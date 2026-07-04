@@ -1,0 +1,98 @@
+"""Monotonic-seq ring buffer for client reconnect replay.
+
+Every downstream event the wrapper emits is appended with its seq. On a client
+`hello(last_seq)`, `replay_from` returns the frames to send: the events with
+seq > last_seq wrapped in replay_start/replay_end. If last_seq is older than
+the buffer's tail (or None), a snapshot + truncated replay is produced.
+"""
+from __future__ import annotations
+
+from collections import deque
+from typing import Optional
+
+from cc_remote.protocol import ReplayStart, ReplayEnd, Snapshot, StateEvent
+
+
+class RingBuffer:
+    def __init__(self, max_events: int, max_bytes: int):
+        self.max_events = max_events
+        self.max_bytes = max_bytes
+        self._buf: deque[tuple[int, object]] = deque()
+        self._bytes = 0
+
+    @staticmethod
+    def _size(msg) -> int:
+        return len(msg.model_dump_json().encode())  # type: ignore[attr-defined]
+
+    def append(self, msg) -> None:
+        size = self._size(msg)
+        self._buf.append((msg.seq, msg))  # type: ignore[attr-defined]
+        self._bytes += size
+        while (len(self._buf) > self.max_events or self._bytes > self.max_bytes) and len(self._buf) > 1:
+            _, old = self._buf.popleft()
+            self._bytes -= self._size(old)
+
+    @property
+    def head_seq(self) -> int:
+        return self._buf[0][0] if self._buf else 0
+
+    @property
+    def tail_seq(self) -> int:
+        return self._buf[-1][0] if self._buf else 0
+
+    def replay_from(self, last_seq: Optional[int], *, cc_session_id, state, tail_text: str = "") -> list:
+        frames: list = []
+        if last_seq is None:
+            # New client: replay the ENTIRE buffered history so it sees the full
+            # conversation, not just a tail snapshot. If the buffer already
+            # evicted early events (head_seq > 1), mark truncated + lead with a
+            # snapshot for context.
+            if not self._buf:
+                return [Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text)]
+            truncated = self.head_seq > 1
+            if truncated:
+                frames.append(Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text))
+            from_seq = self.head_seq
+            to_seq = self.tail_seq
+            frames.append(ReplayStart(from_seq=from_seq, to_seq=to_seq, truncated=truncated))
+            for _, m in self._buf:
+                frames.append(m)
+            frames.append(ReplayEnd(to_seq=to_seq, truncated=truncated))
+            return frames
+
+        have = [(s, m) for s, m in self._buf if s > last_seq]
+        # truncated if the requested last_seq+1 fell off the front of the buffer
+        truncated = (last_seq + 1) < self.head_seq
+
+        if not have:
+            to_seq = last_seq
+            frames.append(ReplayStart(from_seq=last_seq + 1, to_seq=to_seq, truncated=truncated))
+            frames.append(ReplayEnd(to_seq=to_seq, truncated=truncated))
+            return frames
+
+        if truncated:
+            frames.append(Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text))
+        from_seq = have[0][0]
+        to_seq = have[-1][0]
+        frames.append(ReplayStart(from_seq=from_seq, to_seq=to_seq, truncated=truncated))
+        for _, m in have:
+            frames.append(m)
+        frames.append(ReplayEnd(to_seq=to_seq, truncated=truncated))
+        return frames
+
+    def latest_state(self):
+        for _, m in reversed(self._buf):
+            if isinstance(m, StateEvent):
+                return m.state
+        return None
+
+    def latest_tail_text(self) -> str:
+        parts: list[str] = []
+        total = 0
+        for _, m in reversed(self._buf):
+            if m.type == "delta":  # type: ignore[attr-defined]
+                parts.append(m.text)  # type: ignore[attr-defined]
+                total += len(m.text)  # type: ignore[attr-defined]
+                if total > 500:
+                    break
+        return "".join(reversed(parts))[-500:]
