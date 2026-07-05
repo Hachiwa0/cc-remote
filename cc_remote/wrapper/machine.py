@@ -33,7 +33,7 @@ from claude_agent_sdk.types import ResultMessage
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, Hello, Model, Perm, ContextReport, Pong, StateEvent, State, UserMsg, is_downstream,
+    Error, Hello, Model, Perm, ContextReport, DiffReport, Pong, StateEvent, State, UserMsg, is_downstream,
     SessionInfo, SessionList, SessionSwitched,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL,
@@ -158,6 +158,8 @@ class WrapperMachine:
             await self._handle_set_perm(cmd)
         elif t == "get_context":
             await self._handle_get_context(cmd)
+        elif t == "get_diff":
+            await self._handle_get_diff(cmd)
         elif t == "list_sessions":
             await self._handle_list_sessions(cmd)
         elif t == "switch_session":
@@ -256,6 +258,40 @@ class WrapperMachine:
         except Exception as e:
             log.exception("get_context_usage failed", error=str(e))
             await self._emit(Error(code=ERR_INTERNAL, message=f"get_context failed: {e}"))
+
+    async def _handle_get_diff(self, cmd) -> None:
+        try:
+            diff = await self._git_diff(cmd.file)
+            await self._emit(DiffReport(file=cmd.file, diff=diff))
+        except Exception as e:
+            log.exception("get_diff failed", error=str(e))
+            await self._emit(Error(code=ERR_INTERNAL, message=f"get_diff failed: {e}"))
+
+    async def _git_diff(self, file: str) -> str:
+        """Raw `git diff` (vs HEAD) text. Empty file => all files (with
+        `diff --git` headers); a single file falls back to --no-index for
+        new/untracked files (full-add diff). The client parses + renders this
+        with its own Claude-style green/red gutter (theme-adaptive, no pager)."""
+        if not file:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", self.cc_cwd, "diff", "HEAD",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, _ = await proc.communicate()
+            return out.decode(errors="replace") if out else ""
+        # single tracked file vs HEAD
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", self.cc_cwd, "diff", "HEAD", "--", file,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await proc.communicate()
+        diff = out.decode(errors="replace") if out else ""
+        if diff.strip():
+            return diff
+        # untracked/new file => diff against /dev/null (full add)
+        proc2 = await asyncio.create_subprocess_exec(
+            "git", "-C", self.cc_cwd, "diff", "--no-index", "/dev/null", file,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out2, _ = await proc2.communicate()
+        return out2.decode(errors="replace") if out2 else ""
 
     # ---- sessions (list / switch / new) ----
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import type { State, QueryImg, QueryFile } from "../protocol";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
@@ -62,7 +62,7 @@ export function Composer(p: Props) {
     }
   };
 
-  const onPickFiles = (fl: FileList | null) => {
+  const onPickFiles = (fl: FileList | File[] | null) => {
     if (!fl) return;
     Array.from(fl).forEach((f) => {
       const reader = new FileReader();
@@ -74,6 +74,21 @@ export function Composer(p: Props) {
       };
       reader.readAsDataURL(f);
     });
+  };
+
+  // paste images/files straight into the textarea (clipboard API)
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.kind === "file") {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) { e.preventDefault(); onPickFiles(files); }
   };
 
   const send = () => {
@@ -156,6 +171,7 @@ export function Composer(p: Props) {
             placeholder={offline ? "机器离线 — 等待重连…" : "发消息…  输入 / 唤起命令"}
             disabled={offline}
             onChange={(e) => onInput(e.target.value)}
+            onPaste={onPaste}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
           />
           <button className="cchip mini" aria-label="选择模型" onClick={() => setSheetKind("models")}>
@@ -172,11 +188,11 @@ export function Composer(p: Props) {
       <CommandSheet
         open={sheetKind !== null}
         kind={sheetKind || "commands"}
-        onClose={() => setSheetKind(null)}
+        onClose={() => { setSheetKind(null); if (input === "/") setInput(""); }}
         onPickCommand={(slash) => {
-          if (slash === "clear") { p.onClear(); setSheetKind(null); return; }
-          if (slash === "context") { p.onContext(); setSheetKind(null); return; }
-          if (slash === "permissions") { setSheetKind("perms"); return; }
+          if (slash === "clear") { p.onClear(); setInput(""); setSheetKind(null); return; }
+          if (slash === "context") { p.onContext(); setInput(""); setSheetKind(null); return; }
+          if (slash === "permissions") { setInput(""); setSheetKind("perms"); return; }
           setInput("/" + slash + " ");
           setSheetKind(null);
           setTimeout(() => taRef.current?.focus(), 0);

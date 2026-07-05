@@ -7,6 +7,8 @@
 // events, so no client-side reordering is needed.
 import type { ConnState } from "./ws";
 import type { ServerEvent, SessionInfo, State, ContextReport, QueryImg, QueryFile } from "./protocol";
+import type { DiffLine, GitDiffSection } from "./diff";
+import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
 
 export interface TextBlock {
@@ -36,7 +38,10 @@ export interface Turn {
   images?: QueryImg[]; // attached images on the user's message (originating client only)
   files?: QueryFile[]; // attached files (written to /tmp by wrapper, prompt gets @path)
   ts?: number; // send timestamp (ms) for the user-bubble time readout
+  doneTs?: number; // turn-end timestamp (ms) for the AI reply time readout
 }
+
+export interface Artifact { file: string; kind: "diff" | "md" | "gitdiff"; diff?: DiffLine[]; content?: string; sections?: GitDiffSection[]; }
 
 export interface AppState {
   turns: Turn[];
@@ -56,6 +61,7 @@ export interface AppState {
   sessions: SessionInfo[]; // sessions sidebar rows
   activeSessionId: string | null;
   contextReport: ContextReport | null; // /context result modal
+  artifact: Artifact | null; // right-side diff/markdown panel for a changed file
 }
 
 export type Action =
@@ -71,7 +77,9 @@ export type Action =
   | { type: "set_perm"; perm: string }
   | { type: "set_context"; report: ContextReport }
   | { type: "clear_context" }
-  | { type: "set_turns"; turns: Turn[] };
+  | { type: "set_turns"; turns: Turn[] }
+  | { type: "set_artifact"; artifact: Artifact }
+  | { type: "clear_artifact" };
 
 export const initialState: AppState = {
   turns: [],
@@ -88,6 +96,7 @@ export const initialState: AppState = {
   sessions: [],
   activeSessionId: null,
   contextReport: null,
+  artifact: null,
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
@@ -127,6 +136,10 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, contextReport: action.report };
     case "clear_context":
       return { ...state, contextReport: null };
+    case "set_artifact":
+      return { ...state, artifact: action.artifact };
+    case "clear_artifact":
+      return { ...state, artifact: null };
     case "event": {
       return reduceEvent(state, action.event);
     }
@@ -147,6 +160,8 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return { ...state, perm: e.mode };
     case "context_report":
       return { ...state, contextReport: e };
+    case "diff_report":
+      return { ...state, artifact: { file: e.file, kind: "gitdiff", sections: parseGitDiff(e.diff) } };
     case "session_list":
       return { ...state, sessions: e.sessions };
     case "session_switched":
@@ -259,6 +274,7 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       if (t) {
         t.done = true;
         if (e.result.subtype === "error_during_execution") t.interrupted = true;
+        if (t.ts && e.result.duration_ms) t.doneTs = t.ts + e.result.duration_ms;
       }
       return { ...state, turns, state: "idle" };
     }

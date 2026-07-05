@@ -284,9 +284,24 @@ class ContextReport(_Base):
     categories: list[dict[str, Any]] = []
 
 
+class GetDiff(_Base):
+    """client -> wrapper: request a git diff (context + line numbers) for a file.
+    `theme` picks delta's light/dark rendering so the panel matches the app."""
+    type: Literal["get_diff"] = "get_diff"
+    file: str
+    theme: str = "light"
+
+
+class DiffReport(_Base):
+    """wrapper -> client: git diff text (one-shot, like ContextReport)."""
+    type: Literal["diff_report"] = "diff_report"
+    file: str
+    diff: str
+
+
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetPerm, GetContext, ListSessions, SwitchSession, NewSession, Ping, Pong,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport,
+    Hello, Query, Interrupt, SetModel, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, Ping, Pong,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport, DiffReport,
     SessionList, SessionSwitched, RenameSession, ArchiveSession,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
@@ -308,6 +323,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "set_model": SetModel,
     "set_perm": SetPerm,
     "get_context": GetContext,
+    "get_diff": GetDiff,
     "list_sessions": ListSessions,
     "switch_session": SwitchSession,
     "new_session": NewSession,
@@ -322,6 +338,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "model": Model,
     "perm": Perm,
     "context_report": ContextReport,
+    "diff_report": DiffReport,
     "session_list": SessionList,
     "session_switched": SessionSwitched,
     "user_msg": UserMsg,

@@ -65,6 +65,8 @@ export interface ArchiveSession extends Base { type: "archive_session"; session_
 export interface SetPerm extends Base { type: "set_perm"; mode: string }
 export interface Perm extends Base { type: "perm"; mode: string }
 export interface GetContext extends Base { type: "get_context" }
+export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: string }
+export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string }
 export interface ContextCategory { name: string; tokens: number; color: string; isDeferred?: boolean }
 export interface ContextReport extends Base {
   type: "context_report";
@@ -77,7 +79,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Perm | ContextReport
+  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Perm | ContextReport | DiffReport
   | SessionList | SessionSwitched
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;

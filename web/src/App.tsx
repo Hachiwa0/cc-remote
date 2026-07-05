@@ -8,6 +8,7 @@ import { Composer } from "./components/Composer";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { LoginForm } from "./components/LoginForm";
 import { SessionsSidebar } from "./components/SessionsSidebar";
+import { ArtifactPanel } from "./components/ArtifactPanel";
 import { loadSession, saveSession } from "./cache";
 import type { Turn } from "./reducer";
 import type { Snapshot, QueryImg, QueryFile } from "./protocol";
@@ -121,6 +122,26 @@ export default function App() {
     saveSession(sid, state.turns, Math.max(wsRef.current?.lastSeqValue || 0, lastSeqRef.current));
   }, [state.turns, state.ccSessionId]);
 
+  // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Option+B => open latest turn's diff
+  useEffect(() => {
+    if (!authed) return;
+    const onKey = (e: KeyboardEvent) => {
+      const b = e.key === "b" || e.key === "B";
+      if (!b) return;
+      // Ctrl/Cmd+B => toggle left sidebar; Ctrl+Cmd+B => toggle right diff panel
+      if (e.metaKey && e.ctrlKey) {
+        e.preventDefault();
+        if (state.artifact) dispatch({ type: "clear_artifact" });
+        else getDiff("");
+      } else if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        setSidebarOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [authed, state.artifact]);
+
   if (!authed) {
     return <LoginForm onLogin={(t) => { localStorage.setItem(SESSION_KEY, t); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
   }
@@ -140,6 +161,11 @@ export default function App() {
     wsRef.current?.sendSetPerm(perm);
     dispatch({ type: "set_perm", perm });
   };
+  // open the right-side artifact panel for a file changed in a turn:
+  // Edit => diff (old→new), Write => render content (markdown)
+  // fetch a git diff (context + line numbers) from the wrapper; "" = all files.
+  // Pass the current theme so delta renders light/dark-appropriate colors.
+  const getDiff = (file: string) => wsRef.current?.sendGetDiff(file, theme);
   const logout = () => {
     localStorage.removeItem(SESSION_KEY);
     wsRef.current?.stop();
@@ -178,7 +204,7 @@ export default function App() {
 
         <ReconnectBanner banner={state.banner} replaying={state.replaying} truncated={state.truncated} />
 
-        <ChatView turns={state.turns} onEdit={(prompt) => setEditPrompt(prompt)} />
+        <ChatView turns={state.turns} onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
 
         <Composer
           state={state.state}
@@ -231,6 +257,9 @@ export default function App() {
           </>
         )}
       </section>
+      {state.artifact && (
+        <ArtifactPanel artifact={state.artifact} onClose={() => dispatch({ type: "clear_artifact" })} />
+      )}
     </div>
   );
 }
