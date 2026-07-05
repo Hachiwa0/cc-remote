@@ -322,10 +322,12 @@ body{
   color:var(--faint); padding:12px 12px 5px; }
 .cmd{ display:flex; align-items:center; gap:12px; width:100%; text-align:left;
   padding:10px 12px; border-radius:12px; transition:.12s; }
-.cmd:hover,.cmd.sel{ background:var(--accent-weak); }
+.cmd.sel{ background:var(--accent-weak); }
+@media (hover:hover){ .cmd:hover{ background:var(--accent-weak); } }
 .cmd-ic{ width:34px; height:34px; border-radius:10px; background:var(--bg); border:1px solid var(--border);
   display:grid; place-items:center; flex:none; color:var(--accent); }
-.cmd:hover .cmd-ic,.cmd.sel .cmd-ic{ border-color:var(--accent-line); }
+.cmd.sel .cmd-ic{ border-color:var(--accent-line); }
+@media (hover:hover){ .cmd:hover .cmd-ic{ border-color:var(--accent-line); } }
 .cmd-ic svg{ width:17px; height:17px; }
 .cmd-tx{ flex:1; min-width:0; }
 .cmd-nm{ font-weight:600; font-size:14.5px; display:flex; align-items:center; gap:8px; }
@@ -335,7 +337,8 @@ body{
 .cmd-check{ color:var(--accent); flex:none; display:grid; place-items:center; }
 .cmd-check svg{ width:19px; height:19px; }
 .cmd.danger .cmd-ic{ color:var(--danger); background:var(--danger-weak); border-color:transparent; }
-.cmd.danger:hover,.cmd.danger.sel{ background:var(--danger-weak); }
+.cmd.danger.sel{ background:var(--danger-weak); }
+@media (hover:hover){ .cmd.danger:hover{ background:var(--danger-weak); } }
 .cmd.danger .cmd-nm{ color:var(--danger); } .cmd.danger .cmd-check{ color:var(--danger); }
 
 /* LOGIN */

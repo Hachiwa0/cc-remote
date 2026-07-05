@@ -41,7 +41,6 @@ class RingBuffer:
         return self._buf[-1][0] if self._buf else 0
 
     def replay_from(self, last_seq: Optional[int], *, cc_session_id, state, tail_text: str = "") -> list:
-        frames: list = []
         if last_seq is None:
             # First hello: send only a snapshot (cc_session_id + state). The client
             # reads its IndexedDB cache, then re-hellos with last_seq to fetch only
@@ -49,21 +48,35 @@ class RingBuffer:
             # the client already has the history locally.
             return [Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text)]
 
+        # Future cursor: the client's last_seq is beyond our buffer's tail. This
+        # happens because the seq counter resets to 0 on every wrapper restart,
+        # but the client's IndexedDB cache keeps the lastSeq from the previous
+        # wrapper lifetime. Rebuild the client from the full buffer with
+        # rebuild=True (NOT truncated — the buffer has the full history, nothing
+        # is lost, so no "history may be missing" banner). No Snapshot here —
+        # only hello(null) sends one, else the client re-hellos with the stale
+        # cursor and loops.
+        if self._buf and last_seq > self.tail_seq:
+            have = list(self._buf)
+            from_seq = have[0][0]
+            to_seq = have[-1][0]
+            frames: list = [ReplayStart(from_seq=from_seq, to_seq=to_seq, truncated=False, rebuild=True)]
+            frames.extend(m for _, m in have)
+            frames.append(ReplayEnd(to_seq=to_seq, truncated=False))
+            return frames
+
         have = [(s, m) for s, m in self._buf if s > last_seq]
         # truncated if the requested last_seq+1 fell off the front of the buffer
         truncated = (last_seq + 1) < self.head_seq
 
         if not have:
             to_seq = last_seq
-            frames.append(ReplayStart(from_seq=last_seq + 1, to_seq=to_seq, truncated=truncated))
-            frames.append(ReplayEnd(to_seq=to_seq, truncated=truncated))
-            return frames
+            return [ReplayStart(from_seq=last_seq + 1, to_seq=to_seq, truncated=truncated),
+                    ReplayEnd(to_seq=to_seq, truncated=truncated)]
 
-        if truncated:
-            frames.append(Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text))
         from_seq = have[0][0]
         to_seq = have[-1][0]
-        frames.append(ReplayStart(from_seq=from_seq, to_seq=to_seq, truncated=truncated))
+        frames = [ReplayStart(from_seq=from_seq, to_seq=to_seq, truncated=truncated)]
         for _, m in have:
             frames.append(m)
         frames.append(ReplayEnd(to_seq=to_seq, truncated=truncated))

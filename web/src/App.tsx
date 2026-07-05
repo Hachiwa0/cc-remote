@@ -116,10 +116,14 @@ export default function App() {
   }, [state.state, state.queue]);
 
   // Persist turns to IndexedDB (coalesced) so reopening restores instantly.
+  // Prefer the live seq cursor (ws.lastSeqValue): after a wrapper restart the
+  // buffered seq namespace resets, and a stale cached lastSeqRef from the
+  // previous lifetime would otherwise be saved forever (Math.max kept it).
   useEffect(() => {
     const sid = state.ccSessionId;
     if (!sid || state.turns.length === 0) return;
-    saveSession(sid, state.turns, Math.max(wsRef.current?.lastSeqValue || 0, lastSeqRef.current));
+    const live = wsRef.current?.lastSeqValue || 0;
+    saveSession(sid, state.turns, live || lastSeqRef.current);
   }, [state.turns, state.ccSessionId]);
 
   // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Option+B => open latest turn's diff

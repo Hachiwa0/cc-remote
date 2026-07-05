@@ -97,6 +97,11 @@ class ReplayStart(_Base):
     from_seq: int
     to_seq: int
     truncated: bool
+    # rebuild=True: the client's last_seq was from a previous wrapper lifetime
+    # (seq reset on restart), so it must discard its IndexedDB cache and rebuild
+    # from this full-buffer replay. Distinct from `truncated` (which means the
+    # buffer evicted events the client wanted -> data may be lost -> show banner).
+    rebuild: bool = False
 
 
 class ReplayEnd(_Base):

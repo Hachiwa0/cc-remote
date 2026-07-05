@@ -179,9 +179,14 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       };
     case "replay_start":
       // truncated = the buffer evicted events the client's last_seq wanted, so
-      // rebuild from the buffer (drop local turns). Otherwise incremental catch-up:
-      // merge onto existing (possibly cached-from-IndexedDB) turns.
-      return { ...state, replaying: true, truncated: e.truncated, turns: e.truncated ? [] : state.turns };
+      // rebuild from the buffer (drop local turns). rebuild = the client's
+      // last_seq was from a previous wrapper lifetime (seq reset on restart);
+      // also drop local turns, but it's NOT data loss so don't set truncated.
+      // Otherwise incremental catch-up: merge onto existing turns.
+      {
+        const clear = e.truncated || !!e.rebuild;
+        return { ...state, replaying: true, truncated: e.truncated, turns: clear ? [] : state.turns };
+      }
     case "replay_end":
       return { ...state, replaying: false, truncated: state.truncated || e.truncated };
     case "wrapper_disconnected":

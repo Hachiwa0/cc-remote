@@ -28,7 +28,7 @@ export interface Interrupt extends Base { type: "interrupt" }
 export interface SetModel extends Base { type: "set_model"; model: string }
 export interface Ping extends Base { type: "ping"; n: number }
 export interface Pong extends Base { type: "pong"; n: number }
-export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean }
+export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean; rebuild?: boolean }
 export interface ReplayEnd extends Base { type: "replay_end"; to_seq: number; truncated: boolean }
 export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string }
 export interface StateEvent extends Base { type: "state"; state: State }
