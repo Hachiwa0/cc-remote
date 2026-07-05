@@ -231,6 +231,7 @@ export default function App() {
           onClear={() => wsRef.current?.sendNewSession()}
           onContext={() => wsRef.current?.sendGetContext()}
         />
+        {state.state !== "idle" && <div className="spinner" aria-hidden="true" />}
         {state.contextReport && (
           <>
             <div className="scrim show" onClick={() => dispatch({ type: "clear_context" })} />

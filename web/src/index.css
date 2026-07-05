@@ -44,7 +44,7 @@ body{
 
 /* APP SHELL — single chat pane for now (sessions sidebar reserved for multi-session) */
 .shell{ display:block; height:100dvh; overflow:hidden; }
-.pane{ height:100dvh; display:flex; flex-direction:column; overflow:hidden; background:var(--bg); }
+.pane{ position:relative; height:100dvh; display:flex; flex-direction:column; overflow:hidden; background:var(--bg); }
 
 /* ICON BUTTONS */
 .iconbtn{ display:inline-grid; place-items:center; width:38px; height:38px;
@@ -134,6 +134,12 @@ body{
 .thinking span:nth-child(2){ animation-delay:.18s; }
 .thinking span:nth-child(3){ animation-delay:.36s; }
 @keyframes think{ 0%,80%,100%{ opacity:.25; transform:translateY(0); } 40%{ opacity:1; transform:translateY(-3px); } }
+
+/* persistent working spinner (Claude-Code-style 菊花), pinned bottom-left
+   of the pane, shown the whole turn so it's obvious Claude is busy. */
+.spinner{ position:absolute; left:14px; bottom:84px; z-index:30; width:22px; height:22px;
+  border-radius:50%; border:2.5px solid var(--border); border-top-color:var(--accent);
+  animation:spin .7s linear infinite; pointer-events:none; }
 
 /* TOOL CARD */
 .tool{ border:1px solid var(--border); border-radius:13px; background:var(--surface);
