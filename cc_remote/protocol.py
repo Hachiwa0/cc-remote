@@ -67,10 +67,17 @@ class Query(_Base):
     type: Literal["query"] = "query"
     prompt: str
     msg_id: str
+    images: Optional[list[dict[str, str]]] = None  # [{media_type, data(base64)}] — multimodal image blocks
+    files: Optional[list[dict[str, str]]] = None   # [{filename, data(base64)}] — written to /tmp, prompt gets @path
 
 
 class Interrupt(_Base):
     type: Literal["interrupt"] = "interrupt"
+
+
+class SetModel(_Base):
+    type: Literal["set_model"] = "set_model"
+    model: str
 
 
 class Ping(_Base):
@@ -108,6 +115,13 @@ class Snapshot(_Base):
 class StateEvent(_Base):
     type: Literal["state"] = "state"
     state: State
+
+
+class Model(_Base):
+    """The cc session's current model (from SystemMessage init / after set_model).
+    Downstream so a reconnecting client restores the model readout."""
+    type: Literal["model"] = "model"
+    model: str
 
 
 class UserMsg(_Base):
@@ -184,9 +198,96 @@ class WrapperReconnected(_Base):
     state: State
 
 
+# ---- sessions (list / switch / new) ----
+
+class SessionInfo(BaseModel):
+    """A row in the sessions sidebar (subset of SDK SDKSessionInfo)."""
+    model_config = ConfigDict(extra="forbid")
+    session_id: str
+    summary: Optional[str] = None
+    last_modified: Optional[str] = None
+    first_prompt: Optional[str] = None
+    git_branch: Optional[str] = None
+    cwd: Optional[str] = None
+    tag: Optional[str] = None  # SDK session tag; "archived" hides the card in the sidebar
+
+
+class ListSessions(_Base):
+    """client -> wrapper: request the session list for the cwd."""
+    type: Literal["list_sessions"] = "list_sessions"
+
+
+class SessionList(_Base):
+    """wrapper -> client: the sessions (downstream so a reconnect restores it)."""
+    type: Literal["session_list"] = "session_list"
+    sessions: list[SessionInfo]
+
+
+class SwitchSession(_Base):
+    """client -> wrapper: resume a different existing session."""
+    type: Literal["switch_session"] = "switch_session"
+    session_id: str
+
+
+class NewSession(_Base):
+    """client -> wrapper: start a fresh session (no resume)."""
+    type: Literal["new_session"] = "new_session"
+
+
+class SessionSwitched(_Base):
+    """wrapper -> client: switch/creation finished; client clears turns + re-hellos."""
+    type: Literal["session_switched"] = "session_switched"
+    session_id: str
+
+
+class RenameSession(_Base):
+    """client -> wrapper: set a session's custom title (appended to its jsonl)."""
+    type: Literal["rename_session"] = "rename_session"
+    session_id: str
+    title: str
+
+
+class ArchiveSession(_Base):
+    """client -> wrapper: toggle the "archived" tag on a session."""
+    type: Literal["archive_session"] = "archive_session"
+    session_id: str
+    archived: bool
+
+
+class SetPerm(_Base):
+    """client -> wrapper: switch the cc session's permission mode (runtime, no reconnect)."""
+    type: Literal["set_perm"] = "set_perm"
+    mode: str
+
+
+class Perm(_Base):
+    """The cc session's current permission mode. Downstream so a reconnecting
+    client restores the readout."""
+    type: Literal["perm"] = "perm"
+    mode: str
+
+
+class GetContext(_Base):
+    """client -> wrapper: request current context window usage."""
+    type: Literal["get_context"] = "get_context"
+
+
+class ContextReport(_Base):
+    """wrapper -> client: context window usage (one-shot response to GetContext,
+    like SessionList — not buffered)."""
+    type: Literal["context_report"] = "context_report"
+    total_tokens: int
+    max_tokens: int
+    percentage: float
+    model: Optional[str] = None
+    is_auto_compact_enabled: Optional[bool] = None
+    categories: list[dict[str, Any]] = []
+
+
 AnyMessage = Union[
-    Hello, Query, Interrupt, Ping, Pong,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent,
+    Hello, Query, Interrupt, SetModel, SetPerm, GetContext, ListSessions, SwitchSession, NewSession, Ping, Pong,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport,
+    SessionList, SessionSwitched, RenameSession, ArchiveSession,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
@@ -195,20 +296,34 @@ AnyMessage = Union[
 # control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "state", "assistant_msg_start", "delta", "tool_use",
-    "tool_result", "assistant_msg_end", "turn_end", "error",
+    "user_msg", "state", "model", "perm",
+    "assistant_msg_start", "delta", "tool_use", "tool_result",
+    "assistant_msg_end", "turn_end", "error",
 })
 
 _TYPE_MAP: dict[str, type[BaseModel]] = {
     "hello": Hello,
     "query": Query,
     "interrupt": Interrupt,
+    "set_model": SetModel,
+    "set_perm": SetPerm,
+    "get_context": GetContext,
+    "list_sessions": ListSessions,
+    "switch_session": SwitchSession,
+    "new_session": NewSession,
+    "rename_session": RenameSession,
+    "archive_session": ArchiveSession,
     "ping": Ping,
     "pong": Pong,
     "replay_start": ReplayStart,
     "replay_end": ReplayEnd,
     "snapshot": Snapshot,
     "state": StateEvent,
+    "model": Model,
+    "perm": Perm,
+    "context_report": ContextReport,
+    "session_list": SessionList,
+    "session_switched": SessionSwitched,
     "user_msg": UserMsg,
     "assistant_msg_start": AssistantMsgStart,
     "delta": Delta,

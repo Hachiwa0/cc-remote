@@ -3,7 +3,7 @@
 // location so it works both in Vite dev (proxied /ws) and in production
 // (relay serves the build on the same origin). Auto-reconnects with backoff
 // and re-hellos with last_seq on every (re)connect and on wrapper_reconnected.
-import type { ServerEvent } from "./protocol";
+import type { ServerEvent, QueryImg, QueryFile } from "./protocol";
 import { PROTOCOL_VERSION } from "./protocol";
 import { uuid } from "./util";
 
@@ -59,18 +59,56 @@ export class RelayWs {
     if (typeof seq === "number" && seq > this.lastSeq) this.lastSeq = seq;
   }
 
-  sendQuery(prompt: string, msg_id: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "query", prompt, msg_id, ts: nowTs() });
+  sendQuery(prompt: string, msg_id: string, images?: QueryImg[], files?: QueryFile[]): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "query", prompt, msg_id, ts: nowTs() };
+    if (images && images.length) obj.images = images;
+    if (files && files.length) obj.files = files;
+    this.send(obj);
   }
 
   sendInterrupt(): void {
     this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs() });
   }
 
-  resendHello(): void {
+  sendSetModel(model: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_model", model, ts: nowTs() });
+  }
+
+  sendSetPerm(mode: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs() });
+  }
+
+  sendGetContext(): void {
+    this.send({ v: PROTOCOL_VERSION, type: "get_context", ts: nowTs() });
+  }
+
+  sendListSessions(): void {
+    this.send({ v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() });
+  }
+
+  sendSwitchSession(sessionId: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() });
+  }
+
+  sendNewSession(): void {
+    this.send({ v: PROTOCOL_VERSION, type: "new_session", ts: nowTs() });
+  }
+
+  sendRenameSession(sessionId: string, title: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() });
+  }
+
+  sendArchiveSession(sessionId: string, archived: boolean): void {
+    this.send({ v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() });
+  }
+
+  /** Send hello with an explicit last_seq. `null` = first hello (wrapper replies
+   *  with a snapshot so the app can read its IndexedDB cache); an int = catch-up
+   *  (wrapper replays only events with seq > last_seq). */
+  sendHello(lastSeq: number | null): void {
     this.send({
       v: PROTOCOL_VERSION, type: "hello", role: "client", client_id: this.clientId,
-      last_seq: this.lastSeq || null, ts: nowTs(),
+      last_seq: lastSeq, ts: nowTs(),
     });
   }
 
@@ -86,12 +124,20 @@ export class RelayWs {
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = 1;
-      this.cb.onConnState("connected");
-      this.resendHello();
+      this.sendHello(null);  // first hello -> wrapper sends snapshot -> app reads cache + catchUp
+      this.cb.onConnState("connected");  // triggers sendListSessions after hello
     };
     ws.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data) as ServerEvent;
+        if (msg.type === "session_switched") {
+          // new active session: reset the seq cursor; the snapshot from the new
+          // session will trigger a cache read + catchUp in the app.
+          this.lastSeq = 0;
+          this.cb.onEvent(msg);
+          this.sendHello(null);
+          return;
+        }
         this.noteSeq(msg.seq);
         this.cb.onEvent(msg);
       } catch (err) {

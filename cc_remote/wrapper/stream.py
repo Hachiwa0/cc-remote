@@ -18,7 +18,7 @@ from claude_agent_sdk.types import (
 
 from cc_remote.protocol import (
     AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
-    TurnEnd, TurnResult,
+    TurnEnd, TurnResult, UserMsg,
 )
 
 
@@ -104,4 +104,133 @@ def extract_session_id(msg) -> str | None:
         data = msg.data
         if isinstance(data, dict):
             return data.get("session_id")
+    return None
+
+
+def extract_model(msg) -> str | None:
+    """Pull the current model out of the init SystemMessage."""
+    if isinstance(msg, SystemMessage) and msg.subtype == "init":
+        data = msg.data
+        if isinstance(data, dict):
+            return data.get("model")
+    return None
+
+
+# ---- on-disk history -> wire events (for session switch) ----
+
+def translate_history(messages, tool_result_max: int) -> list:
+    """Translate a session's on-disk transcript (list[SessionMessage]) into wire
+    events the client reducer renders as past turns.
+
+    The transcript carries no ResultMessage, so synthetic TurnEnd frames delimit
+    turns. Returned events are appended to the ring buffer (NOT broadcast) on
+    session switch; a client that re-hellos with last_seq=null then replays the
+    full history. Thinking blocks and non-conversational user turns (compact
+    summaries, slash-command envelopes, local-command stdout) are skipped so the
+    history reads like a normal chat.
+    """
+    events: list = []
+    turn_open = False
+
+    def close_turn():
+        nonlocal turn_open
+        if turn_open:
+            events.append(TurnEnd(result=TurnResult(
+                subtype="success", duration_ms=0, is_error=False,
+            )))
+            turn_open = False
+
+    for m in messages:
+        msg = m.message
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role") or m.type
+        content = msg.get("content")
+
+        if role == "user":
+            if isinstance(content, str):
+                if _is_meta_user_text(content):
+                    continue
+                close_turn()
+                events.append(UserMsg(msg_id=m.uuid, prompt=content))
+                turn_open = True
+            elif isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type")
+                    if bt == "tool_result":
+                        text = _stringify(b.get("content"))
+                        truncated = None
+                        if len(text) > tool_result_max:
+                            text = text[:tool_result_max]
+                            truncated = True
+                        events.append(ToolResult(
+                            tool_use_id=b.get("tool_use_id") or "",
+                            content=text,
+                            is_error=bool(b.get("is_error")),
+                            truncated=truncated,
+                        ))
+                    elif bt == "text":
+                        txt = b.get("text", "")
+                        if txt and not _is_meta_user_text(txt):
+                            close_turn()
+                            events.append(UserMsg(msg_id=m.uuid, prompt=txt))
+                            turn_open = True
+        elif role == "assistant":
+            if not isinstance(content, list):
+                continue
+            mid = m.uuid
+            started = False
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                if bt == "text":
+                    txt = b.get("text", "")
+                    if not started:
+                        events.append(AssistantMsgStart(message_id=mid))
+                        started = True
+                    if txt:
+                        events.append(Delta(message_id=mid, text=txt))
+                elif bt == "tool_use":
+                    if not started:
+                        events.append(AssistantMsgStart(message_id=mid))
+                        started = True
+                    events.append(ToolUse(
+                        message_id=mid,
+                        tool_use_id=b.get("id") or "",
+                        tool=b.get("name") or "",
+                        input=b.get("input") or {},
+                    ))
+                # thinking / unknown blocks: skipped (MVP)
+            if started:
+                events.append(AssistantMsgEnd(message_id=mid))
+                turn_open = True
+    close_turn()
+    return events
+
+
+def _is_meta_user_text(text: str) -> bool:
+    """Skip non-conversational user turns that would just clutter the history:
+    compact summaries, slash-command envelopes, and local-command stdout/stderr."""
+    t = text.lstrip()
+    return (
+        t.startswith("This session is being continued from a previous conversation")
+        or t.startswith("<command-name>")
+        or t.startswith("<command-message>")
+        or t.startswith("<command-args>")
+        or t.startswith("<local-command-stdout>")
+        or t.startswith("<local-command-stderr>")
+    )
+
+
+def last_assistant_model(messages) -> str | None:
+    """Most recent assistant message's model id, for restoring the model readout
+    when loading a switched session's history."""
+    for m in reversed(messages):
+        if getattr(m, "type", None) == "assistant" and isinstance(m.message, dict):
+            mdl = m.message.get("model")
+            if mdl:
+                return mdl
     return None

@@ -13,10 +13,7 @@ export function MessageBlock({ text, done }: { text: string; done: boolean }) {
   useEffect(() => {
     latest.current = text;
     if (done) {
-      if (timer.current) {
-        clearTimeout(timer.current);
-        timer.current = null;
-      }
+      if (timer.current) { clearTimeout(timer.current); timer.current = null; }
       setShown(text);
       return;
     }
@@ -33,9 +30,9 @@ export function MessageBlock({ text, done }: { text: string; done: boolean }) {
 
   if (!shown) return null;
   return (
-    <div className="markdown">
+    <div className="prose">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
-      {!done && <span className="cursor">▋</span>}
+      {!done && <span className="cursor" />}
     </div>
   );
 }

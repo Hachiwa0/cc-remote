@@ -43,22 +43,11 @@ class RingBuffer:
     def replay_from(self, last_seq: Optional[int], *, cc_session_id, state, tail_text: str = "") -> list:
         frames: list = []
         if last_seq is None:
-            # New client: replay the ENTIRE buffered history so it sees the full
-            # conversation, not just a tail snapshot. If the buffer already
-            # evicted early events (head_seq > 1), mark truncated + lead with a
-            # snapshot for context.
-            if not self._buf:
-                return [Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text)]
-            truncated = self.head_seq > 1
-            if truncated:
-                frames.append(Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text))
-            from_seq = self.head_seq
-            to_seq = self.tail_seq
-            frames.append(ReplayStart(from_seq=from_seq, to_seq=to_seq, truncated=truncated))
-            for _, m in self._buf:
-                frames.append(m)
-            frames.append(ReplayEnd(to_seq=to_seq, truncated=truncated))
-            return frames
+            # First hello: send only a snapshot (cc_session_id + state). The client
+            # reads its IndexedDB cache, then re-hellos with last_seq to fetch only
+            # the delta — so opening the app doesn't replay the whole buffer when
+            # the client already has the history locally.
+            return [Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text)]
 
         have = [(s, m) for s, m in self._buf if s > last_seq]
         # truncated if the requested last_seq+1 fell off the front of the buffer

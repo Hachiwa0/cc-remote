@@ -5,13 +5,16 @@ interface Props {
 }
 
 export function ReconnectBanner({ banner, replaying, truncated }: Props) {
-  if (!banner && !replaying && !truncated) return null;
+  const parts: string[] = [];
+  if (replaying) parts.push("正在补发历史…");
+  if (banner) parts.push(banner);
+  if (truncated && !replaying) parts.push("（部分历史可能缺失）");
+  const text = parts.join(" · ");
+  if (!text) return null;
   return (
-    <div className="banner">
-      {replaying && "正在补发历史…"}
-      {replaying && banner && " · "}
-      {banner}
-      {truncated && !replaying && "（部分历史可能缺失）"}
+    <div className="banner show">
+      <span className="sp" />
+      <span>{text}</span>
     </div>
   );
 }

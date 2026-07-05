@@ -21,14 +21,18 @@ export interface Hello extends Base {
   buffer_head_seq?: number | null;
   buffer_tail_seq?: number | null;
 }
-export interface Query extends Base { type: "query"; prompt: string; msg_id: string }
+export interface QueryImg { media_type: string; data: string }
+export interface QueryFile { filename: string; data: string }
+export interface Query extends Base { type: "query"; prompt: string; msg_id: string; images?: QueryImg[] | null; files?: QueryFile[] | null }
 export interface Interrupt extends Base { type: "interrupt" }
+export interface SetModel extends Base { type: "set_model"; model: string }
 export interface Ping extends Base { type: "ping"; n: number }
 export interface Pong extends Base { type: "pong"; n: number }
 export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean }
 export interface ReplayEnd extends Base { type: "replay_end"; to_seq: number; truncated: boolean }
 export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string }
 export interface StateEvent extends Base { type: "state"; state: State }
+export interface Model extends Base { type: "model"; model: string }
 export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string }
@@ -41,8 +45,40 @@ export interface ErrorMsg extends Base { type: "error"; code: string; message: s
 export interface WrapperDisconnected extends Base { type: "wrapper_disconnected" }
 export interface WrapperReconnected extends Base { type: "wrapper_reconnected"; cc_session_id?: string | null; state: State }
 
+// sessions
+export interface SessionInfo {
+  session_id: string;
+  summary?: string | null;
+  last_modified?: string | null;
+  first_prompt?: string | null;
+  git_branch?: string | null;
+  cwd?: string | null;
+  tag?: string | null;
+}
+export interface ListSessions extends Base { type: "list_sessions" }
+export interface SwitchSession extends Base { type: "switch_session"; session_id: string }
+export interface NewSession extends Base { type: "new_session" }
+export interface SessionList extends Base { type: "session_list"; sessions: SessionInfo[] }
+export interface SessionSwitched extends Base { type: "session_switched"; session_id: string }
+export interface RenameSession extends Base { type: "rename_session"; session_id: string; title: string }
+export interface ArchiveSession extends Base { type: "archive_session"; session_id: string; archived: boolean }
+export interface SetPerm extends Base { type: "set_perm"; mode: string }
+export interface Perm extends Base { type: "perm"; mode: string }
+export interface GetContext extends Base { type: "get_context" }
+export interface ContextCategory { name: string; tokens: number; color: string; isDeferred?: boolean }
+export interface ContextReport extends Base {
+  type: "context_report";
+  total_tokens: number;
+  max_tokens: number;
+  percentage: number;
+  model?: string | null;
+  is_auto_compact_enabled?: boolean | null;
+  categories: ContextCategory[];
+}
+
 export type ServerEvent =
-  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent
+  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Perm | ContextReport
+  | SessionList | SessionSwitched
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 

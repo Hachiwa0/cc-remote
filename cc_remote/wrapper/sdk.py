@@ -40,11 +40,11 @@ class SdkHandle:
                 f"the interrupt/drain contract may have changed — pin 0.2.110 or re-verify."
             )
 
-    def _options(self, resume_id: str | None) -> ClaudeAgentOptions:
+    def _options(self, resume_id: str | None, cwd: str | None = None) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             include_partial_messages=True,        # StreamEvent with content_block_delta
             permission_mode="bypassPermissions",  # unattended; matches settings.json
-            cwd=self.cfg.cc_cwd,
+            cwd=cwd or self.cfg.cc_cwd,           # dynamic: must match the resumed session's cwd
             resume=resume_id or None,
             stderr=self._on_stderr,               # surface cc subprocess errors
             # setting_sources left None -> load ~/.claude/settings.json (model link, model id)
@@ -54,19 +54,39 @@ class SdkHandle:
     def _on_stderr(line: str) -> None:
         log.warning("cc stderr: " + line.rstrip())
 
-    async def connect(self, resume_id: str | None = None) -> None:
-        opts = self._options(resume_id)
+    async def connect(self, resume_id: str | None = None, cwd: str | None = None) -> None:
+        opts = self._options(resume_id, cwd)
         self.client = ClaudeSDKClient(options=opts)
         await self.client.connect()
-        log.info("sdk connected", resume=bool(resume_id), cwd=self.cfg.cc_cwd, sdk_version=SDK_VERSION)
+        log.info("sdk connected", resume=bool(resume_id), cwd=opts.cwd, sdk_version=SDK_VERSION)
 
-    async def query(self, prompt: str) -> None:
+    async def query(self, prompt) -> None:
+        """Send a request. `prompt` is a string, or an async iterable of user-
+        message dicts (used for multimodal input — text + image blocks)."""
         assert self.client is not None
         await self.client.query(prompt)
 
     async def interrupt(self) -> None:
         assert self.client is not None
         await self.client.interrupt()
+
+    async def set_model(self, model: str) -> None:
+        """Switch the model for the live cc subprocess (takes effect next query,
+        no reconnect)."""
+        assert self.client is not None
+        await self.client.set_model(model)
+        log.info("model set", model=model)
+
+    async def set_permission_mode(self, mode: str) -> None:
+        """Switch the permission mode for the live cc subprocess (runtime, no reconnect)."""
+        assert self.client is not None
+        await self.client.set_permission_mode(mode)
+        log.info("permission mode set", mode=mode)
+
+    async def get_context_usage(self) -> dict:
+        """Return the cc session's context window usage (matches CLI /context)."""
+        assert self.client is not None
+        return await self.client.get_context_usage()
 
     def receive_response(self):
         assert self.client is not None
@@ -79,11 +99,11 @@ class SdkHandle:
             finally:
                 self.client = None
 
-    async def force_reconnect(self, resume_id: str | None) -> None:
+    async def force_reconnect(self, resume_id: str | None, cwd: str | None = None) -> None:
         """Last-resort after a drain timeout: tear down and reconnect with resume."""
         log.warning("force-reconnecting SDK client after drain timeout")
         try:
             await self.disconnect()
         except Exception as e:
             log.warning("disconnect during force-reconnect failed", error=str(e))
-        await self.connect(resume_id=resume_id)
+        await self.connect(resume_id=resume_id, cwd=cwd)

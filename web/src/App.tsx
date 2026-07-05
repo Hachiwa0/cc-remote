@@ -1,31 +1,81 @@
-import { useEffect, useReducer, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
 import { RelayWs } from "./ws";
-import { uuid } from "./util";
 import { reduce, initialState } from "./reducer";
+import { uuid } from "./util";
+import { Icon } from "./icons";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { LoginForm } from "./components/LoginForm";
+import { SessionsSidebar } from "./components/SessionsSidebar";
+import { loadSession, saveSession } from "./cache";
+import type { Turn } from "./reducer";
+import type { Snapshot, QueryImg, QueryFile } from "./protocol";
 
 const SESSION_KEY = "cc_remote_session";
+const THEME_KEY = "cc_remote_theme";
 
 export default function App() {
+  const [theme, setTheme] = useState<string>(() => localStorage.getItem(THEME_KEY) || "light");
   const [authed, setAuthed] = useState<boolean>(() => !!localStorage.getItem(SESSION_KEY));
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [editPrompt, setEditPrompt] = useState<string | null>(null);
   const [state, dispatch] = useReducer(reduce, initialState);
   const wsRef = useRef<RelayWs | null>(null);
-  const [input, setInput] = useState("");
+  const drainingRef = useRef(false);
+  const lastSeqRef = useRef(0);  // highest seq of the locally-cached turns (cache read or live events)
+  const touchStartX = useRef(0);
 
+  // swipe right -> open sidebar, swipe left -> close (mobile)
+  const onTouchStart = (e: TouchEvent) => { touchStartX.current = e.touches[0].clientX; };
+  const onTouchEnd = (e: TouchEvent) => {
+    const dx = e.changedTouches[0].clientX - touchStartX.current;
+    // Open only on swipe-right starting from the left third — so swiping right
+    // to read horizontally-overflowing text in the rest of the pane doesn't
+    // pop the sidebar. Close on swipe-left anywhere.
+    if (dx > 50 && touchStartX.current < window.innerWidth / 3) setSidebarOpen(true);
+    else if (dx < -50) setSidebarOpen(false);
+  };
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+  const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
+
+  // WebSocket lifecycle
   useEffect(() => {
     if (!authed) return;
     const token = localStorage.getItem(SESSION_KEY) || "";
+
+    // First hello -> wrapper sends a snapshot(cc_session_id). Read the IndexedDB
+    // cache for that session: if present, restore turns locally + ask the wrapper
+    // only for the delta (seq > cached lastSeq); else ask for the full buffer.
+    async function handleSnapshot(e: Snapshot) {
+      dispatch({ type: "event", event: e });  // reducer learns cc_session_id + state
+      const sid = e.cc_session_id;
+      if (!sid) { wsRef.current?.sendHello(0); return; }
+      const cached = await loadSession(sid);
+      if (cached && cached.turns.length > 0) {
+        dispatch({ type: "set_turns", turns: cached.turns as Turn[] });
+        lastSeqRef.current = cached.lastSeq;
+        wsRef.current?.sendHello(cached.lastSeq);
+      } else {
+        wsRef.current?.sendHello(0);
+      }
+    }
+
     const ws = new RelayWs(token, {
       onEvent: (msg) => {
+        if (msg.type === "snapshot") { void handleSnapshot(msg); return; }
         dispatch({ type: "event", event: msg });
-        if (msg.type === "wrapper_reconnected") ws.resendHello();
+        if (msg.type === "wrapper_reconnected") { ws.sendHello(null); ws.sendListSessions(); }
       },
-      onConnState: (s, detail) => dispatch({ type: "conn", connState: s, detail }),
+      onConnState: (s, detail) => {
+        dispatch({ type: "conn", connState: s, detail });
+        if (s === "connected") ws.sendListSessions();
+      },
       onAuthFail: () => {
-        // session token invalid/expired — back to login
         localStorage.removeItem(SESSION_KEY);
         setAuthed(false);
       },
@@ -35,33 +85,61 @@ export default function App() {
     return () => {
       ws.stop();
       wsRef.current = null;
+      drainingRef.current = false;
     };
   }, [authed]);
 
+  // interrupt-and-send: when state returns to idle, fire the pending message
+  useEffect(() => {
+    if (state.state === "idle" && state.pendingSend && wsRef.current) {
+      const prompt = state.pendingSend;
+      const msg_id = uuid();
+      wsRef.current.sendQuery(prompt, msg_id);
+      dispatch({ type: "query_sent", prompt, msg_id, ts: Date.now() });
+      dispatch({ type: "clear_pending" });
+    }
+  }, [state.state, state.pendingSend]);
+
+  // queue drain: when idle and queue non-empty, send the head (guard against
+  // re-firing before the wrapper's state:running event arrives)
+  useEffect(() => {
+    if (state.state === "idle" && state.queue.length > 0 && !drainingRef.current && wsRef.current) {
+      drainingRef.current = true;
+      const next = state.queue[0];
+      const msg_id = uuid();
+      wsRef.current.sendQuery(next, msg_id);
+      dispatch({ type: "query_sent", prompt: next, msg_id, ts: Date.now() });
+      dispatch({ type: "dequeue_at", i: 0 });
+    }
+    if (state.state !== "idle") drainingRef.current = false;
+  }, [state.state, state.queue]);
+
+  // Persist turns to IndexedDB (coalesced) so reopening restores instantly.
+  useEffect(() => {
+    const sid = state.ccSessionId;
+    if (!sid || state.turns.length === 0) return;
+    saveSession(sid, state.turns, Math.max(wsRef.current?.lastSeqValue || 0, lastSeqRef.current));
+  }, [state.turns, state.ccSessionId]);
+
   if (!authed) {
-    return (
-      <LoginForm
-        onLogin={(token) => {
-          localStorage.setItem(SESSION_KEY, token);
-          setAuthed(true);
-        }}
-      />
-    );
+    return <LoginForm onLogin={(t) => { localStorage.setItem(SESSION_KEY, t); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
   }
 
-  const busy = state.state === "running" || state.state === "interrupting";
-  const canSend = state.connState === "connected" && !busy;
-
-  const send = () => {
-    const prompt = input.trim();
-    if (!prompt || !wsRef.current) return;
+  const sendQuery = (prompt: string, images?: QueryImg[], files?: QueryFile[]) => {
+    if (!wsRef.current) return;
     const msg_id = uuid();
-    wsRef.current.sendQuery(prompt, msg_id);
-    dispatch({ type: "query_sent", prompt, msg_id });
-    setInput("");
+    wsRef.current.sendQuery(prompt, msg_id, images, files);
+    dispatch({ type: "query_sent", prompt, msg_id, images, files, ts: Date.now() });
   };
-  const stop = () => wsRef.current?.sendInterrupt();
-
+  const interrupt = () => wsRef.current?.sendInterrupt();
+  const setModel = (model: string) => {
+    wsRef.current?.sendSetModel(model);
+    dispatch({ type: "set_model", model });
+  };
+  const setPerm = (perm: string) => {
+    wsRef.current?.sendSetPerm(perm);
+    dispatch({ type: "set_perm", perm });
+  };
   const logout = () => {
     localStorage.removeItem(SESSION_KEY);
     wsRef.current?.stop();
@@ -69,23 +147,90 @@ export default function App() {
   };
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <span className="title">cc-remote</span>
-        <span className={`state state-${state.state}`}>{state.state}</span>
-        <button className="logout" onClick={logout}>退出</button>
-      </header>
-      <ReconnectBanner banner={state.banner} replaying={state.replaying} truncated={state.truncated} />
-      <ChatView turns={state.turns} />
-      <Composer
-        input={input}
-        setInput={setInput}
-        onSend={send}
-        onStop={stop}
-        busy={busy}
-        canSend={canSend}
-        connState={state.connState}
+    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+      <SessionsSidebar
+        open={sidebarOpen}
+        sessions={state.sessions}
+        activeSessionId={state.activeSessionId}
+        onSelect={(id) => { wsRef.current?.sendSwitchSession(id); setSidebarOpen(false); }}
+        onNew={() => { wsRef.current?.sendNewSession(); setSidebarOpen(false); }}
+        onClose={() => setSidebarOpen(false)}
+        onRename={(id, title) => wsRef.current?.sendRenameSession(id, title)}
+        onArchive={(id, archived) => wsRef.current?.sendArchiveSession(id, archived)}
       />
+      <section className="pane">
+        <header className="c-head">
+          <div className="titlewrap">
+            <div className="ttl">
+              <span className="brand" onClick={() => setSidebarOpen(true)} style={{ cursor: "pointer" }}>
+                <span className="dot" />
+                <span className="name serif"><b>cc</b><span>·remote</span></span>
+              </span>
+            </div>
+            <div className="sub">{state.ccSessionId ? `session ${state.ccSessionId.slice(0, 8)}` : "connected"}</div>
+          </div>
+          <span className={`hstat ${state.state}`}><span className="sd" />{state.state}</span>
+          <button className="iconbtn" onClick={toggleTheme} aria-label="切换主题">
+            <Icon name={theme === "dark" ? "sun" : "moon"} />
+          </button>
+          <button className="iconbtn" onClick={logout} aria-label="退出"><Icon name="dots" /></button>
+        </header>
+
+        <ReconnectBanner banner={state.banner} replaying={state.replaying} truncated={state.truncated} />
+
+        <ChatView turns={state.turns} onEdit={(prompt) => setEditPrompt(prompt)} />
+
+        <Composer
+          state={state.state}
+          connState={state.connState}
+          wrapperOnline={state.wrapperOnline}
+          sendMode={state.sendMode}
+          setSendMode={(m) => dispatch({ type: "set_send_mode", mode: m })}
+          queue={state.queue}
+          model={state.model}
+          perm={state.perm}
+          editPrompt={editPrompt}
+          onEditConsumed={() => setEditPrompt(null)}
+          onSendQuery={sendQuery}
+          onInterrupt={interrupt}
+          onEnqueue={(prompt) => dispatch({ type: "enqueue", prompt })}
+          onSetPending={(prompt) => dispatch({ type: "set_pending", prompt })}
+          onDequeue={(i) => dispatch({ type: "dequeue_at", i })}
+          onSetModel={setModel}
+          onSetPerm={setPerm}
+          onClear={() => wsRef.current?.sendNewSession()}
+          onContext={() => wsRef.current?.sendGetContext()}
+        />
+        {state.contextReport && (
+          <>
+            <div className="scrim show" onClick={() => dispatch({ type: "clear_context" })} />
+            <div className="sheet show" role="dialog" aria-label="上下文用量">
+              <div className="sheet-grip" />
+              <div className="sheet-title">上下文用量 · {state.contextReport.model || ""}</div>
+              <div className="sheet-scroll">
+                <div className="ctx-overview">
+                  <div className="ctx-pct">{state.contextReport.percentage.toFixed(1)}%</div>
+                  <div className="ctx-bar"><div className="ctx-bar-fill" style={{ width: `${Math.min(state.contextReport.percentage, 100)}%` }} /></div>
+                  <div className="ctx-numbers">{state.contextReport.total_tokens.toLocaleString()} / {state.contextReport.max_tokens.toLocaleString()} tokens</div>
+                  {state.contextReport.is_auto_compact_enabled && <div className="ctx-auto">autocompact 已启用</div>}
+                </div>
+                <div className="ctx-cats">
+                  {state.contextReport.categories.map((c, i) => (
+                    <div className="ctx-cat" key={i}>
+                      <span className="ctx-cat-dot" style={{ background: c.color }} />
+                      <span className="ctx-cat-name">{c.name}</span>
+                      <span className="ctx-cat-tokens">{c.tokens.toLocaleString()}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="s-foot">
+                <button className="newbtn" onClick={() => dispatch({ type: "clear_context" })}>关闭</button>
+              </div>
+            </div>
+          </>
+        )}
+      </section>
     </div>
   );
 }

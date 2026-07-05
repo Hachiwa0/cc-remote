@@ -1,6 +1,13 @@
 import { useState } from "react";
+import { Icon } from "../icons";
 
-export function LoginForm({ onLogin }: { onLogin: (token: string) => void }) {
+export function LoginForm({
+  onLogin, theme, onToggleTheme,
+}: {
+  onLogin: (token: string) => void;
+  theme: string;
+  onToggleTheme: () => void;
+}) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -28,21 +35,32 @@ export function LoginForm({ onLogin }: { onLogin: (token: string) => void }) {
 
   return (
     <div className="login">
+      <button className="iconbtn tt" onClick={onToggleTheme} aria-label="切换主题">
+        <Icon name={theme === "dark" ? "sun" : "moon"} />
+      </button>
       <div className="login-card">
-        <h2>cc-remote</h2>
-        <input
-          type="password"
-          placeholder="密码"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-          disabled={loading}
-          autoFocus
-        />
+        <div className="login-brand">
+          <span className="dot" />
+          <span className="name"><b>cc</b><span>·remote</span></span>
+        </div>
+        <p className="login-tag serif" style={{ fontSize: 15 }}>你的 Claude Code，随身遥控</p>
+        <div className="login-field">
+          <Icon name="lock" size={18} />
+          <input
+            type="password"
+            placeholder="访问密码"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+            disabled={loading}
+            autoFocus
+          />
+        </div>
         {error && <div className="login-err">{error}</div>}
-        <button className="btn send login-btn" onClick={submit} disabled={loading || !password}>
-          {loading ? "登录中…" : "登录"}
+        <button className="login-btn" onClick={submit} disabled={loading || !password}>
+          {loading ? "登录中…" : "进入"}
         </button>
+        <div className="login-foot">relay · 127.0.0.1:19191 → GLM</div>
       </div>
     </div>
   );

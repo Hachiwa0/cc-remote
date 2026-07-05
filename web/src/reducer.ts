@@ -6,7 +6,8 @@
 // wrapper's emit-lock guarantees replay batches arrive contiguously before live
 // events, so no client-side reordering is needed.
 import type { ConnState } from "./ws";
-import type { ServerEvent, State } from "./protocol";
+import type { ServerEvent, SessionInfo, State, ContextReport, QueryImg, QueryFile } from "./protocol";
+import { matchModelId } from "./data";
 
 export interface TextBlock {
   kind: "text";
@@ -32,6 +33,9 @@ export interface Turn {
   done: boolean;
   interrupted?: boolean;
   error?: string;
+  images?: QueryImg[]; // attached images on the user's message (originating client only)
+  files?: QueryFile[]; // attached files (written to /tmp by wrapper, prompt gets @path)
+  ts?: number; // send timestamp (ms) for the user-bubble time readout
 }
 
 export interface AppState {
@@ -42,12 +46,32 @@ export interface AppState {
   replaying: boolean;
   truncated: boolean; // history may be incomplete
   banner?: string; // status line (machine offline, catching up, ...)
+  // composer / client-side turn scheduling
+  queue: string[]; // queued messages (drain on turn_end)
+  pendingSend: string | null; // interrupt-and-send: send once state returns to idle
+  sendMode: "interrupt" | "queue";
+  wrapperOnline: boolean; // wrapper_disconnected -> false, wrapper_reconnected -> true
+  model: string; // selected model id (UI; wired to backend in Phase 2)
+  perm: string; // permission mode id (UI; Phase 2)
+  sessions: SessionInfo[]; // sessions sidebar rows
+  activeSessionId: string | null;
+  contextReport: ContextReport | null; // /context result modal
 }
 
 export type Action =
   | { type: "event"; event: ServerEvent }
-  | { type: "query_sent"; prompt: string; msg_id: string }
-  | { type: "conn"; connState: ConnState; detail?: string };
+  | { type: "query_sent"; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[]; ts: number }
+  | { type: "conn"; connState: ConnState; detail?: string }
+  | { type: "enqueue"; prompt: string }
+  | { type: "dequeue_at"; i: number }
+  | { type: "set_send_mode"; mode: "interrupt" | "queue" }
+  | { type: "set_pending"; prompt: string }
+  | { type: "clear_pending" }
+  | { type: "set_model"; model: string }
+  | { type: "set_perm"; perm: string }
+  | { type: "set_context"; report: ContextReport }
+  | { type: "clear_context" }
+  | { type: "set_turns"; turns: Turn[] };
 
 export const initialState: AppState = {
   turns: [],
@@ -55,6 +79,15 @@ export const initialState: AppState = {
   connState: "connecting",
   replaying: false,
   truncated: false,
+  queue: [],
+  pendingSend: null,
+  sendMode: "interrupt",
+  wrapperOnline: true,
+  model: "claude-mythos-5",
+  perm: "bypassPermissions",
+  sessions: [],
+  activeSessionId: null,
+  contextReport: null,
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
@@ -71,9 +104,29 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, connState: action.connState, banner };
     }
     case "query_sent": {
-      const turn: Turn = { id: action.msg_id, prompt: action.prompt, blocks: [], done: false };
+      const turn: Turn = { id: action.msg_id, prompt: action.prompt, blocks: [], done: false, images: action.images, files: action.files, ts: action.ts };
       return { ...state, turns: [...state.turns, turn] };
     }
+    case "enqueue":
+      return { ...state, queue: [...state.queue, action.prompt] };
+    case "dequeue_at":
+      return { ...state, queue: state.queue.filter((_, i) => i !== action.i) };
+    case "set_send_mode":
+      return { ...state, sendMode: action.mode };
+    case "set_pending":
+      return { ...state, pendingSend: action.prompt };
+    case "clear_pending":
+      return { ...state, pendingSend: null };
+    case "set_model":
+      return { ...state, model: action.model };
+    case "set_perm":
+      return { ...state, perm: action.perm };
+    case "set_turns":
+      return { ...state, turns: action.turns };
+    case "set_context":
+      return { ...state, contextReport: action.report };
+    case "clear_context":
+      return { ...state, contextReport: null };
     case "event": {
       return reduceEvent(state, action.event);
     }
@@ -82,33 +135,46 @@ export function reduce(state: AppState, action: Action): AppState {
 
 function reduceEvent(state: AppState, e: ServerEvent): AppState {
   switch (e.type) {
-    case "snapshot": {
-      // For a fresh connect (no turns yet) with prior context, show the tail as
-      // a faded text turn. On reconnect-with-gap, replay follows and rebuilds
-      // properly, so ignore the tail there.
-      let turns = state.turns;
-      if (turns.length === 0 && e.tail_text) {
-        turns = [{
-          id: "snapshot",
-          prompt: "",
-          blocks: [{ kind: "text", message_id: "snapshot", text: e.tail_text, done: true }],
-          done: true,
-        }];
-      }
-      return { ...state, turns, state: e.state, ccSessionId: e.cc_session_id ?? undefined };
-    }
+    case "snapshot":
+      // First hello: just learn cc_session_id + state. The app reads its
+      // IndexedDB cache and re-hellos with last_seq to fetch the delta.
+      return { ...state, state: e.state, ccSessionId: e.cc_session_id ?? undefined };
     case "state":
       return { ...state, state: e.state };
+    case "model":
+      return { ...state, model: matchModelId(e.model) };
+    case "perm":
+      return { ...state, perm: e.mode };
+    case "context_report":
+      return { ...state, contextReport: e };
+    case "session_list":
+      return { ...state, sessions: e.sessions };
+    case "session_switched":
+      // new active session: clear turns, reset turn scheduling, drop queue
+      return {
+        ...state,
+        turns: [],
+        state: "idle",
+        replaying: false,
+        truncated: false,
+        banner: undefined,
+        queue: [],
+        pendingSend: null,
+        activeSessionId: e.session_id || state.activeSessionId,
+      };
     case "replay_start":
-      return { ...state, replaying: true, truncated: e.truncated };
+      // truncated = the buffer evicted events the client's last_seq wanted, so
+      // rebuild from the buffer (drop local turns). Otherwise incremental catch-up:
+      // merge onto existing (possibly cached-from-IndexedDB) turns.
+      return { ...state, replaying: true, truncated: e.truncated, turns: e.truncated ? [] : state.turns };
     case "replay_end":
       return { ...state, replaying: false, truncated: state.truncated || e.truncated };
     case "wrapper_disconnected":
-      return { ...state, banner: "machine offline — waiting for reconnect" };
+      return { ...state, wrapperOnline: false, banner: "machine offline — waiting for reconnect" };
     case "wrapper_reconnected":
       // wrapper came back; its buffer survived, but we may have missed events
       // during the gap. The App re-hellos on this event to trigger replay.
-      return { ...state, banner: undefined, state: e.state, ccSessionId: e.cc_session_id ?? undefined };
+      return { ...state, wrapperOnline: true, banner: undefined, state: e.state, ccSessionId: e.cc_session_id ?? undefined };
     case "error": {
       const turns = cloneTurns(state.turns);
       const t = turns[turns.length - 1];
