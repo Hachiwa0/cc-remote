@@ -304,9 +304,28 @@ class DiffReport(_Base):
     diff: str
 
 
+class AskUser(_Base):
+    """wrapper -> client: the agent called the `ask_user` MCP tool and is
+    blocked awaiting the user's choice. The client renders a question card;
+    the user's pick is returned via AnswerQuestion. ask_id correlates the two.
+    The wrapper's MCP handler awaits a Future keyed by ask_id."""
+    type: Literal["ask_user"] = "ask_user"
+    ask_id: str
+    question: str
+    options: list[dict[str, str]] = []  # each: {label, ds?}
+
+
+class AnswerQuestion(_Base):
+    """client -> wrapper: the user's answer to an AskUser prompt. answer is the
+    selected option's label (or free text if the agent allowed it)."""
+    type: Literal["answer_question"] = "answer_question"
+    ask_id: str
+    answer: str
+
+
 AnyMessage = Union[
     Hello, Query, Interrupt, SetModel, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, Ping, Pong,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport, DiffReport,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport, DiffReport, AskUser, AnswerQuestion,
     SessionList, SessionSwitched, RenameSession, ArchiveSession,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
@@ -318,7 +337,7 @@ AnyMessage = Union[
 DOWNSTREAM_TYPES = frozenset({
     "user_msg", "state", "model", "perm",
     "assistant_msg_start", "delta", "tool_use", "tool_result",
-    "assistant_msg_end", "turn_end", "error",
+    "assistant_msg_end", "turn_end", "error", "ask_user",
 })
 
 _TYPE_MAP: dict[str, type[BaseModel]] = {
@@ -344,6 +363,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "perm": Perm,
     "context_report": ContextReport,
     "diff_report": DiffReport,
+    "ask_user": AskUser,
+    "answer_question": AnswerQuestion,
     "session_list": SessionList,
     "session_switched": SessionSwitched,
     "user_msg": UserMsg,

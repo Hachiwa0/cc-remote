@@ -135,12 +135,6 @@ body{
 .thinking span:nth-child(3){ animation-delay:.36s; }
 @keyframes think{ 0%,80%,100%{ opacity:.25; transform:translateY(0); } 40%{ opacity:1; transform:translateY(-3px); } }
 
-/* persistent working spinner (Claude-Code-style 菊花), pinned bottom-left
-   of the pane, shown the whole turn so it's obvious Claude is busy. */
-.spinner{ position:absolute; left:14px; bottom:84px; z-index:30; width:22px; height:22px;
-  border-radius:50%; border:2.5px solid var(--border); border-top-color:var(--accent);
-  animation:spin .7s linear infinite; pointer-events:none; }
-
 /* TOOL CARD */
 .tool{ border:1px solid var(--border); border-radius:13px; background:var(--surface);
   margin:10px 0; overflow:hidden; box-shadow:var(--shadow-sm); }
@@ -293,9 +287,14 @@ body{
 .sendbtn:disabled{ background:var(--border-strong); color:var(--faint); cursor:default; }
 .sendbtn svg{ width:19px; height:19px; }
 .sendbtn.interrupt{ background:var(--danger); }
-.hint{ text-align:center; font-size:11px; color:var(--faint); padding:7px 0 1px; }
+.hint{ display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:11px; color:var(--faint); padding:7px 0 1px; }
 .hint kbd{ font-family:var(--mono); font-size:10px; background:var(--raised);
   border:1px solid var(--border); border-radius:4px; padding:0 4px; }
+.hint-mode{ white-space:nowrap; }
+.hint-mode.plan{ color:var(--accent-ink); }
+.hint-mode.danger{ color:var(--danger); }
+.hint-mode.busy{ color:var(--warn); }
+.hint-kbds{ white-space:nowrap; }
 
 /* COMMAND SHEET */
 .scrim{ position:fixed; inset:0; z-index:40; background:rgba(30,22,12,.34);
@@ -324,6 +323,16 @@ body{
 .sheet-search input{ border:none; background:none; outline:none; color:var(--text); width:100%; font-size:16px; }
 .sheet-scroll{ overflow-y:auto; padding:6px 10px 14px; }
 .sheet-title{ font-size:12.5px; font-weight:600; letter-spacing:.02em; color:var(--dim); padding:8px 20px 2px; }
+.sheet-title .qa-ic{ display:inline-grid; place-items:center; width:18px; height:18px; border-radius:6px;
+  background:var(--accent); color:#fff; margin-right:7px; vertical-align:-3px; }
+.sheet-title .qa-ic svg{ width:13px; height:13px; }
+.qa-question{ font-size:14.5px; font-weight:600; color:var(--text); line-height:1.5; padding:6px 16px 2px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.qa-options{ display:flex; flex-direction:column; gap:8px; padding:10px 16px 16px; }
+.qa-opt{ display:flex; flex-direction:column; gap:3px; text-align:left; padding:11px 13px; border-radius:11px;
+  background:var(--surface); border:1px solid var(--border); color:var(--text); transition:.14s; }
+.qa-opt:hover{ background:var(--accent-weak); border-color:var(--accent-line); }
+.qa-opt-label{ font-size:14px; font-weight:600; }
+.qa-opt-ds{ font-size:12.5px; color:var(--dim); }
 .cmd-group{ font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
   color:var(--faint); padding:12px 12px 5px; }
 .cmd{ display:flex; align-items:center; gap:12px; width:100%; text-align:left;

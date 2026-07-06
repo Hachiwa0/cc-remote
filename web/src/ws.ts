@@ -86,6 +86,10 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "get_diff", file, theme, ts: nowTs() });
   }
 
+  sendAnswerQuestion(askId: string, answer: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs() });
+  }
+
   sendListSessions(): void {
     this.send({ v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() });
   }

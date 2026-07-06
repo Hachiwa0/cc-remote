@@ -33,12 +33,13 @@ from claude_agent_sdk.types import ResultMessage
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, Hello, Model, Perm, ContextReport, DiffReport, Pong, StateEvent, State, UserMsg, is_downstream,
+    Error, Hello, Model, Perm, ContextReport, DiffReport, AskUser, Pong, StateEvent, State, UserMsg, is_downstream,
     SessionInfo, SessionList, SessionSwitched,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
+from cc_remote.wrapper.ask import make_ask_server
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.session import load_session_id, save_session_id
 from cc_remote.wrapper.stream import (
@@ -69,6 +70,11 @@ class WrapperMachine:
         self._emit_lock = asyncio.Lock()
         self._announced_model: Optional[str] = None
         self._announced_perm: Optional[str] = None
+        # ask_user MCP tool: ask_id -> Future the handler awaits until the
+        # client returns an AnswerQuestion. The in-process MCP server is wired
+        # into ClaudeAgentOptions.mcp_servers so the agent can call `ask_user`.
+        self._pending_asks: dict[str, asyncio.Future] = {}
+        self.sdk.ask_server = make_ask_server(self._on_ask)
 
     # ---- lifecycle ----
 
@@ -160,6 +166,8 @@ class WrapperMachine:
             await self._handle_get_context(cmd)
         elif t == "get_diff":
             await self._handle_get_diff(cmd)
+        elif t == "answer_question":
+            await self._handle_answer_question(cmd)
         elif t == "list_sessions":
             await self._handle_list_sessions(cmd)
         elif t == "switch_session":
@@ -266,6 +274,40 @@ class WrapperMachine:
         except Exception as e:
             log.exception("get_diff failed", error=str(e))
             await self._emit(Error(code=ERR_INTERNAL, message=f"get_diff failed: {e}"))
+
+    # ---- ask_user MCP tool (agent asks the user a multiple-choice question) ----
+
+    async def _on_ask(self, question: str, options: list[dict[str, str]]) -> str:
+        """Called by the in-process MCP server when the agent invokes `ask_user`.
+        Emits an AskUser event to the client and blocks (awaits a Future) until
+        the client returns AnswerQuestion. Runs in the SDK's reader task while
+        the turn loop is blocked on receive_response() — the wrapper's command
+        loop is a separate task, so it can still deliver the answer."""
+        ask_id = f"ask-{self._next_seq()}"
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_asks[ask_id] = fut
+        await self._emit(AskUser(ask_id=ask_id, question=question, options=options))
+        log.info("ask_user emitted", ask_id=ask_id, options=len(options))
+        try:
+            # 30 min ceiling so a forgotten prompt doesn't wedge the turn forever.
+            return await asyncio.wait_for(fut, timeout=30 * 60)
+        except asyncio.TimeoutError:
+            log.warning("ask_user timed out", ask_id=ask_id)
+            return "(用户未回答，已超时)"
+        finally:
+            self._pending_asks.pop(ask_id, None)
+
+    async def _handle_answer_question(self, cmd) -> None:
+        fut = self._pending_asks.get(cmd.ask_id)
+        if fut is None:
+            log.warning("answer for unknown ask_id", ask_id=cmd.ask_id)
+            return
+        if not fut.done():
+            fut.set_result(cmd.answer)
+            log.info("ask_user answered", ask_id=cmd.ask_id)
+        else:
+            log.warning("answer for already-done ask_id", ask_id=cmd.ask_id)
 
     async def _git_diff(self, file: str) -> str:
         """Raw `git diff` (vs HEAD) text. Empty file => all files (with

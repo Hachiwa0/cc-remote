@@ -41,13 +41,13 @@ export function matchModelId(m: string): string {
   return hit ? hit.id : m;
 }
 
-export interface Perm { id: string; name: string; ds: string; ic: string; danger?: boolean }
+export interface Perm { id: string; name: string; short: string; ds: string; ic: string; danger?: boolean }
 export const PERMS: Perm[] = [
-  { id: "default", name: "默认", ds: "每次动作前询问", ic: "shield" },
-  { id: "acceptEdits", name: "自动接受编辑", ds: "文件编辑免询问，命令仍询问", ic: "edit" },
-  { id: "plan", name: "Plan 模式", ds: "只读 · 先出方案再执行", ic: "plan" },
-  { id: "auto", name: "自动", ds: "自动执行常规操作", ic: "run" },
-  { id: "bypassPermissions", name: "跳过所有权限", ds: "危险 · 不询问直接执行 · --dangerously-skip-permissions", ic: "bolt", danger: true },
+  { id: "default", name: "默认", short: "询问", ds: "每次动作前询问", ic: "shield" },
+  { id: "acceptEdits", name: "自动接受编辑", short: "编辑", ds: "文件编辑免询问，命令仍询问", ic: "edit" },
+  { id: "plan", name: "Plan 模式", short: "Plan", ds: "只读 · 先出方案再执行", ic: "plan" },
+  { id: "auto", name: "自动", short: "自动", ds: "自动执行常规操作", ic: "run" },
+  { id: "bypassPermissions", name: "跳过所有权限", short: "跳过", ds: "危险 · 不询问直接执行 · --dangerously-skip-permissions", ic: "bolt", danger: true },
 ];
 
 export function isCmd(c: Command): c is Cmd {

@@ -62,6 +62,7 @@ export interface AppState {
   activeSessionId: string | null;
   contextReport: ContextReport | null; // /context result modal
   artifact: Artifact | null; // right-side diff/markdown panel for a changed file
+  pendingQuestion: { ask_id: string; question: string; options: { label: string; ds?: string }[] } | null;
 }
 
 export type Action =
@@ -79,7 +80,8 @@ export type Action =
   | { type: "clear_context" }
   | { type: "set_turns"; turns: Turn[] }
   | { type: "set_artifact"; artifact: Artifact }
-  | { type: "clear_artifact" };
+  | { type: "clear_artifact" }
+  | { type: "answer_question" }; // dismiss the question card (answer sent)
 
 export const initialState: AppState = {
   turns: [],
@@ -97,6 +99,7 @@ export const initialState: AppState = {
   activeSessionId: null,
   contextReport: null,
   artifact: null,
+  pendingQuestion: null,
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
@@ -113,6 +116,9 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, connState: action.connState, banner };
     }
     case "query_sent": {
+      // Originating-client turn creation. Dedup by msg_id: a late user_msg
+      // echo or a re-render can fire this twice; don't create a duplicate turn.
+      if (state.turns.some((t) => t.id === action.msg_id)) return state;
       const turn: Turn = { id: action.msg_id, prompt: action.prompt, blocks: [], done: false, images: action.images, files: action.files, ts: action.ts };
       return { ...state, turns: [...state.turns, turn] };
     }
@@ -140,6 +146,8 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, artifact: action.artifact };
     case "clear_artifact":
       return { ...state, artifact: null };
+    case "answer_question":
+      return { ...state, pendingQuestion: null };
     case "event": {
       return reduceEvent(state, action.event);
     }
@@ -160,6 +168,8 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return { ...state, perm: e.mode };
     case "context_report":
       return { ...state, contextReport: e };
+    case "ask_user":
+      return { ...state, pendingQuestion: { ask_id: e.ask_id, question: e.question, options: e.options } };
     case "diff_report":
       return { ...state, artifact: { file: e.file, kind: "gitdiff", sections: parseGitDiff(e.diff) } };
     case "session_list":
@@ -204,9 +214,14 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
     }
     case "user_msg": {
       // Originating client already created the turn on send (dedup by msg_id);
-      // other clients create it here so they see the prompt too.
+      // other clients create it here so they see the prompt too. If a race left
+      // the turn with an empty prompt (assistant_msg_start beat query_sent),
+      // fill it — the wrapper always echoes the prompt here.
       const turns = cloneTurns(state.turns);
-      if (!turns.some((t) => t.id === e.msg_id)) {
+      const existing = turns.find((t) => t.id === e.msg_id);
+      if (existing) {
+        if (!existing.prompt && e.prompt) existing.prompt = e.prompt;
+      } else {
         turns.push({ id: e.msg_id, prompt: e.prompt, blocks: [], done: false });
       }
       return { ...state, turns };

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import type { State, QueryImg, QueryFile } from "../protocol";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
-import { MODELS } from "../data";
+import { MODELS, PERMS } from "../data";
 import { CommandSheet } from "./CommandSheet";
 
 interface Props {
@@ -93,7 +93,13 @@ export function Composer(p: Props) {
 
   const send = () => {
     if (offline) return;
-    const prompt = input.trim();
+    let prompt = input.trim();
+    // "/plan <task>" or "/normal <task>" typed manually: switch cc's permission
+    // mode (plan / default) and send just the task — don't forward "/plan" as a
+    // prompt (cc has no /plan slash command, so it would reject it and drop the
+    // task). The palette path already calls setPerm directly and clears input.
+    if (prompt.startsWith("/plan ")) { p.onSetPerm("plan"); prompt = prompt.slice(6).trim(); }
+    else if (prompt.startsWith("/normal ")) { p.onSetPerm("bypassPermissions"); prompt = prompt.slice(8).trim(); }
     if (busy) {
       // empty input while busy => stop (interrupt); non-empty => interrupt+send or enqueue
       if (!prompt && !hasAttachments) { p.onInterrupt(); return; }
@@ -114,6 +120,10 @@ export function Composer(p: Props) {
   const sendClass = "sendbtn" + ((stopping || (busy && p.sendMode === "interrupt" && (hasText || hasAttachments))) ? " interrupt" : "");
   const disabled = offline || (!busy && !hasText && !hasAttachments);
   const model = MODELS.find((m) => m.id === p.model) || MODELS[0];
+  const perm = PERMS.find((x) => x.id === p.perm) || PERMS[0];
+  const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
+  const modeCls = perm.id === "plan" ? " plan" : perm.danger ? " danger" : "";
+  const hintBusy = p.state !== "idle";
 
   return (
     <div className="composer">
@@ -182,7 +192,12 @@ export function Composer(p: Props) {
             <Icon name={sendIcon} size={19} />
           </button>
         </div>
-        <div className="hint"><kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · <kbd>/</kbd> 命令</div>
+        <div className="hint">
+          <span className={"hint-mode" + modeCls + (hintBusy ? " busy" : "")}>
+            {perm.short}模式 · {stateZh[p.state]}
+          </span>
+          <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · <kbd>/</kbd> 命令</span>
+        </div>
       </div>
 
       <CommandSheet
@@ -193,6 +208,8 @@ export function Composer(p: Props) {
           if (slash === "clear") { p.onClear(); setInput(""); setSheetKind(null); return; }
           if (slash === "context") { p.onContext(); setInput(""); setSheetKind(null); return; }
           if (slash === "permissions") { setInput(""); setSheetKind("perms"); return; }
+          if (slash === "plan") { p.onSetPerm("plan"); setInput(""); setSheetKind(null); setTimeout(() => taRef.current?.focus(), 0); return; }
+          if (slash === "normal") { p.onSetPerm("bypassPermissions"); setInput(""); setSheetKind(null); setTimeout(() => taRef.current?.focus(), 0); return; }
           setInput("/" + slash + " ");
           setSheetKind(null);
           setTimeout(() => taRef.current?.focus(), 0);

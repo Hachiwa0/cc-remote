@@ -11,6 +11,7 @@ from __future__ import annotations
 import shutil
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, __version__ as SDK_VERSION
+from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
@@ -21,8 +22,9 @@ REQUIRED_SDK = (0, 2)  # 0.2.x; the interrupt/drain contract is version-sensitiv
 
 
 class SdkHandle:
-    def __init__(self, cfg: WrapperConfig):
+    def __init__(self, cfg: WrapperConfig, ask_server: Server | None = None):
         self.cfg = cfg
+        self.ask_server = ask_server  # in-process MCP server exposing ask_user
         self.client: ClaudeSDKClient | None = None
 
     @staticmethod
@@ -48,6 +50,21 @@ class SdkHandle:
             resume=resume_id or None,
             stderr=self._on_stderr,               # surface cc subprocess errors
             # setting_sources left None -> load ~/.claude/settings.json (model link, model id)
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": (
+                    "You have an `ask_user` MCP tool (server: cc-remote-ask). When a request is "
+                    "ambiguous or you need the user to choose between approaches — especially in "
+                    "plan mode — call `ask_user` with a clear question and 2-5 concrete options "
+                    "rather than guessing or asking in plain text. The call blocks until the user "
+                    "answers; their selection is returned as the tool result."
+                ),
+            },
+            mcp_servers=(
+                {"cc-remote-ask": {"type": "sdk", "name": "cc-remote-ask", "instance": self.ask_server}}
+                if self.ask_server is not None else {}
+            ),
         )
 
     @staticmethod

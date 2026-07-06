@@ -67,6 +67,9 @@ export interface Perm extends Base { type: "perm"; mode: string }
 export interface GetContext extends Base { type: "get_context" }
 export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: string }
 export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string }
+export interface AskOption { label: string; ds?: string }
+export interface AskUser extends Base { type: "ask_user"; ask_id: string; question: string; options: AskOption[] }
+export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }
 export interface ContextCategory { name: string; tokens: number; color: string; isDeferred?: boolean }
 export interface ContextReport extends Base {
   type: "context_report";
@@ -80,6 +83,7 @@ export interface ContextReport extends Base {
 
 export type ServerEvent =
   | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Perm | ContextReport | DiffReport
+  | AskUser
   | SessionList | SessionSwitched
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;

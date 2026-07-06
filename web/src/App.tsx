@@ -9,6 +9,7 @@ import { ReconnectBanner } from "./components/ReconnectBanner";
 import { LoginForm } from "./components/LoginForm";
 import { SessionsSidebar } from "./components/SessionsSidebar";
 import { ArtifactPanel } from "./components/ArtifactPanel";
+import { QuestionSheet } from "./components/QuestionSheet";
 import { loadSession, saveSession } from "./cache";
 import type { Turn } from "./reducer";
 import type { Snapshot, QueryImg, QueryFile } from "./protocol";
@@ -231,7 +232,6 @@ export default function App() {
           onClear={() => wsRef.current?.sendNewSession()}
           onContext={() => wsRef.current?.sendGetContext()}
         />
-        {state.state !== "idle" && <div className="spinner" aria-hidden="true" />}
         {state.contextReport && (
           <>
             <div className="scrim show" onClick={() => dispatch({ type: "clear_context" })} />
@@ -264,6 +264,16 @@ export default function App() {
       </section>
       {state.artifact && (
         <ArtifactPanel artifact={state.artifact} onClose={() => dispatch({ type: "clear_artifact" })} />
+      )}
+      {state.pendingQuestion && (
+        <QuestionSheet
+          question={state.pendingQuestion.question}
+          options={state.pendingQuestion.options}
+          onAnswer={(answer) => {
+            wsRef.current?.sendAnswerQuestion(state.pendingQuestion!.ask_id, answer);
+            dispatch({ type: "answer_question" });
+          }}
+        />
       )}
     </div>
   );
