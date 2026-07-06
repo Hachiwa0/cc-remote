@@ -10,6 +10,11 @@ const DB_NAME = "cc_remote_cache";
 const STORE = "sessions";
 const SCHEMA = 1;
 
+// Bump when the cached turn shape changes in a way old entries can't be
+// trusted (e.g. a past bug left tool-only turns without text). Old entries are
+// ignored -> client falls back to a full buffer replay (text + tools restored).
+const CACHE_VER = 2;
+
 export interface CachedSession {
   turns: unknown[];
   lastSeq: number;
@@ -38,7 +43,11 @@ export async function loadSession(sessionId: string): Promise<CachedSession | nu
     return await new Promise((resolve) => {
       const tx = d.transaction(STORE, "readonly");
       const req = tx.objectStore(STORE).get(sessionId);
-      req.onsuccess = () => resolve((req.result as CachedSession) || null);
+      req.onsuccess = () => {
+        const r = req.result as (CachedSession & { v?: number }) | undefined;
+        // Ignore stale caches from before the current shape (v must match).
+        resolve(r && r.v === CACHE_VER ? r : null);
+      };
       req.onerror = () => resolve(null);
     });
   } catch {
@@ -68,7 +77,7 @@ async function flush(): Promise<void> {
     await new Promise<void>((resolve) => {
       const tx = d.transaction(STORE, "readwrite");
       tx.objectStore(STORE).put(
-        { turns: job.turns, lastSeq: job.lastSeq, savedAt: Date.now() }, job.sid);
+        { v: CACHE_VER, turns: job.turns, lastSeq: job.lastSeq, savedAt: Date.now() }, job.sid);
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     });

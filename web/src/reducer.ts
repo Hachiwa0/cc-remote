@@ -6,7 +6,7 @@
 // wrapper's emit-lock guarantees replay batches arrive contiguously before live
 // events, so no client-side reordering is needed.
 import type { ConnState } from "./ws";
-import type { ServerEvent, SessionInfo, State, ContextReport, QueryImg, QueryFile } from "./protocol";
+import type { ServerEvent, SessionInfo, State, ContextReport, QueryImg, QueryFile, DirEntry } from "./protocol";
 import type { DiffLine, GitDiffSection } from "./diff";
 import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
@@ -63,6 +63,16 @@ export interface AppState {
   contextReport: ContextReport | null; // /context result modal
   artifact: Artifact | null; // right-side diff/markdown panel for a changed file
   pendingQuestion: { ask_id: string; question: string; options: { label: string; ds?: string }[] } | null;
+  // Current directory listing for the session-creation picker (null = closed).
+  dirPicker: { path: string; parent: string | null; dirs: DirEntry[] } | null;
+  // Active session's cwd (from Snapshot/SessionSwitched) — default for a new chat.
+  currentCwd: string;
+  // New-chat welcome page: non-null while picking a cwd / before the first message.
+  newChat: { cwd: string } | null;
+  // First message held until the freshly-created session's session_switched arrives;
+  // switchTick bumps on every switch to wake the sender effect.
+  pendingNewQuery: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] } | null;
+  switchTick: number;
 }
 
 export type Action =
@@ -81,7 +91,12 @@ export type Action =
   | { type: "set_turns"; turns: Turn[] }
   | { type: "set_artifact"; artifact: Artifact }
   | { type: "clear_artifact" }
-  | { type: "answer_question" }; // dismiss the question card (answer sent)
+  | { type: "answer_question" } // dismiss the question card (answer sent)
+  | { type: "enter_new_chat"; cwd: string }
+  | { type: "set_new_chat_cwd"; cwd: string }
+  | { type: "exit_new_chat" }
+  | { type: "start_new_query"; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] }
+  | { type: "clear_pending_new_query" };
 
 export const initialState: AppState = {
   turns: [],
@@ -100,6 +115,11 @@ export const initialState: AppState = {
   contextReport: null,
   artifact: null,
   pendingQuestion: null,
+  dirPicker: null,
+  currentCwd: "",
+  newChat: null,
+  pendingNewQuery: null,
+  switchTick: 0,
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
@@ -148,6 +168,16 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, artifact: null };
     case "answer_question":
       return { ...state, pendingQuestion: null };
+    case "enter_new_chat":
+      return { ...state, newChat: { cwd: action.cwd } };
+    case "set_new_chat_cwd":
+      return state.newChat ? { ...state, newChat: { cwd: action.cwd } } : state;
+    case "exit_new_chat":
+      return { ...state, newChat: null };
+    case "start_new_query":
+      return { ...state, newChat: null, pendingNewQuery: { prompt: action.prompt, msg_id: action.msg_id, images: action.images, files: action.files } };
+    case "clear_pending_new_query":
+      return { ...state, pendingNewQuery: null };
     case "event": {
       return reduceEvent(state, action.event);
     }
@@ -157,9 +187,9 @@ export function reduce(state: AppState, action: Action): AppState {
 function reduceEvent(state: AppState, e: ServerEvent): AppState {
   switch (e.type) {
     case "snapshot":
-      // First hello: just learn cc_session_id + state. The app reads its
+      // First hello: just learn cc_session_id + state + cwd. The app reads its
       // IndexedDB cache and re-hellos with last_seq to fetch the delta.
-      return { ...state, state: e.state, ccSessionId: e.cc_session_id ?? undefined };
+      return { ...state, state: e.state, ccSessionId: e.cc_session_id ?? undefined, currentCwd: e.cwd ?? state.currentCwd };
     case "state":
       return { ...state, state: e.state };
     case "model":
@@ -174,6 +204,8 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return { ...state, artifact: { file: e.file, kind: "gitdiff", sections: parseGitDiff(e.diff) } };
     case "session_list":
       return { ...state, sessions: e.sessions };
+    case "dir_list":
+      return { ...state, dirPicker: { path: e.path, parent: e.parent ?? null, dirs: e.dirs } };
     case "session_switched":
       // new active session: clear turns, reset turn scheduling, drop queue
       return {
@@ -186,6 +218,9 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
         queue: [],
         pendingSend: null,
         activeSessionId: e.session_id || state.activeSessionId,
+        currentCwd: e.cwd ?? state.currentCwd,
+        newChat: null,
+        switchTick: state.switchTick + 1,
       };
     case "replay_start":
       // truncated = the buffer evicted events the client's last_seq wanted, so
@@ -210,19 +245,22 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       const t = turns[turns.length - 1];
       if (t && !t.done) t.error = `${e.code}: ${e.message}`;
       else turns.push({ id: `err-${Date.now()}`, prompt: "", blocks: [], done: true, error: `${e.code}: ${e.message}` });
-      return { ...state, turns };
+      return { ...state, turns, pendingNewQuery: null };
     }
     case "user_msg": {
       // Originating client already created the turn on send (dedup by msg_id);
       // other clients create it here so they see the prompt too. If a race left
       // the turn with an empty prompt (assistant_msg_start beat query_sent),
-      // fill it — the wrapper always echoes the prompt here.
+      // fill it — the wrapper always echoes the prompt here. Carries images so
+      // replay/other devices render the attachment.
       const turns = cloneTurns(state.turns);
       const existing = turns.find((t) => t.id === e.msg_id);
+      const imgs = (e.images && e.images.length) ? e.images : undefined;
       if (existing) {
         if (!existing.prompt && e.prompt) existing.prompt = e.prompt;
+        if (!existing.images && imgs) existing.images = imgs;
       } else {
-        turns.push({ id: e.msg_id, prompt: e.prompt, blocks: [], done: false });
+        turns.push({ id: e.msg_id, prompt: e.prompt, images: imgs, blocks: [], done: false });
       }
       return { ...state, turns };
     }

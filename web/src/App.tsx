@@ -8,6 +8,8 @@ import { Composer } from "./components/Composer";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { LoginForm } from "./components/LoginForm";
 import { SessionsSidebar } from "./components/SessionsSidebar";
+import { DirPicker } from "./components/DirPicker";
+import { NewChatView } from "./components/NewChatView";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { loadSession, saveSession } from "./cache";
@@ -21,6 +23,7 @@ export default function App() {
   const [theme, setTheme] = useState<string>(() => localStorage.getItem(THEME_KEY) || "light");
   const [authed, setAuthed] = useState<boolean>(() => !!localStorage.getItem(SESSION_KEY));
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   const [state, dispatch] = useReducer(reduce, initialState);
   const wsRef = useRef<RelayWs | null>(null);
@@ -116,6 +119,16 @@ export default function App() {
     if (state.state !== "idle") drainingRef.current = false;
   }, [state.state, state.queue]);
 
+  // new-chat first message: fire it once the freshly-created session's
+  // session_switched lands (switchTick bumps). Held in pendingNewQuery meanwhile.
+  useEffect(() => {
+    if (!state.pendingNewQuery || !wsRef.current) return;
+    const q = state.pendingNewQuery;
+    wsRef.current.sendQuery(q.prompt, q.msg_id, q.images, q.files);
+    dispatch({ type: "query_sent", prompt: q.prompt, msg_id: q.msg_id, images: q.images, files: q.files, ts: Date.now() });
+    dispatch({ type: "clear_pending_new_query" });
+  }, [state.switchTick]);
+
   // Persist turns to IndexedDB (coalesced) so reopening restores instantly.
   // Prefer the live seq cursor (ws.lastSeqValue): after a wrapper restart the
   // buffered seq namespace resets, and a stale cached lastSeqRef from the
@@ -177,6 +190,15 @@ export default function App() {
     wsRef.current.sendQuery(prompt, msg_id, images, files);
     dispatch({ type: "query_sent", prompt, msg_id, images, files, ts: Date.now() });
   };
+  // First message of a new chat: create the session in the chosen cwd; the
+  // switchTick effect then fires the actual query once session_switched arrives.
+  const sendFirstMessage = (prompt: string) => {
+    if (!wsRef.current || !state.newChat) return;
+    const cwd = state.newChat.cwd;
+    const msg_id = uuid();
+    dispatch({ type: "start_new_query", prompt, msg_id });
+    wsRef.current.sendNewSession(cwd);
+  };
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
     wsRef.current?.sendSetModel(model);
@@ -203,11 +225,21 @@ export default function App() {
         open={sidebarOpen}
         sessions={state.sessions}
         activeSessionId={state.activeSessionId}
-        onSelect={(id) => { wsRef.current?.sendSwitchSession(id); setSidebarOpen(false); }}
-        onNew={() => { wsRef.current?.sendNewSession(); setSidebarOpen(false); }}
+        onSelect={(id) => { dispatch({ type: "exit_new_chat" }); wsRef.current?.sendSwitchSession(id); setSidebarOpen(false); }}
+        onNew={() => { dispatch({ type: "enter_new_chat", cwd: state.currentCwd }); setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { dispatch({ type: "enter_new_chat", cwd }); setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title)}
         onArchive={(id, archived) => wsRef.current?.sendArchiveSession(id, archived)}
+      />
+      <DirPicker
+        open={dirPickerOpen}
+        path={state.dirPicker?.path ?? null}
+        parent={state.dirPicker?.parent ?? null}
+        dirs={state.dirPicker?.dirs ?? []}
+        onBrowse={(p) => wsRef.current?.sendListDir(p)}
+        onConfirm={(cwd) => { if (state.newChat) dispatch({ type: "set_new_chat_cwd", cwd }); setDirPickerOpen(false); }}
+        onClose={() => setDirPickerOpen(false)}
       />
       <section className="pane">
         <header className="c-head">
@@ -229,9 +261,15 @@ export default function App() {
 
         <ReconnectBanner banner={state.banner} replaying={state.replaying} truncated={state.truncated} />
 
-        <ChatView turns={state.turns} onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
+        {state.newChat ? (
+          <NewChatView cwd={state.newChat.cwd} creating={!!state.pendingNewQuery}
+            onPickCwd={() => setDirPickerOpen(true)}
+            onSend={sendFirstMessage} />
+        ) : (
+          <>
+            <ChatView turns={state.turns} onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
 
-        <Composer
+            <Composer
           state={state.state}
           connState={state.connState}
           wrapperOnline={state.wrapperOnline}
@@ -249,9 +287,11 @@ export default function App() {
           onDequeue={(i) => dispatch({ type: "dequeue_at", i })}
           onSetModel={setModel}
           onSetPerm={setPerm}
-          onClear={() => wsRef.current?.sendNewSession()}
+          onClear={() => dispatch({ type: "enter_new_chat", cwd: state.currentCwd })}
           onContext={() => wsRef.current?.sendGetContext()}
         />
+          </>
+        )}
         {state.contextReport && (
           <>
             <div className="scrim show" onClick={() => dispatch({ type: "clear_context" })} />

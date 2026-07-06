@@ -30,10 +30,10 @@ export interface Ping extends Base { type: "ping"; n: number }
 export interface Pong extends Base { type: "pong"; n: number }
 export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean; rebuild?: boolean }
 export interface ReplayEnd extends Base { type: "replay_end"; to_seq: number; truncated: boolean }
-export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string }
+export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string; cwd?: string | null }
 export interface StateEvent extends Base { type: "state"; state: State }
 export interface Model extends Base { type: "model"; model: string }
-export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string }
+export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string }
 export interface ToolUse extends Base { type: "tool_use"; message_id: string; tool_use_id: string; tool: string; input: Record<string, unknown> }
@@ -57,11 +57,14 @@ export interface SessionInfo {
 }
 export interface ListSessions extends Base { type: "list_sessions" }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string }
-export interface NewSession extends Base { type: "new_session" }
+export interface NewSession extends Base { type: "new_session"; cwd?: string | null }
 export interface SessionList extends Base { type: "session_list"; sessions: SessionInfo[] }
-export interface SessionSwitched extends Base { type: "session_switched"; session_id: string }
+export interface SessionSwitched extends Base { type: "session_switched"; session_id: string; cwd?: string | null }
 export interface RenameSession extends Base { type: "rename_session"; session_id: string; title: string }
 export interface ArchiveSession extends Base { type: "archive_session"; session_id: string; archived: boolean }
+export interface DirEntry { name: string; path: string }
+export interface ListDir extends Base { type: "list_dir"; path?: string | null }
+export interface DirList extends Base { type: "dir_list"; path: string; parent?: string | null; dirs: DirEntry[] }
 export interface SetPerm extends Base { type: "set_perm"; mode: string }
 export interface Perm extends Base { type: "perm"; mode: string }
 export interface GetContext extends Base { type: "get_context" }
@@ -85,6 +88,7 @@ export type ServerEvent =
   | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Perm | ContextReport | DiffReport
   | AskUser
   | SessionList | SessionSwitched
+  | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 

@@ -8,6 +8,7 @@ interface Props {
   activeSessionId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
+  onNewInDir: (cwd: string) => void;
   onClose: () => void;
   onRename: (id: string, title: string) => void;
   onArchive: (id: string, archived: boolean) => void;
@@ -19,11 +20,12 @@ function basename(cwd?: string | null): string {
   return parts[parts.length - 1] || cwd;
 }
 
-export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onNew, onClose, onRename, onArchive }: Props) {
+export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive }: Props) {
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   // "archived" group starts collapsed; project groups start expanded.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ archived: true });
   const pressTimer = useRef<number | null>(null);
@@ -63,6 +65,11 @@ export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onN
   const doArchive = (s: SessionInfo, archived: boolean) => {
     onArchive(s.session_id, archived);
     setMenuCardId(null); setLifting(false);
+  };
+  const doCopyId = (s: SessionInfo) => {
+    navigator.clipboard?.writeText(s.session_id).catch(() => {});
+    setCopiedId(s.session_id);
+    window.setTimeout(() => setCopiedId(null), 1200);
   };
   const closeMenu = () => { setMenuCardId(null); setLifting(false); };
 
@@ -136,7 +143,7 @@ export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onN
     return (
       <div
         key={s.session_id}
-        className={"scard" + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu && lifting ? " lifting" : "")}
+        className={"scard" + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu ? " menu-open" : "") + (isMenu && lifting ? " lifting" : "")}
         onTouchStart={(e) => onCardTouchStart(s, e)}
         onTouchMove={onCardTouchMove}
         onTouchEnd={onCardTouchEnd}
@@ -158,6 +165,7 @@ export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onN
         {isMenu && (
           <div className="card-menu" onClick={(e) => e.stopPropagation()}>
             <button onClick={() => startRename(s)}><Icon name="edit" size={15} />重命名</button>
+            <button onClick={() => doCopyId(s)}><Icon name={copiedId === s.session_id ? "check" : "copy"} size={15} />{copiedId === s.session_id ? "已复制" : "复制 session ID"}</button>
             {isArchived ? (
               <button onClick={() => doArchive(s, false)}><Icon name="archive" size={15} />取消归档</button>
             ) : (
@@ -173,13 +181,22 @@ export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onN
     // While searching, expand every group so matches in collapsed/archived groups are visible.
     const isCollapsed = filter ? false : collapsed[key];
     const title = label || basename(key);
+    const canAdd = !!key && !label;  // real cwd group (not "other"/"archived")
     return (
-      <div key={key || "other"}>
-        <button className={"sgroup-toggle" + (isCollapsed ? " collapsed" : "")} onClick={() => toggleGroup(key)}>
-          <span className="chev"><Icon name="chev" size={13} /></span>
-          <span className="label" title={key || undefined}>{title}</span>
-          <span className="count">{items.length}</span>
-        </button>
+      <div key={key || "other"} className="sgroup-wrap">
+        <div className="sgroup-head">
+          <button className={"sgroup-toggle" + (isCollapsed ? " collapsed" : "")} onClick={() => toggleGroup(key)}>
+            <span className="chev"><Icon name="chev" size={13} /></span>
+            <span className="label" title={key || undefined}>{title}</span>
+            <span className="count">{items.length}</span>
+          </button>
+          {canAdd && (
+            <button className="sgroup-add" title={`在 ${title} 新建会话`} aria-label="在此目录新建会话"
+              onClick={(e) => { e.stopPropagation(); onNewInDir(key); }}>
+              <Icon name="plus" size={14} />
+            </button>
+          )}
+        </div>
         {!isCollapsed && items.map(renderCard)}
       </div>
     );

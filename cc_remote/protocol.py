@@ -115,6 +115,7 @@ class Snapshot(_Base):
     cc_session_id: Optional[str] = None
     state: State
     tail_text: str = ""
+    cwd: Optional[str] = None  # active cc cwd, so the client knows the current project
 
 
 class StateEvent(_Base):
@@ -132,10 +133,12 @@ class Model(_Base):
 class UserMsg(_Base):
     """A user's query, broadcast to all clients so every device sees the full
     conversation (prompt + response). The originating client dedups by msg_id
-    (it already created the turn optimistically on send)."""
+    (it already created the turn optimistically on send). Carries images so
+    other devices / fresh replays render the attachment."""
     type: Literal["user_msg"] = "user_msg"
     msg_id: str
     prompt: str
+    images: Optional[list[dict[str, str]]] = None  # [{media_type, data(base64)}]
 
 
 class AssistantMsgStart(_Base):
@@ -235,14 +238,17 @@ class SwitchSession(_Base):
 
 
 class NewSession(_Base):
-    """client -> wrapper: start a fresh session (no resume)."""
+    """client -> wrapper: start a fresh session (no resume). Optional `cwd`
+    spawns it in that directory (default = the wrapper's current cc_cwd)."""
     type: Literal["new_session"] = "new_session"
+    cwd: Optional[str] = None
 
 
 class SessionSwitched(_Base):
     """wrapper -> client: switch/creation finished; client clears turns + re-hellos."""
     type: Literal["session_switched"] = "session_switched"
     session_id: str
+    cwd: Optional[str] = None  # the switched-to session's cwd
 
 
 class RenameSession(_Base):
@@ -257,6 +263,26 @@ class ArchiveSession(_Base):
     type: Literal["archive_session"] = "archive_session"
     session_id: str
     archived: bool
+
+
+# ---- directory picker (for creating a session in an arbitrary cwd) ----
+
+class ListDir(_Base):
+    """client -> wrapper: list subdirectories of a path on the wrapper host.
+    Used by the directory picker when creating a session in an arbitrary cwd.
+    path=None starts at $HOME."""
+    type: Literal["list_dir"] = "list_dir"
+    path: Optional[str] = None
+
+
+class DirList(_Base):
+    """wrapper -> client: subdirectories of the requested path. One-shot like
+    SessionList (not buffered/replayed). `parent` is the parent dir for the
+    "go up" button; null at filesystem root. Hidden dirs (dotfiles) are omitted."""
+    type: Literal["dir_list"] = "dir_list"
+    path: str
+    parent: Optional[str] = None
+    dirs: list[dict[str, str]] = []  # each: {name, path}
 
 
 class SetPerm(_Base):
@@ -324,9 +350,9 @@ class AnswerQuestion(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, Ping, Pong,
+    Hello, Query, Interrupt, SetModel, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport, DiffReport, AskUser, AnswerQuestion,
-    SessionList, SessionSwitched, RenameSession, ArchiveSession,
+    SessionList, SessionSwitched, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
@@ -353,6 +379,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "new_session": NewSession,
     "rename_session": RenameSession,
     "archive_session": ArchiveSession,
+    "list_dir": ListDir,
+    "dir_list": DirList,
     "ping": Ping,
     "pong": Pong,
     "replay_start": ReplayStart,

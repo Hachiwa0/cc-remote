@@ -40,13 +40,13 @@ class RingBuffer:
     def tail_seq(self) -> int:
         return self._buf[-1][0] if self._buf else 0
 
-    def replay_from(self, last_seq: Optional[int], *, cc_session_id, state, tail_text: str = "") -> list:
+    def replay_from(self, last_seq: Optional[int], *, cc_session_id, state, tail_text: str = "", cwd: Optional[str] = None) -> list:
         if last_seq is None:
-            # First hello: send only a snapshot (cc_session_id + state). The client
+            # First hello: send only a snapshot (cc_session_id + state + cwd). The client
             # reads its IndexedDB cache, then re-hellos with last_seq to fetch only
             # the delta — so opening the app doesn't replay the whole buffer when
             # the client already has the history locally.
-            return [Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text)]
+            return [Snapshot(cc_session_id=cc_session_id, state=state, tail_text=tail_text, cwd=cwd)]
 
         # Future cursor: the client's last_seq is beyond our buffer's tail. This
         # happens because the seq counter resets to 0 on every wrapper restart,

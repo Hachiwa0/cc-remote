@@ -25,6 +25,8 @@ frames are tagged `to=<client_id>` so the relay routes them to that client only.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from typing import Optional
 
 from claude_agent_sdk import list_sessions, get_session_messages, rename_session, tag_session, get_session_info
@@ -34,7 +36,7 @@ from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
     Error, Hello, Model, Perm, ContextReport, DiffReport, AskUser, Pong, StateEvent, State, UserMsg, is_downstream,
-    SessionInfo, SessionList, SessionSwitched,
+    SessionInfo, SessionList, SessionSwitched, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL,
 )
@@ -174,6 +176,8 @@ class WrapperMachine:
             await self._handle_switch_session(cmd)
         elif t == "new_session":
             await self._handle_new_session(cmd)
+        elif t == "list_dir":
+            await self._handle_list_dir(cmd)
         elif t == "rename_session":
             await self._handle_rename_session(cmd)
         elif t == "archive_session":
@@ -191,6 +195,7 @@ class WrapperMachine:
             cc_session_id=self.cc_session_id,
             state=st,
             tail_text=tail,
+            cwd=self.cc_cwd,
         )
         # Send the whole replay batch under the lock so it isn't interleaved with
         # a running turn's live emits. Tag each frame `to=<client_id>` so the
@@ -216,7 +221,7 @@ class WrapperMachine:
         # conversation) + the running state, atomically under one lock so a
         # connecting client's replay can't split them.
         async with self._emit_lock:
-            await self._emit_locked(UserMsg(msg_id=cmd.msg_id, prompt=cmd.prompt))
+            await self._emit_locked(UserMsg(msg_id=cmd.msg_id, prompt=cmd.prompt, images=getattr(cmd, "images", None)))
             await self._emit_locked(StateEvent(state="running"))
         self._turn_task = asyncio.create_task(self._run_turn(cmd.prompt, getattr(cmd, "images", None), getattr(cmd, "files", None)))
 
@@ -354,6 +359,10 @@ class WrapperMachine:
         try:
             # No directory -> list sessions across ALL projects (each carries its cwd).
             infos = list_sessions()
+            # Hide cc bg-daemon sessions still running — cc refuses to resume
+            # them ("currently running as a background agent"), so listing them
+            # only tempts a dead-end cc_crash.
+            blocked = await asyncio.to_thread(self._bg_blocked_session_ids)
             sessions = [
                 SessionInfo(
                     session_id=i.session_id,
@@ -365,6 +374,7 @@ class WrapperMachine:
                     tag=i.tag,
                 )
                 for i in infos
+                if i.session_id not in blocked
             ]
             await self._emit(SessionList(sessions=sessions))
             log.info("listed sessions", count=len(sessions))
@@ -382,7 +392,7 @@ class WrapperMachine:
         if self.state != "idle":
             await self._emit(Error(code=ERR_BUSY, message="等当前回合结束再切换会话"))
             return
-        await self._switch_to(None)
+        await self._switch_to(None, cwd=getattr(cmd, "cwd", None))
 
     async def _handle_rename_session(self, cmd) -> None:
         # Writing the custom-title jsonl entry doesn't touch the cc subprocess,
@@ -406,14 +416,71 @@ class WrapperMachine:
             log.exception("archive_session failed", error=str(e))
             await self._emit(Error(code=ERR_INTERNAL, message=f"archive failed: {e}"))
 
-    async def _switch_to(self, resume_id: Optional[str]) -> None:
+    # ---- directory picker (arbitrary-cwd session creation) ----
+
+    async def _handle_list_dir(self, cmd) -> None:
+        try:
+            path, parent, dirs = await asyncio.to_thread(self._scan_dir, cmd.path)
+            await self._emit(DirList(path=path, parent=parent, dirs=dirs))
+        except Exception as e:
+            log.exception("list_dir failed", path=getattr(cmd, "path", None), error=str(e))
+            await self._emit(Error(code=ERR_INTERNAL, message=f"list_dir failed: {e}"))
+
+    @staticmethod
+    def _scan_dir(path: Optional[str]) -> tuple[str, Optional[str], list[dict[str, str]]]:
+        """List immediate subdirectories of `path` (default $HOME) for the
+        directory picker. Returns (realpath, parent_or_None, [{name,path}]).
+        Hidden dirs (dotfiles) are omitted; unreadable dirs yield empty list."""
+        base = path or os.path.expanduser("~")
+        base = os.path.realpath(os.path.expanduser(base))
+        if not os.path.isdir(base):
+            raise FileNotFoundError(base)
+        parent = os.path.dirname(base) or None
+        if parent and os.path.realpath(parent) == base:
+            parent = None  # filesystem root
+        dirs: list[dict[str, str]] = []
+        try:
+            for name in sorted(os.listdir(base)):
+                if name.startswith("."):
+                    continue
+                full = os.path.join(base, name)
+                if os.path.isdir(full):
+                    dirs.append({"name": name, "path": full})
+        except PermissionError:
+            pass
+        return base, parent, dirs
+
+    @staticmethod
+    def _bg_blocked_session_ids() -> set[str]:
+        """cc bg-daemon sessions not yet finished. cc refuses to resume these
+        ("currently running as a background agent"), so the sidebar hides them
+        instead of offering a switch that can only end in cc_crash."""
+        ids: set[str] = set()
+        jobs = os.path.expanduser("~/.claude/jobs")
+        if not os.path.isdir(jobs):
+            return ids
+        for name in os.listdir(jobs):
+            st = os.path.join(jobs, name, "state.json")
+            if not os.path.isfile(st):
+                continue
+            try:
+                with open(st) as f:
+                    s = json.load(f)
+            except Exception:
+                continue
+            if s.get("state") != "done" and s.get("sessionId"):
+                ids.add(s["sessionId"])
+        return ids
+
+    async def _switch_to(self, resume_id: Optional[str], cwd: Optional[str] = None) -> None:
         """Disconnect the cc client, clear the ring buffer, reconnect with the
         new resume id (None = fresh session) using that session's cwd, and load
         its on-disk history into the buffer. The relay WS stays up; the client
         clears turns + re-hellos on SessionSwitched and replays the history."""
         # Resolve the target cwd BEFORE reconnecting: cc's --resume locates the
         # session jsonl under ~/.claude/projects/<cwd-with->/, so cwd must match.
-        # New session -> stay in the currently active project's cwd.
+        # resume -> that session's cwd; fresh + cwd -> the chosen directory;
+        # fresh + no cwd -> stay in the currently active project's cwd.
         if resume_id:
             try:
                 info = await asyncio.to_thread(get_session_info, resume_id)
@@ -424,6 +491,11 @@ class WrapperMachine:
                 await self._emit(Error(code=ERR_INTERNAL, message=f"session not found: {resume_id}"))
                 return
             target_cwd = info.cwd or self.cfg.cc_cwd
+        elif cwd:
+            target_cwd = os.path.realpath(os.path.expanduser(cwd))
+            if not os.path.isdir(target_cwd):
+                await self._emit(Error(code=ERR_INTERNAL, message=f"目录不存在: {cwd}"))
+                return
         else:
             target_cwd = self.cc_cwd
         log.info("switching session", resume=resume_id, cwd=target_cwd)
@@ -454,7 +526,7 @@ class WrapperMachine:
         # the switched chat would look empty. Buffer-only (no broadcast) — each
         # client gets the history via its own hello replay.
         await self._load_history(resume_id)
-        await self._emit(SessionSwitched(session_id=resume_id or ""))
+        await self._emit(SessionSwitched(session_id=resume_id or "", cwd=self.cc_cwd))
         # re-announce to the relay (buffer bounds changed)
         await self._on_transport_connected()
 

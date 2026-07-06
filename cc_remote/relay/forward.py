@@ -1,11 +1,13 @@
-"""Per-client connection with a bounded send queue and load shedding.
+"""Per-client connection with an unbounded send queue + soft load shedding.
 
-A slow/mobile client must not block the wrapper. Each client has its own async
-sender task draining a bounded queue. When the queue fills, intermediate
-`delta` frames are shed (the oldest delta in the queue is dropped to make
-room) while state/tool_use/tool_result/turn_end and control frames are always
-kept — so a slow client sees every marker and the latest text, just not every
-token.
+A slow/mobile client must not block the wrapper, and a replay burst (the whole
+ring buffer, potentially thousands of frames) must NOT lose frames — shedding
+markers (tool_use / turn_end / replay_*) mid-replay corrupts history. So the
+queue is unbounded (put never blocks, never raises), and we only shed the
+oldest *delta* once qsize exceeds a soft cap. Markers are always kept. The soft
+cap defaults well above the ring-buffer size, so a normal replay (<= 2000
+frames) never triggers shedding; the cap is just a memory backstop for a
+runaway/silent client.
 """
 from __future__ import annotations
 
@@ -17,20 +19,13 @@ from cc_remote.protocol import serialize
 
 log = logger("cc_remote.relay.forward")
 
-# Frame types we never shed when load-shedding (markers + control).
-_KEEP_TYPES = frozenset({
-    "state", "tool_use", "tool_result", "assistant_msg_start", "assistant_msg_end",
-    "turn_end", "replay_start", "replay_end", "snapshot", "error",
-    "wrapper_disconnected", "wrapper_reconnected", "pong",
-})
-
 
 class ClientConn:
     def __init__(self, ws, cap: int, client_id: str):
         self.ws = ws
-        self.cap = cap
+        self.soft_cap = cap
         self.client_id = client_id
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=cap)
+        self.queue: asyncio.Queue = asyncio.Queue()  # unbounded — replay must not drop
         self._sender: Optional[asyncio.Task] = None
         self._closed = False
         self._shed_count = 0
@@ -48,32 +43,16 @@ class ClientConn:
                 pass
 
     async def send(self, msg) -> None:
-        """Enqueue a frame to this client. Sheds an intermediate delta if full."""
+        """Enqueue a frame. Never drops markers; only sheds the oldest delta
+        once qsize is over the soft cap (memory backstop for slow clients)."""
         if self._closed:
             return
-        try:
-            self.queue.put_nowait(msg)
-        except asyncio.QueueFull:
-            if self._shed_one_delta():
-                try:
-                    self.queue.put_nowait(msg)
-                except asyncio.QueueFull:
-                    log.warning("client queue still full after shed, dropping frame",
-                                client_id=self.client_id, type=msg.type)
-            else:
-                # nothing sheddable; if the new frame is a delta, drop it; else force-room
-                if getattr(msg, "type", None) == "delta":
-                    self._shed_count += 1
-                else:
-                    self._shed_one_delta(force=True)
-                    try:
-                        self.queue.put_nowait(msg)
-                    except asyncio.QueueFull:
-                        log.warning("client queue full, dropping non-delta frame",
-                                    client_id=self.client_id, type=msg.type)
+        self.queue.put_nowait(msg)  # unbounded — always succeeds
+        if self.queue.qsize() > self.soft_cap:
+            self._shed_oldest_delta()
 
-    def _shed_one_delta(self, force: bool = False) -> bool:
-        """Drop the oldest delta currently in the queue. Returns True if dropped."""
+    def _shed_oldest_delta(self) -> None:
+        """Drop the single oldest delta currently in the queue (markers kept)."""
         items: list = []
         while not self.queue.empty():
             try:
@@ -86,15 +65,9 @@ class ClientConn:
                 dropped = True
                 self._shed_count += 1
                 continue
-            try:
-                self.queue.put_nowait(it)
-            except asyncio.QueueFull:
-                # requeue ran out of room; keep the rest discarded (they're deltas)
-                break
+            self.queue.put_nowait(it)
         if dropped:
-            log.debug("shed intermediate delta", client_id=self.client_id,
-                      shed_total=self._shed_count)
-        return dropped
+            log.debug("shed oldest delta", client_id=self.client_id, shed_total=self._shed_count)
 
     async def _run(self) -> None:
         try:

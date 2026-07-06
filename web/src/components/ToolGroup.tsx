@@ -1,24 +1,22 @@
-import { useEffect, useState } from "react";
 import type { ToolBlock } from "../reducer";
 import { Icon } from "../icons";
 import { ToolCallCard } from "./ToolCallCard";
 
-/** Collapsible group for consecutive tool calls within a turn (Claude-app
- * style: a gray summary line "N 个工具调用 · Bash ×2 · Edit ×1" that expands to
- * the individual tool cards). Auto-expands while the turn is running and
- * auto-collapses when the turn completes. */
-export function ToolGroup({ tools, done }: { tools: ToolBlock[]; done: boolean }) {
+/** Collapsible group for tool calls within a turn (Claude-app style: a gray
+ * summary line "N 个工具调用 · Bash ×2 · Edit ×1" that expands to the individual
+ * tool cards). ALWAYS collapsed by default — even while running, only the
+ * summary + spinner show; the busy stack of Bash/Edit cards is hidden until
+ * the user clicks. */
+export function ToolGroup({ tools }: { tools: ToolBlock[] }) {
   const running = tools.some((t) => !t.result);
   const hasErr = tools.some((t) => t.result?.is_error);
-  const [open, setOpen] = useState(!done);
-  useEffect(() => { if (done) setOpen(false); }, [done]);
 
   const counts: Record<string, number> = {};
   tools.forEach((t) => { counts[t.tool] = (counts[t.tool] || 0) + 1; });
   const sub = Object.entries(counts).map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(" · ");
 
   return (
-    <details className="tool-group" open={open} onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}>
+    <details className="tool-group">
       <summary className="tool-group-h">
         <span className={"tool-group-ic" + (running ? " running" : "")}>
           {running ? <span className="spin-dot" /> : <Icon name="verify" size={13} />}

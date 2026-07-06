@@ -41,8 +41,10 @@ class RelayConfig:
     wrapper_token: str = field(default_factory=lambda: _env("WRAPPER_TOKEN", "change-me-wrapper"))
     # Optional path to a built web client (web/dist) to serve from the same origin.
     static_dir: str = field(default_factory=lambda: _env("WEB_STATIC_DIR", ""))
-    # Per-client send queue cap before the relay starts dropping intermediate deltas.
-    client_queue_cap: int = field(default_factory=lambda: _int("CLIENT_QUEUE_CAP", 256))
+    # Soft cap for per-client delta shedding. Must exceed the ring-buffer size
+    # (RING_MAX_EVENTS, default 2000) so a full replay never sheds. The queue is
+    # unbounded below this — replay integrity > memory.
+    client_queue_cap: int = field(default_factory=lambda: _int("CLIENT_QUEUE_CAP", 4096))
     # Login gate: web clients must POST /api/login with this password to get a
     # short-lived HMAC session token (stored in localStorage), replacing the
     # static CLIENT_TOKEN that used to be baked into the JS bundle.
@@ -61,8 +63,8 @@ class WrapperConfig:
     # --resume cannot locate the session jsonl under ~/.claude/projects/.
     cc_cwd: str = field(default_factory=lambda: _env("CC_CWD", os.getcwd()))
     resume_session_id: str = field(default_factory=lambda: _env("CC_RESUME_SESSION_ID", ""))
-    ring_max_events: int = field(default_factory=lambda: _int("RING_MAX_EVENTS", 2000))
-    ring_max_bytes: int = field(default_factory=lambda: _int("RING_MAX_BYTES", 4 * 1024 * 1024))
+    ring_max_events: int = field(default_factory=lambda: _int("RING_MAX_EVENTS", 10000))
+    ring_max_bytes: int = field(default_factory=lambda: _int("RING_MAX_BYTES", 24 * 1024 * 1024))
     tool_result_max: int = field(default_factory=lambda: _int("TOOL_RESULT_MAX", 65536))
     # Seconds to wait for the terminal ResultMessage after interrupt() before
     # forcing an SDK reconnect (drain safety net).

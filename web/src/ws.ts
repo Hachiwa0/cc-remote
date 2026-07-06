@@ -98,8 +98,16 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() });
   }
 
-  sendNewSession(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "new_session", ts: nowTs() });
+  sendNewSession(cwd?: string | null): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "new_session", ts: nowTs() };
+    if (cwd) obj.cwd = cwd;
+    this.send(obj);
+  }
+
+  sendListDir(path?: string | null): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_dir", ts: nowTs() };
+    if (path) obj.path = path;
+    this.send(obj);
   }
 
   sendRenameSession(sessionId: string, title: string): void {

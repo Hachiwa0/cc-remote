@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { Turn, Block, TextBlock, ToolBlock } from "../reducer";
 import { MessageBlock } from "./MessageBlock";
-import { ToolCallCard } from "./ToolCallCard";
 import { ToolGroup } from "./ToolGroup";
 import { Icon } from "../icons";
 
@@ -137,11 +136,15 @@ export function ChatView({ turns, onEdit, onGetDiff }: { turns: Turn[]; onEdit: 
                 {groupBlocks(t.blocks).map((seg, si) =>
                   seg.kind === "text" ? (
                     <MessageBlock key={`t${si}`} text={seg.block.text} done={seg.block.done} />
-                  ) : seg.tools.length === 1 ? (
-                    <ToolCallCard key={`o${si}`} block={seg.tools[0]} />
                   ) : (
-                    <ToolGroup key={`g${si}`} tools={seg.tools} done={t.done} />
+                    <ToolGroup key={`g${si}`} tools={seg.tools} />
                   )
+                )}
+                {!t.done && (
+                  <div className="turn-working">
+                    <span className="thinking"><span/><span/><span/></span>
+                    <span className="turn-working-tx">思考中</span>
+                  </div>
                 )}
                 {t.done && (
                   <div className="ubub-meta ai-meta">
