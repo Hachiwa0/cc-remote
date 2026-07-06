@@ -32,8 +32,36 @@ export function Composer(p: Props) {
   const [sheetKind, setSheetKind] = useState<"commands" | "models" | "perms" | null>(null);
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
+  const [dragDepth, setDragDepth] = useState(0);
+  const dragOver = dragDepth > 0;
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // Whole-window drag-drop overlay (ChatGPT/Claude-app style): any file drag
+  // over the window shows a drop overlay; drop anywhere to attach. A depth
+  // counter avoids flicker when the pointer crosses child element boundaries.
+  useEffect(() => {
+    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes("Files");
+    const onEnter = (e: DragEvent) => { if (hasFiles(e)) setDragDepth((d) => d + 1); };
+    const onLeave = (e: DragEvent) => { if (hasFiles(e)) setDragDepth((d) => Math.max(0, d - 1)); };
+    const onOver = (e: DragEvent) => { if (hasFiles(e)) e.preventDefault(); };  // allow drop
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      setDragDepth(0);
+      if (e.dataTransfer?.files?.length) onPickFiles(e.dataTransfer.files);
+    };
+    window.addEventListener("dragenter", onEnter);
+    window.addEventListener("dragleave", onLeave);
+    window.addEventListener("dragover", onOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onEnter);
+      window.removeEventListener("dragleave", onLeave);
+      window.removeEventListener("dragover", onOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
 
   const busy = p.state === "running" || p.state === "interrupting";
   const offline = !p.wrapperOnline;
@@ -193,10 +221,15 @@ export function Composer(p: Props) {
           </button>
         </div>
         <div className="hint">
-          <span className={"hint-mode" + modeCls + (hintBusy ? " busy" : "")}>
-            {perm.short}模式 · {stateZh[p.state]}
-          </span>
-          <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · <kbd>/</kbd> 命令</span>
+          <button
+            type="button"
+            className={"hint-mode" + modeCls + (hintBusy ? " busy" : "")}
+            onClick={() => setSheetKind("perms")}
+            title="点击切换权限模式"
+          >
+            {perm.short}模式 · {stateZh[p.state]} <span className="hint-mode-ch">▾</span>
+          </button>
+          <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令</span>
         </div>
       </div>
 
@@ -219,6 +252,16 @@ export function Composer(p: Props) {
         currentPerm={p.perm}
         onPickPerm={(perm) => { p.onSetPerm(perm); setSheetKind(null); }}
       />
+
+      {dragOver && (
+        <div className="drop-overlay" aria-hidden="true">
+          <div className="drop-card">
+            <span className="dc-ic"><Icon name="plus" size={36} /></span>
+            <div className="dc-tx">拖拽文件到此处发送</div>
+            <div className="dc-sub">图片直接进对话 · 其他文件写到 /tmp 用 @ 引用</div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

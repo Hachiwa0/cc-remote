@@ -54,11 +54,15 @@ class SdkHandle:
                 "type": "preset",
                 "preset": "claude_code",
                 "append": (
-                    "You have an `ask_user` MCP tool (server: cc-remote-ask). When a request is "
-                    "ambiguous or you need the user to choose between approaches — especially in "
-                    "plan mode — call `ask_user` with a clear question and 2-5 concrete options "
-                    "rather than guessing or asking in plain text. The call blocks until the user "
-                    "answers; their selection is returned as the tool result."
+                    "You have two MCP tools on the cc-remote-ask server:\n"
+                    "- `ask_user(question, options)`: ask the user a multiple-choice clarifying "
+                    "question (instead of plain text). Blocks until they answer.\n"
+                    "- `set_mode(mode)`: switch cc's permission mode yourself, in the middle of a "
+                    "turn. When the user expresses intent — 'plan first' / 'let's plan this' -> "
+                    "set_mode('plan'); 'just do it' / 'go ahead' -> set_mode('bypassPermissions') "
+                    "or 'acceptEdits'. The user has no Shift+Tab here, so calling this is how you "
+                    "enter plan mode for them.\n"
+                    "Modes: default, acceptEdits, plan, auto, bypassPermissions."
                 ),
             },
             mcp_servers=(

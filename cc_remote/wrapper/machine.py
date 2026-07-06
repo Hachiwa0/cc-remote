@@ -74,7 +74,7 @@ class WrapperMachine:
         # client returns an AnswerQuestion. The in-process MCP server is wired
         # into ClaudeAgentOptions.mcp_servers so the agent can call `ask_user`.
         self._pending_asks: dict[str, asyncio.Future] = {}
-        self.sdk.ask_server = make_ask_server(self._on_ask)
+        self.sdk.ask_server = make_ask_server(self._on_ask, self._on_set_mode)
 
     # ---- lifecycle ----
 
@@ -251,6 +251,19 @@ class WrapperMachine:
         except Exception as e:
             log.exception("set_permission_mode failed", error=str(e))
             await self._emit(Error(code=ERR_INTERNAL, message=f"set_perm failed: {e}"))
+
+    async def _on_set_mode(self, mode: str) -> None:
+        """Agent-facing set_mode MCP tool: switch cc's permission mode from
+        within a turn (when the user expresses intent). Same effect as the
+        client's SetPerm command — sdk.set_permission_mode + Perm broadcast."""
+        try:
+            await self.sdk.set_permission_mode(mode)
+            self._announced_perm = mode
+            await self._emit(Perm(mode=mode))
+            log.info("agent set permission mode", mode=mode)
+        except Exception as e:
+            log.exception("agent set_mode failed", error=str(e))
+            raise
 
     async def _handle_get_context(self, cmd) -> None:
         try:

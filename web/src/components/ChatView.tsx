@@ -1,8 +1,27 @@
 import { useEffect, useRef, useState } from "react";
-import type { Turn } from "../reducer";
+import type { Turn, Block, TextBlock, ToolBlock } from "../reducer";
 import { MessageBlock } from "./MessageBlock";
 import { ToolCallCard } from "./ToolCallCard";
+import { ToolGroup } from "./ToolGroup";
 import { Icon } from "../icons";
+
+type Segment = { kind: "text"; block: TextBlock } | { kind: "tools"; tools: ToolBlock[] };
+
+/** Group a turn's blocks into text segments + consecutive-tool segments so the
+ * tool calls render as one collapsible group instead of a busy stack. */
+function groupBlocks(blocks: Block[]): Segment[] {
+  const segs: Segment[] = [];
+  for (let i = 0; i < blocks.length;) {
+    const b = blocks[i];
+    if (b.kind === "text") { segs.push({ kind: "text", block: b }); i++; }
+    else {
+      const tools: ToolBlock[] = [];
+      while (i < blocks.length && blocks[i].kind === "tool") { tools.push(blocks[i] as ToolBlock); i++; }
+      segs.push({ kind: "tools", tools });
+    }
+  }
+  return segs;
+}
 
 function formatTime(ts: number): string {
   const d = new Date(ts);
@@ -115,11 +134,13 @@ export function ChatView({ turns, onEdit, onGetDiff }: { turns: Turn[]; onEdit: 
                   <span className="av"><Icon name="spark" size={14} /></span>
                   <span className="nm">Claude</span>
                 </div>
-                {t.blocks.map((b) =>
-                  b.kind === "text" ? (
-                    <MessageBlock key={b.message_id} text={b.text} done={b.done} />
+                {groupBlocks(t.blocks).map((seg, si) =>
+                  seg.kind === "text" ? (
+                    <MessageBlock key={`t${si}`} text={seg.block.text} done={seg.block.done} />
+                  ) : seg.tools.length === 1 ? (
+                    <ToolCallCard key={`o${si}`} block={seg.tools[0]} />
                   ) : (
-                    <ToolCallCard key={b.tool_use_id} block={b} />
+                    <ToolGroup key={`g${si}`} tools={seg.tools} done={t.done} />
                   )
                 )}
                 {t.done && (

@@ -147,6 +147,26 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [authed, state.artifact]);
 
+  // Shift+Tab => cycle permission mode (bypassPermissions -> acceptEdits -> plan -> back),
+  // matching cc's Shift+Tab rhythm. The user has no TTY Shift+Tab here, so this + the
+  // clickable mode text in the composer are how they switch modes from the UI.
+  useEffect(() => {
+    if (!authed) return;
+    const CYCLE: Record<string, string> = {
+      bypassPermissions: "acceptEdits",
+      acceptEdits: "plan",
+      plan: "bypassPermissions",
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Tab" && e.shiftKey) {
+        e.preventDefault();
+        setPerm(CYCLE[state.perm] || "bypassPermissions");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [authed, state.perm]);
+
   if (!authed) {
     return <LoginForm onLogin={(t) => { localStorage.setItem(SESSION_KEY, t); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
   }

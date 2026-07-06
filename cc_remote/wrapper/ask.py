@@ -1,16 +1,15 @@
-"""In-process MCP server exposing the `ask_user` tool.
+"""In-process MCP server exposing cc-remote's agent-facing tools.
 
-The agent calls `ask_user(question, options)` when it needs a clarifying
-choice from the user (plan mode, ambiguous requests, etc.). The SDK routes
-the `tools/call` to this in-process server (registered via
+Tools:
+- `ask_user(question, options)`: ask the user a multiple-choice clarifying
+  question. Blocks until the user answers (client renders a question card).
+- `set_mode(mode)`: switch cc's permission mode yourself (e.g. "plan" when the
+  user wants to plan, "bypassPermissions" to go back to normal). The mode
+  change takes effect immediately for the rest of the turn.
+
+The SDK routes `tools/call` to this in-process server (registered via
 `ClaudeAgentOptions.mcp_servers={"cc-remote-ask":{"type":"sdk","instance":...}}`).
-Our handler blocks on a callback provided by WrapperMachine, which emits an
-`AskUser` wire event to the client and awaits a Future keyed by `ask_id`.
-The client renders a question card; the user's pick comes back as an
-`AnswerQuestion` command, which resolves the Future. The handler returns the
-answer as the tool_result, and the SDK resumes the turn — mid-turn pause,
-identical UX to cc's interactive AskUserQuestion (which is TTY-only and thus
-unavailable in SDK mode).
+Handlers delegate to callbacks provided by WrapperMachine.
 """
 from __future__ import annotations
 
@@ -20,14 +19,17 @@ from mcp import types
 from mcp.server import Server
 
 ASK_USER_TOOL = "ask_user"
+SET_MODE_TOOL = "set_mode"
+MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
 
-# Signature: async (question, options) -> answer string.
-# WrapperMachine provides this; it emits AskUser + awaits the client's answer.
+# async (question, options) -> answer string
 AskCallback = Callable[[str, list[dict[str, str]]], Awaitable[str]]
+# async (mode) -> None  (machine: sdk.set_permission_mode + emit Perm)
+SetModeCallback = Callable[[str], Awaitable[None]]
 
 
-def make_ask_server(ask: AskCallback) -> Server:
-    """Build an in-process MCP server exposing the `ask_user` tool."""
+def make_ask_server(ask: AskCallback, set_mode: SetModeCallback) -> Server:
+    """Build an in-process MCP server exposing the ask_user + set_mode tools."""
     server: Server = Server("cc-remote-ask")
 
     @server.list_tools()
@@ -45,10 +47,7 @@ def make_ask_server(ask: AskCallback) -> Server:
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "The question to ask the user.",
-                        },
+                        "question": {"type": "string", "description": "The question to ask the user."},
                         "options": {
                             "type": "array",
                             "description": "2-5 selectable options.",
@@ -66,21 +65,42 @@ def make_ask_server(ask: AskCallback) -> Server:
                     },
                     "required": ["question", "options"],
                 },
-            )
+            ),
+            types.Tool(
+                name=SET_MODE_TOOL,
+                description=(
+                    "Switch cc's permission mode yourself. Use this when the user expresses "
+                    "intent — e.g. 'let's plan this' / 'plan first' -> set_mode('plan'); "
+                    "'just do it' / 'go ahead and edit' -> set_mode('bypassPermissions') or "
+                    "'acceptEdits'. Takes effect immediately for the rest of the turn. "
+                    "Modes: 'default' (ask each time), 'acceptEdits' (auto-accept edits), "
+                    "'plan' (read-only, plan first), 'auto', 'bypassPermissions' (skip all)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"mode": {"type": "string", "enum": MODES}},
+                    "required": ["mode"],
+                },
+            ),
         ]
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict[str, Any]):
-        if name != ASK_USER_TOOL:
-            return [types.TextContent(type="text", text=f"unknown tool: {name}")]
-        question = str(arguments.get("question", ""))
-        opts = arguments.get("options") or []
-        # Normalize: keep only label + ds, coerce to str.
-        options = [
-            {"label": str(o.get("label", "")), **({"ds": str(o["ds"])} if o.get("ds") else {})}
-            for o in opts if isinstance(o, dict) and o.get("label")
-        ]
-        answer = await ask(question, options)
-        return [types.TextContent(type="text", text=answer or "(no answer)")]
+        if name == ASK_USER_TOOL:
+            question = str(arguments.get("question", ""))
+            opts = arguments.get("options") or []
+            options = [
+                {"label": str(o.get("label", "")), **({"ds": str(o["ds"])} if o.get("ds") else {})}
+                for o in opts if isinstance(o, dict) and o.get("label")
+            ]
+            answer = await ask(question, options)
+            return [types.TextContent(type="text", text=answer or "(no answer)")]
+        if name == SET_MODE_TOOL:
+            mode = str(arguments.get("mode", ""))
+            if mode not in MODES:
+                return [types.TextContent(type="text", text=f"unknown mode: {mode}; valid: {MODES}")]
+            await set_mode(mode)
+            return [types.TextContent(type="text", text=f"permission mode set to {mode}")]
+        return [types.TextContent(type="text", text=f"unknown tool: {name}")]
 
     return server
