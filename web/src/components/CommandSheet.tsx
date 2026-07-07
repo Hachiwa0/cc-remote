@@ -87,7 +87,7 @@ export function CommandSheet({ open, kind, filter = "", onClose, onPickCommand, 
                 className={"cmd" + (m.id === currentModel ? " sel" : "")}
                 onClick={() => onPickModel?.(m.id)}
               >
-                <span className="cmd-ic"><Icon name="cpu" size={17} /></span>
+                <span className="cmd-ic"><Icon name={m.ic} size={17} /></span>
                 <span className="cmd-tx">
                   <span className="cmd-nm">{m.name}</span>
                   <span className="cmd-ds">{m.ds}</span>

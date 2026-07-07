@@ -28,13 +28,13 @@ export const COMMANDS: Command[] = [
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
 ];
 
-export interface Model { id: string; name: string; ds: string }
+export interface Model { id: string; name: string; ds: string; ic: string }
 export const MODELS: Model[] = [
-  { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌" },
-  { id: "claude-opus-4-8", name: "Opus 4.8", ds: "最强推理" },
-  { id: "claude-sonnet-5", name: "Sonnet 5", ds: "均衡 · 更快" },
-  { id: "claude-haiku-4-5", name: "Haiku 4.5", ds: "轻量 · 极速" },
-  { id: "claude-fable-5", name: "Fable 5", ds: "大便" },
+  { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "crown" },
+  { id: "claude-opus-4-8", name: "Opus 4.8", ds: "最强推理", ic: "gem" },
+  { id: "claude-sonnet-5", name: "Sonnet 5", ds: "均衡 · 更快", ic: "balance" },
+  { id: "claude-haiku-4-5", name: "Haiku 4.5", ds: "轻量 · 极速", ic: "bolt" },
+  { id: "claude-fable-5", name: "Fable 5", ds: "大便", ic: "book" },
 ];
 
 // Map a cc-reported model id (e.g. "claude-mythos-5[1m]") to a MODELS entry id.

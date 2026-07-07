@@ -197,7 +197,7 @@ export function Composer(p: Props) {
   const disabled = offline || (!busy && !hasText && !hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
-  const model = MODELS.find((m) => m.id === p.model) || { id: p.model, name: p.model || MODELS[0].name, ds: "" };
+  const model = MODELS.find((m) => m.id === p.model) || { id: p.model, name: p.model || MODELS[0].name, ds: "", ic: "cpu" };
   const perm = PERMS.find((x) => x.id === p.perm) || PERMS[0];
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm.id === "plan" ? " plan" : perm.danger ? " danger" : "";
@@ -287,7 +287,7 @@ export function Composer(p: Props) {
             }}
           />
           <button className="cchip mini" aria-label="选择模型" onClick={() => setSheetKind("models")}>
-            <span className="ci"><Icon name="cpu" size={15} /></span>
+            <span className="ci"><Icon name={model.ic} size={15} /></span>
             <span className="cv">{model.name}</span>
           </button>
           <button className={sendClass} onClick={send} disabled={disabled} aria-label="发送">
