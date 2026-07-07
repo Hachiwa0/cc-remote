@@ -243,7 +243,7 @@ export default function App() {
         onNewInDir={(cwd) => { dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title)}
-        onArchive={(id, archived) => wsRef.current?.sendArchiveSession(id, archived)}
+        onArchive={(id, archived) => { dispatch({ type: "set_session_tag", sid: id, tag: archived ? "archived" : null }); wsRef.current?.sendArchiveSession(id, archived); }}
       />
       <DirPicker
         open={dirPickerOpen}

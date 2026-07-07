@@ -111,6 +111,7 @@ export type Action =
   | { type: "open_artifact_loading"; file: string }
   | { type: "clear_artifact" }
   | { type: "focus_session"; sid: string }
+  | { type: "set_session_tag"; sid: string; tag: string | null }
   | { type: "hydrate_cache"; sid: string; turns: Turn[] }
   | { type: "answer_question" }
   | { type: "enter_new_chat"; cwd: string }
@@ -212,6 +213,11 @@ export function reduce(state: AppState, action: Action): AppState {
       const runtimes = { ...state.runtimes, [sid]: { ...rt, loading: rt.turns.length === 0 } };
       return { ...state, focusedSid: sid, runtimes };
     }
+    case "set_session_tag":
+      // optimistic archive/unarchive: flip the tag locally right away so the card
+      // moves instantly, even if the archive_session round-trip is slow or a
+      // connection blip drops it. The server's next SessionList reconciles.
+      return { ...state, sessions: state.sessions.map((s) => s.session_id === action.sid ? { ...s, tag: action.tag } : s) };
     case "hydrate_cache":
       // fill a session's turns from the IndexedDB cache for an INSTANT render;
       // only if still empty (never clobber live/streaming or already-replayed turns).
