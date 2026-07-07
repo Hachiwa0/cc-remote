@@ -24,7 +24,8 @@ function groupBlocks(blocks: Block[]): Segment[] {
 
 function formatTime(ts: number): string {
   const d = new Date(ts);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 export function ChatView({ sid, turns, loading, onEdit, onGetDiff }: { sid: string | null; turns: Turn[]; loading?: boolean; onEdit: (prompt: string) => void; onGetDiff: (file: string) => void }) {

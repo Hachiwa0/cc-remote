@@ -213,7 +213,7 @@ export function Composer(p: Props) {
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
   const model = MODELS.find((m) => m.id === p.model) || { id: p.model, name: p.model || MODELS[0].name, ds: "", ic: "cpu" };
-  const effort = EFFORTS.find((e) => e.id === p.effort) || EFFORTS[2]; // default 高
+  const effort = EFFORTS.find((e) => e.id === p.effort) || EFFORTS[4]; // default 最大
   const perm = PERMS.find((x) => x.id === p.perm) || PERMS[0];
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm.id === "plan" ? " plan" : perm.danger ? " danger" : "";

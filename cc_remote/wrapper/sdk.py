@@ -29,7 +29,9 @@ class SdkHandle:
         # reasoning effort is a spawn-time flag (--effort), not a runtime setter.
         # `effort` is the desired level; `applied_effort` is what the live client
         # was spawned with — they differ after set_effort until the next reconnect.
-        self.effort: str | None = None
+        # Default to "max" so new sessions get the strongest reasoning out of the
+        # box (matches the client's default chip); the user can lower it per session.
+        self.effort: str | None = "max"
         self.applied_effort: str | None = None
 
     @staticmethod

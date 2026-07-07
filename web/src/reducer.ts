@@ -86,7 +86,7 @@ export interface AppState {
 
 export function createRuntime(): SessionRuntime {
   return {
-    turns: [], state: "idle", model: "claude-mythos-5", effort: "high", perm: "bypassPermissions",
+    turns: [], state: "idle", model: "claude-mythos-5", effort: "max", perm: "bypassPermissions",
     replaying: false, truncated: false, pendingQuestion: null, contextReport: null,
     queue: [], pendingSend: null,
   };
