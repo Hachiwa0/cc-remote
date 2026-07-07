@@ -308,20 +308,33 @@ body{
 /* control bar (model + perm chips, idle only) */
 .ctrlbar{ display:none; align-items:center; gap:8px; padding:2px 2px 9px; flex-wrap:wrap; }
 .ctrlbar.show{ display:flex; }
-.cchip{ display:inline-flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600;
-  color:var(--dim); background:var(--surface); border:1px solid var(--border);
-  padding:6px 10px; border-radius:11px; transition:.14s; max-width:100%; }
-.cchip:hover{ border-color:var(--border-strong); color:var(--text); }
-.cchip .ci{ display:grid; place-items:center; width:15px; height:15px; color:var(--accent); flex:none; }
-.cchip .ci svg{ width:15px; height:15px; }
-.cchip .cv{ color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.cchip .cx{ display:grid; place-items:center; width:13px; height:13px; color:var(--faint); flex:none; }
-.cchip .cx svg{ width:13px; height:13px; }
-.cchip.danger{ color:var(--danger); background:var(--danger-weak); border-color:transparent; }
-.cchip.danger .ci{ color:var(--danger); } .cchip.danger .cv{ color:var(--danger); }
-.cchip .ci,.cchip .cv,.cchip .cx{ pointer-events:none; }
-.cchip.mini{ padding:6px 9px; flex:none; }
-.cchip.mini .cv{ font-size:12.5px; }
+/* frameless bottom-bar controls (model / effort) — no box, just text */
+.hint-ctl{ border:0; background:none; padding:0; font:inherit; font-weight:600; font-size:12px;
+  color:var(--text); cursor:pointer; white-space:nowrap; transition:color .14s; }
+.hint-ctl:hover{ color:var(--accent-ink); }
+/* context-usage ring */
+.hint-ring{ border:0; background:none; padding:0; display:inline-flex; cursor:pointer; line-height:0; flex:none; }
+.hint-ring svg{ display:block; transition:transform .14s; }
+.hint-ring:hover svg{ transform:scale(1.12); }
+.hint-ring .hr-track{ fill:none; stroke:var(--border); stroke-width:3.5; }
+.hint-ring .hr-fill{ fill:none; stroke:var(--accent); stroke-width:3.5; stroke-linecap:round; }
+/* context popover, anchored above the ring */
+.ctx-pop{ position:absolute; right:0; bottom:calc(100% + 8px); width:280px; z-index:30;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--r-card,16px);
+  box-shadow:0 12px 34px rgba(0,0,0,.14); padding:14px 15px; cursor:default;
+  animation:panel-in .16s var(--ease); }
+.ctx-pop-row{ display:flex; justify-content:space-between; align-items:baseline; gap:10px; font-size:12.5px; color:var(--dim); }
+.ctx-pop-nums{ font-family:var(--mono); font-size:11.5px; color:var(--text); }
+.ctx-pop-bar{ height:5px; background:var(--raised); border-radius:3px; overflow:hidden; margin:8px 0 12px; }
+.ctx-pop-bar>i{ display:block; height:100%; background:var(--accent); border-radius:3px; }
+.ctx-pop-cats{ display:flex; flex-direction:column; gap:5px; }
+.ctx-pop-cat{ display:flex; align-items:center; gap:7px; font-size:11.5px; }
+.ctx-pop-cat .ctx-cat-dot{ width:8px; height:8px; border-radius:2px; flex:none; }
+.ctx-pop-cat-name{ color:var(--dim); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ctx-pop-cat-tok{ font-family:var(--mono); font-size:10.5px; color:var(--faint); }
+.ctx-pop-auto{ margin-top:10px; font-size:11px; color:var(--accent-ink); }
+.ctx-pop-foot{ margin-top:10px; font-size:11px; color:var(--faint); }
+.ctx-pop-loading{ font-size:12.5px; color:var(--faint); }
 
 /* run bar (running only) */
 .runbar{ display:none; align-items:center; gap:8px; padding:2px 2px 9px; }
@@ -355,7 +368,8 @@ body{
 .sendbtn:disabled{ background:var(--border-strong); color:var(--faint); cursor:default; }
 .sendbtn svg{ width:19px; height:19px; }
 .sendbtn.interrupt{ background:var(--danger); }
-.hint{ display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:11px; color:var(--faint); padding:7px 0 1px; }
+.hint{ display:flex; align-items:center; gap:12px; font-size:11px; color:var(--faint); padding:7px 2px 1px; }
+.hint-right{ position:relative; display:flex; align-items:center; gap:14px; margin-left:auto; flex:none; }
 .hint kbd{ font-family:var(--mono); font-size:10px; background:var(--raised);
   border:1px solid var(--border); border-radius:4px; padding:0 4px; }
 .hint-mode{ white-space:nowrap; cursor:pointer; font:inherit; color:inherit; background:none; border:0; padding:0; display:inline-flex; align-items:center; gap:3px; }
@@ -364,7 +378,9 @@ body{
 .hint-mode.plan{ color:var(--accent-ink); }
 .hint-mode.danger{ color:var(--danger); }
 .hint-mode.busy{ color:var(--warn); }
-.hint-kbds{ white-space:nowrap; }
+.hint-kbds{ white-space:nowrap; flex:1; text-align:center; overflow:hidden; text-overflow:ellipsis; }
+/* narrow screens: drop the keyboard hint (shortcuts are desktop-only), keep mode + controls */
+@media (max-width:640px){ .hint-kbds{ display:none; } .hint-right{ gap:12px; } }
 
 /* COMMAND SHEET */
 .scrim{ position:fixed; inset:0; z-index:40; background:rgba(30,22,12,.34);

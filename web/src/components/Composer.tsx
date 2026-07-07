@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ClipboardEvent } from "react";
-import type { State, QueryImg, QueryFile } from "../protocol";
+import type { State, QueryImg, QueryFile, ContextReport } from "../protocol";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
 import { MODELS, EFFORTS, PERMS, CLIENT_SLASHES, slashToken, matchCommands, parseSlash } from "../data";
@@ -27,6 +27,7 @@ interface Props {
   onSetPerm: (perm: string) => void;
   onClear: () => void;
   onContext: () => void;
+  contextReport: ContextReport | null;
 }
 
 export function Composer(p: Props) {
@@ -34,6 +35,8 @@ export function Composer(p: Props) {
   // Only the modal pickers live in state now; the "/" command palette is a live
   // popover DERIVED from the composer text (no second input box).
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
+  const [ctxOpen, setCtxOpen] = useState(false);
+  const ctxWrapRef = useRef<HTMLDivElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<number | null>(null);
   const [images, setImages] = useState<QueryImg[]>([]);
@@ -42,6 +45,16 @@ export function Composer(p: Props) {
   const dragOver = dragDepth > 0;
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // context popover: close on outside click
+  useEffect(() => {
+    if (!ctxOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) setCtxOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [ctxOpen]);
 
   // Whole-window drag-drop overlay (ChatGPT/Claude-app style): any file drag
   // over the window shows a drop overlay; drop anywhere to attach. A depth
@@ -289,14 +302,6 @@ export function Composer(p: Props) {
               }
             }}
           />
-          <button className="cchip mini" aria-label="选择模型" onClick={() => setSheetKind("models")}>
-            <span className="ci"><Icon name={model.ic} size={15} /></span>
-            <span className="cv">{model.name}</span>
-          </button>
-          <button className="cchip mini" aria-label="思考强度" onClick={() => setSheetKind("efforts")}>
-            <span className="ci"><Icon name={effort.ic} size={15} /></span>
-            <span className="cv">{effort.name}</span>
-          </button>
           <button className={sendClass} onClick={send} disabled={disabled} aria-label="发送">
             <Icon name={sendIcon} size={19} />
           </button>
@@ -311,6 +316,57 @@ export function Composer(p: Props) {
             {perm.short}模式 · {stateZh[p.state]} <span className="hint-mode-ch">▾</span>
           </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令</span>
+          <div className="hint-right" ref={ctxWrapRef}>
+            <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型">{model.name}</button>
+            <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度">{effort.name}</button>
+            <button
+              className="hint-ring"
+              aria-label="上下文占用"
+              title="上下文占用"
+              onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}
+            >
+              <svg viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
+                <circle className="hr-track" cx="18" cy="18" r="15" />
+                <circle
+                  className="hr-fill"
+                  cx="18" cy="18" r="15"
+                  strokeDasharray="94.25"
+                  strokeDashoffset={94.25 * (1 - Math.min(p.contextReport?.percentage ?? 0, 100) / 100)}
+                  transform="rotate(-90 18 18)"
+                />
+              </svg>
+            </button>
+            {ctxOpen && (
+              <div className="ctx-pop" role="dialog" aria-label="上下文占用">
+                {p.contextReport ? (
+                  <>
+                    <div className="ctx-pop-row">
+                      <span>上下文窗口</span>
+                      <span className="ctx-pop-nums">
+                        {p.contextReport.total_tokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({p.contextReport.percentage.toFixed(0)}%)
+                      </span>
+                    </div>
+                    <div className="ctx-pop-bar"><i style={{ width: `${Math.min(p.contextReport.percentage, 100)}%` }} /></div>
+                    {p.contextReport.categories.length > 0 && (
+                      <div className="ctx-pop-cats">
+                        {p.contextReport.categories.map((c, i) => (
+                          <div className="ctx-pop-cat" key={i}>
+                            <span className="ctx-cat-dot" style={{ background: c.color }} />
+                            <span className="ctx-pop-cat-name">{c.name}</span>
+                            <span className="ctx-pop-cat-tok">{c.tokens.toLocaleString()}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {p.contextReport.is_auto_compact_enabled && <div className="ctx-pop-auto">autocompact 已启用</div>}
+                    <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
+                  </>
+                ) : (
+                  <div className="ctx-pop-loading">读取上下文占用…</div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

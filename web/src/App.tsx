@@ -71,6 +71,8 @@ export default function App() {
         if (msg.type === "snapshot") { void handleSnapshot(msg); return; }
         dispatch({ type: "event", event: msg });
         if (msg.type === "wrapper_reconnected") { ws.sendHello(); ws.sendListSessions(); }
+        // refresh the context ring after each turn (local SDK query, no model tokens)
+        if (msg.type === "turn_end") ws.sendGetContext();
       },
       onConnState: (s, detail) => {
         dispatch({ type: "conn", connState: s, detail });
@@ -284,38 +286,11 @@ export default function App() {
           onSetPerm={setPerm}
           onClear={() => dispatch({ type: "enter_new_chat", cwd: state.currentCwd })}
           onContext={() => wsRef.current?.sendGetContext()}
+          contextReport={rt.contextReport}
         />
           </>
         )}
-        {rt.contextReport && (
-          <>
-            <div className="scrim show" onClick={() => dispatch({ type: "clear_context" })} />
-            <div className="sheet show" role="dialog" aria-label="上下文用量">
-              <div className="sheet-grip" />
-              <div className="sheet-title">上下文用量 · {rt.contextReport.model || ""}</div>
-              <div className="sheet-scroll">
-                <div className="ctx-overview">
-                  <div className="ctx-pct">{rt.contextReport.percentage.toFixed(1)}%</div>
-                  <div className="ctx-bar"><div className="ctx-bar-fill" style={{ width: `${Math.min(rt.contextReport.percentage, 100)}%` }} /></div>
-                  <div className="ctx-numbers">{rt.contextReport.total_tokens.toLocaleString()} / {rt.contextReport.max_tokens.toLocaleString()} tokens</div>
-                  {rt.contextReport.is_auto_compact_enabled && <div className="ctx-auto">autocompact 已启用</div>}
-                </div>
-                <div className="ctx-cats">
-                  {rt.contextReport.categories.map((c, i) => (
-                    <div className="ctx-cat" key={i}>
-                      <span className="ctx-cat-dot" style={{ background: c.color }} />
-                      <span className="ctx-cat-name">{c.name}</span>
-                      <span className="ctx-cat-tokens">{c.tokens.toLocaleString()}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <div className="s-foot">
-                <button className="newbtn" onClick={() => dispatch({ type: "clear_context" })}>关闭</button>
-              </div>
-            </div>
-          </>
-        )}
+        {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
       {state.artifact && (
         <ArtifactPanel artifact={state.artifact} onClose={() => dispatch({ type: "clear_artifact" })} />
