@@ -200,7 +200,7 @@ export default function App() {
     wsRef.current?.sendSetPerm(perm);
     dispatch({ type: "set_perm", perm });
   };
-  const getDiff = (file: string) => wsRef.current?.sendGetDiff(file, theme);
+  const getDiff = (file: string) => { dispatch({ type: "open_artifact_loading", file }); wsRef.current?.sendGetDiff(file, theme); };
   const logout = () => {
     localStorage.removeItem(SESSION_KEY);
     wsRef.current?.stop();
@@ -214,7 +214,7 @@ export default function App() {
         sessions={state.sessions}
         liveStates={Object.fromEntries(Object.entries(state.runtimes).map(([sid, r]) => [sid, r.state]))}
         activeSessionId={focusedSid}
-        onSelect={(id) => { dispatch({ type: "exit_new_chat" }); wsRef.current?.sendSwitchSession(id); if (isMobile()) setSidebarOpen(false); }}
+        onSelect={(id) => { dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id); wsRef.current?.sendSwitchSession(id); if (isMobile()) setSidebarOpen(false); }}
         onNew={() => { dispatch({ type: "enter_new_chat", cwd: state.currentCwd }); if (isMobile()) setSidebarOpen(false); }}
         onNewInDir={(cwd) => { dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}

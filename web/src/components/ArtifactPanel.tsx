@@ -7,7 +7,8 @@ import { Icon } from "../icons";
 export function ArtifactPanel({ artifact, onClose }: { artifact: Artifact; onClose: () => void }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const sections = artifact.kind === "gitdiff" ? (artifact.sections || []) : [];
-  const empty = artifact.kind === "gitdiff" && sections.length === 0;
+  const loading = !!artifact.loading && sections.length === 0;
+  const empty = artifact.kind === "gitdiff" && !loading && sections.length === 0;
 
   // Click anywhere outside the panel (the blank chat area) closes it — not only
   // the × button. mousedown so a text-selection drag that starts inside the
@@ -29,7 +30,9 @@ export function ArtifactPanel({ artifact, onClose }: { artifact: Artifact; onClo
         <button className="iconbtn" onClick={onClose} aria-label="关闭"><Icon name="close" /></button>
       </div>
       <div className="artifact-body">
-        {artifact.kind === "gitdiff" ? (
+        {loading ? (
+          <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在读取 diff…</div>
+        ) : artifact.kind === "gitdiff" ? (
           empty ? (
             <div className="diff-empty">没有未提交的改动。</div>
           ) : (

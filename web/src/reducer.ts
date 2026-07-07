@@ -45,7 +45,7 @@ export interface Turn {
   doneTs?: number;
 }
 
-export interface Artifact { file: string; kind: "diff" | "md" | "gitdiff"; diff?: DiffLine[]; content?: string; sections?: GitDiffSection[]; }
+export interface Artifact { file: string; kind: "diff" | "md" | "gitdiff"; diff?: DiffLine[]; content?: string; sections?: GitDiffSection[]; loading?: boolean; }
 
 export interface SessionRuntime {
   turns: Turn[];
@@ -103,7 +103,9 @@ export type Action =
   | { type: "clear_context" }
   | { type: "set_turns"; sid: string; turns: Turn[] }
   | { type: "set_artifact"; artifact: Artifact }
+  | { type: "open_artifact_loading"; file: string }
   | { type: "clear_artifact" }
+  | { type: "focus_session"; sid: string }
   | { type: "answer_question" }
   | { type: "enter_new_chat"; cwd: string }
   | { type: "set_new_chat_cwd"; cwd: string }
@@ -185,8 +187,20 @@ export function reduce(state: AppState, action: Action): AppState {
       return patch(state, state.focusedSid, (rt) => { rt.contextReport = null; });
     case "set_artifact":
       return { ...state, artifact: action.artifact };
+    case "open_artifact_loading":
+      // optimistic: show the diff panel (with a spinner) instantly on click; the
+      // diff_report event replaces it with the real sections when it arrives.
+      return { ...state, artifact: { file: action.file, kind: "gitdiff", sections: [], loading: true } };
     case "clear_artifact":
       return { ...state, artifact: null };
+    case "focus_session": {
+      // optimistic view switch: focus the session locally right away (its runtime
+      // is usually already in memory) instead of waiting for the round-trip
+      // session_focus. The server's session_focus later just re-confirms.
+      const sid = action.sid;
+      const runtimes = state.runtimes[sid] ? state.runtimes : { ...state.runtimes, [sid]: createRuntime() };
+      return { ...state, focusedSid: sid, runtimes };
+    }
     case "answer_question":
       return patch(state, state.focusedSid, (rt) => { rt.pendingQuestion = null; });
     case "enter_new_chat":
