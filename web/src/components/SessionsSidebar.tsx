@@ -215,25 +215,29 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
     <>
       <div className={"scrim-side" + (open ? " show" : "")} onClick={onClose} />
       <aside className={"sessions" + (open ? " show" : "")}>
-        <div className="s-head">
-          <div className="brand" onClick={onClose}>
-            <span className="dot" />
-            <span className="name"><b>cc</b><span>·remote</span></span>
+        {/* fixed-width inner so the desktop column can animate its width (0→352)
+            as a slide-reveal without the content reflowing/squishing. */}
+        <div className="s-inner">
+          <div className="s-head">
+            <div className="brand" onClick={onClose}>
+              <span className="dot" />
+              <span className="name"><b>cc</b><span>·remote</span></span>
+            </div>
+            <button className="iconbtn" onClick={onClose} aria-label="关闭"><Icon name="close" /></button>
           </div>
-          <button className="iconbtn" onClick={onClose} aria-label="关闭"><Icon name="close" /></button>
-        </div>
-        <div className="search">
-          <Icon name="search" size={17} />
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索会话、路径…" aria-label="搜索会话" />
-        </div>
-        <div className="s-scroll" onClick={closeMenu}>
-          {filtered.length === 0 && <div className="s-group">{sessions.length === 0 ? "暂无会话" : "无匹配"}</div>}
-          {groupKeys.map((k) => renderGroup(k, groups[k]))}
-          {archived.length > 0 && renderGroup("archived", archived, "已归档")}
-          <div className={"s-lift-scrim" + (lifting ? " show" : "")} onClick={closeMenu} />
-        </div>
-        <div className="s-foot">
-          <button className="newbtn" onClick={onNew}><Icon name="plus" size={19} />新会话</button>
+          <div className="search">
+            <Icon name="search" size={17} />
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索会话、路径…" aria-label="搜索会话" />
+          </div>
+          <div className="s-scroll" onClick={closeMenu}>
+            {filtered.length === 0 && <div className="s-group">{sessions.length === 0 ? "暂无会话" : "无匹配"}</div>}
+            {groupKeys.map((k) => renderGroup(k, groups[k]))}
+            {archived.length > 0 && renderGroup("archived", archived, "已归档")}
+            <div className={"s-lift-scrim" + (lifting ? " show" : "")} onClick={closeMenu} />
+          </div>
+          <div className="s-foot">
+            <button className="newbtn" onClick={onNew}><Icon name="plus" size={19} />新会话</button>
+          </div>
         </div>
       </aside>
     </>
