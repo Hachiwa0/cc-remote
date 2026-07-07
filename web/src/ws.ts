@@ -26,6 +26,9 @@ export class RelayWs {
   private ws: WebSocket | null = null;
   private lastSeqBySession: Record<string, number> = {};
   private focusedSid: string | null = null;
+  // set while a new_session is in flight: the wrapper assigns + focuses it, so
+  // that ONE SessionFocus must be honored even though it won't match focusedSid.
+  private awaitingNewFocus = false;
   private readonly clientId: string;
   private readonly url: string;
   private backoff = 1;
@@ -74,6 +77,7 @@ export class RelayWs {
 
   setFocusedSid(sid: string | null): void {
     this.focusedSid = sid;
+    this.awaitingNewFocus = false; // an explicit switch supersedes a pending new-session focus
   }
 
   private sidObj(): Record<string, unknown> {
@@ -124,6 +128,7 @@ export class RelayWs {
   }
 
   sendNewSession(cwd?: string | null): void {
+    this.awaitingNewFocus = true; // honor the wrapper's focus for the freshly-created session
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "new_session", ts: nowTs() };
     if (cwd) obj.cwd = cwd;
     this.send(obj);
@@ -170,7 +175,16 @@ export class RelayWs {
       try {
         const msg = JSON.parse(e.data) as ServerEvent;
         if (msg.type === "session_focus") {
-          // NON-destructive: just focus + dispatch. Cursor unchanged, no re-hello.
+          // Drop a STALE switch-confirmation: when you click through several
+          // sessions quickly, the wrapper processes each switch in turn and emits
+          // a SessionFocus for every one. Honoring the late ones would "replay"
+          // your clicks — yanking the view through each session. Only honor a
+          // focus that matches your current intent (or the one new_session is
+          // waiting for, or the very first focus when we have none yet).
+          if (this.focusedSid != null && msg.session_id !== this.focusedSid && !this.awaitingNewFocus) {
+            return; // superseded — ignore
+          }
+          this.awaitingNewFocus = false;
           this.focusedSid = msg.session_id;
           this.cb.onEvent(msg);
           return;

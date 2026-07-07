@@ -256,9 +256,11 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       // id-capture is handled by session_rekey — keeping it out of here is what
       // stops a background session's id-capture from stealing the user's view.
       const newF = e.session_id;
-      const runtimes = state.runtimes[newF]
-        ? state.runtimes
-        : { ...state.runtimes, [newF]: createRuntime() };
+      // switch confirmed by the wrapper → stop the loading spinner. Essential for
+      // a RESIDENT session with no replay (e.g. one that only ran /theme and has
+      // no history) — otherwise it'd spin until the 6s fallback.
+      const base = state.runtimes[newF] ?? createRuntime();
+      const runtimes = { ...state.runtimes, [newF]: { ...base, loading: false } };
       return { ...state, focusedSid: newF, runtimes, currentCwd: e.cwd ?? state.currentCwd, switchTick: state.switchTick + 1 };
     }
     case "session_rekey": {
