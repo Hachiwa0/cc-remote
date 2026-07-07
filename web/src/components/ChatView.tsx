@@ -27,7 +27,7 @@ function formatTime(ts: number): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null; turns: Turn[]; onEdit: (prompt: string) => void; onGetDiff: (file: string) => void }) {
+export function ChatView({ sid, turns, loading, onEdit, onGetDiff }: { sid: string | null; turns: Turn[]; loading?: boolean; onEdit: (prompt: string) => void; onGetDiff: (file: string) => void }) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -100,6 +100,14 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
   };
 
   if (turns.length === 0) {
+    if (loading) {
+      return (
+        <div className="empty">
+          <div className="spinner" aria-label="加载中" />
+          <p className="loading-tx">加载会话历史…</p>
+        </div>
+      );
+    }
     return (
       <div className="empty">
         <div className="glyph"><ClaudeMark size={30} /></div>

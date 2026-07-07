@@ -55,6 +55,9 @@ export interface SessionRuntime {
   perm: string;
   replaying: boolean;
   truncated: boolean;
+  // true while we've switched to a session but its history hasn't arrived yet
+  // (no cache hit + waiting on the wrapper's cold spawn/replay) — drives a spinner.
+  loading?: boolean;
   ccSessionId?: string;
   pendingQuestion: { ask_id: string; question: string; options: { label: string; ds?: string }[] } | null;
   contextReport: ContextReport | null;
@@ -108,6 +111,7 @@ export type Action =
   | { type: "open_artifact_loading"; file: string }
   | { type: "clear_artifact" }
   | { type: "focus_session"; sid: string }
+  | { type: "hydrate_cache"; sid: string; turns: Turn[] }
   | { type: "answer_question" }
   | { type: "enter_new_chat"; cwd: string }
   | { type: "set_new_chat_cwd"; cwd: string }
@@ -202,9 +206,19 @@ export function reduce(state: AppState, action: Action): AppState {
       // is usually already in memory) instead of waiting for the round-trip
       // session_focus. The server's session_focus later just re-confirms.
       const sid = action.sid;
-      const runtimes = state.runtimes[sid] ? state.runtimes : { ...state.runtimes, [sid]: createRuntime() };
+      const rt = state.runtimes[sid] ?? createRuntime();
+      // if we have no turns yet, mark loading so the UI shows a spinner (not the
+      // empty "send a message" prompt) until cache-hydrate or the wrapper replay lands.
+      const runtimes = { ...state.runtimes, [sid]: { ...rt, loading: rt.turns.length === 0 } };
       return { ...state, focusedSid: sid, runtimes };
     }
+    case "hydrate_cache":
+      // fill a session's turns from the IndexedDB cache for an INSTANT render;
+      // only if still empty (never clobber live/streaming or already-replayed turns).
+      return patch(state, action.sid, (rt) => {
+        if (rt.turns.length === 0 && action.turns.length) rt.turns = action.turns;
+        rt.loading = false;
+      }, true);
     case "answer_question":
       return patch(state, state.focusedSid, (rt) => { rt.pendingQuestion = null; });
     case "enter_new_chat":
@@ -294,10 +308,12 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return patch(state, e.sid, (rt) => {
         rt.replaying = true;
         rt.truncated = e.truncated;
-        if (e.truncated || !!e.rebuild) rt.turns = [];
+        // rebuild clears turns then refills — keep loading=true so the gap shows a
+        // spinner rather than briefly flashing the empty "send a message" prompt.
+        if (e.truncated || !!e.rebuild) { rt.turns = []; rt.loading = true; }
       });
     case "replay_end":
-      return patch(state, e.sid, (rt) => { rt.replaying = false; rt.truncated = rt.truncated || e.truncated; });
+      return patch(state, e.sid, (rt) => { rt.replaying = false; rt.truncated = rt.truncated || e.truncated; rt.loading = false; });
     case "error":
       return { ...patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);

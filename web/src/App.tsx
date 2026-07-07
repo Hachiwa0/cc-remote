@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
 import { RelayWs } from "./ws";
-import { reduce, initialState, createRuntime } from "./reducer";
+import { reduce, initialState, createRuntime, type Turn } from "./reducer";
 import { uuid } from "./util";
 import { Icon, ClaudeMark } from "./icons";
 import { ChatView } from "./components/ChatView";
@@ -137,6 +137,24 @@ export default function App() {
     });
   }, [focusedSid, rt.turns, rt.ccSessionId]);
 
+  // Hydrate the focused session's turns from IndexedDB for an INSTANT render on
+  // switch — the wrapper's replay (for non-resident sessions) then reconciles.
+  // This completes the previously write-only cache: switching no longer shows an
+  // empty view while waiting on a cold wrapper round-trip. A 6s fallback clears
+  // the spinner if a session has no cache and the wrapper stays silent.
+  useEffect(() => {
+    const sid = focusedSid;
+    if (!sid) return;
+    let cancelled = false;
+    import("./cache").then(({ loadSession }) => loadSession(sid)).then((cached) => {
+      if (!cancelled && cached && Array.isArray(cached.turns) && cached.turns.length) {
+        dispatch({ type: "hydrate_cache", sid, turns: cached.turns as Turn[] });
+      }
+    });
+    const t = window.setTimeout(() => dispatch({ type: "hydrate_cache", sid, turns: [] }), 6000);
+    return () => { cancelled = true; window.clearTimeout(t); };
+  }, [focusedSid]);
+
   // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Option+B => open latest turn's diff
   useEffect(() => {
     if (!authed) return;
@@ -262,7 +280,7 @@ export default function App() {
             onSend={sendFirstMessage} />
         ) : (
           <>
-            <ChatView sid={focusedSid} turns={rt.turns} onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
+            <ChatView sid={focusedSid} turns={rt.turns} loading={!!rt.loading} onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
 
             <Composer
           state={rt.state}
