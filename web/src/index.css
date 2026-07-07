@@ -7,9 +7,9 @@ textarea,input{font:inherit}
 
 /* tokens: light (default) */
 :root,:root[data-theme="light"]{
-  --bg:#F7F5EF; --surface:#FEFDFB; --sidebar:#F1EEE4; --raised:#FBF9F3;
+  --bg:#F7F5EF; --surface:#FEFDFB; --sidebar:#F4F1E9; --raised:#FBF9F3;
   --text:#201E18; --dim:#75705F; --faint:#A29B88;
-  --border:#E7E2D5; --border-strong:#DAD3C2;
+  --border:#E7E2D5; --border-strong:#DAD3C2; --divider:#ECE6DA;
   --accent:#C15F3C; --accent-ink:#A64B2C; --accent-weak:#F2E7DF; --accent-line:#E7D2C6;
   --ok:#3F8B6E; --ok-weak:#E4EFE9;
   --warn:#B07D1E; --warn-weak:#F3EAD6;
@@ -25,9 +25,9 @@ textarea,input{font:inherit}
   --ease:cubic-bezier(.22,.61,.36,1);
 }
 :root[data-theme="dark"]{
-  --bg:#1B1A17; --surface:#252420; --sidebar:#201F1B; --raised:#2C2A25;
+  --bg:#1B1A17; --surface:#252420; --sidebar:#1E1D19; --raised:#2C2A25;
   --text:#ECE9DF; --dim:#9C978A; --faint:#6B675C;
-  --border:#332F29; --border-strong:#433F37;
+  --border:#332F29; --border-strong:#433F37; --divider:#282520;
   --accent:#DB7C5E; --accent-ink:#EB9679; --accent-weak:#352520; --accent-line:#463027;
   --ok:#5FAF8D; --ok-weak:#233029;
   --warn:#CBA24E; --warn-weak:#332C1D;
@@ -105,9 +105,12 @@ body{
 .ubub-act svg{ width:13px; height:13px; }
 .ubub-meta.ai-meta{ margin-left:0; margin-right:auto; }
 .arole{ display:flex; align-items:center; gap:8px; margin:0 0 8px; }
-.arole .av{ width:23px; height:23px; border-radius:7px; background:var(--accent); color:#fff;
-  display:grid; place-items:center; flex:none; }
-.arole .av svg{ width:14px; height:14px; }
+.arole .av{ width:24px; height:24px; border-radius:8px; background:var(--accent-weak); color:var(--accent);
+  border:1px solid var(--accent-line); display:grid; place-items:center; flex:none; }
+.arole .av svg{ width:16px; height:16px; }
+/* the Claude mark bobs + breathes while the turn is running */
+.arole .av.working{ animation:av-work 1.15s ease-in-out infinite; }
+@keyframes av-work{ 0%,100%{ transform:translateY(0) scale(1) } 45%{ transform:translateY(-2.5px) scale(1.09) } }
 .arole .nm{ font-size:12.5px; font-weight:600; color:var(--dim); letter-spacing:.02em; }
 
 /* prose (react-markdown output) */
@@ -516,7 +519,7 @@ body{
   .shell.sidebar-open{ grid-template-columns:352px 1fr; }
   .sessions{ position:static; transform:none; width:auto; height:100dvh; overflow:hidden; }
   .s-inner{ width:352px; }
-  .shell.sidebar-open .sessions{ border-right:1px solid var(--border); }
+  .shell.sidebar-open .sessions{ border-right:1px solid var(--divider); }
   .scrim-side{ display:none; }
 }
 /* CONTEXT REPORT MODAL */

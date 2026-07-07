@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Turn, Block, TextBlock, ToolBlock } from "../reducer";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
-import { Icon } from "../icons";
+import { Icon, ClaudeMark } from "../icons";
 
 type Segment = { kind: "text"; block: TextBlock } | { kind: "tools"; tools: ToolBlock[] };
 
@@ -102,7 +102,7 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
   if (turns.length === 0) {
     return (
       <div className="empty">
-        <div className="glyph"><Icon name="spark" size={28} /></div>
+        <div className="glyph"><ClaudeMark size={30} /></div>
         <h2>已连接</h2>
         <p>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</p>
       </div>
@@ -141,7 +141,7 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
             {t.blocks.length > 0 ? (
               <>
                 <div className="arole">
-                  <span className="av"><Icon name="spark" size={14} /></span>
+                  <span className={"av" + (!t.done ? " working" : "")}><ClaudeMark size={15} /></span>
                   <span className="nm">Claude</span>
                 </div>
                 {groupBlocks(t.blocks).map((seg, si) =>
@@ -166,7 +166,7 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
               </>
             ) : (!t.done && t.prompt) ? (
               <div className="arole">
-                <span className="av"><Icon name="spark" size={14} /></span>
+                <span className="av working"><ClaudeMark size={15} /></span>
                 <span className="nm">Claude<span className="thinking"><span/><span/><span/></span></span>
               </div>
             ) : null}
