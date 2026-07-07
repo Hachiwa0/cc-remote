@@ -112,7 +112,7 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
   return (
     <div className="thread" ref={scrollRef} onScroll={onScroll}>
       <div className="thread-in">
-        {turns.map((t) => (
+        {turns.map((t, ti) => (
           <div className="turn" key={t.id}>
             {(t.prompt || (t.images && t.images.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
@@ -156,7 +156,7 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
                       {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
                       <button className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")} onClick={() => copyText(t.id + "-ai", aiText(t))} aria-label="复制"><Icon name="check" size={13} /></button>
                     </div>
-                    <div className="turn-done-mark"><ClaudeSpark size={22} /></div>
+                    {ti === turns.length - 1 && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
                   </>
                 )}
               </>

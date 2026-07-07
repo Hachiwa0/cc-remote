@@ -366,7 +366,9 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
         if (t) {
           t.done = true;
           if (e.result.subtype === "error_during_execution") t.interrupted = true;
-          if (t.ts && e.result.duration_ms) t.doneTs = t.ts + e.result.duration_ms;
+          // stamp completion time whenever we know when the turn started; a
+          // missing/zero duration_ms must NOT drop the timestamp.
+          if (t.ts) t.doneTs = t.ts + (e.result.duration_ms || 0);
         }
         rt.turns = turns;
         rt.state = "idle";
