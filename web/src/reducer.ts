@@ -305,11 +305,14 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
         const turns = cloneTurns(rt.turns);
         const existing = turns.find((t) => t.id === e.msg_id);
         const imgs = (e.images && e.images.length) ? e.images : undefined;
+        // server ts is seconds -> ms; keep any optimistic client ts already set.
+        const stamp = e.ts ? Math.round(e.ts * 1000) : undefined;
         if (existing) {
           if (!existing.prompt && e.prompt) existing.prompt = e.prompt;
           if (!existing.images && imgs) existing.images = imgs;
+          if (!existing.ts && stamp) existing.ts = stamp;
         } else {
-          turns.push({ id: e.msg_id, prompt: e.prompt, images: imgs, blocks: [], done: false });
+          turns.push({ id: e.msg_id, prompt: e.prompt, images: imgs, blocks: [], done: false, ts: stamp });
         }
         rt.turns = turns;
       });
@@ -366,9 +369,12 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
         if (t) {
           t.done = true;
           if (e.result.subtype === "error_during_execution") t.interrupted = true;
-          // stamp completion time whenever we know when the turn started; a
-          // missing/zero duration_ms must NOT drop the timestamp.
-          if (t.ts) t.doneTs = t.ts + (e.result.duration_ms || 0);
+          // Stamp completion time from the event's own server ts (seconds -> ms).
+          // Robust for BOTH live turns and replayed history: the old
+          // `t.ts + duration_ms` reconstruction dropped the timestamp for any turn
+          // without a client-side start time (i.e. everything after a refresh,
+          // where turns come from history replay). Fall back to start time, then now.
+          t.doneTs = e.ts ? Math.round(e.ts * 1000) : (t.ts || Date.now());
         }
         rt.turns = turns;
         rt.state = "idle";
