@@ -151,7 +151,8 @@ body{
 /* the spark kept under a finished reply (below the time/copy row); click to replay */
 .turn-done-mark{ margin-top:2px; }
 .spark-btn{ display:inline-grid; place-items:center; padding:3px; border-radius:9px; color:var(--accent); transition:.14s; }
-.spark-btn:hover{ background:var(--accent-weak); }
+/* no hover box — the click plays the animation; just a subtle grow for affordance */
+.spark-btn:hover{ transform:scale(1.12); }
 .spark-btn svg{ display:block; }
 @keyframes think{ 0%,80%,100%{ opacity:.25; transform:translateY(0); } 40%{ opacity:1; transform:translateY(-3px); } }
 
