@@ -75,6 +75,15 @@ export class RelayWs {
     this.lastSeqBySession[sid] = seq;
   }
 
+  /** Bulk-seed cursors from the IndexedDB cache BEFORE the first hello, so the
+   *  wrapper replays only the delta (seq > lastSeq) instead of the whole history
+   *  of every resident session — that flood is what wedged reconnect into a loop. */
+  seedCursors(cursors: Record<string, number>): void {
+    for (const [sid, seq] of Object.entries(cursors)) {
+      if (typeof seq === "number" && seq > (this.lastSeqBySession[sid] ?? 0)) this.lastSeqBySession[sid] = seq;
+    }
+  }
+
   setFocusedSid(sid: string | null): void {
     this.focusedSid = sid;
     this.awaitingNewFocus = false; // an explicit switch supersedes a pending new-session focus
@@ -232,6 +241,6 @@ export class RelayWs {
   private scheduleReconnect(): void {
     this.cb.onConnState("reconnecting");
     this.reconnectTimer = setTimeout(() => this.connect(), this.backoff * 1000);
-    this.backoff = Math.min(this.backoff * 2, 30);
+    this.backoff = Math.min(this.backoff * 2, 5);  // cap at 5s so reconnect recovers fast
   }
 }

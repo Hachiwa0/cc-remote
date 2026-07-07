@@ -57,36 +57,45 @@ export default function App() {
     if (!authed) return;
     const token = localStorage.getItem(SESSION_KEY) || "";
 
-    // A snapshot announces a session (cc_session_id/state/cwd); the wrapper's
-    // full-buffer replay (right after) supplies the turns. IDB cache + delta
-    // cursors are Phase 2. Seed a 0 cursor so the next hello requests a replay.
-    async function handleSnapshot(e: Snapshot) {
+    let cancelled = false;
+
+    // A snapshot announces a session (cc_session_id/state/cwd). We do NOT reset
+    // the cursor here anymore — cursors are seeded from the IndexedDB cache before
+    // connecting, so hello asks the wrapper only for the DELTA instead of a full
+    // history replay of every resident session (that flood wedged reconnect).
+    function handleSnapshot(e: Snapshot) {
       dispatch({ type: "event", event: e });
-      const sid = e.cc_session_id ?? e.sid;
-      if (sid) wsRef.current?.setLastSeq(sid, 0);
     }
 
-    const ws = new RelayWs(token, {
-      onEvent: (msg) => {
-        if (msg.type === "snapshot") { void handleSnapshot(msg); return; }
-        dispatch({ type: "event", event: msg });
-        if (msg.type === "wrapper_reconnected") { ws.sendHello(); ws.sendListSessions(); }
-        // refresh the context ring after each turn (local SDK query, no model tokens)
-        if (msg.type === "turn_end") ws.sendGetContext();
-      },
-      onConnState: (s, detail) => {
-        dispatch({ type: "conn", connState: s, detail });
-        if (s === "connected") ws.sendListSessions();
-      },
-      onAuthFail: () => {
-        localStorage.removeItem(SESSION_KEY);
-        setAuthed(false);
-      },
-    });
-    wsRef.current = ws;
-    ws.start();
+    (async () => {
+      let seeded: Record<string, number> = {};
+      try { seeded = await import("./cache").then((m) => m.loadAllCursors()); } catch { /* best-effort */ }
+      if (cancelled) return;
+      const ws = new RelayWs(token, {
+        onEvent: (msg) => {
+          if (msg.type === "snapshot") { handleSnapshot(msg); return; }
+          dispatch({ type: "event", event: msg });
+          if (msg.type === "wrapper_reconnected") { ws.sendHello(); ws.sendListSessions(); }
+          // refresh the context ring after each turn (local SDK query, no model tokens)
+          if (msg.type === "turn_end") ws.sendGetContext();
+        },
+        onConnState: (s, detail) => {
+          dispatch({ type: "conn", connState: s, detail });
+          if (s === "connected") ws.sendListSessions();
+        },
+        onAuthFail: () => {
+          localStorage.removeItem(SESSION_KEY);
+          setAuthed(false);
+        },
+      });
+      ws.seedCursors(seeded);  // delta-only reconnect
+      wsRef.current = ws;
+      ws.start();
+    })();
+
     return () => {
-      ws.stop();
+      cancelled = true;
+      wsRef.current?.stop();
       wsRef.current = null;
       drainingRef.current = false;
     };

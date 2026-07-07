@@ -55,6 +55,32 @@ export async function loadSession(sessionId: string): Promise<CachedSession | nu
   }
 }
 
+/** All cached sessions' last-seen seq, for seeding reconnect cursors so the
+ *  wrapper replays only the DELTA (seq > lastSeq) instead of flooding the full
+ *  history of every resident session on every reconnect. */
+export async function loadAllCursors(): Promise<Record<string, number>> {
+  if (typeof indexedDB === "undefined") return {};
+  try {
+    const d = await db();
+    return await new Promise((resolve) => {
+      const out: Record<string, number> = {};
+      const req = d.transaction(STORE, "readonly").objectStore(STORE).openCursor();
+      req.onsuccess = () => {
+        const cur = req.result;
+        if (!cur) { resolve(out); return; }
+        const r = cur.value as (CachedSession & { v?: number }) | undefined;
+        if (r && r.v === CACHE_VER && typeof r.lastSeq === "number" && r.lastSeq > 0) {
+          out[String(cur.key)] = r.lastSeq;
+        }
+        cur.continue();
+      };
+      req.onerror = () => resolve(out);
+    });
+  } catch {
+    return {};
+  }
+}
+
 let pending: { sid: string; turns: unknown[]; lastSeq: number } | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
