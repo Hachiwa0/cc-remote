@@ -57,8 +57,15 @@ body{
 
 /* CHAT HEADER */
 .c-head{ display:flex; align-items:center; gap:6px; padding:9px 10px 9px 6px;
-  border-bottom:1px solid var(--border); background:var(--bg); flex:none;
+  background:var(--bg); flex:none; position:relative; z-index:7;
   padding-top:max(9px, env(safe-area-inset-top)); }
+/* no hard divider; instead the thread's top content fades + frosts as it scrolls
+   up under the header (毛玻璃渐隐), so header→chat isn't a割裂 line. */
+.c-head::after{ content:""; position:absolute; left:0; right:0; top:100%; height:42px; z-index:6;
+  pointer-events:none; background:linear-gradient(to bottom, var(--bg) 0%, transparent 100%);
+  -webkit-backdrop-filter:blur(3px); backdrop-filter:blur(3px);
+  -webkit-mask-image:linear-gradient(to bottom, #000 0%, #000 22%, transparent 100%);
+  mask-image:linear-gradient(to bottom, #000 0%, #000 22%, transparent 100%); }
 .c-head .titlewrap{ flex:1; min-width:0; }
 .c-head .ttl{ font-weight:600; font-size:15px; letter-spacing:-.01em;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; align-items:center; gap:8px; }
@@ -105,12 +112,12 @@ body{
 .ubub-act svg{ width:13px; height:13px; }
 .ubub-meta.ai-meta{ margin-left:0; margin-right:auto; }
 .arole{ display:flex; align-items:center; gap:8px; margin:0 0 8px; }
-.arole .av{ width:24px; height:24px; border-radius:8px; background:var(--accent-weak); color:var(--accent);
-  border:1px solid var(--accent-line); display:grid; place-items:center; flex:none; }
-.arole .av svg{ width:16px; height:16px; }
-/* the Claude mark bobs + breathes while the turn is running */
-.arole .av.working{ animation:av-work 1.15s ease-in-out infinite; }
-@keyframes av-work{ 0%,100%{ transform:translateY(0) scale(1) } 45%{ transform:translateY(-2.5px) scale(1.09) } }
+/* no box around the mark — just the terracotta sunburst */
+.arole .av{ width:22px; height:22px; color:var(--accent); display:grid; place-items:center; flex:none; }
+.arole .av svg{ width:22px; height:22px; }
+/* while the turn is running the mark breathes — a smooth scale in/out (not a bob) */
+.arole .av.working{ animation:av-work 1.5s ease-in-out infinite; transform-origin:center; }
+@keyframes av-work{ 0%,100%{ transform:scale(1) } 50%{ transform:scale(1.17) } }
 .arole .nm{ font-size:12.5px; font-weight:600; color:var(--dim); letter-spacing:.02em; }
 
 /* prose (react-markdown output) */
@@ -233,9 +240,8 @@ body{
 /* EMPTY STATE */
 .empty{ flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
   text-align:center; padding:40px; gap:6px; }
-.empty .glyph{ width:56px; height:56px; border-radius:17px; background:var(--accent-weak);
-  color:var(--accent); display:grid; place-items:center; margin-bottom:10px; }
-.empty .glyph svg{ width:28px; height:28px; }
+.empty .glyph{ color:var(--accent); display:grid; place-items:center; margin-bottom:14px; }
+.empty .glyph svg{ width:48px; height:48px; }
 .empty h2{ font-family:var(--serif); font-weight:500; font-size:25px; margin:0; letter-spacing:-.01em; }
 .empty p{ color:var(--dim); margin:0; max-width:280px; font-size:14px; }
 

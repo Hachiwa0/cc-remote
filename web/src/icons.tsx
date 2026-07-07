@@ -44,16 +44,15 @@ export function Icon({ name, size = 20, sw = 1.75 }: { name: string; size?: numb
   );
 }
 
-// The Claude mark: a solid terracotta sunburst (radiating tapered rays), in the
-// spirit of the official Claude app icon. Filled (not stroked like Icon), so the
-// rays read as a solid burst; `color` sets the ray color.
+// The Claude mark: a solid terracotta sunburst of tapered rays radiating from a
+// filled centre. Filled (not stroked like Icon); `color` sets the ray colour.
 export function ClaudeMark({ size = 16, className }: { size?: number; className?: string }) {
-  const N = 12;
+  const N = 11; // tapered spikes radiating from centre
+  const ray = "M12 1.9 Q 13.6 6.4 13.0 10.4 Q 12.78 11.7 12 11.7 Q 11.22 11.7 11.0 10.4 Q 10.4 6.4 12 1.9 Z";
   return (
     <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" className={className} aria-hidden="true">
       {Array.from({ length: N }, (_, i) => (
-        <rect key={i} x="10.95" y="2.5" width="2.1" height="8.1" rx="1.05"
-          transform={`rotate(${(360 / N) * i} 12 12)`} />
+        <path key={i} d={ray} transform={`rotate(${(360 / N) * i} 12 12)`} />
       ))}
     </svg>
   );
