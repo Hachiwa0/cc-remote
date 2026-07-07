@@ -21,7 +21,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from cc_remote.config import RelayConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, Hello, ProtocolError, WrapperDisconnected, WrapperReconnected,
+    Error, ProtocolError, WrapperDisconnected, WrapperReconnected,
     deserialize, serialize,
     ERR_WRAPPER_OFFLINE, ERR_WRAPPER_ALREADY_CONNECTED, ERR_PROTOCOL,
 )

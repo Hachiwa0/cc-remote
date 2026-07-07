@@ -246,18 +246,10 @@ class NewSession(_Base):
     cwd: Optional[str] = None
 
 
-class SessionSwitched(_Base):
-    """wrapper -> client: switch/creation finished; client clears turns + re-hellos."""
-    type: Literal["session_switched"] = "session_switched"
-    session_id: str
-    cwd: Optional[str] = None  # the switched-to session's cwd
-
-
 class SessionFocus(_Base):
     """wrapper -> client: NON-destructive view change — the user switched which
-    resident session they're viewing. Distinct from SessionSwitched (which is
-    destructive: clears turns on a full reconnect). The client just swaps its
-    view to this session; turns are NOT cleared (they're already in memory).
+    resident session they're viewing. The client just swaps its view to this
+    session; turns are NOT cleared (they're already in memory).
 
     Focus-moving ONLY: sending this switches the client's view. A brand-new
     session captures its real cc id mid-turn — that is a re-key, NOT a focus
@@ -384,7 +376,7 @@ class AnswerQuestion(_Base):
 AnyMessage = Union[
     Hello, Query, Interrupt, SetModel, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport, DiffReport, AskUser, AnswerQuestion,
-    SessionList, SessionSwitched, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
+    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
@@ -426,7 +418,6 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "ask_user": AskUser,
     "answer_question": AnswerQuestion,
     "session_list": SessionList,
-    "session_switched": SessionSwitched,
     "session_focus": SessionFocus,
     "session_rekey": SessionRekey,
     "user_msg": UserMsg,

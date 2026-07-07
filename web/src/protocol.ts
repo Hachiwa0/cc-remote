@@ -61,7 +61,6 @@ export interface ListSessions extends Base { type: "list_sessions" }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string }
 export interface NewSession extends Base { type: "new_session"; cwd?: string | null }
 export interface SessionList extends Base { type: "session_list"; sessions: SessionInfo[] }
-export interface SessionSwitched extends Base { type: "session_switched"; session_id: string; cwd?: string | null }
 export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null }
 // NON-focusing re-key: a temp-keyed new session captured its real cc id. Rename
 // the runtime old_key -> session_id + migrate the cursor; focus only follows if
@@ -94,7 +93,7 @@ export interface ContextReport extends Base {
 export type ServerEvent =
   | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Perm | ContextReport | DiffReport
   | AskUser
-  | SessionList | SessionSwitched | SessionFocus | SessionRekey
+  | SessionList | SessionFocus | SessionRekey
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;

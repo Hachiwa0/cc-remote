@@ -50,7 +50,7 @@ from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
     Error, Hello, Model, Perm, ContextReport, DiffReport, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
-    SessionInfo, SessionList, SessionSwitched, SessionFocus, SessionRekey, DirList,
+    SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL,
 )

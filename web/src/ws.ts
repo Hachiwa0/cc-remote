@@ -171,15 +171,6 @@ export class RelayWs {
           this.cb.onEvent(msg);
           return;
         }
-        if (msg.type === "session_switched") {
-          // Legacy destructive path (wrapper restart reconnect): reset cursors
-          // and re-hello. The non-interrupting flow uses session_focus above.
-          this.focusedSid = msg.session_id || this.focusedSid;
-          this.lastSeqBySession = {};
-          this.cb.onEvent(msg);
-          this.sendHello();
-          return;
-        }
         if (msg.type === "session_rekey") {
           // Runtime re-key (tmp -> real id): migrate the cursor and, ONLY if we
           // were viewing old_key, the focus. Never a focus change by itself.

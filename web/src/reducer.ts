@@ -250,12 +250,6 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
         currentCwd: wasFocused && e.cwd ? e.cwd : state.currentCwd,
       };
     }
-    case "session_switched":
-      // Destructive (wrapper restart reconnect path). Clear the focused runtime.
-      return patch(state, e.session_id || state.focusedSid, (rt) => {
-        rt.turns = []; rt.state = "idle"; rt.replaying = false; rt.truncated = false;
-        rt.queue = []; rt.pendingSend = null; rt.pendingQuestion = null;
-      });
     case "session_list":
       return { ...state, sessions: e.sessions };
     case "dir_list":

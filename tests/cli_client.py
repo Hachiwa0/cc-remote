@@ -21,7 +21,7 @@ import uuid
 import cc_remote.config  # noqa: F401  (triggers .env load)
 from cc_remote.log import logger, setup
 from cc_remote.protocol import (
-    Error, Hello, Interrupt, Ping, Query, ProtocolError,
+    Hello, Interrupt, Ping, Query, ProtocolError,
     deserialize, serialize,
 )
 from websockets.asyncio.client import connect

@@ -13,7 +13,7 @@ from typing import Any
 
 from claude_agent_sdk.types import (
     AssistantMessage, ResultMessage, UserMessage, SystemMessage,
-    StreamEvent, RateLimitEvent, ToolUseBlock, ToolResultBlock,
+    StreamEvent, ToolUseBlock, ToolResultBlock,
 )
 
 from cc_remote.protocol import (

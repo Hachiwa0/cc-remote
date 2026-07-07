@@ -1,6 +1,7 @@
-// Slash commands, models, permission modes — lifted from design/prototype.html.
-// Phase 1: slash commands are client-side prompt prefixes; model/perm chips are
-// UI-only (wired to the backend in Phase 2).
+// Slash commands, models, permission modes. Slash commands split into
+// client-side ones (CLIENT_SLASHES: model/plan/normal/permissions/clear/context,
+// handled in Composer.send) and cc skills (forwarded verbatim to cc). Model/perm
+// chips drive set_model / set_permission_mode on the wrapper.
 
 export interface CmdGroup { g: string }
 export interface Cmd { slash: string; name: string; ds: string; ic: string }
@@ -56,7 +57,7 @@ export function isCmd(c: Command): c is Cmd {
   return (c as Cmd).slash !== undefined;
 }
 
-export const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
+const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 
 // Slashes handled locally by the web client (never forwarded to cc as a prompt).
 // Everything else (code-review, verify, run, deep-research, …) is a cc skill and
