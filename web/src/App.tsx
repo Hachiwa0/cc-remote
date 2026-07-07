@@ -32,6 +32,8 @@ export default function App() {
   const wsRef = useRef<RelayWs | null>(null);
   const drainingRef = useRef(false);
   const touchStartX = useRef(0);
+  // guards the once-per-connection "land on the latest session" auto-focus below
+  const didInitFocusRef = useRef(false);
 
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
@@ -55,6 +57,7 @@ export default function App() {
   // WebSocket lifecycle
   useEffect(() => {
     if (!authed) return;
+    didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
     const token = localStorage.getItem(SESSION_KEY) || "";
 
     let cancelled = false;
@@ -100,6 +103,27 @@ export default function App() {
       drainingRef.current = false;
     };
   }, [authed]);
+
+  // Land on the MOST-RECENTLY-ACTIVE session on load. The wrapper's hello sends a
+  // snapshot per resident session but no focus, so the reducer defaults to the
+  // first one (the bootstrap session) — not where you last worked. Once the
+  // session list arrives, switch to the latest by last_modified (same field the
+  // sidebar sorts by). Guarded to fire once per connection: reconnects keep the
+  // current view; only a fresh page load / re-login re-arms it.
+  useEffect(() => {
+    if (didInitFocusRef.current || !wsRef.current) return;
+    if (state.sessions.length === 0) return;  // wait for the list
+    const latest = [...state.sessions]
+      .filter((s) => s.tag !== "archived")
+      .sort((a, b) => (parseInt(b.last_modified || "0", 10) || 0) - (parseInt(a.last_modified || "0", 10) || 0))[0]
+      ?? state.sessions[0];
+    didInitFocusRef.current = true;
+    if (latest && latest.session_id !== state.focusedSid) {
+      dispatch({ type: "focus_session", sid: latest.session_id });
+      wsRef.current.setFocusedSid(latest.session_id);
+      wsRef.current.sendSwitchSession(latest.session_id);
+    }
+  }, [state.sessions]);
 
   // interrupt-and-send: when the focused session returns to idle, fire its pending message
   useEffect(() => {
