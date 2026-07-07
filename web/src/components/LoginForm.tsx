@@ -60,7 +60,6 @@ export function LoginForm({
         <button className="login-btn" onClick={submit} disabled={loading || !password}>
           {loading ? "登录中…" : "进入"}
         </button>
-        <div className="login-foot">relay · 127.0.0.1:19191 → GLM</div>
       </div>
     </div>
   );
