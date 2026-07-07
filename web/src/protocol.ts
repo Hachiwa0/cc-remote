@@ -27,6 +27,7 @@ export interface QueryFile { filename: string; data: string }
 export interface Query extends Base { type: "query"; prompt: string; msg_id: string; images?: QueryImg[] | null; files?: QueryFile[] | null }
 export interface Interrupt extends Base { type: "interrupt" }
 export interface SetModel extends Base { type: "set_model"; model: string }
+export interface SetEffort extends Base { type: "set_effort"; effort: string }
 export interface Ping extends Base { type: "ping"; n: number }
 export interface Pong extends Base { type: "pong"; n: number }
 export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean; rebuild?: boolean }
@@ -34,6 +35,7 @@ export interface ReplayEnd extends Base { type: "replay_end"; to_seq: number; tr
 export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string; cwd?: string | null }
 export interface StateEvent extends Base { type: "state"; state: State }
 export interface Model extends Base { type: "model"; model: string }
+export interface Effort extends Base { type: "effort"; effort: string }
 export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string }
@@ -91,7 +93,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Perm | ContextReport | DiffReport
+  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Perm | ContextReport | DiffReport
   | AskUser
   | SessionList | SessionFocus | SessionRekey
   | DirList

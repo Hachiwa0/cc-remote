@@ -37,6 +37,18 @@ export const MODELS: Model[] = [
   { id: "claude-fable-5", name: "Fable 5", ds: "大便", ic: "book" },
 ];
 
+// Reasoning effort (思考强度) — maps to the cc `--effort` flag. Changing it
+// respawns the session with resume (one cold context resend), so it's a
+// deliberate knob, not a per-message toggle.
+export interface Effort { id: string; name: string; ds: string; ic: string }
+export const EFFORTS: Effort[] = [
+  { id: "low", name: "低", ds: "最省 · 最快响应", ic: "gauge1" },
+  { id: "medium", name: "中", ds: "适度思考", ic: "gauge2" },
+  { id: "high", name: "高", ds: "深度推理 · 默认", ic: "gauge3" },
+  { id: "xhigh", name: "超高", ds: "更深推理 · 部分模型支持", ic: "gauge4" },
+  { id: "max", name: "最大", ds: "最强 · 最慢最贵", ic: "gauge5" },
+];
+
 // Map a cc-reported model id (e.g. "claude-mythos-5[1m]") to a MODELS entry id.
 export function matchModelId(m: string): string {
   const base = m.replace(/\[.*\]$/, "");

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import type { State, QueryImg, QueryFile } from "../protocol";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
-import { MODELS, PERMS, CLIENT_SLASHES, slashToken, matchCommands, parseSlash } from "../data";
+import { MODELS, EFFORTS, PERMS, CLIENT_SLASHES, slashToken, matchCommands, parseSlash } from "../data";
 import { CommandSheet } from "./CommandSheet";
 
 interface Props {
@@ -13,6 +13,7 @@ interface Props {
   setSendMode: (m: "interrupt" | "queue") => void;
   queue: string[];
   model: string;
+  effort: string;
   perm: string;
   editPrompt: string | null;
   onEditConsumed: () => void;
@@ -22,6 +23,7 @@ interface Props {
   onSetPending: (prompt: string) => void;
   onDequeue: (i: number) => void;
   onSetModel: (model: string) => void;
+  onSetEffort: (effort: string) => void;
   onSetPerm: (perm: string) => void;
   onClear: () => void;
   onContext: () => void;
@@ -31,7 +33,7 @@ export function Composer(p: Props) {
   const [input, setInput] = useState("");
   // Only the modal pickers live in state now; the "/" command palette is a live
   // popover DERIVED from the composer text (no second input box).
-  const [sheetKind, setSheetKind] = useState<"models" | "perms" | null>(null);
+  const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<number | null>(null);
   const [images, setImages] = useState<QueryImg[]>([]);
@@ -198,6 +200,7 @@ export function Composer(p: Props) {
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
   const model = MODELS.find((m) => m.id === p.model) || { id: p.model, name: p.model || MODELS[0].name, ds: "", ic: "cpu" };
+  const effort = EFFORTS.find((e) => e.id === p.effort) || EFFORTS[2]; // default 高
   const perm = PERMS.find((x) => x.id === p.perm) || PERMS[0];
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm.id === "plan" ? " plan" : perm.danger ? " danger" : "";
@@ -290,6 +293,10 @@ export function Composer(p: Props) {
             <span className="ci"><Icon name={model.ic} size={15} /></span>
             <span className="cv">{model.name}</span>
           </button>
+          <button className="cchip mini" aria-label="思考强度" onClick={() => setSheetKind("efforts")}>
+            <span className="ci"><Icon name={effort.ic} size={15} /></span>
+            <span className="cv">{effort.name}</span>
+          </button>
           <button className={sendClass} onClick={send} disabled={disabled} aria-label="发送">
             <Icon name={sendIcon} size={19} />
           </button>
@@ -313,6 +320,8 @@ export function Composer(p: Props) {
         onClose={() => setSheetKind(null)}
         currentModel={p.model}
         onPickModel={(m) => { p.onSetModel(m); setSheetKind(null); }}
+        currentEffort={p.effort}
+        onPickEffort={(ef) => { p.onSetEffort(ef); setSheetKind(null); }}
         currentPerm={p.perm}
         onPickPerm={(perm) => { p.onSetPerm(perm); setSheetKind(null); }}
       />

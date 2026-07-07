@@ -1,9 +1,9 @@
-import { COMMANDS, MODELS, PERMS, isCmd, type Cmd, type CmdGroup } from "../data";
+import { COMMANDS, MODELS, EFFORTS, PERMS, isCmd, type Cmd, type CmdGroup } from "../data";
 import { Icon } from "../icons";
 
 interface Props {
   open: boolean;
-  kind: "commands" | "models" | "perms";
+  kind: "commands" | "models" | "efforts" | "perms";
   // command mode: the token typed after "/" in the composer (prefix filter).
   // There is NO input box in this sheet anymore — the composer textarea is the
   // single input, and this palette is a live suggestion overlay driven by it.
@@ -12,13 +12,16 @@ interface Props {
   onPickCommand?: (slash: string) => void;
   currentModel?: string;
   onPickModel?: (model: string) => void;
+  currentEffort?: string;
+  onPickEffort?: (effort: string) => void;
   currentPerm?: string;
   onPickPerm?: (perm: string) => void;
 }
 
-export function CommandSheet({ open, kind, filter = "", onClose, onPickCommand, currentModel, onPickModel, currentPerm, onPickPerm }: Props) {
+export function CommandSheet({ open, kind, filter = "", onClose, onPickCommand, currentModel, onPickModel, currentEffort, onPickEffort, currentPerm, onPickPerm }: Props) {
   const isCmdMode = kind === "commands";
   const isPermMode = kind === "perms";
+  const isEffortMode = kind === "efforts";
   const f = filter.toLowerCase();
 
   // Prefix-match on the slash (same rule the composer uses to decide visibility),
@@ -38,7 +41,7 @@ export function CommandSheet({ open, kind, filter = "", onClose, onPickCommand, 
   }
   const visible = groups.filter((g) => g.cmds.length > 0);
 
-  const title = isCmdMode ? "命令面板" : isPermMode ? "选择权限模式" : "选择模型";
+  const title = isCmdMode ? "命令面板" : isPermMode ? "选择权限模式" : isEffortMode ? "选择思考强度" : "选择模型";
 
   return (
     <>
@@ -76,6 +79,23 @@ export function CommandSheet({ open, kind, filter = "", onClose, onPickCommand, 
                   <span className="cmd-ds">{p.ds}</span>
                 </span>
                 {p.id === currentPerm
+                  ? <span className="cmd-check"><Icon name="check" size={19} /></span>
+                  : <span className="cmd-kbd" />}
+              </button>
+            ))
+          ) : isEffortMode ? (
+            EFFORTS.map((ef) => (
+              <button
+                key={ef.id}
+                className={"cmd" + (ef.id === currentEffort ? " sel" : "")}
+                onClick={() => onPickEffort?.(ef.id)}
+              >
+                <span className="cmd-ic"><Icon name={ef.ic} size={17} /></span>
+                <span className="cmd-tx">
+                  <span className="cmd-nm">{ef.name}</span>
+                  <span className="cmd-ds">{ef.ds}</span>
+                </span>
+                {ef.id === currentEffort
                   ? <span className="cmd-check"><Icon name="check" size={19} /></span>
                   : <span className="cmd-kbd" />}
               </button>

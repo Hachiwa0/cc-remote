@@ -95,6 +95,10 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_model", model, ts: nowTs(), ...this.sidObj() });
   }
 
+  sendSetEffort(effort: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_effort", effort, ts: nowTs(), ...this.sidObj() });
+  }
+
   sendSetPerm(mode: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }

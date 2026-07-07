@@ -41,6 +41,7 @@ class SessionContext:
     turn_task: Optional[asyncio.Task] = None
     translator: Optional[StreamTranslator] = None
     announced_model: Optional[str] = None
+    announced_effort: Optional[str] = None
     announced_perm: Optional[str] = None
     pending_asks: dict = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)

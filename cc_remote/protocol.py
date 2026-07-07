@@ -81,6 +81,14 @@ class SetModel(_Base):
     model: str
 
 
+class SetEffort(_Base):
+    """client -> wrapper: set the session's reasoning effort (thinking strength).
+    Unlike set_model, effort is a spawn-time CLI flag (--effort), so applying it
+    respawns the cc subprocess with resume — done lazily at the next turn."""
+    type: Literal["set_effort"] = "set_effort"
+    effort: str  # low | medium | high | xhigh | max
+
+
 class Ping(_Base):
     type: Literal["ping"] = "ping"
     n: int
@@ -129,6 +137,13 @@ class Model(_Base):
     Downstream so a reconnecting client restores the model readout."""
     type: Literal["model"] = "model"
     model: str
+
+
+class Effort(_Base):
+    """The session's current reasoning effort. Downstream so a reconnecting
+    client restores the effort readout."""
+    type: Literal["effort"] = "effort"
+    effort: str
 
 
 class UserMsg(_Base):
@@ -374,8 +389,8 @@ class AnswerQuestion(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport, DiffReport, AskUser, AnswerQuestion,
+    Hello, Query, Interrupt, SetModel, SetEffort, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
@@ -385,7 +400,7 @@ AnyMessage = Union[
 # control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "state", "model", "perm",
+    "user_msg", "state", "model", "effort", "perm",
     "assistant_msg_start", "delta", "tool_use", "tool_result",
     "assistant_msg_end", "turn_end", "error", "ask_user",
 })
@@ -395,6 +410,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "query": Query,
     "interrupt": Interrupt,
     "set_model": SetModel,
+    "set_effort": SetEffort,
     "set_perm": SetPerm,
     "get_context": GetContext,
     "get_diff": GetDiff,
@@ -412,6 +428,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "snapshot": Snapshot,
     "state": StateEvent,
     "model": Model,
+    "effort": Effort,
     "perm": Perm,
     "context_report": ContextReport,
     "diff_report": DiffReport,

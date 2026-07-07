@@ -51,6 +51,7 @@ export interface SessionRuntime {
   turns: Turn[];
   state: State;
   model: string;
+  effort: string;
   perm: string;
   replaying: boolean;
   truncated: boolean;
@@ -82,7 +83,7 @@ export interface AppState {
 
 export function createRuntime(): SessionRuntime {
   return {
-    turns: [], state: "idle", model: "claude-mythos-5", perm: "bypassPermissions",
+    turns: [], state: "idle", model: "claude-mythos-5", effort: "high", perm: "bypassPermissions",
     replaying: false, truncated: false, pendingQuestion: null, contextReport: null,
     queue: [], pendingSend: null,
   };
@@ -98,6 +99,7 @@ export type Action =
   | { type: "set_pending"; prompt: string }
   | { type: "clear_pending" }
   | { type: "set_model"; model: string }
+  | { type: "set_effort"; effort: string }
   | { type: "set_perm"; perm: string }
   | { type: "set_context"; report: ContextReport }
   | { type: "clear_context" }
@@ -177,6 +179,8 @@ export function reduce(state: AppState, action: Action): AppState {
       return patch(state, state.focusedSid, (rt) => { rt.pendingSend = null; });
     case "set_model":
       return patch(state, state.focusedSid, (rt) => { rt.model = action.model; });
+    case "set_effort":
+      return patch(state, state.focusedSid, (rt) => { rt.effort = action.effort; });
     case "set_perm":
       return patch(state, state.focusedSid, (rt) => { rt.perm = action.perm; });
     case "set_turns":
@@ -278,6 +282,8 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return patch(state, e.sid, (rt) => { rt.state = e.state; });
     case "model":
       return patch(state, e.sid, (rt) => { rt.model = matchModelId(e.model); });
+    case "effort":
+      return patch(state, e.sid, (rt) => { rt.effort = e.effort; });
     case "perm":
       return patch(state, e.sid, (rt) => { rt.perm = e.mode; });
     case "context_report":

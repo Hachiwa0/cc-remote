@@ -49,7 +49,7 @@ from claude_agent_sdk.types import ResultMessage
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, Hello, Model, Perm, ContextReport, DiffReport, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
+    Error, Hello, Model, Effort, Perm, ContextReport, DiffReport, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
     SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL,
@@ -178,6 +178,8 @@ class WrapperMachine:
             await self._handle_interrupt(cmd)
         elif t == "set_model":
             await self._handle_set_model(cmd)
+        elif t == "set_effort":
+            await self._handle_set_effort(cmd)
         elif t == "set_perm":
             await self._handle_set_perm(cmd)
         elif t == "get_context":
@@ -282,6 +284,19 @@ class WrapperMachine:
         except Exception as e:
             log.exception("set_model failed", error=str(e))
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_model failed: {e}"))
+
+    async def _handle_set_effort(self, cmd) -> None:
+        # effort (--effort) is spawn-time, so unlike set_model we can't flip it on
+        # the live subprocess. Just record the desired level and announce it; the
+        # respawn-with-resume happens lazily at the next turn (see _run_turn), so an
+        # idle effort tweak costs no tokens until the user actually sends.
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return
+        ctx.sdk.effort = cmd.effort
+        ctx.announced_effort = cmd.effort
+        await self._emit(ctx, Effort(effort=cmd.effort))
+        log.info("effort set (applies on next turn via reconnect)", sid=ctx.session_id, effort=cmd.effort)
 
     async def _handle_set_perm(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -731,6 +746,14 @@ class WrapperMachine:
                 await queue.put(None)
 
         try:
+            # apply a pending effort change: --effort is spawn-time, so respawn the
+            # cc subprocess (resume preserves context) before issuing this turn. Only
+            # fires when the level actually changed since the live client was spawned;
+            # costs one resume (cold prompt cache) on the first turn after a change.
+            if ctx.sdk.effort != ctx.sdk.applied_effort:
+                log.info("applying effort change via reconnect", sid=ctx.session_id,
+                         effort=ctx.sdk.effort, was=ctx.sdk.applied_effort)
+                await ctx.sdk.force_reconnect(resume_id=ctx.session_id, cwd=ctx.cwd, reason="effort change")
             if files:
                 prompt = self._stash_files(prompt, files)
             if images:

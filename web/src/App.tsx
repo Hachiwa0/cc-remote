@@ -196,6 +196,10 @@ export default function App() {
     wsRef.current?.sendSetModel(model);
     dispatch({ type: "set_model", model });
   };
+  const setEffort = (effort: string) => {
+    wsRef.current?.sendSetEffort(effort);
+    dispatch({ type: "set_effort", effort });
+  };
   const setPerm = (perm: string) => {
     wsRef.current?.sendSetPerm(perm);
     dispatch({ type: "set_perm", perm });
@@ -266,6 +270,7 @@ export default function App() {
           setSendMode={(m) => dispatch({ type: "set_send_mode", mode: m })}
           queue={rt.queue}
           model={rt.model}
+          effort={rt.effort}
           perm={rt.perm}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
@@ -275,6 +280,7 @@ export default function App() {
           onSetPending={(prompt) => dispatch({ type: "set_pending", prompt })}
           onDequeue={(i) => dispatch({ type: "dequeue_at", i })}
           onSetModel={setModel}
+          onSetEffort={setEffort}
           onSetPerm={setPerm}
           onClear={() => dispatch({ type: "enter_new_chat", cwd: state.currentCwd })}
           onContext={() => wsRef.current?.sendGetContext()}

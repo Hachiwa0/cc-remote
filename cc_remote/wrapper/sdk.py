@@ -26,6 +26,11 @@ class SdkHandle:
         self.cfg = cfg
         self.ask_server = ask_server  # in-process MCP server exposing ask_user
         self.client: ClaudeSDKClient | None = None
+        # reasoning effort is a spawn-time flag (--effort), not a runtime setter.
+        # `effort` is the desired level; `applied_effort` is what the live client
+        # was spawned with — they differ after set_effort until the next reconnect.
+        self.effort: str | None = None
+        self.applied_effort: str | None = None
 
     @staticmethod
     def preflight() -> None:
@@ -48,6 +53,7 @@ class SdkHandle:
             permission_mode="bypassPermissions",  # unattended; matches settings.json
             cwd=cwd or self.cfg.cc_cwd,           # dynamic: must match the resumed session's cwd
             resume=resume_id or None,
+            effort=self.effort,                   # reasoning strength; None -> CLI default (high)
             stderr=self._on_stderr,               # surface cc subprocess errors
             # setting_sources left None -> load ~/.claude/settings.json (model link, model id)
             system_prompt={
@@ -79,7 +85,9 @@ class SdkHandle:
         opts = self._options(resume_id, cwd)
         self.client = ClaudeSDKClient(options=opts)
         await self.client.connect()
-        log.info("sdk connected", resume=bool(resume_id), cwd=opts.cwd, sdk_version=SDK_VERSION)
+        self.applied_effort = self.effort  # the live subprocess now reflects this effort
+        log.info("sdk connected", resume=bool(resume_id), cwd=opts.cwd,
+                 effort=self.effort, sdk_version=SDK_VERSION)
 
     async def query(self, prompt) -> None:
         """Send a request. `prompt` is a string, or an async iterable of user-
@@ -120,9 +128,11 @@ class SdkHandle:
             finally:
                 self.client = None
 
-    async def force_reconnect(self, resume_id: str | None, cwd: str | None = None) -> None:
-        """Last-resort after a drain timeout: tear down and reconnect with resume."""
-        log.warning("force-reconnecting SDK client after drain timeout")
+    async def force_reconnect(self, resume_id: str | None, cwd: str | None = None,
+                              reason: str = "drain timeout") -> None:
+        """Tear down and reconnect with resume. Used after a drain timeout, and to
+        apply a spawn-time option change (e.g. effort) to a live session."""
+        log.warning("force-reconnecting SDK client", reason=reason)
         try:
             await self.disconnect()
         except Exception as e:
