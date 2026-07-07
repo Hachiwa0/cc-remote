@@ -31,6 +31,8 @@ const PATHS: Record<string, string> = {
   init: '<path d="M12 3v18M3 12h18" opacity=".25"/><circle cx="12" cy="12" r="8.5"/><path d="M12 8v4l2.5 2.5"/>',
   folder: '<path d="M3.5 7.5A1.5 1.5 0 015 6h4l2 2.5h8A1.5 1.5 0 0120.5 10v8A1.5 1.5 0 0119 19.5H5A1.5 1.5 0 013.5 18z"/>',
   chev: '<path d="M6 9l6 6 6-6"/>',
+  'chevrons-left': '<path d="M11 7l-5 5 5 5M18 7l-5 5 5 5"/>',
+  'chevrons-right': '<path d="M13 7l5 5-5 5M6 7l5 5-5 5"/>',
   cpu: '<rect x="6.5" y="6.5" width="11" height="11" rx="2"/><path d="M9.5 2.5v2M14.5 2.5v2M9.5 19.5v2M14.5 19.5v2M2.5 9.5h2M2.5 14.5h2M19.5 9.5h2M19.5 14.5h2"/>',
   check: '<path d="M5 12.5l4.5 4.5L19 7"/>',
   archive: '<rect x="3" y="4" width="18" height="4" rx="1.5"/><path d="M5 8v9a2 2 0 002 2h10a2 2 0 002-2V8"/><path d="M10 12h4"/>',

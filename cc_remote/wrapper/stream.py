@@ -197,11 +197,15 @@ def translate_history(messages, tool_result_max: int) -> list:
                     if not started:
                         events.append(AssistantMsgStart(message_id=mid))
                         started = True
+                    # a stored tool_use input SHOULD be a dict, but old/odd history
+                    # can carry a scalar (e.g. 3); coerce so ToolUse validation
+                    # doesn't crash the whole history load (and thus the resume).
+                    _inp = b.get("input")
                     events.append(ToolUse(
                         message_id=mid,
                         tool_use_id=b.get("id") or "",
                         tool=b.get("name") or "",
-                        input=b.get("input") or {},
+                        input=_inp if isinstance(_inp, dict) else ({} if _inp is None else {"value": _inp}),
                     ))
                 # thinking / unknown blocks: skipped (MVP)
             if started:

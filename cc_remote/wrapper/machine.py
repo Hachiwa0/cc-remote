@@ -654,8 +654,14 @@ class WrapperMachine:
         except Exception as e:
             log.warning("get_session_messages failed", session_id=session_id, error=str(e))
             return
-        events = translate_history(msgs, self.cfg.tool_result_max)
-        mdl = last_assistant_model(msgs)
+        try:
+            events = translate_history(msgs, self.cfg.tool_result_max)
+            mdl = last_assistant_model(msgs)
+        except Exception as e:
+            # a single malformed history message must never break the resume — the
+            # session still connects; the client just won't get the replayed history.
+            log.exception("translate_history failed; resuming without replay", session_id=session_id, error=str(e))
+            return
         async with ctx.emit_lock:
             if mdl and mdl.startswith("claude-") and mdl != ctx.announced_model:
                 ctx.announced_model = mdl

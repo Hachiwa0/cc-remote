@@ -27,7 +27,7 @@ export function ArtifactPanel({ artifact, onClose }: { artifact: Artifact; onClo
       <div className="artifact-head">
         <span className="artifact-title">{artifact.file.split("/").pop()}</span>
         <span className="artifact-path" title={artifact.file}>{artifact.file || "所有改动"}</span>
-        <button className="iconbtn" onClick={onClose} aria-label="关闭"><Icon name="close" /></button>
+        <button className="iconbtn" onClick={onClose} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>
       <div className="artifact-body">
         {loading ? (

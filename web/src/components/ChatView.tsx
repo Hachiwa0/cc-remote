@@ -140,10 +140,6 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
             )}
             {t.blocks.length > 0 ? (
               <>
-                <div className="arole">
-                  <span className="av"><ClaudeMark size={16} /></span>
-                  <span className="nm">Claude</span>
-                </div>
                 {groupBlocks(t.blocks).map((seg, si) =>
                   seg.kind === "text" ? (
                     <MessageBlock key={`t${si}`} text={seg.block.text} done={seg.block.done} />
@@ -162,13 +158,7 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
                 )}
               </>
             ) : (!t.done && t.prompt) ? (
-              <>
-                <div className="arole">
-                  <span className="av"><ClaudeMark size={16} /></span>
-                  <span className="nm">Claude</span>
-                </div>
-                <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">思考中</span></div>
-              </>
+              <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">思考中</span></div>
             ) : null}
             {fileChips(t)}
             {t.interrupted && <div className="note interrupted">— 已打断 —</div>}

@@ -223,7 +223,7 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
               <span className="brand-mark"><ClaudeMark size={17} /></span>
               <span className="name"><b>cc</b><span>·remote</span></span>
             </div>
-            <button className="iconbtn" onClick={onClose} aria-label="关闭"><Icon name="close" /></button>
+            <button className="iconbtn" onClick={onClose} aria-label="收起"><Icon name="chevrons-left" /></button>
           </div>
           <div className="search">
             <Icon name="search" size={17} />
