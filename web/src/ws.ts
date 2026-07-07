@@ -124,6 +124,19 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "get_diff", file, theme, ts: nowTs(), ...this.sidObj() });
   }
 
+  /** Fetch a session's history as ONE bulk frame, read on-demand from its
+   *  transcript (like a web chat's GET /conversation). client_id lets the wrapper
+   *  route the History reply to=this client. Replaces per-hello buffer replay. */
+  sendGetHistory(sessionId: string, before?: string | null, limit?: number | null): void {
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_history", session_id: sessionId,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (before) obj.before = before;
+    if (limit) obj.limit = limit;
+    this.send(obj);
+  }
+
   sendAnswerQuestion(askId: string, answer: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
   }

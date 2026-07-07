@@ -292,6 +292,29 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
     }
     case "session_list":
       return { ...state, sessions: e.sessions };
+    case "history": {
+      // Bulk on-demand history (one frame, read from the transcript — like a web
+      // chat's GET /conversation). Rebuild this session's COMPLETED turns by
+      // running the events through a throwaway empty runtime: this reuses the
+      // per-event reduce logic verbatim so deltas accumulate EXACTLY ONCE (never
+      // double-appending over cache-hydrated or live text). Any not-yet-done turn
+      // already in the runtime (an in-flight turn still streaming live, not yet in
+      // the transcript) is preserved and appended after the rebuilt history.
+      const sid = e.session_id;
+      let scratch: AppState = { ...state, runtimes: { [sid]: createRuntime() } };
+      for (const ev of e.events) scratch = reduceEvent(scratch, ev as ServerEvent);
+      const built = scratch.runtimes[sid] ?? createRuntime();
+      const base = state.runtimes[sid] ?? createRuntime();
+      const liveOnly = base.turns.filter((t) => !t.done);
+      const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
+      return {
+        ...state,
+        runtimes: {
+          ...state.runtimes,
+          [sid]: { ...base, turns: [...built.turns, ...liveOnly], model: hadModel ? built.model : base.model, loading: false },
+        },
+      };
+    }
     case "dir_list":
       return { ...state, dirPicker: { path: e.path, parent: e.parent ?? null, dirs: e.dirs } };
     case "wrapper_disconnected":

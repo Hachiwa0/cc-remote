@@ -16,7 +16,7 @@ from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 State = Literal["idle", "running", "interrupting", "draining"]
 
@@ -369,6 +369,34 @@ class DiffReport(_Base):
     diff: str
 
 
+class GetHistory(_Base):
+    """client -> wrapper: request a session's history, read ON-DEMAND from its
+    transcript (NOT the ring buffer, NOT requiring the session to be resident).
+    This replaces per-session buffer replay on hello — history is fetched once
+    when a session is opened, like a web chat's GET /conversation. `before`/
+    `limit` page older turns (load-more); omit both for the whole history."""
+    type: Literal["get_history"] = "get_history"
+    session_id: str
+    client_id: Optional[str] = None  # requester, so the wrapper routes History back to=<client_id>
+    cwd: Optional[str] = None
+    before: Optional[str] = None  # oldest already-loaded turn's msg_id — page strictly older than this
+    limit: Optional[int] = None   # max turns to return (null = all)
+
+
+class History(_Base):
+    """wrapper -> client: a session's history as ONE bulk frame (one-shot, like
+    ContextReport/SessionList — NOT seq'd/buffered). `events` are already-
+    serialized narrative event dicts (same shape as the live stream) that the
+    client applies in a single reducer pass into runtimes[session_id], deduped
+    by msg_id/message_id against any live tail. Routed to=<client_id>."""
+    type: Literal["history"] = "history"
+    session_id: str
+    events: list[dict[str, Any]] = []
+    has_more: bool = False            # older turns exist beyond what's returned (pagination)
+    oldest_id: Optional[str] = None   # first returned turn's msg_id — cursor for load-more
+    newest_id: Optional[str] = None   # last returned turn's msg_id
+
+
 class AskUser(_Base):
     """wrapper -> client: the agent called the `ask_user` MCP tool and is
     blocked awaiting the user's choice. The client renders a question card;
@@ -389,8 +417,8 @@ class AnswerQuestion(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetEffort, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, AskUser, AnswerQuestion,
+    Hello, Query, Interrupt, SetModel, SetEffort, SetPerm, GetContext, GetDiff, GetHistory, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, History, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
@@ -414,6 +442,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "set_perm": SetPerm,
     "get_context": GetContext,
     "get_diff": GetDiff,
+    "get_history": GetHistory,
     "list_sessions": ListSessions,
     "switch_session": SwitchSession,
     "new_session": NewSession,
@@ -432,6 +461,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "perm": Perm,
     "context_report": ContextReport,
     "diff_report": DiffReport,
+    "history": History,
     "ask_user": AskUser,
     "answer_question": AnswerQuestion,
     "session_list": SessionList,

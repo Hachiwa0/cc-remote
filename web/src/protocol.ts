@@ -78,6 +78,10 @@ export interface Perm extends Base { type: "perm"; mode: string }
 export interface GetContext extends Base { type: "get_context" }
 export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: string }
 export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string }
+// On-demand bulk history: fetched once when a session is opened (like a web
+// chat's GET /conversation) instead of replaying the ring buffer on every hello.
+export interface GetHistory extends Base { type: "get_history"; session_id: string; client_id?: string | null; cwd?: string | null; before?: string | null; limit?: number | null }
+export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null }
 export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; question: string; options: AskOption[] }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }
@@ -93,11 +97,11 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Perm | ContextReport | DiffReport
+  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Perm | ContextReport | DiffReport | History
   | AskUser
   | SessionList | SessionFocus | SessionRekey
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;

@@ -188,6 +188,15 @@ export default function App() {
     return () => { cancelled = true; window.clearTimeout(t); };
   }, [focusedSid]);
 
+  // Fetch authoritative history for the focused session — bulk, on-demand, read
+  // from the transcript (like a web chat's GET /conversation). Fires on focus
+  // change AND on (re)connect, so a reconnect re-syncs any turns that completed
+  // while we were away. The `history` event reconciles over the instant cache paint.
+  useEffect(() => {
+    if (!focusedSid || state.connState !== "connected") return;
+    wsRef.current?.sendGetHistory(focusedSid);
+  }, [focusedSid, state.connState]);
+
   // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Option+B => open latest turn's diff
   useEffect(() => {
     if (!authed) return;

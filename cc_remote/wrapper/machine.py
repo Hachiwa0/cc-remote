@@ -49,7 +49,7 @@ from claude_agent_sdk.types import ResultMessage
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, Hello, Model, Effort, Perm, ContextReport, DiffReport, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
+    Error, Hello, Model, Effort, Perm, ContextReport, DiffReport, History, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
     SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL,
@@ -186,6 +186,8 @@ class WrapperMachine:
             await self._handle_get_context(cmd)
         elif t == "get_diff":
             await self._handle_get_diff(cmd)
+        elif t == "get_history":
+            await self._handle_get_history(cmd)
         elif t == "answer_question":
             await self._handle_answer_question(cmd)
         elif t == "list_sessions":
@@ -206,36 +208,67 @@ class WrapperMachine:
             log.warning("unexpected command", type=t, role=getattr(cmd, "role", None))
 
     async def _handle_client_hello(self, cmd) -> None:
-        # Per-session catch-up: for EACH resident ctx send a Snapshot (so the
-        # client learns cc_session_id/state/cwd) then replay the buffer from the
-        # client's cursor for that sid. cursors absent → full buffer (0). Frames
-        # are stamped with each ctx's sid and routed `to=<client_id>`.
-        cursors = getattr(cmd, "cursors", None) or {}
-        total = 0
+        # Send ONE lightweight Snapshot per resident session so the client builds a
+        # runtime + sidebar status dot for each. History is NO LONGER replayed here
+        # — the client fetches it on demand via GetHistory (one bulk frame read from
+        # the transcript, like a web chat's GET /conversation). Dropping the
+        # per-session full-buffer replay is what kills the multi-thousand-frame
+        # reconnect flood that made refreshes slow.
         # snapshot: a concurrent turn may re-key self.sessions across the awaits below
         for key, ctx in list(self.sessions.items()):
             sid = ctx.session_id or key
-            if cursors:
-                last = cursors.get(sid, 0)
-            else:
-                last = 0  # no cursors → full buffer replay for every resident session
             tail = ctx.buffer.latest_tail_text()
             st = ctx.buffer.latest_state() or ctx.state
             snap = Snapshot(cc_session_id=ctx.session_id, state=st, tail_text=tail, cwd=ctx.cwd)
-            frames = ctx.buffer.replay_from(
-                last,
-                cc_session_id=ctx.session_id,
-                state=st,
-                tail_text=tail,
-                cwd=ctx.cwd,
-            )
             async with ctx.emit_lock:
                 await self.transport.send(snap.model_copy(update={"to": cmd.client_id, "sid": sid}))
-                for f in frames:
-                    await self.transport.send(f.model_copy(update={"to": cmd.client_id, "sid": sid}))
-            total += len(frames) + 1
         log.info("client hello handled", client_id=cmd.client_id,
-                 cursors=bool(cursors), sessions=len(self.sessions), frames=total)
+                 sessions=len(self.sessions))
+
+    async def _handle_get_history(self, cmd) -> None:
+        """Read a session's history ON-DEMAND from its transcript and return it as
+        ONE bulk History frame, routed to the requesting client. No spawn, no ring
+        buffer — like a web chat's GET /conversation. The transcript parse runs in
+        a thread so it never blocks the event loop or other sessions. Events are
+        the SAME classes as the live stream, so the client dedups history vs. the
+        live tail by msg_id/message_id."""
+        sid = cmd.session_id
+        # Reading requires the session's own cwd (transcript lives under it).
+        # Prefer a resident ctx's cwd, else the client-provided cwd, else default.
+        ctx = self.sessions.get(sid) or next(
+            (c for c in self.sessions.values() if c.session_id == sid), None)
+        directory = (ctx.cwd if ctx else None) or getattr(cmd, "cwd", None) or self.cfg.cc_cwd
+        events: list = []
+        mdl = None
+        try:
+            msgs = await asyncio.to_thread(get_session_messages, sid, directory=directory)
+            events = translate_history(msgs, self.cfg.tool_result_max)
+            mdl = last_assistant_model(msgs)
+        except Exception as e:
+            log.warning("get_history failed", session_id=sid, error=str(e))
+        payload: list[dict] = []
+        if mdl and mdl.startswith("claude-"):
+            m = Model(model=mdl); m.sid = sid
+            payload.append(m.model_dump(mode="json"))
+        turn_ids: list[str] = []
+        for ev in events:
+            ev.sid = sid
+            if getattr(ev, "type", None) == "user_msg":
+                turn_ids.append(ev.msg_id)
+            payload.append(ev.model_dump(mode="json"))
+        hist = History(
+            session_id=sid, events=payload, has_more=False,
+            oldest_id=(turn_ids[0] if turn_ids else None),
+            newest_id=(turn_ids[-1] if turn_ids else None),
+        )
+        client_id = getattr(cmd, "client_id", None)
+        if client_id:
+            hist.to = client_id
+            await self.transport.send(hist)
+        else:
+            await self._emit_focused(hist)  # fallback: broadcast (like other one-shots)
+        log.info("history sent", session_id=sid, events=len(payload),
+                 client_id=client_id, resident=(ctx is not None))
 
     async def _handle_query(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -454,7 +487,13 @@ class WrapperMachine:
         # snapshot + full replay so the client builds a runtime for it (else the
         # client would show an empty/wrong view).
         if newly_spawned:
-            await self._send_session_catchup(ctx)
+            # Build the client's runtime for a freshly-resumed session with a
+            # lightweight Snapshot (state/cwd/id); its HISTORY arrives via the
+            # client's GetHistory request — no full buffer replay (that was a flood).
+            snap = Snapshot(cc_session_id=ctx.session_id,
+                            state=ctx.buffer.latest_state() or ctx.state,
+                            tail_text=ctx.buffer.latest_tail_text(), cwd=ctx.cwd)
+            await self._emit(ctx, snap)
         await self._emit(ctx, SessionFocus(session_id=ctx.session_id or self.focused_sid or sid, cwd=ctx.cwd))
 
     async def _send_session_catchup(self, ctx: SessionContext) -> None:
