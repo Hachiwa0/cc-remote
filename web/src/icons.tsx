@@ -1,5 +1,6 @@
 // Icon paths lifted verbatim from design/prototype.html (the I dictionary).
 // One <Icon name="..."/> component renders the SVG; sizes via prop.
+import { useEffect, useState } from "react";
 
 const PATHS: Record<string, string> = {
   search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>',
@@ -44,16 +45,43 @@ export function Icon({ name, size = 20, sw = 1.75 }: { name: string; size?: numb
   );
 }
 
-// The Claude mark: a solid terracotta sunburst of tapered rays radiating from a
-// filled centre. Filled (not stroked like Icon); `color` sets the ray colour.
+// A 4-point spark (concave star), the base of the Claude mark. `s` scales it
+// about the centre; `rot` rotates it. Original shape, drawn to read as an
+// AI "spark" rather than a sun.
+const SPARK = "M12 1.7 C 12.5 8.4 15.6 11.5 22.3 12 C 15.6 12.5 12.5 15.6 12 22.3 C 11.5 15.6 8.4 12.5 1.7 12 C 8.4 11.5 11.5 8.4 12 1.7 Z";
+function sparkTransform(s: number, rot = 0): string {
+  const t = 12 * (1 - s);
+  return `rotate(${rot} 12 12) translate(${t} ${t}) scale(${s})`;
+}
+
+// Static Claude mark: a spark with a small diagonal spark behind it.
 export function ClaudeMark({ size = 16, className }: { size?: number; className?: string }) {
-  const N = 11; // tapered spikes radiating from centre
-  const ray = "M12 1.9 Q 13.6 6.4 13.0 10.4 Q 12.78 11.7 12 11.7 Q 11.22 11.7 11.0 10.4 Q 10.4 6.4 12 1.9 Z";
   return (
     <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" className={className} aria-hidden="true">
-      {Array.from({ length: N }, (_, i) => (
-        <path key={i} d={ray} transform={`rotate(${(360 / N) * i} 12 12)`} />
-      ))}
+      <path d={SPARK} transform={sparkTransform(0.42, 45)} opacity="0.55" />
+      <path d={SPARK} transform={sparkTransform(0.9)} />
+    </svg>
+  );
+}
+
+// Claude "working" indicator: not one icon scaling, but a loop of morphing
+// sparks — a big spark + a diagonal spark trading size/emphasis frame by frame,
+// so it shimmers like the official Claude thinking animation.
+const WORK_FRAMES: Array<[number, number]> = [
+  [0.55, 0.0], [0.85, 0.35], [1.0, 0.6], [0.8, 0.85], [0.5, 1.0], [0.32, 0.72],
+];
+export function ClaudeWorking({ size = 22, className }: { size?: number; className?: string }) {
+  const [i, setI] = useState(0);
+  useEffect(() => {
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const id = window.setInterval(() => setI((x) => (x + 1) % WORK_FRAMES.length), 125);
+    return () => clearInterval(id);
+  }, []);
+  const [a, b] = WORK_FRAMES[i];
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" className={className} aria-hidden="true">
+      {b > 0 && <path d={SPARK} transform={sparkTransform(b, 45)} opacity="0.8" />}
+      {a > 0 && <path d={SPARK} transform={sparkTransform(a)} />}
     </svg>
   );
 }

@@ -112,12 +112,9 @@ body{
 .ubub-act svg{ width:13px; height:13px; }
 .ubub-meta.ai-meta{ margin-left:0; margin-right:auto; }
 .arole{ display:flex; align-items:center; gap:8px; margin:0 0 8px; }
-/* no box around the mark — just the terracotta sunburst */
+/* no box around the mark — just the terracotta spark */
 .arole .av{ width:22px; height:22px; color:var(--accent); display:grid; place-items:center; flex:none; }
 .arole .av svg{ width:22px; height:22px; }
-/* while the turn is running the mark breathes — a smooth scale in/out (not a bob) */
-.arole .av.working{ animation:av-work 1.5s ease-in-out infinite; transform-origin:center; }
-@keyframes av-work{ 0%,100%{ transform:scale(1) } 50%{ transform:scale(1.17) } }
 .arole .nm{ font-size:12.5px; font-weight:600; color:var(--dim); letter-spacing:.02em; }
 
 /* prose (react-markdown output) */
@@ -146,10 +143,11 @@ body{
 .thinking span{ width:4px; height:4px; border-radius:50%; background:var(--dim); animation:think 1.2s infinite ease-in-out; }
 .thinking span:nth-child(2){ animation-delay:.18s; }
 .thinking span:nth-child(3){ animation-delay:.36s; }
-.turn-working{ display:inline-flex; align-items:center; gap:8px; margin:4px 0 2px; padding:4px 10px;
-  font-size:12.5px; color:var(--dim); }
-.turn-working .thinking{ margin:0; }
-.turn-working .turn-working-tx{ font-weight:600; color:var(--accent-ink); }
+/* the "working" indicator lives BELOW the streamed text (so it stays visible as
+   the reply grows). The mark itself is animated — a loop of morphing sparks. */
+.turn-working{ display:inline-flex; align-items:center; gap:7px; margin:8px 0 2px; color:var(--accent); }
+.turn-working svg{ display:block; }
+.turn-working .turn-working-tx{ font-weight:600; color:var(--accent-ink); font-size:12.5px; }
 @keyframes think{ 0%,80%,100%{ opacity:.25; transform:translateY(0); } 40%{ opacity:1; transform:translateY(-3px); } }
 
 /* TOOL CARD */

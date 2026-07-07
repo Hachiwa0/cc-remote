@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Turn, Block, TextBlock, ToolBlock } from "../reducer";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
-import { Icon, ClaudeMark } from "../icons";
+import { Icon, ClaudeMark, ClaudeWorking } from "../icons";
 
 type Segment = { kind: "text"; block: TextBlock } | { kind: "tools"; tools: ToolBlock[] };
 
@@ -141,7 +141,7 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
             {t.blocks.length > 0 ? (
               <>
                 <div className="arole">
-                  <span className={"av" + (!t.done ? " working" : "")}><ClaudeMark size={15} /></span>
+                  <span className="av"><ClaudeMark size={16} /></span>
                   <span className="nm">Claude</span>
                 </div>
                 {groupBlocks(t.blocks).map((seg, si) =>
@@ -152,10 +152,7 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
                   )
                 )}
                 {!t.done && (
-                  <div className="turn-working">
-                    <span className="thinking"><span/><span/><span/></span>
-                    <span className="turn-working-tx">思考中</span>
-                  </div>
+                  <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">思考中</span></div>
                 )}
                 {t.done && (
                   <div className="ubub-meta ai-meta">
@@ -165,10 +162,13 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
                 )}
               </>
             ) : (!t.done && t.prompt) ? (
-              <div className="arole">
-                <span className="av working"><ClaudeMark size={15} /></span>
-                <span className="nm">Claude<span className="thinking"><span/><span/><span/></span></span>
-              </div>
+              <>
+                <div className="arole">
+                  <span className="av"><ClaudeMark size={16} /></span>
+                  <span className="nm">Claude</span>
+                </div>
+                <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">思考中</span></div>
+              </>
             ) : null}
             {fileChips(t)}
             {t.interrupted && <div className="note interrupted">— 已打断 —</div>}
