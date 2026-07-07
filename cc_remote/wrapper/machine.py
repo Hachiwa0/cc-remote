@@ -607,6 +607,18 @@ class WrapperMachine:
                 await self._emit_focused(Error(code=ERR_INTERNAL, message=f"session not found: {resume_id}"))
                 return None
             target_cwd = info.cwd or self.cfg.cc_cwd
+            # The session's original cwd may be gone (e.g. a deleted /tmp scratch
+            # dir). cc can't chdir into a missing dir → "Working directory does not
+            # exist" crash on switch. Recreate it (empty) so resume still works —
+            # history loads by session id regardless; fall back to the default cwd
+            # only if recreation fails.
+            if not os.path.isdir(target_cwd):
+                try:
+                    os.makedirs(target_cwd, exist_ok=True)
+                    log.warning("recreated missing session cwd for resume", session_id=resume_id, cwd=target_cwd)
+                except Exception as e:
+                    log.warning("session cwd missing, using default", session_id=resume_id, cwd=target_cwd, error=str(e))
+                    target_cwd = self.cfg.cc_cwd
         elif cwd:
             target_cwd = os.path.realpath(os.path.expanduser(cwd))
             if not os.path.isdir(target_cwd):

@@ -316,6 +316,7 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return patch(state, e.sid, (rt) => { rt.replaying = false; rt.truncated = rt.truncated || e.truncated; rt.loading = false; });
     case "error":
       return { ...patch(state, e.sid, (rt) => {
+        rt.loading = false; // never leave a spinner spinning behind an error
         const turns = cloneTurns(rt.turns);
         const t = turns[turns.length - 1];
         if (t && !t.done) t.error = `${e.code}: ${e.message}`;

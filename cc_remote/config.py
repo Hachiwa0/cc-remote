@@ -70,8 +70,10 @@ class WrapperConfig:
     # forcing an SDK reconnect (drain safety net).
     drain_timeout: float = field(default_factory=lambda: _float("DRAIN_TIMEOUT", 15.0))
     # Max cc subprocesses (resident sessions) the wrapper runs concurrently. Each
-    # session = one `claude --resume` child (RAM/CPU). Over the cap → ERR_BUSY.
-    max_concurrent_sessions: int = field(default_factory=lambda: _int("MAX_CONCURRENT_SESSIONS", 4))
+    # session = one `claude --resume` child (~190MB RAM). Over the cap → evict an
+    # idle one (client keeps its cached history; viewing stays instant). Raised
+    # from 4 so browsing many sessions doesn't thrash-respawn. Tune via env.
+    max_concurrent_sessions: int = field(default_factory=lambda: _int("MAX_CONCURRENT_SESSIONS", 20))
     state_dir: Path = field(default_factory=lambda: Path(_env("CC_REMOTE_STATE_DIR", str(Path.home() / ".cc-remote"))))
 
 
