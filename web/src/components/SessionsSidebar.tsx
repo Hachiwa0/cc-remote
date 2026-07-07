@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState, type TouchEvent } from "react";
-import type { SessionInfo } from "../protocol";
+import type { SessionInfo, State } from "../protocol";
 import { Icon } from "../icons";
 
 interface Props {
   open: boolean;
   sessions: SessionInfo[];
+  // Live state per resident session (from the client's runtimes), overriding the
+  // list_sessions snapshot so a background session's dot updates in real time.
+  liveStates?: Record<string, State>;
   activeSessionId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
@@ -20,7 +23,7 @@ function basename(cwd?: string | null): string {
   return parts[parts.length - 1] || cwd;
 }
 
-export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive }: Props) {
+export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive }: Props) {
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
@@ -140,6 +143,8 @@ export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onN
       if (lifting) { closeMenu(); return; }
       onSelect(s.session_id);
     };
+    // Prefer live runtime state (resident session) over the list snapshot.
+    const st = liveStates?.[s.session_id] ?? s.state;
     return (
       <div
         key={s.session_id}
@@ -147,15 +152,19 @@ export function SessionsSidebar({ open, sessions, activeSessionId, onSelect, onN
         onTouchStart={(e) => onCardTouchStart(s, e)}
         onTouchMove={onCardTouchMove}
         onTouchEnd={onCardTouchEnd}
+        onClick={onTitleClick}
       >
         <div className="scard-top">
-          <span className="scard-title" onClick={onTitleClick}>
+          <span className="scard-title">
             {s.summary || (s.first_prompt || "").slice(0, 40) || s.session_id.slice(0, 8)}
           </span>
           {isActive && <span className="pill idle"><span className="sd" />当前</span>}
+          {(st === "running" || st === "interrupting") && (
+            <span className={"pill " + st}><span className="sd" />{st === "running" ? "运行" : "中断"}</span>
+          )}
         </div>
-        {s.cwd && <div className="scard-path" onClick={onTitleClick} title={s.cwd}>{s.cwd}</div>}
-        {s.first_prompt && !s.summary && <div className="scard-prev" onClick={onTitleClick}>{s.first_prompt}</div>}
+        {s.cwd && <div className="scard-path" title={s.cwd}>{s.cwd}</div>}
+        {s.first_prompt && !s.summary && <div className="scard-prev">{s.first_prompt}</div>}
         <div className="scard-actions">
           <button className="scard-act" aria-label="更多操作"
             onClick={(e) => { e.stopPropagation(); setMenuCardId(isMenu ? null : s.session_id); setLifting(false); }}>

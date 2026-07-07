@@ -1,8 +1,11 @@
 // WebSocket client to the relay. Browsers can't set Authorization on a
-// WebSocket, so the token goes in ?token=. Derives the URL from the page
-// location so it works both in Vite dev (proxied /ws) and in production
-// (relay serves the build on the same origin). Auto-reconnects with backoff
-// and re-hellos with last_seq on every (re)connect and on wrapper_reconnected.
+// WebSocket, so the token goes in ?token=. Auto-reconnects with backoff.
+//
+// Multi-session: every inbound frame is demuxed by `msg.sid` (the wrapper
+// stamps it). lastSeq is tracked PER session (lastSeqBySession) so catch-up
+// cursors are per-session. session_focus just sets focusedSid + dispatches —
+// no cursor reset, no re-hello (background turns keep streaming). All outbound
+// commands that target a session stamp `sid: focusedSid`.
 import type { ServerEvent, QueryImg, QueryFile } from "./protocol";
 import { PROTOCOL_VERSION } from "./protocol";
 import { uuid } from "./util";
@@ -21,7 +24,8 @@ function nowTs(): number {
 
 export class RelayWs {
   private ws: WebSocket | null = null;
-  private lastSeq = 0;
+  private lastSeqBySession: Record<string, number> = {};
+  private focusedSid: string | null = null;
   private readonly clientId: string;
   private readonly url: string;
   private backoff = 1;
@@ -41,7 +45,7 @@ export class RelayWs {
   }
 
   start(): void {
-    this.connect(false);
+    this.connect();
   }
 
   stop(): void {
@@ -50,44 +54,61 @@ export class RelayWs {
     this.ws?.close();
   }
 
+  /** Highest seq across all known sessions (used by the App's IDB persist). */
   get lastSeqValue(): number {
-    return this.lastSeq;
+    const vals = Object.values(this.lastSeqBySession);
+    return vals.length ? Math.max(...vals) : 0;
   }
 
-  /** Track the highest seq seen (so reconnect replays from there). */
-  noteSeq(seq: number | null | undefined): void {
-    if (typeof seq === "number" && seq > this.lastSeq) this.lastSeq = seq;
+  /** Track the highest seq seen for a session (so reconnect replays from there). */
+  noteSeq(sid: string | null | undefined, seq: number | null | undefined): void {
+    if (sid && typeof seq === "number") {
+      this.lastSeqBySession[sid] = Math.max(this.lastSeqBySession[sid] ?? 0, seq);
+    }
+  }
+
+  /** Seed a session's cursor (e.g. from the IndexedDB cache on load). */
+  setLastSeq(sid: string, seq: number): void {
+    this.lastSeqBySession[sid] = seq;
+  }
+
+  setFocusedSid(sid: string | null): void {
+    this.focusedSid = sid;
+  }
+
+  private sidObj(): Record<string, unknown> {
+    return this.focusedSid ? { sid: this.focusedSid } : {};
   }
 
   sendQuery(prompt: string, msg_id: string, images?: QueryImg[], files?: QueryFile[]): void {
-    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "query", prompt, msg_id, ts: nowTs() };
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "query", prompt, msg_id, ts: nowTs(), ...this.sidObj() };
     if (images && images.length) obj.images = images;
     if (files && files.length) obj.files = files;
     this.send(obj);
   }
 
   sendInterrupt(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs() });
+    this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs(), ...this.sidObj() });
   }
 
   sendSetModel(model: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "set_model", model, ts: nowTs() });
+    this.send({ v: PROTOCOL_VERSION, type: "set_model", model, ts: nowTs(), ...this.sidObj() });
   }
 
   sendSetPerm(mode: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs() });
+    this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }
 
   sendGetContext(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_context", ts: nowTs() });
+    this.send({ v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj() });
   }
 
   sendGetDiff(file: string, theme: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_diff", file, theme, ts: nowTs() });
+    this.send({ v: PROTOCOL_VERSION, type: "get_diff", file, theme, ts: nowTs(), ...this.sidObj() });
   }
 
   sendAnswerQuestion(askId: string, answer: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs() });
+    this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
   }
 
   sendListSessions(): void {
@@ -104,12 +125,6 @@ export class RelayWs {
     this.send(obj);
   }
 
-  sendListDir(path?: string | null): void {
-    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_dir", ts: nowTs() };
-    if (path) obj.path = path;
-    this.send(obj);
-  }
-
   sendRenameSession(sessionId: string, title: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() });
   }
@@ -118,13 +133,17 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() });
   }
 
-  /** Send hello with an explicit last_seq. `null` = first hello (wrapper replies
-   *  with a snapshot so the app can read its IndexedDB cache); an int = catch-up
-   *  (wrapper replays only events with seq > last_seq). */
-  sendHello(lastSeq: number | null): void {
+  sendListDir(path?: string | null): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_dir", ts: nowTs() };
+    if (path) obj.path = path;
+    this.send(obj);
+  }
+
+  /** Send hello with the per-session cursor map (multi-session catch-up). */
+  sendHello(): void {
     this.send({
       v: PROTOCOL_VERSION, type: "hello", role: "client", client_id: this.clientId,
-      last_seq: lastSeq, ts: nowTs(),
+      cursors: { ...this.lastSeqBySession }, ts: nowTs(),
     });
   }
 
@@ -134,27 +153,55 @@ export class RelayWs {
     }
   }
 
-  private connect(reconnect: boolean): void {
-    this.cb.onConnState(reconnect ? "reconnecting" : "connecting");
+  private connect(): void {
+    this.cb.onConnState("connecting");
     const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = 1;
-      this.sendHello(null);  // first hello -> wrapper sends snapshot -> app reads cache + catchUp
-      this.cb.onConnState("connected");  // triggers sendListSessions after hello
+      this.sendHello();  // cursors = whatever we remember (empty on first connect)
+      this.cb.onConnState("connected");  // triggers sendListSessions
     };
     ws.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data) as ServerEvent;
-        if (msg.type === "session_switched") {
-          // new active session: reset the seq cursor; the snapshot from the new
-          // session will trigger a cache read + catchUp in the app.
-          this.lastSeq = 0;
+        if (msg.type === "session_focus") {
+          // NON-destructive: just focus + dispatch. Cursor unchanged, no re-hello.
+          this.focusedSid = msg.session_id;
           this.cb.onEvent(msg);
-          this.sendHello(null);
           return;
         }
-        this.noteSeq(msg.seq);
+        if (msg.type === "session_switched") {
+          // Legacy destructive path (wrapper restart reconnect): reset cursors
+          // and re-hello. The non-interrupting flow uses session_focus above.
+          this.focusedSid = msg.session_id || this.focusedSid;
+          this.lastSeqBySession = {};
+          this.cb.onEvent(msg);
+          this.sendHello();
+          return;
+        }
+        if (msg.type === "session_rekey") {
+          // Runtime re-key (tmp -> real id): migrate the cursor and, ONLY if we
+          // were viewing old_key, the focus. Never a focus change by itself.
+          const { old_key, session_id } = msg;
+          if (old_key !== session_id) {
+            if (this.lastSeqBySession[old_key] != null && this.lastSeqBySession[session_id] == null) {
+              this.lastSeqBySession[session_id] = this.lastSeqBySession[old_key];
+            }
+            delete this.lastSeqBySession[old_key];
+            if (this.focusedSid === old_key) this.focusedSid = session_id;
+          }
+          this.cb.onEvent(msg);
+          return;
+        }
+        if (msg.type === "replay_start" && msg.rebuild && msg.sid) {
+          // The wrapper is REBUILDING this session (evicted + re-spawned, seq
+          // reset to 0). Drop our stale cursor so the rebuild frames — whose
+          // seqs restart low — actually advance it instead of being ignored by
+          // the Math.max in noteSeq.
+          this.lastSeqBySession[msg.sid] = 0;
+        }
+        this.noteSeq(msg.sid, (msg as { seq?: number | null }).seq);
         this.cb.onEvent(msg);
       } catch (err) {
         console.warn("dropping malformed frame", err);
@@ -163,8 +210,6 @@ export class RelayWs {
     ws.onclose = (ev: CloseEvent) => {
       this.ws = null;
       if (ev.code === 1008) {
-        // Auth rejected (invalid/expired session token). Stop retrying — let
-        // the app drop the session and show the login page.
         this.cb.onAuthFail?.();
         return;
       }
@@ -177,7 +222,7 @@ export class RelayWs {
 
   private scheduleReconnect(): void {
     this.cb.onConnState("reconnecting");
-    this.reconnectTimer = setTimeout(() => this.connect(true), this.backoff * 1000);
+    this.reconnectTimer = setTimeout(() => this.connect(), this.backoff * 1000);
     this.backoff = Math.min(this.backoff * 2, 30);
   }
 }

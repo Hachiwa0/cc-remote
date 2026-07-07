@@ -37,17 +37,41 @@ inherited from `~/.claude/settings.json`; we only build the **control link**
   leaving them loaded is safe.
 - **Auth is header-only**: `Authorization: Bearer <token>` at WS upgrade. Never
   put tokens in message bodies; the logger redacts token-named fields.
+- **Multi-session routing key**: the wrapper runs a POOL of resident sessions
+  (`WrapperMachine.sessions: dict[key, SessionContext]`, cap
+  `MAX_CONCURRENT_SESSIONS`). `ctx.key` is the routing identity = the real cc sid
+  once known, else `tmp-<uuid>`. Every emit stamps `sid = ctx.session_id or
+  ctx.key`, so a brand-new session's pre-capture frames route deterministically
+  (never leak into the focused runtime). Keep `ctx.key` in sync with the pool
+  dict key on every re-key.
+- **Focus vs re-key (don't conflate)**: switching the viewed session is
+  `SessionFocus` (focus only, no disconnect — the previous session keeps
+  streaming). A new session capturing its real id mid-turn is `SessionRekey`
+  (rename tmp-key→sid + migrate cursor), which moves focus ONLY if the client was
+  already viewing the temp key. Emitting SessionFocus on id-capture = focus-steal
+  by background sessions.
+- **Evict/re-focus rebuilds, never merges**: over the cap, an idle non-focused
+  session is evicted (subprocess torn down); re-focusing re-spawns it with a
+  FRESH ring buffer (seq resets to 0). Catch-up MUST use the rebuild replay
+  (`replay_from(..., rebuild=True)` → `ReplayStart(rebuild=True)`) so the client
+  discards its stale turns and rebuilds; the client also resets its per-session
+  cursor to 0 on a rebuild frame. Token-aware: resume = cold prompt cache = full
+  context re-send, so it only happens on first spawn / re-focus-after-eviction —
+  raising the cap trades RAM for fewer cold re-sends.
 
 ## Module map
 - `cc_remote/protocol.py` — pydantic wire schema; all modules depend on it.
   `serialize`/`deserialize` with `v` check; `is_downstream` for seq/buffer.
-- `cc_remote/config.py` — env-driven config (RelayConfig, WrapperConfig).
+  Multi-session control frames: `SessionFocus` / `SessionRekey` / `SessionInfo.state`.
+- `cc_remote/config.py` — env-driven config (RelayConfig, WrapperConfig,
+  `max_concurrent_sessions`).
 - `cc_remote/log.py` — JSON logging with token redaction; use `logger("...")`.
-- `cc_remote/wrapper/` — sdk.py (client lifecycle), machine.py (state machine +
-  drain), stream.py (SDK→protocol translate), ringbuffer.py (seq + replay),
-  transport.py (WS client to relay), session.py (session id persistence).
+- `cc_remote/wrapper/` — sdk.py (client lifecycle), machine.py (session pool +
+  per-ctx state machine + drain), session_ctx.py (one SessionContext per resident
+  session), stream.py (SDK→protocol translate), ringbuffer.py (seq + replay +
+  rebuild), transport.py (WS client to relay), session.py (session id persistence).
 - `cc_remote/relay/` — server.py (FastAPI /ws + static), auth.py (bearer),
-  pairing.py (single wrapper slot + fan-out), forward.py (per-client queues).
+  pairing.py (single wrapper slot + `to=`/broadcast fan-out), forward.py (per-client queues).
 
 ## Run / test
 ```bash

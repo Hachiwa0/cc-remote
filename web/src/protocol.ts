@@ -16,6 +16,7 @@ export interface Hello extends Base {
   role: "client" | "wrapper";
   client_id?: string | null;
   last_seq?: number | null;
+  cursors?: Record<string, number> | null;
   cc_session_id?: string | null;
   state?: State | null;
   buffer_head_seq?: number | null;
@@ -54,12 +55,18 @@ export interface SessionInfo {
   git_branch?: string | null;
   cwd?: string | null;
   tag?: string | null;
+  state?: State | null;
 }
 export interface ListSessions extends Base { type: "list_sessions" }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string }
 export interface NewSession extends Base { type: "new_session"; cwd?: string | null }
 export interface SessionList extends Base { type: "session_list"; sessions: SessionInfo[] }
 export interface SessionSwitched extends Base { type: "session_switched"; session_id: string; cwd?: string | null }
+export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null }
+// NON-focusing re-key: a temp-keyed new session captured its real cc id. Rename
+// the runtime old_key -> session_id + migrate the cursor; focus only follows if
+// we were already viewing old_key. Prevents focus-steal by background sessions.
+export interface SessionRekey extends Base { type: "session_rekey"; old_key: string; session_id: string; cwd?: string | null }
 export interface RenameSession extends Base { type: "rename_session"; session_id: string; title: string }
 export interface ArchiveSession extends Base { type: "archive_session"; session_id: string; archived: boolean }
 export interface DirEntry { name: string; path: string }
@@ -87,9 +94,9 @@ export interface ContextReport extends Base {
 export type ServerEvent =
   | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Perm | ContextReport | DiffReport
   | AskUser
-  | SessionList | SessionSwitched
+  | SessionList | SessionSwitched | SessionFocus | SessionRekey
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;

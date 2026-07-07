@@ -40,7 +40,20 @@ class RingBuffer:
     def tail_seq(self) -> int:
         return self._buf[-1][0] if self._buf else 0
 
-    def replay_from(self, last_seq: Optional[int], *, cc_session_id, state, tail_text: str = "", cwd: Optional[str] = None) -> list:
+    def replay_from(self, last_seq: Optional[int], *, cc_session_id, state, tail_text: str = "", cwd: Optional[str] = None, rebuild: bool = False) -> list:
+        # rebuild=True: caller knows the client's runtime for this session is
+        # stale (e.g. it was evicted from the pool and re-spawned with a fresh
+        # ring, seq reset to 0). Emit the WHOLE buffer wrapped in a rebuild
+        # envelope so the client discards its old turns and rebuilds — never
+        # merges (which would duplicate). No cursor math; unconditional.
+        if rebuild:
+            head = self.head_seq
+            tail = self.tail_seq
+            frames: list = [ReplayStart(from_seq=head, to_seq=tail, truncated=False, rebuild=True)]
+            frames.extend(m for _, m in self._buf)
+            frames.append(ReplayEnd(to_seq=tail, truncated=False))
+            return frames
+
         if last_seq is None:
             # First hello: send only a snapshot (cc_session_id + state + cwd). The client
             # reads its IndexedDB cache, then re-hellos with last_seq to fetch only

@@ -69,6 +69,9 @@ class WrapperConfig:
     # Seconds to wait for the terminal ResultMessage after interrupt() before
     # forcing an SDK reconnect (drain safety net).
     drain_timeout: float = field(default_factory=lambda: _float("DRAIN_TIMEOUT", 15.0))
+    # Max cc subprocesses (resident sessions) the wrapper runs concurrently. Each
+    # session = one `claude --resume` child (RAM/CPU). Over the cap → ERR_BUSY.
+    max_concurrent_sessions: int = field(default_factory=lambda: _int("MAX_CONCURRENT_SESSIONS", 4))
     state_dir: Path = field(default_factory=lambda: Path(_env("CC_REMOTE_STATE_DIR", str(Path.home() / ".cc-remote"))))
 
 

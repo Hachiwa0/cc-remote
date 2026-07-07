@@ -17,9 +17,8 @@ async def main() -> None:
     SdkHandle.preflight()
     log.info("starting wrapper", relay=cfg.relay_url, cwd=cfg.cc_cwd,
              resume=bool(cfg.resume_session_id))
-    sdk = SdkHandle(cfg)
     transport = WrapperTransport(cfg.relay_url, cfg.wrapper_token)
-    machine = WrapperMachine(cfg, sdk, transport)
+    machine = WrapperMachine(cfg, transport)
     try:
         await machine.run()
     except KeyboardInterrupt:

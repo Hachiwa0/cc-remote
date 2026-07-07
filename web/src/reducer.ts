@@ -1,10 +1,14 @@
 // Turn/block state model for the chat UI.
 //
-// A Turn = one user query + the assistant's response (which may span multiple
-// assistant messages with tool calls). Blocks are keyed by message_id (text) or
-// tool_use_id (tool). The reducer applies server events in arrival order; the
-// wrapper's emit-lock guarantees replay batches arrive contiguously before live
-// events, so no client-side reordering is needed.
+// Multi-session: AppState holds a `runtimes` map keyed by session id (or a
+// wrapper-assigned temp key for a brand-new session until its real id is
+// captured). Each SessionRuntime has its own turns/state/model/perm/queue/etc.
+// `focusedSid` selects the viewed one. Switching sessions is a pure view change
+// (session_focus) — background turns keep streaming into their own runtime.
+//
+// Inbound frames carry `sid`; narrative events route to runtimes[msg.sid]
+// (unknown sid → drop; null sid → focused). Control frames (session_list,
+// session_focus, wrapper_reconnected, diff_report, ...) are global.
 import type { ConnState } from "./ws";
 import type { ServerEvent, SessionInfo, State, ContextReport, QueryImg, QueryFile, DirEntry } from "./protocol";
 import type { DiffLine, GitDiffSection } from "./diff";
@@ -35,44 +39,53 @@ export interface Turn {
   done: boolean;
   interrupted?: boolean;
   error?: string;
-  images?: QueryImg[]; // attached images on the user's message (originating client only)
-  files?: QueryFile[]; // attached files (written to /tmp by wrapper, prompt gets @path)
-  ts?: number; // send timestamp (ms) for the user-bubble time readout
-  doneTs?: number; // turn-end timestamp (ms) for the AI reply time readout
+  images?: QueryImg[];
+  files?: QueryFile[];
+  ts?: number;
+  doneTs?: number;
 }
 
 export interface Artifact { file: string; kind: "diff" | "md" | "gitdiff"; diff?: DiffLine[]; content?: string; sections?: GitDiffSection[]; }
 
-export interface AppState {
+export interface SessionRuntime {
   turns: Turn[];
   state: State;
-  connState: ConnState;
-  ccSessionId?: string;
+  model: string;
+  perm: string;
   replaying: boolean;
-  truncated: boolean; // history may be incomplete
-  banner?: string; // status line (machine offline, catching up, ...)
-  // composer / client-side turn scheduling
-  queue: string[]; // queued messages (drain on turn_end)
-  pendingSend: string | null; // interrupt-and-send: send once state returns to idle
-  sendMode: "interrupt" | "queue";
-  wrapperOnline: boolean; // wrapper_disconnected -> false, wrapper_reconnected -> true
-  model: string; // selected model id (UI; wired to backend in Phase 2)
-  perm: string; // permission mode id (UI; Phase 2)
-  sessions: SessionInfo[]; // sessions sidebar rows
-  activeSessionId: string | null;
-  contextReport: ContextReport | null; // /context result modal
-  artifact: Artifact | null; // right-side diff/markdown panel for a changed file
+  truncated: boolean;
+  ccSessionId?: string;
   pendingQuestion: { ask_id: string; question: string; options: { label: string; ds?: string }[] } | null;
-  // Current directory listing for the session-creation picker (null = closed).
+  contextReport: ContextReport | null;
+  queue: string[];
+  pendingSend: string | null;
+}
+
+export interface AppState {
+  // connection / global UI
+  connState: ConnState;
+  wrapperOnline: boolean;
+  banner?: string;
+  artifact: Artifact | null;
   dirPicker: { path: string; parent: string | null; dirs: DirEntry[] } | null;
-  // Active session's cwd (from Snapshot/SessionSwitched) — default for a new chat.
   currentCwd: string;
-  // New-chat welcome page: non-null while picking a cwd / before the first message.
+  sendMode: "interrupt" | "queue";
+  // new-chat welcome page (global; only one new-chat flow at a time)
   newChat: { cwd: string } | null;
-  // First message held until the freshly-created session's session_switched arrives;
-  // switchTick bumps on every switch to wake the sender effect.
   pendingNewQuery: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] } | null;
   switchTick: number;
+  // sessions + multi-session runtimes
+  sessions: SessionInfo[];
+  focusedSid: string | null;
+  runtimes: Record<string, SessionRuntime>;
+}
+
+export function createRuntime(): SessionRuntime {
+  return {
+    turns: [], state: "idle", model: "claude-mythos-5", perm: "bypassPermissions",
+    replaying: false, truncated: false, pendingQuestion: null, contextReport: null,
+    queue: [], pendingSend: null,
+  };
 }
 
 export type Action =
@@ -88,10 +101,10 @@ export type Action =
   | { type: "set_perm"; perm: string }
   | { type: "set_context"; report: ContextReport }
   | { type: "clear_context" }
-  | { type: "set_turns"; turns: Turn[] }
+  | { type: "set_turns"; sid: string; turns: Turn[] }
   | { type: "set_artifact"; artifact: Artifact }
   | { type: "clear_artifact" }
-  | { type: "answer_question" } // dismiss the question card (answer sent)
+  | { type: "answer_question" }
   | { type: "enter_new_chat"; cwd: string }
   | { type: "set_new_chat_cwd"; cwd: string }
   | { type: "exit_new_chat" }
@@ -99,31 +112,41 @@ export type Action =
   | { type: "clear_pending_new_query" };
 
 export const initialState: AppState = {
-  turns: [],
-  state: "idle",
   connState: "connecting",
-  replaying: false,
-  truncated: false,
-  queue: [],
-  pendingSend: null,
-  sendMode: "interrupt",
   wrapperOnline: true,
-  model: "claude-mythos-5",
-  perm: "bypassPermissions",
-  sessions: [],
-  activeSessionId: null,
-  contextReport: null,
   artifact: null,
-  pendingQuestion: null,
   dirPicker: null,
   currentCwd: "",
+  sendMode: "interrupt",
   newChat: null,
   pendingNewQuery: null,
   switchTick: 0,
+  sessions: [],
+  focusedSid: null,
+  runtimes: {},
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
   return turns.map((t) => ({ ...t, blocks: t.blocks.map((b) => ({ ...b })) }));
+}
+
+// Patch a runtime by sid (explicit sid wins; null/undefined → focused). `create`
+// creates the runtime if missing (used by snapshot for a session we haven't
+// seen). Unknown sid with create=false → no-op (drop the frame: it's for a
+// non-resident session the client doesn't track yet).
+function patch(state: AppState, sid: string | null | undefined,
+               fn: (rt: SessionRuntime) => void, create = false): AppState {
+  const key = sid ?? state.focusedSid;
+  if (!key) return state;
+  let rt = state.runtimes[key];
+  if (!rt) {
+    if (!create) return state;
+    rt = createRuntime();
+  } else {
+    rt = { ...rt };
+  }
+  fn(rt);
+  return { ...state, runtimes: { ...state.runtimes, [key]: rt } };
 }
 
 export function reduce(state: AppState, action: Action): AppState {
@@ -135,39 +158,37 @@ export function reduce(state: AppState, action: Action): AppState {
       else if (action.connState === "connecting") banner = "connecting…";
       return { ...state, connState: action.connState, banner };
     }
-    case "query_sent": {
-      // Originating-client turn creation. Dedup by msg_id: a late user_msg
-      // echo or a re-render can fire this twice; don't create a duplicate turn.
-      if (state.turns.some((t) => t.id === action.msg_id)) return state;
-      const turn: Turn = { id: action.msg_id, prompt: action.prompt, blocks: [], done: false, images: action.images, files: action.files, ts: action.ts };
-      return { ...state, turns: [...state.turns, turn] };
-    }
+    case "query_sent":
+      return patch(state, state.focusedSid, (rt) => {
+        if (rt.turns.some((t) => t.id === action.msg_id)) return;
+        rt.turns = [...rt.turns, { id: action.msg_id, prompt: action.prompt, blocks: [], done: false, images: action.images, files: action.files, ts: action.ts }];
+      });
     case "enqueue":
-      return { ...state, queue: [...state.queue, action.prompt] };
+      return patch(state, state.focusedSid, (rt) => { rt.queue = [...rt.queue, action.prompt]; });
     case "dequeue_at":
-      return { ...state, queue: state.queue.filter((_, i) => i !== action.i) };
+      return patch(state, state.focusedSid, (rt) => { rt.queue = rt.queue.filter((_, i) => i !== action.i); });
     case "set_send_mode":
       return { ...state, sendMode: action.mode };
     case "set_pending":
-      return { ...state, pendingSend: action.prompt };
+      return patch(state, state.focusedSid, (rt) => { rt.pendingSend = action.prompt; });
     case "clear_pending":
-      return { ...state, pendingSend: null };
+      return patch(state, state.focusedSid, (rt) => { rt.pendingSend = null; });
     case "set_model":
-      return { ...state, model: action.model };
+      return patch(state, state.focusedSid, (rt) => { rt.model = action.model; });
     case "set_perm":
-      return { ...state, perm: action.perm };
+      return patch(state, state.focusedSid, (rt) => { rt.perm = action.perm; });
     case "set_turns":
-      return { ...state, turns: action.turns };
+      return patch(state, action.sid, (rt) => { rt.turns = action.turns; }, true);
     case "set_context":
-      return { ...state, contextReport: action.report };
+      return patch(state, state.focusedSid, (rt) => { rt.contextReport = action.report; });
     case "clear_context":
-      return { ...state, contextReport: null };
+      return patch(state, state.focusedSid, (rt) => { rt.contextReport = null; });
     case "set_artifact":
       return { ...state, artifact: action.artifact };
     case "clear_artifact":
       return { ...state, artifact: null };
     case "answer_question":
-      return { ...state, pendingQuestion: null };
+      return patch(state, state.focusedSid, (rt) => { rt.pendingQuestion = null; });
     case "enter_new_chat":
       return { ...state, newChat: { cwd: action.cwd } };
     case "set_new_chat_cwd":
@@ -178,164 +199,170 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, newChat: null, pendingNewQuery: { prompt: action.prompt, msg_id: action.msg_id, images: action.images, files: action.files } };
     case "clear_pending_new_query":
       return { ...state, pendingNewQuery: null };
-    case "event": {
+    case "event":
       return reduceEvent(state, action.event);
-    }
   }
 }
 
 function reduceEvent(state: AppState, e: ServerEvent): AppState {
   switch (e.type) {
-    case "snapshot":
-      // First hello: just learn cc_session_id + state + cwd. The app reads its
-      // IndexedDB cache and re-hellos with last_seq to fetch the delta.
-      return { ...state, state: e.state, ccSessionId: e.cc_session_id ?? undefined, currentCwd: e.cwd ?? state.currentCwd };
-    case "state":
-      return { ...state, state: e.state };
-    case "model":
-      return { ...state, model: matchModelId(e.model) };
-    case "perm":
-      return { ...state, perm: e.mode };
-    case "context_report":
-      return { ...state, contextReport: e };
-    case "ask_user":
-      return { ...state, pendingQuestion: { ask_id: e.ask_id, question: e.question, options: e.options } };
-    case "diff_report":
-      return { ...state, artifact: { file: e.file, kind: "gitdiff", sections: parseGitDiff(e.diff) } };
+    case "snapshot": {
+      // Per-session: the frame's sid is the runtime key; cc_session_id is the
+      // real cc id (may still be null while a brand-new session's id is captured).
+      const key = e.sid ?? e.cc_session_id ?? state.focusedSid;
+      if (!key) return state;
+      // First snapshot on a fresh connect focuses that session so the UI shows
+      // something; a later session_focus (or the user picking one) overrides it.
+      const focusedSid = state.focusedSid ?? key;
+      return { ...patch(state, key, (rt) => {
+        rt.state = e.state;
+        rt.ccSessionId = e.cc_session_id ?? rt.ccSessionId;
+      }, true), focusedSid };
+    }
+    case "session_focus": {
+      // NON-destructive, focus-ONLY view change. Runtime key migration on
+      // id-capture is handled by session_rekey — keeping it out of here is what
+      // stops a background session's id-capture from stealing the user's view.
+      const newF = e.session_id;
+      const runtimes = state.runtimes[newF]
+        ? state.runtimes
+        : { ...state.runtimes, [newF]: createRuntime() };
+      return { ...state, focusedSid: newF, runtimes, currentCwd: e.cwd ?? state.currentCwd, switchTick: state.switchTick + 1 };
+    }
+    case "session_rekey": {
+      // A temp-keyed new session captured its real cc id. Rename the runtime
+      // old_key -> session_id; focus follows ONLY if we were viewing old_key
+      // (so a BACKGROUND new session's capture never yanks the current view).
+      const { old_key, session_id } = e;
+      if (old_key === session_id) return state;
+      const runtimes = { ...state.runtimes };
+      if (runtimes[old_key]) {
+        if (!runtimes[session_id]) runtimes[session_id] = runtimes[old_key];
+        delete runtimes[old_key];
+      } else if (!runtimes[session_id]) {
+        runtimes[session_id] = createRuntime();
+      }
+      const wasFocused = state.focusedSid === old_key;
+      return {
+        ...state,
+        runtimes,
+        focusedSid: wasFocused ? session_id : state.focusedSid,
+        currentCwd: wasFocused && e.cwd ? e.cwd : state.currentCwd,
+      };
+    }
+    case "session_switched":
+      // Destructive (wrapper restart reconnect path). Clear the focused runtime.
+      return patch(state, e.session_id || state.focusedSid, (rt) => {
+        rt.turns = []; rt.state = "idle"; rt.replaying = false; rt.truncated = false;
+        rt.queue = []; rt.pendingSend = null; rt.pendingQuestion = null;
+      });
     case "session_list":
       return { ...state, sessions: e.sessions };
     case "dir_list":
       return { ...state, dirPicker: { path: e.path, parent: e.parent ?? null, dirs: e.dirs } };
-    case "session_switched":
-      // new active session: clear turns, reset turn scheduling, drop queue
-      return {
-        ...state,
-        turns: [],
-        state: "idle",
-        replaying: false,
-        truncated: false,
-        banner: undefined,
-        queue: [],
-        pendingSend: null,
-        activeSessionId: e.session_id || state.activeSessionId,
-        currentCwd: e.cwd ?? state.currentCwd,
-        newChat: null,
-        switchTick: state.switchTick + 1,
-      };
-    case "replay_start":
-      // truncated = the buffer evicted events the client's last_seq wanted, so
-      // rebuild from the buffer (drop local turns). rebuild = the client's
-      // last_seq was from a previous wrapper lifetime (seq reset on restart);
-      // also drop local turns, but it's NOT data loss so don't set truncated.
-      // Otherwise incremental catch-up: merge onto existing turns.
-      {
-        const clear = e.truncated || !!e.rebuild;
-        return { ...state, replaying: true, truncated: e.truncated, turns: clear ? [] : state.turns };
-      }
-    case "replay_end":
-      return { ...state, replaying: false, truncated: state.truncated || e.truncated };
     case "wrapper_disconnected":
       return { ...state, wrapperOnline: false, banner: "machine offline — waiting for reconnect" };
     case "wrapper_reconnected":
-      // wrapper came back; its buffer survived, but we may have missed events
-      // during the gap. The App re-hellos on this event to trigger replay.
-      return { ...state, wrapperOnline: true, banner: undefined, state: e.state, ccSessionId: e.cc_session_id ?? undefined };
-    case "error": {
-      const turns = cloneTurns(state.turns);
-      const t = turns[turns.length - 1];
-      if (t && !t.done) t.error = `${e.code}: ${e.message}`;
-      else turns.push({ id: `err-${Date.now()}`, prompt: "", blocks: [], done: true, error: `${e.code}: ${e.message}` });
-      return { ...state, turns, pendingNewQuery: null };
-    }
-    case "user_msg": {
-      // Originating client already created the turn on send (dedup by msg_id);
-      // other clients create it here so they see the prompt too. If a race left
-      // the turn with an empty prompt (assistant_msg_start beat query_sent),
-      // fill it — the wrapper always echoes the prompt here. Carries images so
-      // replay/other devices render the attachment.
-      const turns = cloneTurns(state.turns);
-      const existing = turns.find((t) => t.id === e.msg_id);
-      const imgs = (e.images && e.images.length) ? e.images : undefined;
-      if (existing) {
-        if (!existing.prompt && e.prompt) existing.prompt = e.prompt;
-        if (!existing.images && imgs) existing.images = imgs;
-      } else {
-        turns.push({ id: e.msg_id, prompt: e.prompt, images: imgs, blocks: [], done: false });
-      }
-      return { ...state, turns };
-    }
-    case "assistant_msg_start": {
-      const turns = cloneTurns(state.turns);
-      let t = turns[turns.length - 1];
-      if (!t || t.done) {
-        t = { id: e.message_id, prompt: "", blocks: [], done: false };
-        turns.push(t);
-      }
-      if (!t.blocks.some((b) => b.kind === "text" && b.message_id === e.message_id)) {
-        t.blocks.push({ kind: "text", message_id: e.message_id, text: "", done: false });
-      }
-      return { ...state, turns };
-    }
-    case "delta": {
-      const turns = cloneTurns(state.turns);
-      let t = turns[turns.length - 1];
-      if (!t || t.done) {
-        t = { id: e.message_id, prompt: "", blocks: [], done: false };
-        turns.push(t);
-      }
-      let block = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
-      if (!block) {
-        block = { kind: "text", message_id: e.message_id, text: "", done: false };
-        t.blocks.push(block);
-      }
-      block.text += e.text;
-      return { ...state, turns };
-    }
-    case "tool_use": {
-      const turns = cloneTurns(state.turns);
-      let t = turns[turns.length - 1];
-      if (!t || t.done) {
-        t = { id: e.message_id, prompt: "", blocks: [], done: false };
-        turns.push(t);
-      }
-      if (!t.blocks.some((b) => b.kind === "tool" && b.tool_use_id === e.tool_use_id)) {
-        t.blocks.push({
-          kind: "tool", message_id: e.message_id, tool_use_id: e.tool_use_id,
-          tool: e.tool, input: e.input, done: false,
-        });
-      }
-      return { ...state, turns };
-    }
-    case "tool_result": {
-      const turns = cloneTurns(state.turns);
-      for (const t of turns) {
-        const b = t.blocks.find((b) => b.kind === "tool" && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
-        if (b) {
-          b.result = { content: e.content, is_error: e.is_error, truncated: e.truncated ?? undefined };
-          b.done = true;
-          break;
+      return { ...state, wrapperOnline: true, banner: undefined };
+    case "diff_report":
+      return { ...state, artifact: { file: e.file, kind: "gitdiff", sections: parseGitDiff(e.diff) } };
+    case "state":
+      return patch(state, e.sid, (rt) => { rt.state = e.state; });
+    case "model":
+      return patch(state, e.sid, (rt) => { rt.model = matchModelId(e.model); });
+    case "perm":
+      return patch(state, e.sid, (rt) => { rt.perm = e.mode; });
+    case "context_report":
+      return patch(state, e.sid, (rt) => { rt.contextReport = e; });
+    case "ask_user":
+      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, question: e.question, options: e.options }; });
+    case "replay_start":
+      return patch(state, e.sid, (rt) => {
+        rt.replaying = true;
+        rt.truncated = e.truncated;
+        if (e.truncated || !!e.rebuild) rt.turns = [];
+      });
+    case "replay_end":
+      return patch(state, e.sid, (rt) => { rt.replaying = false; rt.truncated = rt.truncated || e.truncated; });
+    case "error":
+      return { ...patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        const t = turns[turns.length - 1];
+        if (t && !t.done) t.error = `${e.code}: ${e.message}`;
+        else turns.push({ id: `err-${Date.now()}`, prompt: "", blocks: [], done: true, error: `${e.code}: ${e.message}` });
+        rt.turns = turns;
+      }), pendingNewQuery: null };
+    case "user_msg":
+      return patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        const existing = turns.find((t) => t.id === e.msg_id);
+        const imgs = (e.images && e.images.length) ? e.images : undefined;
+        if (existing) {
+          if (!existing.prompt && e.prompt) existing.prompt = e.prompt;
+          if (!existing.images && imgs) existing.images = imgs;
+        } else {
+          turns.push({ id: e.msg_id, prompt: e.prompt, images: imgs, blocks: [], done: false });
         }
-      }
-      return { ...state, turns };
-    }
-    case "assistant_msg_end": {
-      const turns = cloneTurns(state.turns);
-      for (const t of turns) {
-        const b = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
-        if (b) { b.done = true; break; }
-      }
-      return { ...state, turns };
-    }
-    case "turn_end": {
-      const turns = cloneTurns(state.turns);
-      const t = turns[turns.length - 1];
-      if (t) {
-        t.done = true;
-        if (e.result.subtype === "error_during_execution") t.interrupted = true;
-        if (t.ts && e.result.duration_ms) t.doneTs = t.ts + e.result.duration_ms;
-      }
-      return { ...state, turns, state: "idle" };
-    }
+        rt.turns = turns;
+      });
+    case "assistant_msg_start":
+      return patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        let t = turns[turns.length - 1];
+        if (!t || t.done) { t = { id: e.message_id, prompt: "", blocks: [], done: false }; turns.push(t); }
+        if (!t.blocks.some((b) => b.kind === "text" && b.message_id === e.message_id))
+          t.blocks.push({ kind: "text", message_id: e.message_id, text: "", done: false });
+        rt.turns = turns;
+      });
+    case "delta":
+      return patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        let t = turns[turns.length - 1];
+        if (!t || t.done) { t = { id: e.message_id, prompt: "", blocks: [], done: false }; turns.push(t); }
+        let block = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
+        if (!block) { block = { kind: "text", message_id: e.message_id, text: "", done: false }; t.blocks.push(block); }
+        block.text += e.text;
+        rt.turns = turns;
+      });
+    case "tool_use":
+      return patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        let t = turns[turns.length - 1];
+        if (!t || t.done) { t = { id: e.message_id, prompt: "", blocks: [], done: false }; turns.push(t); }
+        if (!t.blocks.some((b) => b.kind === "tool" && b.tool_use_id === e.tool_use_id))
+          t.blocks.push({ kind: "tool", message_id: e.message_id, tool_use_id: e.tool_use_id, tool: e.tool, input: e.input, done: false });
+        rt.turns = turns;
+      });
+    case "tool_result":
+      return patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        for (const t of turns) {
+          const b = t.blocks.find((b) => b.kind === "tool" && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
+          if (b) { b.result = { content: e.content, is_error: e.is_error, truncated: e.truncated ?? undefined }; b.done = true; break; }
+        }
+        rt.turns = turns;
+      });
+    case "assistant_msg_end":
+      return patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        for (const t of turns) {
+          const b = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
+          if (b) { b.done = true; break; }
+        }
+        rt.turns = turns;
+      });
+    case "turn_end":
+      return patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        const t = turns[turns.length - 1];
+        if (t) {
+          t.done = true;
+          if (e.result.subtype === "error_during_execution") t.interrupted = true;
+          if (t.ts && e.result.duration_ms) t.doneTs = t.ts + e.result.duration_ms;
+        }
+        rt.turns = turns;
+        rt.state = "idle";
+      });
     case "pong":
     case "hello":
       return state;

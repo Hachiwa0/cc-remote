@@ -11,6 +11,8 @@ export const COMMANDS: Command[] = [
   { slash: "plan", name: "Plan mode", ds: "先给方案，确认后再动手", ic: "plan" },
   { slash: "normal", name: "普通模式", ds: "直接执行，边做边说", ic: "run" },
   { slash: "permissions", name: "权限模式", ds: "选择 cc 的权限模式", ic: "shield" },
+  { g: "模型" },
+  { slash: "model", name: "切换模型", ds: "/model <id> 切到指定模型(支持隐藏模型),无参数则打开选择器", ic: "cpu" },
   { g: "审查" },
   { slash: "code-review", name: "代码审查", ds: "审当前 diff 的正确性与可简化项", ic: "review" },
   { slash: "security-review", name: "安全审查", ds: "扫描分支改动的安全隐患", ic: "shield" },
@@ -52,4 +54,35 @@ export const PERMS: Perm[] = [
 
 export function isCmd(c: Command): c is Cmd {
   return (c as Cmd).slash !== undefined;
+}
+
+export const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
+
+// Slashes handled locally by the web client (never forwarded to cc as a prompt).
+// Everything else (code-review, verify, run, deep-research, …) is a cc skill and
+// is forwarded verbatim so cc's own slash-command layer runs it.
+export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context"]);
+
+// The command "token" the user is typing after "/", up to the first space.
+// null when the input isn't an in-progress slash command (no leading "/", or a
+// space already started the arguments). Drives the palette's show/hide.
+export function slashToken(input: string): string | null {
+  if (!input.startsWith("/")) return null;
+  const after = input.slice(1);
+  if (/\s/.test(after)) return null; // a space => choosing args, not the command
+  return after;
+}
+
+// Commands whose slash starts with `token` (case-insensitive, prefix match).
+export function matchCommands(token: string): Cmd[] {
+  const t = token.toLowerCase();
+  return CMD_LIST.filter((c) => c.slash.toLowerCase().startsWith(t));
+}
+
+// Split "/slash rest of args" -> { slash, args }. null if not a slash line.
+export function parseSlash(input: string): { slash: string; args: string } | null {
+  if (!input.startsWith("/")) return null;
+  const m = input.slice(1).match(/^(\S+)\s*([\s\S]*)$/);
+  if (!m) return null;
+  return { slash: m[1].toLowerCase(), args: m[2].trim() };
 }

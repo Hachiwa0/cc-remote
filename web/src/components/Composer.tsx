@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import type { State, QueryImg, QueryFile } from "../protocol";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
-import { MODELS, PERMS } from "../data";
+import { MODELS, PERMS, CLIENT_SLASHES, slashToken, matchCommands, parseSlash } from "../data";
 import { CommandSheet } from "./CommandSheet";
 
 interface Props {
@@ -29,7 +29,11 @@ interface Props {
 
 export function Composer(p: Props) {
   const [input, setInput] = useState("");
-  const [sheetKind, setSheetKind] = useState<"commands" | "models" | "perms" | null>(null);
+  // Only the modal pickers live in state now; the "/" command palette is a live
+  // popover DERIVED from the composer text (no second input box).
+  const [sheetKind, setSheetKind] = useState<"models" | "perms" | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<number | null>(null);
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
   const [dragDepth, setDragDepth] = useState(0);
@@ -81,14 +85,32 @@ export function Composer(p: Props) {
     }
   }, [p.editPrompt]);
 
-  const onInput = (v: string) => {
-    setInput(v);
-    if (v === "/") setSheetKind("commands");
+  const resetTaHeight = () => { if (taRef.current) taRef.current.style.height = "auto"; };
+  const growTa = () => {
     if (taRef.current) {
       taRef.current.style.height = "auto";
       taRef.current.style.height = Math.min(taRef.current.scrollHeight, 132) + "px";
     }
   };
+  const focusTa = () => setTimeout(() => taRef.current?.focus(), 0);
+  const flash = (msg: string) => {
+    setNotice(msg);
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 2200);
+  };
+
+  const onInput = (v: string) => {
+    setInput(v);
+    growTa();
+  };
+
+  // Command palette = live suggestions derived from the input. Visible while the
+  // user is typing a command name (after "/", before a space) that prefix-matches
+  // at least one command. Typing past a match (/pet) hides it; deleting back
+  // (/pe) shows it again — no separate input, no modal scrim over the composer.
+  const cmdToken = slashToken(input);
+  const cmdMatches = cmdToken !== null ? matchCommands(cmdToken) : [];
+  const cmdOpen = cmdMatches.length > 0;
 
   const onPickFiles = (fl: FileList | File[] | null) => {
     if (!fl) return;
@@ -119,35 +141,63 @@ export function Composer(p: Props) {
     if (files.length) { e.preventDefault(); onPickFiles(files); }
   };
 
-  const send = () => {
-    if (offline) return;
-    let prompt = input.trim();
-    // "/plan <task>" or "/normal <task>" typed manually: switch cc's permission
-    // mode (plan / default) and send just the task — don't forward "/plan" as a
-    // prompt (cc has no /plan slash command, so it would reject it and drop the
-    // task). The palette path already calls setPerm directly and clears input.
-    if (prompt.startsWith("/plan ")) { p.onSetPerm("plan"); prompt = prompt.slice(6).trim(); }
-    else if (prompt.startsWith("/normal ")) { p.onSetPerm("bypassPermissions"); prompt = prompt.slice(8).trim(); }
+  // Send prompt text to cc, honoring busy/queue/interrupt rules.
+  const submitPrompt = (prompt: string) => {
     if (busy) {
       // empty input while busy => stop (interrupt); non-empty => interrupt+send or enqueue
       if (!prompt && !hasAttachments) { p.onInterrupt(); return; }
       if (p.sendMode === "queue") { p.onEnqueue(prompt); setInput(""); return; }
       p.onInterrupt(); p.onSetPending(prompt);
-      setInput(""); setImages([]); setFiles([]);
-      if (taRef.current) taRef.current.style.height = "auto";
+      setInput(""); setImages([]); setFiles([]); resetTaHeight();
       return;
     }
     if (!prompt && !hasAttachments) return;
     p.onSendQuery(prompt, images.length ? images : undefined, files.length ? files : undefined);
-    setInput(""); setImages([]); setFiles([]);
-    if (taRef.current) taRef.current.style.height = "auto";
+    setInput(""); setImages([]); setFiles([]); resetTaHeight();
+  };
+
+  // Client-side slash commands — never forwarded to cc. "/model <id>" passes the
+  // id straight to set_model (hidden models included), aligning with Claude Code.
+  const runClientSlash = (slash: string, args: string) => {
+    switch (slash) {
+      case "model":
+        if (args) { p.onSetModel(args); flash(`已切换模型：${args}`); }
+        else setSheetKind("models");
+        break;
+      case "permissions": setSheetKind("perms"); break;
+      case "clear": p.onClear(); break;
+      case "context": p.onContext(); break;
+      case "plan": p.onSetPerm("plan"); if (args) { submitPrompt(args); return; } break;
+      case "normal": p.onSetPerm("bypassPermissions"); if (args) { submitPrompt(args); return; } break;
+    }
+    setInput(""); resetTaHeight();
+  };
+
+  // Pick a command from the palette. Client commands run now; cc skills
+  // (/code-review …) fill the composer so the user can add args, then send.
+  const pickCommand = (slash: string) => {
+    if (CLIENT_SLASHES.has(slash)) { runClientSlash(slash, ""); focusTa(); return; }
+    setInput("/" + slash + " ");
+    focusTa(); growTa();
+  };
+
+  const send = () => {
+    if (offline) return;
+    const raw = input.trim();
+    if (raw === "/") return;
+    const parsed = parseSlash(raw);
+    if (parsed && CLIENT_SLASHES.has(parsed.slash)) { runClientSlash(parsed.slash, parsed.args); return; }
+    // plain text, or a cc skill slash (/code-review …) forwarded verbatim to cc
+    submitPrompt(raw);
   };
 
   const stopping = busy && !hasText && !hasAttachments;
   const sendIcon = !busy ? "send" : stopping ? "stop" : p.sendMode === "interrupt" ? "bolt" : "queue";
   const sendClass = "sendbtn" + ((stopping || (busy && p.sendMode === "interrupt" && (hasText || hasAttachments))) ? " interrupt" : "");
   const disabled = offline || (!busy && !hasText && !hasAttachments);
-  const model = MODELS.find((m) => m.id === p.model) || MODELS[0];
+  // Fall back to the raw id (not MODELS[0]) so a hidden model set via
+  // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
+  const model = MODELS.find((m) => m.id === p.model) || { id: p.model, name: p.model || MODELS[0].name, ds: "" };
   const perm = PERMS.find((x) => x.id === p.perm) || PERMS[0];
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm.id === "plan" ? " plan" : perm.danger ? " danger" : "";
@@ -156,6 +206,21 @@ export function Composer(p: Props) {
   return (
     <div className="composer">
       <div className="composer-in">
+        {cmdOpen && (
+          <div className="cmd-pop" role="listbox" aria-label="命令">
+            {cmdMatches.map((c) => (
+              <button key={c.slash} type="button" className="cmd" onClick={() => pickCommand(c.slash)}>
+                <span className="cmd-ic"><Icon name={c.ic} size={17} /></span>
+                <span className="cmd-tx">
+                  <span className="cmd-nm"><span className="slash">/{c.slash}</span></span>
+                  <span className="cmd-ds">{c.name} — {c.ds}</span>
+                </span>
+                <span className="cmd-kbd">↵</span>
+              </button>
+            ))}
+          </div>
+        )}
+        {notice && <div className="composer-notice">{notice}</div>}
         {p.queue.length > 0 && (
           <div className="queued show">
             {p.queue.map((m, i) => (
@@ -210,7 +275,16 @@ export function Composer(p: Props) {
             disabled={offline}
             onChange={(e) => onInput(e.target.value)}
             onPaste={onPaste}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && cmdOpen) { setInput(""); resetTaHeight(); return; }
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                // typing a command name (no args) => Enter completes/executes the top match
+                if (cmdOpen && cmdToken) { pickCommand(cmdMatches[0].slash); return; }
+                if (cmdToken === "") return; // just "/" — do nothing
+                send();
+              }
+            }}
           />
           <button className="cchip mini" aria-label="选择模型" onClick={() => setSheetKind("models")}>
             <span className="ci"><Icon name="cpu" size={15} /></span>
@@ -235,18 +309,8 @@ export function Composer(p: Props) {
 
       <CommandSheet
         open={sheetKind !== null}
-        kind={sheetKind || "commands"}
-        onClose={() => { setSheetKind(null); if (input === "/") setInput(""); }}
-        onPickCommand={(slash) => {
-          if (slash === "clear") { p.onClear(); setInput(""); setSheetKind(null); return; }
-          if (slash === "context") { p.onContext(); setInput(""); setSheetKind(null); return; }
-          if (slash === "permissions") { setInput(""); setSheetKind("perms"); return; }
-          if (slash === "plan") { p.onSetPerm("plan"); setInput(""); setSheetKind(null); setTimeout(() => taRef.current?.focus(), 0); return; }
-          if (slash === "normal") { p.onSetPerm("bypassPermissions"); setInput(""); setSheetKind(null); setTimeout(() => taRef.current?.focus(), 0); return; }
-          setInput("/" + slash + " ");
-          setSheetKind(null);
-          setTimeout(() => taRef.current?.focus(), 0);
-        }}
+        kind={sheetKind ?? "models"}
+        onClose={() => setSheetKind(null)}
         currentModel={p.model}
         onPickModel={(m) => { p.onSetModel(m); setSheetKind(null); }}
         currentPerm={p.perm}

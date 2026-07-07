@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState } from "react";
 import { COMMANDS, MODELS, PERMS, isCmd, type Cmd, type CmdGroup } from "../data";
 import { Icon } from "../icons";
 
 interface Props {
   open: boolean;
   kind: "commands" | "models" | "perms";
+  // command mode: the token typed after "/" in the composer (prefix filter).
+  // There is NO input box in this sheet anymore — the composer textarea is the
+  // single input, and this palette is a live suggestion overlay driven by it.
+  filter?: string;
   onClose: () => void;
   onPickCommand?: (slash: string) => void;
   currentModel?: string;
@@ -13,28 +16,18 @@ interface Props {
   onPickPerm?: (perm: string) => void;
 }
 
-export function CommandSheet({ open, kind, onClose, onPickCommand, currentModel, onPickModel, currentPerm, onPickPerm }: Props) {
-  const [q, setQ] = useState("");
-  const searchRef = useRef<HTMLInputElement>(null);
-  const filter = q.toLowerCase();
+export function CommandSheet({ open, kind, filter = "", onClose, onPickCommand, currentModel, onPickModel, currentPerm, onPickPerm }: Props) {
   const isCmdMode = kind === "commands";
   const isPermMode = kind === "perms";
+  const f = filter.toLowerCase();
 
-  // When the command sheet opens, focus the search box + clear the filter so
-  // typing narrows the list (Claude-app style: "/" => palette, type to filter).
-  useEffect(() => {
-    if (open && isCmdMode) {
-      setQ("");
-      const t = setTimeout(() => searchRef.current?.focus(), 0);
-      return () => clearTimeout(t);
-    }
-  }, [open, isCmdMode]);
-
+  // Prefix-match on the slash (same rule the composer uses to decide visibility),
+  // preserving group headers that still have matches.
   const groups: { name: string; cmds: Cmd[] }[] = [];
   if (isCmdMode) {
     for (const c of COMMANDS) {
       if (isCmd(c)) {
-        if (!filter || c.slash.toLowerCase().includes(filter) || c.name.toLowerCase().includes(filter)) {
+        if (!f || c.slash.toLowerCase().startsWith(f)) {
           if (!groups.length) groups.push({ name: "", cmds: [] });
           groups[groups.length - 1].cmds.push(c);
         }
@@ -52,14 +45,7 @@ export function CommandSheet({ open, kind, onClose, onPickCommand, currentModel,
       <div className={"scrim" + (open ? " show" : "")} onClick={onClose} />
       <div className={"sheet" + (open ? " show" : "")} role="dialog" aria-label={title}>
         <div className="sheet-grip" />
-        {isCmdMode ? (
-          <div className="sheet-search">
-            <Icon name="term" size={17} />
-            <input ref={searchRef} value={q} onChange={(e) => setQ(e.target.value)} placeholder="运行命令或技能…" />
-          </div>
-        ) : (
-          <div className="sheet-title">{title}</div>
-        )}
+        <div className="sheet-title">{isCmdMode ? (filter ? `/${filter}` : "命令面板") : title}</div>
         <div className="sheet-scroll">
           {isCmdMode ? (
             visible.map((g, gi) => (

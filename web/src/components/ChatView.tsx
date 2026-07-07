@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Turn, Block, TextBlock, ToolBlock } from "../reducer";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
@@ -27,7 +27,7 @@ function formatTime(ts: number): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-export function ChatView({ turns, onEdit, onGetDiff }: { turns: Turn[]; onEdit: (prompt: string) => void; onGetDiff: (file: string) => void }) {
+export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null; turns: Turn[]; onEdit: (prompt: string) => void; onGetDiff: (file: string) => void }) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -40,8 +40,19 @@ export function ChatView({ turns, onEdit, onGetDiff }: { turns: Turn[]; onEdit: 
     setAtBottom(dist < 80);
   };
 
+  // On session switch (sid change): jump to the bottom INSTANTLY, before paint,
+  // so a session with history opens already at the latest turn — no visible
+  // scroll-from-top animation. useLayoutEffect runs before the browser paints.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    setAtBottom(true);
+  }, [sid]);
+
   // Auto-scroll to bottom on new turns only if the user is already there
-  // (so reading older history isn't yanked away by streaming deltas).
+  // (so reading older history isn't yanked away by streaming deltas). Streaming
+  // within the focused session keeps the smooth behavior; the switch case above
+  // already put us at the bottom, so this is a no-op right after a switch.
   useEffect(() => {
     if (atBottom) endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [turns, atBottom]);

@@ -16,7 +16,7 @@ from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 State = Literal["idle", "running", "interrupting", "draining"]
 
@@ -56,7 +56,8 @@ class Hello(_Base):
     type: Literal["hello"] = "hello"
     role: Literal["client", "wrapper"]
     client_id: Optional[str] = None  # client
-    last_seq: Optional[int] = None  # client
+    last_seq: Optional[int] = None  # client (legacy: focused session only)
+    cursors: Optional[dict[str, int]] = None  # client: per-session last_seq for multi-session catch-up
     cc_session_id: Optional[str] = None  # wrapper
     state: Optional[State] = None  # wrapper
     buffer_head_seq: Optional[int] = None  # wrapper
@@ -218,6 +219,7 @@ class SessionInfo(BaseModel):
     git_branch: Optional[str] = None
     cwd: Optional[str] = None
     tag: Optional[str] = None  # SDK session tag; "archived" hides the card in the sidebar
+    state: Optional[State] = None  # if resident: this session's idle/running/... (sidebar status dot)
 
 
 class ListSessions(_Base):
@@ -249,6 +251,36 @@ class SessionSwitched(_Base):
     type: Literal["session_switched"] = "session_switched"
     session_id: str
     cwd: Optional[str] = None  # the switched-to session's cwd
+
+
+class SessionFocus(_Base):
+    """wrapper -> client: NON-destructive view change — the user switched which
+    resident session they're viewing. Distinct from SessionSwitched (which is
+    destructive: clears turns on a full reconnect). The client just swaps its
+    view to this session; turns are NOT cleared (they're already in memory).
+
+    Focus-moving ONLY: sending this switches the client's view. A brand-new
+    session captures its real cc id mid-turn — that is a re-key, NOT a focus
+    change, so it uses SessionRekey (below), else a background session capturing
+    its id would yank the user's view (focus-steal)."""
+    type: Literal["session_focus"] = "session_focus"
+    session_id: str
+    cwd: Optional[str] = None
+
+
+class SessionRekey(_Base):
+    """wrapper -> client: a resident session's pool key changed from a temp key
+    (`tmp-<uuid>`, assigned to a brand-new session before its id is known) to
+    its real cc session id, captured from the first ResultMessage/init. The
+    client renames its runtime entry old_key -> session_id and migrates that
+    session's replay cursor. This does NOT move focus — focus only follows if
+    the client was already viewing old_key. Splitting this out from
+    SessionFocus is what prevents focus-steal when a *background* new session
+    captures its id."""
+    type: Literal["session_rekey"] = "session_rekey"
+    old_key: str
+    session_id: str
+    cwd: Optional[str] = None
 
 
 class RenameSession(_Base):
@@ -352,7 +384,7 @@ class AnswerQuestion(_Base):
 AnyMessage = Union[
     Hello, Query, Interrupt, SetModel, SetPerm, GetContext, GetDiff, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Perm, ContextReport, DiffReport, AskUser, AnswerQuestion,
-    SessionList, SessionSwitched, RenameSession, ArchiveSession, DirList,
+    SessionList, SessionSwitched, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
@@ -395,6 +427,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "answer_question": AnswerQuestion,
     "session_list": SessionList,
     "session_switched": SessionSwitched,
+    "session_focus": SessionFocus,
+    "session_rekey": SessionRekey,
     "user_msg": UserMsg,
     "assistant_msg_start": AssistantMsgStart,
     "delta": Delta,
