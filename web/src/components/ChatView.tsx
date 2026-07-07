@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Turn, Block, TextBlock, ToolBlock } from "../reducer";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
-import { Icon, ClaudeMark, ClaudeWorking } from "../icons";
+import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
 
 type Segment = { kind: "text"; block: TextBlock } | { kind: "tools"; tools: ToolBlock[] };
 
@@ -151,10 +151,13 @@ export function ChatView({ sid, turns, onEdit, onGetDiff }: { sid: string | null
                   <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">思考中</span></div>
                 )}
                 {t.done && (
-                  <div className="ubub-meta ai-meta">
-                    {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
-                    <button className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")} onClick={() => copyText(t.id + "-ai", aiText(t))} aria-label="复制"><Icon name="check" size={13} /></button>
-                  </div>
+                  <>
+                    <div className="ubub-meta ai-meta">
+                      {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
+                      <button className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")} onClick={() => copyText(t.id + "-ai", aiText(t))} aria-label="复制"><Icon name="check" size={13} /></button>
+                    </div>
+                    <div className="turn-done-mark"><ClaudeSpark size={22} /></div>
+                  </>
                 )}
               </>
             ) : (!t.done && t.prompt) ? (

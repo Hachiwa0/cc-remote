@@ -66,6 +66,31 @@ export function ClaudeMark({ size = 16, className }: { size?: number; className?
   );
 }
 
+// A clickable Claude spark that sits under a finished reply: static at rest,
+// and on click it plays ONE loop of the working morph, then settles back.
+export function ClaudeSpark({ size = 22, className }: { size?: number; className?: string }) {
+  const [frame, setFrame] = useState(-1); // -1 = static
+  const play = () => {
+    if (frame >= 0) return; // already playing
+    let i = 0;
+    setFrame(0);
+    const id = window.setInterval(() => {
+      i += 1;
+      if (i >= WORK_FRAMES.length) { window.clearInterval(id); setFrame(-1); }
+      else setFrame(i);
+    }, 110);
+  };
+  const [a, b] = frame >= 0 ? WORK_FRAMES[frame] : [0.9, 0.42];
+  return (
+    <button type="button" className={"spark-btn" + (className ? " " + className : "")} onClick={play} aria-label="Claude">
+      <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" aria-hidden="true">
+        {b > 0 && <path d={SPARK} transform={sparkTransform(b, 45)} opacity={frame >= 0 ? 0.8 : 0.55} />}
+        {a > 0 && <path d={SPARK} transform={sparkTransform(a)} />}
+      </svg>
+    </button>
+  );
+}
+
 // Claude "working" indicator: not one icon scaling, but a loop of morphing
 // sparks — a big spark + a diagonal spark trading size/emphasis frame by frame,
 // so it shimmers like the official Claude thinking animation.
