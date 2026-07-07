@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Icon } from "../icons";
+import { Icon, ClaudeMark } from "../icons";
 
 export function LoginForm({
   onLogin, theme, onToggleTheme,
@@ -40,7 +40,7 @@ export function LoginForm({
       </button>
       <div className="login-card">
         <div className="login-brand">
-          <span className="dot" />
+          <span className="brand-mark"><ClaudeMark size={30} /></span>
           <span className="name"><b>cc</b><span>·remote</span></span>
         </div>
         <p className="login-tag serif" style={{ fontSize: 15 }}>你的 Claude Code，随身遥控</p>

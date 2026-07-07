@@ -2,7 +2,7 @@ import { useEffect, useReducer, useRef, useState, type TouchEvent } from "react"
 import { RelayWs } from "./ws";
 import { reduce, initialState, createRuntime } from "./reducer";
 import { uuid } from "./util";
-import { Icon } from "./icons";
+import { Icon, ClaudeMark } from "./icons";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { ReconnectBanner } from "./components/ReconnectBanner";
@@ -235,7 +235,7 @@ export default function App() {
           <div className="titlewrap">
             <div className="ttl">
               <span className="brand" onClick={() => setSidebarOpen(true)} style={{ cursor: "pointer" }}>
-                <span className="dot" />
+                <span className="brand-mark"><ClaudeMark size={18} /></span>
                 <span className="name serif"><b>cc</b><span>·remote</span></span>
               </span>
             </div>

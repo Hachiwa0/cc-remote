@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type TouchEvent } from "react";
 import type { SessionInfo, State } from "../protocol";
-import { Icon } from "../icons";
+import { Icon, ClaudeMark } from "../icons";
 
 interface Props {
   open: boolean;
@@ -220,7 +220,7 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
         <div className="s-inner">
           <div className="s-head">
             <div className="brand" onClick={onClose}>
-              <span className="dot" />
+              <span className="brand-mark"><ClaudeMark size={17} /></span>
               <span className="name"><b>cc</b><span>·remote</span></span>
             </div>
             <button className="iconbtn" onClick={onClose} aria-label="关闭"><Icon name="close" /></button>
