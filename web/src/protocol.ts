@@ -81,7 +81,7 @@ export interface DiffReport extends Base { type: "diff_report"; file: string; di
 // On-demand bulk history: fetched once when a session is opened (like a web
 // chat's GET /conversation) instead of replaying the ring buffer on every hello.
 export interface GetHistory extends Base { type: "get_history"; session_id: string; client_id?: string | null; cwd?: string | null; before?: string | null; limit?: number | null }
-export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null }
+export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null }
 export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; question: string; options: AskOption[] }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }

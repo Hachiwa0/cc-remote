@@ -94,6 +94,9 @@ body{
 /* THREAD */
 .thread{ flex:1; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch; padding:20px 16px 8px; position:relative; }
 .thread-in{ max-width:760px; margin:0 auto; }
+.load-more-wrap{ display:flex; justify-content:center; padding:4px 0 16px; }
+.load-more-btn{ font:inherit; font-size:12.5px; color:var(--dim); background:transparent; border:1px solid var(--border); border-radius:999px; padding:5px 14px; cursor:pointer; transition:.16s; }
+.load-more-btn:hover{ background:var(--accent-weak); color:var(--accent-ink); border-color:var(--accent-weak); }
 .scroll-bottom-wrap{ position:sticky; bottom:16px; display:flex; justify-content:center; pointer-events:none; z-index:5; }
 .scroll-bottom-btn{ pointer-events:auto; width:40px; height:40px; border-radius:50%; background:rgba(254,253,251,.72); backdrop-filter:blur(14px) saturate(1.4); -webkit-backdrop-filter:blur(14px) saturate(1.4); border:1px solid var(--border); box-shadow:var(--shadow); display:grid; place-items:center; color:var(--dim); transition:.16s; }
 :root[data-theme="dark"] .scroll-bottom-btn{ background:rgba(37,36,32,.72); }

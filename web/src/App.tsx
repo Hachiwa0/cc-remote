@@ -16,6 +16,7 @@ import type { Snapshot, QueryImg, QueryFile } from "./protocol";
 
 const SESSION_KEY = "cc_remote_session";
 const THEME_KEY = "cc_remote_theme";
+const HISTORY_PAGE = 60;  // turns fetched per GetHistory (initial load + each "load more")
 
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
@@ -194,7 +195,7 @@ export default function App() {
   // while we were away. The `history` event reconciles over the instant cache paint.
   useEffect(() => {
     if (!focusedSid || state.connState !== "connected") return;
-    wsRef.current?.sendGetHistory(focusedSid);
+    wsRef.current?.sendGetHistory(focusedSid, undefined, HISTORY_PAGE);
   }, [focusedSid, state.connState]);
 
   // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Option+B => open latest turn's diff
@@ -322,7 +323,10 @@ export default function App() {
             onSend={sendFirstMessage} />
         ) : (
           <>
-            <ChatView sid={focusedSid} turns={rt.turns} loading={!!rt.loading} onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
+            <ChatView sid={focusedSid} turns={rt.turns} loading={!!rt.loading}
+              hasMore={!!rt.hasMore}
+              onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_PAGE); }}
+              onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
 
             <Composer
           state={rt.state}

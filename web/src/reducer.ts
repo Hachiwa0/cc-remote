@@ -58,6 +58,10 @@ export interface SessionRuntime {
   // true while we've switched to a session but its history hasn't arrived yet
   // (no cache hit + waiting on the wrapper's cold spawn/replay) — drives a spinner.
   loading?: boolean;
+  // pagination: older turns exist beyond what's loaded, and the oldest loaded
+  // turn id — the cursor the "load more" button pages back from.
+  hasMore?: boolean;
+  oldestId?: string | null;
   ccSessionId?: string;
   pendingQuestion: { ask_id: string; question: string; options: { label: string; ds?: string }[] } | null;
   contextReport: ContextReport | null;
@@ -305,13 +309,28 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       for (const ev of e.events) scratch = reduceEvent(scratch, ev as ServerEvent);
       const built = scratch.runtimes[sid] ?? createRuntime();
       const base = state.runtimes[sid] ?? createRuntime();
-      const liveOnly = base.turns.filter((t) => !t.done);
+      let turns: Turn[];
+      if (e.before) {
+        // pagination (load older): PREPEND the older turns ahead of what we have,
+        // deduped by id — keeps the current view and in-flight turn intact.
+        const haveIds = new Set(base.turns.map((t) => t.id));
+        turns = [...built.turns.filter((t) => !haveIds.has(t.id)), ...base.turns];
+      } else {
+        // initial load: rebuild completed turns, then keep any in-flight (not-done)
+        // turn still streaming live (not yet in the transcript).
+        turns = [...built.turns, ...base.turns.filter((t) => !t.done)];
+      }
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       return {
         ...state,
         runtimes: {
           ...state.runtimes,
-          [sid]: { ...base, turns: [...built.turns, ...liveOnly], model: hadModel ? built.model : base.model, loading: false },
+          [sid]: {
+            ...base, turns, loading: false,
+            model: hadModel ? built.model : base.model,
+            hasMore: e.has_more,
+            oldestId: e.oldest_id ?? base.oldestId,
+          },
         },
       };
     }

@@ -49,9 +49,12 @@ class _Base(BaseModel):
 class Hello(_Base):
     """First frame after upgrade. `role` distinguishes client vs wrapper.
 
-    Client role sends `client_id` (for routed replay) and `last_seq` (request
-    replay from last_seq+1; null = fresh catch-up / snapshot only). Wrapper role
-    announces its cc session id, current state, and ring-buffer bounds.
+    Client role sends `client_id` (for routed frames). `last_seq`/`cursors` are
+    LEGACY — hello no longer replays history; it only prompts the wrapper to send
+    a lightweight Snapshot per resident session (state dot). History is fetched
+    on demand via GetHistory (one bulk frame read from the transcript), like a
+    web chat's GET /conversation. Wrapper role announces its cc session id,
+    current state, and ring-buffer bounds.
     """
     type: Literal["hello"] = "hello"
     role: Literal["client", "wrapper"]
@@ -395,6 +398,7 @@ class History(_Base):
     has_more: bool = False            # older turns exist beyond what's returned (pagination)
     oldest_id: Optional[str] = None   # first returned turn's msg_id — cursor for load-more
     newest_id: Optional[str] = None   # last returned turn's msg_id
+    before: Optional[str] = None      # echoes the request's `before`: set => this is an OLDER page (client prepends)
 
 
 class AskUser(_Base):

@@ -238,6 +238,8 @@ class WrapperMachine:
         ctx = self.sessions.get(sid) or next(
             (c for c in self.sessions.values() if c.session_id == sid), None)
         directory = (ctx.cwd if ctx else None) or getattr(cmd, "cwd", None) or self.cfg.cc_cwd
+        before = getattr(cmd, "before", None)   # page strictly older than this turn id
+        limit = getattr(cmd, "limit", None)     # max turns to return (newest-most)
         events: list = []
         mdl = None
         try:
@@ -246,20 +248,41 @@ class WrapperMachine:
             mdl = last_assistant_model(msgs)
         except Exception as e:
             log.warning("get_history failed", session_id=sid, error=str(e))
-        payload: list[dict] = []
-        if mdl and mdl.startswith("claude-"):
-            m = Model(model=mdl); m.sid = sid
-            payload.append(m.model_dump(mode="json"))
-        turn_ids: list[str] = []
         for ev in events:
             ev.sid = sid
-            if getattr(ev, "type", None) == "user_msg":
-                turn_ids.append(ev.msg_id)
-            payload.append(ev.model_dump(mode="json"))
+        # Group events into turns at each user_msg boundary (a turn = one user
+        # message + the assistant's reply); leading non-user events form group 0.
+        turns: list[list] = []
+        for ev in events:
+            if getattr(ev, "type", None) == "user_msg" or not turns:
+                turns.append([])
+            turns[-1].append(ev)
+
+        def _tid(grp):
+            return next((e.msg_id for e in grp if getattr(e, "type", None) == "user_msg"), None)
+
+        # Select the page of turns: newest `limit` turns, ending before `before`.
+        end = len(turns)
+        if before is not None:
+            idx = next((i for i, g in enumerate(turns) if _tid(g) == before), None)
+            if idx is not None:
+                end = idx
+        start = max(0, end - limit) if isinstance(limit, int) and limit > 0 else 0
+        page = turns[start:end]
+        has_more = start > 0
+
+        payload: list[dict] = []
+        # Prepend the model readout only on the newest page (initial load).
+        if before is None and mdl and mdl.startswith("claude-"):
+            m = Model(model=mdl); m.sid = sid
+            payload.append(m.model_dump(mode="json"))
+        for grp in page:
+            for ev in grp:
+                payload.append(ev.model_dump(mode="json"))
         hist = History(
-            session_id=sid, events=payload, has_more=False,
-            oldest_id=(turn_ids[0] if turn_ids else None),
-            newest_id=(turn_ids[-1] if turn_ids else None),
+            session_id=sid, events=payload, has_more=has_more, before=before,
+            oldest_id=(_tid(page[0]) if page else None),
+            newest_id=(_tid(page[-1]) if page else None),
         )
         client_id = getattr(cmd, "client_id", None)
         if client_id:
@@ -267,8 +290,8 @@ class WrapperMachine:
             await self.transport.send(hist)
         else:
             await self._emit_focused(hist)  # fallback: broadcast (like other one-shots)
-        log.info("history sent", session_id=sid, events=len(payload),
-                 client_id=client_id, resident=(ctx is not None))
+        log.info("history sent", session_id=sid, turns=len(page), events=len(payload),
+                 has_more=has_more, before=bool(before), client_id=client_id)
 
     async def _handle_query(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -495,23 +518,6 @@ class WrapperMachine:
                             tail_text=ctx.buffer.latest_tail_text(), cwd=ctx.cwd)
             await self._emit(ctx, snap)
         await self._emit(ctx, SessionFocus(session_id=ctx.session_id or self.focused_sid or sid, cwd=ctx.cwd))
-
-    async def _send_session_catchup(self, ctx: SessionContext) -> None:
-        """Broadcast a ctx's snapshot + full buffer replay so every client builds
-        (or REBUILDS) a runtime for a session it wasn't tracking or was tracking
-        stale (a freshly-spawned resume, e.g. after cap eviction). rebuild=True
-        makes the client discard any old turns for this sid and rebuild — never
-        merge, which would duplicate."""
-        sid = ctx.session_id or ctx.key
-        tail = ctx.buffer.latest_tail_text()
-        st = ctx.buffer.latest_state() or ctx.state
-        snap = Snapshot(cc_session_id=ctx.session_id, state=st, tail_text=tail, cwd=ctx.cwd)
-        frames = ctx.buffer.replay_from(0, cc_session_id=ctx.session_id, state=st, tail_text=tail, cwd=ctx.cwd, rebuild=True)
-        async with ctx.emit_lock:
-            await self.transport.send(snap.model_copy(update={"sid": sid}))
-            for f in frames:
-                await self.transport.send(f.model_copy(update={"sid": sid}))
-        log.info("session catchup sent", sid=sid, frames=len(frames))
 
     async def _capture_session_id(self, ctx: SessionContext, sid: str) -> None:
         """A brand-new session learned its real cc id (from the first

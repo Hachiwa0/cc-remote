@@ -50,14 +50,20 @@ inherited from `~/.claude/settings.json`; we only build the **control link**
   (rename tmp-key→sid + migrate cursor), which moves focus ONLY if the client was
   already viewing the temp key. Emitting SessionFocus on id-capture = focus-steal
   by background sessions.
-- **Evict/re-focus rebuilds, never merges**: over the cap, an idle non-focused
-  session is evicted (subprocess torn down); re-focusing re-spawns it with a
-  FRESH ring buffer (seq resets to 0). Catch-up MUST use the rebuild replay
-  (`replay_from(..., rebuild=True)` → `ReplayStart(rebuild=True)`) so the client
-  discards its stale turns and rebuilds; the client also resets its per-session
-  cursor to 0 on a rebuild frame. Token-aware: resume = cold prompt cache = full
-  context re-send, so it only happens on first spawn / re-focus-after-eviction —
-  raising the cap trades RAM for fewer cold re-sends.
+- **History = on-demand bulk read, NOT ring-buffer replay** (v3; aligns with
+  cc-on-web / web chats): the client fetches a session's history via `GetHistory`
+  → the wrapper reads the transcript (`get_session_messages` + `translate_history`,
+  in a thread) and returns it as ONE `History` frame (paginated by turn via
+  `before`/`limit`), routed to the requester — no spawn, no ring buffer. hello now
+  sends only a lightweight `Snapshot` per resident session (state dot); it does
+  NOT replay buffers (that multi-thousand-frame flood is what made refreshes slow
+  and serialized). History and the live stream are the SAME event types, deduped
+  client-side by msg_id/message_id, so a completed turn from the transcript never
+  doubles a live one; an in-flight (`!done`) turn is preserved across a refetch.
+- **Token-aware residency**: resume = cold prompt cache = full context re-send, so
+  it only happens on first spawn / re-focus-after-eviction; raising the cap trades
+  RAM for fewer cold re-sends. Reading history is free (plain transcript I/O), so
+  browsing/refreshing never costs model tokens.
 
 ## Module map
 - `cc_remote/protocol.py` — pydantic wire schema; all modules depend on it.

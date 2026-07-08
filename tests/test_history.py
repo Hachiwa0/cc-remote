@@ -89,3 +89,35 @@ def test_get_history_survives_transcript_read_failure(monkeypatch):
         assert len(tr.sent) == 1 and tr.sent[0].type == "history"
         assert tr.sent[0].events == []
     asyncio.run(go())
+
+
+def test_get_history_paginates_by_turn(monkeypatch):
+    """5 turns u1..u5; verify newest-page + load-older paging by turn boundary."""
+    def turn(uid):
+        return [UserMsg(msg_id=uid, prompt="q"),
+                TurnEnd(result=TurnResult(subtype="success", duration_ms=0, is_error=False))]
+    canned = [ev for uid in ("u1", "u2", "u3", "u4", "u5") for ev in turn(uid)]
+    monkeypatch.setattr(mm, "get_session_messages", lambda sid, directory=None: ["m"])
+    monkeypatch.setattr(mm, "translate_history", lambda msgs, mx: [e.model_copy() for e in canned])
+    monkeypatch.setattr(mm, "last_assistant_model", lambda msgs: None)
+
+    async def go():
+        m, tr = _mk_machine()
+
+        async def fetch(before, limit):
+            await m._handle_get_history(SimpleNamespace(
+                session_id="sX", client_id="c1", cwd="/tmp", before=before, limit=limit))
+            h = tr.sent[-1]
+            return h, [e["msg_id"] for e in h.events if e["type"] == "user_msg"]
+
+        # newest 2 turns
+        h, uids = await fetch(None, 2)
+        assert uids == ["u4", "u5"] and h.has_more is True
+        assert h.oldest_id == "u4" and h.newest_id == "u5" and h.before is None
+        # older page before u4
+        h, uids = await fetch("u4", 2)
+        assert uids == ["u2", "u3"] and h.has_more is True and h.before == "u4"
+        # oldest page — u1 only, no more
+        h, uids = await fetch("u2", 2)
+        assert uids == ["u1"] and h.has_more is False and h.oldest_id == "u1"
+    asyncio.run(go())

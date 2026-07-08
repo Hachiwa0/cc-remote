@@ -28,10 +28,24 @@ function formatTime(ts: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-export function ChatView({ sid, turns, loading, onEdit, onGetDiff }: { sid: string | null; turns: Turn[]; loading?: boolean; onEdit: (prompt: string) => void; onGetDiff: (file: string) => void }) {
+export function ChatView({ sid, turns, loading, hasMore, onLoadMore, onEdit, onGetDiff }: { sid: string | null; turns: Turn[]; loading?: boolean; hasMore?: boolean; onLoadMore?: () => void; onEdit: (prompt: string) => void; onGetDiff: (file: string) => void }) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
+  // scroll anchoring for "load more": capture scrollHeight before older turns
+  // prepend, then restore position after so the view doesn't jump.
+  const anchorRef = useRef<number | null>(null);
+  const doLoadMore = () => {
+    anchorRef.current = scrollRef.current?.scrollHeight ?? null;
+    onLoadMore?.();
+  };
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && anchorRef.current != null) {
+      el.scrollTop = el.scrollTop + el.scrollHeight - anchorRef.current;  // shift down by the prepended height
+      anchorRef.current = null;
+    }
+  }, [turns]);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -121,6 +135,11 @@ export function ChatView({ sid, turns, loading, onEdit, onGetDiff }: { sid: stri
   return (
     <div className="thread" ref={scrollRef} onScroll={onScroll}>
       <div className="thread-in">
+        {hasMore && (
+          <div className="load-more-wrap">
+            <button className="load-more-btn" onClick={doLoadMore}>加载更早的历史</button>
+          </div>
+        )}
         {turns.map((t, ti) => (
           <div className="turn" key={t.id}>
             {(t.prompt || (t.images && t.images.length) || (t.files && t.files.length)) && (
