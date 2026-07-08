@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Change User / paths to match the account that runs Claude Code on this machine.
+# Change User + the three paths below to match the account that runs Claude Code.
 User=youruser
-WorkingDirectory=/home/youruser/claude-workspace/cc-remote
-EnvironmentFile=/home/youruser/claude-workspace/cc-remote/.env
-# systemd runs a minimal PATH that won't include ~/.local/bin where the claude
-# CLI lives — add it so the SDK can spawn cc.
+WorkingDirectory=/path/to/cc-remote
+EnvironmentFile=/path/to/cc-remote/.env
+# systemd's minimal PATH won't include ~/.local/bin where the claude CLI may
+# live — add it so the SDK can spawn cc.
 Environment="PATH=/home/youruser/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/home/youruser/claude-workspace/cc-remote/.venv/bin/python -m cc_remote.wrapper
+ExecStart=/path/to/cc-remote/.venv/bin/python -m cc_remote.wrapper
 Restart=on-failure
 RestartSec=5
 

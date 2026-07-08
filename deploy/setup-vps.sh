@@ -2,16 +2,16 @@
 # vps setup (Ubuntu/Debian). Run as root/sudo:
 #   sudo bash deploy/setup-vps.sh your-domain.com
 #
-# Assumes /opt/cc-remote already contains: the code, web/dist (built with
-# VITE_CLIENT_TOKEN), requirements.txt, and a filled-in .env (from
-# deploy/env.relay.example with strong tokens).
+# Assumes /opt/cc-remote already contains: the code, web/dist (from
+# `npm --prefix web run build`), requirements.txt, and a filled-in .env (from
+# deploy/env.relay.example — LOGIN_PASSWORD, SESSION_SECRET, WRAPPER_TOKEN).
 set -euo pipefail
 
 DOMAIN="${1:?usage: sudo bash setup-vps.sh your-domain.com}"
 APPDIR=/opt/cc-remote
 
 [ -f "$APPDIR/.env" ] || { echo "ERROR: $APPDIR/.env missing (copy deploy/env.relay.example, fill tokens)"; exit 1; }
-[ -d "$APPDIR/web/dist" ] || { echo "ERROR: $APPDIR/web/dist missing (build on dev machine with VITE_CLIENT_TOKEN, then scp)"; exit 1; }
+[ -d "$APPDIR/web/dist" ] || { echo "ERROR: $APPDIR/web/dist missing (run 'npm --prefix web run build' on your dev machine, then rsync web/dist here)"; exit 1; }
 [ -f "$APPDIR/requirements.txt" ] || { echo "ERROR: $APPDIR/requirements.txt missing"; exit 1; }
 
 echo "==> installing system deps (python3-venv) + Caddy (official repo)"
