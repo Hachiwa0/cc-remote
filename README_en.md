@@ -69,7 +69,7 @@ First get the relay + wrapper + web running on the **machine where `claude` runs
 ### 1) Install deps + build the web client
 
 ```bash
-git clone <this-repo> cc-remote && cd cc-remote
+git clone https://github.com/muggle-stack/cc-remote.git && cd cc-remote
 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt

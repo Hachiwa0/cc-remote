@@ -69,7 +69,7 @@
 ### 1）装依赖 + 构建网页
 
 ```bash
-git clone <this-repo> cc-remote && cd cc-remote
+git clone https://github.com/muggle-stack/cc-remote.git && cd cc-remote
 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
