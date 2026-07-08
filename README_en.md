@@ -8,6 +8,12 @@ A `claude` (Claude Code) session on one machine, remote-controlled in real time 
 
 **中文:** [README.md](README.md)
 
+<p align="center">
+  <img src="assets/01-cc-remote-UI.png" alt="cc-remote browser UI" width="600">
+  &nbsp;
+  <img src="assets/02-cc-remote-iphone.png" alt="cc-remote on a phone browser" width="175">
+</p>
+
 ---
 
 ## Table of contents

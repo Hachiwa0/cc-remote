@@ -8,6 +8,12 @@
 
 **English:** [README_en.md](README_en.md)
 
+<p align="center">
+  <img src="assets/01-cc-remote-UI.png" alt="cc-remote 浏览器界面" width="600">
+  &nbsp;
+  <img src="assets/02-cc-remote-iphone.png" alt="cc-remote 手机浏览器界面" width="175">
+</p>
+
 ---
 
 ## 目录
