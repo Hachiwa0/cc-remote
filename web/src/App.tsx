@@ -198,13 +198,13 @@ export default function App() {
     wsRef.current?.sendGetHistory(focusedSid, undefined, HISTORY_PAGE);
   }, [focusedSid, state.connState]);
 
-  // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Option+B => open latest turn's diff
+  // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Shift+B => open latest turn's diff
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
       const b = e.key === "b" || e.key === "B";
       if (!b) return;
-      if (e.metaKey && e.ctrlKey) {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey) {
         e.preventDefault();
         if (state.artifact) dispatch({ type: "clear_artifact" });
         else getDiff("");
