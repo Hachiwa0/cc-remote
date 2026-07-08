@@ -55,7 +55,7 @@ def test_get_history_returns_one_bulk_frame(monkeypatch):
         TurnEnd(result=TurnResult(subtype="success", duration_ms=0, is_error=False)),
     ]
     monkeypatch.setattr(mm, "get_session_messages", lambda sid, directory=None: ["m"])
-    monkeypatch.setattr(mm, "translate_history", lambda msgs, mx: [e.model_copy() for e in canned])
+    monkeypatch.setattr(mm, "translate_history", lambda msgs, mx, timestamps=None: [e.model_copy() for e in canned])
     monkeypatch.setattr(mm, "last_assistant_model", lambda msgs: "claude-opus-4-8")
 
     async def go():
@@ -98,7 +98,7 @@ def test_get_history_paginates_by_turn(monkeypatch):
                 TurnEnd(result=TurnResult(subtype="success", duration_ms=0, is_error=False))]
     canned = [ev for uid in ("u1", "u2", "u3", "u4", "u5") for ev in turn(uid)]
     monkeypatch.setattr(mm, "get_session_messages", lambda sid, directory=None: ["m"])
-    monkeypatch.setattr(mm, "translate_history", lambda msgs, mx: [e.model_copy() for e in canned])
+    monkeypatch.setattr(mm, "translate_history", lambda msgs, mx, timestamps=None: [e.model_copy() for e in canned])
     monkeypatch.setattr(mm, "last_assistant_model", lambda msgs: None)
 
     async def go():
@@ -121,3 +121,22 @@ def test_get_history_paginates_by_turn(monkeypatch):
         h, uids = await fetch("u2", 2)
         assert uids == ["u1"] and h.has_more is False and h.oldest_id == "u1"
     asyncio.run(go())
+
+
+def test_translate_history_stamps_real_timestamps():
+    """UserMsg gets the ask-time; TurnEnd gets the turn's last message time
+    (answer-done) — NOT 'now'. This fixes the 'every message shows now' clock bug."""
+    from cc_remote.wrapper.stream import translate_history
+    msgs = [
+        SimpleNamespace(uuid="u1", type="user",
+                        message={"role": "user", "content": "hi"}),
+        SimpleNamespace(uuid="a1", type="assistant",
+                        message={"role": "assistant", "content": [{"type": "text", "text": "hello"}]}),
+    ]
+    events = translate_history(msgs, 10000, timestamps={"u1": 1000.0, "a1": 1005.0})
+    um = next(e for e in events if e.type == "user_msg")
+    te = next(e for e in events if e.type == "turn_end")
+    assert um.ts == 1000.0        # question time
+    assert te.ts == 1005.0        # answer-done = last (assistant) message time
+    # missing timestamps must not crash (falls back to the _Base default)
+    assert any(e.type == "user_msg" for e in translate_history(msgs, 10000))

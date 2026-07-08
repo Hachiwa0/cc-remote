@@ -61,7 +61,7 @@ from cc_remote.wrapper.session import load_session_id, save_session_id
 from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.wrapper.stream import (
     StreamTranslator, extract_session_id, extract_model,
-    translate_history, last_assistant_model,
+    translate_history, last_assistant_model, transcript_timestamps,
 )
 from cc_remote.wrapper.transport import WrapperTransport
 
@@ -243,8 +243,11 @@ class WrapperMachine:
         events: list = []
         mdl = None
         try:
-            msgs = await asyncio.to_thread(get_session_messages, sid, directory=directory)
-            events = translate_history(msgs, self.cfg.tool_result_max)
+            def _read():
+                return (get_session_messages(sid, directory=directory),
+                        transcript_timestamps(sid))
+            msgs, tss = await asyncio.to_thread(_read)
+            events = translate_history(msgs, self.cfg.tool_result_max, timestamps=tss)
             mdl = last_assistant_model(msgs)
         except Exception as e:
             log.warning("get_history failed", session_id=sid, error=str(e))

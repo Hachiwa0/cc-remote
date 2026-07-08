@@ -8,7 +8,11 @@ still stream live via StreamEvent.
 """
 from __future__ import annotations
 
+import glob
+import json
+import os
 import uuid
+from datetime import datetime
 from typing import Any
 
 from claude_agent_sdk.types import (
@@ -118,26 +122,68 @@ def extract_model(msg) -> str | None:
 
 # ---- on-disk history -> wire events (for session switch) ----
 
-def translate_history(messages, tool_result_max: int) -> list:
+def transcript_timestamps(session_id: str) -> dict[str, float]:
+    """Map each transcript entry's uuid -> epoch seconds, read straight from the
+    .jsonl. The SDK's SessionMessage drops the per-message timestamp, so without
+    this, history events default their `ts` to now (making every past message show
+    the current time — "like a clock"). Best-effort: {} if not found/readable.
+    session_id is globally unique, so a glob across all project dirs locates it."""
+    out: dict[str, float] = {}
+    try:
+        matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
+        if not matches:
+            return out
+        with open(matches[0]) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                uid, ts = d.get("uuid"), d.get("timestamp")
+                if not uid or not isinstance(ts, str):
+                    continue
+                try:
+                    out[uid] = datetime.fromisoformat(
+                        ts.replace("Z", "+00:00") if ts.endswith("Z") else ts).timestamp()
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def translate_history(messages, tool_result_max: int, timestamps: dict | None = None) -> list:
     """Translate a session's on-disk transcript (list[SessionMessage]) into wire
     events the client reducer renders as past turns.
 
     The transcript carries no ResultMessage, so synthetic TurnEnd frames delimit
-    turns. Returned events are appended to the ring buffer (NOT broadcast) on
-    session switch; a client that re-hellos with last_seq=null then replays the
-    full history. Thinking blocks and non-conversational user turns (compact
-    summaries, slash-command envelopes, local-command stdout) are skipped so the
-    history reads like a normal chat.
+    turns. `timestamps` (uuid -> epoch seconds, from transcript_timestamps) stamps
+    each UserMsg with its real ask-time and each TurnEnd with the turn's last
+    message time (answer-done time) — otherwise history shows "now". Thinking
+    blocks and non-conversational user turns (compact summaries, slash-command
+    envelopes, local-command stdout) are skipped so the history reads like a chat.
     """
     events: list = []
     turn_open = False
+    last_ts = None  # transcript ts of the most-recent message in the open turn
+
+    def _ts(uid):
+        return timestamps.get(uid) if timestamps else None
+
+    def _um(uid, prompt):
+        um = UserMsg(msg_id=uid, prompt=prompt)
+        t = _ts(uid)
+        if t is not None:
+            um.ts = t   # question time, not load time
+        return um
 
     def close_turn():
         nonlocal turn_open
         if turn_open:
-            events.append(TurnEnd(result=TurnResult(
-                subtype="success", duration_ms=0, is_error=False,
-            )))
+            te = TurnEnd(result=TurnResult(subtype="success", duration_ms=0, is_error=False))
+            if last_ts is not None:
+                te.ts = last_ts   # answer-done time = last message of the turn
+            events.append(te)
             turn_open = False
 
     for m in messages:
@@ -152,7 +198,7 @@ def translate_history(messages, tool_result_max: int) -> list:
                 if _is_meta_user_text(content):
                     continue
                 close_turn()
-                events.append(UserMsg(msg_id=m.uuid, prompt=content))
+                events.append(_um(m.uuid, content))
                 turn_open = True
             elif isinstance(content, list):
                 for b in content:
@@ -175,7 +221,7 @@ def translate_history(messages, tool_result_max: int) -> list:
                         txt = b.get("text", "")
                         if txt and not _is_meta_user_text(txt):
                             close_turn()
-                            events.append(UserMsg(msg_id=m.uuid, prompt=txt))
+                            events.append(_um(m.uuid, txt))
                             turn_open = True
         elif role == "assistant":
             if not isinstance(content, list):
@@ -211,6 +257,12 @@ def translate_history(messages, tool_result_max: int) -> list:
             if started:
                 events.append(AssistantMsgEnd(message_id=mid))
                 turn_open = True
+        # advance last_ts AFTER handling m: a leading close_turn (for the next user
+        # msg) stamps the PRIOR turn's tail; the final close_turn stamps this turn's
+        # last (assistant) message = answer-done time.
+        mts = _ts(m.uuid)
+        if mts is not None:
+            last_ts = mts
     close_turn()
     return events
 
