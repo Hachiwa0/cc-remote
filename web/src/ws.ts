@@ -36,6 +36,10 @@ export class RelayWs {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly token: string;
   private readonly cb: WsCallbacks;
+  // Heartbeat: detect a HALF-OPEN link (dead TCP with no close event) and recover.
+  private lastRecvAt = 0;
+  private hbTimer: ReturnType<typeof setInterval> | null = null;
+  private pingSeq = 0;
 
   constructor(token: string, cb: WsCallbacks) {
     this.token = token;
@@ -54,7 +58,28 @@ export class RelayWs {
   stop(): void {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.stopHeartbeat();
     this.ws?.close();
+  }
+
+  // App-level heartbeat. The browser's WS onclose does NOT fire for a HALF-OPEN
+  // link (dead TCP with no FIN — common behind mobile NAT / TUN proxies), so the
+  // client would sit "connected" receiving nothing until a manual refresh (this
+  // is exactly the "只能强行刷新才能看到" symptom). Ping every 20s; if NO frame at
+  // all arrives for 45s (i.e. pongs stopped), force-close → onclose → reconnect.
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.lastRecvAt = Date.now();
+    this.hbTimer = setInterval(() => {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - this.lastRecvAt > 45000) { ws.close(); return; }
+      this.send({ v: PROTOCOL_VERSION, type: "ping", n: ++this.pingSeq, ts: nowTs() });
+    }, 20000);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null; }
   }
 
   /** Highest seq across all known sessions (used by the App's IDB persist). */
@@ -218,11 +243,23 @@ export class RelayWs {
     ws.onopen = () => {
       this.backoff = 1;
       this.sendHello();  // cursors = whatever we remember (empty on first connect)
+      this.startHeartbeat();  // detect a half-open link and auto-recover
       this.cb.onConnState("connected");  // triggers sendListSessions
     };
     ws.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data) as ServerEvent;
+        this.lastRecvAt = Date.now();  // any frame proves the link is alive
+        // Debug hook: record inbound frames so a live-sync issue is diagnosable
+        // from the browser console. Inspect `window.__wsLog`; set
+        // `window.__CCDEBUG = true` to also console.debug each frame.
+        try {
+          const w = window as unknown as { __wsLog?: unknown[]; __CCDEBUG?: boolean };
+          (w.__wsLog ||= []).push({ t: (msg as { type: string }).type, sid: (msg as { sid?: string }).sid, seq: (msg as { seq?: number }).seq });
+          if (w.__wsLog!.length > 800) w.__wsLog!.shift();
+          if (w.__CCDEBUG) console.debug(`[ws] ${(msg as { type: string }).type} sid=${(msg as { sid?: string }).sid ?? "-"} seq=${(msg as { seq?: number }).seq ?? "-"}`);
+        } catch { /* ignore */ }
+        if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
         if (msg.type === "session_focus") {
           // Drop a STALE switch-confirmation: when you click through several
           // sessions quickly, the wrapper processes each switch in turn and emits
@@ -267,6 +304,7 @@ export class RelayWs {
     };
     ws.onclose = (ev: CloseEvent) => {
       this.ws = null;
+      this.stopHeartbeat();
       if (ev.code === 1008) {
         this.cb.onAuthFail?.();
         return;
