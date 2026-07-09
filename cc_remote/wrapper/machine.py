@@ -92,10 +92,12 @@ class WrapperMachine:
         return self.sessions.get(self.focused_sid) if self.focused_sid else None
 
     def _ctx_for(self, sid: Optional[str]) -> Optional[SessionContext]:
-        """Resolve a command's target ctx. Explicit sid wins (match by pool key
-        or by ctx.session_id); None falls back to the focused ctx (legacy/untagged
-        commands route to the viewed session — today's behavior). Iterates a
-        snapshot: a concurrent turn may re-key the pool mid-iteration."""
+        """Resolve a command's target ctx. An EXPLICIT sid that isn't resident
+        returns None — NOT the focused ctx: a session whose spawn failed (e.g. bad
+        codex config) must not silently reroute its query to whatever is focused
+        (that made a failed session look like "no response" while its "在？" landed
+        on another session). Only an absent sid (legacy/untagged commands) falls
+        back to the focused view. Iterates a snapshot (a turn may re-key mid-scan)."""
         if sid:
             ctx = self.sessions.get(sid)
             if ctx:
@@ -103,6 +105,7 @@ class WrapperMachine:
             for c in list(self.sessions.values()):
                 if c.session_id == sid:
                     return c
+            return None
         return self._focused_ctx()
 
     # ---- lifecycle ----
@@ -167,6 +170,17 @@ class WrapperMachine:
             await self._emit(ctx, msg)
         else:
             msg.sid = self.focused_sid
+            await self.transport.send(msg)
+
+    async def _emit_to_sid(self, sid: Optional[str], msg) -> None:
+        """Route a control-path frame to a SPECIFIC session's view (tagged by sid),
+        even when it has no ctx — so a failed-to-spawn session's error surfaces on
+        that session, not on whatever happens to be focused."""
+        ctx = self.sessions.get(sid) if sid else None
+        if ctx is not None:
+            await self._emit(ctx, msg)
+        else:
+            msg.sid = sid or self.focused_sid
             await self.transport.send(msg)
 
     async def _set_state(self, ctx: SessionContext, state: State) -> None:
@@ -330,9 +344,14 @@ class WrapperMachine:
                  has_more=has_more, before=bool(before), client_id=client_id)
 
     async def _handle_query(self, cmd) -> None:
-        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        sid = getattr(cmd, "sid", None)
+        ctx = self._ctx_for(sid)
         if ctx is None:
-            await self._emit_focused(Error(code=ERR_INTERNAL, message="no active session"))
+            # sid given but not resident (spawn failed / evicted). Tag the error to
+            # THAT session so the user sees it there — and never reroute the prompt
+            # to a different session.
+            await self._emit_to_sid(sid, Error(code=ERR_NOT_RUNNING,
+                message="该会话未启动(可能启动失败),重新点进这个会话再发"))
             return
         if ctx.state != "idle":
             await self._emit(ctx, Error(code=ERR_BUSY, message="该会话正忙,先 interrupt"))
@@ -651,7 +670,12 @@ class WrapperMachine:
         if ctx is None:
             ctx = await self._spawn(resume_id=sid, engine=getattr(cmd, "engine", None) or "claude")
             if ctx is None:
-                return  # error already emitted (cap / not found / bg-daemon)
+                # surface it on the session the user switched INTO (not the stale
+                # focused one), so a spawn failure never looks like silent "no
+                # response". Common cause: bad codex config / backend.
+                await self._emit_to_sid(sid, Error(code=ERR_CC_CRASH,
+                    message="会话启动失败:可能是 codex 配置/后端问题(见服务端日志)"))
+                return
         self.focused_sid = ctx.key
         # A newly-spawned session isn't tracked by the client yet — send its
         # snapshot + full replay so the client builds a runtime for it (else the

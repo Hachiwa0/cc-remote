@@ -32,6 +32,8 @@ export function ChatView({ sid, turns, loading, hasMore, onLoadMore, onEdit, onG
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
+  const [zoom, setZoom] = useState<string | null>(null);   // lightbox image src
+  const [zoomBig, setZoomBig] = useState(false);           // fit-to-screen vs actual size
   // scroll anchoring for "load more": capture scrollHeight before older turns
   // prepend, then restore position after so the view doesn't jump.
   const anchorRef = useRef<number | null>(null);
@@ -147,9 +149,11 @@ export function ChatView({ sid, turns, loading, hasMore, onLoadMore, onEdit, onG
                 {t.prompt && <div className="ubub">{t.prompt}</div>}
                 {t.images && t.images.length > 0 && (
                   <div className="ubub-imgs">
-                    {t.images.map((img, i) => (
-                      <img key={i} src={`data:${img.media_type};base64,${img.data}`} className="ubub-img" alt="" />
-                    ))}
+                    {t.images.map((img, i) => {
+                      const src = `data:${img.media_type};base64,${img.data}`;
+                      return <img key={i} src={src} className="ubub-img" alt="" title="点击放大"
+                        onClick={() => setZoom(src)} />;
+                    })}
                   </div>
                 )}
                 {t.files && t.files.length > 0 && (
@@ -203,6 +207,14 @@ export function ChatView({ sid, turns, loading, hasMore, onLoadMore, onEdit, onG
           <button className="scroll-bottom-btn" onClick={scrollToBottom} aria-label="滚动到底部">
             <Icon name="chev" size={20} />
           </button>
+        </div>
+      )}
+      {zoom && (
+        <div className="lightbox" onClick={() => { setZoom(null); setZoomBig(false); }} role="dialog" aria-label="图片预览">
+          <img src={zoom} className={"lightbox-img" + (zoomBig ? " big" : "")} alt=""
+            title={zoomBig ? "点击缩小 · 点背景关闭" : "点击放大 · 点背景关闭"}
+            onClick={(e) => { e.stopPropagation(); setZoomBig((b) => !b); }} />
+          <button className="lightbox-close" onClick={() => { setZoom(null); setZoomBig(false); }} aria-label="关闭"><Icon name="close" size={22} /></button>
         </div>
       )}
     </div>

@@ -32,10 +32,22 @@ def list_codex_sessions(limit: int = 60) -> list[dict]:
     except Exception:
         return []
     files.sort(key=_mtime, reverse=True)
+    cur = codex_current_provider().strip()
     out: list[dict] = []
-    for path in files[:limit]:
+    hidden = 0
+    for path in files:
+        if len(out) >= limit:
+            break
         meta = _read_meta(path)
         if not meta or not meta.get("id"):
+            continue
+        # Different vendor -> different sessions: hide rollouts created under a
+        # provider other than the one configured now (they'd fail to resume —
+        # provider-encrypted reasoning). Unknown/blank provider is shown (can't
+        # classify), and if no current provider is set we don't filter at all.
+        prov = (meta.get("model_provider") or "").strip()
+        if cur and prov and prov != cur:
+            hidden += 1
             continue
         out.append({
             "session_id": meta["id"],
@@ -43,6 +55,8 @@ def list_codex_sessions(limit: int = 60) -> list[dict]:
             "last_modified": _mtime_iso(path),
             "first_prompt": _first_user_prompt(path),
         })
+    if hidden:
+        log.info("codex sessions filtered by provider", provider=cur, hidden=hidden, shown=len(out))
     return out
 
 
@@ -69,6 +83,13 @@ def codex_model(default: str = "gpt-5-codex") -> str:
 def codex_effort(default: str = "high") -> str:
     """The default reasoning effort from ~/.codex/config.toml (model_reasoning_effort)."""
     return _config_value("model_reasoning_effort", default)
+
+
+def codex_current_provider() -> str:
+    """The provider Codex is configured for right now (config.toml model_provider).
+    A codex rollout carries provider-encrypted reasoning, so a session from a
+    DIFFERENT provider can't be resumed here — the list is filtered to this one."""
+    return _config_value("model_provider", "")
 
 
 def codex_context_window(default: int = 256000) -> int:

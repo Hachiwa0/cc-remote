@@ -33,6 +33,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
+  // right slot is shared by diff + /btw; rightView picks which shows.
+  const [rightView, setRightView] = useState<"diff" | "btw">("diff");
   const [state, dispatch] = useReducer(reduce, initialState);
   const wsRef = useRef<RelayWs | null>(null);
   const drainingRef = useRef(false);
@@ -224,20 +226,24 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
-      const b = e.key === "b" || e.key === "B";
-      if (!b) return;
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey) {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const k = e.key.toLowerCase();
+      if (k === "b" && e.shiftKey) {           // diff (shared right slot)
         e.preventDefault();
-        if (state.artifact) dispatch({ type: "clear_artifact" });
+        if (state.artifact && rightView === "diff") dispatch({ type: "clear_artifact" });
         else getDiff("");
-      } else if (e.metaKey || e.ctrlKey) {
+      } else if (k === "b") {                    // toggle sidebar
         e.preventDefault();
         setSidebarOpen((v) => !v);
+      } else if (k === "k" && e.shiftKey) {      // /btw side panel (shared right slot)
+        e.preventDefault();
+        if (state.btwSid && rightView === "btw") closeBtw();
+        else openBtw();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [authed, state.artifact]);
+  }, [authed, state.artifact, state.btwSid, rightView]);
 
   // Shift+Tab => cycle permission mode for the focused session
   useEffect(() => {
@@ -294,12 +300,14 @@ export default function App() {
     wsRef.current?.sendSetPerm(perm);
     dispatch({ type: "set_perm", perm });
   };
-  const getDiff = (file: string) => { dispatch({ type: "open_artifact_loading", file }); wsRef.current?.sendGetDiff(file, theme); };
+  const getDiff = (file: string) => { setRightView("diff"); dispatch({ type: "open_artifact_loading", file }); wsRef.current?.sendGetDiff(file, theme); };
   // /btw: fork the focused session into an ephemeral side panel (wrapper replies
   // BtwOpened → reducer opens the panel). Send/close target the fork by its sid.
-  const openBtw = () => { if (focusedSid) wsRef.current?.sendOpenBtw(focusedSid); };
+  const openBtw = () => { setRightView("btw"); if (focusedSid && !state.btwSid) wsRef.current?.sendOpenBtw(focusedSid); };
   const sendBtw = (prompt: string) => { if (state.btwSid) wsRef.current?.sendQueryTo(state.btwSid, prompt, uuid()); };
   const closeBtw = () => { if (state.btwSid) { wsRef.current?.sendCloseBtw(state.btwSid); dispatch({ type: "clear_btw" }); } };
+  // Header tab switch between the two right-slot views (opening the target lazily).
+  const switchRight = (v: "diff" | "btw") => { if (v === "diff") getDiff(""); else openBtw(); };
   const logout = () => {
     localStorage.removeItem(SESSION_KEY);
     wsRef.current?.stop();
@@ -395,13 +403,19 @@ export default function App() {
         )}
         {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
-      {state.btwSid && (
-        <BtwPanel sid={state.btwSid} rt={state.runtimes[state.btwSid]} engine={state.btwEngine}
-          onSend={sendBtw} onClose={closeBtw} />
-      )}
-      {state.artifact && (
-        <ArtifactPanel artifact={state.artifact} onClose={() => dispatch({ type: "clear_artifact" })} />
-      )}
+      {/* Shared right slot: diff and /btw take turns; header tabs switch. */}
+      {(() => {
+        const view = rightView === "btw" && state.btwSid ? "btw"
+          : state.artifact ? "diff" : state.btwSid ? "btw" : null;
+        if (view === "btw" && state.btwSid)
+          return <BtwPanel sid={state.btwSid} rt={state.runtimes[state.btwSid]} engine={state.btwEngine}
+            active="btw" hasDiff={!!state.artifact} onTab={switchRight}
+            onSend={sendBtw} onClose={closeBtw} />;
+        if (view === "diff" && state.artifact)
+          return <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!state.btwSid}
+            onTab={switchRight} onClose={() => dispatch({ type: "clear_artifact" })} />;
+        return null;
+      })()}
       {rt.pendingQuestion && (
         <QuestionSheet
           question={rt.pendingQuestion.question}

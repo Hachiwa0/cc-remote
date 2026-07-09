@@ -1,31 +1,22 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useEffect, useRef } from "react";
 import type { Artifact } from "../reducer";
 import { Icon } from "../icons";
+import { PanelTabs } from "./PanelTabs";
 
-export function ArtifactPanel({ artifact, onClose }: { artifact: Artifact; onClose: () => void }) {
-  const panelRef = useRef<HTMLDivElement>(null);
+export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose }: {
+  artifact: Artifact; active: "diff" | "btw"; hasBtw: boolean;
+  onTab: (v: "diff" | "btw") => void; onClose: () => void;
+}) {
   const sections = artifact.kind === "gitdiff" ? (artifact.sections || []) : [];
   const loading = !!artifact.loading && sections.length === 0;
   const empty = artifact.kind === "gitdiff" && !loading && sections.length === 0;
 
-  // Click anywhere outside the panel (the blank chat area) closes it — not only
-  // the × button. mousedown so a text-selection drag that starts inside the
-  // panel doesn't close it; deferred attach so the click that OPENED the panel
-  // isn't the one that closes it.
-  useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) onClose();
-    };
-    const id = window.setTimeout(() => document.addEventListener("mousedown", onDown), 0);
-    return () => { clearTimeout(id); document.removeEventListener("mousedown", onDown); };
-  }, [onClose]);
-
   return (
-    <div className="artifact-panel" ref={panelRef}>
+    <div className="artifact-panel">
       <div className="artifact-head">
-        <span className="artifact-title">{artifact.file.split("/").pop()}</span>
+        {hasBtw ? <PanelTabs active={active} onTab={onTab} />
+          : <span className="artifact-title">{artifact.file.split("/").pop() || "改动"}</span>}
         <span className="artifact-path" title={artifact.file}>{artifact.file || "所有改动"}</span>
         <button className="iconbtn" onClick={onClose} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>

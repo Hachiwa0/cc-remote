@@ -23,7 +23,7 @@ from datetime import datetime
 
 from cc_remote.protocol import (
     AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
-    TurnEnd, TurnResult, UserMsg,
+    TurnEnd, TurnResult, UserMsg, Error, ERR_CC_CRASH,
 )
 
 _TOOL_TYPES = {"commandExecution", "fileChange", "mcpToolCall"}
@@ -66,9 +66,27 @@ class CodexStreamTranslator:
             elif t in _TOOL_TYPES:
                 out.append(self._tool_result(item))
 
+        elif method == "error":
+            # codex emits `error` notifications (provider timeout, 401, stream
+            # disconnect, …). The transient retries (willRetry=true) are noise, but
+            # the FINAL failure must reach the user — else a failed turn just looks
+            # like "no response". Surface only the terminal one.
+            if not p.get("willRetry"):
+                err = p.get("error") if isinstance(p.get("error"), dict) else {}
+                msg = err.get("message") or "codex 出错"
+                det = err.get("additionalDetails")
+                out.append(Error(code=ERR_CC_CRASH, message=f"codex: {msg}" + (f" — {det}" if det else "")))
+
         elif method == "turn/completed":
             turn = p.get("turn") or {}
             st = turn.get("status") or "completed"
+            # a failed turn carries its reason in turn.error — surface it (the
+            # error notifications above may not have fired for every failure mode).
+            if st == "failed":
+                te = turn.get("error")
+                emsg = te.get("message") if isinstance(te, dict) else (te if isinstance(te, str) else None)
+                if emsg:
+                    out.append(Error(code=ERR_CC_CRASH, message=f"codex 回合失败: {emsg}"))
             # Map codex TurnStatus (completed|interrupted|failed) onto cc's wire
             # subtype vocabulary so the engine-agnostic reducer treats them right:
             # "interrupted" -> "error_during_execution" is the token the client keys
@@ -175,6 +193,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
     assistant_open = False
     cur_mid: str | None = None
     last_ts = None
+    pending_images: list = []   # input_image blocks seen before the next user_message
 
     def _ts(iso: str):
         try:
@@ -220,15 +239,27 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
 
             if t == "turn_context" and p.get("model"):
                 model = p["model"]
+            elif t == "response_item" and p.get("type") == "message" and p.get("role") == "user":
+                # the raw user turn carries any uploaded images (input_image, a
+                # data: URI). It precedes the clean event_msg/user_message; buffer
+                # them and attach to that UserMsg so images replay on reload.
+                for it in (p.get("content") or []):
+                    if isinstance(it, dict) and it.get("type") == "input_image":
+                        img = _data_uri_to_img(it.get("image_url"))
+                        if img:
+                            pending_images.append(img)
             elif t == "event_msg" and p.get("type") == "user_message":
                 msg = p.get("message") or ""
                 if msg and not msg.lstrip().startswith("<"):
                     close_turn()
                     um = UserMsg(msg_id=uuid.uuid4().hex, prompt=msg)
+                    if pending_images:
+                        um.images = pending_images
                     if ts is not None:
                         um.ts = ts
                     events.append(um)
                     turn_open = True
+                pending_images = []   # consume (per user turn)
             elif t == "response_item" and p.get("type") == "function_call":
                 ensure_assistant()
                 events.append(ToolUse(
@@ -289,3 +320,15 @@ def _hist_tool_input(arguments) -> dict:
 def _exit_is_error(output: str) -> bool:
     m = re.search(r"exited with code (\d+)", output or "")
     return bool(m) and m.group(1) != "0"
+
+
+def _data_uri_to_img(url) -> dict | None:
+    """`data:image/png;base64,XXXX` -> {media_type, data} (the web's QueryImg shape)."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    try:
+        head, data = url.split(",", 1)
+        mt = head[5:].split(";")[0] or "image/png"
+        return {"media_type": mt, "data": data}
+    except Exception:
+        return None

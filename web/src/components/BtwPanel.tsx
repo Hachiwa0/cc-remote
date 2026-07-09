@@ -1,15 +1,19 @@
 import { useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Icon } from "../icons";
+import { PanelTabs } from "./PanelTabs";
 import type { SessionRuntime } from "../reducer";
 
 /** /btw side panel: a mini chat over an ephemeral fork of the current session.
  * Reuses ChatView for the transcript; a minimal textarea for input. Closing
  * discards the fork (the main thread never sees any of this). */
-export function BtwPanel({ sid, rt, engine, onSend, onClose }: {
+export function BtwPanel({ sid, rt, engine, active, hasDiff, onTab, onSend, onClose }: {
   sid: string;
   rt: SessionRuntime | undefined;
   engine?: string;
+  active: "diff" | "btw";
+  hasDiff: boolean;
+  onTab: (v: "diff" | "btw") => void;
   onSend: (prompt: string) => void;
   onClose: () => void;
 }) {
@@ -30,10 +34,12 @@ export function BtwPanel({ sid, rt, engine, onSend, onClose }: {
   return (
     <div className="btw-panel">
       <div className="btw-head">
-        <div className="btw-titles">
-          <span className="btw-title">btw · 侧边对话{engine === "codex" ? " · Codex" : ""}</span>
-          <span className="btw-sub">基于当前会话上下文,不写回主线</span>
-        </div>
+        {hasDiff
+          ? <PanelTabs active={active} onTab={onTab} />
+          : <div className="btw-titles">
+              <span className="btw-title">btw · 侧边对话{engine === "codex" ? " · Codex" : ""}</span>
+              <span className="btw-sub">基于当前会话上下文,不写回主线</span>
+            </div>}
         <button className="iconbtn" onClick={onClose} aria-label="关闭 btw" title="关闭并丢弃这个侧边对话">
           <Icon name="chevrons-right" />
         </button>

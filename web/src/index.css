@@ -301,6 +301,12 @@ body{
 .btw-send:disabled{ opacity:.4; cursor:default; }
 @media (max-width:980px){ .btw-panel{ top:auto; left:10px; right:10px; bottom:10px; width:auto; max-height:82vh; animation:panel-in-m .24s var(--ease); } }
 
+/* shared diff/btw header tabs (right slot is reused between the two views) */
+.panel-tabs{ display:flex; gap:3px; flex:1; min-width:0; }
+.ptab{ display:inline-flex; align-items:center; gap:5px; border:0; background:none; padding:5px 11px; border-radius:8px; font:inherit; font-size:13px; font-weight:650; color:var(--dim); cursor:pointer; white-space:nowrap; transition:color .12s, background .12s; }
+.ptab.on{ color:var(--accent); background:var(--accent-weak); }
+.ptab:not(.on):hover{ color:var(--text); }
+
 /* NOTE */
 .note{ text-align:center; font-size:12.5px; color:var(--dim); margin:14px 0; position:relative; }
 .note::before,.note::after{ content:""; position:absolute; top:50%; width:calc(50% - 70px); height:1px; background:var(--border); }
@@ -369,7 +375,13 @@ body{
 .drop-card .dc-tx{ font-size:15.5px; font-weight:600; color:var(--text); }
 .drop-card .dc-sub{ font-size:12.5px; color:var(--dim); }
 .ubub-imgs{ display:flex; flex-wrap:wrap; gap:6px; max-width:82%; margin-left:auto; margin-bottom:6px; }
-.ubub-img{ max-width:180px; max-height:180px; border-radius:10px; border:1px solid var(--border); }
+.ubub-img{ max-width:180px; max-height:180px; border-radius:10px; border:1px solid var(--border); cursor:zoom-in; }
+/* image lightbox (click a message image to zoom) */
+.lightbox{ position:fixed; inset:0; z-index:100; background:rgba(0,0,0,.85); display:flex; align-items:center; justify-content:center; overflow:auto; padding:20px; animation:panel-in .16s var(--ease); }
+.lightbox-img{ max-width:96vw; max-height:96vh; object-fit:contain; border-radius:8px; box-shadow:var(--shadow-lg); cursor:zoom-in; }
+.lightbox-img.big{ max-width:none; max-height:none; width:auto; cursor:zoom-out; }
+.lightbox-close{ position:fixed; top:14px; right:14px; width:40px; height:40px; border-radius:50%; border:0; background:rgba(255,255,255,.16); color:#fff; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
+.lightbox-close:hover{ background:rgba(255,255,255,.28); }
 .ubub-files{ display:flex; flex-wrap:wrap; gap:6px; max-width:82%; margin-left:auto; margin-bottom:6px; }
 .ubub-file{ display:inline-flex; align-items:center; gap:6px; background:var(--accent-weak); border:1px solid var(--accent-line); border-radius:8px; padding:5px 9px; font-size:12.5px; color:var(--text); }
 .ubub-file svg{ width:14px; height:14px; color:var(--accent); }

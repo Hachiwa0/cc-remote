@@ -84,6 +84,15 @@ class StreamTranslator:
         return events
 
 
+def _cc_img_block(b: dict) -> dict | None:
+    """A cc transcript image block {type:image, source:{type:base64, media_type,
+    data}} -> {media_type, data} (the web's QueryImg shape). None if not base64."""
+    src = b.get("source")
+    if isinstance(src, dict) and src.get("type") == "base64" and src.get("data"):
+        return {"media_type": src.get("media_type") or "image/png", "data": src["data"]}
+    return None
+
+
 def _stringify(content: Any) -> str:
     if content is None:
         return ""
@@ -201,6 +210,15 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                 events.append(_um(m.uuid, content))
                 turn_open = True
             elif isinstance(content, list):
+                # collect any uploaded images up front so they attach to this turn's
+                # UserMsg (replay on reload — the transcript stores the base64).
+                imgs = []
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "image":
+                        img = _cc_img_block(b)
+                        if img:
+                            imgs.append(img)
+                made = False
                 for b in content:
                     if not isinstance(b, dict):
                         continue
@@ -221,8 +239,18 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                         txt = b.get("text", "")
                         if txt and not _is_meta_user_text(txt):
                             close_turn()
-                            events.append(_um(m.uuid, txt))
+                            um = _um(m.uuid, txt)
+                            if imgs and not made:
+                                um.images = imgs
+                                made = True
+                            events.append(um)
                             turn_open = True
+                if imgs and not made:   # image-only user turn
+                    close_turn()
+                    um = _um(m.uuid, "")
+                    um.images = imgs
+                    events.append(um)
+                    turn_open = True
         elif role == "assistant":
             if not isinstance(content, list):
                 continue

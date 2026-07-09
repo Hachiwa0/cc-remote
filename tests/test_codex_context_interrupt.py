@@ -97,10 +97,30 @@ def test_config_fast_toggle_preserves_file():
         os.unlink(tf.name)
 
 
+def test_codex_errors_surface():
+    """A failed codex turn (provider timeout / 401 / stream drop) must reach the
+    client as an Error, not silence. Transient retries (willRetry) stay quiet."""
+    from cc_remote.protocol import Error
+    tr = CodexStreamTranslator(8000)
+    # transient retry -> nothing
+    assert tr.feed({"method": "error", "params": {"willRetry": True, "error": {"message": "Reconnecting... 2/5"}}}) == []
+    # terminal error -> Error
+    evs = tr.feed({"method": "error", "params": {"willRetry": False,
+        "error": {"message": "unexpected status 401 Unauthorized", "additionalDetails": "Incorrect API key"}}})
+    assert len(evs) == 1 and isinstance(evs[0], Error) and "401" in evs[0].message and "codex" in evs[0].message
+    # failed turn/completed -> surfaces turn.error, then a TurnEnd(is_error)
+    tr2 = CodexStreamTranslator(8000)
+    out = tr2.feed({"method": "turn/completed", "params": {"turn": {"status": "failed", "error": {"message": "request timed out"}}}})
+    assert any(isinstance(e, Error) and "request timed out" in e.message for e in out), out
+    assert out[-1].result.is_error is True and out[-1].result.subtype == "error"
+    print("  codex errors surface: retry silent, 401 + failed-turn -> Error  OK")
+
+
 if __name__ == "__main__":
     import os
     test_context_window_capture_and_usage()
     test_context_uses_last_not_cumulative_total()
     test_interrupt_status_maps_to_cc_vocab()
     test_config_fast_toggle_preserves_file()
+    test_codex_errors_surface()
     print("ALL PASS")
