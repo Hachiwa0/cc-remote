@@ -87,6 +87,10 @@ export interface AppState {
   sessions: SessionInfo[];
   focusedSid: string | null;
   runtimes: Record<string, SessionRuntime>;
+  // /btw ephemeral side-fork: the fork's routing key (its runtime lives in
+  // `runtimes[btwSid]`) + engine, or null when no side panel is open.
+  btwSid: string | null;
+  btwEngine?: string;
 }
 
 export function createRuntime(): SessionRuntime {
@@ -116,6 +120,7 @@ export type Action =
   | { type: "set_artifact"; artifact: Artifact }
   | { type: "open_artifact_loading"; file: string }
   | { type: "clear_artifact" }
+  | { type: "clear_btw" }
   | { type: "focus_session"; sid: string }
   | { type: "set_session_tag"; sid: string; tag: string | null }
   | { type: "hydrate_cache"; sid: string; turns: Turn[] }
@@ -139,6 +144,7 @@ export const initialState: AppState = {
   sessions: [],
   focusedSid: null,
   runtimes: {},
+  btwSid: null,
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
@@ -208,6 +214,12 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, artifact: { file: action.file, kind: "gitdiff", sections: [], loading: true } };
     case "clear_artifact":
       return { ...state, artifact: null };
+    case "clear_btw": {
+      if (!state.btwSid) return state;
+      const runtimes = { ...state.runtimes };
+      delete runtimes[state.btwSid];   // ephemeral: drop the fork's runtime
+      return { ...state, btwSid: null, btwEngine: undefined, runtimes };
+    }
     case "focus_session": {
       // optimistic view switch: focus the session locally right away (its runtime
       // is usually already in memory) instead of waiting for the round-trip
@@ -352,6 +364,12 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return patch(state, e.sid, (rt) => { rt.effort = e.effort; });
     case "fast":
       return patch(state, e.sid, (rt) => { rt.fast = e.on; });
+    case "btw_opened": {
+      // open the side panel + ensure a runtime for the fork; do NOT change focus
+      // (the main view stays put — the fork lives only in the panel).
+      const runtimes = { ...state.runtimes, [e.btw_sid]: state.runtimes[e.btw_sid] ?? createRuntime() };
+      return { ...state, btwSid: e.btw_sid, btwEngine: e.engine, runtimes };
+    }
     case "perm":
       return patch(state, e.sid, (rt) => { rt.perm = e.mode; });
     case "context_report":

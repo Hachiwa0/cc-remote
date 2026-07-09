@@ -100,6 +100,21 @@ class SetServiceTier(_Base):
     service_tier: str  # fast | default (or "" = off)
 
 
+class OpenBtw(_Base):
+    """client -> wrapper: open a /btw ephemeral side-fork of `sid` (the parent
+    session). The wrapper forks it (inherits context) and replies BtwOpened
+    routed to=<client_id> (only the requester opens the panel)."""
+    type: Literal["open_btw"] = "open_btw"
+    client_id: Optional[str] = None  # requester, for routing BtwOpened back
+    # `sid` (inherited) = the parent session to fork.
+
+
+class CloseBtw(_Base):
+    """client -> wrapper: discard the /btw fork `sid` (tear down, never persisted)."""
+    type: Literal["close_btw"] = "close_btw"
+    # `sid` (inherited) = the btw fork to close.
+
+
 class Ping(_Base):
     type: Literal["ping"] = "ping"
     n: int
@@ -163,6 +178,15 @@ class Fast(_Base):
     the fast tier or standard — not just that it was 'toggled'."""
     type: Literal["fast"] = "fast"
     on: bool
+
+
+class BtwOpened(_Base):
+    """wrapper -> client: a /btw fork is ready. `btw_sid` is the stable routing key
+    for the side panel (send Query{sid=btw_sid} for its turns, CloseBtw to end)."""
+    type: Literal["btw_opened"] = "btw_opened"
+    btw_sid: str
+    parent_sid: str
+    engine: str
 
 
 class UserMsg(_Base):
@@ -447,7 +471,7 @@ class AnswerQuestion(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, GetContext, GetDiff, GetHistory, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
+    Hello, Query, Interrupt, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetDiff, GetHistory, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, History, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
@@ -458,7 +482,7 @@ AnyMessage = Union[
 # control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "state", "model", "effort", "perm", "fast",
+    "user_msg", "state", "model", "effort", "perm", "fast", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_result",
     "assistant_msg_end", "turn_end", "error", "ask_user",
 })
@@ -470,6 +494,9 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "set_model": SetModel,
     "set_effort": SetEffort,
     "set_service_tier": SetServiceTier,
+    "open_btw": OpenBtw,
+    "close_btw": CloseBtw,
+    "btw_opened": BtwOpened,
     "set_perm": SetPerm,
     "get_context": GetContext,
     "get_diff": GetDiff,

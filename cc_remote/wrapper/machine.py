@@ -43,13 +43,13 @@ import os
 from uuid import uuid4
 from typing import Optional
 
-from claude_agent_sdk import list_sessions, get_session_messages, rename_session, tag_session, get_session_info
+from claude_agent_sdk import list_sessions, get_session_messages, rename_session, tag_session, get_session_info, delete_session
 from claude_agent_sdk.types import ResultMessage
 
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, Hello, Model, Effort, Fast, Perm, ContextReport, DiffReport, History, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
+    Error, Hello, Model, Effort, Fast, Perm, BtwOpened, ContextReport, DiffReport, History, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
     SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL,
@@ -190,6 +190,10 @@ class WrapperMachine:
             await self._handle_set_effort(cmd)
         elif t == "set_service_tier":
             await self._handle_set_service_tier(cmd)
+        elif t == "open_btw":
+            await self._handle_open_btw(cmd)
+        elif t == "close_btw":
+            await self._handle_close_btw(cmd)
         elif t == "set_perm":
             await self._handle_set_perm(cmd)
         elif t == "get_context":
@@ -226,6 +230,8 @@ class WrapperMachine:
         # reconnect flood that made refreshes slow.
         # snapshot: a concurrent turn may re-key self.sessions across the awaits below
         for key, ctx in list(self.sessions.items()):
+            if ctx.btw:
+                continue  # /btw forks are ephemeral + per-client; not restored on hello
             sid = ctx.session_id or key
             tail = ctx.buffer.latest_tail_text()
             st = ctx.buffer.latest_state() or ctx.state
@@ -412,6 +418,54 @@ class WrapperMachine:
         except Exception as e:
             log.exception("set_service_tier failed", error=str(e))
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_service_tier failed: {e}"))
+
+    async def _handle_open_btw(self, cmd) -> None:
+        parent = self._ctx_for(getattr(cmd, "sid", None))
+        if parent is None:
+            await self._emit_focused(Error(code=ERR_NOT_RUNNING, message="没有可 fork 的会话"))
+            return
+        if parent.btw:  # never fork a fork — fork its parent instead
+            parent = self.sessions.get(parent.parent_sid) or next(
+                (c for c in self.sessions.values() if c.session_id == parent.parent_sid), parent)
+        btw = await self._spawn_btw(parent)
+        if btw is None:
+            return  # error already emitted
+        ev = BtwOpened(btw_sid=btw.key, parent_sid=parent.session_id or parent.key, engine=btw.engine)
+        ev.sid = btw.key
+        cid = getattr(cmd, "client_id", None)
+        if cid:
+            ev.to = cid
+        await self.transport.send(ev)
+        # a fresh Snapshot so the requester builds a runtime for the fork's key.
+        snap = Snapshot(cc_session_id=None, state="idle", tail_text="", cwd=btw.cwd)
+        snap.sid = btw.key
+        if cid:
+            snap.to = cid
+        await self.transport.send(snap)
+        log.info("btw opened", btw_sid=btw.key, parent=parent.session_id, client_id=cid)
+
+    async def _handle_close_btw(self, cmd) -> None:
+        sid = getattr(cmd, "sid", None)
+        ctx = self.sessions.get(sid) if sid else None
+        if ctx is None or not ctx.btw:
+            return
+        self.sessions.pop(ctx.key, None)
+        try:
+            if ctx.turn_task and not ctx.turn_task.done():
+                ctx.turn_task.cancel()
+            await ctx.sdk.disconnect()
+        except Exception as e:
+            log.warning("btw close disconnect failed", error=str(e))
+        # codex forks are ephemeral (no rollout); cc fork_session persists a
+        # transcript under btw_real_id — hard-delete it so it never clutters the
+        # session list. Best-effort.
+        if ctx.engine != "codex" and ctx.btw_real_id:
+            try:
+                await asyncio.to_thread(delete_session, ctx.btw_real_id, directory=ctx.cwd)
+                log.info("btw fork transcript deleted", forked=ctx.btw_real_id)
+            except Exception as e:
+                log.warning("btw fork transcript delete failed", forked=ctx.btw_real_id, error=str(e))
+        log.info("btw closed", btw_sid=sid)
 
     async def _handle_set_perm(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -622,6 +676,13 @@ class WrapperMachine:
         sync, migrate focus ONLY if this ctx was the focused one, and tell the
         client to re-key its runtime (SessionRekey — NOT SessionFocus, else a
         background session's capture would steal the user's view)."""
+        # /btw forks keep their stable `btw-<uuid>` pool key so their events always
+        # route to the side panel; they're ephemeral (never resumed/saved/re-keyed).
+        # Record the real forked id (cc fork_session persists one) for close-time
+        # cleanup, but don't route/save under it.
+        if ctx.btw:
+            ctx.btw_real_id = sid
+            return
         old_key = ctx.key
         ctx.session_id = sid
         if ctx.engine != "codex":
@@ -728,7 +789,7 @@ class WrapperMachine:
         # so merely browsing between sessions never wedges you.
         if not bootstrap and len(self.sessions) >= self.cfg.max_concurrent_sessions:
             victim = next((k for k, c in self.sessions.items()
-                           if k != self.focused_sid and c.state == "idle"), None)
+                           if k != self.focused_sid and c.state == "idle" and not c.btw), None)
             if victim is None:
                 await self._emit_focused(Error(
                     code=ERR_BUSY,
@@ -832,6 +893,53 @@ class WrapperMachine:
             await self._emit(ctx, Perm(mode=ctx.announced_perm))
         log.info("session spawned", resume=resume_id, cwd=target_cwd, key=key,
                  resident=len(self.sessions))
+        return ctx
+
+    async def _spawn_btw(self, parent: SessionContext) -> Optional[SessionContext]:
+        """Spawn an ephemeral /btw fork of `parent`: a throwaway side-session that
+        inherits the parent's context (codex thread/fork · cc fork_session) and
+        streams under a stable `btw-<uuid>` key. Never persisted / listed / focused;
+        discarded on close. Its turns reuse the normal _run_turn path."""
+        parent_id = parent.session_id
+        if not parent_id:
+            await self._emit_focused(Error(code=ERR_INTERNAL,
+                message="这个会话还没有上下文,先发一条消息再开 btw"))
+            return None
+        # btw counts toward the cap; evict an idle, non-focused, non-btw victim.
+        if len(self.sessions) >= self.cfg.max_concurrent_sessions:
+            victim = next((k for k, c in self.sessions.items()
+                           if k != self.focused_sid and c.state == "idle" and not c.btw), None)
+            if victim is None:
+                await self._emit_focused(Error(code=ERR_BUSY, message="会话已满,先关闭一个再开 btw"))
+                return None
+            vc = self.sessions.pop(victim)
+            try:
+                await vc.sdk.disconnect()
+            except Exception:
+                pass
+            log.info("evicted idle session for btw", key=victim)
+        engine = parent.engine
+        sdk = CodexHandle(self.cfg, cwd=parent.cwd) if engine == "codex" else SdkHandle(self.cfg)
+        ctx = SessionContext(
+            session_id=None, sdk=sdk,
+            buffer=RingBuffer(self.cfg.ring_max_events, self.cfg.ring_max_bytes),
+            cwd=parent.cwd, engine=engine, btw=True, parent_sid=parent_id)
+        if engine != "codex":
+            ctx.sdk.ask_server = make_ask_server(
+                lambda q, o: self._on_ask(ctx, q, o),
+                lambda m: self._on_set_mode(ctx, m),
+            )
+        try:
+            await ctx.sdk.connect(resume_id=parent_id, cwd=parent.cwd, fork=True)
+        except Exception as e:
+            log.exception("btw fork connect failed", error=str(e))
+            await self._emit_focused(Error(code=ERR_CC_CRASH, message=f"btw fork 失败: {e}"))
+            return None
+        key = f"btw-{uuid4().hex}"
+        self.sessions[key] = ctx
+        ctx.key = key
+        log.info("btw fork spawned", parent=parent_id, key=key, engine=engine,
+                 fork_thread=getattr(ctx.sdk, "thread_id", None))
         return ctx
 
     async def _load_history(self, ctx: SessionContext, session_id: Optional[str]) -> None:

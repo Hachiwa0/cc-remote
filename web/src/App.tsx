@@ -11,6 +11,7 @@ import { SessionsSidebar } from "./components/SessionsSidebar";
 import { DirPicker } from "./components/DirPicker";
 import { NewChatView } from "./components/NewChatView";
 import { ArtifactPanel } from "./components/ArtifactPanel";
+import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import type { Snapshot, QueryImg, QueryFile } from "./protocol";
 
@@ -294,6 +295,11 @@ export default function App() {
     dispatch({ type: "set_perm", perm });
   };
   const getDiff = (file: string) => { dispatch({ type: "open_artifact_loading", file }); wsRef.current?.sendGetDiff(file, theme); };
+  // /btw: fork the focused session into an ephemeral side panel (wrapper replies
+  // BtwOpened → reducer opens the panel). Send/close target the fork by its sid.
+  const openBtw = () => { if (focusedSid) wsRef.current?.sendOpenBtw(focusedSid); };
+  const sendBtw = (prompt: string) => { if (state.btwSid) wsRef.current?.sendQueryTo(state.btwSid, prompt, uuid()); };
+  const closeBtw = () => { if (state.btwSid) { wsRef.current?.sendCloseBtw(state.btwSid); dispatch({ type: "clear_btw" }); } };
   const logout = () => {
     localStorage.removeItem(SESSION_KEY);
     wsRef.current?.stop();
@@ -382,12 +388,17 @@ export default function App() {
           onSetPerm={setPerm}
           onClear={() => dispatch({ type: "enter_new_chat", cwd: state.currentCwd })}
           onContext={() => wsRef.current?.sendGetContext()}
+          onOpenBtw={openBtw}
           contextReport={rt.contextReport}
         />
           </>
         )}
         {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
+      {state.btwSid && (
+        <BtwPanel sid={state.btwSid} rt={state.runtimes[state.btwSid]} engine={state.btwEngine}
+          onSend={sendBtw} onClose={closeBtw} />
+      )}
       {state.artifact && (
         <ArtifactPanel artifact={state.artifact} onClose={() => dispatch({ type: "clear_artifact" })} />
       )}

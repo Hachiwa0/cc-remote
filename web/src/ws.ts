@@ -100,6 +100,18 @@ export class RelayWs {
     this.send(obj);
   }
 
+  // ---- /btw ephemeral side-fork ----
+  sendOpenBtw(parentSid: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "open_btw", sid: parentSid, client_id: this.clientId, ts: nowTs() });
+  }
+  sendCloseBtw(btwSid: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs() });
+  }
+  // a turn targeted at an explicit sid (the btw fork), NOT the focused session.
+  sendQueryTo(sid: string, prompt: string, msg_id: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: nowTs() });
+  }
+
   sendInterrupt(): void {
     this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs(), ...this.sidObj() });
   }

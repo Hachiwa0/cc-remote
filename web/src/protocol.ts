@@ -38,6 +38,9 @@ export interface StateEvent extends Base { type: "state"; state: State }
 export interface Model extends Base { type: "model"; model: string }
 export interface Effort extends Base { type: "effort"; effort: string }
 export interface Fast extends Base { type: "fast"; on: boolean }
+export interface OpenBtw extends Base { type: "open_btw"; client_id?: string }
+export interface CloseBtw extends Base { type: "close_btw" }
+export interface BtwOpened extends Base { type: "btw_opened"; btw_sid: string; parent_sid: string; engine: string }
 export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string }
@@ -100,7 +103,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | Perm | ContextReport | DiffReport | History
+  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History
   | AskUser
   | SessionList | SessionFocus | SessionRekey
   | DirList

@@ -53,7 +53,8 @@ class CodexHandle:
         self.service_tier: Optional[str] = None             # "fast" = Codex Fast mode; None = default
         self.tier_dirty: bool = False                       # service_tier changed -> reconnect next turn to reload config
 
-    async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None) -> None:
+    async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
+                      fork: bool = False) -> None:
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
         self.proc = await asyncio.create_subprocess_exec(
             CODEX_BIN, "app-server", "--stdio",
@@ -69,7 +70,15 @@ class CodexHandle:
         await self._request("initialize", {"clientInfo": {"name": "cc-remote", "version": "0.1.0"}})
         await self._notify("initialized")
 
-        if resume_id:
+        if fork and resume_id:
+            # ephemeral /btw fork: inherits resume_id's context into a throwaway
+            # thread; the parent thread is never touched (verified: fork answers
+            # from parent context, parent stays coherent).
+            res = await self._request("thread/fork", {
+                "threadId": resume_id, "ephemeral": True,
+                "cwd": self._cwd, "approvalPolicy": self.approval})
+            self.thread_id = _thread_id_of(res)
+        elif resume_id:
             res = await self._request("thread/resume", {
                 "threadId": resume_id, "cwd": self._cwd, "approvalPolicy": self.approval})
             self.thread_id = _thread_id_of(res) or resume_id
@@ -77,7 +86,8 @@ class CodexHandle:
             res = await self._request("thread/start", {
                 "cwd": self._cwd, "approvalPolicy": self.approval})
             self.thread_id = _thread_id_of(res)
-        log.info("codex connected", thread_id=self.thread_id, cwd=self._cwd, resume=bool(resume_id))
+        log.info("codex connected", thread_id=self.thread_id, cwd=self._cwd,
+                 resume=bool(resume_id), fork=fork)
 
     async def query(self, prompt) -> None:
         assert self.proc is not None and self.thread_id, "connect() first"

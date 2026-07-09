@@ -30,6 +30,7 @@ interface Props {
   onSetPerm: (perm: string) => void;
   onClear: () => void;
   onContext: () => void;
+  onOpenBtw?: () => void;
   contextReport: ContextReport | null;
 }
 
@@ -188,6 +189,8 @@ export function Composer(p: Props) {
       case "context": p.onContext(); setCtxOpen(true); break;
       // codex /status = session config + token usage; surface the context readout.
       case "status": p.onContext(); setCtxOpen(true); break;
+      // /btw: open an ephemeral side-fork panel (both engines).
+      case "btw": p.onOpenBtw?.(); break;
       // codex /fast: flip the Fast service tier. The wrapper toggles off the
       // actual config (source of truth); p.fast is the current state, so the
       // resulting state is its negation. Applies on the next message.

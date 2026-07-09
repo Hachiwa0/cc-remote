@@ -41,6 +41,14 @@ class SessionContext:
     engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
     turn_task: Optional[asyncio.Task] = None
     translator: Optional[StreamTranslator] = None
+    # /btw ephemeral fork: a throwaway side-session forked from `parent_sid` that
+    # inherits its context. Never persisted, excluded from the session list, and
+    # discarded on close. Its turns reuse the normal _run_turn path.
+    btw: bool = False
+    parent_sid: Optional[str] = None
+    # cc fork_session persists a transcript under a new id (unlike codex's
+    # ephemeral fork); capture it here so close_btw can hard-delete it.
+    btw_real_id: Optional[str] = None
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
     announced_perm: Optional[str] = None

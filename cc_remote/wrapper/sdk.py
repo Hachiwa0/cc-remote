@@ -49,12 +49,17 @@ class SdkHandle:
                 f"the interrupt/drain contract may have changed — pin 0.2.110 or re-verify."
             )
 
-    def _options(self, resume_id: str | None, cwd: str | None = None) -> ClaudeAgentOptions:
+    def _options(self, resume_id: str | None, cwd: str | None = None,
+                 fork: bool = False) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             include_partial_messages=True,        # StreamEvent with content_block_delta
             permission_mode="bypassPermissions",  # unattended; matches settings.json
             cwd=cwd or self.cfg.cc_cwd,           # dynamic: must match the resumed session's cwd
             resume=resume_id or None,
+            # fork_session=True resumes `resume_id`'s context but writes new turns to
+            # a FRESH session id, leaving the original transcript untouched — used for
+            # ephemeral /btw side-forks.
+            fork_session=fork,
             effort=self.effort,                   # reasoning strength; None -> CLI default (high)
             stderr=self._on_stderr,               # surface cc subprocess errors
             # setting_sources left None -> load ~/.claude/settings.json (model link, model id)
@@ -83,12 +88,13 @@ class SdkHandle:
     def _on_stderr(line: str) -> None:
         log.warning("cc stderr: " + line.rstrip())
 
-    async def connect(self, resume_id: str | None = None, cwd: str | None = None) -> None:
-        opts = self._options(resume_id, cwd)
+    async def connect(self, resume_id: str | None = None, cwd: str | None = None,
+                      fork: bool = False) -> None:
+        opts = self._options(resume_id, cwd, fork=fork)
         self.client = ClaudeSDKClient(options=opts)
         await self.client.connect()
         self.applied_effort = self.effort  # the live subprocess now reflects this effort
-        log.info("sdk connected", resume=bool(resume_id), cwd=opts.cwd,
+        log.info("sdk connected", resume=bool(resume_id), fork=fork, cwd=opts.cwd,
                  effort=self.effort, sdk_version=SDK_VERSION)
 
     async def query(self, prompt) -> None:
