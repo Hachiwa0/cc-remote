@@ -37,6 +37,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import uuid
 from typing import Optional
 
@@ -45,7 +46,7 @@ from cc_remote.log import logger, setup
 from cc_remote.protocol import (
     Hello, Query, Interrupt, SetModel, SetEffort, GetContext,
     GetHistory, ListSessions, SwitchSession, NewSession, AnswerQuestion,
-    serialize,
+    Ping, serialize,
 )
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -94,6 +95,8 @@ class Tui:
         self.state = "idle"
         self._midline = False               # cursor is mid-line from streaming deltas
         self.ws = None
+        self.last_recv = 0.0                 # monotonic time of the last inbound frame (heartbeat)
+        self._ping_n = 0
         self._quitting = False
         self._cmd_q: asyncio.Queue = asyncio.Queue()
         self._stdin_task: Optional[asyncio.Task] = None
@@ -147,7 +150,7 @@ class Tui:
         while not self._quitting:
             try:
                 async with connect(self.url, additional_headers={"Authorization": f"Bearer {self.token}"},
-                                   max_size=32 * 1024 * 1024, close_timeout=3) as ws:
+                                   max_size=32 * 1024 * 1024, close_timeout=3, open_timeout=30) as ws:
                     self.ws = ws
                     await self._send(Hello(role="client", client_id=self.client_id,
                                            cursors=dict(self.cursors) or None))
@@ -166,15 +169,41 @@ class Tui:
                 backoff = min(backoff * 2, 5.0)
 
     async def _session(self, ws) -> None:
+        self.last_recv = time.monotonic()
         recv = asyncio.create_task(self._receiver(ws))
         cmd = asyncio.create_task(self._cmd_consumer(ws))
-        _, pending = await asyncio.wait({recv, cmd}, return_when=asyncio.FIRST_COMPLETED)
+        hb = asyncio.create_task(self._heartbeat(ws))
+        _, pending = await asyncio.wait({recv, cmd, hb}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
+
+    async def _heartbeat(self, ws) -> None:
+        # Same half-open guard as the web client. If the WS silently dies (dead TCP,
+        # no close frame — common on flaky/proxied links), `async for raw in ws`
+        # never returns and we'd stop receiving broadcasts without noticing (no
+        # error → no reconnect → the terminal misses messages other clients send).
+        # Ping every 20s; if NO frame arrives for 45s, close the ws so the
+        # connection loop reconnects — which re-attaches + re-pulls history,
+        # backfilling anything missed during the gap.
+        while True:
+            await asyncio.sleep(20)
+            if time.monotonic() - self.last_recv > 45:
+                self._line(DIM("[链路空闲,重连中…]"))
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                return
+            try:
+                self._ping_n += 1
+                await ws.send(serialize(Ping(n=self._ping_n)))
+            except Exception:
+                return
 
     async def _receiver(self, ws) -> None:
         try:
             async for raw in ws:
+                self.last_recv = time.monotonic()  # any frame proves the link is alive
                 try:
                     d = json.loads(raw)
                 except Exception:
