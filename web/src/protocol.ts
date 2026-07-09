@@ -28,6 +28,7 @@ export interface Query extends Base { type: "query"; prompt: string; msg_id: str
 export interface Interrupt extends Base { type: "interrupt" }
 export interface SetModel extends Base { type: "set_model"; model: string }
 export interface SetEffort extends Base { type: "set_effort"; effort: string }
+export interface SetServiceTier extends Base { type: "set_service_tier"; service_tier: string }
 export interface Ping extends Base { type: "ping"; n: number }
 export interface Pong extends Base { type: "pong"; n: number }
 export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean; rebuild?: boolean }
@@ -36,6 +37,7 @@ export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: strin
 export interface StateEvent extends Base { type: "state"; state: State }
 export interface Model extends Base { type: "model"; model: string }
 export interface Effort extends Base { type: "effort"; effort: string }
+export interface Fast extends Base { type: "fast"; on: boolean }
 export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string }
@@ -58,10 +60,11 @@ export interface SessionInfo {
   cwd?: string | null;
   tag?: string | null;
   state?: State | null;
+  engine?: "claude" | "codex" | null;
 }
-export interface ListSessions extends Base { type: "list_sessions" }
-export interface SwitchSession extends Base { type: "switch_session"; session_id: string }
-export interface NewSession extends Base { type: "new_session"; cwd?: string | null }
+export interface ListSessions extends Base { type: "list_sessions"; engine?: "claude" | "codex" }
+export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: "claude" | "codex" }
+export interface NewSession extends Base { type: "new_session"; cwd?: string | null; engine?: "claude" | "codex" }
 export interface SessionList extends Base { type: "session_list"; sessions: SessionInfo[] }
 export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null }
 // NON-focusing re-key: a temp-keyed new session captured its real cc id. Rename
@@ -97,7 +100,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Perm | ContextReport | DiffReport | History
+  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | Perm | ContextReport | DiffReport | History
   | AskUser
   | SessionList | SessionFocus | SessionRekey
   | DirList

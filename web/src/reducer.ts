@@ -53,6 +53,7 @@ export interface SessionRuntime {
   model: string;
   effort: string;
   perm: string;
+  fast: boolean;   // codex Fast-mode (service tier) on/off
   replaying: boolean;
   truncated: boolean;
   // true while we've switched to a session but its history hasn't arrived yet
@@ -91,6 +92,7 @@ export interface AppState {
 export function createRuntime(): SessionRuntime {
   return {
     turns: [], state: "idle", model: "claude-mythos-5", effort: "max", perm: "bypassPermissions",
+    fast: false,
     replaying: false, truncated: false, pendingQuestion: null, contextReport: null,
     queue: [], pendingSend: null,
   };
@@ -348,6 +350,8 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return patch(state, e.sid, (rt) => { rt.model = matchModelId(e.model); });
     case "effort":
       return patch(state, e.sid, (rt) => { rt.effort = e.effort; });
+    case "fast":
+      return patch(state, e.sid, (rt) => { rt.fast = e.on; });
     case "perm":
       return patch(state, e.sid, (rt) => { rt.perm = e.mode; });
     case "context_report":

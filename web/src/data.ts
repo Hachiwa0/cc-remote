@@ -49,10 +49,31 @@ export const EFFORTS: Effort[] = [
   { id: "max", name: "最大", ds: "最强 · 最慢最贵", ic: "gauge5" },
 ];
 
+// ---- Codex engine option sets (aligned with the codex app-server) ----
+// model/list => gpt-5.5; supportedReasoningEfforts => low/medium/high/xhigh;
+// "mode" maps to codex approval policy (untrusted/on-request/never).
+export const CODEX_MODELS: Model[] = [
+  { id: "gpt-5.5", name: "GPT-5.5", ds: "最强 agentic 编码", ic: "cpu" },
+];
+export const CODEX_EFFORTS: Effort[] = [
+  { id: "low", name: "低", ds: "更快 · 轻推理", ic: "gauge1" },
+  { id: "medium", name: "中", ds: "均衡", ic: "gauge2" },
+  { id: "high", name: "高", ds: "深度推理", ic: "gauge3" },
+  { id: "xhigh", name: "超高", ds: "最深推理 · 最慢", ic: "gauge5" },
+];
+export const CODEX_PERMS: Perm[] = [
+  { id: "never", name: "自动", short: "自动", ds: "不询问 · 直接执行", ic: "run" },
+  { id: "on-request", name: "按需", short: "按需", ds: "需要时才询问", ic: "shield" },
+  { id: "untrusted", name: "严格", short: "严格", ds: "每步都先询问", ic: "shield" },
+];
+export const modelsFor = (engine?: string): Model[] => (engine === "codex" ? CODEX_MODELS : MODELS);
+export const effortsFor = (engine?: string): Effort[] => (engine === "codex" ? CODEX_EFFORTS : EFFORTS);
+export const permsFor = (engine?: string): Perm[] => (engine === "codex" ? CODEX_PERMS : PERMS);
+
 // Map a cc-reported model id (e.g. "claude-mythos-5[1m]") to a MODELS entry id.
-export function matchModelId(m: string): string {
+export function matchModelId(m: string, engine?: string): string {
   const base = m.replace(/\[.*\]$/, "");
-  const hit = MODELS.find((x) => base === x.id || base.startsWith(x.id));
+  const hit = modelsFor(engine).find((x) => base === x.id || base.startsWith(x.id));
   return hit ? hit.id : m;
 }
 
@@ -76,6 +97,37 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // is forwarded verbatim so cc's own slash-command layer runs it.
 export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context"]);
 
+// Codex engine command palette — its REAL slash commands (verified against the
+// codex binary's own "get started" hint: /init /status /permissions /model /review).
+// Client-handled: model/clear/context/status/permissions (status & context both
+// surface token usage; permissions opens the approval-policy picker). Forwarded
+// ones (review/init) expand to a prompt codex handles agentically — the app-server
+// has no TUI slash layer. NB: /fast is a codex keybinding (not an app-server knob),
+// and /hook /plan are Claude-only — so they're intentionally omitted.
+export const CODEX_COMMANDS: Command[] = [
+  { g: "审查" },
+  { slash: "review", name: "代码审查", ds: "审当前 git 改动的 bug 与改进", ic: "review" },
+  { g: "项目" },
+  { slash: "init", name: "初始化 AGENTS.md", ds: "生成/更新代码库说明", ic: "init" },
+  { g: "模式" },
+  { slash: "model", name: "切换模型", ds: "选择模型与思考强度", ic: "cpu" },
+  { slash: "permissions", name: "权限模式", ds: "选择 Codex 的审批策略(自动/按需/严格)", ic: "shield" },
+  { slash: "fast", name: "Fast 模式", ds: "开/关 Fast 服务档位(更快响应),下条消息生效", ic: "bolt" },
+  { g: "会话" },
+  { slash: "status", name: "会话状态", ds: "模型 · 思考强度 · token 占用", ic: "cpu" },
+  { slash: "context", name: "上下文用量", ds: "查看 token 占用与容量", ic: "cpu" },
+  { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
+];
+const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
+export const CODEX_CLIENT_SLASHES = new Set(["model", "clear", "context", "status", "permissions", "fast"]);
+export const commandsFor = (engine?: string): Command[] => (engine === "codex" ? CODEX_COMMANDS : COMMANDS);
+export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
+// codex slash -> the prompt actually sent to codex (agentic; no TUI slash layer).
+export const CODEX_PROMPTS: Record<string, string> = {
+  review: "Review the current git changes (the diff) for correctness bugs, risks, and simplifications. Be concise.",
+  init: "Create or update AGENTS.md at the repo root: a concise overview of this codebase, how to build/test/run it, and key conventions.",
+};
+
 // The command "token" the user is typing after "/", up to the first space.
 // null when the input isn't an in-progress slash command (no leading "/", or a
 // space already started the arguments). Drives the palette's show/hide.
@@ -87,9 +139,10 @@ export function slashToken(input: string): string | null {
 }
 
 // Commands whose slash starts with `token` (case-insensitive, prefix match).
-export function matchCommands(token: string): Cmd[] {
+export function matchCommands(token: string, engine?: string): Cmd[] {
   const t = token.toLowerCase();
-  return CMD_LIST.filter((c) => c.slash.toLowerCase().startsWith(t));
+  const list = engine === "codex" ? CODEX_CMD_LIST : CMD_LIST;
+  return list.filter((c) => c.slash.toLowerCase().startsWith(t));
 }
 
 // Split "/slash rest of args" -> { slash, args }. null if not a slash line.

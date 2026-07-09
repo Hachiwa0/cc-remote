@@ -8,11 +8,12 @@ import { Icon } from "../icons";
 interface Props {
   cwd: string;
   creating: boolean;  // true while the new session is being created (pendingNewQuery set)
+  engine?: "claude" | "codex";  // which backend this new chat will use
   onPickCwd: () => void;  // open the directory picker
   onSend: (prompt: string) => void;
 }
 
-export function NewChatView({ cwd, creating, onPickCwd, onSend }: Props) {
+export function NewChatView({ cwd, creating, engine = "claude", onPickCwd, onSend }: Props) {
   const [text, setText] = useState("");
   const send = () => {
     const p = text.trim();
@@ -22,7 +23,9 @@ export function NewChatView({ cwd, creating, onPickCwd, onSend }: Props) {
   return (
     <div className="newchat">
       <div className="newchat-card">
-        <div className="newchat-greet">开始新对话</div>
+        <div className="newchat-greet">{engine === "codex" ? "开始 Codex 新对话" : "开始新对话"}
+          <span className={`newchat-engine ${engine}`}>{engine === "codex" ? "◇ Codex" : "✳ Claude"}</span>
+        </div>
         <button className="newchat-cwd" onClick={onPickCwd} title="更改工作目录" disabled={creating}>
           <Icon name="folder" size={16} />
           <span className="newchat-cwd-path">{cwd || "未指定目录"}</span>

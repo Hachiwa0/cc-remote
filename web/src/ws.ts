@@ -112,6 +112,10 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", effort, ts: nowTs(), ...this.sidObj() });
   }
 
+  sendSetServiceTier(service_tier: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_service_tier", service_tier, ts: nowTs(), ...this.sidObj() });
+  }
+
   sendSetPerm(mode: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }
@@ -141,18 +145,25 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
   }
 
-  sendListSessions(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() });
+  sendListSessions(engine?: "claude" | "codex"): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
+    if (engine && engine !== "claude") obj.engine = engine;
+    this.send(obj);
   }
 
-  sendSwitchSession(sessionId: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() });
+  sendSwitchSession(sessionId: string, engine?: "claude" | "codex"): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() };
+    if (engine && engine !== "claude") obj.engine = engine;
+    this.send(obj);
   }
 
-  sendNewSession(cwd?: string | null): void {
+  sendNewSession(cwd?: string | null, engine?: "claude" | "codex"): void {
     this.awaitingNewFocus = true; // honor the wrapper's focus for the freshly-created session
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "new_session", ts: nowTs() };
     if (cwd) obj.cwd = cwd;
+    // only include `engine` for codex, so claude new_session frames stay byte-identical
+    // (an old relay that doesn't know the field never sees it on cc traffic).
+    if (engine && engine !== "claude") obj.engine = engine;
     this.send(obj);
   }
 

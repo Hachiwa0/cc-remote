@@ -92,6 +92,14 @@ class SetEffort(_Base):
     effort: str  # low | medium | high | xhigh | max
 
 
+class SetServiceTier(_Base):
+    """client -> wrapper: set the Codex service tier (codex only). "fast" maps to
+    codex's Fast mode via turn/start's `serviceTier` param; "" / "default" turns it
+    off. Applied on the NEXT turn (a per-turn turn/start override, like model)."""
+    type: Literal["set_service_tier"] = "set_service_tier"
+    service_tier: str  # fast | default (or "" = off)
+
+
 class Ping(_Base):
     type: Literal["ping"] = "ping"
     n: int
@@ -147,6 +155,14 @@ class Effort(_Base):
     client restores the effort readout."""
     type: Literal["effort"] = "effort"
     effort: str
+
+
+class Fast(_Base):
+    """Codex Fast-mode (service_tier) state, downstream. Emitted after a /fast
+    toggle and on each codex turn so the client shows whether the next reply is on
+    the fast tier or standard — not just that it was 'toggled'."""
+    type: Literal["fast"] = "fast"
+    on: bool
 
 
 class UserMsg(_Base):
@@ -238,11 +254,15 @@ class SessionInfo(BaseModel):
     cwd: Optional[str] = None
     tag: Optional[str] = None  # SDK session tag; "archived" hides the card in the sidebar
     state: Optional[State] = None  # if resident: this session's idle/running/... (sidebar status dot)
+    engine: Optional[str] = None  # "claude" | "codex"; None = claude (legacy sidebar badge)
 
 
 class ListSessions(_Base):
-    """client -> wrapper: request the session list for the cwd."""
+    """client -> wrapper: request the session list. `engine` picks the backend's
+    session store (Claude ~/.claude/projects vs Codex ~/.codex/sessions);
+    optional, default claude."""
     type: Literal["list_sessions"] = "list_sessions"
+    engine: Literal["claude", "codex"] = "claude"
 
 
 class SessionList(_Base):
@@ -252,16 +272,22 @@ class SessionList(_Base):
 
 
 class SwitchSession(_Base):
-    """client -> wrapper: resume a different existing session."""
+    """client -> wrapper: resume a different existing session. `engine` tells the
+    wrapper which backend to resume it with (codex threads resume differently)."""
     type: Literal["switch_session"] = "switch_session"
     session_id: str
+    engine: Optional[str] = None
 
 
 class NewSession(_Base):
     """client -> wrapper: start a fresh session (no resume). Optional `cwd`
-    spawns it in that directory (default = the wrapper's current cc_cwd)."""
+    spawns it in that directory (default = the wrapper's current cc_cwd).
+    `engine` selects the backend — Claude Code (default) or Codex. Optional and
+    backward-compatible (no PROTOCOL_VERSION bump): old clients omit it and get
+    Claude, exactly as before; only codex-session creation carries the new field."""
     type: Literal["new_session"] = "new_session"
     cwd: Optional[str] = None
+    engine: Literal["claude", "codex"] = "claude"
 
 
 class SessionFocus(_Base):
@@ -421,7 +447,7 @@ class AnswerQuestion(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetEffort, SetPerm, GetContext, GetDiff, GetHistory, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
+    Hello, Query, Interrupt, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, GetContext, GetDiff, GetHistory, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, History, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
@@ -432,7 +458,7 @@ AnyMessage = Union[
 # control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "state", "model", "effort", "perm",
+    "user_msg", "state", "model", "effort", "perm", "fast",
     "assistant_msg_start", "delta", "tool_use", "tool_result",
     "assistant_msg_end", "turn_end", "error", "ask_user",
 })
@@ -443,6 +469,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "interrupt": Interrupt,
     "set_model": SetModel,
     "set_effort": SetEffort,
+    "set_service_tier": SetServiceTier,
     "set_perm": SetPerm,
     "get_context": GetContext,
     "get_diff": GetDiff,
@@ -462,6 +489,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "state": StateEvent,
     "model": Model,
     "effort": Effort,
+    "fast": Fast,
     "perm": Perm,
     "context_report": ContextReport,
     "diff_report": DiffReport,

@@ -16,6 +16,7 @@ import type { Snapshot, QueryImg, QueryFile } from "./protocol";
 
 const SESSION_KEY = "cc_remote_session";
 const THEME_KEY = "cc_remote_theme";
+const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const HISTORY_PAGE = 60;  // turns fetched per GetHistory (initial load + each "load more")
 
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
@@ -25,6 +26,8 @@ const isMobile = () => window.matchMedia("(max-width: 979px)").matches;
 
 export default function App() {
   const [theme, setTheme] = useState<string>(() => localStorage.getItem(THEME_KEY) || "light");
+  const [engine, setEngine] = useState<"claude" | "codex">(
+    () => (localStorage.getItem(ENGINE_KEY) as "claude" | "codex") || "claude");
   const [authed, setAuthed] = useState<boolean>(() => !!localStorage.getItem(SESSION_KEY));
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
@@ -55,6 +58,24 @@ export default function App() {
   }, [theme]);
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
 
+  // `engine` selects the backend (Claude Code / Codex): the whole UI re-skins via
+  // data-engine, and the sidebar re-lists that engine's own sessions.
+  const engineRef = useRef(engine);
+  useEffect(() => {
+    engineRef.current = engine;
+    document.documentElement.setAttribute("data-engine", engine);
+    localStorage.setItem(ENGINE_KEY, engine);
+    wsRef.current?.sendListSessions(engine);  // codex sessions vs claude sessions
+  }, [engine]);
+  // Tapping the engine pill switches engine AND drops you into a fresh chat for
+  // it — otherwise "switch to Codex" silently only affects the *next* new session,
+  // which reads as "nothing happened". Existing sessions stay in the sidebar.
+  const toggleEngine = () => {
+    setEngine((e) => (e === "codex" ? "claude" : "codex"));
+    dispatch({ type: "enter_new_chat", cwd: state.currentCwd });
+    if (isMobile()) setSidebarOpen(false);
+  };
+
   // WebSocket lifecycle
   useEffect(() => {
     if (!authed) return;
@@ -79,13 +100,13 @@ export default function App() {
         onEvent: (msg) => {
           if (msg.type === "snapshot") { handleSnapshot(msg); return; }
           dispatch({ type: "event", event: msg });
-          if (msg.type === "wrapper_reconnected") { ws.sendHello(); ws.sendListSessions(); }
+          if (msg.type === "wrapper_reconnected") { ws.sendHello(); ws.sendListSessions(engineRef.current); }
           // refresh the context ring after each turn (local SDK query, no model tokens)
           if (msg.type === "turn_end") ws.sendGetContext();
         },
         onConnState: (s, detail) => {
           dispatch({ type: "conn", connState: s, detail });
-          if (s === "connected") ws.sendListSessions();
+          if (s === "connected") ws.sendListSessions(engineRef.current);
         },
         onAuthFail: () => {
           localStorage.removeItem(SESSION_KEY);
@@ -122,7 +143,7 @@ export default function App() {
     if (latest && latest.session_id !== state.focusedSid) {
       dispatch({ type: "focus_session", sid: latest.session_id });
       wsRef.current.setFocusedSid(latest.session_id);
-      wsRef.current.sendSwitchSession(latest.session_id);
+      wsRef.current.sendSwitchSession(latest.session_id, (latest.engine as "claude" | "codex") || engineRef.current);
     }
   }, [state.sessions]);
 
@@ -252,7 +273,7 @@ export default function App() {
     const cwd = state.newChat.cwd;
     const msg_id = uuid();
     dispatch({ type: "start_new_query", prompt, msg_id });
-    wsRef.current.sendNewSession(cwd);
+    wsRef.current.sendNewSession(cwd, engine);
   };
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
@@ -262,6 +283,11 @@ export default function App() {
   const setEffort = (effort: string) => {
     wsRef.current?.sendSetEffort(effort);
     dispatch({ type: "set_effort", effort });
+  };
+  // codex Fast mode (service tier). No chip/reducer state — the Composer tracks
+  // the on/off locally; here we just forward it to the wrapper.
+  const setServiceTier = (tier: string) => {
+    wsRef.current?.sendSetServiceTier(tier);
   };
   const setPerm = (perm: string) => {
     wsRef.current?.sendSetPerm(perm);
@@ -281,7 +307,7 @@ export default function App() {
         sessions={state.sessions}
         liveStates={Object.fromEntries(Object.entries(state.runtimes).map(([sid, r]) => [sid, r.state]))}
         activeSessionId={focusedSid}
-        onSelect={(id) => { dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id); wsRef.current?.sendSwitchSession(id); if (isMobile()) setSidebarOpen(false); }}
+        onSelect={(id) => { dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id); wsRef.current?.sendSwitchSession(id, (state.sessions.find((s) => s.session_id === id)?.engine as "claude" | "codex") || engine); if (isMobile()) setSidebarOpen(false); }}
         onNew={() => { dispatch({ type: "enter_new_chat", cwd: state.currentCwd }); if (isMobile()) setSidebarOpen(false); }}
         onNewInDir={(cwd) => { dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
@@ -309,6 +335,8 @@ export default function App() {
             <div className="sub">{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</div>
           </div>
           <span className={`hstat ${rt.state}`}><span className="sd" />{rt.state}</span>
+          <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
+            title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
           <button className="iconbtn" onClick={toggleTheme} aria-label="切换主题">
             <Icon name={theme === "dark" ? "sun" : "moon"} />
           </button>
@@ -319,6 +347,7 @@ export default function App() {
 
         {state.newChat ? (
           <NewChatView cwd={state.newChat.cwd} creating={!!state.pendingNewQuery}
+            engine={engine}
             onPickCwd={() => setDirPickerOpen(true)}
             onSend={sendFirstMessage} />
         ) : (
@@ -338,6 +367,8 @@ export default function App() {
           model={rt.model}
           effort={rt.effort}
           perm={rt.perm}
+          fast={rt.fast}
+          engine={engine}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
           onSendQuery={sendQuery}
@@ -347,6 +378,7 @@ export default function App() {
           onDequeue={(i) => dispatch({ type: "dequeue_at", i })}
           onSetModel={setModel}
           onSetEffort={setEffort}
+          onSetServiceTier={setServiceTier}
           onSetPerm={setPerm}
           onClear={() => dispatch({ type: "enter_new_chat", cwd: state.currentCwd })}
           onContext={() => wsRef.current?.sendGetContext()}

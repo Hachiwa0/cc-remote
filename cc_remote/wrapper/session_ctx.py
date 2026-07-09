@@ -38,6 +38,7 @@ class SessionContext:
     key: Optional[str] = None
     seq: int = 0                       # per-session monotonic counter
     state: State = "idle"
+    engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
     turn_task: Optional[asyncio.Task] = None
     translator: Optional[StreamTranslator] = None
     announced_model: Optional[str] = None

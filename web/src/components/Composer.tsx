@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import type { State, QueryImg, QueryFile, ContextReport } from "../protocol";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
-import { MODELS, EFFORTS, PERMS, CLIENT_SLASHES, slashToken, matchCommands, parseSlash } from "../data";
+import { clientSlashesFor, CODEX_PROMPTS, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor } from "../data";
 import { CommandSheet } from "./CommandSheet";
 
 interface Props {
@@ -15,6 +15,8 @@ interface Props {
   model: string;
   effort: string;
   perm: string;
+  fast?: boolean;   // codex Fast-mode state (from wrapper)
+  engine?: "claude" | "codex";
   editPrompt: string | null;
   onEditConsumed: () => void;
   onSendQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => void;
@@ -24,6 +26,7 @@ interface Props {
   onDequeue: (i: number) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
+  onSetServiceTier?: (tier: string) => void;
   onSetPerm: (perm: string) => void;
   onClear: () => void;
   onContext: () => void;
@@ -124,7 +127,7 @@ export function Composer(p: Props) {
   // at least one command. Typing past a match (/pet) hides it; deleting back
   // (/pe) shows it again — no separate input, no modal scrim over the composer.
   const cmdToken = slashToken(input);
-  const cmdMatches = cmdToken !== null ? matchCommands(cmdToken) : [];
+  const cmdMatches = cmdToken !== null ? matchCommands(cmdToken, p.engine) : [];
   const cmdOpen = cmdMatches.length > 0;
 
   const onPickFiles = (fl: FileList | File[] | null) => {
@@ -181,7 +184,18 @@ export function Composer(p: Props) {
         break;
       case "permissions": setSheetKind("perms"); break;
       case "clear": p.onClear(); break;
-      case "context": p.onContext(); break;
+      // open the popup too (not just fetch) — same as clicking the context ring.
+      case "context": p.onContext(); setCtxOpen(true); break;
+      // codex /status = session config + token usage; surface the context readout.
+      case "status": p.onContext(); setCtxOpen(true); break;
+      // codex /fast: flip the Fast service tier. The wrapper toggles off the
+      // actual config (source of truth); p.fast is the current state, so the
+      // resulting state is its negation. Applies on the next message.
+      case "fast": {
+        p.onSetServiceTier?.("toggle");
+        flash(!p.fast ? "⚡ 已开启快速模式 · 下条生效" : "已回到标准模式 · 下条生效");
+        break;
+      }
       case "plan": p.onSetPerm("plan"); if (args) { submitPrompt(args); return; } break;
       case "normal": p.onSetPerm("bypassPermissions"); if (args) { submitPrompt(args); return; } break;
     }
@@ -191,7 +205,7 @@ export function Composer(p: Props) {
   // Pick a command from the palette. Client commands run now; cc skills
   // (/code-review …) fill the composer so the user can add args, then send.
   const pickCommand = (slash: string) => {
-    if (CLIENT_SLASHES.has(slash)) { runClientSlash(slash, ""); focusTa(); return; }
+    if (clientSlashesFor(p.engine).has(slash)) { runClientSlash(slash, ""); focusTa(); return; }
     setInput("/" + slash + " ");
     focusTa(); growTa();
   };
@@ -201,7 +215,18 @@ export function Composer(p: Props) {
     const raw = input.trim();
     if (raw === "/") return;
     const parsed = parseSlash(raw);
-    if (parsed && CLIENT_SLASHES.has(parsed.slash)) { runClientSlash(parsed.slash, parsed.args); return; }
+    if (parsed && clientSlashesFor(p.engine).has(parsed.slash)) { runClientSlash(parsed.slash, parsed.args); return; }
+    // Codex has no TUI slash layer over the app-server, so a codex command
+    // (/review, /init) is sent as the natural-language prompt codex handles.
+    if (p.engine === "codex" && parsed && CODEX_PROMPTS[parsed.slash]) {
+      submitPrompt(CODEX_PROMPTS[parsed.slash] + (parsed.args ? "\n\n" + parsed.args : ""));
+      return;
+    }
+    // Codex has no TUI slash layer, so an unknown "/xxx" is NOT a command — don't
+    // ship it to the model as literal text (it would just improvise a fake reply,
+    // e.g. "/fast" -> "已切到快节奏…"). Hint and keep the input. (cc is different:
+    // it has its own slash/skill layer, so unknown slashes fall through to it.)
+    if (p.engine === "codex" && parsed) { flash(`Codex 无此指令：/${parsed.slash}`); return; }
     // plain text, or a cc skill slash (/code-review …) forwarded verbatim to cc
     submitPrompt(raw);
   };
@@ -212,9 +237,13 @@ export function Composer(p: Props) {
   const disabled = offline || (!busy && !hasText && !hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
-  const model = MODELS.find((m) => m.id === p.model) || { id: p.model, name: p.model || MODELS[0].name, ds: "", ic: "cpu" };
-  const effort = EFFORTS.find((e) => e.id === p.effort) || EFFORTS[4]; // default 最大
-  const perm = PERMS.find((x) => x.id === p.perm) || PERMS[0];
+  const MODELS_E = modelsFor(p.engine), EFFORTS_E = effortsFor(p.engine), PERMS_E = permsFor(p.engine);
+  // Codex: if the session hasn't reported a codex model yet (or it's a stale
+  // claude id), show the codex default instead of a leftover "Mythos 5".
+  const model = MODELS_E.find((m) => m.id === p.model)
+    || (p.engine === "codex" ? MODELS_E[0] : { id: p.model, name: p.model || MODELS_E[0].name, ds: "", ic: "cpu" });
+  const effort = EFFORTS_E.find((e) => e.id === p.effort) || EFFORTS_E[EFFORTS_E.length - 1];
+  const perm = PERMS_E.find((x) => x.id === p.perm) || PERMS_E[0];
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm.id === "plan" ? " plan" : perm.danger ? " danger" : "";
   const hintBusy = p.state !== "idle";
@@ -319,6 +348,13 @@ export function Composer(p: Props) {
           <div className="hint-right" ref={ctxWrapRef}>
             <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型">{model.name}</button>
             <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度">{effort.name}</button>
+            {p.engine === "codex" && (
+              <button
+                className={"hint-ctl fast-chip" + (p.fast ? " on" : "")}
+                onClick={() => p.onSetServiceTier?.("toggle")}
+                title="Fast 服务档位:快 / 标准(下条消息生效)"
+              >{p.fast ? "⚡ 快" : "标准"}</button>
+            )}
             <button
               className="hint-ring"
               aria-label="上下文占用"
@@ -373,6 +409,7 @@ export function Composer(p: Props) {
       <CommandSheet
         open={sheetKind !== null}
         kind={sheetKind ?? "models"}
+        engine={p.engine}
         onClose={() => setSheetKind(null)}
         currentModel={p.model}
         onPickModel={(m) => { p.onSetModel(m); setSheetKind(null); }}
