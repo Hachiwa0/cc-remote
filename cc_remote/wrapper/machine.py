@@ -944,6 +944,10 @@ class WrapperMachine:
             log.info("evicted idle session for btw", key=victim)
         engine = parent.engine
         sdk = CodexHandle(self.cfg, cwd=parent.cwd) if engine == "codex" else SdkHandle(self.cfg)
+        # /btw is a quick side question — run the fork at LOW effort so the first
+        # reply is snappy (the parent's own effort can be high/xhigh, which makes a
+        # context-inheriting fork slow). Applied at connect (cc) / per-turn (codex).
+        sdk.effort = "low"
         ctx = SessionContext(
             session_id=None, sdk=sdk,
             buffer=RingBuffer(self.cfg.ring_max_events, self.cfg.ring_max_bytes),

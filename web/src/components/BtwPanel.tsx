@@ -7,10 +7,11 @@ import type { SessionRuntime } from "../reducer";
 /** /btw side panel: a mini chat over an ephemeral fork of the current session.
  * Reuses ChatView for the transcript; a minimal textarea for input. Closing
  * discards the fork (the main thread never sees any of this). */
-export function BtwPanel({ sid, rt, engine, active, hasDiff, onTab, onSend, onClose }: {
-  sid: string;
+export function BtwPanel({ sid, rt, engine, opening, active, hasDiff, onTab, onSend, onClose }: {
+  sid?: string;
   rt: SessionRuntime | undefined;
   engine?: string;
+  opening?: boolean;   // fork still spawning (no sid yet) — show a spinner
   active: "diff" | "btw";
   hasDiff: boolean;
   onTab: (v: "diff" | "btw") => void;
@@ -20,7 +21,7 @@ export function BtwPanel({ sid, rt, engine, active, hasDiff, onTab, onSend, onCl
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
   const turns = rt?.turns ?? [];
-  const busy = rt?.state === "running";
+  const busy = !!opening || rt?.state === "running";
 
   const send = () => {
     const t = text.trim();
@@ -45,15 +46,17 @@ export function BtwPanel({ sid, rt, engine, active, hasDiff, onTab, onSend, onCl
         </button>
       </div>
       <div className="btw-body">
-        {turns.length === 0
-          ? <div className="btw-empty">问一个基于当前会话的侧边问题 —— 回答不会写进主线,关闭即丢弃。</div>
-          : <ChatView sid={sid} turns={turns} onEdit={() => {}} onGetDiff={() => {}} />}
+        {opening
+          ? <div className="btw-empty"><span className="thinking"><span/><span/><span/></span> 正在打开侧边对话…</div>
+          : turns.length === 0
+            ? <div className="btw-empty">问一个基于当前会话的侧边问题 —— 回答不会写进主线,关闭即丢弃。</div>
+            : <ChatView sid={sid ?? null} turns={turns} onEdit={() => {}} onGetDiff={() => {}} />}
       </div>
       <div className="btw-input">
         <textarea
           ref={taRef}
           value={text}
-          placeholder={busy ? "回答中…" : "问点什么(Enter 发送 · Shift+Enter 换行)"}
+          placeholder={opening ? "正在打开…" : rt?.state === "running" ? "回答中…" : "问点什么(Enter 发送 · Shift+Enter 换行)"}
           rows={1}
           onChange={(e) => { setText(e.target.value); grow(e.target); }}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
