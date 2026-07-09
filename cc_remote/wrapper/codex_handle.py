@@ -63,6 +63,10 @@ class CodexHandle:
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
             env=os.environ.copy(),
+            # a single JSON-RPC line can exceed asyncio's default 64KB StreamReader
+            # cap (e.g. an image echo or a big tool output) and crash readline —
+            # raise it so the reader never dies mid-turn.
+            limit=16 * 1024 * 1024,
         )
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -89,12 +93,12 @@ class CodexHandle:
         log.info("codex connected", thread_id=self.thread_id, cwd=self._cwd,
                  resume=bool(resume_id), fork=fork)
 
-    async def query(self, prompt) -> None:
+    async def query(self, prompt, images=None) -> None:
         assert self.proc is not None and self.thread_id, "connect() first"
         self._turn_q = asyncio.Queue()
         params = {
             "threadId": self.thread_id,
-            "input": _to_input(prompt),
+            "input": _to_input(prompt, images),
             "approvalPolicy": self.approval,
         }
         if self.model:
@@ -280,11 +284,13 @@ class CodexHandle:
             pass
 
 
-def _to_input(prompt) -> list:
-    """cc-remote sends a str prompt; multimodal (images) can extend this later."""
-    if isinstance(prompt, str):
-        return [{"type": "text", "text": prompt}]
-    return [{"type": "text", "text": str(prompt)}]
+def _to_input(prompt, images=None) -> list:
+    """Build codex turn input: a text item + one localImage item per attached
+    image path (verified codex reads localImage). `images` is a list of /tmp paths."""
+    out = [{"type": "text", "text": prompt if isinstance(prompt, str) else str(prompt)}]
+    for path in (images or []):
+        out.append({"type": "localImage", "path": path})
+    return out
 
 
 def _thread_id_of(res) -> Optional[str]:

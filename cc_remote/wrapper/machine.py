@@ -981,9 +981,13 @@ class WrapperMachine:
             return await asyncio.wait_for(queue.get(), timeout=self.cfg.drain_timeout)
         return await queue.get()
 
-    def _stash_files(self, prompt: str, files: list) -> str:
+    def _stash_files(self, prompt: str, files: list, engine: str = "claude") -> str:
+        """Write attached files to /tmp and reference them in the prompt. cc reads
+        the `@path` convention; codex has no `@` layer over the app-server and
+        ignores `mention` items (verified), but reads a plain path via its tools —
+        so codex gets an explicit 'read these files' block with bare paths."""
         import base64, os, re, time
-        refs = []
+        paths = []
         for i, f in enumerate(files):
             fn = f.get("filename") or f"file-{i}"
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", fn) or f"file-{i}"
@@ -992,13 +996,36 @@ class WrapperMachine:
                 data = base64.b64decode(f.get("data", ""))
                 with open(path, "wb") as fp:
                     fp.write(data)
-                refs.append(f"@{path}")
+                paths.append(path)
                 log.info("attachment stashed", path=path, bytes=len(data))
             except Exception as e:
                 log.warning("failed to stash attachment", filename=fn, error=str(e))
-        if refs:
-            return (prompt + "\n\n" if prompt else "") + " ".join(refs)
-        return prompt
+        if not paths:
+            return prompt
+        if engine == "codex":
+            block = "[用户附件,请用工具读取以下文件]:\n" + "\n".join(paths)
+        else:
+            block = " ".join(f"@{p}" for p in paths)
+        return (prompt + "\n\n" if prompt else "") + block
+
+    def _stash_images(self, images: list) -> list:
+        """Write base64 images to /tmp and return their paths — codex reads images
+        via `{type:"localImage", path}` (verified: it saw a blue test image)."""
+        import base64, os, time
+        _ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                "image/webp": ".webp", "image/gif": ".gif"}
+        paths = []
+        for i, img in enumerate(images or []):
+            mt = img.get("media_type", "image/png")
+            path = os.path.join("/tmp", f"cc-remote-{int(time.time())}-img{i}{_ext.get(mt, '.png')}")
+            try:
+                with open(path, "wb") as fp:
+                    fp.write(base64.b64decode(img.get("data", "")))
+                paths.append(path)
+                log.info("image stashed", path=path)
+            except Exception as e:
+                log.warning("failed to stash image", error=str(e))
+        return paths
 
     def _cleanup_tmp(self) -> None:
         import os, time
@@ -1047,8 +1074,13 @@ class WrapperMachine:
                 await ctx.sdk.force_reconnect(resume_id=ctx.session_id, cwd=ctx.cwd, reason="service tier change")
                 ctx.sdk.tier_dirty = False
             if files:
-                prompt = self._stash_files(prompt, files)
-            if images and not is_codex:
+                prompt = self._stash_files(prompt, files, ctx.engine)
+            if is_codex:
+                # codex: images -> /tmp -> localImage input items; files already
+                # referenced by path in the prompt text above.
+                img_paths = self._stash_images(images) if images else []
+                await ctx.sdk.query(prompt, images=img_paths)
+            elif images:
                 content: list = []
                 if prompt:
                     content.append({"type": "text", "text": prompt})
