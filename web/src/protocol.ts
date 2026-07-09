@@ -67,7 +67,7 @@ export interface SessionInfo {
 }
 export interface ListSessions extends Base { type: "list_sessions"; engine?: "claude" | "codex" }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: "claude" | "codex" }
-export interface NewSession extends Base { type: "new_session"; cwd?: string | null; engine?: "claude" | "codex" }
+export interface NewSession extends Base { type: "new_session"; cwd?: string | null; engine?: "claude" | "codex"; model?: string | null; effort?: string | null }
 export interface SessionList extends Base { type: "session_list"; sessions: SessionInfo[] }
 export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null }
 // NON-focusing re-key: a temp-keyed new session captured its real cc id. Rename

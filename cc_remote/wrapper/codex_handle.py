@@ -16,8 +16,10 @@ concern. We never set a model/provider here.
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import os
+import shutil
 from typing import Optional
 
 from cc_remote.log import logger
@@ -25,8 +27,41 @@ from cc_remote.wrapper.codex_sessions import codex_model, codex_effort, codex_co
 
 log = logger("cc_remote.wrapper.codex_handle")
 
-CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 _REQ_TIMEOUT = 60.0
+
+
+def _resolve_codex_bin() -> str:
+    """Locate the codex CLI robustly. Prefer $CODEX_BIN, then PATH, then known
+    npm-global (nvm) / user-local install dirs. The wrapper is often relaunched
+    with a minimal PATH (systemd default / a bare `nohup` relaunch) that omits
+    the nvm node bin where `codex` lives — a bare "codex" then dies with
+    FileNotFoundError. Searching known dirs makes spawning PATH-independent."""
+    override = os.environ.get("CODEX_BIN")
+    if override:
+        return override
+    found = shutil.which("codex")
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    # newest node version first, then common user-local / system locations
+    candidates = sorted(glob.glob(os.path.join(home, ".nvm/versions/node/*/bin/codex")), reverse=True)
+    candidates += [os.path.join(home, ".local/bin/codex"), "/usr/local/bin/codex", "/usr/bin/codex"]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return "codex"  # last resort — errors clearly if truly absent
+
+
+def _codex_env(bin_path: str) -> dict:
+    """Child env for the codex subprocess. codex.js runs via `#!/usr/bin/env
+    node`, so the child needs `node` on PATH. When codex was resolved from a
+    dir that also ships node (nvm / npm-global bin), prepend that dir so the
+    shebang resolves even if the wrapper's own PATH lacks it."""
+    env = os.environ.copy()
+    bindir = os.path.dirname(os.path.abspath(bin_path)) if os.sep in bin_path else ""
+    if bindir and os.path.exists(os.path.join(bindir, "node")):
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    return env
 
 
 class CodexHandle:
@@ -56,13 +91,14 @@ class CodexHandle:
     async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
                       fork: bool = False) -> None:
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
+        codex_bin = _resolve_codex_bin()
         self.proc = await asyncio.create_subprocess_exec(
-            CODEX_BIN, "app-server", "--stdio",
+            codex_bin, "app-server", "--stdio",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
-            env=os.environ.copy(),
+            env=_codex_env(codex_bin),
             # a single JSON-RPC line can exceed asyncio's default 64KB StreamReader
             # cap (e.g. an image echo or a big tool output) and crash readline —
             # raise it so the reader never dies mid-turn.

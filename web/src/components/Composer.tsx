@@ -4,6 +4,7 @@ import type { ConnState } from "../ws";
 import { Icon } from "../icons";
 import { clientSlashesFor, CODEX_PROMPTS, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor } from "../data";
 import { CommandSheet } from "./CommandSheet";
+import { pickFiles } from "../img";
 
 interface Props {
   state: State;
@@ -32,42 +33,6 @@ interface Props {
   onContext: () => void;
   onOpenBtw?: () => void;
   contextReport: ContextReport | null;
-}
-
-// Downscale an uploaded image so its long edge is <= IMG_MAX_EDGE before it's
-// sent — shrinks the upload, the wire frame, the model's vision tokens (large
-// images time out / cost more), AND the base64 that gets replayed in history.
-// PNG (screenshots) stays PNG so text stays crisp; anything else -> JPEG.
-const IMG_MAX_EDGE = 1568;
-function downscaleImage(f: File): Promise<QueryImg> {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result as string;
-      const raw = (): QueryImg => ({ media_type: f.type || "image/png", data: (dataUrl.split(",", 2)[1]) || "" });
-      const img = new Image();
-      img.onload = () => {
-        const long = Math.max(img.width, img.height);
-        if (!long || long <= IMG_MAX_EDGE) { resolve(raw()); return; }
-        const scale = IMG_MAX_EDGE / long;
-        const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
-        const canvas = document.createElement("canvas");
-        canvas.width = w; canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) { resolve(raw()); return; }
-        ctx.drawImage(img, 0, 0, w, h);
-        const mt = f.type === "image/png" ? "image/png" : "image/jpeg";
-        try {
-          const out = canvas.toDataURL(mt, 0.85);
-          resolve({ media_type: mt, data: (out.split(",", 2)[1]) || "" });
-        } catch { resolve(raw()); }
-      };
-      img.onerror = () => resolve(raw());
-      img.src = dataUrl;
-    };
-    reader.onerror = () => resolve({ media_type: f.type || "image/png", data: "" });
-    reader.readAsDataURL(f);
-  });
 }
 
 export function Composer(p: Props) {
@@ -167,22 +132,10 @@ export function Composer(p: Props) {
   const cmdMatches = cmdToken !== null ? matchCommands(cmdToken, p.engine) : [];
   const cmdOpen = cmdMatches.length > 0;
 
-  const onPickFiles = (fl: FileList | File[] | null) => {
-    if (!fl) return;
-    Array.from(fl).forEach((f) => {
-      if (f.type.startsWith("image/")) {
-        // downscale before adding (caps upload/wire/tokens/history size)
-        downscaleImage(f).then((img) => { if (img.data) setImages((prev) => [...prev, img]); });
-        return;
-      }
-      const reader = new FileReader();
-      reader.onload = () => {
-        const base64 = ((reader.result as string).split(",", 2)[1]) || "";
-        setFiles((prev) => [...prev, { filename: f.name, data: base64 }]);
-      };
-      reader.readAsDataURL(f);
-    });
-  };
+  const onPickFiles = (fl: FileList | File[] | null) =>
+    pickFiles(fl,
+      (img) => setImages((prev) => [...prev, img]),   // images downscaled in pickFiles
+      (file) => setFiles((prev) => [...prev, file]));
 
   // paste images/files straight into the textarea (clipboard API)
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {

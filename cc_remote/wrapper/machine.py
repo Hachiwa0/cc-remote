@@ -722,7 +722,9 @@ class WrapperMachine:
 
     async def _handle_new_session(self, cmd) -> None:
         ctx = await self._spawn(resume_id=None, cwd=getattr(cmd, "cwd", None),
-                                engine=getattr(cmd, "engine", "claude"))
+                                engine=getattr(cmd, "engine", "claude"),
+                                model=getattr(cmd, "model", None),
+                                effort=getattr(cmd, "effort", None))
         if ctx is None:
             return  # error already emitted
         self.focused_sid = ctx.key
@@ -802,11 +804,16 @@ class WrapperMachine:
     # ---- spawn (build a ctx: SdkHandle + connect + history) ----
 
     async def _spawn(self, resume_id: Optional[str], cwd: Optional[str] = None,
-                     bootstrap: bool = False, engine: str = "claude") -> Optional[SessionContext]:
+                     bootstrap: bool = False, engine: str = "claude",
+                     model: Optional[str] = None, effort: Optional[str] = None) -> Optional[SessionContext]:
         """Create a SessionContext, connect its SDK subprocess, load history.
         Returns the ctx (added to the pool under its real or temp key) or None
         on failure (an Error has been emitted). `bootstrap` exempts the cap and
-        retries resume→fresh on connect failure."""
+        retries resume→fresh on connect failure. `model`/`effort` (new_session
+        only) pre-select those at spawn: effort BEFORE connect so the first turn
+        runs at that strength with no respawn; cc model via a live set_model
+        after connect; codex model as a per-turn field. Omitted => engine
+        defaults (unchanged behavior)."""
         # Concurrency cap (bootstrap always allowed). When full, evict an idle,
         # non-focused session (tear down its subprocess; the client keeps its
         # runtime and re-spawns on re-focus). Only reject if ALL are running —
@@ -873,6 +880,18 @@ class WrapperMachine:
             target_cwd = self.cfg.cc_cwd
 
         sdk = CodexHandle(self.cfg, cwd=target_cwd) if engine == "codex" else SdkHandle(self.cfg)
+        # Pre-select effort at spawn (before connect): cc reads it via _options at
+        # connect so --effort is baked into the first turn (no respawn); codex uses
+        # it as a per-turn param. codex model is also a per-turn field, so set it
+        # here; cc's model needs a live set_model AFTER connect (below). Set
+        # applied_effort too so _run_turn's "effort != applied" reconnect check
+        # sees the first turn as already-applied (cc's connect re-syncs it anyway;
+        # this is what keeps codex from a spurious first-turn reconnect).
+        if effort:
+            sdk.effort = effort
+            sdk.applied_effort = effort
+        if model and engine == "codex":
+            sdk.model = model
         ctx = SessionContext(
             session_id=resume_id,
             sdk=sdk,
@@ -905,6 +924,19 @@ class WrapperMachine:
                 await self._emit_focused(Error(code=ERR_CC_CRASH, message=f"connect failed: {e}"))
                 return None
 
+        # cc model is a runtime switch on the live subprocess (set_model), so apply
+        # a pre-selected model now that we're connected. codex was set pre-connect.
+        if model and engine != "codex":
+            try:
+                await ctx.sdk.set_model(model)
+            except Exception as e:
+                log.warning("spawn set_model failed", model=model, error=str(e))
+        # Record the pre-selected values so _run_turn doesn't redundantly re-announce
+        # them (the client already reflects its own pick optimistically).
+        if model:
+            ctx.announced_model = model
+        if effort:
+            ctx.announced_effort = effort
         # Pool key: real sid if known, else a temp id until captured in _run_turn.
         key = resume_id or f"tmp-{uuid4().hex}"
         self.sessions[key] = ctx

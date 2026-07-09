@@ -79,9 +79,10 @@ export interface AppState {
   dirPicker: { path: string; parent: string | null; dirs: DirEntry[] } | null;
   currentCwd: string;
   sendMode: "interrupt" | "queue";
-  // new-chat welcome page (global; only one new-chat flow at a time)
-  newChat: { cwd: string } | null;
-  pendingNewQuery: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] } | null;
+  // new-chat welcome page (global; only one new-chat flow at a time). model/effort
+  // are the pre-selected values (null = use the wrapper's engine default).
+  newChat: { cwd: string; model: string | null; effort: string | null } | null;
+  pendingNewQuery: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[]; model?: string | null; effort?: string | null } | null;
   switchTick: number;
   // sessions + multi-session runtimes
   sessions: SessionInfo[];
@@ -125,10 +126,12 @@ export type Action =
   | { type: "set_session_tag"; sid: string; tag: string | null }
   | { type: "hydrate_cache"; sid: string; turns: Turn[] }
   | { type: "answer_question" }
-  | { type: "enter_new_chat"; cwd: string }
+  | { type: "enter_new_chat"; cwd: string; model?: string | null; effort?: string | null }
   | { type: "set_new_chat_cwd"; cwd: string }
+  | { type: "set_new_chat_model"; model: string | null }
+  | { type: "set_new_chat_effort"; effort: string | null }
   | { type: "exit_new_chat" }
-  | { type: "start_new_query"; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] }
+  | { type: "start_new_query"; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[]; model?: string | null; effort?: string | null }
   | { type: "clear_pending_new_query" };
 
 export const initialState: AppState = {
@@ -246,13 +249,17 @@ export function reduce(state: AppState, action: Action): AppState {
     case "answer_question":
       return patch(state, state.focusedSid, (rt) => { rt.pendingQuestion = null; });
     case "enter_new_chat":
-      return { ...state, newChat: { cwd: action.cwd } };
+      return { ...state, newChat: { cwd: action.cwd, model: action.model ?? null, effort: action.effort ?? null } };
     case "set_new_chat_cwd":
-      return state.newChat ? { ...state, newChat: { cwd: action.cwd } } : state;
+      return state.newChat ? { ...state, newChat: { ...state.newChat, cwd: action.cwd } } : state;
+    case "set_new_chat_model":
+      return state.newChat ? { ...state, newChat: { ...state.newChat, model: action.model } } : state;
+    case "set_new_chat_effort":
+      return state.newChat ? { ...state, newChat: { ...state.newChat, effort: action.effort } } : state;
     case "exit_new_chat":
       return { ...state, newChat: null };
     case "start_new_query":
-      return { ...state, newChat: null, pendingNewQuery: { prompt: action.prompt, msg_id: action.msg_id, images: action.images, files: action.files } };
+      return { ...state, newChat: null, pendingNewQuery: { prompt: action.prompt, msg_id: action.msg_id, images: action.images, files: action.files, model: action.model, effort: action.effort } };
     case "clear_pending_new_query":
       return { ...state, pendingNewQuery: null };
     case "event":

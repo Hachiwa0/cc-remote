@@ -306,12 +306,17 @@ class SwitchSession(_Base):
 class NewSession(_Base):
     """client -> wrapper: start a fresh session (no resume). Optional `cwd`
     spawns it in that directory (default = the wrapper's current cc_cwd).
-    `engine` selects the backend — Claude Code (default) or Codex. Optional and
-    backward-compatible (no PROTOCOL_VERSION bump): old clients omit it and get
-    Claude, exactly as before; only codex-session creation carries the new field."""
+    `engine` selects the backend — Claude Code (default) or Codex. Optional
+    `model`/`effort` pre-select the model and reasoning strength AT SPAWN — so
+    the very first turn already uses them (effort especially: applying it at
+    spawn avoids the respawn-with-resume that a post-spawn set_effort forces).
+    All fields optional and backward-compatible (no PROTOCOL_VERSION bump): an
+    old client omits them and gets the wrapper's defaults, exactly as before."""
     type: Literal["new_session"] = "new_session"
     cwd: Optional[str] = None
     engine: Literal["claude", "codex"] = "claude"
+    model: Optional[str] = None    # None -> engine default (settings.json / codex config)
+    effort: Optional[str] = None   # low|medium|high|xhigh|max; None -> engine default
 
 
 class SessionFocus(_Base):

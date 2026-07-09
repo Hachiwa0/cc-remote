@@ -680,6 +680,14 @@ body{
 .newchat-input:focus{ border-color:var(--accent-line); }
 .newchat-foot{ display:flex; align-items:center; justify-content:space-between; gap:12px; }
 .newchat-hint{ font-size:11.5px; color:var(--faint); }
+.newchat-ctls{ display:flex; align-items:center; gap:8px; min-width:0; }
+.newchat-foot-right{ display:flex; align-items:center; gap:12px; flex:none; }
+.newchat-attach{ margin:-2px 0 0; }
+/* model/effort chips read as pickers (bordered pills) on the new-chat page */
+.newchat-ctls .hint-ctl{ padding:6px 12px; border:1px solid var(--border); border-radius:999px;
+  background:var(--raised); color:var(--dim); max-width:38vw; overflow:hidden; text-overflow:ellipsis; }
+.newchat-ctls .hint-ctl:hover{ border-color:var(--border-strong); color:var(--text); background:var(--surface); }
+.newchat-ctls .hint-ctl:disabled{ opacity:.55; cursor:default; }
 .newchat-send{ display:flex; align-items:center; gap:7px; background:var(--accent); color:#fff; font-weight:600; font-size:14px; padding:10px 18px; border-radius:12px; transition:filter .14s, opacity .14s; }
 .newchat-send:hover{ filter:brightness(1.05); }
 .newchat-send:disabled{ opacity:.45; cursor:not-allowed; }

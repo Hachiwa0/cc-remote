@@ -169,13 +169,17 @@ export class RelayWs {
     this.send(obj);
   }
 
-  sendNewSession(cwd?: string | null, engine?: "claude" | "codex"): void {
+  sendNewSession(cwd?: string | null, engine?: "claude" | "codex", model?: string | null, effort?: string | null): void {
     this.awaitingNewFocus = true; // honor the wrapper's focus for the freshly-created session
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "new_session", ts: nowTs() };
     if (cwd) obj.cwd = cwd;
     // only include `engine` for codex, so claude new_session frames stay byte-identical
     // (an old relay that doesn't know the field never sees it on cc traffic).
     if (engine && engine !== "claude") obj.engine = engine;
+    // model/effort only when the user explicitly pre-picked one on the new-chat
+    // page; omitted => the wrapper uses its own defaults (no behavior change).
+    if (model) obj.model = model;
+    if (effort) obj.effort = effort;
     this.send(obj);
   }
 

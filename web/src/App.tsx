@@ -78,7 +78,7 @@ export default function App() {
   // which reads as "nothing happened". Existing sessions stay in the sidebar.
   const toggleEngine = () => {
     setEngine((e) => (e === "codex" ? "claude" : "codex"));
-    dispatch({ type: "enter_new_chat", cwd: state.currentCwd });
+    dispatch({ type: "enter_new_chat", cwd: "~" });  // fresh chat defaults to home
     if (isMobile()) setSidebarOpen(false);
   };
 
@@ -184,6 +184,10 @@ export default function App() {
     const q = state.pendingNewQuery;
     wsRef.current.sendQuery(q.prompt, q.msg_id, q.images, q.files);
     dispatch({ type: "query_sent", prompt: q.prompt, msg_id: q.msg_id, images: q.images, files: q.files, ts: Date.now() });
+    // Reflect the pre-picked model/effort on the freshly-focused runtime's chips
+    // (display only — the wrapper already spawned the session with them).
+    if (q.model) dispatch({ type: "set_model", model: q.model });
+    if (q.effort) dispatch({ type: "set_effort", effort: q.effort });
     dispatch({ type: "clear_pending_new_query" });
   }, [state.switchTick]);
 
@@ -276,14 +280,15 @@ export default function App() {
     wsRef.current.sendQuery(prompt, msg_id, images, files);
     dispatch({ type: "query_sent", prompt, msg_id, images, files, ts: Date.now() });
   };
-  // First message of a new chat: create the session in the chosen cwd; the
-  // switchTick effect fires the actual query once session_focus arrives.
-  const sendFirstMessage = (prompt: string) => {
+  // First message of a new chat: create the session in the chosen cwd with the
+  // pre-selected model/effort; the switchTick effect fires the actual query
+  // (with its attachments) once session_focus arrives.
+  const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[]) => {
     if (!wsRef.current || !state.newChat) return;
-    const cwd = state.newChat.cwd;
+    const { cwd, model, effort } = state.newChat;
     const msg_id = uuid();
-    dispatch({ type: "start_new_query", prompt, msg_id });
-    wsRef.current.sendNewSession(cwd, engine);
+    dispatch({ type: "start_new_query", prompt, msg_id, images, files, model, effort });
+    wsRef.current.sendNewSession(cwd, engine, model, effort);
   };
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
@@ -339,7 +344,7 @@ export default function App() {
         liveStates={Object.fromEntries(Object.entries(state.runtimes).map(([sid, r]) => [sid, r.state]))}
         activeSessionId={focusedSid}
         onSelect={(id) => { dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id); wsRef.current?.sendSwitchSession(id, (state.sessions.find((s) => s.session_id === id)?.engine as "claude" | "codex") || engine); if (isMobile()) setSidebarOpen(false); }}
-        onNew={() => { dispatch({ type: "enter_new_chat", cwd: state.currentCwd }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={() => { dispatch({ type: "enter_new_chat", cwd: "~" }); if (isMobile()) setSidebarOpen(false); }}
         onNewInDir={(cwd) => { dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title)}
@@ -379,7 +384,10 @@ export default function App() {
         {state.newChat ? (
           <NewChatView cwd={state.newChat.cwd} creating={!!state.pendingNewQuery}
             engine={engine}
+            model={state.newChat.model} effort={state.newChat.effort}
             onPickCwd={() => setDirPickerOpen(true)}
+            onPickModel={(m) => dispatch({ type: "set_new_chat_model", model: m })}
+            onPickEffort={(ef) => dispatch({ type: "set_new_chat_effort", effort: ef })}
             onSend={sendFirstMessage} />
         ) : (
           <>
