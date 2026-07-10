@@ -117,6 +117,16 @@ export const modelsFor = (engine?: string, catalog?: Catalog): Model[] => {
   return live?.length ? fromCatalog(live) : CODEX_MODELS;
 };
 
+/** Model a NEW chat starts on: the engine's configured default (codex config.toml's
+ *  `model`), else the first catalog entry. An EXISTING session's model is per-session
+ *  and comes from the wrapper, never from here. */
+export const defaultModelFor = (engine?: string, catalog?: Catalog,
+                                defaults?: Record<string, string>): string => {
+  const list = modelsFor(engine, catalog);
+  const want = engine ? defaults?.[engine] : undefined;
+  return want && list.some((m) => m.id === want) ? want : list[0].id;
+};
+
 /** Effort levels the SELECTED model actually accepts. Unknown/unset model falls back
  *  to the engine's baseline list. */
 export const effortsFor = (engine?: string, model?: string | null, catalog?: Catalog): Effort[] => {

@@ -110,38 +110,17 @@ def codex_fast_enabled() -> bool:
 
 
 def set_codex_config_fast(on: bool) -> bool:
-    """Toggle a top-level `service_tier = "fast"` line in ~/.codex/config.toml —
-    this is what the user validates against and what codex reads at app-server
-    start (so the caller reconnects the app-server to apply it). `on` adds/ensures
-    the line, `off` removes it. Only touches that one line; the rest is preserved.
-    Returns True on success."""
-    try:
-        with open(_CONFIG) as f:
-            lines = f.readlines()
-    except Exception as e:
-        log.warning("read config.toml failed", error=str(e))
-        return False
-    # Top-level keys live before the first [table] header; only edit there so we
-    # never inject service_tier under some [section].
-    first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), len(lines))
-    kept: list[str] = []
-    for i, l in enumerate(lines):
-        if i < first_table and re.match(r"\s*service_tier\s*=", l):
-            continue  # drop any existing top-level service_tier line
-        kept.append(l)
-    if on:
-        entry = 'service_tier = "fast"\n'
-        # place it right after the `model = ...` line if present, else at the top.
-        after = next((i for i, l in enumerate(kept) if re.match(r"\s*model\s*=", l)), None)
-        kept.insert(after + 1 if after is not None else 0, entry)
-    try:
-        with open(_CONFIG, "w") as f:
-            f.writelines(kept)
+    """Toggle a top-level `service_tier = "fast"` line in ~/.codex/config.toml.
+
+    Unlike model/effort — which are per-turn turn/start params, so the live session
+    honors a change immediately — codex reads `service_tier` ONCE at app-server
+    start. A per-turn override can't turn it back OFF while the config still says
+    "fast", so this really must be written, and the caller reconnects to apply it.
+    """
+    ok = set_codex_config_key("service_tier", "fast" if on else None)
+    if ok:
         log.info("codex config service_tier toggled", fast=on)
-        return True
-    except Exception as e:
-        log.warning("write config.toml failed", error=str(e))
-        return False
+    return ok
 
 
 def set_codex_config_key(key: str, value: Optional[str]) -> bool:
@@ -150,11 +129,12 @@ def set_codex_config_key(key: str, value: Optional[str]) -> bool:
     the file's line ORDER — is kept byte-for-byte. Top-level keys live before the
     first [table] header, so we never inject into a [section].
 
-    Used for `model` and `model_reasoning_effort`: codex takes both as per-turn
-    turn/start params (so the live session already honors a change), but config.toml
-    is what the user inspects with `cat` and what NEW sessions — including their
-    terminal codex — inherit. Keeping them in sync avoids "I switched to luna but
-    config still says sol".
+    NOTE we deliberately do NOT write `model`/`model_reasoning_effort` here on a
+    per-session switch. codex keeps those two concerns apart — `thread/settings/update`
+    changes one thread and never touches config.toml (measured), while `config/write`
+    is a separate, explicit "change my default" call. config.toml is the default a
+    NEW session (and the user's terminal codex) inherits; a session's own model/effort
+    live in its rollout. See codex_session_settings().
     """
     try:
         with open(_CONFIG) as f:

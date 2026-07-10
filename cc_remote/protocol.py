@@ -401,10 +401,15 @@ class Models(_Base):
     default_effort, is_default}. `efforts` is authoritative: turn/start does NOT
     validate the level (it accepts `bogus-zzz`), so offering one the model lacks
     only fails later inside the model API. Empty list = we couldn't read it; the
-    client falls back to its static table rather than rendering nothing."""
+    client falls back to its static table rather than rendering nothing.
+
+    `default_model` is what a NEW session starts on — codex's ~/.codex/config.toml
+    `model`, i.e. the same default the user's terminal codex inherits. It is NOT the
+    focused session's model (that's per-session, carried in its own rollout)."""
     type: Literal["models"] = "models"
     engine: str
     models: list[dict[str, Any]] = []
+    default_model: Optional[str] = None
 
 
 class SetPerm(_Base):

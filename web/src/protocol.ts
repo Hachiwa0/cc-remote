@@ -104,7 +104,10 @@ export interface CatalogModel {
   default_effort?: string | null;
   is_default?: boolean;
 }
-export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[] }
+// `default_model` = what a NEW session starts on (codex config.toml's `model`, the
+// same default the terminal codex inherits). NOT the focused session's model — that
+// is per-session and lives in the session's own rollout.
+export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[]; default_model?: string | null }
 export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; question: string; options: AskOption[] }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }

@@ -13,7 +13,7 @@ import { NewChatView } from "./components/NewChatView";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
-import { modelsFor, defaultEffortFor } from "./data";
+import { defaultModelFor, defaultEffortFor } from "./data";
 import type { Snapshot, QueryImg, QueryFile } from "./protocol";
 
 const SESSION_KEY = "cc_remote_session";
@@ -320,7 +320,7 @@ export default function App() {
     // engine's first entry, and an unpicked effort means that model's HIGHEST level
     // (product rule). Send both explicitly so the spawned session matches the UI —
     // effort levels are per-model, so we can only pick the max once the model is known.
-    const model = state.newChat.model ?? modelsFor(engine, state.catalog)[0].id;
+    const model = state.newChat.model ?? defaultModelFor(engine, state.catalog, state.catalogDefault);
     const effort = state.newChat.effort ?? defaultEffortFor(engine, model, state.catalog);
     const msg_id = uuid();
     dispatch({ type: "start_new_query", prompt, msg_id, images, files, model, effort });
@@ -416,6 +416,7 @@ export default function App() {
           <NewChatView cwd={state.newChat.cwd} creating={!!state.pendingNewQuery}
             engine={engine}
             catalog={state.catalog}
+            catalogDefault={state.catalogDefault}
             model={state.newChat.model} effort={state.newChat.effort}
             onPickCwd={() => setDirPickerOpen(true)}
             onPickModel={(m) => {

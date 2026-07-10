@@ -99,6 +99,9 @@ export interface AppState {
   // Model catalogs the ENGINE reported (codex only). Absent until the `models`
   // frame lands; data.ts falls back to its static table until then.
   catalog: Catalog;
+  // engine -> the model a NEW session starts on (codex config.toml's `model`).
+  // Never the focused session's model — that one is per-session.
+  catalogDefault: Record<string, string>;
 }
 
 export function createRuntime(): SessionRuntime {
@@ -157,6 +160,7 @@ export const initialState: AppState = {
   runtimes: {},
   btwSid: null,
   catalog: {},
+  catalogDefault: {},
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
@@ -377,9 +381,14 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
       return { ...state, dirPicker: { path: e.path, parent: e.parent ?? null, dirs: e.dirs } };
     // The engine's real model catalog. Empty => the wrapper couldn't read it; keep
     // what we have (data.ts's static table) rather than blanking the pickers.
-    case "models":
+    case "models": {
       if (!e.models.length) return state;
-      return { ...state, catalog: { ...state.catalog, [e.engine]: e.models } };
+      const catalog = { ...state.catalog, [e.engine]: e.models };
+      const catalogDefault = e.default_model
+        ? { ...state.catalogDefault, [e.engine]: e.default_model }
+        : state.catalogDefault;
+      return { ...state, catalog, catalogDefault };
+    }
     case "wrapper_disconnected":
       return { ...state, wrapperOnline: false, banner: "machine offline — waiting for reconnect" };
     case "wrapper_reconnected":

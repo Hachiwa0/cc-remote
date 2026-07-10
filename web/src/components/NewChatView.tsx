@@ -7,7 +7,7 @@
 import { useRef, useState, type ClipboardEvent } from "react";
 import { Icon } from "../icons";
 import { CommandSheet } from "./CommandSheet";
-import { modelsFor, effortsFor, defaultEffortFor, type Catalog } from "../data";
+import { modelsFor, effortsFor, defaultEffortFor, defaultModelFor, type Catalog } from "../data";
 import { pickFiles } from "../img";
 import type { QueryImg, QueryFile } from "../protocol";
 
@@ -16,6 +16,7 @@ interface Props {
   creating: boolean;  // true while the new session is being created (pendingNewQuery set)
   engine?: "claude" | "codex";  // which backend this new chat will use
   catalog?: Catalog;  // engine-reported models/efforts; falls back to data.ts
+  catalogDefault?: Record<string, string>;  // engine -> model a NEW session starts on
   model: string | null;   // pre-selected model (null = engine default)
   effort: string | null;  // pre-selected reasoning effort (null = engine default)
   onPickCwd: () => void;  // open the directory picker
@@ -24,7 +25,7 @@ interface Props {
   onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => void;
 }
 
-export function NewChatView({ cwd, creating, engine = "claude", catalog, model, effort, onPickCwd, onPickModel, onPickEffort, onSend }: Props) {
+export function NewChatView({ cwd, creating, engine = "claude", catalog, catalogDefault, model, effort, onPickCwd, onPickModel, onPickEffort, onSend }: Props) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
@@ -32,8 +33,9 @@ export function NewChatView({ cwd, creating, engine = "claude", catalog, model, 
   const fileRef = useRef<HTMLInputElement>(null);
 
   const MODELS_E = modelsFor(engine, catalog);
-  // A null model means "the engine's first entry" — that's what the wrapper will use.
-  const selModelId = model ?? MODELS_E[0].id;
+  // A null model means "the engine's configured default" (codex config.toml's `model`)
+  // — the same thing the wrapper will start the session on.
+  const selModelId = model ?? defaultModelFor(engine, catalog, catalogDefault);
   // Effort levels are per-model — read them off the resolved model, not the engine.
   const EFFORTS_E = effortsFor(engine, selModelId, catalog);
   const modelName = MODELS_E.find((m) => m.id === selModelId)?.name ?? MODELS_E[0].name;
