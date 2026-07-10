@@ -70,7 +70,7 @@ from cc_remote.wrapper.codex_stream import (
 )
 from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
-    set_codex_config_fast, codex_fast_enabled, set_codex_config_key,
+    codex_session_settings, set_codex_config_fast, codex_fast_enabled, set_codex_config_key,
 )
 from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
 from cc_remote.wrapper.transport import WrapperTransport
@@ -549,6 +549,11 @@ class WrapperMachine:
             ctx.announced_model = cmd.model
             await self._emit(ctx, Model(model=cmd.model))
             if ctx.engine == "codex":
+                # codex takes the model as a per-turn turn/start param, so the live
+                # session already switched. Persist it like effort: config.toml is what
+                # the user `cat`s to check, and what NEW sessions (incl. their terminal
+                # codex) inherit. Without this, "switch to luna" still read `sol`.
+                await asyncio.to_thread(set_codex_config_key, "model", cmd.model)
                 # The new model may not support the level we're carrying (sol has
                 # `ultra`, luna tops out at `max`). Clamp before the next turn/start
                 # sends it — codex accepts any string here and only fails at the API.
@@ -878,10 +883,18 @@ class WrapperMachine:
                             tail_text=ctx.buffer.latest_tail_text(), cwd=ctx.cwd)
             await self._emit(ctx, snap)
         await self._emit(ctx, SessionFocus(session_id=ctx.session_id or self.focused_sid or sid, cwd=ctx.cwd))
-        # Seed the Fast-mode chip on entering a codex session (state is global,
-        # from config.toml), so it's correct before the first turn/toggle.
+        # Seed the chips on entering a codex session so they're right before the first
+        # turn. Fast is global (config.toml); model/effort are per-session (restored
+        # from the rollout in _spawn). Without the Model frame the composer falls back
+        # to the engine's first model, so a luna session came up labelled "Sol".
         if ctx.engine == "codex":
             await self._emit(ctx, Fast(on=codex_fast_enabled()))
+            if ctx.sdk.model:
+                ctx.announced_model = ctx.sdk.model
+                await self._emit(ctx, Model(model=ctx.sdk.model))
+            if ctx.sdk.effort:
+                ctx.announced_effort = ctx.sdk.effort
+                await self._emit(ctx, Effort(effort=ctx.sdk.effort))
 
     async def _capture_session_id(self, ctx: SessionContext, sid: str) -> None:
         """A brand-new session learned its real cc id (from the first
@@ -1080,12 +1093,22 @@ class WrapperMachine:
         # applied_effort too so _run_turn's "effort != applied" reconnect check
         # sees the first turn as already-applied (cc's connect re-syncs it anyway;
         # this is what keeps codex from a spurious first-turn reconnect).
-        if model and engine == "codex":
-            sdk.model = model
-            # A stale client can ask for a level this model doesn't have (it used to
-            # offer `minimal`, and `ultra` on luna). codex takes any string here and
-            # only fails inside the model API, so clamp against the real catalog.
-            effort = await clamp_effort(model, effort)
+        if engine == "codex":
+            # A resumed codex session's model/effort live in ITS OWN rollout (codex
+            # writes a `turn_context` per turn). CodexHandle seeds them from
+            # config.toml, which is a single GLOBAL default — so resuming used to
+            # silently drag a session the user had switched to luna back to sol, and
+            # in multi-session one session's pick leaked into another.
+            if resume_id and (not model or not effort):
+                prev = await asyncio.to_thread(codex_session_settings, resume_id)
+                model = model or prev.get("model")
+                effort = effort or prev.get("effort")
+            if model:
+                sdk.model = model
+                # A stale client can ask for a level this model doesn't have (it used
+                # to offer `minimal`, and `ultra` on luna). codex takes any string here
+                # and only fails inside the model API, so clamp against the real catalog.
+                effort = await clamp_effort(model, effort)
         if effort:
             sdk.effort = effort
             sdk.applied_effort = effort

@@ -146,14 +146,15 @@ def set_codex_config_fast(on: bool) -> bool:
 
 def set_codex_config_key(key: str, value: Optional[str]) -> bool:
     """Set/replace a TOP-LEVEL `key = "value"` line in ~/.codex/config.toml
-    (value=None removes it). Only that one line is touched; everything else is kept
-    byte-for-byte. Top-level keys live before the first [table] header, so we never
-    inject into a [section].
+    (value=None removes it). Only that one line is touched; every other line — and
+    the file's line ORDER — is kept byte-for-byte. Top-level keys live before the
+    first [table] header, so we never inject into a [section].
 
-    Used for `model_reasoning_effort`: codex takes effort as a per-turn turn/start
-    param (so the live session already honors a change), but config.toml is what the
-    user inspects with `cat` and what NEW sessions — including their terminal codex —
-    inherit. Keeping both in sync avoids "I set ultra but config still says xhigh".
+    Used for `model` and `model_reasoning_effort`: codex takes both as per-turn
+    turn/start params (so the live session already honors a change), but config.toml
+    is what the user inspects with `cat` and what NEW sessions — including their
+    terminal codex — inherit. Keeping them in sync avoids "I switched to luna but
+    config still says sol".
     """
     try:
         with open(_CONFIG) as f:
@@ -165,19 +166,67 @@ def set_codex_config_key(key: str, value: Optional[str]) -> bool:
     # `model\s*=` never matches model_provider / model_reasoning_effort (they have
     # more name chars before the `=`), so anchoring on the key name is exact.
     pat = re.compile(r"\s*" + re.escape(key) + r"\s*=")
-    kept = [l for i, l in enumerate(lines) if not (i < first_table and pat.match(l))]
-    if value is not None:
-        entry = f'{key} = "{value}"\n'
-        after = next((i for i, l in enumerate(kept) if re.match(r"\s*model\s*=", l)), None)
-        kept.insert(after + 1 if after is not None else 0, entry)
+    hits = [i for i, l in enumerate(lines) if i < first_table and pat.match(l)]
+    entry = f'{key} = "{value}"\n'
+    if value is None:
+        for i in reversed(hits):
+            del lines[i]
+    elif hits:
+        lines[hits[0]] = entry              # replace IN PLACE — never reshuffle the file
+        for i in reversed(hits[1:]):
+            del lines[i]                    # drop any duplicate (invalid TOML anyway)
+    else:
+        after = next((i for i, l in enumerate(lines)
+                      if i < first_table and re.match(r"\s*model\s*=", l)), None)
+        lines.insert(after + 1 if after is not None else 0, entry)
     try:
         with open(_CONFIG, "w") as f:
-            f.writelines(kept)
+            f.writelines(lines)
         log.info("codex config key set", key=key, value=value)
         return True
     except Exception as e:
         log.warning("write config.toml failed", error=str(e))
         return False
+
+
+def codex_session_settings(session_id: str) -> dict:
+    """The model/effort THIS session last ran with, read from its own rollout.
+
+    codex appends a `turn_context` record per turn carrying `model` and `effort`.
+    That — not config.toml — is a resumed session's truth. config.toml holds ONE
+    global default, so seeding a resumed session from it silently reverted a session
+    the user had switched to gpt-5.6-luna back to the config's gpt-5.6-sol, and in
+    multi-session it leaked one session's pick into another.
+
+    Returns {} when the rollout is missing/unreadable; the caller falls back to the
+    config defaults (correct for a brand-new session).
+    """
+    path = _rollout_path(session_id)
+    if not path:
+        return {}
+    out: dict = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                # cheap prefilter: most lines are messages, not turn contexts
+                if '"turn_context"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("type") != "turn_context":
+                    continue
+                payload = rec.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                for key in ("model", "effort"):
+                    val = payload.get(key)
+                    if isinstance(val, str) and val:
+                        out[key] = val      # last one wins = the session's current setting
+    except Exception as e:
+        log.warning("read codex session settings failed", session_id=session_id, error=str(e))
+    return out
 
 
 def _config_value(key: str, default: str) -> str:
