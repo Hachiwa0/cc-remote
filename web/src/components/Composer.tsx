@@ -21,6 +21,7 @@ interface Props {
   // its transcript. We mirror it live but must NOT write: a cc session has a single
   // owner, so sending from here would fork the conversation.
   external?: boolean;
+  onTakeover?: () => void;   // drop the read-only lock now (wrapper reloads before our turn)
   engine?: "claude" | "codex";
   editPrompt: string | null;
   onEditConsumed: () => void;
@@ -275,6 +276,8 @@ export function Composer(p: Props) {
           <div className="external-bar" role="status">
             <Icon name="read" size={14} />
             <span><b>终端占用中</b> · 只读镜像 —— 这个会话正由终端里的原生 cc 驱动,新消息会实时同步到这里。</span>
+            <button className="external-take" onClick={() => p.onTakeover?.()}
+              title="立刻接管这个会话(发送前会自动重载终端最新的对话)">接管</button>
           </div>
         )}
         {p.queue.length > 0 && (

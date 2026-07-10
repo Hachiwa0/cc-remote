@@ -144,6 +144,42 @@ def set_codex_config_fast(on: bool) -> bool:
         return False
 
 
+def set_codex_config_key(key: str, value: Optional[str]) -> bool:
+    """Set/replace a TOP-LEVEL `key = "value"` line in ~/.codex/config.toml
+    (value=None removes it). Only that one line is touched; everything else is kept
+    byte-for-byte. Top-level keys live before the first [table] header, so we never
+    inject into a [section].
+
+    Used for `model_reasoning_effort`: codex takes effort as a per-turn turn/start
+    param (so the live session already honors a change), but config.toml is what the
+    user inspects with `cat` and what NEW sessions — including their terminal codex —
+    inherit. Keeping both in sync avoids "I set ultra but config still says xhigh".
+    """
+    try:
+        with open(_CONFIG) as f:
+            lines = f.readlines()
+    except Exception as e:
+        log.warning("read config.toml failed", error=str(e))
+        return False
+    first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), len(lines))
+    # `model\s*=` never matches model_provider / model_reasoning_effort (they have
+    # more name chars before the `=`), so anchoring on the key name is exact.
+    pat = re.compile(r"\s*" + re.escape(key) + r"\s*=")
+    kept = [l for i, l in enumerate(lines) if not (i < first_table and pat.match(l))]
+    if value is not None:
+        entry = f'{key} = "{value}"\n'
+        after = next((i for i, l in enumerate(kept) if re.match(r"\s*model\s*=", l)), None)
+        kept.insert(after + 1 if after is not None else 0, entry)
+    try:
+        with open(_CONFIG, "w") as f:
+            f.writelines(kept)
+        log.info("codex config key set", key=key, value=value)
+        return True
+    except Exception as e:
+        log.warning("write config.toml failed", error=str(e))
+        return False
+
+
 def _config_value(key: str, default: str) -> str:
     try:
         with open(_CONFIG) as f:

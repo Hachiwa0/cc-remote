@@ -124,6 +124,7 @@ export type Action =
   | { type: "set_artifact"; artifact: Artifact }
   | { type: "open_artifact_loading"; file: string }
   | { type: "clear_artifact" }
+  | { type: "clear_external"; sid: string }
   | { type: "clear_btw" }
   | { type: "focus_session"; sid: string }
   | { type: "set_session_tag"; sid: string; tag: string | null }
@@ -220,6 +221,11 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, artifact: { file: action.file, kind: "gitdiff", sections: [], loading: true } };
     case "clear_artifact":
       return { ...state, artifact: null };
+    case "clear_external":
+      // "take over": drop the read-only lock now instead of waiting out the wrapper's
+      // external window. Safe — the wrapper force_reconnects (reloads the transcript)
+      // before running our turn, so we continue from where the terminal left off.
+      return patch(state, action.sid, (rt) => { rt.external = false; });
     case "clear_btw": {
       if (!state.btwSid) return state;
       const runtimes = { ...state.runtimes };

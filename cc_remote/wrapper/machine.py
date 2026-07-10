@@ -70,7 +70,7 @@ from cc_remote.wrapper.codex_stream import (
 )
 from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
-    set_codex_config_fast, codex_fast_enabled,
+    set_codex_config_fast, codex_fast_enabled, set_codex_config_key,
 )
 from cc_remote.wrapper.transport import WrapperTransport
 
@@ -266,7 +266,7 @@ class WrapperMachine:
 
     # ---- history: on-demand transcript read + EXTERNAL-append mirror ----
 
-    EXTERNAL_TTL = 120.0    # a session stays read-only this long after the last external append
+    EXTERNAL_TTL = 60.0     # a session stays read-only this long after the last external append
     OWN_WRITE_GRACE = 10.0  # appends this soon after one of OUR turns are ours, not external
     MIRROR_LIMIT = 60       # turns per mirrored push (matches the client's initial page)
     WATCH_MAX = 32          # cap on simultaneously watched transcripts
@@ -304,12 +304,23 @@ class WrapperMachine:
             pass
 
     def _watch_session(self, sid: str) -> None:
-        """Start mirroring a session's transcript. Called when a client opens it."""
+        """Start mirroring a session's transcript. Called when a client opens it.
+
+        CLAUDE ONLY. Codex is deliberately excluded: its app-server flushes the rollout
+        ASYNCHRONOUSLY, up to ~50s after turn/completed (measured: turn ended 11:19:11,
+        rollout still growing at 11:20:01). Our own-write rule ("growth while no turn is
+        running") therefore misfires on codex and would lock the user out of their OWN
+        codex session for the whole external window. (Resuming a codex thread does NOT
+        write — that part is fine; the post-turn flush is the problem.) The mirror
+        exists for a native `claude` in the terminal, so this costs nothing.
+        """
         if not sid or sid.startswith("tmp-") or sid in self._watch:
             return
         ctx = self._ctx_by_sid(sid)
         engine = ctx.engine if ctx else "claude"
-        path = codex_rollout_path(sid) if engine == "codex" else transcript_path(sid)
+        if engine == "codex":
+            return
+        path = transcript_path(sid)
         if not path:
             return
         try:
@@ -318,7 +329,8 @@ class WrapperMachine:
             return
         if len(self._watch) >= self.WATCH_MAX:
             self._watch.pop(next(iter(self._watch)), None)   # drop the oldest
-        self._watch[sid] = {"path": path, "size": size, "engine": engine, "external_ts": 0.0}
+        self._watch[sid] = {"path": path, "size": size, "engine": engine,
+                            "external_ts": 0.0, "flagged": False}
         log.info("watching transcript", session_id=sid, engine=engine, size=size)
 
     async def _watch_loop(self) -> None:
@@ -347,6 +359,7 @@ class WrapperMachine:
                     if self._own_write(sid):
                         continue                      # our own turn wrote it; live stream covers it
                     w["external_ts"] = time.time()
+                    w["flagged"] = True
                     ctx = self._ctx_by_sid(sid)
                     if ctx is not None:
                         ctx.external_ts = w["external_ts"]
@@ -356,6 +369,22 @@ class WrapperMachine:
                     hist = await self._build_history(sid, limit=self.MIRROR_LIMIT)
                     hist.sid = sid                    # tag with the MIRRORED session, not the focused one
                     await self.transport.send(hist)   # broadcast; clients dedup by msg_id
+
+                # UNLOCK pass: the watcher only pushes on GROWTH, so once the terminal
+                # exits nothing would ever tell clients the session is writable again —
+                # their `external` would stay stuck true forever. When the window
+                # expires, push one History(external=false) to release the read-only UI.
+                for sid, w in list(self._watch.items()):
+                    if not w.get("flagged") or self._is_external(sid):
+                        continue
+                    w["flagged"] = False
+                    ctx = self._ctx_by_sid(sid)
+                    if ctx is not None:
+                        ctx.external_ts = 0.0
+                    log.info("external window expired -> unlocking", session_id=sid)
+                    hist = await self._build_history(sid, limit=self.MIRROR_LIMIT)
+                    hist.sid = sid
+                    await self.transport.send(hist)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -508,17 +537,23 @@ class WrapperMachine:
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_model failed: {e}"))
 
     async def _handle_set_effort(self, cmd) -> None:
-        # effort (--effort) is spawn-time, so unlike set_model we can't flip it on
-        # the live subprocess. Just record the desired level and announce it; the
-        # respawn-with-resume happens lazily at the next turn (see _run_turn), so an
-        # idle effort tweak costs no tokens until the user actually sends.
+        # cc: effort is a spawn-time flag (--effort), so we can't flip it on the live
+        # subprocess — record it and let _run_turn respawn-with-resume lazily at the
+        # next turn (an idle tweak then costs no tokens).
+        # codex: effort is a per-turn turn/start param, so the live session honors it
+        # immediately — no reconnect needed.
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return
         ctx.sdk.effort = cmd.effort
         ctx.announced_effort = cmd.effort
+        if ctx.engine == "codex":
+            # ...but ~/.codex/config.toml is what the user inspects with `cat` and what
+            # NEW sessions (incl. their terminal codex) inherit. Persist it too, else
+            # "I switched to ultra" still reads `model_reasoning_effort = "xhigh"`.
+            await asyncio.to_thread(set_codex_config_key, "model_reasoning_effort", cmd.effort)
         await self._emit(ctx, Effort(effort=cmd.effort))
-        log.info("effort set (applies on next turn via reconnect)", sid=ctx.session_id, effort=cmd.effort)
+        log.info("effort set", sid=ctx.session_id, effort=cmd.effort, engine=ctx.engine)
 
     async def _handle_set_service_tier(self, cmd) -> None:
         # Codex Fast mode. codex reads `service_tier` from ~/.codex/config.toml at

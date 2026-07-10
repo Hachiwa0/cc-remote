@@ -43,13 +43,16 @@ export const MODELS: Model[] = [
 // Reasoning effort (思考强度) — maps to the cc `--effort` flag. Changing it
 // respawns the session with resume (one cold context resend), so it's a
 // deliberate knob, not a per-message toggle.
+// `name` is the RAW level id on purpose: it's what `~/.codex/config.toml`
+// (model_reasoning_effort) and cc's `--effort` take, so what the chip shows is
+// exactly what you can grep for in the config. No translated labels.
 export interface Effort { id: string; name: string; ds: string; ic: string }
 export const EFFORTS: Effort[] = [
-  { id: "low", name: "低", ds: "最省 · 最快响应", ic: "gauge1" },
-  { id: "medium", name: "中", ds: "适度思考", ic: "gauge2" },
-  { id: "high", name: "高", ds: "深度推理 · 默认", ic: "gauge3" },
-  { id: "xhigh", name: "超高", ds: "更深推理 · 部分模型支持", ic: "gauge4" },
-  { id: "max", name: "最大", ds: "最强 · 最慢最贵", ic: "gauge5" },
+  { id: "low", name: "low", ds: "最省 · 最快响应", ic: "gauge1" },
+  { id: "medium", name: "medium", ds: "适度思考", ic: "gauge2" },
+  { id: "high", name: "high", ds: "深度推理 · 默认", ic: "gauge3" },
+  { id: "xhigh", name: "xhigh", ds: "更深推理 · 部分模型支持", ic: "gauge4" },
+  { id: "max", name: "max", ds: "最强 · 最慢最贵", ic: "gauge5" },
 ];
 
 // ---- Codex engine option sets (aligned with the codex app-server) ----
@@ -73,22 +76,22 @@ export const EFFORTS: Effort[] = [
 // fails the whole turn, so never offer one it can't take — see effortsFor().
 // Declared BEFORE CODEX_MODELS: consts aren't hoisted, and CODEX_MODELS references this.
 export const CODEX_EFFORTS: Effort[] = [   // gpt-5.5 and older
-  { id: "low", name: "低", ds: "更快 · 轻推理", ic: "gauge1" },
-  { id: "medium", name: "中", ds: "均衡 · 日常任务", ic: "gauge2" },
-  { id: "high", name: "高", ds: "深度推理 · 复杂问题", ic: "gauge3" },
-  { id: "xhigh", name: "超高", ds: "更深推理 · 更慢", ic: "gauge4" },
+  { id: "low", name: "low", ds: "更快 · 轻推理", ic: "gauge1" },
+  { id: "medium", name: "medium", ds: "均衡 · 日常任务", ic: "gauge2" },
+  { id: "high", name: "high", ds: "深度推理 · 复杂问题", ic: "gauge3" },
+  { id: "xhigh", name: "xhigh", ds: "更深推理 · 更慢", ic: "gauge4" },
 ];
 // GPT-5.6 (sol/terra/luna). `max` uses codex's own wording ("Maximum reasoning depth
 // for the hardest problems"); the `minimal`/`ultra` blurbs are ours — codex ships no
 // description string for those two.
 export const CODEX_EFFORTS_56: Effort[] = [
-  { id: "minimal", name: "最简", ds: "几乎不推理 · 最快最省", ic: "gauge1" },
-  { id: "low", name: "低", ds: "更快 · 轻推理", ic: "gauge2" },
-  { id: "medium", name: "中", ds: "均衡 · 日常任务", ic: "gauge3" },
-  { id: "high", name: "高", ds: "深度推理 · 复杂问题", ic: "gauge4" },
-  { id: "xhigh", name: "超高", ds: "更深推理 · 更慢", ic: "gauge5" },
-  { id: "max", name: "最大", ds: "最深推理 · 最难的问题", ic: "bolt" },
-  { id: "ultra", name: "极限", ds: "极限推理 · 最慢最贵", ic: "crown" },
+  { id: "minimal", name: "minimal", ds: "几乎不推理 · 最快最省", ic: "gauge1" },
+  { id: "low", name: "low", ds: "更快 · 轻推理", ic: "gauge2" },
+  { id: "medium", name: "medium", ds: "均衡 · 日常任务", ic: "gauge3" },
+  { id: "high", name: "high", ds: "深度推理 · 复杂问题", ic: "gauge4" },
+  { id: "xhigh", name: "xhigh", ds: "更深推理 · 更慢", ic: "gauge5" },
+  { id: "max", name: "max", ds: "最深推理 · 最难的问题", ic: "bolt" },
+  { id: "ultra", name: "ultra", ds: "极限推理 · 最慢最贵", ic: "crown" },
 ];
 export const CODEX_MODELS: Model[] = [
   { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", ds: "旗舰 · 最强 agentic 编码", ic: "crown", efforts: CODEX_EFFORTS_56 },

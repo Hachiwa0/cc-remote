@@ -438,6 +438,7 @@ export default function App() {
           perm={rt.perm}
           fast={rt.fast}
           external={rt.external}
+          onTakeover={() => { if (focusedSid) dispatch({ type: "clear_external", sid: focusedSid }); }}
           engine={engine}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
