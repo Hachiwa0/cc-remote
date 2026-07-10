@@ -63,6 +63,9 @@ export interface SessionRuntime {
   // turn id — the cursor the "load more" button pages back from.
   hasMore?: boolean;
   oldestId?: string | null;
+  // true => an external process (native `claude`/`codex` in the terminal) owns this
+  // session and is writing its transcript; we mirror it read-only.
+  external?: boolean;
   ccSessionId?: string;
   pendingQuestion: { ask_id: string; question: string; options: { label: string; ds?: string }[] } | null;
   contextReport: ContextReport | null;
@@ -351,6 +354,10 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
             model: hadModel ? built.model : base.model,
             hasMore: e.has_more,
             oldestId: e.oldest_id ?? base.oldestId,
+            // A native `claude`/`codex` in the terminal owns this session and is
+            // appending to its transcript; the wrapper mirrors those appends here.
+            // Render read-only — a cc session has ONE owner, and typing would fork it.
+            external: !!e.external,
           },
         },
       };

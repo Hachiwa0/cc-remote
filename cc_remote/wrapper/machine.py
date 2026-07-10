@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from uuid import uuid4
 from typing import Optional
 
@@ -61,7 +62,7 @@ from cc_remote.wrapper.session import load_session_id, save_session_id
 from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.wrapper.stream import (
     StreamTranslator, extract_session_id, extract_model,
-    translate_history, last_assistant_model, transcript_timestamps,
+    translate_history, last_assistant_model, transcript_timestamps, transcript_path,
 )
 from cc_remote.wrapper.codex_handle import CodexHandle
 from cc_remote.wrapper.codex_stream import (
@@ -85,6 +86,11 @@ class WrapperMachine:
         self.sessions: dict[str, SessionContext] = {}
         self.focused_sid: Optional[str] = None  # pool key of the viewed session
         self.transport.on_connected = self._on_transport_connected
+        # Transcript mirror: sessions a client has opened (registered on GetHistory),
+        # sid -> {"path", "size", "engine"}. The watcher polls each file's SIZE and,
+        # when it grows without us having written it, mirrors the append to clients.
+        self._watch: dict[str, dict] = {}
+        self._watch_task: Optional[asyncio.Task] = None
 
     # ---- pool helpers ----
 
@@ -122,6 +128,7 @@ class WrapperMachine:
         self.focused_sid = ctx.key
         log.info("wrapper running", session_id=ctx.session_id, key=self.focused_sid)
         await self.transport.start()
+        self._watch_task = asyncio.create_task(self._watch_loop())
         try:
             async for cmd in self.transport.incoming():
                 try:
@@ -129,6 +136,8 @@ class WrapperMachine:
                 except Exception:
                     log.exception("command handling failed", type=cmd.type)
         finally:
+            if self._watch_task:
+                self._watch_task.cancel()
             await self.transport.stop()
             for c in list(self.sessions.values()):
                 try:
@@ -255,20 +264,110 @@ class WrapperMachine:
         log.info("client hello handled", client_id=cmd.client_id,
                  sessions=len(self.sessions))
 
-    async def _handle_get_history(self, cmd) -> None:
-        """Read a session's history ON-DEMAND from its transcript and return it as
-        ONE bulk History frame, routed to the requesting client. No spawn, no ring
-        buffer — like a web chat's GET /conversation. The transcript parse runs in
-        a thread so it never blocks the event loop or other sessions. Events are
-        the SAME classes as the live stream, so the client dedups history vs. the
-        live tail by msg_id/message_id."""
-        sid = cmd.session_id
+    # ---- history: on-demand transcript read + EXTERNAL-append mirror ----
+
+    EXTERNAL_TTL = 120.0    # a session stays read-only this long after the last external append
+    OWN_WRITE_GRACE = 10.0  # appends this soon after one of OUR turns are ours, not external
+    MIRROR_LIMIT = 60       # turns per mirrored push (matches the client's initial page)
+    WATCH_MAX = 32          # cap on simultaneously watched transcripts
+
+    def _ctx_by_sid(self, sid: str) -> Optional[SessionContext]:
+        return self.sessions.get(sid) or next(
+            (c for c in self.sessions.values() if c.session_id == sid), None)
+
+    def _is_external(self, sid: str) -> bool:
+        """This session's transcript was appended to by someone other than us, recently."""
+        w = self._watch.get(sid)
+        return bool(w) and (time.time() - w["external_ts"]) < self.EXTERNAL_TTL
+
+    def _own_write(self, sid: str) -> bool:
+        """True if WE plausibly produced the append: a turn is streaming, or one just
+        finished (cc keeps writing for a moment after the result)."""
+        ctx = self._ctx_by_sid(sid)
+        if ctx is None:
+            return False                       # not resident => we cannot have written it
+        if ctx.state != "idle":
+            return True
+        return (time.time() - ctx.last_turn_end) < self.OWN_WRITE_GRACE
+
+    def _resync_watch(self, sid: str) -> None:
+        """Re-baseline a watched transcript's size after WE appended to it outside of
+        a turn. rename_session/tag_session write an `operation` record straight into
+        the .jsonl; without this the watcher would see that growth, call it external,
+        and wrongly flag the user's own session read-only."""
+        w = self._watch.get(sid)
+        if not w:
+            return
+        try:
+            w["size"] = os.path.getsize(w["path"])
+        except OSError:
+            pass
+
+    def _watch_session(self, sid: str) -> None:
+        """Start mirroring a session's transcript. Called when a client opens it."""
+        if not sid or sid.startswith("tmp-") or sid in self._watch:
+            return
+        ctx = self._ctx_by_sid(sid)
+        engine = ctx.engine if ctx else "claude"
+        path = codex_rollout_path(sid) if engine == "codex" else transcript_path(sid)
+        if not path:
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if len(self._watch) >= self.WATCH_MAX:
+            self._watch.pop(next(iter(self._watch)), None)   # drop the oldest
+        self._watch[sid] = {"path": path, "size": size, "engine": engine, "external_ts": 0.0}
+        log.info("watching transcript", session_id=sid, engine=engine, size=size)
+
+    async def _watch_loop(self) -> None:
+        """Mirror EXTERNAL appends to watched transcripts.
+
+        A native `claude`/`codex` in the user's terminal owns its session and appends
+        to the very .jsonl we read. Poll st_SIZE — NOT st_mtime: `claude --resume`
+        touches mtime without writing a single byte (verified), so mtime would
+        false-positive on every session we merely spawn. Growth we did not cause =>
+        an external writer => rebuild the history, broadcast it, and mark the session
+        read-only + stale (our resumed child's in-memory context has moved on)."""
+        while True:
+            try:
+                await asyncio.sleep(1.5)
+                for sid, w in list(self._watch.items()):
+                    try:
+                        size = await asyncio.to_thread(os.path.getsize, w["path"])
+                    except OSError:
+                        continue
+                    if size < w["size"]:
+                        w["size"] = size   # truncated/rotated: re-baseline, else a stale
+                        continue           # larger baseline would swallow future appends
+                    if size == w["size"]:
+                        continue
+                    grew, w["size"] = size - w["size"], size
+                    if self._own_write(sid):
+                        continue                      # our own turn wrote it; live stream covers it
+                    w["external_ts"] = time.time()
+                    ctx = self._ctx_by_sid(sid)
+                    if ctx is not None:
+                        ctx.external_ts = w["external_ts"]
+                        ctx.needs_reload = True       # resumed child now holds a stale context
+                    log.info("external transcript append -> mirroring", session_id=sid,
+                             bytes=grew, resident=ctx is not None)
+                    hist = await self._build_history(sid, limit=self.MIRROR_LIMIT)
+                    hist.sid = sid                    # tag with the MIRRORED session, not the focused one
+                    await self.transport.send(hist)   # broadcast; clients dedup by msg_id
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("transcript watch loop error")
+
+    async def _build_history(self, sid: str, before=None, limit=None, cwd_hint=None) -> History:
+        """Read a session's transcript and assemble ONE History frame. Shared by
+        GetHistory (routed to the requester) and the watcher (broadcast on external
+        append). No spawn, no ring buffer; the parse runs in a thread."""
         # Reading requires the session's own cwd (transcript lives under it).
         # Prefer a resident ctx's cwd, else the client-provided cwd, else default.
-        ctx = self.sessions.get(sid) or next(
-            (c for c in self.sessions.values() if c.session_id == sid), None)
-        before = getattr(cmd, "before", None)   # page strictly older than this turn id
-        limit = getattr(cmd, "limit", None)     # max turns to return (newest-most)
+        ctx = self._ctx_by_sid(sid)
         events: list = []
         mdl = None
         is_codex_hist = ctx is not None and ctx.engine == "codex"
@@ -283,7 +382,7 @@ class WrapperMachine:
             except Exception as e:
                 log.warning("codex get_history failed", session_id=sid, error=str(e))
         else:
-            directory = (ctx.cwd if ctx else None) or getattr(cmd, "cwd", None) or self.cfg.cc_cwd
+            directory = (ctx.cwd if ctx else None) or cwd_hint or self.cfg.cc_cwd
             try:
                 def _read():
                     return (get_session_messages(sid, directory=directory),
@@ -329,19 +428,31 @@ class WrapperMachine:
         for grp in page:
             for ev in grp:
                 payload.append(ev.model_dump(mode="json"))
-        hist = History(
+        return History(
             session_id=sid, events=payload, has_more=has_more, before=before,
             oldest_id=(_tid(page[0]) if page else None),
             newest_id=(_tid(page[-1]) if page else None),
+            external=self._is_external(sid),
         )
+
+    async def _handle_get_history(self, cmd) -> None:
+        """Client opened a session: return its history as ONE bulk frame, routed to
+        the requester — like a web chat's GET /conversation. Opening it also starts
+        MIRRORING its transcript, so appends made by a native `claude` in the user's
+        terminal stream through to every client (read-only)."""
+        sid = cmd.session_id
+        self._watch_session(sid)   # snapshot size before we read, so no append is missed
+        hist = await self._build_history(
+            sid, before=getattr(cmd, "before", None), limit=getattr(cmd, "limit", None),
+            cwd_hint=getattr(cmd, "cwd", None))
         client_id = getattr(cmd, "client_id", None)
         if client_id:
-            hist.to = client_id
-            await self.transport.send(hist)
-        else:
-            await self._emit_focused(hist)  # fallback: broadcast (like other one-shots)
-        log.info("history sent", session_id=sid, turns=len(page), events=len(payload),
-                 has_more=has_more, before=bool(before), client_id=client_id)
+            hist.to = client_id            # relay routes it to just this client
+        hist.sid = sid                     # tag with THIS session (never the focused one)
+        await self.transport.send(hist)
+        log.info("history sent", session_id=sid, events=len(hist.events),
+                 has_more=hist.has_more, before=bool(hist.before),
+                 external=hist.external, client_id=client_id)
 
     async def _handle_query(self, cmd) -> None:
         sid = getattr(cmd, "sid", None)
@@ -735,6 +846,8 @@ class WrapperMachine:
     async def _handle_rename_session(self, cmd) -> None:
         try:
             await asyncio.to_thread(rename_session, cmd.session_id, cmd.title)
+            # our own append -> re-baseline, else the watcher calls it an external write
+            self._resync_watch(cmd.session_id)
             log.info("session renamed", session_id=cmd.session_id, title=cmd.title)
             await self._handle_list_sessions(cmd)
         except Exception as e:
@@ -745,6 +858,8 @@ class WrapperMachine:
         try:
             tag = "archived" if cmd.archived else None
             await asyncio.to_thread(tag_session, cmd.session_id, tag)
+            # our own append -> re-baseline (see _resync_watch)
+            self._resync_watch(cmd.session_id)
             log.info("session archive toggled", session_id=cmd.session_id, archived=cmd.archived)
             await self._handle_list_sessions(cmd)
         except Exception as e:
@@ -1118,6 +1233,16 @@ class WrapperMachine:
                 await queue.put(None)
 
         try:
+            # An EXTERNAL process (a native `claude`/`codex` in the user's terminal)
+            # appended to this session's transcript since we resumed it, so our child's
+            # in-memory context is STALE — continuing from it would fork the
+            # conversation. Reload by resuming afresh before issuing the turn.
+            if ctx.needs_reload and ctx.session_id:
+                log.info("reloading session after external transcript change",
+                         sid=ctx.session_id)
+                await ctx.sdk.force_reconnect(resume_id=ctx.session_id, cwd=ctx.cwd,
+                                              reason="external transcript change")
+                ctx.needs_reload = False
             # apply a pending effort change: --effort is spawn-time, so respawn the
             # cc subprocess (resume preserves context) before issuing this turn. Only
             # fires when the level actually changed since the live client was spawned;
@@ -1225,6 +1350,10 @@ class WrapperMachine:
         finally:
             ctx.translator = None
             ctx.turn_task = None
+            # cc keeps flushing this turn's lines to the transcript for a moment after
+            # the result; the watcher uses this stamp to attribute those bytes to US
+            # instead of mistaking them for an external writer.
+            ctx.last_turn_end = time.time()
             if reader_task is not None and not reader_task.done():
                 reader_task.cancel()
                 try:

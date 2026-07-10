@@ -446,7 +446,8 @@ class History(_Base):
     ContextReport/SessionList — NOT seq'd/buffered). `events` are already-
     serialized narrative event dicts (same shape as the live stream) that the
     client applies in a single reducer pass into runtimes[session_id], deduped
-    by msg_id/message_id against any live tail. Routed to=<client_id>."""
+    by msg_id/message_id against any live tail. Routed to=<client_id>, EXCEPT the
+    mirror push below, which is broadcast."""
     type: Literal["history"] = "history"
     session_id: str
     events: list[dict[str, Any]] = []
@@ -454,6 +455,12 @@ class History(_Base):
     oldest_id: Optional[str] = None   # first returned turn's msg_id — cursor for load-more
     newest_id: Optional[str] = None   # last returned turn's msg_id
     before: Optional[str] = None      # echoes the request's `before`: set => this is an OLDER page (client prepends)
+    # True => this session's transcript is being appended to by an EXTERNAL process
+    # (a native `claude`/`codex` in the user's terminal), not by us. The wrapper
+    # mirrors those appends by broadcasting a fresh History; the client renders the
+    # session READ-ONLY, since a cc session has a single owner and typing here would
+    # fork the conversation. Additive + defaulted, so no PROTOCOL_VERSION bump.
+    external: bool = False
 
 
 class AskUser(_Base):

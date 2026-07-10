@@ -17,6 +17,10 @@ interface Props {
   effort: string;
   perm: string;
   fast?: boolean;   // codex Fast-mode state (from wrapper)
+  // A native `claude`/`codex` in the terminal owns this session and is appending to
+  // its transcript. We mirror it live but must NOT write: a cc session has a single
+  // owner, so sending from here would fork the conversation.
+  external?: boolean;
   engine?: "claude" | "codex";
   editPrompt: string | null;
   onEditConsumed: () => void;
@@ -89,6 +93,9 @@ export function Composer(p: Props) {
 
   const busy = p.state === "running" || p.state === "interrupting";
   const offline = !p.wrapperOnline;
+  // `locked` = we must not write to this session: the machine is offline, OR a native
+  // `claude` in the terminal owns it (we mirror it read-only).
+  const locked = offline || !!p.external;
   const hasText = input.trim().length > 0;
   const hasAttachments = images.length > 0 || files.length > 0;
 
@@ -206,7 +213,7 @@ export function Composer(p: Props) {
   };
 
   const send = () => {
-    if (offline) return;
+    if (locked) return;
     const raw = input.trim();
     if (raw === "/") return;
     const parsed = parseSlash(raw);
@@ -229,7 +236,7 @@ export function Composer(p: Props) {
   const stopping = busy && !hasText && !hasAttachments;
   const sendIcon = !busy ? "send" : stopping ? "stop" : p.sendMode === "interrupt" ? "bolt" : "queue";
   const sendClass = "sendbtn" + ((stopping || (busy && p.sendMode === "interrupt" && (hasText || hasAttachments))) ? " interrupt" : "");
-  const disabled = offline || (!busy && !hasText && !hasAttachments);
+  const disabled = locked || (!busy && !hasText && !hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
   const MODELS_E = modelsFor(p.engine), PERMS_E = permsFor(p.engine);
@@ -264,6 +271,12 @@ export function Composer(p: Props) {
           </div>
         )}
         {notice && <div className="composer-notice">{notice}</div>}
+        {p.external && (
+          <div className="external-bar" role="status">
+            <Icon name="read" size={14} />
+            <span><b>终端占用中</b> · 只读镜像 —— 这个会话正由终端里的原生 cc 驱动,新消息会实时同步到这里。</span>
+          </div>
+        )}
         {p.queue.length > 0 && (
           <div className="queued show">
             {p.queue.map((m, i) => (
@@ -308,14 +321,16 @@ export function Composer(p: Props) {
         )}
 
         <div className="inrow">
-          <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="附件" disabled={offline}><Icon name="plus" size={19} /></button>
+          <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="附件" disabled={locked}><Icon name="plus" size={19} /></button>
           <input ref={fileRef} type="file" multiple hidden onChange={(e) => { onPickFiles(e.target.files); e.target.value = ""; }} />
           <textarea
             ref={taRef}
             rows={1}
             value={input}
-            placeholder={offline ? "机器离线 — 等待重连…" : "发消息…  输入 / 唤起命令"}
-            disabled={offline}
+            placeholder={offline ? "机器离线 — 等待重连…"
+              : p.external ? "终端占用中 — 只读镜像,无法在此发送"
+              : "发消息…  输入 / 唤起命令"}
+            disabled={locked}
             onChange={(e) => onInput(e.target.value)}
             onPaste={onPaste}
             onKeyDown={(e) => {

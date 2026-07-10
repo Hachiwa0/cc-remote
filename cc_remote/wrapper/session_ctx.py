@@ -52,6 +52,18 @@ class SessionContext:
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
     announced_perm: Optional[str] = None
+    # ---- external-write mirroring (a native `claude`/`codex` in the user's
+    # terminal owns this session and is appending to its transcript) ----
+    # epoch of the last append this wrapper did NOT make. Recent => the session is
+    # externally owned: clients show it read-only and get mirrored History frames.
+    external_ts: float = 0.0
+    # an external append happened, so our resumed subprocess now holds a STALE
+    # context. Reload (force_reconnect with resume) before running another turn,
+    # else we'd continue from a conversation that has since moved on.
+    needs_reload: bool = False
+    # epoch the last turn we ran finished — writes within a short grace window
+    # after it are OURS, not external.
+    last_turn_end: float = 0.0
     pending_asks: dict = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

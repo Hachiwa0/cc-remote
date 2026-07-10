@@ -131,6 +131,21 @@ def extract_model(msg) -> str | None:
 
 # ---- on-disk history -> wire events (for session switch) ----
 
+def transcript_path(session_id: str) -> str | None:
+    """Absolute path of a cc session's transcript .jsonl, or None. session_id is
+    globally unique, so a glob across all project dirs finds it regardless of cwd.
+
+    Used by the transcript watcher to spot writes made by an EXTERNAL process (a
+    native `claude` in the user's terminal). Watch st_size, NOT st_mtime: merely
+    spawning `claude --resume <id>` touches mtime without changing a byte, so mtime
+    would false-positive on every session the wrapper opens."""
+    try:
+        matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
+        return matches[0] if matches else None
+    except Exception:
+        return None
+
+
 def transcript_timestamps(session_id: str) -> dict[str, float]:
     """Map each transcript entry's uuid -> epoch seconds, read straight from the
     .jsonl. The SDK's SessionMessage drops the per-message timestamp, so without

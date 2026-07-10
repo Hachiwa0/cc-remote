@@ -437,6 +437,7 @@ export default function App() {
           effort={rt.effort}
           perm={rt.perm}
           fast={rt.fast}
+          external={rt.external}
           engine={engine}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
