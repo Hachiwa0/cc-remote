@@ -51,10 +51,23 @@ export const EFFORTS: Effort[] = [
 ];
 
 // ---- Codex engine option sets (aligned with the codex app-server) ----
-// model/list => gpt-5.5; supportedReasoningEfforts => low/medium/high/xhigh;
-// "mode" maps to codex approval policy (untrusted/on-request/never).
+// Model ids + display names verified against the codex binary's embedded catalog
+// (openai.gpt-5.6-sol -> "Sol", -terra -> "Terra", -luna -> "Luna"). Note codex's
+// `model/list` RPC only advertises its built-in OpenAI catalog (5.5/5.4); a custom
+// provider (config.toml `model_provider`) passes any model id straight through —
+// and ~/.codex/config.toml already defaults to gpt-5.6-sol.
+// 5.5/5.4 stay listed so OLDER sessions render their real model instead of falling
+// back to the first entry (Composer falls back to MODELS_E[0] on an unknown id).
+// The `ds` blurbs are our own labels — codex exposes no per-model description for
+// a custom provider.
+// supportedReasoningEfforts => low/medium/high/xhigh; "mode" maps to codex approval
+// policy (untrusted/on-request/never).
 export const CODEX_MODELS: Model[] = [
-  { id: "gpt-5.5", name: "GPT-5.5", ds: "最强 agentic 编码", ic: "cpu" },
+  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", ds: "旗舰 · 最强 agentic 编码", ic: "crown" },
+  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", ds: "均衡 · 日常编码", ic: "balance" },
+  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", ds: "轻量 · 更快", ic: "bolt" },
+  { id: "gpt-5.5", name: "GPT-5.5", ds: "上一代 · 旧会话兼容", ic: "cpu" },
+  { id: "gpt-5.4", name: "GPT-5.4", ds: "更早 · 旧会话兼容", ic: "cpu" },
 ];
 export const CODEX_EFFORTS: Effort[] = [
   { id: "low", name: "低", ds: "更快 · 轻推理", ic: "gauge1" },
