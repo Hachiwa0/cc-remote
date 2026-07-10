@@ -270,6 +270,29 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [authed, focusedSid, rt.perm]);
 
+  // ---- /btw effects ----
+  // These MUST stay ABOVE the `!authed` early return below. Hooks have to run
+  // unconditionally and in the same order on every render; putting them after the
+  // return meant logging out (authed -> false) rendered fewer hooks than the
+  // previous render, and React blew up with #300 ("rendered fewer hooks than
+  // expected"). Logging back in tripped the mirror image. Refreshing "fixed" it
+  // only because a fresh mount has no previous render to disagree with.
+  //
+  // the fork is ready once btw_opened lands its sid -> drop the opening spinner.
+  useEffect(() => { if (state.btwSid) setBtwOpening(false); }, [state.btwSid]);
+  // A /btw fork belongs to the session it was forked from. When you switch session
+  // or toggle engine, discard it — else a codex btw would linger while you view a
+  // cc session ("cc shows codex btw"). Read via ref so opening btw (no focus
+  // change) doesn't trip this, and it only fires on actual navigation.
+  const btwSidRef = useRef<string | null>(null);
+  btwSidRef.current = state.btwSid;
+  useEffect(() => {
+    setBtwOpening(false);
+    const s = btwSidRef.current;
+    if (s) { wsRef.current?.sendCloseBtw(s); dispatch({ type: "clear_btw" }); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedSid, engine]);
+
   if (!authed) {
     return <LoginForm onLogin={(t) => { localStorage.setItem(SESSION_KEY, t); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
   }
@@ -314,20 +337,6 @@ export default function App() {
   const openBtw = () => { setRightView("btw"); setBtwOpening(true); if (focusedSid && !state.btwSid) wsRef.current?.sendOpenBtw(focusedSid); };
   const sendBtw = (prompt: string) => { if (state.btwSid) wsRef.current?.sendQueryTo(state.btwSid, prompt, uuid()); };
   const closeBtw = () => { setBtwOpening(false); if (state.btwSid) { wsRef.current?.sendCloseBtw(state.btwSid); dispatch({ type: "clear_btw" }); } };
-  // the fork is ready once btw_opened lands its sid -> drop the opening spinner.
-  useEffect(() => { if (state.btwSid) setBtwOpening(false); }, [state.btwSid]);
-  // A /btw fork belongs to the session it was forked from. When you switch session
-  // or toggle engine, discard it — else a codex btw would linger while you view a
-  // cc session ("cc shows codex btw"). Read via ref so opening btw (no focus
-  // change) doesn't trip this, and it only fires on actual navigation.
-  const btwSidRef = useRef<string | null>(null);
-  btwSidRef.current = state.btwSid;
-  useEffect(() => {
-    setBtwOpening(false);
-    const s = btwSidRef.current;
-    if (s) { wsRef.current?.sendCloseBtw(s); dispatch({ type: "clear_btw" }); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusedSid, engine]);
   // Header tab switch between the two right-slot views (opening the target lazily).
   const switchRight = (v: "diff" | "btw") => { if (v === "diff") getDiff(""); else openBtw(); };
   const logout = () => {
