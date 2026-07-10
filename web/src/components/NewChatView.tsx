@@ -7,7 +7,7 @@
 import { useRef, useState, type ClipboardEvent } from "react";
 import { Icon } from "../icons";
 import { CommandSheet } from "./CommandSheet";
-import { modelsFor, effortsFor } from "../data";
+import { modelsFor, effortsFor, defaultEffortFor } from "../data";
 import { pickFiles } from "../img";
 import type { QueryImg, QueryFile } from "../protocol";
 
@@ -30,12 +30,15 @@ export function NewChatView({ cwd, creating, engine = "claude", model, effort, o
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const MODELS_E = modelsFor(engine), EFFORTS_E = effortsFor(engine);
-  const modelName = MODELS_E.find((m) => m.id === model)?.name ?? MODELS_E[0].name;
-  // null effort => show the engine's nominal default (cc's real default is "max";
-  // codex's comes from its config, so just say "默认"). The chip corrects itself
-  // once the spawned session reports its actual effort.
-  const effortName = EFFORTS_E.find((e) => e.id === effort)?.name ?? (engine === "codex" ? "默认" : "最大");
+  const MODELS_E = modelsFor(engine);
+  // A null model means "the engine's first entry" — that's what the wrapper will use.
+  const selModelId = model ?? MODELS_E[0].id;
+  // Effort levels are per-model (GPT-5.6 => 7, gpt-5.5 => 4, cc => 5).
+  const EFFORTS_E = effortsFor(engine, selModelId);
+  const modelName = MODELS_E.find((m) => m.id === selModelId)?.name ?? MODELS_E[0].name;
+  // A null effort means "the model's highest level" (product rule: default to max
+  // thinking, whatever the model supports).
+  const effortName = (EFFORTS_E.find((e) => e.id === effort) ?? EFFORTS_E[EFFORTS_E.length - 1]).name;
 
   const hasAttachments = images.length > 0 || files.length > 0;
   const canSend = (text.trim().length > 0 || hasAttachments) && !creating;
@@ -118,9 +121,9 @@ export function NewChatView({ cwd, creating, engine = "claude", model, effort, o
         kind={sheetKind ?? "models"}
         engine={engine}
         onClose={() => setSheetKind(null)}
-        currentModel={model ?? MODELS_E[0]?.id}
+        currentModel={selModelId}
         onPickModel={(m) => { onPickModel(m); setSheetKind(null); }}
-        currentEffort={effort ?? (engine === "codex" ? undefined : "max")}
+        currentEffort={effort ?? defaultEffortFor(engine, selModelId)}
         onPickEffort={(ef) => { onPickEffort(ef); setSheetKind(null); }}
       />
     </div>

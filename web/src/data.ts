@@ -29,7 +29,9 @@ export const COMMANDS: Command[] = [
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
 ];
 
-export interface Model { id: string; name: string; ds: string; ic: string }
+// `efforts` overrides the engine's baseline effort list for THIS model (reasoning
+// levels are per-model: the GPT-5.6 family has 7, gpt-5.5 and older have 4).
+export interface Model { id: string; name: string; ds: string; ic: string; efforts?: Effort[] }
 export const MODELS: Model[] = [
   { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "crown" },
   { id: "claude-opus-4-8", name: "Opus 4.8", ds: "最强推理", ic: "gem" },
@@ -52,28 +54,48 @@ export const EFFORTS: Effort[] = [
 
 // ---- Codex engine option sets (aligned with the codex app-server) ----
 // Model ids + display names verified against the codex binary's embedded catalog
-// (openai.gpt-5.6-sol -> "Sol", -terra -> "Terra", -luna -> "Luna"). Note codex's
-// `model/list` RPC only advertises its built-in OpenAI catalog (5.5/5.4); a custom
-// provider (config.toml `model_provider`) passes any model id straight through —
-// and ~/.codex/config.toml already defaults to gpt-5.6-sol.
+// (openai.gpt-5.6-sol -> "Sol", -terra -> "Terra", -luna -> "Luna"). codex's
+// `model/list` RPC only advertises its built-in OpenAI catalog (5.5/5.4/5.4-mini/
+// 5.3-codex/5.2); a custom provider (config.toml `model_provider`) passes any model
+// id straight through and codex uses `used_fallback_model_metadata` for it — which
+// is why ~/.codex/config.toml can already run gpt-5.6-sol before the CLI ships a
+// catalog entry for it.
 // 5.5/5.4 stay listed so OLDER sessions render their real model instead of falling
 // back to the first entry (Composer falls back to MODELS_E[0] on an unknown id).
 // The `ds` blurbs are our own labels — codex exposes no per-model description for
 // a custom provider.
-// supportedReasoningEfforts => low/medium/high/xhigh; "mode" maps to codex approval
-// policy (untrusted/on-request/never).
+
+// Reasoning effort is PER MODEL, not per engine. `model/list` reports
+// [low, medium, high, xhigh] for gpt-5.5 and older; the GPT-5.6 family (sol/terra/
+// luna) adds `minimal` below and `max` + `ultra` on top => 7 levels. The codex
+// binary's ReasoningEffort enum is Minimal·Low·Medium·High·XHigh·Max·Ultra ("High"
+// is tail-merged into "XHigh" in .rodata). Sending a level the model doesn't support
+// fails the whole turn, so never offer one it can't take — see effortsFor().
+// Declared BEFORE CODEX_MODELS: consts aren't hoisted, and CODEX_MODELS references this.
+export const CODEX_EFFORTS: Effort[] = [   // gpt-5.5 and older
+  { id: "low", name: "低", ds: "更快 · 轻推理", ic: "gauge1" },
+  { id: "medium", name: "中", ds: "均衡 · 日常任务", ic: "gauge2" },
+  { id: "high", name: "高", ds: "深度推理 · 复杂问题", ic: "gauge3" },
+  { id: "xhigh", name: "超高", ds: "更深推理 · 更慢", ic: "gauge4" },
+];
+// GPT-5.6 (sol/terra/luna). `max` uses codex's own wording ("Maximum reasoning depth
+// for the hardest problems"); the `minimal`/`ultra` blurbs are ours — codex ships no
+// description string for those two.
+export const CODEX_EFFORTS_56: Effort[] = [
+  { id: "minimal", name: "最简", ds: "几乎不推理 · 最快最省", ic: "gauge1" },
+  { id: "low", name: "低", ds: "更快 · 轻推理", ic: "gauge2" },
+  { id: "medium", name: "中", ds: "均衡 · 日常任务", ic: "gauge3" },
+  { id: "high", name: "高", ds: "深度推理 · 复杂问题", ic: "gauge4" },
+  { id: "xhigh", name: "超高", ds: "更深推理 · 更慢", ic: "gauge5" },
+  { id: "max", name: "最大", ds: "最深推理 · 最难的问题", ic: "bolt" },
+  { id: "ultra", name: "极限", ds: "极限推理 · 最慢最贵", ic: "crown" },
+];
 export const CODEX_MODELS: Model[] = [
-  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", ds: "旗舰 · 最强 agentic 编码", ic: "crown" },
-  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", ds: "均衡 · 日常编码", ic: "balance" },
-  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", ds: "轻量 · 更快", ic: "bolt" },
+  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", ds: "旗舰 · 最强 agentic 编码", ic: "crown", efforts: CODEX_EFFORTS_56 },
+  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", ds: "均衡 · 日常编码", ic: "balance", efforts: CODEX_EFFORTS_56 },
+  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", ds: "轻量 · 更快", ic: "bolt", efforts: CODEX_EFFORTS_56 },
   { id: "gpt-5.5", name: "GPT-5.5", ds: "上一代 · 旧会话兼容", ic: "cpu" },
   { id: "gpt-5.4", name: "GPT-5.4", ds: "更早 · 旧会话兼容", ic: "cpu" },
-];
-export const CODEX_EFFORTS: Effort[] = [
-  { id: "low", name: "低", ds: "更快 · 轻推理", ic: "gauge1" },
-  { id: "medium", name: "中", ds: "均衡", ic: "gauge2" },
-  { id: "high", name: "高", ds: "深度推理", ic: "gauge3" },
-  { id: "xhigh", name: "超高", ds: "最深推理 · 最慢", ic: "gauge5" },
 ];
 export const CODEX_PERMS: Perm[] = [
   { id: "never", name: "自动", short: "自动", ds: "不询问 · 直接执行", ic: "run" },
@@ -81,7 +103,20 @@ export const CODEX_PERMS: Perm[] = [
   { id: "untrusted", name: "严格", short: "严格", ds: "每步都先询问", ic: "shield" },
 ];
 export const modelsFor = (engine?: string): Model[] => (engine === "codex" ? CODEX_MODELS : MODELS);
-export const effortsFor = (engine?: string): Effort[] => (engine === "codex" ? CODEX_EFFORTS : EFFORTS);
+/** Effort levels for the SELECTED model (5.6 => 7 levels, 5.5 => 4, cc => 5).
+ *  Unknown/unset model falls back to the engine's baseline list. */
+export const effortsFor = (engine?: string, model?: string | null): Effort[] => {
+  const m = model ? modelsFor(engine).find((x) => x.id === model) : undefined;
+  if (m?.efforts) return m.efforts;
+  return engine === "codex" ? CODEX_EFFORTS : EFFORTS;
+};
+/** Default effort = the HIGHEST level the selected model supports (product decision:
+ *  always think as hard as the model allows). Also the value we clamp to when the
+ *  user switches to a model that doesn't support the current level. */
+export const defaultEffortFor = (engine?: string, model?: string | null): string => {
+  const list = effortsFor(engine, model);
+  return list[list.length - 1].id;
+};
 export const permsFor = (engine?: string): Perm[] => (engine === "codex" ? CODEX_PERMS : PERMS);
 
 // Map a cc-reported model id (e.g. "claude-mythos-5[1m]") to a MODELS entry id.

@@ -24,7 +24,9 @@ export function CommandSheet({ open, kind, engine, filter = "", onClose, onPickC
   const isPermMode = kind === "perms";
   const isEffortMode = kind === "efforts";
   const f = filter.toLowerCase();
-  const MODELS = modelsFor(engine), EFFORTS = effortsFor(engine), PERMS = permsFor(engine);
+  // Effort levels are per-model (GPT-5.6 => 7, gpt-5.5 => 4), so the effort sheet
+  // must be built from the model currently selected, not just the engine.
+  const MODELS = modelsFor(engine), EFFORTS = effortsFor(engine, currentModel), PERMS = permsFor(engine);
 
   // Prefix-match on the slash (same rule the composer uses to decide visibility),
   // preserving group headers that still have matches.

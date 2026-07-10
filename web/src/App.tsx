@@ -13,6 +13,7 @@ import { NewChatView } from "./components/NewChatView";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
+import { modelsFor, defaultEffortFor } from "./data";
 import type { Snapshot, QueryImg, QueryFile } from "./protocol";
 
 const SESSION_KEY = "cc_remote_session";
@@ -308,7 +309,13 @@ export default function App() {
   // (with its attachments) once session_focus arrives.
   const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[]) => {
     if (!wsRef.current || !state.newChat) return;
-    const { cwd, model, effort } = state.newChat;
+    const { cwd } = state.newChat;
+    // Resolve what the new-chat page is actually showing: an unpicked model means the
+    // engine's first entry, and an unpicked effort means that model's HIGHEST level
+    // (product rule). Send both explicitly so the spawned session matches the UI —
+    // effort levels are per-model, so we can only pick the max once the model is known.
+    const model = state.newChat.model ?? modelsFor(engine)[0].id;
+    const effort = state.newChat.effort ?? defaultEffortFor(engine, model);
     const msg_id = uuid();
     dispatch({ type: "start_new_query", prompt, msg_id, images, files, model, effort });
     wsRef.current.sendNewSession(cwd, engine, model, effort);
@@ -317,6 +324,15 @@ export default function App() {
   const setModel = (model: string) => {
     wsRef.current?.sendSetModel(model);
     dispatch({ type: "set_model", model });
+    // Effort levels are PER MODEL (GPT-5.6 has 7, gpt-5.5 has 4). Carrying the old
+    // level across a model switch can send one the new model doesn't support (e.g.
+    // 5.6's "ultra" to gpt-5.5), which fails the whole turn. Reset to the new model's
+    // highest level — "default to the max thinking the model allows".
+    const effort = defaultEffortFor(engine, model);
+    if (effort !== rt.effort) {
+      wsRef.current?.sendSetEffort(effort);
+      dispatch({ type: "set_effort", effort });
+    }
   };
   const setEffort = (effort: string) => {
     wsRef.current?.sendSetEffort(effort);
@@ -395,7 +411,12 @@ export default function App() {
             engine={engine}
             model={state.newChat.model} effort={state.newChat.effort}
             onPickCwd={() => setDirPickerOpen(true)}
-            onPickModel={(m) => dispatch({ type: "set_new_chat_model", model: m })}
+            onPickModel={(m) => {
+              dispatch({ type: "set_new_chat_model", model: m });
+              // effort levels are per-model — drop the pick so it re-defaults to the
+              // new model's highest level (and can never be an unsupported one).
+              dispatch({ type: "set_new_chat_effort", effort: null });
+            }}
             onPickEffort={(ef) => dispatch({ type: "set_new_chat_effort", effort: ef })}
             onSend={sendFirstMessage} />
         ) : (
