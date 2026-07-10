@@ -19,7 +19,9 @@ import asyncio
 import glob
 import json
 import os
+import re
 import shutil
+import subprocess
 from typing import Optional
 
 from cc_remote.log import logger
@@ -28,28 +30,73 @@ from cc_remote.wrapper.codex_sessions import codex_model, codex_effort, codex_co
 log = logger("cc_remote.wrapper.codex_handle")
 
 _REQ_TIMEOUT = 60.0
+_BIN_CACHE: Optional[str] = None
+
+
+def _codex_candidates() -> list[str]:
+    """Every codex install we can find, in tie-break order (earlier wins ties).
+    Managed standalone releases first: `codex upgrade` writes there, so it's the
+    one the user actually updates. An npm-global under nvm is often stale but
+    shadows everything else on PATH."""
+    home = os.path.expanduser("~")
+    out = sorted(glob.glob(os.path.join(home, ".codex/packages/standalone/releases/*/bin/codex")), reverse=True)
+    out.append(os.path.join(home, ".local/bin/codex"))
+    which = shutil.which("codex")
+    if which:
+        out.append(which)
+    out += sorted(glob.glob(os.path.join(home, ".nvm/versions/node/*/bin/codex")), reverse=True)
+    out += ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/usr/bin/codex"]
+    seen, uniq = set(), []
+    for c in out:
+        if not os.path.exists(c):
+            continue
+        real = os.path.realpath(c)
+        if real in seen:
+            continue
+        seen.add(real)
+        uniq.append(c)
+    return uniq
+
+
+def _codex_version(path: str) -> tuple[int, ...]:
+    """`codex --version` -> (0, 144, 1). (-1,) when it can't be run/parsed, so a
+    broken install always loses to a working one."""
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True,
+                           timeout=15, env=_codex_env(path))
+    except Exception:
+        return (-1,)
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", (r.stdout or "") + (r.stderr or ""))
+    return tuple(int(g) for g in m.groups()) if m else (-1,)
 
 
 def _resolve_codex_bin() -> str:
-    """Locate the codex CLI robustly. Prefer $CODEX_BIN, then PATH, then known
-    npm-global (nvm) / user-local install dirs. The wrapper is often relaunched
-    with a minimal PATH (systemd default / a bare `nohup` relaunch) that omits
-    the nvm node bin where `codex` lives — a bare "codex" then dies with
-    FileNotFoundError. Searching known dirs makes spawning PATH-independent."""
+    """Locate the codex CLI, preferring the NEWEST install.
+
+    $CODEX_BIN short-circuits. Otherwise we version-probe every candidate and take
+    the highest — plain PATH order is wrong: a stale npm-global (nvm bin sits first
+    on the wrapper's PATH) shadowed a newer standalone release, so the wrapper kept
+    spawning an old app-server whose `model/list` predated the current model family.
+    The app-server IS our model catalog, so serving a stale one silently corrupts
+    every model/effort decision downstream. Blocking (subprocess); cached for the
+    process — call via asyncio.to_thread from async code."""
+    global _BIN_CACHE
     override = os.environ.get("CODEX_BIN")
     if override:
         return override
-    found = shutil.which("codex")
-    if found:
-        return found
-    home = os.path.expanduser("~")
-    # newest node version first, then common user-local / system locations
-    candidates = sorted(glob.glob(os.path.join(home, ".nvm/versions/node/*/bin/codex")), reverse=True)
-    candidates += [os.path.join(home, ".local/bin/codex"), "/usr/local/bin/codex", "/usr/bin/codex"]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return "codex"  # last resort — errors clearly if truly absent
+    if _BIN_CACHE:
+        return _BIN_CACHE
+    cands = _codex_candidates()
+    if not cands:
+        return "codex"  # last resort — errors clearly if truly absent
+    versions = [(_codex_version(c), c) for c in cands]
+    best_v, best = max(versions, key=lambda p: p[0])
+    if best_v == (-1,):
+        best = cands[0]
+    _BIN_CACHE = best
+    log.info("codex bin resolved", path=best, version=".".join(map(str, best_v)),
+             considered=[{"path": c, "version": ".".join(map(str, v))} for v, c in versions])
+    return best
 
 
 def _codex_env(bin_path: str) -> dict:
@@ -91,7 +138,8 @@ class CodexHandle:
     async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
                       fork: bool = False) -> None:
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
-        codex_bin = _resolve_codex_bin()
+        # version-probes subprocesses on first call; keep it off the event loop.
+        codex_bin = await asyncio.to_thread(_resolve_codex_bin)
         self.proc = await asyncio.create_subprocess_exec(
             codex_bin, "app-server", "--stdio",
             stdin=asyncio.subprocess.PIPE,

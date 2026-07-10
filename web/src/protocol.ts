@@ -91,6 +91,20 @@ export interface GetHistory extends Base { type: "get_history"; session_id: stri
 // `codex` in the user's terminal. The wrapper mirrors those appends by broadcasting
 // a fresh History; we render the session read-only (a cc session has one owner).
 export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; external?: boolean }
+// The engine's own model catalog. codex's app-server reports, per model, exactly
+// which reasoning levels it accepts — and `turn/start` does NOT validate the level
+// (it accepts `bogus-zzz`), so one we invent client-side only fails later inside the
+// model API. The server is authoritative; data.ts's table is a fallback.
+export interface GetModels extends Base { type: "get_models"; engine?: string | null; client_id?: string | null }
+export interface CatalogModel {
+  id: string;
+  display_name: string;
+  description: string;
+  efforts: string[];
+  default_effort?: string | null;
+  is_default?: boolean;
+}
+export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[] }
 export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; question: string; options: AskOption[] }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }
@@ -106,7 +120,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History
+  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History | Models
   | AskUser
   | SessionList | SessionFocus | SessionRekey
   | DirList

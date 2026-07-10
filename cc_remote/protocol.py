@@ -382,6 +382,31 @@ class DirList(_Base):
     dirs: list[dict[str, str]] = []  # each: {name, path}
 
 
+# ---- model catalog (the engine is the source of truth, not the client) ----
+
+class GetModels(_Base):
+    """client -> wrapper: what models does this engine actually offer?
+
+    Only `codex` answers with real data: its app-server's `model/list` reports each
+    model's `supportedReasoningEfforts` + `defaultReasoningEffort`. cc has no such
+    RPC, so the client keeps its static table for engine="cc"."""
+    type: Literal["get_models"] = "get_models"
+    engine: Optional[str] = None
+    client_id: Optional[str] = None  # requester, so the wrapper routes Models back to=<client_id>
+
+
+class Models(_Base):
+    """wrapper -> client: the engine's model catalog (one-shot, like DirList — not
+    seq'd/buffered). Each entry: {id, display_name, description, efforts,
+    default_effort, is_default}. `efforts` is authoritative: turn/start does NOT
+    validate the level (it accepts `bogus-zzz`), so offering one the model lacks
+    only fails later inside the model API. Empty list = we couldn't read it; the
+    client falls back to its static table rather than rendering nothing."""
+    type: Literal["models"] = "models"
+    engine: str
+    models: list[dict[str, Any]] = []
+
+
 class SetPerm(_Base):
     """client -> wrapper: switch the cc session's permission mode (runtime, no reconnect)."""
     type: Literal["set_perm"] = "set_perm"
@@ -483,8 +508,8 @@ class AnswerQuestion(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetDiff, GetHistory, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, History, AskUser, AnswerQuestion,
+    Hello, Query, Interrupt, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, History, Models, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
@@ -513,6 +538,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_context": GetContext,
     "get_diff": GetDiff,
     "get_history": GetHistory,
+    "get_models": GetModels,
+    "models": Models,
     "list_sessions": ListSessions,
     "switch_session": SwitchSession,
     "new_session": NewSession,

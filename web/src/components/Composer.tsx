@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import type { State, QueryImg, QueryFile, ContextReport } from "../protocol";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
-import { clientSlashesFor, CODEX_PROMPTS, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor } from "../data";
+import { clientSlashesFor, CODEX_PROMPTS, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor, type Catalog } from "../data";
 import { CommandSheet } from "./CommandSheet";
 import { pickFiles } from "../img";
 
@@ -23,6 +23,7 @@ interface Props {
   external?: boolean;
   onTakeover?: () => void;   // drop the read-only lock now (wrapper reloads before our turn)
   engine?: "claude" | "codex";
+  catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   editPrompt: string | null;
   onEditConsumed: () => void;
   onSendQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => void;
@@ -240,14 +241,14 @@ export function Composer(p: Props) {
   const disabled = locked || (!busy && !hasText && !hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
-  const MODELS_E = modelsFor(p.engine), PERMS_E = permsFor(p.engine);
+  const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
   // Codex: if the session hasn't reported a codex model yet (or it's a stale
   // claude id), show the codex default instead of a leftover "Mythos 5".
   const model = MODELS_E.find((m) => m.id === p.model)
     || (p.engine === "codex" ? MODELS_E[0] : { id: p.model, name: p.model || MODELS_E[0].name, ds: "", ic: "cpu" });
-  // Effort levels come from the RESOLVED model (GPT-5.6 => 7, gpt-5.5 => 4, cc => 5),
-  // and the fallback is the LAST entry = the highest level that model supports.
-  const EFFORTS_E = effortsFor(p.engine, model.id);
+  // Effort levels come from the RESOLVED model, and the fallback is the highest
+  // level that model supports.
+  const EFFORTS_E = effortsFor(p.engine, model.id, p.catalog);
   const effort = EFFORTS_E.find((e) => e.id === p.effort) || EFFORTS_E[EFFORTS_E.length - 1];
   const perm = PERMS_E.find((x) => x.id === p.perm) || PERMS_E[0];
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
@@ -426,6 +427,7 @@ export function Composer(p: Props) {
         open={sheetKind !== null}
         kind={sheetKind ?? "models"}
         engine={p.engine}
+        catalog={p.catalog}
         onClose={() => setSheetKind(null)}
         currentModel={p.model}
         onPickModel={(m) => { p.onSetModel(m); setSheetKind(null); }}

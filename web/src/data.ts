@@ -3,6 +3,8 @@
 // handled in Composer.send) and cc skills (forwarded verbatim to cc). Model/perm
 // chips drive set_model / set_permission_mode on the wrapper.
 
+import type { CatalogModel } from "./protocol";
+
 export interface CmdGroup { g: string }
 export interface Cmd { slash: string; name: string; ds: string; ic: string }
 export type Command = CmdGroup | Cmd;
@@ -29,8 +31,8 @@ export const COMMANDS: Command[] = [
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
 ];
 
-// `efforts` overrides the engine's baseline effort list for THIS model (reasoning
-// levels are per-model: the GPT-5.6 family has 7, gpt-5.5 and older have 4).
+// `efforts` overrides the engine's baseline effort list for THIS model — reasoning
+// levels are per-model, not per-engine.
 export interface Model { id: string; name: string; ds: string; ic: string; efforts?: Effort[] }
 export const MODELS: Model[] = [
   { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "crown" },
@@ -40,63 +42,42 @@ export const MODELS: Model[] = [
   { id: "claude-fable-5", name: "Fable 5", ds: "大便", ic: "book" },
 ];
 
-// Reasoning effort (思考强度) — maps to the cc `--effort` flag. Changing it
-// respawns the session with resume (one cold context resend), so it's a
-// deliberate knob, not a per-message toggle.
-// `name` is the RAW level id on purpose: it's what `~/.codex/config.toml`
-// (model_reasoning_effort) and cc's `--effort` take, so what the chip shows is
-// exactly what you can grep for in the config. No translated labels.
+// Reasoning effort (思考强度). `name` is the RAW level id on purpose: it's what
+// `~/.codex/config.toml` (model_reasoning_effort) and cc's `--effort` take, so what
+// the chip shows is exactly what you can grep for in the config. No translated labels.
 export interface Effort { id: string; name: string; ds: string; ic: string }
-export const EFFORTS: Effort[] = [
-  { id: "low", name: "low", ds: "最省 · 最快响应", ic: "gauge1" },
-  { id: "medium", name: "medium", ds: "适度思考", ic: "gauge2" },
-  { id: "high", name: "high", ds: "深度推理 · 默认", ic: "gauge3" },
-  { id: "xhigh", name: "xhigh", ds: "更深推理 · 部分模型支持", ic: "gauge4" },
-  { id: "max", name: "max", ds: "最强 · 最慢最贵", ic: "gauge5" },
-];
 
-// ---- Codex engine option sets (aligned with the codex app-server) ----
-// Model ids + display names verified against the codex binary's embedded catalog
-// (openai.gpt-5.6-sol -> "Sol", -terra -> "Terra", -luna -> "Luna"). codex's
-// `model/list` RPC only advertises its built-in OpenAI catalog (5.5/5.4/5.4-mini/
-// 5.3-codex/5.2); a custom provider (config.toml `model_provider`) passes any model
-// id straight through and codex uses `used_fallback_model_metadata` for it — which
-// is why ~/.codex/config.toml can already run gpt-5.6-sol before the CLI ships a
-// catalog entry for it.
-// 5.5/5.4 stay listed so OLDER sessions render their real model instead of falling
-// back to the first entry (Composer falls back to MODELS_E[0] on an unknown id).
-// The `ds` blurbs are our own labels — codex exposes no per-model description for
-// a custom provider.
+// Blurb + icon per level, low -> high. Order here IS the cost/latency order, and is
+// what we rank by — never trust arrival order from the server.
+const EFFORT_META: Record<string, { ds: string; ic: string }> = {
+  minimal: { ds: "几乎不推理 · 最快最省", ic: "gauge1" },
+  low: { ds: "更快 · 轻推理", ic: "gauge1" },
+  medium: { ds: "均衡 · 日常任务", ic: "gauge2" },
+  high: { ds: "深度推理 · 复杂问题", ic: "gauge3" },
+  xhigh: { ds: "更深推理 · 更慢", ic: "gauge4" },
+  max: { ds: "最深推理 · 最难的问题", ic: "gauge5" },
+  ultra: { ds: "极限推理 · 最慢最贵", ic: "crown" },
+};
+export const EFFORT_ORDER = Object.keys(EFFORT_META);
+const rank = (id: string) => { const i = EFFORT_ORDER.indexOf(id); return i < 0 ? EFFORT_ORDER.length : i; };
+const effort = (id: string): Effort => ({ id, name: id, ds: EFFORT_META[id]?.ds ?? "", ic: EFFORT_META[id]?.ic ?? "gauge3" });
+const efforts = (...ids: string[]): Effort[] => ids.map(effort);
 
-// Reasoning effort is PER MODEL, not per engine. `model/list` reports
-// [low, medium, high, xhigh] for gpt-5.5 and older; the GPT-5.6 family (sol/terra/
-// luna) adds `minimal` below and `max` + `ultra` on top => 7 levels. The codex
-// binary's ReasoningEffort enum is Minimal·Low·Medium·High·XHigh·Max·Ultra ("High"
-// is tail-merged into "XHigh" in .rodata). Sending a level the model doesn't support
-// fails the whole turn, so never offer one it can't take — see effortsFor().
-// Declared BEFORE CODEX_MODELS: consts aren't hoisted, and CODEX_MODELS references this.
-export const CODEX_EFFORTS: Effort[] = [   // gpt-5.5 and older
-  { id: "low", name: "low", ds: "更快 · 轻推理", ic: "gauge1" },
-  { id: "medium", name: "medium", ds: "均衡 · 日常任务", ic: "gauge2" },
-  { id: "high", name: "high", ds: "深度推理 · 复杂问题", ic: "gauge3" },
-  { id: "xhigh", name: "xhigh", ds: "更深推理 · 更慢", ic: "gauge4" },
-];
-// GPT-5.6 (sol/terra/luna). `max` uses codex's own wording ("Maximum reasoning depth
-// for the hardest problems"); the `minimal`/`ultra` blurbs are ours — codex ships no
-// description string for those two.
-export const CODEX_EFFORTS_56: Effort[] = [
-  { id: "minimal", name: "minimal", ds: "几乎不推理 · 最快最省", ic: "gauge1" },
-  { id: "low", name: "low", ds: "更快 · 轻推理", ic: "gauge2" },
-  { id: "medium", name: "medium", ds: "均衡 · 日常任务", ic: "gauge3" },
-  { id: "high", name: "high", ds: "深度推理 · 复杂问题", ic: "gauge4" },
-  { id: "xhigh", name: "xhigh", ds: "更深推理 · 更慢", ic: "gauge5" },
-  { id: "max", name: "max", ds: "最深推理 · 最难的问题", ic: "bolt" },
-  { id: "ultra", name: "ultra", ds: "极限推理 · 最慢最贵", ic: "crown" },
-];
+export const EFFORTS: Effort[] = efforts("low", "medium", "high", "xhigh", "max");        // cc
+
+// ---- Codex: the app-server IS the catalog ----
+// Everything below is only a FALLBACK for the first paint (and if `model/list`
+// fails). The live catalog arrives as a `models` frame and wins — see catalogFor().
+// Hardcoding this table is what produced two shipped bugs: `minimal` exists on no
+// model at all, and gpt-5.6-luna tops out at `max`, not `ultra`. `turn/start` accepts
+// ANY effort string (measured: `bogus-zzz` starts a turn), so a level we invent here
+// doesn't fail loudly — it fails deep inside the model API. Never guess these.
+export const CODEX_EFFORTS: Effort[] = efforts("low", "medium", "high", "xhigh");         // gpt-5.5 and older
+export const CODEX_EFFORTS_56: Effort[] = efforts("low", "medium", "high", "xhigh", "max", "ultra");
 export const CODEX_MODELS: Model[] = [
   { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", ds: "旗舰 · 最强 agentic 编码", ic: "crown", efforts: CODEX_EFFORTS_56 },
   { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", ds: "均衡 · 日常编码", ic: "balance", efforts: CODEX_EFFORTS_56 },
-  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", ds: "轻量 · 更快", ic: "bolt", efforts: CODEX_EFFORTS_56 },
+  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", ds: "轻量 · 更快", ic: "bolt", efforts: efforts("low", "medium", "high", "xhigh", "max") },
   { id: "gpt-5.5", name: "GPT-5.5", ds: "上一代 · 旧会话兼容", ic: "cpu" },
   { id: "gpt-5.4", name: "GPT-5.4", ds: "更早 · 旧会话兼容", ic: "cpu" },
 ];
@@ -105,24 +86,58 @@ export const CODEX_PERMS: Perm[] = [
   { id: "on-request", name: "按需", short: "按需", ds: "需要时才询问", ic: "shield" },
   { id: "untrusted", name: "严格", short: "严格", ds: "每步都先询问", ic: "shield" },
 ];
-export const modelsFor = (engine?: string): Model[] => (engine === "codex" ? CODEX_MODELS : MODELS);
-/** Effort levels for the SELECTED model (5.6 => 7 levels, 5.5 => 4, cc => 5).
- *  Unknown/unset model falls back to the engine's baseline list. */
-export const effortsFor = (engine?: string, model?: string | null): Effort[] => {
-  const m = model ? modelsFor(engine).find((x) => x.id === model) : undefined;
+
+/** Live catalogs by engine, as reported by the wrapper (`models` frame). */
+export type Catalog = Record<string, CatalogModel[]>;
+
+// Pretty Chinese name/blurb/icon per known id. A model we've never heard of still
+// renders — it just borrows the server's own English display_name/description, so a
+// newly-shipped codex model appears in the UI without a redeploy.
+const CODEX_LOOKS: Record<string, { name: string; ds: string; ic: string }> = {
+  "gpt-5.6-sol": { name: "GPT-5.6 Sol", ds: "旗舰 · 最强 agentic 编码", ic: "crown" },
+  "gpt-5.6-terra": { name: "GPT-5.6 Terra", ds: "均衡 · 日常编码", ic: "balance" },
+  "gpt-5.6-luna": { name: "GPT-5.6 Luna", ds: "轻量 · 更快", ic: "bolt" },
+};
+
+const fromCatalog = (entries: CatalogModel[]): Model[] =>
+  entries.map((e) => {
+    const look = CODEX_LOOKS[e.id];
+    return {
+      id: e.id,
+      name: look?.name ?? e.display_name ?? e.id,
+      ds: look?.ds ?? e.description ?? "",
+      ic: look?.ic ?? "cpu",
+      efforts: e.efforts?.length ? e.efforts.map(effort) : undefined,
+    };
+  });
+
+export const modelsFor = (engine?: string, catalog?: Catalog): Model[] => {
+  if (engine !== "codex") return MODELS;
+  const live = catalog?.codex;
+  return live?.length ? fromCatalog(live) : CODEX_MODELS;
+};
+
+/** Effort levels the SELECTED model actually accepts. Unknown/unset model falls back
+ *  to the engine's baseline list. */
+export const effortsFor = (engine?: string, model?: string | null, catalog?: Catalog): Effort[] => {
+  const m = model ? modelsFor(engine, catalog).find((x) => x.id === model) : undefined;
   if (m?.efforts) return m.efforts;
   return engine === "codex" ? CODEX_EFFORTS : EFFORTS;
 };
+
 /** Default effort = the HIGHEST level the selected model supports (product decision:
- *  always think as hard as the model allows). Also the value we clamp to when the
- *  user switches to a model that doesn't support the current level. */
-export const defaultEffortFor = (engine?: string, model?: string | null): string => {
-  const list = effortsFor(engine, model);
-  return list[list.length - 1].id;
+ *  always think as hard as the model allows — we deliberately ignore the server's
+ *  own `default_effort`, which is `low` for sol). Also what we clamp to when the user
+ *  switches to a model that lacks the current level (sol `ultra` -> luna `max`). */
+export const defaultEffortFor = (engine?: string, model?: string | null, catalog?: Catalog): string => {
+  const list = effortsFor(engine, model, catalog);
+  return list.reduce((a, b) => (rank(b.id) > rank(a.id) ? b : a)).id;
 };
 export const permsFor = (engine?: string): Perm[] => (engine === "codex" ? CODEX_PERMS : PERMS);
 
 // Map a cc-reported model id (e.g. "claude-mythos-5[1m]") to a MODELS entry id.
+// An id we don't know (any codex model) passes through verbatim — the codex chips
+// resolve it against the live catalog themselves.
 export function matchModelId(m: string, engine?: string): string {
   const base = m.replace(/\[.*\]$/, "");
   const hit = modelsFor(engine).find((x) => base === x.id || base.startsWith(x.id));

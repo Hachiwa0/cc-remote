@@ -107,13 +107,19 @@ export default function App() {
         onEvent: (msg) => {
           if (msg.type === "snapshot") { handleSnapshot(msg); return; }
           dispatch({ type: "event", event: msg });
-          if (msg.type === "wrapper_reconnected") { ws.sendHello(); ws.sendListSessions(engineRef.current); }
+          if (msg.type === "wrapper_reconnected") { ws.sendHello(); ws.sendListSessions(engineRef.current); ws.sendGetModels("codex"); }
           // refresh the context ring after each turn (local SDK query, no model tokens)
           if (msg.type === "turn_end") ws.sendGetContext();
         },
         onConnState: (s, detail) => {
           dispatch({ type: "conn", connState: s, detail });
-          if (s === "connected") ws.sendListSessions(engineRef.current);
+          if (s === "connected") {
+            ws.sendListSessions(engineRef.current);
+            // Always fetch codex's catalog, not just when codex is the active engine:
+            // the engine pill switches instantly and must render real models/efforts.
+            // The wrapper caches it, so a refresh doesn't respawn an app-server.
+            ws.sendGetModels("codex");
+          }
         },
         onAuthFail: () => {
           localStorage.removeItem(SESSION_KEY);
@@ -314,8 +320,8 @@ export default function App() {
     // engine's first entry, and an unpicked effort means that model's HIGHEST level
     // (product rule). Send both explicitly so the spawned session matches the UI —
     // effort levels are per-model, so we can only pick the max once the model is known.
-    const model = state.newChat.model ?? modelsFor(engine)[0].id;
-    const effort = state.newChat.effort ?? defaultEffortFor(engine, model);
+    const model = state.newChat.model ?? modelsFor(engine, state.catalog)[0].id;
+    const effort = state.newChat.effort ?? defaultEffortFor(engine, model, state.catalog);
     const msg_id = uuid();
     dispatch({ type: "start_new_query", prompt, msg_id, images, files, model, effort });
     wsRef.current.sendNewSession(cwd, engine, model, effort);
@@ -324,11 +330,11 @@ export default function App() {
   const setModel = (model: string) => {
     wsRef.current?.sendSetModel(model);
     dispatch({ type: "set_model", model });
-    // Effort levels are PER MODEL (GPT-5.6 has 7, gpt-5.5 has 4). Carrying the old
-    // level across a model switch can send one the new model doesn't support (e.g.
-    // 5.6's "ultra" to gpt-5.5), which fails the whole turn. Reset to the new model's
-    // highest level — "default to the max thinking the model allows".
-    const effort = defaultEffortFor(engine, model);
+    // Effort levels are PER MODEL. Carrying the old level across a model switch can
+    // send one the new model doesn't support (sol's "ultra" to luna, which stops at
+    // "max"), and codex only rejects it deep inside the model API. Reset to the new
+    // model's highest level — "default to the max thinking the model allows".
+    const effort = defaultEffortFor(engine, model, state.catalog);
     if (effort !== rt.effort) {
       wsRef.current?.sendSetEffort(effort);
       dispatch({ type: "set_effort", effort });
@@ -409,6 +415,7 @@ export default function App() {
         {state.newChat ? (
           <NewChatView cwd={state.newChat.cwd} creating={!!state.pendingNewQuery}
             engine={engine}
+            catalog={state.catalog}
             model={state.newChat.model} effort={state.newChat.effort}
             onPickCwd={() => setDirPickerOpen(true)}
             onPickModel={(m) => {
@@ -428,6 +435,7 @@ export default function App() {
 
             <Composer
           state={rt.state}
+          catalog={state.catalog}
           connState={state.connState}
           wrapperOnline={state.wrapperOnline}
           sendMode={state.sendMode}

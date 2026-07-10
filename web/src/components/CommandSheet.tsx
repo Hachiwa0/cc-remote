@@ -1,10 +1,11 @@
-import { isCmd, commandsFor, modelsFor, effortsFor, permsFor, type Cmd, type CmdGroup } from "../data";
+import { isCmd, commandsFor, modelsFor, effortsFor, permsFor, type Cmd, type CmdGroup, type Catalog } from "../data";
 import { Icon } from "../icons";
 
 interface Props {
   open: boolean;
   kind: "commands" | "models" | "efforts" | "perms";
   engine?: "claude" | "codex";
+  catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   // command mode: the token typed after "/" in the composer (prefix filter).
   // There is NO input box in this sheet anymore — the composer textarea is the
   // single input, and this palette is a live suggestion overlay driven by it.
@@ -19,14 +20,14 @@ interface Props {
   onPickPerm?: (perm: string) => void;
 }
 
-export function CommandSheet({ open, kind, engine, filter = "", onClose, onPickCommand, currentModel, onPickModel, currentEffort, onPickEffort, currentPerm, onPickPerm }: Props) {
+export function CommandSheet({ open, kind, engine, catalog, filter = "", onClose, onPickCommand, currentModel, onPickModel, currentEffort, onPickEffort, currentPerm, onPickPerm }: Props) {
   const isCmdMode = kind === "commands";
   const isPermMode = kind === "perms";
   const isEffortMode = kind === "efforts";
   const f = filter.toLowerCase();
-  // Effort levels are per-model (GPT-5.6 => 7, gpt-5.5 => 4), so the effort sheet
-  // must be built from the model currently selected, not just the engine.
-  const MODELS = modelsFor(engine), EFFORTS = effortsFor(engine, currentModel), PERMS = permsFor(engine);
+  // Effort levels are per-model, so the effort sheet must be built from the model
+  // currently selected, not just the engine.
+  const MODELS = modelsFor(engine, catalog), EFFORTS = effortsFor(engine, currentModel, catalog), PERMS = permsFor(engine);
 
   // Prefix-match on the slash (same rule the composer uses to decide visibility),
   // preserving group headers that still have matches.

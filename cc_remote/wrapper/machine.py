@@ -50,7 +50,7 @@ from claude_agent_sdk.types import ResultMessage
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, Hello, Model, Effort, Fast, Perm, BtwOpened, ContextReport, DiffReport, History, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
+    Error, Hello, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, DiffReport, History, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, is_downstream,
     SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL,
@@ -72,6 +72,7 @@ from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
     set_codex_config_fast, codex_fast_enabled, set_codex_config_key,
 )
+from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -225,6 +226,8 @@ class WrapperMachine:
             await self._handle_get_diff(cmd)
         elif t == "get_history":
             await self._handle_get_history(cmd)
+        elif t == "get_models":
+            await self._handle_get_models(cmd)
         elif t == "answer_question":
             await self._handle_answer_question(cmd)
         elif t == "list_sessions":
@@ -524,6 +527,19 @@ class WrapperMachine:
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"interrupt failed: {e}"))
             # leave interrupting; the drain timeout will recover
 
+    async def _handle_get_models(self, cmd) -> None:
+        """Answer with the ENGINE's own catalog. codex's app-server knows exactly
+        which reasoning levels each model takes; cc has no equivalent RPC, so we
+        return nothing and the client keeps its static table."""
+        engine = getattr(cmd, "engine", None) or "cc"
+        models = await codex_catalog() if engine == "codex" else []
+        msg = Models(engine=engine, models=models)
+        client_id = getattr(cmd, "client_id", None)
+        if client_id:
+            msg.to = client_id           # relay routes it to just this client
+        await self.transport.send(msg)
+        log.info("models sent", engine=engine, count=len(models), client_id=client_id)
+
     async def _handle_set_model(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
@@ -532,9 +548,34 @@ class WrapperMachine:
             await ctx.sdk.set_model(cmd.model)
             ctx.announced_model = cmd.model
             await self._emit(ctx, Model(model=cmd.model))
+            if ctx.engine == "codex":
+                # The new model may not support the level we're carrying (sol has
+                # `ultra`, luna tops out at `max`). Clamp before the next turn/start
+                # sends it — codex accepts any string here and only fails at the API.
+                applied = await self._apply_codex_effort(ctx, ctx.announced_effort)
+                if applied and applied != ctx.announced_effort:
+                    ctx.announced_effort = applied
+                    await self._emit(ctx, Effort(effort=applied))
         except Exception as e:
             log.exception("set_model failed", error=str(e))
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_model failed: {e}"))
+
+    async def _apply_codex_effort(self, ctx, effort: Optional[str]) -> Optional[str]:
+        """Clamp `effort` to what ctx's codex model supports, apply it to the live
+        handle, and persist it. Returns the APPLIED level (may differ from the
+        request); the caller announces it. Doesn't touch ctx.announced_effort."""
+        applied = await clamp_effort(getattr(ctx.sdk, "model", None), effort)
+        if not applied:
+            return applied
+        # codex effort is a per-turn turn/start param, so keep applied_effort in
+        # lockstep — _run_turn's "effort != applied" check must not force a respawn.
+        ctx.sdk.effort = applied
+        ctx.sdk.applied_effort = applied
+        # ~/.codex/config.toml is what the user inspects with `cat` and what NEW
+        # sessions (incl. their terminal codex) inherit. Persist it too, else
+        # "I switched to ultra" still reads `model_reasoning_effort = "xhigh"`.
+        await asyncio.to_thread(set_codex_config_key, "model_reasoning_effort", applied)
+        return applied
 
     async def _handle_set_effort(self, cmd) -> None:
         # cc: effort is a spawn-time flag (--effort), so we can't flip it on the live
@@ -545,13 +586,15 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return
+        if ctx.engine == "codex":
+            applied = await self._apply_codex_effort(ctx, cmd.effort) or cmd.effort
+            ctx.announced_effort = applied
+            await self._emit(ctx, Effort(effort=applied))
+            log.info("effort set", sid=ctx.session_id, effort=applied,
+                     requested=cmd.effort, engine=ctx.engine)
+            return
         ctx.sdk.effort = cmd.effort
         ctx.announced_effort = cmd.effort
-        if ctx.engine == "codex":
-            # ...but ~/.codex/config.toml is what the user inspects with `cat` and what
-            # NEW sessions (incl. their terminal codex) inherit. Persist it too, else
-            # "I switched to ultra" still reads `model_reasoning_effort = "xhigh"`.
-            await asyncio.to_thread(set_codex_config_key, "model_reasoning_effort", cmd.effort)
         await self._emit(ctx, Effort(effort=cmd.effort))
         log.info("effort set", sid=ctx.session_id, effort=cmd.effort, engine=ctx.engine)
 
@@ -1037,11 +1080,15 @@ class WrapperMachine:
         # applied_effort too so _run_turn's "effort != applied" reconnect check
         # sees the first turn as already-applied (cc's connect re-syncs it anyway;
         # this is what keeps codex from a spurious first-turn reconnect).
+        if model and engine == "codex":
+            sdk.model = model
+            # A stale client can ask for a level this model doesn't have (it used to
+            # offer `minimal`, and `ultra` on luna). codex takes any string here and
+            # only fails inside the model API, so clamp against the real catalog.
+            effort = await clamp_effort(model, effort)
         if effort:
             sdk.effort = effort
             sdk.applied_effort = effort
-        if model and engine == "codex":
-            sdk.model = model
         ctx = SessionContext(
             session_id=resume_id,
             sdk=sdk,

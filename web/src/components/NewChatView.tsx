@@ -7,7 +7,7 @@
 import { useRef, useState, type ClipboardEvent } from "react";
 import { Icon } from "../icons";
 import { CommandSheet } from "./CommandSheet";
-import { modelsFor, effortsFor, defaultEffortFor } from "../data";
+import { modelsFor, effortsFor, defaultEffortFor, type Catalog } from "../data";
 import { pickFiles } from "../img";
 import type { QueryImg, QueryFile } from "../protocol";
 
@@ -15,6 +15,7 @@ interface Props {
   cwd: string;
   creating: boolean;  // true while the new session is being created (pendingNewQuery set)
   engine?: "claude" | "codex";  // which backend this new chat will use
+  catalog?: Catalog;  // engine-reported models/efforts; falls back to data.ts
   model: string | null;   // pre-selected model (null = engine default)
   effort: string | null;  // pre-selected reasoning effort (null = engine default)
   onPickCwd: () => void;  // open the directory picker
@@ -23,18 +24,18 @@ interface Props {
   onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => void;
 }
 
-export function NewChatView({ cwd, creating, engine = "claude", model, effort, onPickCwd, onPickModel, onPickEffort, onSend }: Props) {
+export function NewChatView({ cwd, creating, engine = "claude", catalog, model, effort, onPickCwd, onPickModel, onPickEffort, onSend }: Props) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const MODELS_E = modelsFor(engine);
+  const MODELS_E = modelsFor(engine, catalog);
   // A null model means "the engine's first entry" — that's what the wrapper will use.
   const selModelId = model ?? MODELS_E[0].id;
-  // Effort levels are per-model (GPT-5.6 => 7, gpt-5.5 => 4, cc => 5).
-  const EFFORTS_E = effortsFor(engine, selModelId);
+  // Effort levels are per-model — read them off the resolved model, not the engine.
+  const EFFORTS_E = effortsFor(engine, selModelId, catalog);
   const modelName = MODELS_E.find((m) => m.id === selModelId)?.name ?? MODELS_E[0].name;
   // A null effort means "the model's highest level" (product rule: default to max
   // thinking, whatever the model supports).
@@ -120,10 +121,11 @@ export function NewChatView({ cwd, creating, engine = "claude", model, effort, o
         open={sheetKind !== null}
         kind={sheetKind ?? "models"}
         engine={engine}
+        catalog={catalog}
         onClose={() => setSheetKind(null)}
         currentModel={selModelId}
         onPickModel={(m) => { onPickModel(m); setSheetKind(null); }}
-        currentEffort={effort ?? defaultEffortFor(engine, selModelId)}
+        currentEffort={effort ?? defaultEffortFor(engine, selModelId, catalog)}
         onPickEffort={(ef) => { onPickEffort(ef); setSheetKind(null); }}
       />
     </div>

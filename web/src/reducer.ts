@@ -11,6 +11,7 @@
 // session_focus, wrapper_reconnected, diff_report, ...) are global.
 import type { ConnState } from "./ws";
 import type { ServerEvent, SessionInfo, State, ContextReport, QueryImg, QueryFile, DirEntry } from "./protocol";
+import type { Catalog } from "./data";
 import type { DiffLine, GitDiffSection } from "./diff";
 import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
@@ -95,6 +96,9 @@ export interface AppState {
   // `runtimes[btwSid]`) + engine, or null when no side panel is open.
   btwSid: string | null;
   btwEngine?: string;
+  // Model catalogs the ENGINE reported (codex only). Absent until the `models`
+  // frame lands; data.ts falls back to its static table until then.
+  catalog: Catalog;
 }
 
 export function createRuntime(): SessionRuntime {
@@ -152,6 +156,7 @@ export const initialState: AppState = {
   focusedSid: null,
   runtimes: {},
   btwSid: null,
+  catalog: {},
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
@@ -370,6 +375,11 @@ function reduceEvent(state: AppState, e: ServerEvent): AppState {
     }
     case "dir_list":
       return { ...state, dirPicker: { path: e.path, parent: e.parent ?? null, dirs: e.dirs } };
+    // The engine's real model catalog. Empty => the wrapper couldn't read it; keep
+    // what we have (data.ts's static table) rather than blanking the pickers.
+    case "models":
+      if (!e.models.length) return state;
+      return { ...state, catalog: { ...state.catalog, [e.engine]: e.models } };
     case "wrapper_disconnected":
       return { ...state, wrapperOnline: false, banner: "machine offline — waiting for reconnect" };
     case "wrapper_reconnected":

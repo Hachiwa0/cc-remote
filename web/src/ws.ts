@@ -178,6 +178,12 @@ export class RelayWs {
     this.send(obj);
   }
 
+  /** Ask the engine which models it really has, and which reasoning levels each
+   *  one takes. Only codex answers; cc keeps the static table in data.ts. */
+  sendGetModels(engine: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "get_models", engine, client_id: this.clientId, ts: nowTs() });
+  }
+
   sendAnswerQuestion(askId: string, answer: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
   }
