@@ -10,7 +10,7 @@
 // (unknown sid → drop; null sid → focused). Control frames (session_list,
 // session_focus, wrapper_reconnected, diff_report, ...) are global.
 import type { ConnState } from "./ws";
-import type { ServerEvent, SessionInfo, State, ContextReport, ThreadGoal, QueryImg, QueryFile, DirEntry } from "./protocol";
+import type { ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal, QueryImg, QueryFile, DirEntry } from "./protocol";
 import type { Catalog } from "./data";
 import type { DiffLine, GitDiffSection } from "./diff";
 import { parseGitDiff } from "./diff";
@@ -86,6 +86,7 @@ export interface SessionRuntime {
   pendingQuestion: { ask_id: string; header?: string | null; question: string; options: { label: string; ds?: string }[]; allow_text?: boolean; secret?: boolean } | null;
   contextReport: ContextReport | null;
   goal: ThreadGoal | null;
+  statusReport: StatusReport | null;
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
 }
@@ -124,7 +125,7 @@ export function createRuntime(): SessionRuntime {
     fast: false,
     takeoverPending: false, takeoverMessage: null,
     replaying: false, syncReady: false, truncated: false,
-    pendingQuestion: null, contextReport: null, goal: null,
+    pendingQuestion: null, contextReport: null, goal: null, statusReport: null,
     queue: [], pendingSend: null,
   };
 }
@@ -572,6 +573,8 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret }; });
     case "goal_state":
       return patch(state, e.sid, (rt) => { rt.goal = e.goal ?? null; });
+    case "status_report":
+      return patch(state, e.sid, (rt) => { rt.statusReport = e; });
     case "replay_start":
       return { ...patch(state, e.sid, (rt) => {
         rt.replaying = true;

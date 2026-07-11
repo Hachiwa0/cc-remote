@@ -159,6 +159,43 @@ export interface ThreadGoal {
   tokensAtStart?: number;
 }
 export interface GoalState extends Base { type: "goal_state"; goal?: ThreadGoal | null }
+export interface StatusThread {
+  thread_id: string;
+  session_id?: string | null;
+  cwd?: string | null;
+  source?: string | null;
+  cli_version?: string | null;
+  status: string;
+  active_flags: string[];
+  ephemeral?: boolean | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+}
+export interface StatusRuntime {
+  app_server_version?: string | null;
+  model?: string | null;
+  model_provider?: string | null;
+  reasoning_effort?: string | null;
+  service_tier?: string | null;
+  approval_policy?: string | null;
+  sandbox_mode?: string | null;
+  web_search?: string | null;
+}
+export interface StatusContext { used_tokens?: number | null; max_tokens?: number | null; percentage?: number | null }
+export interface StatusAccount { auth_type: string; plan_type?: string | null; requires_openai_auth: boolean }
+export interface StatusRateWindow { used_percent: number; resets_at?: number | null; window_duration_mins?: number | null }
+export interface StatusRateLimit { limit_id?: string | null; name?: string | null; plan_type?: string | null; reached?: string | null; primary?: StatusRateWindow | null; secondary?: StatusRateWindow | null }
+export interface StatusUsage { lifetime_tokens?: number | null; current_streak_days?: number | null; longest_streak_days?: number | null; peak_daily_tokens?: number | null; longest_running_turn_sec?: number | null }
+export interface StatusReport extends Base {
+  type: "status_report";
+  thread: StatusThread;
+  runtime: StatusRuntime;
+  context: StatusContext;
+  account?: StatusAccount | null;
+  rate_limits: StatusRateLimit[];
+  usage?: StatusUsage | null;
+  component_errors: string[];
+}
 export interface ContextCategory { name: string; tokens: number; color: string; isDeferred?: boolean }
 export interface ContextReport extends Base {
   type: "context_report";
@@ -172,7 +209,7 @@ export interface ContextReport extends Base {
 
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History | Models | TakeoverState
-  | AskUser | GoalState
+  | AskUser | GoalState | StatusReport
   | SessionList | SessionFocus | SessionRekey
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd

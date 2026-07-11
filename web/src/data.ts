@@ -177,8 +177,9 @@ export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions",
 
 // Codex engine command palette — its REAL slash commands (verified against the
 // codex binary's own "get started" hint: /init /status /permissions /model /review).
-// Client-handled: model/clear/context/status/permissions (status & context both
-// surface token usage; permissions opens the approval-policy picker). Forwarded
+// Client-handled: model/clear/context/status/permissions. /context is the focused
+// thread's token window; /status is a separate app-server snapshot (thread,
+// config, account and rate limits). Forwarded
 // ones (review/init) expand to a prompt codex handles agentically — the app-server
 // has no TUI slash layer. NB: /fast is a codex keybinding (not an app-server knob),
 // and /hook /plan are Claude-only — so they're intentionally omitted.
@@ -194,7 +195,7 @@ export const CODEX_COMMANDS: Command[] = [
   { g: "会话" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
-  { slash: "status", name: "会话状态", ds: "模型 · 思考强度 · token 占用", ic: "cpu" },
+  { slash: "status", name: "完整状态", ds: "线程 · 配置 · 账户 · 限额 · token", ic: "cpu" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用与容量", ic: "cpu" },
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];

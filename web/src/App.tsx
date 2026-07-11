@@ -14,6 +14,7 @@ import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { GoalPanel } from "./components/GoalPanel";
+import { StatusSheet } from "./components/StatusSheet";
 import { parseGoalCommand } from "./goal-command";
 import { defaultModelFor, defaultEffortFor, permsFor } from "./data";
 import { shouldAcceptSessionList } from "./session-list";
@@ -49,6 +50,7 @@ export default function App() {
   // Goal is deliberately opt-in UI: no empty bar and no RPC until /goal runs.
   // Keep reveal/editor state per session so switching sessions never leaks it.
   const [goalUiBySid, setGoalUiBySid] = useState<Record<string, { revealed: boolean; open: boolean }>>({});
+  const [statusOpenSid, setStatusOpenSid] = useState<string | null>(null);
   const [state, dispatch] = useReducer(reduce, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -273,6 +275,7 @@ export default function App() {
           discardedBtwSidsRef.current.clear();
           setBtwOpening(false);
           setGoalUiBySid({});
+          setStatusOpenSid(null);
           dispatch({ type: "reset" });
           setAuthed(false);
           void (async () => {
@@ -556,6 +559,11 @@ export default function App() {
     if (command.kind === "show") wsRef.current?.sendGetGoal();
     else wsRef.current?.sendSetGoal(command.objective, "active", null);
   };
+  const openStatus = () => {
+    if (!focusedSid) return;
+    setStatusOpenSid(focusedSid);
+    wsRef.current?.sendGetStatus();
+  };
   const getDiff = (file: string) => {
     setRightView("diff");
     dispatch({ type: "open_artifact_loading", file, sid: focusedSid });
@@ -731,6 +739,7 @@ export default function App() {
           onContext={() => wsRef.current?.sendGetContext()}
           onOpenBtw={openBtw}
           onGoal={runGoal}
+          onStatus={openStatus}
           contextReport={rt.contextReport}
         />
           </>
@@ -765,6 +774,9 @@ export default function App() {
           }}
         />
       )}
+      <StatusSheet open={statusOpenSid === focusedSid} report={rt.statusReport}
+        onClose={() => setStatusOpenSid(null)}
+        onRefresh={() => wsRef.current?.sendGetStatus()} />
     </div>
   );
 }

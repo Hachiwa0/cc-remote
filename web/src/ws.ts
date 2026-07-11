@@ -334,6 +334,10 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "get_goal", ts: nowTs(), ...this.sidObj() });
   }
 
+  sendGetStatus(): void {
+    this.send({ v: PROTOCOL_VERSION, type: "get_status", client_id: this.clientId, ts: nowTs(), ...this.sidObj() });
+  }
+
   sendSetGoal(objective: string | null, status: string | null, tokenBudget: number | null): void {
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "set_goal", ts: nowTs(), ...this.sidObj() };
     if (objective !== null) obj.objective = objective;
