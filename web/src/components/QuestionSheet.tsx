@@ -1,13 +1,18 @@
+import { useState } from "react";
 import type { AskOption } from "../protocol";
 import { Icon } from "../icons";
 
 interface Props {
   question: string;
+  header?: string | null;
   options: AskOption[];
+  allowText?: boolean;
+  secret?: boolean;
   onAnswer: (answer: string) => void;
 }
 
-export function QuestionSheet({ question, options, onAnswer }: Props) {
+export function QuestionSheet({ question, header, options, allowText, secret, onAnswer }: Props) {
+  const [text, setText] = useState("");
   return (
     <>
       <div className="scrim show" />
@@ -15,7 +20,7 @@ export function QuestionSheet({ question, options, onAnswer }: Props) {
         <div className="sheet-grip" />
         <div className="sheet-title">
           <span className="qa-ic"><Icon name="spark" size={15} /></span>
-          助手想确认一下
+          {header || "助手想确认一下"}
         </div>
         <div className="sheet-scroll">
           <div className="qa-question">{question}</div>
@@ -27,6 +32,13 @@ export function QuestionSheet({ question, options, onAnswer }: Props) {
               </button>
             ))}
           </div>
+          {allowText && <div className="qa-text-answer">
+            <input type={secret ? "password" : "text"} value={text}
+              autoFocus={options.length === 0} placeholder={secret ? "输入敏感内容" : "输入回答"}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) onAnswer(text); }} />
+            <button disabled={!text.trim()} onClick={() => onAnswer(text)}>确定</button>
+          </div>}
         </div>
       </div>
     </>

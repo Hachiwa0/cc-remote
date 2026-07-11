@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import os
 import shutil
+from typing import Any, Awaitable, Callable
 
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, __version__ as SDK_VERSION
+from claude_agent_sdk import (
+    ClaudeSDKClient, ClaudeAgentOptions, PermissionResultDeny,
+    __version__ as SDK_VERSION,
+)
 from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
@@ -46,6 +50,14 @@ class SdkHandle:
         # box (matches the client's default chip); the user can lower it per session.
         self.effort: str | None = "max"
         self.applied_effort: str | None = None
+        self.permission_callback: Callable[[str, dict[str, Any], Any], Awaitable[Any]] | None = None
+
+    async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any):
+        callback = self.permission_callback
+        if callback is None:
+            log.warning("tool permission requested without client callback", tool=tool_name)
+            return PermissionResultDeny(message="remote permission callback unavailable")
+        return await callback(tool_name, tool_input, context)
 
     @staticmethod
     def preflight(cli_path: str = "") -> None:
@@ -73,6 +85,7 @@ class SdkHandle:
         return ClaudeAgentOptions(
             include_partial_messages=True,        # StreamEvent with content_block_delta
             permission_mode="bypassPermissions",  # unattended; matches settings.json
+            can_use_tool=self._can_use_tool,
             cwd=cwd or self.cfg.cc_cwd,           # dynamic: must match the resumed session's cwd
             cli_path=_explicit_cli_path(self.cfg.claude_bin),
             resume=resume_id or None,

@@ -10,7 +10,7 @@
 // (unknown sid → drop; null sid → focused). Control frames (session_list,
 // session_focus, wrapper_reconnected, diff_report, ...) are global.
 import type { ConnState } from "./ws";
-import type { ServerEvent, SessionInfo, State, ContextReport, QueryImg, QueryFile, DirEntry } from "./protocol";
+import type { ServerEvent, SessionInfo, State, ContextReport, ThreadGoal, QueryImg, QueryFile, DirEntry } from "./protocol";
 import type { Catalog } from "./data";
 import type { DiffLine, GitDiffSection } from "./diff";
 import { parseGitDiff } from "./diff";
@@ -80,9 +80,12 @@ export interface SessionRuntime {
   // true => an external process (native `claude`/`codex` in the terminal) owns this
   // session and is writing its transcript; we mirror it read-only.
   external?: boolean;
+  takeoverPending: boolean;
+  takeoverMessage: string | null;
   ccSessionId?: string;
-  pendingQuestion: { ask_id: string; question: string; options: { label: string; ds?: string }[] } | null;
+  pendingQuestion: { ask_id: string; header?: string | null; question: string; options: { label: string; ds?: string }[]; allow_text?: boolean; secret?: boolean } | null;
   contextReport: ContextReport | null;
+  goal: ThreadGoal | null;
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
 }
@@ -119,8 +122,9 @@ export function createRuntime(): SessionRuntime {
   return {
     turns: [], state: "idle", model: "claude-mythos-5", effort: "max", perm: "bypassPermissions",
     fast: false,
+    takeoverPending: false, takeoverMessage: null,
     replaying: false, syncReady: false, truncated: false,
-    pendingQuestion: null, contextReport: null,
+    pendingQuestion: null, contextReport: null, goal: null,
     queue: [], pendingSend: null,
   };
 }
@@ -145,7 +149,6 @@ export type Action =
   | { type: "set_artifact"; artifact: Artifact }
   | { type: "open_artifact_loading"; file: string; sid: string | null }
   | { type: "clear_artifact" }
-  | { type: "clear_external"; sid: string }
   | { type: "clear_btw" }
   | { type: "focus_session"; sid: string }
   | { type: "set_session_tag"; sid: string; tag: string | null }
@@ -297,11 +300,6 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, artifact: { file: action.file, sid: action.sid, kind: "gitdiff", sections: [], loading: true } };
     case "clear_artifact":
       return { ...state, artifact: null };
-    case "clear_external":
-      // "take over": drop the read-only lock now instead of waiting out the wrapper's
-      // external window. Safe — the wrapper force_reconnects (reloads the transcript)
-      // before running our turn, so we continue from where the terminal left off.
-      return patch(state, action.sid, (rt) => { rt.external = false; });
     case "clear_btw": {
       if (!state.btwSid) return state;
       const runtimes = { ...state.runtimes };
@@ -495,6 +493,8 @@ function reduceEvent(
             // appending to its transcript; the wrapper mirrors those appends here.
             // Render read-only — a cc session has ONE owner, and typing would fork it.
             external: !!e.external,
+            takeoverPending: !!e.takeover_pending,
+            takeoverMessage: e.takeover_pending ? base.takeoverMessage : null,
           },
         },
       };
@@ -547,6 +547,11 @@ function reduceEvent(
         }
         rt.turns = turns;
       });
+    case "takeover_state":
+      return patch(state, e.sid, (rt) => {
+        rt.takeoverPending = e.pending;
+        rt.takeoverMessage = e.message ?? null;
+      });
     case "model":
       return patch(state, e.sid, (rt) => { rt.model = matchModelId(e.model); });
     case "effort":
@@ -564,7 +569,9 @@ function reduceEvent(
     case "context_report":
       return patch(state, e.sid, (rt) => { rt.contextReport = e; });
     case "ask_user":
-      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, question: e.question, options: e.options }; });
+      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret }; });
+    case "goal_state":
+      return patch(state, e.sid, (rt) => { rt.goal = e.goal ?? null; });
     case "replay_start":
       return { ...patch(state, e.sid, (rt) => {
         rt.replaying = true;

@@ -14,7 +14,9 @@ from starlette.websockets import WebSocketDisconnect
 
 from cc_remote.config import RelayConfig, validate_relay_config
 from cc_remote.log import JsonFormatter
-from cc_remote.protocol import Hello, ProtocolError, deserialize, serialize
+from cc_remote.protocol import (
+    PROTOCOL_VERSION, Hello, ProtocolError, deserialize, serialize,
+)
 from cc_remote.relay import server
 from cc_remote.relay.auth import (
     SESSION_COOKIE_NAME,
@@ -224,7 +226,7 @@ def test_unicode_login_password_is_compared_without_type_error():
 def test_protocol_validation_error_never_embeds_untrusted_input():
     sentinel = "UNLABELED_SECRET_SHOULD_NOT_REACH_LOGS"
     raw = json.dumps({
-        "v": 4,
+        "v": PROTOCOL_VERSION,
         "type": "query",
         "prompt": [sentinel],
         "msg_id": "m1",
@@ -237,7 +239,7 @@ def test_protocol_validation_error_never_embeds_untrusted_input():
 
     with pytest.raises(ProtocolError):
         deserialize(json.dumps({
-            "v": 4, "type": "hello", "role": "client",
+            "v": PROTOCOL_VERSION, "type": "hello", "role": "client",
             "client_id": "../../unsafe*glob",
         }))
 

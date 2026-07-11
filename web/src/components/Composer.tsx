@@ -26,6 +26,8 @@ interface Props {
   // its transcript. We mirror it live but must NOT write: a cc session has a single
   // owner, so sending from here would fork the conversation.
   external?: boolean;
+  takeoverPending?: boolean;
+  takeoverMessage?: string | null;
   onTakeover?: () => void;   // drop the read-only lock now (wrapper reloads before our turn)
   engine?: "claude" | "codex";
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
@@ -329,9 +331,14 @@ export function Composer(p: Props) {
         {p.external && (
           <div className="external-bar" role="status">
             <Icon name="read" size={14} />
-            <span><b>终端占用中</b> · 只读镜像 —— 这个会话正由终端里的原生 cc 驱动,新消息会实时同步到这里。</span>
+            <span><b>{p.takeoverPending ? "等待接管" : "终端占用中"}</b> · 只读镜像 —— {
+              p.takeoverMessage || (p.engine === "codex"
+                ? "这个会话正由终端里的原生 Codex 驱动，新消息会实时同步到这里；退出终端后会自动解锁。"
+                : "这个会话正由终端里的原生 Claude Code 驱动，新消息会实时同步到这里。")}</span>
             <button className="external-take" onClick={() => p.onTakeover?.()}
-              title="立刻接管这个会话(发送前会自动重载终端最新的对话)">接管</button>
+              disabled={!!p.takeoverPending}
+              title="点击接管；终端正在回复时会在本轮结束后自动交权">
+              {p.takeoverPending ? "已登记" : "接管"}</button>
           </div>
         )}
         {p.queue.length > 0 && (

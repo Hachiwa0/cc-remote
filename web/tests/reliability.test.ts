@@ -108,6 +108,7 @@ const runtimes = {
   c: { state: "running", syncReady: true, pendingSend: null, queue: [{ prompt: "busy-c" }] },
   d: { state: "idle", syncReady: true, pendingSend: null, queue: [{ prompt: "draining-d" }] },
   e: { state: "idle", syncReady: false, pendingSend: null, queue: [{ prompt: "stale-e" }] },
+  f: { state: "idle", syncReady: true, external: true, pendingSend: null, queue: [{ prompt: "external-f" }] },
 };
 assert.deepEqual(
   selectDrainCandidates(runtimes, new Set(["d"]), true, true),
@@ -259,7 +260,7 @@ try {
   const { createRuntime, initialState, reduce } = await reducerHarness.ssrLoadModule(
     "/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 4, ts: 10, ...body,
+    v: 5, ts: 10, ...body,
   } as ServerEvent);
   const sid = "race-a";
   const otherSid = "race-b";
@@ -318,6 +319,17 @@ try {
     (block: { kind: string; text?: string }) => block.kind === "text" ? block.text : "tool"),
   ["only once"]);
   assert.deepEqual(state.runtimes[otherSid].turns, [untouched]);
+
+  state = reduce(state, { type: "event", event: event({
+    type: "takeover_state", sid, pending: true, message: "等待当前回复结束",
+  }) });
+  assert.equal(state.runtimes[sid].takeoverPending, true);
+  assert.equal(state.runtimes[sid].takeoverMessage, "等待当前回复结束");
+  state = reduce(state, { type: "event", event: event({
+    type: "takeover_state", sid, pending: false,
+  }) });
+  assert.equal(state.runtimes[sid].takeoverPending, false);
+  assert.equal(state.runtimes[sid].takeoverMessage, null);
 
   const progressSid = "progress";
   state = {
@@ -515,7 +527,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 4, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 5, ts: 1, ...frame }) });
   }
 }
 
@@ -549,6 +561,13 @@ for (const id of ["gpt-5.6-terra", "gpt-5.6-luna"]) {
   assert.equal(frame.sid, "codex-model-session");
   assert.equal(frame.model, id);
 }
+
+assert.equal(relay.sendTakeover("codex-model-session"), true);
+const takeoverFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(takeoverFrame.type, "takeover");
+assert.equal(takeoverFrame.sid, "codex-model-session");
+assert.equal(typeof takeoverFrame.cmd_id, "string");
+assert.equal(typeof takeoverFrame.client_id, "string");
 
 socket.receive({
   type: "snapshot", sid: "s1", cc_session_id: "s1", generation: "g1",

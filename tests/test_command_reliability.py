@@ -22,6 +22,8 @@ from cc_remote.protocol import (
     Snapshot,
     SessionList,
     SwitchSession,
+    Takeover,
+    TakeoverState,
     UserMsg,
     deserialize,
     serialize,
@@ -39,6 +41,14 @@ def test_command_envelope_and_routed_ack_roundtrip():
         client_id="client-1",
     )
     assert deserialize(serialize(command)) == command
+    takeover = Takeover(
+        sid="session-1", cmd_id="takeover-1", client_id="client-1")
+    assert deserialize(serialize(takeover)) == takeover
+    takeover_state = TakeoverState(
+        sid="session-1", pending=True, message="waiting")
+    assert deserialize(serialize(takeover_state)) == takeover_state
+    with pytest.raises(ValidationError):
+        Takeover(sid="session-1")
     ack = CommandAck(
         cmd_id="cmd-1",
         client_id="client-1",
@@ -101,6 +111,27 @@ def test_wrapper_deduplicates_processed_command_and_resends_ack():
             and ack.to == "client-1"
             for ack in acks
         )
+
+    asyncio.run(run())
+
+
+def test_takeover_duplicate_is_at_most_once_and_only_resends_ack():
+    async def run():
+        machine, transport = _mk_machine()
+        handled = []
+
+        async def fake_handle(cmd):
+            handled.append(cmd.cmd_id)
+
+        machine._handle = fake_handle
+        command = Takeover(
+            sid="session-1", cmd_id="takeover-1", client_id="client-1")
+        await machine._process_command(command)
+        await machine._process_command(command)
+
+        assert handled == ["takeover-1"]
+        assert [msg.type for msg in transport.sent] == [
+            "command_ack", "command_ack"]
 
     asyncio.run(run())
 

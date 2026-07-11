@@ -30,6 +30,8 @@ export interface QueryImg { media_type: string; data: string }
 export interface QueryFile { filename: string; data: string }
 export interface Query extends Base { type: "query"; prompt: string; msg_id: string; images?: QueryImg[] | null; files?: QueryFile[] | null }
 export interface Interrupt extends Base { type: "interrupt" }
+export interface Takeover extends Base { type: "takeover"; sid: string }
+export interface TakeoverState extends Base { type: "takeover_state"; pending: boolean; message?: string | null }
 export interface SetModel extends Base { type: "set_model"; model: string }
 export interface SetEffort extends Base { type: "set_effort"; effort: string }
 export interface SetServiceTier extends Base { type: "set_service_tier"; service_tier: string }
@@ -118,7 +120,7 @@ export interface GetHistory extends Base { type: "get_history"; session_id: stri
 // `external`: this session's transcript is being appended to by a native `claude`/
 // `codex` in the user's terminal. The wrapper mirrors those appends by broadcasting
 // a fresh History; we render the session read-only (a cc session has one owner).
-export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; external?: boolean; in_progress?: boolean }
+export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean }
 // The engine's own model catalog. codex's app-server reports, per model, exactly
 // which reasoning levels it accepts — and `turn/start` does NOT validate the level
 // (it accepts `bogus-zzz`), so one we invent client-side only fails later inside the
@@ -137,8 +139,11 @@ export interface CatalogModel {
 // is per-session and lives in the session's own rollout.
 export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[]; default_model?: string | null }
 export interface AskOption { label: string; ds?: string }
-export interface AskUser extends Base { type: "ask_user"; ask_id: string; question: string; options: AskOption[] }
+export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }
+export type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+export interface ThreadGoal { threadId: string; objective: string; status: GoalStatus; tokenBudget?: number | null; tokensUsed: number; timeUsedSeconds: number; createdAt: number; updatedAt: number }
+export interface GoalState extends Base { type: "goal_state"; goal?: ThreadGoal | null }
 export interface ContextCategory { name: string; tokens: number; color: string; isDeferred?: boolean }
 export interface ContextReport extends Base {
   type: "context_report";
@@ -151,14 +156,14 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History | Models
-  | AskUser
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History | Models | TakeoverState
+  | AskUser | GoalState
   | SessionList | SessionFocus | SessionRekey
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** Build the correlated command used to open one ephemeral /btw fork. */
 export function makeOpenBtwCommand(

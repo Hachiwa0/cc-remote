@@ -74,7 +74,7 @@ class RelayHub:
                     pass
                 return
             self._wrapper_ws = ws
-        log.info("wrapper connected")
+        announced = False
         try:
             while True:
                 raw = await ws.receive_text()
@@ -82,7 +82,38 @@ class RelayHub:
                     msg = deserialize(raw)
                 except ProtocolError as e:
                     log.warning("bad frame from wrapper", error=str(e))
-                    continue
+                    mismatch = "protocol version mismatch" in str(e)
+                    try:
+                        await ws.send_text(serialize(Error(
+                            code=ERR_PROTOCOL,
+                            message="wrapper protocol upgrade required"
+                            if mismatch else "invalid wrapper protocol frame",
+                        )))
+                        await ws.close(
+                            code=(PROTOCOL_MISMATCH_CLOSE_CODE
+                                  if mismatch else PROTOCOL_ERROR_CLOSE_CODE),
+                            reason=(PROTOCOL_MISMATCH_CLOSE_REASON
+                                    if mismatch else PROTOCOL_ERROR_CLOSE_REASON),
+                        )
+                    except Exception:
+                        pass
+                    break
+                if not announced:
+                    if msg.type != "hello" or getattr(msg, "role", None) != "wrapper":
+                        try:
+                            await ws.send_text(serialize(Error(
+                                code=ERR_PROTOCOL,
+                                message="first frame must be a wrapper hello",
+                            )))
+                            await ws.close(
+                                code=PROTOCOL_ERROR_CLOSE_CODE,
+                                reason=PROTOCOL_ERROR_CLOSE_REASON,
+                            )
+                        except Exception:
+                            pass
+                        break
+                    announced = True
+                    log.info("wrapper connected")
                 await self._on_wrapper_msg(msg)
         except WebSocketDisconnect:
             pass

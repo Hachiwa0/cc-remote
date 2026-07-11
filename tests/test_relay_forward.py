@@ -54,6 +54,26 @@ def test_client_queue_is_bounded_by_items_and_bytes():
     asyncio.run(run())
 
 
+def test_wrapper_protocol_mismatch_is_closed_and_releases_single_slot():
+    async def run():
+        hub = RelayHub(SimpleNamespace())
+        ws = ScriptedWs()
+        await ws.incoming.put(json.dumps({
+            "v": 4, "type": "hello", "role": "wrapper", "ts": 1,
+        }))
+
+        await hub.serve_wrapper(ws)
+
+        assert ws.closed == [(
+            pairing.PROTOCOL_MISMATCH_CLOSE_CODE,
+            pairing.PROTOCOL_MISMATCH_CLOSE_REASON,
+        )]
+        assert hub.wrapper_connected is False
+        assert json.loads(ws.sent[0])["code"] == "protocol"
+
+    asyncio.run(run())
+
+
 def test_replacing_client_closes_old_generation():
     async def run():
         cfg = SimpleNamespace(client_queue_cap=4, client_queue_bytes=4096)

@@ -1,6 +1,7 @@
 export interface DrainableRuntime<Query> {
   state: string;
   syncReady: boolean;
+  external?: boolean;
   pendingSend: Query | null;
   queue: Query[];
 }
@@ -89,7 +90,8 @@ export function selectDrainCandidates<Query>(
 
   const candidates: DrainCandidate<Query>[] = [];
   for (const [sid, runtime] of Object.entries(runtimes)) {
-    if (!runtime.syncReady || runtime.state !== "idle" || draining.has(sid)) continue;
+    if (!runtime.syncReady || runtime.external
+        || runtime.state !== "idle" || draining.has(sid)) continue;
     if (runtime.pendingSend) {
       candidates.push({ sid, source: "pending", query: runtime.pendingSend });
     } else if (runtime.queue.length > 0) {

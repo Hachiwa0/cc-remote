@@ -50,14 +50,18 @@ from collections import OrderedDict
 from uuid import uuid4
 from typing import Optional
 
-from claude_agent_sdk import list_sessions, get_session_messages, rename_session, tag_session, get_session_info, delete_session
+from claude_agent_sdk import (
+    PermissionResultAllow, PermissionResultDeny, delete_session,
+    get_session_info, get_session_messages, list_sessions, rename_session,
+    tag_session,
+)
 from claude_agent_sdk.types import ResultMessage
 
 from cc_remote.attachments import decode_attachment, validate_attachments
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, Hello, Query, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, DiffReport, History, AskUser, Pong, Snapshot, StateEvent, State, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
+    ASK_OPTION_MAX_COUNT, Error, Hello, Query, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH,
@@ -80,6 +84,10 @@ from cc_remote.wrapper.codex_sessions import (
     codex_session_settings, set_codex_config_fast, codex_fast_enabled,
 )
 from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
+from cc_remote.wrapper.codex_external import (
+    ProcessIdentity, parse_turn_markers, process_identity,
+    writable_rollout_holders,
+)
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -117,15 +125,15 @@ class WrapperMachine:
     BG_JOB_STATE_MAX_BYTES = 64 * 1024
     SAFE_RETRY_COMMANDS = frozenset({
         "list_sessions", "get_history", "get_models",
-        "get_context", "get_diff", "list_dir",
+        "get_context", "get_diff", "get_goal", "list_dir",
     })
     # Commands whose target is a runtime ``sid``.  A /btw runtime is private to
     # the client that created it, so every operation against that sid must pass
     # the owner check before its handler is allowed to read or mutate state.
     BTW_SID_COMMANDS = frozenset({
-        "query", "interrupt", "set_model", "set_effort",
+        "query", "interrupt", "takeover", "set_model", "set_effort",
         "set_service_tier", "open_btw", "close_btw", "set_perm",
-        "get_context", "get_diff", "answer_question",
+        "get_context", "get_diff", "answer_question", "get_goal", "set_goal", "clear_goal",
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
@@ -146,6 +154,8 @@ class WrapperMachine:
         # when it grows without us having written it, mirrors the append to clients.
         self._watch: dict[str, dict] = {}
         self._watch_task: Optional[asyncio.Task] = None
+        self._codex_watch_lock = asyncio.Lock()
+        self._codex_probe_warned = False
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
         # resets this window (documented residual risk, not durable exactly-once).
@@ -697,6 +707,8 @@ class WrapperMachine:
             return await self._handle_query(cmd)
         elif t == "interrupt":
             await self._handle_interrupt(cmd)
+        elif t == "takeover":
+            return await self._handle_takeover(cmd)
         elif t == "set_model":
             await self._handle_set_model(cmd)
         elif t == "set_effort":
@@ -719,6 +731,12 @@ class WrapperMachine:
             await self._handle_get_models(cmd)
         elif t == "answer_question":
             await self._handle_answer_question(cmd)
+        elif t == "get_goal":
+            return await self._handle_get_goal(cmd)
+        elif t == "set_goal":
+            return await self._handle_set_goal(cmd)
+        elif t == "clear_goal":
+            return await self._handle_clear_goal(cmd)
         elif t == "list_sessions":
             await self._handle_list_sessions(cmd)
         elif t == "switch_session":
@@ -818,8 +836,12 @@ class WrapperMachine:
 
     # ---- history: on-demand transcript read + EXTERNAL-append mirror ----
 
-    EXTERNAL_TTL = 60.0     # a session stays read-only this long after the last external append
-    OWN_WRITE_GRACE = 10.0  # appends this soon after one of OUR turns are ours, not external
+    EXTERNAL_TTL = 60.0     # Claude/fallback unlock after the last external append
+    OWN_WRITE_GRACE = 10.0  # Claude appends this soon after our turn are still ours
+    CODEX_TURN_TRACK_MAX = 512
+    CODEX_TURN_ATTRIBUTION_GRACE = 3.0
+    WATCH_READ_MAX = 4 * 1024 * 1024
+    CODEX_TAIL_READ_MAX = 16 * 1024 * 1024
     MIRROR_LIMIT = 60       # turns per mirrored push (matches the client's initial page)
     WATCH_MAX = 32          # cap on simultaneously watched transcripts
 
@@ -831,6 +853,8 @@ class WrapperMachine:
     def _is_external(self, sid: str) -> bool:
         """This session's transcript was appended to by someone other than us, recently."""
         w = self._watch.get(sid)
+        if w and w.get("engine") == "codex":
+            return bool(w.get("external"))
         return bool(w) and (time.time() - w["external_ts"]) < self.EXTERNAL_TTL
 
     def _own_write(self, sid: str) -> bool:
@@ -857,87 +881,513 @@ class WrapperMachine:
             pass
 
     def _watch_session(self, sid: str) -> None:
-        """Start mirroring a session's transcript. Called when a client opens it.
+        """Start mirroring a session transcript when a client opens it.
 
-        CLAUDE ONLY. Codex is deliberately excluded: its app-server flushes the rollout
-        ASYNCHRONOUSLY, up to ~50s after turn/completed (measured: turn ended 11:19:11,
-        rollout still growing at 11:20:01). Our own-write rule ("growth while no turn is
-        running") therefore misfires on codex and would lock the user out of their OWN
-        codex session for the whole external window. (Resuming a codex thread does NOT
-        write — that part is fine; the post-turn flush is the problem.) The mirror
-        exists for a native `claude` in the terminal, so this costs nothing.
+        Claude ownership is inferred from unattributed file growth. Codex cannot use
+        that heuristic because app-server flushes its own rollout asynchronously; its
+        primary ownership signal is a second writable FD for the same rollout inode.
         """
-        if not sid or sid.startswith("tmp-") or sid in self._watch:
+        if not sid or sid.startswith("tmp-"):
             return
         ctx = self._ctx_by_sid(sid)
-        engine = ctx.engine if ctx else "claude"
-        if engine == "codex":
-            return
-        path = transcript_path(sid)
+        existing = self._watch.get(sid)
+        if existing is not None:
+            if ctx is None or existing.get("engine") == ctx.engine:
+                return
+            # A cold history request may have registered before the resident
+            # engine was known. Correct the watcher once the real context exists.
+            self._watch.pop(sid, None)
+        if ctx is not None:
+            engine = ctx.engine
+            path = codex_rollout_path(sid) if engine == "codex" else transcript_path(sid)
+        else:
+            # A session can be evicted from the resident pool while still present
+            # in a browser. Resolve its store instead of silently parsing Codex as
+            # a Claude transcript on the next history request.
+            path = codex_rollout_path(sid)
+            engine = "codex" if path else "claude"
+            if path is None:
+                path = transcript_path(sid)
         if not path:
             return
         try:
-            size = os.path.getsize(path)
+            st = os.stat(path)
         except OSError:
             return
         if len(self._watch) >= self.WATCH_MAX:
-            self._watch.pop(next(iter(self._watch)), None)   # drop the oldest
-        self._watch[sid] = {"path": path, "size": size, "engine": engine,
-                            "external_ts": 0.0, "flagged": False}
-        log.info("watching transcript", session_id=sid, engine=engine, size=size)
+            victim = next(
+                (watched_sid for watched_sid in self._watch
+                 if not self._is_external(watched_sid)), None)
+            if victim is None:
+                log.warning("transcript watch cap reached; all watches are external",
+                            session_id=sid)
+                return
+            self._watch.pop(victim, None)
+        watch = {
+            "path": path, "size": st.st_size, "file_id": (st.st_dev, st.st_ino),
+            "engine": engine, "external_ts": 0.0, "flagged": False,
+        }
+        if engine == "codex":
+            own_turn_ids = set(
+                getattr(ctx.sdk, "owned_turn_ids", ())) if ctx is not None else set()
+            tail_active, tail_partial = self._codex_tail_state(path, st.st_size)
+            active_turns = {
+                turn_id: time.time()
+                for turn_id in tail_active
+                if turn_id not in own_turn_ids
+            }
+            watch.update({
+                "external": bool(active_turns),
+                "holders": set(),
+                "writers": set(),
+                "active_external_turns": active_turns,
+                # A cold tail cannot distinguish a live turn from a crashed old
+                # task_started record. The first complete /proc scan confirms it.
+                "seeded_external_turns": set(active_turns),
+                "pending_wrapper_turns": {},
+                "takeover_holders": set(),
+                "takeover_interactive_holders": set(),
+                "takeover_pending": None,
+                "partial": tail_partial,
+            })
+            if active_turns:
+                watch["external_ts"] = time.time()
+        self._watch[sid] = watch
+        log.info("watching transcript", session_id=sid, engine=engine, size=st.st_size)
+
+    def _codex_own_processes(self) -> set[ProcessIdentity]:
+        own: set[ProcessIdentity] = set()
+        for ctx in list(self.sessions.values()):
+            if ctx.engine != "codex":
+                continue
+            proc = getattr(ctx.sdk, "proc", None)
+            pid = getattr(proc, "pid", None)
+            if not isinstance(pid, int) or getattr(proc, "returncode", None) is not None:
+                continue
+            identity = process_identity(pid, parent_pid=os.getpid())
+            if identity is not None:
+                own.add(identity)
+        return own
+
+    def _codex_watch_paths(self, only_sid: Optional[str] = None) -> dict[str, str]:
+        return {
+            sid: w["path"] for sid, w in self._watch.items()
+            if w.get("engine") == "codex" and (only_sid is None or sid == only_sid)
+        }
+
+    async def _probe_codex_holders(self, paths: dict[str, str]):
+        initial_own = self._codex_own_processes()
+        scan = await asyncio.to_thread(
+            writable_rollout_holders, paths, initial_own)
+        # A reconnect can replace an app-server while /proc is being scanned.
+        # Remove both the initial and current exact child identities before the
+        # result is allowed to influence ownership.
+        current_own = self._codex_own_processes()
+        for holders in scan.holders.values():
+            holders.difference_update(initial_own)
+            holders.difference_update(current_own)
+        for holders in scan.passive_holders.values():
+            holders.difference_update(initial_own)
+            holders.difference_update(current_own)
+        if not scan.complete:
+            if not self._codex_probe_warned:
+                log.warning("codex rollout owner scan incomplete; preserving prior state")
+                self._codex_probe_warned = True
+        elif self._codex_probe_warned:
+            log.info("codex rollout owner scan recovered")
+            self._codex_probe_warned = False
+        return scan
+
+    @staticmethod
+    def _codex_holder_sets(
+        w: dict, scan, sid: str,
+    ) -> tuple[set[ProcessIdentity], set[ProcessIdentity]]:
+        """Return (interactive owners, all non-ignored external writers)."""
+        raw = set(scan.holders.get(sid, ()))
+        seeded: set[str] = w.setdefault("seeded_external_turns", set())
+        if seeded and scan.complete:
+            # A tail marker is only a cold-start candidate. Without any live
+            # foreign writer, an unmatched historical task_started is a crashed
+            # orphan and must not manufacture a fresh 60-second read-only lock.
+            if not raw:
+                active = w.setdefault("active_external_turns", {})
+                for turn_id in seeded:
+                    active.pop(turn_id, None)
+            seeded.clear()
+        ignored: set[ProcessIdentity] = w.setdefault("takeover_holders", set())
+        ignored_interactive: set[ProcessIdentity] = w.setdefault(
+            "takeover_interactive_holders", set())
+        if scan.complete:
+            # Exact start ticks make this safe against PID reuse. Once a captured
+            # process exits, a later process with the same PID is a new owner.
+            ignored.intersection_update(raw)
+            ignored_interactive.intersection_update(raw)
+        passive = set(scan.passive_holders.get(sid, ()))
+        writers = raw.difference(ignored)
+        return writers.difference(passive), writers
+
+    async def _prime_codex_ownership(self, sid: str) -> bool:
+        """Atomically consume growth and refresh one owner before History/Query."""
+        w = self._watch.get(sid)
+        if not w or w.get("engine") != "codex":
+            return False
+        async with self._codex_watch_lock:
+            scan = await self._probe_codex_holders({sid: w["path"]})
+            holders, writers = self._codex_holder_sets(w, scan, sid)
+            if not scan.complete:
+                holders.update(w.get("holders", ()))
+                writers.update(w.get("writers", ()))
+            await self._poll_codex_watch(
+                sid, w, holders, time.time(), writers=writers,
+                ownership_scan_complete=scan.complete)
+            return bool(w.get("external"))
+
+    @classmethod
+    def _codex_tail_state(cls, path: str, size: int) -> tuple[set[str], bytes]:
+        """Best-effort seed when a watch begins during an external Codex turn."""
+        try:
+            start = max(0, size - cls.CODEX_TAIL_READ_MAX)
+            with open(path, "rb") as stream:
+                stream.seek(start)
+                data = stream.read(cls.CODEX_TAIL_READ_MAX)
+        except OSError:
+            return set(), b""
+        if start:
+            _, separator, data = data.partition(b"\n")
+            if not separator:
+                return set(), b""
+        markers = parse_turn_markers(data)
+        # A Codex thread has one current turn. Historical crash/orphan starts can
+        # lack a matching terminal record, so set subtraction would resurrect an
+        # ancient turn forever. The last ordered lifecycle marker is authoritative.
+        active: set[str] = set()
+        for kind, turn_id in markers.ordered:
+            active = {turn_id} if kind == "task_started" else set()
+        return active, markers.partial
+
+    @classmethod
+    def _read_watch_growth(cls, path: str, offset: int, available: int) -> bytes:
+        with open(path, "rb") as stream:
+            stream.seek(offset)
+            return stream.read(min(max(0, available), cls.WATCH_READ_MAX))
+
+    async def _push_mirrored_history(self, sid: str) -> History:
+        hist = await self._build_history(sid, limit=self.MIRROR_LIMIT)
+        hist.sid = sid
+        await self.transport.send(hist)
+        return hist
+
+    @classmethod
+    def _remember_watch_turn(cls, bucket: dict[str, float], turn_id: str,
+                             seen_at: float) -> None:
+        bucket[turn_id] = seen_at
+        while len(bucket) > cls.CODEX_TURN_TRACK_MAX:
+            bucket.pop(next(iter(bucket)))
+
+    @staticmethod
+    def _revoke_codex_takeover(
+        w: dict,
+        holders: set[ProcessIdentity],
+        writers: set[ProcessIdentity],
+    ) -> None:
+        """Restore a captured owner once it produces a new external turn."""
+        captured = w.get("takeover_holders")
+        if not captured:
+            return
+        writers.update(captured)
+        holders.update(w.get("takeover_interactive_holders", ()))
+        captured.clear()
+        w["takeover_interactive_holders"].clear()
+
+    @staticmethod
+    def _grant_codex_takeover(
+        w: dict,
+        holders: set[ProcessIdentity],
+        writers: set[ProcessIdentity],
+        *,
+        allowed_writers: Optional[set[ProcessIdentity]] = None,
+        allowed_interactive: Optional[set[ProcessIdentity]] = None,
+    ) -> None:
+        """Capture current owners and make Remote authoritative without killing."""
+        captured_writers = set(writers)
+        captured_interactive = set(holders)
+        if allowed_writers is not None:
+            captured_writers.intersection_update(allowed_writers)
+        if allowed_interactive is not None:
+            captured_interactive.intersection_update(allowed_interactive)
+        w.setdefault("takeover_holders", set()).update(captured_writers)
+        w.setdefault("takeover_interactive_holders", set()).update(
+            captured_interactive)
+        holders.difference_update(captured_interactive)
+        writers.difference_update(captured_writers)
+        w.setdefault("pending_wrapper_turns", {}).clear()
+        w["takeover_pending"] = None
+
+    async def _poll_codex_watch(
+        self, sid: str, w: dict, holders: set[ProcessIdentity], now: float,
+        *, writers: Optional[set[ProcessIdentity]] = None,
+        ownership_scan_complete: bool = True,
+    ) -> None:
+        if writers is None:
+            writers = set(holders)
+        was_external = bool(w.get("external"))
+        w["holders"] = holders
+        w["writers"] = writers
+        external_growth = False
+        takeover_cleared = False
+        takeover_clear_message: Optional[str] = None
+        data = b""
+        try:
+            st = await asyncio.to_thread(os.stat, w["path"])
+        except OSError:
+            return
+
+        pending_takeover = w.get("takeover_pending")
+        if pending_takeover:
+            new_writers = writers.difference(
+                pending_takeover.get("writers", ()))
+            if new_writers:
+                # A click authorizes one exact ownership epoch. A later process
+                # must never inherit that authority without another click. Only
+                # mutate after stat succeeds so every cancellation can notify UI.
+                w["takeover_pending"] = None
+                pending_takeover = None
+                takeover_cleared = True
+                takeover_clear_message = "终端出现了新的占用者，本次自动接管已取消，请重新点击接管"
+                log.info(
+                    "queued takeover cancelled by new holder",
+                    session_id=sid, new_holders=len(new_writers))
+
+        file_id = (st.st_dev, st.st_ino)
+        if file_id != w.get("file_id") or st.st_size < w["size"]:
+            # Codex is append-only. Rotation/truncation is itself an external
+            # mutation unless caused by a process we already classify as external;
+            # in either case the resident context must reload. Re-baseline at EOF
+            # to avoid replaying a potentially huge replacement as fresh turns.
+            w["file_id"] = file_id
+            w["size"] = st.st_size
+            w["partial"] = b""
+            w["active_external_turns"].clear()
+            w["pending_wrapper_turns"].clear()
+            if w.get("takeover_pending"):
+                takeover_cleared = True
+                takeover_clear_message = "会话文件已变化，本次自动接管已取消，请重新点击接管"
+            w["takeover_pending"] = None
+            external_growth = True
+        elif st.st_size > w["size"]:
+            data = await asyncio.to_thread(
+                self._read_watch_growth, w["path"], w["size"], st.st_size - w["size"])
+            w["size"] += len(data)
+
+        ctx = self._ctx_by_sid(sid)
+        sdk = ctx.sdk if ctx is not None else None
+        own_turn_ids = set(getattr(sdk, "owned_turn_ids", ())) if sdk else set()
+        active: dict[str, float] = w["active_external_turns"]
+        pending: dict[str, dict[str, object]] = w["pending_wrapper_turns"]
+        wrapper_may_own_turn = bool(
+            sdk is not None and (
+                getattr(sdk, "turn_start_pending", False)
+                or getattr(sdk, "turn_active", False)))
+
+        # app-server stdout and rollout writes are independent channels.  An own
+        # task_started record can win the race against the authoritative turn id.
+        # A synchronous turn/start RPC is already bounded by the app-server request
+        # timeout, so never replace that bound with the much shorter attribution
+        # grace. Automatic continuations have no pending RPC and use the grace.
+        # A live foreign holder bypasses either wait and is classified immediately.
+        # Also reconcile defensively against active: a delayed turn/start response
+        # may identify a marker after an earlier implementation already promoted it.
+        for turn_id in own_turn_ids:
+            active.pop(turn_id, None)
+        for turn_id, record in list(pending.items()):
+            seen_at = float(record.get("seen_at", now))
+            if turn_id in own_turn_ids:
+                pending.pop(turn_id, None)
+                continue
+            awaiting_rpc = bool(record.get("awaiting_rpc"))
+            rpc_finished_without_match = (
+                awaiting_rpc and not getattr(sdk, "turn_start_pending", False))
+            automatic_grace_expired = (
+                not awaiting_rpc
+                and now - seen_at >= self.CODEX_TURN_ATTRIBUTION_GRACE)
+            if (holders or not wrapper_may_own_turn
+                    or rpc_finished_without_match or automatic_grace_expired):
+                takeover = w.get("takeover_pending")
+                if takeover and turn_id not in takeover.get("turn_ids", ()):
+                    w["takeover_pending"] = None
+                    takeover_cleared = True
+                    takeover_clear_message = "终端开始了新回合，本次自动接管已取消，请重新点击接管"
+                self._revoke_codex_takeover(w, holders, writers)
+                if not bool(record.get("finished")):
+                    self._remember_watch_turn(active, turn_id, now)
+                pending.pop(turn_id, None)
+                external_growth = True
+
+        if data:
+            markers = parse_turn_markers(data, w.get("partial", b""))
+            w["partial"] = markers.partial
+            for turn_id in markers.started:
+                if turn_id in own_turn_ids:
+                    continue
+                if not holders and wrapper_may_own_turn:
+                    # Never guess an id merely because turn/start is pending: a
+                    # short terminal turn can race the final probe and disappear
+                    # before the next holder scan. Only the RPC response or an
+                    # app-server turn/started notification is authoritative.
+                    pending.setdefault(turn_id, {
+                        "seen_at": now,
+                        "finished": False,
+                        "awaiting_rpc": bool(
+                            getattr(sdk, "turn_start_pending", False)),
+                    })
+                    while len(pending) > self.CODEX_TURN_TRACK_MAX:
+                        pending.pop(next(iter(pending)))
+                        # Losing an unclassified id must fail stale rather than
+                        # silently treating a potentially foreign turn as ours.
+                        external_growth = True
+                else:
+                    takeover = w.get("takeover_pending")
+                    if takeover and turn_id not in takeover.get("turn_ids", ()):
+                        w["takeover_pending"] = None
+                        takeover_cleared = True
+                        takeover_clear_message = "终端开始了新回合，本次自动接管已取消，请重新点击接管"
+                    # The captured terminal spoke again after manual takeover.
+                    # Restore interactive ownership; a headless app-server remains
+                    # governed by the active marker below.
+                    self._revoke_codex_takeover(w, holders, writers)
+                    self._remember_watch_turn(active, turn_id, now)
+                    external_growth = True
+            for turn_id in markers.finished:
+                if turn_id in pending:
+                    pending[turn_id]["finished"] = True
+                elif turn_id in active:
+                    external_growth = True
+                    active.pop(turn_id, None)
+
+            if holders or active:
+                external_growth = True
+            if external_growth:
+                for turn_id in active:
+                    active[turn_id] = now
+
+        if holders or (active and writers):
+            w["external_ts"] = now
+        elif external_growth:
+            w["external_ts"] = now
+        elif active and now - w["external_ts"] >= self.EXTERNAL_TTL:
+            # Fallback for a crashed short-lived writer that never recorded a
+            # terminal marker. A live writer's FD keeps the session locked.
+            active.clear()
+
+        # Clicking takeover during a live terminal response records the user's
+        # ownership intent immediately, but waits for that response to reach a
+        # terminal marker. This preserves the right to take over without allowing
+        # two app-servers to write the same thread concurrently.
+        pending_takeover = w.get("takeover_pending")
+        if (pending_takeover and ownership_scan_complete
+                and not active and not pending):
+            self._grant_codex_takeover(
+                w, holders, writers,
+                allowed_writers=set(pending_takeover.get("writers", ())),
+                allowed_interactive=set(
+                    pending_takeover.get("interactive", ())),
+            )
+            takeover_cleared = True
+            external_growth = True
+
+        # An interactive TUI owns the session even while idle. Headless app-server
+        # daemons are filtered from holders and lock only while an external turn's
+        # task_started marker remains unmatched.
+        is_external = bool(holders or active or w.get("takeover_pending"))
+        w["external"] = is_external
+        if (external_growth or (is_external and not was_external)) and ctx is not None:
+            ctx.needs_reload = True
+
+        if external_growth or is_external != was_external or takeover_cleared:
+            log.info(
+                "codex external ownership changed" if is_external != was_external
+                else "codex external rollout append -> mirroring",
+                session_id=sid,
+                external=is_external,
+                holders=len(holders),
+                active_turns=len(active),
+            )
+            await self._push_mirrored_history(sid)
+        if takeover_cleared and ctx is not None:
+            # This control frame follows History so a cancellation explanation is
+            # not immediately erased by the authoritative history refresh.
+            await self._emit(ctx, TakeoverState(
+                pending=False, message=takeover_clear_message))
+
+    async def _poll_claude_watch(self, sid: str, w: dict) -> None:
+        try:
+            size = await asyncio.to_thread(os.path.getsize, w["path"])
+        except OSError:
+            return
+        if size < w["size"]:
+            w["size"] = size
+            return
+        if size == w["size"]:
+            return
+        grew, w["size"] = size - w["size"], size
+        if self._own_write(sid):
+            return
+        w["external_ts"] = time.time()
+        w["flagged"] = True
+        ctx = self._ctx_by_sid(sid)
+        if ctx is not None:
+            ctx.external_ts = w["external_ts"]
+            ctx.needs_reload = True
+        log.info("external transcript append -> mirroring", session_id=sid,
+                 bytes=grew, resident=ctx is not None)
+        await self._push_mirrored_history(sid)
+
+    async def _poll_watches_once(self) -> None:
+        paths = self._codex_watch_paths()
+        if paths:
+            async with self._codex_watch_lock:
+                scan = await self._probe_codex_holders(paths)
+                now = time.time()
+                for sid, path in paths.items():
+                    w = self._watch.get(sid)
+                    if w is None or w.get("path") != path:
+                        continue
+                    holders, writers = self._codex_holder_sets(w, scan, sid)
+                    if not scan.complete:
+                        holders.update(w.get("holders", ()))
+                        writers.update(w.get("writers", ()))
+                    await self._poll_codex_watch(
+                        sid, w, holders, now, writers=writers,
+                        ownership_scan_complete=scan.complete)
+
+        for sid, w in list(self._watch.items()):
+            if w.get("engine") != "codex":
+                await self._poll_claude_watch(sid, w)
+
+        # Claude's activity heuristic requires an explicit unlock notification.
+        for sid, w in list(self._watch.items()):
+            if w.get("engine") == "codex":
+                continue
+            if not w.get("flagged") or self._is_external(sid):
+                continue
+            w["flagged"] = False
+            ctx = self._ctx_by_sid(sid)
+            if ctx is not None:
+                ctx.external_ts = 0.0
+            log.info("external window expired -> unlocking", session_id=sid)
+            await self._push_mirrored_history(sid)
 
     async def _watch_loop(self) -> None:
         """Mirror EXTERNAL appends to watched transcripts.
 
-        A native `claude`/`codex` in the user's terminal owns its session and appends
-        to the very .jsonl we read. Poll st_SIZE — NOT st_mtime: `claude --resume`
-        touches mtime without writing a single byte (verified), so mtime would
-        false-positive on every session we merely spawn. Growth we did not cause =>
-        an external writer => rebuild the history, broadcast it, and mark the session
-        read-only + stale (our resumed child's in-memory context has moved on)."""
+        Claude uses unattributed st_size growth (mtime is touched on resume without a
+        write). Codex uses a writable-holder scan plus turn-id attribution because its
+        own app-server keeps flushing rollout records after turn/completed. External
+        growth rebuilds history and marks the resident context stale before reuse."""
         while True:
             try:
                 await asyncio.sleep(1.5)
-                for sid, w in list(self._watch.items()):
-                    try:
-                        size = await asyncio.to_thread(os.path.getsize, w["path"])
-                    except OSError:
-                        continue
-                    if size < w["size"]:
-                        w["size"] = size   # truncated/rotated: re-baseline, else a stale
-                        continue           # larger baseline would swallow future appends
-                    if size == w["size"]:
-                        continue
-                    grew, w["size"] = size - w["size"], size
-                    if self._own_write(sid):
-                        continue                      # our own turn wrote it; live stream covers it
-                    w["external_ts"] = time.time()
-                    w["flagged"] = True
-                    ctx = self._ctx_by_sid(sid)
-                    if ctx is not None:
-                        ctx.external_ts = w["external_ts"]
-                        ctx.needs_reload = True       # resumed child now holds a stale context
-                    log.info("external transcript append -> mirroring", session_id=sid,
-                             bytes=grew, resident=ctx is not None)
-                    hist = await self._build_history(sid, limit=self.MIRROR_LIMIT)
-                    hist.sid = sid                    # tag with the MIRRORED session, not the focused one
-                    await self.transport.send(hist)   # broadcast; clients dedup by msg_id
-
-                # UNLOCK pass: the watcher only pushes on GROWTH, so once the terminal
-                # exits nothing would ever tell clients the session is writable again —
-                # their `external` would stay stuck true forever. When the window
-                # expires, push one History(external=false) to release the read-only UI.
-                for sid, w in list(self._watch.items()):
-                    if not w.get("flagged") or self._is_external(sid):
-                        continue
-                    w["flagged"] = False
-                    ctx = self._ctx_by_sid(sid)
-                    if ctx is not None:
-                        ctx.external_ts = 0.0
-                    log.info("external window expired -> unlocking", session_id=sid)
-                    hist = await self._build_history(sid, limit=self.MIRROR_LIMIT)
-                    hist.sid = sid
-                    await self.transport.send(hist)
+                await self._poll_watches_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -953,7 +1403,9 @@ class WrapperMachine:
         in_progress = bool(ctx is not None and ctx.state != "idle")
         events: list = []
         mdl = None
-        is_codex_hist = ctx is not None and ctx.engine == "codex"
+        watched_engine = (self._watch.get(sid) or {}).get("engine")
+        is_codex_hist = bool(
+            (ctx is not None and ctx.engine == "codex") or watched_engine == "codex")
         source_path = None
         try:
             source_path = await asyncio.to_thread(
@@ -973,6 +1425,8 @@ class WrapperMachine:
                     has_more=False,
                     before=before,
                     external=self._is_external(sid),
+                    takeover_pending=bool(
+                        (self._watch.get(sid) or {}).get("takeover_pending")),
                     in_progress=in_progress,
                 )
         except OSError:
@@ -1046,6 +1500,8 @@ class WrapperMachine:
                 oldest_id=(_tid(selected[0]) if selected else None),
                 newest_id=(_tid(selected[-1]) if selected else None),
                 external=self._is_external(sid),
+                takeover_pending=bool(
+                    (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
             )
 
@@ -1132,10 +1588,13 @@ class WrapperMachine:
     async def _handle_get_history(self, cmd) -> None:
         """Client opened a session: return its history as ONE bulk frame, routed to
         the requester — like a web chat's GET /conversation. Opening it also starts
-        MIRRORING its transcript, so appends made by a native `claude` in the user's
-        terminal stream through to every client (read-only)."""
+        MIRRORING its transcript, so appends made by a native Claude/Codex process
+        stream through to every client (read-only)."""
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         self._watch_session(sid)   # snapshot size before we read, so no append is missed
+        if (self._watch.get(sid) or {}).get("engine") == "codex":
+            # Do not leave a short writable window while waiting for the 1.5s poll.
+            await self._prime_codex_ownership(sid)
         hist = await self._build_history(
             sid, before=getattr(cmd, "before", None), limit=getattr(cmd, "limit", None),
             cwd_hint=getattr(cmd, "cwd", None))
@@ -1147,6 +1606,86 @@ class WrapperMachine:
         log.info("history sent", session_id=sid, events=len(hist.events),
                  has_more=hist.has_more, before=bool(hist.before),
                  external=hist.external, client_id=client_id)
+
+    async def _handle_takeover(self, cmd):
+        """Explicitly transfer a read-only terminal session back to Remote.
+
+        The exact current external process identities are ignored until they
+        exit. A later unknown task_started marker still re-locks the session, so
+        a terminal that speaks again becomes the newest owner without being
+        killed or silently racing forever.
+        """
+        sid = getattr(cmd, "sid", None)
+        ctx = self._ctx_for(sid)
+        if ctx is None:
+            error = Error(code=ERR_NOT_RUNNING, message="该会话未启动，无法接管")
+            await self._emit_to_sid(sid, error)
+            return error
+        if ctx.state != "idle":
+            error = Error(code=ERR_BUSY, message="该会话正在运行，当前无需接管")
+            await self._emit(ctx, error)
+            return error
+
+        resolved_sid = ctx.session_id or sid
+        if not resolved_sid:
+            error = Error(code=ERR_NOT_RUNNING, message="该会话尚无可接管的会话 ID")
+            await self._emit(ctx, error)
+            return error
+        self._watch_session(resolved_sid)
+        w = self._watch.get(resolved_sid)
+        if w is None:
+            error = Error(code=ERR_INTERNAL, message="无法读取该会话的终端状态")
+            await self._emit(ctx, error)
+            return error
+
+        if ctx.engine == "codex":
+            async with self._codex_watch_lock:
+                scan = await self._probe_codex_holders({resolved_sid: w["path"]})
+                if not scan.complete:
+                    error = Error(
+                        code=ERR_BUSY,
+                        message="终端状态扫描暂不完整，未执行接管，请重试",
+                    )
+                    await self._emit(ctx, error)
+                    return error
+                holders, writers = self._codex_holder_sets(
+                    w, scan, resolved_sid)
+                await self._poll_codex_watch(
+                    resolved_sid, w, holders, time.time(), writers=writers,
+                    ownership_scan_complete=scan.complete)
+                if w["active_external_turns"]:
+                    w["takeover_pending"] = {
+                        "writers": set(writers),
+                        "interactive": set(holders),
+                        "turn_ids": set(w["active_external_turns"]),
+                    }
+                    await self._emit(ctx, TakeoverState(
+                        pending=True,
+                        message=("已登记接管；当前回复结束后会自动交给 Remote。"
+                                 "若期间出现新终端或新回合，本次登记会安全取消"),
+                    ))
+                    log.info("session takeover queued behind external turn",
+                             session_id=resolved_sid)
+                    return None
+                self._grant_codex_takeover(w, holders, writers)
+                w["external"] = bool(holders)
+                ctx.needs_reload = True
+        else:
+            w["external_ts"] = 0.0
+            w["flagged"] = False
+            ctx.external_ts = 0.0
+            ctx.needs_reload = True
+
+        log.info("session manually taken over", session_id=resolved_sid,
+                 engine=ctx.engine)
+        # The browser stays read-only until this authoritative History arrives;
+        # queued sends cannot overtake the takeover command on the WebSocket.
+        await self._push_mirrored_history(resolved_sid)
+        # Takeover is at-most-once. Do not cache/replay an old external=false
+        # History: a new terminal owner may have appeared before an ACK-lost retry.
+        # The duplicate receives only its ACK; GetHistory or another explicit click
+        # can recover a response that was lost with the original WebSocket.
+        return None
 
     async def _handle_query(self, cmd):
         sid = getattr(cmd, "sid", None)
@@ -1166,6 +1705,16 @@ class WrapperMachine:
                 msg_id=getattr(cmd, "msg_id", None))
             await self._emit(ctx, error)
             return error
+        if ctx.engine == "codex" and ctx.session_id:
+            self._watch_session(ctx.session_id)
+            if await self._prime_codex_ownership(ctx.session_id):
+                error = Error(
+                    code=ERR_BUSY,
+                    message="该 Codex 会话正在被本机终端使用；请退出终端或点击『接管』",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
         if not cmd.prompt and not cmd.images and not cmd.files:
             error = Error(
                 code=ERR_BAD_PROMPT, message="empty prompt",
@@ -1497,6 +2046,58 @@ class WrapperMachine:
             log.exception("get_context_usage failed", error=str(e))
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"get_context failed: {e}"))
 
+    async def _goal_ctx(self, cmd):
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return None
+        if ctx.engine != "codex":
+            await self._emit(ctx, Error(
+                code=ERR_INTERNAL,
+                message="Claude SDK 没有 Codex thread goal API；不能伪造同名能力",
+            ))
+            return None
+        return ctx
+
+    async def _handle_get_goal(self, cmd) -> None:
+        ctx = await self._goal_ctx(cmd)
+        if ctx is None:
+            return
+        try:
+            event = GoalState(goal=await ctx.sdk.get_goal())
+            await self._emit(ctx, event)
+            return event
+        except Exception as e:
+            log.exception("get_goal failed", error=str(e))
+            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"get_goal failed: {e}"))
+
+    async def _handle_set_goal(self, cmd) -> None:
+        ctx = await self._goal_ctx(cmd)
+        if ctx is None:
+            return
+        try:
+            goal = await ctx.sdk.set_goal(
+                objective=cmd.objective, status=cmd.status,
+                token_budget=cmd.token_budget)
+            event = GoalState(goal=goal)
+            await self._emit(ctx, event)
+            return event
+        except Exception as e:
+            log.exception("set_goal failed", error=str(e))
+            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_goal failed: {e}"))
+
+    async def _handle_clear_goal(self, cmd) -> None:
+        ctx = await self._goal_ctx(cmd)
+        if ctx is None:
+            return
+        try:
+            await ctx.sdk.clear_goal()
+            event = GoalState(goal=None)
+            await self._emit(ctx, event)
+            return event
+        except Exception as e:
+            log.exception("clear_goal failed", error=str(e))
+            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"clear_goal failed: {e}"))
+
     async def _handle_get_diff(self, cmd) -> None:
         sid = getattr(cmd, "sid", None)
         ctx = self._ctx_for(sid)
@@ -1520,7 +2121,9 @@ class WrapperMachine:
 
     # ---- ask_user MCP tool (agent asks the user a multiple-choice question) ----
 
-    async def _on_ask(self, ctx: SessionContext, question: str, options: list[dict[str, str]]) -> str:
+    async def _on_ask(self, ctx: SessionContext, question: str,
+                      options: list[dict[str, str]], *, header: str | None = None,
+                      allow_text: bool = False, secret: bool = False) -> str:
         """Called by THIS ctx's in-process MCP server when the agent invokes
         `ask_user`. Emits AskUser on the ctx and blocks until AnswerQuestion.
         Runs in the ctx's reader task while its turn loop is blocked on
@@ -1532,7 +2135,8 @@ class WrapperMachine:
         # Validate model-originated text before registering a pending Future.
         # Otherwise a malformed/oversized AskUser raises during emit and leaves
         # an unreachable entry in pending_asks for the life of the session.
-        event = AskUser(ask_id=ask_id, question=question, options=options)
+        event = AskUser(ask_id=ask_id, question=question, options=options,
+                        header=header, allow_text=allow_text, secret=secret)
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         ctx.pending_asks[ask_id] = fut
@@ -1599,6 +2203,146 @@ class WrapperMachine:
             "拒绝": "decline",
             "取消": "cancel",
         }.get(answer, "decline")
+
+    async def _on_codex_interaction(self, ctx: SessionContext, method: str,
+                                    params: dict) -> dict:
+        if method == "item/permissions/requestApproval":
+            requested = params.get("permissions")
+            if not isinstance(requested, dict):
+                raise ValueError("permissions request is missing its profile")
+            detail = json.dumps(requested, ensure_ascii=False, indent=2)
+            reason = str(params.get("reason") or "").strip()
+            prompt = "Codex 请求额外权限：\n" + detail[:12000]
+            if reason:
+                prompt += "\n原因：" + reason[:1000]
+            answer = await self._on_ask(ctx, prompt, [
+                {"label": "允许本回合", "ds": "仅在当前回合授予这些权限"},
+                {"label": "允许本会话", "ds": "本会话后续保留这些权限"},
+                {"label": "拒绝", "ds": "不授予额外权限"},
+            ], header="权限审批")
+            if answer == "允许本回合":
+                return {"permissions": requested, "scope": "turn"}
+            if answer == "允许本会话":
+                return {"permissions": requested, "scope": "session"}
+            return {"permissions": {}, "scope": "turn"}
+
+        if method == "mcpServer/elicitation/request":
+            return await self._on_codex_mcp_elicitation(ctx, params)
+
+        if method != "item/tool/requestUserInput":
+            raise ValueError(f"unsupported codex interaction: {method}")
+        questions = params.get("questions")
+        if not isinstance(questions, list) or not 1 <= len(questions) <= 3:
+            raise ValueError("requestUserInput requires 1-3 questions")
+        answers: dict[str, dict[str, list[str]]] = {}
+        for question in questions:
+            if not isinstance(question, dict):
+                raise ValueError("invalid requestUserInput question")
+            question_id = question.get("id")
+            prompt = question.get("question")
+            if not isinstance(question_id, str) or not question_id:
+                raise ValueError("requestUserInput question id missing")
+            if not isinstance(prompt, str) or not prompt:
+                raise ValueError("requestUserInput question text missing")
+            raw_options = question.get("options") or []
+            options = []
+            for option in raw_options[:ASK_OPTION_MAX_COUNT]:
+                if isinstance(option, dict) and option.get("label"):
+                    options.append({"label": str(option["label"])[:512],
+                                    "ds": str(option.get("description") or "")[:2048]})
+            # The wire question card requires either 2+ choices or a text box.
+            # A one-option server payload is still answerable through text.
+            allow_text = bool(question.get("isOther")) or len(options) < 2
+            answer = await self._on_ask(
+                ctx, prompt, options, header=str(question.get("header") or "")[:512] or None,
+                allow_text=allow_text, secret=bool(question.get("isSecret")))
+            answers[question_id] = {"answers": [answer]}
+        return {"answers": answers}
+
+    async def _on_codex_mcp_elicitation(self, ctx: SessionContext,
+                                        params: dict) -> dict:
+        mode = params.get("mode")
+        message = str(params.get("message") or "MCP 服务请求输入")[:16000]
+        server = str(params.get("serverName") or "MCP")[:512]
+        if mode == "url":
+            url = str(params.get("url") or "")[:4096]
+            answer = await self._on_ask(ctx, f"{message}\n\n{url}", [
+                {"label": "已完成并继续", "ds": "我已在链接页面完成操作"},
+                {"label": "拒绝", "ds": "不继续这次 MCP 请求"},
+                {"label": "取消", "ds": "取消当前操作"},
+            ], header=f"{server} 请求网页操作")
+            return {"action": {"已完成并继续": "accept", "取消": "cancel"}.get(answer, "decline")}
+
+        schema = params.get("requestedSchema")
+        if not isinstance(schema, dict):
+            # openai/form schemas may be intentionally opaque. Preserve a usable
+            # accept/decline path instead of rejecting the server request.
+            answer = await self._on_ask(ctx, message, [
+                {"label": "接受", "ds": "继续此 MCP 表单请求"},
+                {"label": "拒绝", "ds": "拒绝此 MCP 表单请求"},
+            ], header=f"{server} 请求输入")
+            return {"action": "accept" if answer == "接受" else "decline"}
+        properties = schema.get("properties")
+        if not isinstance(properties, dict) or len(properties) > 32:
+            raise ValueError("invalid MCP elicitation schema")
+        required = set(schema.get("required") or [])
+        content = {}
+        for name, spec in properties.items():
+            if not isinstance(name, str) or not isinstance(spec, dict):
+                raise ValueError("invalid MCP elicitation field")
+            title = str(spec.get("title") or name)[:512]
+            question = str(spec.get("description") or title)[:16000]
+            values = spec.get("enum") or []
+            names = spec.get("enumNames") or []
+            options = [
+                {"label": str(names[i] if i < len(names) else value)[:512],
+                 "ds": str(value)[:2048]}
+                for i, value in enumerate(values[:5])
+            ]
+            answer = await self._on_ask(
+                ctx, question, options, header=f"{server} · {title}",
+                allow_text=len(options) < 2, secret=bool(spec.get("format") == "password"))
+            if not answer and name in required:
+                return {"action": "cancel"}
+            field_type = spec.get("type")
+            if field_type == "boolean":
+                content[name] = answer.lower() in {"true", "yes", "1", "是", "同意"}
+            elif field_type == "integer":
+                content[name] = int(answer)
+            elif field_type == "number":
+                content[name] = float(answer)
+            else:
+                # Map a display label back to its enum wire value when possible.
+                if answer in names:
+                    content[name] = values[names.index(answer)]
+                else:
+                    content[name] = answer
+        return {"action": "accept", "content": content}
+
+    async def _on_claude_tool_permission(self, ctx: SessionContext,
+                                         tool_name: str, tool_input: dict,
+                                         permission_context):
+        """Bridge Claude Agent SDK can_use_tool to the remote client."""
+        def short(value, limit: int = 1200) -> str:
+            text = str(value or "").strip()
+            return text if len(text) <= limit else text[:limit] + "…"
+
+        lines = [f"Claude 请求使用工具：{short(tool_name, 240)}"]
+        if tool_input:
+            try:
+                detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                detail = repr(tool_input)
+            lines.append(short(detail))
+        if getattr(permission_context, "suggestions", None):
+            lines.append("SDK 提供了可选权限建议；本次仅处理单次授权。")
+        answer = await self._on_ask(ctx, "\n".join(lines), [
+            {"label": "允许一次", "ds": "仅批准这一次工具调用"},
+            {"label": "拒绝", "ds": "拒绝这次工具调用"},
+        ])
+        if answer == "允许一次":
+            return PermissionResultAllow()
+        return PermissionResultDeny(message="用户拒绝了远程工具授权")
 
     async def _handle_answer_question(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -2338,9 +3082,16 @@ class WrapperMachine:
                 lambda q, o: self._on_ask(ctx, q, o),
                 lambda m: self._on_set_mode(ctx, m),
             )
+            ctx.sdk.permission_callback = (
+                lambda tool, tool_input, permission_context:
+                self._on_claude_tool_permission(
+                    ctx, tool, tool_input, permission_context))
         else:
             ctx.sdk.approval_callback = (
                 lambda method, params: self._on_codex_approval(
+                    ctx, method, params))
+            ctx.sdk.interaction_callback = (
+                lambda method, params: self._on_codex_interaction(
                     ctx, method, params))
 
         try:
@@ -2377,6 +3128,9 @@ class WrapperMachine:
         key = resume_id or f"tmp-{uuid4().hex}"
         self.sessions[key] = ctx
         ctx.key = key
+        if resume_id and engine == "codex":
+            self._watch_session(resume_id)
+            await self._prime_codex_ownership(resume_id)
         if resume_id and engine != "codex":
             save_session_id(self.cfg.state_dir, target_cwd, resume_id)
         await self._load_history(ctx, resume_id)
@@ -2445,10 +3199,17 @@ class WrapperMachine:
                 lambda q, o: self._on_ask(ctx, q, o),
                 lambda m: self._on_set_mode(ctx, m),
             )
+            ctx.sdk.permission_callback = (
+                lambda tool, tool_input, permission_context:
+                self._on_claude_tool_permission(
+                    ctx, tool, tool_input, permission_context))
         else:
             ctx.sdk.approval = parent.sdk.approval
             ctx.sdk.approval_callback = (
                 lambda method, params: self._on_codex_approval(
+                    ctx, method, params))
+            ctx.sdk.interaction_callback = (
+                lambda method, params: self._on_codex_interaction(
                     ctx, method, params))
         try:
             await ctx.sdk.connect(resume_id=parent_id, cwd=parent.cwd, fork=True)
@@ -2804,6 +3565,69 @@ class WrapperMachine:
                     # codex: images -> private temp dir -> localImage items; files already
                     # referenced by path in the prompt text above.
                     img_paths = self._stash_images(images, temp_dir) if images else []
+                    # Keep the final ownership check adjacent to turn/start. A
+                    # short native turn can finish between the earlier reload and
+                    # this probe: no holder remains, but consuming its markers sets
+                    # needs_reload. Reconnect once, then probe again before sending.
+                    if ctx.session_id:
+                        external = await self._prime_codex_ownership(ctx.session_id)
+                        if (ctx.interrupt_event.is_set()
+                                or ctx.state == "interrupting"):
+                            await self._emit(ctx, TurnEnd(result=TurnResult(
+                                subtype="error_during_execution",
+                                duration_ms=0,
+                                is_error=True,
+                            )))
+                            await self._set_state(ctx, "idle")
+                            return
+                        if external:
+                            await self._emit(ctx, Error(
+                                code=ERR_BUSY,
+                                message=("该 Codex 会话刚被本机终端打开，本次发送已取消；"
+                                         "请退出终端或点击『接管』后重试"),
+                                msg_id=ctx.active_msg_id,
+                            ))
+                            await self._set_state(ctx, "idle")
+                            return
+                        if ctx.needs_reload:
+                            log.info(
+                                "reloading session after external transcript change "
+                                "found at final preflight",
+                                sid=ctx.session_id,
+                            )
+                            await ctx.sdk.force_reconnect(
+                                resume_id=ctx.session_id, cwd=ctx.cwd,
+                                reason="external transcript change at final preflight",
+                            )
+                            ctx.needs_reload = False
+                            if (ctx.interrupt_event.is_set()
+                                    or ctx.state == "interrupting"):
+                                await self._emit(ctx, TurnEnd(result=TurnResult(
+                                    subtype="error_during_execution",
+                                    duration_ms=0,
+                                    is_error=True,
+                                )))
+                                await self._set_state(ctx, "idle")
+                                return
+                            external = await self._prime_codex_ownership(ctx.session_id)
+                            if (ctx.interrupt_event.is_set()
+                                    or ctx.state == "interrupting"):
+                                await self._emit(ctx, TurnEnd(result=TurnResult(
+                                    subtype="error_during_execution",
+                                    duration_ms=0,
+                                    is_error=True,
+                                )))
+                                await self._set_state(ctx, "idle")
+                                return
+                            if external or ctx.needs_reload:
+                                await self._emit(ctx, Error(
+                                    code=ERR_BUSY,
+                                    message=("该 Codex 会话在重载期间又被本机终端更新，"
+                                             "本次发送已取消；请退出终端或点击『接管』后重试"),
+                                    msg_id=ctx.active_msg_id,
+                                ))
+                                await self._set_state(ctx, "idle")
+                                return
                     await ctx.sdk.query(prompt, images=img_paths)
                 elif images:
                     content: list = []

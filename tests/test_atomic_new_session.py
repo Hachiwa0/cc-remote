@@ -1,4 +1,4 @@
-"""Zero-token tests for protocol-v4 atomic new-session first queries."""
+"""Zero-token tests for protocol-v5 atomic new-session first queries."""
 from __future__ import annotations
 
 import asyncio
@@ -19,8 +19,8 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
-def test_protocol_v4_new_session_query_roundtrip_and_validation():
-    assert PROTOCOL_VERSION == 4
+def test_protocol_v5_new_session_query_roundtrip_and_validation():
+    assert PROTOCOL_VERSION == 5
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",

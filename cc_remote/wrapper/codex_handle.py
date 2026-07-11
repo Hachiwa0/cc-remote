@@ -23,9 +23,10 @@ import re
 import signal
 import shutil
 import subprocess
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_sessions import codex_model, codex_effort, codex_context_window
@@ -41,8 +42,10 @@ _MAX_CODEX_CANDIDATES = 16
 _MAX_STANDALONE_CANDIDATES = 6
 _MAX_NVM_CANDIDATES = 3
 _CODEX_VERSION_TIMEOUT = 5
+_OWNED_TURN_IDS_MAX = 512
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
+InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
 
 _NEW_APPROVAL_METHODS = frozenset({
     "item/commandExecution/requestApproval",
@@ -51,6 +54,11 @@ _NEW_APPROVAL_METHODS = frozenset({
 _LEGACY_APPROVAL_METHODS = frozenset({
     "execCommandApproval",
     "applyPatchApproval",
+})
+_INTERACTION_METHODS = frozenset({
+    "item/tool/requestUserInput",
+    "item/permissions/requestApproval",
+    "mcpServer/elicitation/request",
 })
 _APPROVAL_DECISIONS = frozenset({"accept", "acceptForSession", "decline", "cancel"})
 _LEGACY_DECISIONS = {
@@ -151,11 +159,18 @@ def _codex_env(bin_path: str) -> dict:
 
 class CodexHandle:
     def __init__(self, cfg, cwd: Optional[str] = None,
-                 approval_callback: Optional[ApprovalCallback] = None):
+                 approval_callback: Optional[ApprovalCallback] = None,
+                 interaction_callback: Optional[InteractionCallback] = None):
         self.cfg = cfg
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
         self.turn_id: Optional[str] = None
+        self.turn_start_pending = False
+        self.turn_active = False
+        # turn/start ids produced by this wrapper. Codex can flush a rollout for
+        # tens of seconds after turn/completed; retaining ids lets the transcript
+        # watcher attribute those late records to us instead of to a terminal.
+        self._owned_turn_ids: OrderedDict[str, None] = OrderedDict()
         self._cwd = cwd
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
@@ -173,6 +188,7 @@ class CodexHandle:
         self._generation = 0
         self._dead = False
         self.approval_callback = approval_callback
+        self.interaction_callback = interaction_callback
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
         # per-session codex settings, applied on thread/start + turn/start — the
@@ -260,9 +276,33 @@ class CodexHandle:
             params["effort"] = self.effort
         if self.service_tier:
             params["serviceTier"] = self.service_tier   # codex Fast mode
-        res = await self._request("turn/start", params)
+        # Mark the turn active before awaiting the RPC.  app-server may dispatch
+        # turn/completed immediately after the response, before this coroutine is
+        # scheduled again; setting this afterwards would resurrect a completed
+        # turn and leave ownership attribution stuck on "ours".
+        self.turn_active = True
+        self.turn_start_pending = True
+        try:
+            res = await self._request("turn/start", params)
+        except BaseException:
+            self.turn_active = False
+            raise
+        finally:
+            self.turn_start_pending = False
         turn = (res or {}).get("turn") or {}
         self.turn_id = turn.get("id")
+        if self.turn_id:
+            self.remember_owned_turn_id(self.turn_id)
+
+    def remember_owned_turn_id(self, turn_id: str) -> None:
+        self._owned_turn_ids[turn_id] = None
+        self._owned_turn_ids.move_to_end(turn_id)
+        while len(self._owned_turn_ids) > _OWNED_TURN_IDS_MAX:
+            self._owned_turn_ids.popitem(last=False)
+
+    @property
+    def owned_turn_ids(self) -> frozenset[str]:
+        return frozenset(self._owned_turn_ids)
 
     async def receive_response(self):
         """Async-gen of this turn's raw notification dicts, ending at turn/completed."""
@@ -278,6 +318,7 @@ class CodexHandle:
         finally:
             if self._turn_q is q:
                 self._turn_q = None
+            self.turn_active = False
 
     async def interrupt(self) -> None:
         if self.proc and self.thread_id and self.turn_id:
@@ -339,6 +380,8 @@ class CodexHandle:
                 fut.set_exception(RuntimeError("codex app-server disconnected"))
         self._pending.clear()
         self.turn_id = None
+        self.turn_start_pending = False
+        self.turn_active = False
 
     async def force_reconnect(self, resume_id: Optional[str], cwd: Optional[str] = None,
                               reason: str = "reconnect") -> None:
@@ -363,6 +406,34 @@ class CodexHandle:
             raise ValueError(f"unsupported codex approval policy: {mode}")
         self.approval = mode
         log.info("codex approval set (applies next turn)", approval=mode)
+
+    async def get_goal(self) -> Optional[dict]:
+        assert self.thread_id, "connect() first"
+        result = await self._request("thread/goal/get", {"threadId": self.thread_id})
+        goal = (result or {}).get("goal")
+        return goal if isinstance(goal, dict) else None
+
+    async def set_goal(self, *, objective: Optional[str] = None,
+                       status: Optional[str] = None,
+                       token_budget: Optional[int] = None) -> dict:
+        assert self.thread_id, "connect() first"
+        params = {"threadId": self.thread_id}
+        if objective is not None:
+            params["objective"] = objective
+        if status is not None:
+            params["status"] = status
+        if token_budget is not None:
+            params["tokenBudget"] = token_budget
+        result = await self._request("thread/goal/set", params)
+        goal = (result or {}).get("goal")
+        if not isinstance(goal, dict):
+            raise RuntimeError("codex app-server did not return a goal")
+        return goal
+
+    async def clear_goal(self) -> bool:
+        assert self.thread_id, "connect() first"
+        result = await self._request("thread/goal/clear", {"threadId": self.thread_id})
+        return bool((result or {}).get("cleared"))
 
     async def get_context_usage(self) -> dict:
         # Real shape (verified, gpt-5.5): tokenUsage = {last:{totalTokens,…},
@@ -445,12 +516,30 @@ class CodexHandle:
         if not isinstance(method, str):
             await self._respond_error(rid, -32600, "invalid server request")
             return
-        if method not in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS:
+        if method not in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS | _INTERACTION_METHODS:
             log.warning("unsupported codex server request; rejecting", method=method)
             await self._respond_error(rid, -32601, f"unsupported server request: {method}")
             return
         if not isinstance(params, dict):
             await self._respond_error(rid, -32602, f"invalid params for {method}")
+            return
+
+        if method in _INTERACTION_METHODS:
+            callback = self.interaction_callback
+            if callback is None:
+                await self._respond_error(rid, -32000, "remote interaction callback unavailable")
+                return
+            try:
+                result = await asyncio.wait_for(
+                    callback(method, params), timeout=_APPROVAL_TIMEOUT)
+            except asyncio.TimeoutError:
+                await self._respond_error(rid, -32001, "remote user input timed out")
+                return
+            except Exception as exc:
+                log.warning("codex interaction callback failed", method=method, error=str(exc))
+                await self._respond_error(rid, -32000, "remote user input failed")
+                return
+            await self._respond(rid, result)
             return
 
         decision = await self._approval_decision(method, params)
@@ -551,6 +640,16 @@ class CodexHandle:
         method = m.get("method")
         if method == "thread/started" and not self.thread_id:
             self.thread_id = _thread_id_of_notif(m)
+        elif method == "turn/started":
+            # Automatic continuations can start without a new local turn/start
+            # response.  Remember the authoritative notification id so delayed
+            # rollout flushes are still attributed to this app-server.
+            turn = (m.get("params") or {}).get("turn") or {}
+            turn_id = turn.get("id")
+            if isinstance(turn_id, str) and turn_id:
+                self.turn_id = turn_id
+                self.remember_owned_turn_id(turn_id)
+            self.turn_active = True
         elif method == "thread/tokenUsage/updated":
             tu = (m.get("params") or {}).get("tokenUsage")
             if isinstance(tu, dict):
@@ -560,6 +659,8 @@ class CodexHandle:
                 mcw = tu.get("modelContextWindow")
                 if mcw:
                     self.context_window = mcw
+        if method == "turn/completed":
+            self.turn_active = False
         if self._turn_q is not None:
             queue = self._turn_q
             await queue.put(m)

@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -89,6 +89,9 @@ AskOptionDescription = Annotated[
 ]
 AskAnswerText = Annotated[
     str, StringConstraints(min_length=1, max_length=ASK_ANSWER_MAX_CHARS),
+]
+GoalStatus = Literal[
+    "active", "paused", "blocked", "usageLimited", "budgetLimited", "complete",
 ]
 
 
@@ -212,6 +215,27 @@ class Query(_Command):
 
 class Interrupt(_Command):
     type: Literal["interrupt"] = "interrupt"
+
+
+class Takeover(_Command):
+    """client -> wrapper: explicitly release a terminal read-only lock."""
+    type: Literal["takeover"] = "takeover"
+    sid: WireId
+    # v5 introduced takeover as an at-most-once ownership mutation. Unlike
+    # legacy commands, it has no compatibility reason to allow an unreliable
+    # envelope that can bypass wrapper deduplication.
+    cmd_id: WireId
+
+
+class TakeoverState(_Base):
+    """wrapper -> clients: transient status for an active-turn takeover intent.
+
+    This is a control frame, not transcript narrative, so it is never seq'd or
+    replayed after the intent has completed or been cancelled.
+    """
+    type: Literal["takeover_state"] = "takeover_state"
+    pending: bool
+    message: Optional[str] = Field(default=None, max_length=4096)
 
 
 class SetModel(_Command):
@@ -682,6 +706,9 @@ class History(_Base):
     # session READ-ONLY, since a cc session has a single owner and typing here would
     # fork the conversation. Additive + defaulted, so no PROTOCOL_VERSION bump.
     external: bool = False
+    # Authoritative current takeover intent. Unlike TakeoverState this survives
+    # a GetHistory refresh without becoming replayable transcript narrative.
+    takeover_pending: bool = False
     # True while the resident wrapper context is running/interrupting. Claude's
     # transcript has no ResultMessage, so the final History TurnEnd is synthetic;
     # clients must not let it close their matching live tail while this is true.
@@ -696,10 +723,16 @@ class AskUser(_Base):
     type: Literal["ask_user"] = "ask_user"
     ask_id: WireId
     question: AskQuestionText
-    options: list[AskOption] = Field(
-        min_length=ASK_OPTION_MIN_COUNT,
-        max_length=ASK_OPTION_MAX_COUNT,
-    )
+    header: Optional[str] = Field(default=None, max_length=512)
+    options: list[AskOption] = Field(default_factory=list, max_length=ASK_OPTION_MAX_COUNT)
+    allow_text: bool = False
+    secret: bool = False
+
+    @model_validator(mode="after")
+    def choices_or_text(self):
+        if not self.allow_text and len(self.options) < ASK_OPTION_MIN_COUNT:
+            raise ValueError("ask_user requires 2-5 options unless text input is enabled")
+        return self
 
 
 class AnswerQuestion(_Command):
@@ -710,10 +743,32 @@ class AnswerQuestion(_Command):
     answer: AskAnswerText
 
 
+class GetGoal(_Command):
+    type: Literal["get_goal"] = "get_goal"
+
+
+class SetGoal(_Command):
+    type: Literal["set_goal"] = "set_goal"
+    objective: Optional[str] = Field(default=None, max_length=16 * 1024)
+    status: Optional[GoalStatus] = None
+    token_budget: Optional[int] = Field(default=None, ge=1)
+
+
+class ClearGoal(_Command):
+    type: Literal["clear_goal"] = "clear_goal"
+
+
+class GoalState(_Base):
+    """Authoritative Codex thread goal. goal=None means no active goal."""
+    type: Literal["goal_state"] = "goal_state"
+    goal: Optional[dict[str, Any]] = None
+
+
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, History, Models, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
+    GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
@@ -731,6 +786,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "hello": Hello,
     "query": Query,
     "interrupt": Interrupt,
+    "takeover": Takeover,
+    "takeover_state": TakeoverState,
     "set_model": SetModel,
     "set_effort": SetEffort,
     "set_service_tier": SetServiceTier,
@@ -766,6 +823,10 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "history": History,
     "ask_user": AskUser,
     "answer_question": AnswerQuestion,
+    "get_goal": GetGoal,
+    "set_goal": SetGoal,
+    "clear_goal": ClearGoal,
+    "goal_state": GoalState,
     "session_list": SessionList,
     "session_focus": SessionFocus,
     "session_rekey": SessionRekey,

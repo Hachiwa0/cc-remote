@@ -275,6 +275,10 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs(), ...this.sidObj() });
   }
 
+  sendTakeover(sid: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "takeover", sid, ts: nowTs() });
+  }
+
   sendSetModel(model: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_model", model, ts: nowTs(), ...this.sidObj() });
   }
@@ -324,6 +328,22 @@ export class RelayWs {
 
   sendAnswerQuestion(askId: string, answer: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
+  }
+
+  sendGetGoal(): void {
+    this.send({ v: PROTOCOL_VERSION, type: "get_goal", ts: nowTs(), ...this.sidObj() });
+  }
+
+  sendSetGoal(objective: string | null, status: string | null, tokenBudget: number | null): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "set_goal", ts: nowTs(), ...this.sidObj() };
+    if (objective !== null) obj.objective = objective;
+    if (status !== null) obj.status = status;
+    if (tokenBudget !== null) obj.token_budget = tokenBudget;
+    this.send(obj);
+  }
+
+  sendClearGoal(): void {
+    this.send({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...this.sidObj() });
   }
 
   sendListSessions(engine?: "claude" | "codex"): void {

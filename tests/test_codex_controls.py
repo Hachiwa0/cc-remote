@@ -6,8 +6,9 @@ import stat
 from types import SimpleNamespace
 
 import pytest
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
-from cc_remote.protocol import Model, NewSession
+from cc_remote.protocol import GoalState, Model, NewSession
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
@@ -56,6 +57,13 @@ def test_codex_model_id_is_exact_through_wrapper_and_turn_start(model):
         await handle.query("which model")
         assert requests[-1][0] == "turn/start"
         assert requests[-1][1]["model"] == model
+        assert handle.owned_turn_ids == {"turn-model"}
+        assert handle.turn_active is True and handle.turn_start_pending is False
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-model", "status": "completed"}},
+        })
+        assert handle.turn_active is False
 
     asyncio.run(run())
 
@@ -107,6 +115,43 @@ def test_codex_app_server_uses_and_cleans_its_own_process_group(monkeypatch):
             (424242, codex_handle_module.signal.SIGTERM),
             (424242, codex_handle_module.signal.SIGKILL),
         ]
+
+    asyncio.run(run())
+
+
+def test_codex_turn_completion_before_start_waiter_does_not_resurrect_active():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "codex-fast-turn"
+
+        async def request(method, _params=None):
+            assert method == "turn/start"
+            await handle._dispatch({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "fast", "status": "completed"}},
+            })
+            return {"turn": {"id": "fast"}}
+
+        handle._request = request
+        await handle.query("fast")
+        assert handle.turn_start_pending is False
+        assert handle.turn_active is False
+        assert handle.owned_turn_ids == {"fast"}
+
+    asyncio.run(run())
+
+
+def test_codex_turn_started_notification_tracks_automatic_turn_id():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        await handle._dispatch({
+            "method": "turn/started",
+            "params": {"turn": {"id": "automatic"}},
+        })
+        assert handle.turn_id == "automatic"
+        assert handle.turn_active is True
+        assert handle.owned_turn_ids == {"automatic"}
 
     asyncio.run(run())
 
@@ -428,6 +473,176 @@ def test_machine_codex_approval_uses_ask_user_choices():
         ]
         assert "git clean -fd" in captured[0][0]
         assert "目录：/work" in captured[0][0]
+
+    asyncio.run(run())
+
+
+def test_machine_claude_tool_permission_allows_or_denies_once():
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("claude-1", "claude-1")
+        captured = []
+        answers = iter(["允许一次", "拒绝"])
+
+        async def ask(_ctx, question, options):
+            captured.append((question, options))
+            return next(answers)
+
+        machine._on_ask = ask  # type: ignore[method-assign]
+        context = SimpleNamespace(suggestions=[object()])
+        allowed = await machine._on_claude_tool_permission(
+            ctx, "Bash", {"command": "git status"}, context)
+        denied = await machine._on_claude_tool_permission(
+            ctx, "Write", {"file_path": "/tmp/a"}, context)
+
+        assert isinstance(allowed, PermissionResultAllow)
+        assert isinstance(denied, PermissionResultDeny)
+        assert [o["label"] for o in captured[0][1]] == ["允许一次", "拒绝"]
+        assert "Bash" in captured[0][0] and "git status" in captured[0][0]
+
+    asyncio.run(run())
+
+
+def test_claude_sdk_permission_callback_fails_closed_without_bridge():
+    async def run():
+        result = await SdkHandle(_Cfg())._can_use_tool(
+            "Bash", {"command": "rm -rf /tmp/x"}, SimpleNamespace())
+        assert isinstance(result, PermissionResultDeny)
+
+    asyncio.run(run())
+
+
+def test_codex_goal_rpc_uses_official_thread_api():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method.endswith("/get"):
+                return {"goal": None}
+            if method.endswith("/set"):
+                return {"goal": {"threadId": "thread-1", "objective": "ship", "status": "active", "tokensUsed": 0, "timeUsedSeconds": 0, "createdAt": 1, "updatedAt": 1}}
+            return {"cleared": True}
+
+        handle._request = request
+        assert await handle.get_goal() is None
+        goal = await handle.set_goal(objective="ship", status="active", token_budget=12000)
+        assert goal["objective"] == "ship"
+        assert await handle.clear_goal() is True
+        assert requests == [
+            ("thread/goal/get", {"threadId": "thread-1"}),
+            ("thread/goal/set", {"threadId": "thread-1", "objective": "ship", "status": "active", "tokenBudget": 12000}),
+            ("thread/goal/clear", {"threadId": "thread-1"}),
+        ]
+
+    asyncio.run(run())
+
+
+def test_machine_goal_emits_authoritative_state():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("goal-1", "goal-1")
+        ctx.engine = "codex"
+        goal = {"threadId": "goal-1", "objective": "finish", "status": "active", "tokensUsed": 2, "timeUsedSeconds": 3, "createdAt": 1, "updatedAt": 1}
+        ctx.sdk = SimpleNamespace(get_goal=lambda: None)
+
+        async def get_goal(): return goal
+        async def set_goal(**_kwargs): return goal
+        async def clear_goal(): return True
+        ctx.sdk.get_goal = get_goal
+        ctx.sdk.set_goal = set_goal
+        ctx.sdk.clear_goal = clear_goal
+        machine.sessions[ctx.key] = ctx
+        await machine._handle_get_goal(SimpleNamespace(sid=ctx.key))
+        await machine._handle_set_goal(SimpleNamespace(sid=ctx.key, objective="finish", status="active", token_budget=None))
+        await machine._handle_clear_goal(SimpleNamespace(sid=ctx.key))
+        states = [m for m in transport.sent if isinstance(m, GoalState)]
+        assert [state.goal for state in states] == [goal, goal, None]
+
+    asyncio.run(run())
+
+
+def test_codex_request_user_input_round_trips_all_answers():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        seen = []
+
+        async def interact(method, params):
+            seen.append((method, params))
+            return {"answers": {"name": {"answers": ["Nancy"]}}}
+
+        handle.interaction_callback = interact
+        response = await _dispatch_request(handle, "item/tool/requestUserInput", {
+            "threadId": "t", "turnId": "u", "itemId": "i",
+            "questions": [{"id": "name", "header": "名称", "question": "你的名字？"}],
+        })
+        assert response["result"] == {"answers": {"name": {"answers": ["Nancy"]}}}
+        assert seen[0][0] == "item/tool/requestUserInput"
+
+    asyncio.run(run())
+
+
+def test_machine_codex_request_user_input_supports_choice_text_and_secret():
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("codex-input", "codex-input")
+        calls = []
+        replies = iter(["A", "s3cr3t"])
+
+        async def ask(_ctx, question, options, **kwargs):
+            calls.append((question, options, kwargs))
+            return next(replies)
+
+        machine._on_ask = ask  # type: ignore[method-assign]
+        result = await machine._on_codex_interaction(ctx, "item/tool/requestUserInput", {
+            "questions": [
+                {"id": "pick", "header": "选择", "question": "选哪个？", "options": [{"label": "A", "description": "first"}]},
+                {"id": "token", "header": "密钥", "question": "请输入", "isSecret": True},
+            ],
+        })
+        assert result == {"answers": {"pick": {"answers": ["A"]}, "token": {"answers": ["s3cr3t"]}}}
+        assert calls[0][2]["allow_text"] is True
+        assert calls[1][2]["allow_text"] is True and calls[1][2]["secret"] is True
+
+    asyncio.run(run())
+
+
+def test_machine_codex_generic_permissions_preserve_requested_profile():
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("codex-perm", "codex-perm")
+        answers = iter(["允许本回合", "拒绝"])
+        machine._on_ask = lambda *_args, **_kwargs: _next_answer(answers)  # type: ignore[method-assign]
+        requested = {"network": {"enabled": True}}
+        allowed = await machine._on_codex_interaction(ctx, "item/permissions/requestApproval", {"permissions": requested})
+        denied = await machine._on_codex_interaction(ctx, "item/permissions/requestApproval", {"permissions": requested})
+        assert allowed == {"permissions": requested, "scope": "turn"}
+        assert denied == {"permissions": {}, "scope": "turn"}
+
+    async def _next_answer(iterator):
+        return next(iterator)
+
+    asyncio.run(run())
+
+
+def test_machine_codex_mcp_elicitation_form_returns_typed_content():
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("codex-mcp", "codex-mcp")
+        answers = iter(["Nancy", "3"])
+
+        async def ask(*_args, **_kwargs): return next(answers)
+        machine._on_ask = ask  # type: ignore[method-assign]
+        result = await machine._on_codex_interaction(ctx, "mcpServer/elicitation/request", {
+            "mode": "form", "serverName": "demo", "message": "configure",
+            "requestedSchema": {"type": "object", "properties": {
+                "name": {"type": "string", "title": "Name"},
+                "count": {"type": "integer", "title": "Count"},
+            }, "required": ["name"]},
+        })
+        assert result == {"action": "accept", "content": {"name": "Nancy", "count": 3}}
 
     asyncio.run(run())
 

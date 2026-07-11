@@ -13,6 +13,7 @@ import { NewChatView } from "./components/NewChatView";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
+import { GoalPanel } from "./components/GoalPanel";
 import { defaultModelFor, defaultEffortFor, permsFor } from "./data";
 import { shouldAcceptSessionList } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
@@ -76,6 +77,12 @@ export default function App() {
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const allQueued = collectWaitingQueries(state.runtimes);
   const replaceableQueued = collectWaitingQueries(state.runtimes, focusedSid);
+
+  useEffect(() => {
+    if (focusedSid && engine === "codex" && state.connState === "connected") {
+      wsRef.current?.sendGetGoal();
+    }
+  }, [focusedSid, engine, state.connState]);
 
   // HttpOnly cookies can't be inspected from JS. Ask the relay whether this
   // browser session is still registered before opening a WebSocket; this also
@@ -647,6 +654,10 @@ export default function App() {
               onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_PAGE); }}
               onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
 
+            {engine === "codex" && <GoalPanel goal={rt.goal}
+              onSave={(objective, status, budget) => wsRef.current?.sendSetGoal(objective, status, budget)}
+              onClear={() => wsRef.current?.sendClearGoal()} />}
+
             <Composer
           state={rt.state}
           catalog={state.catalog}
@@ -662,7 +673,9 @@ export default function App() {
           perm={rt.perm}
           fast={rt.fast}
           external={rt.external}
-          onTakeover={() => { if (focusedSid) dispatch({ type: "clear_external", sid: focusedSid }); }}
+          takeoverPending={rt.takeoverPending}
+          takeoverMessage={rt.takeoverMessage}
+          onTakeover={() => { if (focusedSid) wsRef.current?.sendTakeover(focusedSid); }}
           engine={engine}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
@@ -701,8 +714,11 @@ export default function App() {
       })()}
       {rt.pendingQuestion && (
         <QuestionSheet
+          header={rt.pendingQuestion.header}
           question={rt.pendingQuestion.question}
           options={rt.pendingQuestion.options}
+          allowText={rt.pendingQuestion.allow_text}
+          secret={rt.pendingQuestion.secret}
           onAnswer={(answer) => {
             wsRef.current?.sendAnswerQuestion(rt.pendingQuestion!.ask_id, answer);
             dispatch({ type: "answer_question" });

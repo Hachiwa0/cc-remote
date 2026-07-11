@@ -15,6 +15,7 @@ from cc_remote.protocol import (
     GetDiff,
     GetModels,
     NewSession,
+    PROTOCOL_VERSION,
     ProtocolError,
     Query,
     SetEffort,
@@ -48,7 +49,7 @@ def test_nested_attachment_unknown_fields_are_rejected_without_reflection(
     sentinel = "UNTRUSTED_ATTACHMENT_PADDING"
     attachment["padding"] = sentinel
     raw = json.dumps({
-        "v": 4,
+        "v": PROTOCOL_VERSION,
         "type": "query",
         "prompt": "inspect",
         "msg_id": "msg-1",
@@ -80,7 +81,7 @@ def test_surrogate_filename_is_a_clean_validation_error():
     assert "filename" in validate_attachments([], [invalid])
 
     raw = json.dumps({
-        "v": 4,
+        "v": PROTOCOL_VERSION,
         "type": "query",
         "prompt": "inspect",
         "msg_id": "msg-1",

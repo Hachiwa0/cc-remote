@@ -156,10 +156,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **从协议 v3 升级到 v4**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **从协议 v4 升级到 v5**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
-> v3 页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
+> v4 页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v5 relay 和
+> v5 wrapper；这样旧 wrapper 不会占住 relay 的单连接槽。
 
 ### 3）停服维护窗口内，从 staging 发布到 VPS
 
@@ -169,7 +171,7 @@ rsync -av --delete --exclude='.git' --exclude='.venv' \
   --exclude='web/node_modules' --exclude='.env' \
   ./ <vps-user>@<vps>:~/cc-remote-upload/
 
-# VPS：协议 v4 的 Python + web/dist 在停服窗口一起发布，避免混跑
+# VPS：协议 v5 的 Python + web/dist 在停服窗口一起发布，避免混跑
 ssh <vps-user>@<vps>
 sudo systemctl stop cc-remote-relay 2>/dev/null || true
 sudo mkdir -p /opt/cc-remote
