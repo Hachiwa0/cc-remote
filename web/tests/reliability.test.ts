@@ -26,7 +26,129 @@ import {
 } from "../src/protocol.ts";
 import { RelayWs } from "../src/ws.ts";
 import { modelsFor } from "../src/data.ts";
+import {
+  createMobileViewportSync,
+  type MobileViewportBindings,
+  type MobileViewportEvent,
+  type ViewportReading,
+} from "../src/use-mobile-viewport.ts";
 import type { ServerEvent } from "../src/protocol.ts";
+
+const viewportListeners = new Map<MobileViewportEvent, Set<() => void>>();
+const viewportCss = new Map<string, string>();
+const viewportFrames = new Map<number, () => void>();
+const viewportDelays = new Map<number, () => void>();
+let nextViewportTaskId = 1;
+let viewportReading: ViewportReading = {
+  height: 844, layoutHeight: 844, offsetTop: 0, scale: 1,
+};
+let editableFocused = false;
+let layoutScrollResets = 0;
+const viewportBindings: MobileViewportBindings = {
+  readViewport: () => viewportReading,
+  setCssProperty: (name, value) => { viewportCss.set(name, value); },
+  clearCssProperty: (name) => { viewportCss.delete(name); },
+  listen: (event, listener) => {
+    const listeners = viewportListeners.get(event) ?? new Set();
+    listeners.add(listener);
+    viewportListeners.set(event, listeners);
+    return () => listeners.delete(listener);
+  },
+  requestFrame: (listener) => {
+    const id = nextViewportTaskId++;
+    viewportFrames.set(id, listener);
+    return id;
+  },
+  cancelFrame: (id) => { viewportFrames.delete(id); },
+  setDelay: (listener) => {
+    const id = nextViewportTaskId++;
+    viewportDelays.set(id, listener);
+    return id;
+  },
+  clearDelay: (id) => { viewportDelays.delete(id); },
+  isEditableFocused: () => editableFocused,
+  resetLayoutScroll: () => { layoutScrollResets += 1; },
+};
+const flushViewportFrames = () => {
+  const frames = [...viewportFrames.values()];
+  viewportFrames.clear();
+  for (const frame of frames) frame();
+};
+const emitViewport = (event: MobileViewportEvent) => {
+  for (const listener of viewportListeners.get(event) ?? []) listener();
+};
+
+const stopViewportSync = createMobileViewportSync(viewportBindings);
+assert.equal(viewportCss.get("--app-height"), "844px");
+assert.equal(viewportCss.get("--app-offset-top"), "0px");
+assert.equal(viewportCss.get("--keyboard-inset"), "0px");
+
+viewportReading = { height: 510.25, layoutHeight: 844, offsetTop: 0, scale: 1 };
+emitViewport("viewport-resize");
+assert.equal(viewportCss.get("--app-height"), "844px");
+flushViewportFrames();
+assert.equal(viewportCss.get("--app-height"), "510.25px");
+assert.equal(viewportCss.get("--keyboard-inset"), "333.75px");
+
+viewportReading = { height: 500, layoutHeight: 844, offsetTop: 24, scale: 1 };
+emitViewport("viewport-scroll");
+flushViewportFrames();
+assert.equal(viewportCss.get("--app-height"), "500px");
+assert.equal(viewportCss.get("--app-offset-top"), "24px");
+assert.equal(viewportCss.get("--keyboard-inset"), "320px");
+
+// Pinch zoom remains user-controlled and must not be treated as a keyboard.
+viewportReading = { height: 420, layoutHeight: 844, offsetTop: 30, scale: 1.5 };
+emitViewport("viewport-resize");
+flushViewportFrames();
+assert.equal(viewportCss.get("--app-offset-top"), "0px");
+assert.equal(viewportCss.get("--keyboard-inset"), "0px");
+
+// Safari can report its pre-blur viewport for a few animation frames. Delayed
+// settling rereads it and clears only the layout-level focus pan.
+viewportReading = { height: 844, layoutHeight: 844, offsetTop: 0, scale: 1 };
+emitViewport("focus-out");
+assert.equal(viewportDelays.size, 2);
+flushViewportFrames();
+for (const delayed of [...viewportDelays.values()]) delayed();
+viewportDelays.clear();
+flushViewportFrames();
+assert.equal(layoutScrollResets, 2);
+assert.equal(viewportCss.get("--app-height"), "844px");
+
+editableFocused = true;
+emitViewport("orientation-change");
+for (const delayed of [...viewportDelays.values()]) delayed();
+viewportDelays.clear();
+flushViewportFrames();
+assert.equal(layoutScrollResets, 2);
+editableFocused = false;
+
+// Repeated keyboard cycles must always settle back to the full viewport instead
+// of accumulating height, offset, or bottom-inset drift.
+for (let cycle = 0; cycle < 10; cycle += 1) {
+  viewportReading = { height: 508, layoutHeight: 844, offsetTop: 18, scale: 1 };
+  emitViewport("viewport-resize");
+  flushViewportFrames();
+  viewportReading = { height: 844, layoutHeight: 844, offsetTop: 0, scale: 1 };
+  emitViewport("focus-out");
+  flushViewportFrames();
+  for (const delayed of [...viewportDelays.values()]) delayed();
+  viewportDelays.clear();
+  flushViewportFrames();
+  assert.equal(viewportCss.get("--app-height"), "844px");
+  assert.equal(viewportCss.get("--app-offset-top"), "0px");
+  assert.equal(viewportCss.get("--keyboard-inset"), "0px");
+}
+assert.equal(layoutScrollResets, 22);
+
+stopViewportSync();
+assert.equal(viewportCss.has("--app-height"), false);
+assert.equal(viewportCss.has("--app-offset-top"), false);
+assert.equal(viewportCss.has("--keyboard-inset"), false);
+assert.equal(viewportFrames.size, 0);
+assert.equal(viewportDelays.size, 0);
+for (const listeners of viewportListeners.values()) assert.equal(listeners.size, 0);
 
 assert.equal(shouldSubmitTextKey({
   key: "Enter", shiftKey: false, isComposing: false, keyCode: 13,
