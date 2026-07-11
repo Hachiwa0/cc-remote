@@ -30,18 +30,18 @@ function Row({ label, children, mono = false }: { label: string; children: React
 
 function RateWindow({ name, window }: { name: string; window?: StatusRateWindow | null }) {
   if (!window) return null;
-  const pct = Math.max(0, Math.min(100, window.used_percent));
+  const pct = window.used_percent == null ? null : Math.max(0, Math.min(100, window.used_percent));
   return <div className="status-rate-window">
-    <div><span>{name}</span><b>{pct}% 已用</b></div>
-    <i><span style={{ width: `${pct}%` }} /></i>
+    <div><span>{name}</span><b>{pct == null ? "—" : `${pct}% 已用`}</b></div>
+    <i><span style={{ width: `${pct ?? 0}%` }} /></i>
     <small>{window.window_duration_mins ? `${window.window_duration_mins} 分钟窗口` : "滚动窗口"} · {resetTime(window.resets_at)} 重置</small>
   </div>;
 }
 
 function RateLimit({ limit }: { limit: StatusRateLimit }) {
   return <div className="status-rate-card">
-    <div className="status-rate-head"><b>{limit.name || limit.limit_id || "Codex"}</b><span>{limit.plan_type || "—"}</span></div>
-    {limit.reached && <div className="status-rate-warning">{limit.reached}</div>}
+    <div className="status-rate-head"><b>{limit.limit_name || limit.limit_id || "Codex"}</b><span>{limit.plan_type || "—"}</span></div>
+    {limit.rate_limit_reached_type && <div className="status-rate-warning">{limit.rate_limit_reached_type}</div>}
     <RateWindow name="主要限额" window={limit.primary} />
     <RateWindow name="次要限额" window={limit.secondary} />
   </div>;

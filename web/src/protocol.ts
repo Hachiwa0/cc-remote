@@ -183,8 +183,8 @@ export interface StatusRuntime {
 }
 export interface StatusContext { used_tokens?: number | null; max_tokens?: number | null; percentage?: number | null }
 export interface StatusAccount { auth_type: string; plan_type?: string | null; requires_openai_auth: boolean }
-export interface StatusRateWindow { used_percent: number; resets_at?: number | null; window_duration_mins?: number | null }
-export interface StatusRateLimit { limit_id?: string | null; name?: string | null; plan_type?: string | null; reached?: string | null; primary?: StatusRateWindow | null; secondary?: StatusRateWindow | null }
+export interface StatusRateWindow { used_percent?: number | null; resets_at?: number | null; window_duration_mins?: number | null }
+export interface StatusRateLimit { limit_id?: string | null; limit_name?: string | null; plan_type?: string | null; rate_limit_reached_type?: string | null; primary?: StatusRateWindow | null; secondary?: StatusRateWindow | null }
 export interface StatusUsage { lifetime_tokens?: number | null; current_streak_days?: number | null; longest_streak_days?: number | null; peak_daily_tokens?: number | null; longest_running_turn_sec?: number | null }
 export interface StatusReport extends Base {
   type: "status_report";
