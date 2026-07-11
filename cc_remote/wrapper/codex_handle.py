@@ -49,6 +49,7 @@ _STATUS_RATE_LIMIT_MAX = 16
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
 GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
+TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
 
 _NEW_APPROVAL_METHODS = frozenset({
     "item/commandExecution/requestApproval",
@@ -164,7 +165,8 @@ class CodexHandle:
     def __init__(self, cfg, cwd: Optional[str] = None,
                  approval_callback: Optional[ApprovalCallback] = None,
                  interaction_callback: Optional[InteractionCallback] = None,
-                 goal_callback: Optional[GoalCallback] = None):
+                 goal_callback: Optional[GoalCallback] = None,
+                 turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None):
         self.cfg = cfg
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
@@ -194,6 +196,7 @@ class CodexHandle:
         self.approval_callback = approval_callback
         self.interaction_callback = interaction_callback
         self.goal_callback = goal_callback
+        self.turn_lifecycle_callback = turn_lifecycle_callback
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
         self.app_server_version: Optional[str] = None
@@ -201,6 +204,11 @@ class CodexHandle:
         self.last_rate_limits: Optional[dict] = None
         self.last_rate_limits_by_id: dict[str, dict] = {}
         self.last_goal: Optional[dict[str, Any]] = None
+        # A goal/automatic continuation can start without query(), hence without
+        # a response queue owned by Machine._run_turn.  Track that one turn
+        # separately so the machine can lock the session, expose interrupt, and
+        # return to idle at its authoritative turn/completed notification.
+        self._spontaneous_turn_id: Optional[str] = None
         # per-session codex settings, applied on thread/start + turn/start — the
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
@@ -243,6 +251,7 @@ class CodexHandle:
         self.last_rate_limits = None
         self.last_rate_limits_by_id = {}
         self.last_goal = None
+        self._spontaneous_turn_id = None
         self.last_token_usage = None
         self.context_window = None
         self._reader = asyncio.create_task(self._read_loop(proc, generation))
@@ -477,6 +486,20 @@ class CodexHandle:
             # may contain relay/provider details.
             log.warning(
                 "codex goal callback failed",
+                error_type=type(exc).__name__,
+            )
+
+    async def _publish_turn_lifecycle(self, phase: str, turn_id: str) -> None:
+        """Forward a spontaneous app-server turn without killing stdout reader."""
+        callback = self.turn_lifecycle_callback
+        if callback is None:
+            return
+        try:
+            await callback(phase, turn_id)
+        except Exception as exc:
+            log.warning(
+                "codex spontaneous turn callback failed",
+                phase=phase,
                 error_type=type(exc).__name__,
             )
 
@@ -793,6 +816,9 @@ class CodexHandle:
             # exception from this reader task.
             if generation == self._generation:
                 self._dead = True
+                spontaneous_turn_id = self._spontaneous_turn_id
+                self._spontaneous_turn_id = None
+                self.turn_active = False
                 # The process can no longer receive approval responses.  Release
                 # any AskUser callbacks tied to this generation immediately.
                 for task in list(self._server_request_tasks):
@@ -803,6 +829,9 @@ class CodexHandle:
                 for fut in self._pending.values():
                     if not fut.done():
                         fut.set_exception(RuntimeError("codex app-server closed"))
+                if spontaneous_turn_id is not None:
+                    await self._publish_turn_lifecycle(
+                        "completed", spontaneous_turn_id)
 
     async def _dispatch(self, m: dict) -> None:
         has_id = "id" in m
@@ -841,12 +870,22 @@ class CodexHandle:
             # Automatic continuations can start without a new local turn/start
             # response.  Remember the authoritative notification id so delayed
             # rollout flushes are still attributed to this app-server.
+            was_active = self.turn_active
             turn = (m.get("params") or {}).get("turn") or {}
             turn_id = turn.get("id")
             if isinstance(turn_id, str) and turn_id:
                 self.turn_id = turn_id
                 self.remember_owned_turn_id(turn_id)
             self.turn_active = True
+            if not was_active and isinstance(turn_id, str) and turn_id:
+                # A goal loop/automatic continuation is not backed by query().
+                # The previous managed turn's receive_response() may still hold
+                # its local queue after consuming completed+sentinel. Detach the
+                # handle reference so this new turn cannot fill that orphaned
+                # bounded queue and deadlock the sole stdout reader.
+                self._turn_q = None
+                self._spontaneous_turn_id = turn_id
+                await self._publish_turn_lifecycle("started", turn_id)
         elif method == "thread/tokenUsage/updated":
             tu = (m.get("params") or {}).get("tokenUsage")
             if isinstance(tu, dict):
@@ -898,6 +937,17 @@ class CodexHandle:
                 await self._publish_goal(None)
         if method == "turn/completed":
             self.turn_active = False
+            turn = (m.get("params") or {}).get("turn") or {}
+            completed_turn_id = turn.get("id")
+            spontaneous_turn_id = self._spontaneous_turn_id
+            if (
+                spontaneous_turn_id is not None
+                and (not completed_turn_id
+                     or completed_turn_id == spontaneous_turn_id)
+            ):
+                self._spontaneous_turn_id = None
+                await self._publish_turn_lifecycle(
+                    "completed", spontaneous_turn_id)
         if self._turn_q is not None:
             queue = self._turn_q
             await queue.put(m)

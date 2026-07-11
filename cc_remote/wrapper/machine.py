@@ -61,7 +61,7 @@ from cc_remote.attachments import decode_attachment, validate_attachments
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    ASK_OPTION_MAX_COUNT, Error, Hello, Query, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, StatusReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
+    ASK_OPTION_MAX_COUNT, Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, StatusReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
@@ -2092,6 +2092,48 @@ class WrapperMachine:
         """
         await self._emit(ctx, GoalState(goal=goal))
 
+    async def _on_codex_turn_lifecycle(
+        self, ctx: SessionContext, phase: str, turn_id: str,
+    ) -> None:
+        """Mirror a Codex turn that app-server started without query().
+
+        Goal loops and automatic continuations have no Machine._run_turn
+        consumer, but they still own the thread. Keep the same single-writer
+        state/interrupt contract as a normal remote turn and only unlock on the
+        matching authoritative completion notification.
+        """
+        if phase == "started":
+            ctx.codex_spontaneous_turn_id = turn_id
+            if ctx.turn_task is not None:
+                # A user send claimed the session but has not reached turn/start
+                # yet (otherwise CodexHandle.turn_active would already be true).
+                # Abort that launch rather than write concurrently with the
+                # automatic turn that won the race.
+                ctx.interrupt_event.set()
+            if ctx.state == "idle":
+                ctx.interrupt_event.clear()
+                ctx.interrupt_deadline = None
+                await self._set_state(ctx, "running")
+            return
+        if phase != "completed" or ctx.codex_spontaneous_turn_id != turn_id:
+            return
+        ctx.codex_spontaneous_turn_id = None
+        ctx.active_msg_id = None
+        ctx.interrupt_deadline = None
+        ctx.interrupt_event.clear()
+        # If this continuation began while the previous managed consumer was
+        # still unwinding, that task performs the final unlock after it releases
+        # translator/queue ownership. Unlocking here would admit a second
+        # _run_turn against the same SessionContext.
+        if ctx.turn_task is None and ctx.state != "idle":
+            await self._set_state(ctx, "idle")
+
+    async def _set_idle_after_managed_turn(self, ctx: SessionContext) -> None:
+        """Do not unlock a thread already claimed by an automatic continuation."""
+        if ctx.engine == "codex" and ctx.codex_spontaneous_turn_id is not None:
+            return
+        await self._set_state(ctx, "idle")
+
     async def _emit_goal_error(self, ctx: SessionContext, cmd,
                                message: str) -> Error:
         error = Error(
@@ -2179,13 +2221,38 @@ class WrapperMachine:
                     "Claude set_goal failed", error_type=type(exc).__name__)
                 return await self._emit_goal_error(ctx, cmd, "设置 Goal 失败")
         try:
-            goal = await ctx.sdk.set_goal(
-                objective=cmd.objective, status=cmd.status,
-                token_budget=cmd.token_budget)
+            # thread/goal/set(status=active) can synchronously launch an app-server
+            # turn. Claim before the RPC so a query arriving before turn/started
+            # cannot become a second writer. launch_lock also makes an immediate
+            # interrupt wait until the authoritative automatic turn id is known.
+            async with ctx.launch_lock:
+                if ctx.state != "idle":
+                    error = Error(
+                        code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                        to=getattr(cmd, "client_id", None))
+                    await self._emit(ctx, error)
+                    return error
+                ctx.interrupt_event.clear()
+                ctx.interrupt_deadline = None
+                ctx.state = "running"
+                await self._emit(ctx, StateEvent(state="running"))
+                goal = await ctx.sdk.set_goal(
+                    objective=cmd.objective, status=cmd.status,
+                    token_budget=cmd.token_budget)
+                automatic_turn_live = bool(
+                    ctx.codex_spontaneous_turn_id
+                    or getattr(ctx.sdk, "turn_active", False))
+                if not automatic_turn_live and ctx.state != "idle":
+                    await self._set_idle_after_managed_turn(ctx)
             event = GoalState(goal=goal)
             await self._emit(ctx, event)
             return event
         except Exception as exc:
+            automatic_turn_live = bool(
+                ctx.codex_spontaneous_turn_id
+                or getattr(ctx.sdk, "turn_active", False))
+            if not automatic_turn_live and ctx.state != "idle":
+                await self._set_state(ctx, "idle")
             log.warning("set_goal failed", error_type=type(exc).__name__)
             return await self._emit_goal_error(ctx, cmd, "设置 Goal 失败")
 
@@ -2220,8 +2287,22 @@ class WrapperMachine:
                 log.warning(
                     "Claude clear_goal failed", error_type=type(exc).__name__)
                 return await self._emit_goal_error(ctx, cmd, "清除 Goal 失败")
+        if (ctx.state != "idle"
+                and ctx.codex_spontaneous_turn_id is None):
+            error = Error(
+                code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                to=getattr(cmd, "client_id", None))
+            await self._emit(ctx, error)
+            return error
         try:
-            await ctx.sdk.clear_goal()
+            async with ctx.launch_lock:
+                await ctx.sdk.clear_goal()
+            # Clearing the condition does not necessarily stop the already-live
+            # automatic turn. Route it through the normal interrupt state machine
+            # so the thread cannot keep writing invisibly after the UI says clear.
+            if (ctx.codex_spontaneous_turn_id is not None
+                    and ctx.state == "running"):
+                await self._handle_interrupt(Interrupt(sid=ctx.key))
             event = GoalState(goal=None)
             await self._emit(ctx, event)
             return event
@@ -3229,6 +3310,9 @@ class WrapperMachine:
                     ctx, method, params))
             ctx.sdk.goal_callback = (
                 lambda goal: self._on_codex_goal(ctx, goal))
+            ctx.sdk.turn_lifecycle_callback = (
+                lambda phase, turn_id: self._on_codex_turn_lifecycle(
+                    ctx, phase, turn_id))
 
         try:
             await ctx.sdk.connect(resume_id=resume_id, cwd=target_cwd)
@@ -3349,6 +3433,9 @@ class WrapperMachine:
                     ctx, method, params))
             ctx.sdk.goal_callback = (
                 lambda goal: self._on_codex_goal(ctx, goal))
+            ctx.sdk.turn_lifecycle_callback = (
+                lambda phase, turn_id: self._on_codex_turn_lifecycle(
+                    ctx, phase, turn_id))
         try:
             await ctx.sdk.connect(resume_id=parent_id, cwd=parent.cwd, fork=True)
         except Exception as e:
@@ -3673,7 +3760,7 @@ class WrapperMachine:
                         duration_ms=0,
                         is_error=True,
                     )))
-                    await self._set_state(ctx, "idle")
+                    await self._set_idle_after_managed_turn(ctx)
                     return
 
                 # Emit the authoritative user echo immediately before sdk.query(),
@@ -3697,7 +3784,7 @@ class WrapperMachine:
                         duration_ms=0,
                         is_error=True,
                     )))
-                    await self._set_state(ctx, "idle")
+                    await self._set_idle_after_managed_turn(ctx)
                     return
                 if is_codex:
                     # codex: images -> private temp dir -> localImage items; files already
@@ -3716,7 +3803,7 @@ class WrapperMachine:
                                 duration_ms=0,
                                 is_error=True,
                             )))
-                            await self._set_state(ctx, "idle")
+                            await self._set_idle_after_managed_turn(ctx)
                             return
                         if external:
                             await self._emit(ctx, Error(
@@ -3725,7 +3812,7 @@ class WrapperMachine:
                                          "请退出终端或点击『接管』后重试"),
                                 msg_id=ctx.active_msg_id,
                             ))
-                            await self._set_state(ctx, "idle")
+                            await self._set_idle_after_managed_turn(ctx)
                             return
                         if ctx.needs_reload:
                             log.info(
@@ -3745,7 +3832,7 @@ class WrapperMachine:
                                     duration_ms=0,
                                     is_error=True,
                                 )))
-                                await self._set_state(ctx, "idle")
+                                await self._set_idle_after_managed_turn(ctx)
                                 return
                             external = await self._prime_codex_ownership(ctx.session_id)
                             if (ctx.interrupt_event.is_set()
@@ -3755,7 +3842,7 @@ class WrapperMachine:
                                     duration_ms=0,
                                     is_error=True,
                                 )))
-                                await self._set_state(ctx, "idle")
+                                await self._set_idle_after_managed_turn(ctx)
                                 return
                             if external or ctx.needs_reload:
                                 await self._emit(ctx, Error(
@@ -3764,7 +3851,7 @@ class WrapperMachine:
                                              "本次发送已取消；请退出终端或点击『接管』后重试"),
                                     msg_id=ctx.active_msg_id,
                                 ))
-                                await self._set_state(ctx, "idle")
+                                await self._set_idle_after_managed_turn(ctx)
                                 return
                     await ctx.sdk.query(prompt, images=img_paths)
                 elif images:
@@ -3862,7 +3949,7 @@ class WrapperMachine:
                 if ctx.goal_visible:
                     await self._emit(ctx, GoalState(goal=goal))
 
-            await self._set_state(ctx, "idle")
+            await self._set_idle_after_managed_turn(ctx)
         except asyncio.TimeoutError:
             log.error("drain timeout — interrupt did not yield a ResultMessage",
                       prompt_length=len(prompt))
@@ -3870,6 +3957,7 @@ class WrapperMachine:
                 code=ERR_DRAIN_TIMEOUT,
                 message="interrupt drain timed out; reconnecting cc",
                 msg_id=ctx.active_msg_id))
+            timed_out_spontaneous_turn = ctx.codex_spontaneous_turn_id
             try:
                 await ctx.sdk.force_reconnect(ctx.session_id, ctx.cwd)
             except Exception as e:
@@ -3878,20 +3966,25 @@ class WrapperMachine:
                     code=ERR_CC_CRASH,
                     message="agent reconnect failed; see wrapper logs",
                     msg_id=ctx.active_msg_id))
-            await self._set_state(ctx, "idle")
+            # Reconnect terminates the old app-server turn. Preserve only a
+            # different id delivered by the new generation while it connected.
+            if ctx.codex_spontaneous_turn_id == timed_out_spontaneous_turn:
+                ctx.codex_spontaneous_turn_id = None
+            await self._set_idle_after_managed_turn(ctx)
         except Exception as e:
             log.exception("turn failed", error=str(e))
             await self._emit(ctx, Error(
                 code=ERR_CC_CRASH,
                 message="agent turn failed; see wrapper logs",
                 msg_id=ctx.active_msg_id))
-            await self._set_state(ctx, "idle")
+            await self._set_idle_after_managed_turn(ctx)
         finally:
             ctx.translator = None
             ctx.turn_task = None
-            ctx.active_msg_id = None
-            ctx.interrupt_deadline = None
-            ctx.interrupt_event.clear()
+            if ctx.codex_spontaneous_turn_id is None:
+                ctx.active_msg_id = None
+                ctx.interrupt_deadline = None
+                ctx.interrupt_event.clear()
             # cc keeps flushing this turn's lines to the transcript for a moment after
             # the result; the watcher uses this stamp to attribute those bytes to US
             # instead of mistaking them for an external writer.

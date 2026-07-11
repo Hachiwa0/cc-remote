@@ -9,7 +9,9 @@ import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from pydantic import ValidationError
 
-from cc_remote.protocol import Error, GoalState, Model, NewSession, ThreadGoal
+from cc_remote.protocol import (
+    Error, GoalState, Model, NewSession, StateEvent, ThreadGoal,
+)
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
@@ -153,6 +155,53 @@ def test_codex_turn_started_notification_tracks_automatic_turn_id():
         assert handle.turn_id == "automatic"
         assert handle.turn_active is True
         assert handle.owned_turn_ids == {"automatic"}
+
+    asyncio.run(run())
+
+
+def test_codex_spontaneous_lifecycle_detaches_old_queue_and_filters_local_turn():
+    async def run():
+        seen = []
+
+        async def on_lifecycle(phase, turn_id):
+            seen.append((phase, turn_id))
+
+        handle = CodexHandle(_Cfg(), turn_lifecycle_callback=on_lifecycle)
+        old_queue = asyncio.Queue()
+        handle._turn_q = old_queue
+        handle.turn_active = False  # the old turn completed; consumer is unwinding
+        await handle._dispatch({
+            "method": "turn/started",
+            "params": {"turn": {"id": "goal-auto"}},
+        })
+        assert handle._turn_q is None
+        assert seen == [("started", "goal-auto")]
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "goal-auto", "status": "completed"}},
+        })
+        assert seen[-1] == ("completed", "goal-auto")
+
+        # query() marks turn_active before its turn/start RPC. Its notifications
+        # remain on the managed response queue and never double-drive Machine.
+        local_queue = asyncio.Queue()
+        handle._turn_q = local_queue
+        handle.turn_active = True
+        await handle._dispatch({
+            "method": "turn/started",
+            "params": {"turn": {"id": "remote-local"}},
+        })
+        assert handle._turn_q is local_queue
+        assert seen == [
+            ("started", "goal-auto"), ("completed", "goal-auto"),
+        ]
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "remote-local", "status": "completed"}},
+        })
+        assert seen == [
+            ("started", "goal-auto"), ("completed", "goal-auto"),
+        ]
 
     asyncio.run(run())
 
@@ -645,6 +694,174 @@ def test_machine_goal_emits_authoritative_state():
         await machine._on_codex_goal(ctx, goal)
         assert isinstance(transport.sent[-1], GoalState)
         assert transport.sent[-1].to is None
+
+    asyncio.run(run())
+
+
+def test_codex_goal_auto_turn_claims_session_interrupts_and_completes():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("goal-auto", "goal-auto")
+        ctx.engine = "codex"
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        requests = []
+        goal = {
+            "threadId": ctx.session_id, "objective": "finish tests",
+            "status": "active", "tokensUsed": 0,
+            "timeUsedSeconds": 0, "createdAt": 1, "updatedAt": 1,
+        }
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "thread/goal/set":
+                entered.set()
+                await release.wait()
+                return {"goal": goal}
+            if method == "turn/interrupt":
+                return {}
+            raise AssertionError(method)
+
+        handle._request = request
+        set_task = asyncio.create_task(machine._handle_set_goal(SimpleNamespace(
+            sid=ctx.key, client_id="client-1", objective="finish tests",
+            status="active", token_budget=None,
+        )))
+        await entered.wait()
+        assert ctx.state == "running"
+
+        # The goal RPC has not returned and turn/started has not arrived yet, but
+        # the session is already claimed: no second remote writer can slip in.
+        busy = await machine._handle_query(SimpleNamespace(
+            sid=ctx.key, prompt="race", images=None, files=None,
+            msg_id="race-query",
+        ))
+        assert isinstance(busy, Error) and busy.code == "busy"
+
+        await handle._dispatch({
+            "method": "turn/started",
+            "params": {"turn": {"id": "auto-1"}},
+        })
+        release.set()
+        result = await set_task
+        assert isinstance(result, GoalState)
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "auto-1"
+
+        await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
+        assert ctx.state == "interrupting"
+        assert requests[-1] == (
+            "turn/interrupt",
+            {"threadId": ctx.session_id, "turnId": "auto-1"},
+        )
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "auto-1", "status": "interrupted"}},
+        })
+        assert ctx.state == "idle"
+        assert ctx.codex_spontaneous_turn_id is None
+        assert [event.state for event in transport.sent
+                if isinstance(event, StateEvent)][-3:] == [
+                    "running", "interrupting", "idle",
+                ]
+
+    asyncio.run(run())
+
+
+def test_clearing_live_codex_goal_interrupts_automatic_turn():
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("goal-clear-auto", "goal-clear-auto")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.codex_spontaneous_turn_id = "auto-clear"
+        requests = []
+
+        class Sdk:
+            async def clear_goal(self):
+                requests.append(("clear", None))
+                return True
+
+            async def interrupt(self):
+                requests.append(("interrupt", "auto-clear"))
+
+        ctx.sdk = Sdk()
+        machine.sessions[ctx.key] = ctx
+        result = await machine._handle_clear_goal(SimpleNamespace(
+            sid=ctx.key, client_id="client-1"))
+        assert isinstance(result, GoalState) and result.goal is None
+        assert requests == [("clear", None), ("interrupt", "auto-clear")]
+        assert ctx.state == "interrupting"
+
+    asyncio.run(run())
+
+
+def test_managed_turn_unwind_preserves_live_auto_interrupt_state():
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("managed-auto-overlap", None)
+        ctx.engine = "codex"
+        ctx.state = "interrupting"
+        ctx.active_msg_id = "managed-message"
+        ctx.codex_spontaneous_turn_id = "auto-overlap"
+        ctx.interrupt_deadline = 123.0
+        ctx.interrupt_event.set()
+        ctx.turn_task = asyncio.current_task()
+
+        # The managed send loses the pre-turn/start race and unwinds. Its finally
+        # block must not erase the interrupt that now belongs to the auto turn.
+        await machine._run_turn(ctx, "must not be submitted")
+        assert ctx.state == "interrupting"
+        assert ctx.codex_spontaneous_turn_id == "auto-overlap"
+        assert ctx.interrupt_event.is_set()
+        assert ctx.interrupt_deadline == 123.0
+        assert ctx.active_msg_id == "managed-message"
+        assert ctx.turn_task is None
+
+        await machine._on_codex_turn_lifecycle(
+            ctx, "completed", "auto-overlap")
+        assert ctx.state == "idle"
+        assert not ctx.interrupt_event.is_set()
+
+    asyncio.run(run())
+
+
+def test_managed_turn_exception_does_not_unlock_live_auto_turn():
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("managed-auto-error", None)
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "managed-error"
+        ctx.codex_spontaneous_turn_id = "auto-after-error"
+        ctx.turn_task = asyncio.current_task()
+
+        class FailingSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+
+            async def query(self, _prompt, images=None):
+                raise RuntimeError("managed launch failed")
+
+        ctx.sdk = FailingSdk()
+        await machine._run_turn(ctx, "fails")
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "auto-after-error"
+        assert ctx.turn_task is None
+
+        await machine._on_codex_turn_lifecycle(
+            ctx, "completed", "auto-after-error")
+        assert ctx.state == "idle"
 
     asyncio.run(run())
 

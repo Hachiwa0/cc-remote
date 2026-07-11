@@ -65,6 +65,10 @@ class SessionContext:
     # user explicitly invokes /goal (get/set); this avoids a permanent empty
     # panel above the composer merely because a Claude/Codex session was opened.
     goal_visible: bool = False
+    # app-server goal loops/automatic continuations can start without the
+    # machine calling query(). Their lifecycle is delivered separately from the
+    # managed turn stream so the session remains single-writer and interruptible.
+    codex_spontaneous_turn_id: Optional[str] = None
     # ---- external-write mirroring (a native `claude`/`codex` in the user's
     # terminal owns this session and is appending to its transcript) ----
     # epoch of the last append this wrapper did NOT make. Recent => the session is
