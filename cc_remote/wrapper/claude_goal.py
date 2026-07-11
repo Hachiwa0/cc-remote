@@ -68,6 +68,7 @@ def _new_goal(
         "threadId": thread_id,
         "objective": objective,
         "status": "active",
+        "engine": "claude",
         "tokenBudget": None,
         "tokensUsed": 0,
         "timeUsedSeconds": 0,

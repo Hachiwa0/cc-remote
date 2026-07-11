@@ -860,6 +860,37 @@ class ClearGoal(_Command):
     type: Literal["clear_goal"] = "clear_goal"
 
 
+class ThreadGoal(BaseModel):
+    """Display-safe goal state shared by the Codex and Claude engines.
+
+    Keep this model explicit and extra-forbidden: Codex's app-server goal API is
+    experimental, so blindly forwarding its response would make every future
+    server field part of cc-remote's public wire protocol.  Claude's transcript
+    bridge uses the same base fields and only the four lifecycle extensions
+    below.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    threadId: WireId
+    objective: str = Field(min_length=1, max_length=16 * 1024)
+    status: GoalStatus
+    engine: Literal["claude", "codex"]
+    tokenBudget: Optional[int] = Field(default=None, ge=1)
+    tokensUsed: int = Field(ge=0)
+    timeUsedSeconds: int = Field(ge=0)
+    # Codex emits integer epoch seconds; Claude's transcript bridge preserves
+    # sub-second timestamps. Both are safe wire numbers and intentionally
+    # accepted without coercing strings/bools under strict mode.
+    createdAt: Optional[Union[int, float]] = Field(default=None, ge=0)
+    updatedAt: Optional[Union[int, float]] = Field(default=None, ge=0)
+    # Claude Code native /goal lifecycle extensions.
+    iterations: Optional[int] = Field(default=None, ge=0)
+    lastReason: Optional[str] = Field(default=None, max_length=16 * 1024)
+    setAt: Optional[float] = Field(default=None, ge=0)
+    tokensAtStart: Optional[int] = Field(default=None, ge=0)
+
+
 class GoalState(_Base):
     """Authoritative engine goal. goal=None means no active goal.
 
@@ -868,7 +899,7 @@ class GoalState(_Base):
     iterations, lastReason, setAt, and tokensAtStart.
     """
     type: Literal["goal_state"] = "goal_state"
-    goal: Optional[dict[str, Any]] = None
+    goal: Optional[ThreadGoal] = None
 
 
 AnyMessage = Union[

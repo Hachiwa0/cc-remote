@@ -2082,6 +2082,26 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         return ctx
 
+    async def _on_codex_goal(self, ctx: SessionContext,
+                             goal: Optional[dict]) -> None:
+        """Broadcast an authoritative app-server goal notification.
+
+        ``CodexHandle`` has already copied the strict public allow-list.  _emit
+        broadcasts normal-session updates to every signed-in client and
+        automatically routes private /btw updates to their owning client.
+        """
+        await self._emit(ctx, GoalState(goal=goal))
+
+    async def _emit_goal_error(self, ctx: SessionContext, cmd,
+                               message: str) -> Error:
+        error = Error(
+            code=ERR_INTERNAL,
+            message=message,
+            to=getattr(cmd, "client_id", None),
+        )
+        await self._emit(ctx, error)
+        return error
+
     async def _handle_get_goal(self, cmd) -> None:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
@@ -2090,12 +2110,15 @@ class WrapperMachine:
             ctx.goal_visible = True
             goal = (await ctx.sdk.get_goal() if ctx.engine == "codex"
                     else await ctx.sdk.refresh_goal(ctx.session_id))
-            event = GoalState(goal=goal)
+            event = GoalState(
+                goal=goal,
+                to=getattr(cmd, "client_id", None),
+            )
             await self._emit(ctx, event)
             return event
-        except Exception as e:
-            log.exception("get_goal failed", error=str(e))
-            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"get_goal failed: {e}"))
+        except Exception as exc:
+            log.warning("get_goal failed", error_type=type(exc).__name__)
+            return await self._emit_goal_error(ctx, cmd, "Goal 状态暂不可用")
 
     async def _handle_set_goal(self, cmd) -> None:
         ctx = await self._goal_ctx(cmd)
@@ -2106,6 +2129,7 @@ class WrapperMachine:
                 error = Error(
                     code=ERR_PROTOCOL,
                     message="Claude /goal 不支持 token budget",
+                    to=getattr(cmd, "client_id", None),
                 )
                 await self._emit(ctx, error)
                 return error
@@ -2113,6 +2137,7 @@ class WrapperMachine:
                 error = Error(
                     code=ERR_PROTOCOL,
                     message="Claude /goal 只支持设置目标或 clear，不支持暂停/状态切换",
+                    to=getattr(cmd, "client_id", None),
                 )
                 await self._emit(ctx, error)
                 return error
@@ -2121,11 +2146,14 @@ class WrapperMachine:
                 error = Error(
                     code=ERR_BAD_PROMPT,
                     message="Claude /goal 需要非空完成条件",
+                    to=getattr(cmd, "client_id", None),
                 )
                 await self._emit(ctx, error)
                 return error
             if ctx.state != "idle":
-                error = Error(code=ERR_BUSY, message="该会话正忙,先 interrupt")
+                error = Error(
+                    code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                    to=getattr(cmd, "client_id", None))
                 await self._emit(ctx, error)
                 return error
 
@@ -2145,13 +2173,11 @@ class WrapperMachine:
                 event = GoalState(goal=goal)
                 await self._emit(ctx, event)
                 return event
-            except Exception as e:
+            except Exception as exc:
                 ctx.sdk.restore_goal_state(previous)
-                log.exception("Claude set_goal failed", error=str(e))
-                error = Error(
-                    code=ERR_INTERNAL, message=f"set_goal failed: {e}")
-                await self._emit(ctx, error)
-                return error
+                log.warning(
+                    "Claude set_goal failed", error_type=type(exc).__name__)
+                return await self._emit_goal_error(ctx, cmd, "设置 Goal 失败")
         try:
             goal = await ctx.sdk.set_goal(
                 objective=cmd.objective, status=cmd.status,
@@ -2159,9 +2185,9 @@ class WrapperMachine:
             event = GoalState(goal=goal)
             await self._emit(ctx, event)
             return event
-        except Exception as e:
-            log.exception("set_goal failed", error=str(e))
-            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_goal failed: {e}"))
+        except Exception as exc:
+            log.warning("set_goal failed", error_type=type(exc).__name__)
+            return await self._emit_goal_error(ctx, cmd, "设置 Goal 失败")
 
     async def _handle_clear_goal(self, cmd) -> None:
         ctx = await self._goal_ctx(cmd)
@@ -2169,7 +2195,9 @@ class WrapperMachine:
             return
         if ctx.engine != "codex":
             if ctx.state != "idle":
-                error = Error(code=ERR_BUSY, message="该会话正忙,先 interrupt")
+                error = Error(
+                    code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                    to=getattr(cmd, "client_id", None))
                 await self._emit(ctx, error)
                 return error
             previous = dict(ctx.sdk.goal) if ctx.sdk.goal is not None else None
@@ -2187,21 +2215,19 @@ class WrapperMachine:
                 event = GoalState(goal=None)
                 await self._emit(ctx, event)
                 return event
-            except Exception as e:
+            except Exception as exc:
                 ctx.sdk.restore_goal_state(previous)
-                log.exception("Claude clear_goal failed", error=str(e))
-                error = Error(
-                    code=ERR_INTERNAL, message=f"clear_goal failed: {e}")
-                await self._emit(ctx, error)
-                return error
+                log.warning(
+                    "Claude clear_goal failed", error_type=type(exc).__name__)
+                return await self._emit_goal_error(ctx, cmd, "清除 Goal 失败")
         try:
             await ctx.sdk.clear_goal()
             event = GoalState(goal=None)
             await self._emit(ctx, event)
             return event
-        except Exception as e:
-            log.exception("clear_goal failed", error=str(e))
-            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"clear_goal failed: {e}"))
+        except Exception as exc:
+            log.warning("clear_goal failed", error_type=type(exc).__name__)
+            return await self._emit_goal_error(ctx, cmd, "清除 Goal 失败")
 
     async def _handle_get_diff(self, cmd) -> None:
         sid = getattr(cmd, "sid", None)
@@ -3201,6 +3227,8 @@ class WrapperMachine:
             ctx.sdk.interaction_callback = (
                 lambda method, params: self._on_codex_interaction(
                     ctx, method, params))
+            ctx.sdk.goal_callback = (
+                lambda goal: self._on_codex_goal(ctx, goal))
 
         try:
             await ctx.sdk.connect(resume_id=resume_id, cwd=target_cwd)
@@ -3319,6 +3347,8 @@ class WrapperMachine:
             ctx.sdk.interaction_callback = (
                 lambda method, params: self._on_codex_interaction(
                     ctx, method, params))
+            ctx.sdk.goal_callback = (
+                lambda goal: self._on_codex_goal(ctx, goal))
         try:
             await ctx.sdk.connect(resume_id=parent_id, cwd=parent.cwd, fork=True)
         except Exception as e:

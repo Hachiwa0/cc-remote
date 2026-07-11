@@ -29,6 +29,7 @@ from itertools import islice
 from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote.log import logger
+from cc_remote.protocol import ThreadGoal
 from cc_remote.wrapper.codex_sessions import codex_model, codex_effort, codex_context_window
 from cc_remote.wrapper.child_env import sanitized_child_env
 
@@ -47,6 +48,7 @@ _STATUS_RATE_LIMIT_MAX = 16
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
+GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 
 _NEW_APPROVAL_METHODS = frozenset({
     "item/commandExecution/requestApproval",
@@ -161,7 +163,8 @@ def _codex_env(bin_path: str) -> dict:
 class CodexHandle:
     def __init__(self, cfg, cwd: Optional[str] = None,
                  approval_callback: Optional[ApprovalCallback] = None,
-                 interaction_callback: Optional[InteractionCallback] = None):
+                 interaction_callback: Optional[InteractionCallback] = None,
+                 goal_callback: Optional[GoalCallback] = None):
         self.cfg = cfg
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
@@ -190,12 +193,14 @@ class CodexHandle:
         self._dead = False
         self.approval_callback = approval_callback
         self.interaction_callback = interaction_callback
+        self.goal_callback = goal_callback
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
         self.app_server_version: Optional[str] = None
         self.last_thread_status: Optional[dict] = None
         self.last_rate_limits: Optional[dict] = None
         self.last_rate_limits_by_id: dict[str, dict] = {}
+        self.last_goal: Optional[dict[str, Any]] = None
         # per-session codex settings, applied on thread/start + turn/start — the
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
@@ -237,6 +242,7 @@ class CodexHandle:
         self.last_thread_status = None
         self.last_rate_limits = None
         self.last_rate_limits_by_id = {}
+        self.last_goal = None
         self.last_token_usage = None
         self.context_window = None
         self._reader = asyncio.create_task(self._read_loop(proc, generation))
@@ -426,7 +432,11 @@ class CodexHandle:
         assert self.thread_id, "connect() first"
         result = await self._request("thread/goal/get", {"threadId": self.thread_id})
         goal = (result or {}).get("goal")
-        return goal if isinstance(goal, dict) else None
+        if goal is None:
+            self.last_goal = None
+            return None
+        self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
+        return self.last_goal
 
     async def set_goal(self, *, objective: Optional[str] = None,
                        status: Optional[str] = None,
@@ -443,12 +453,32 @@ class CodexHandle:
         goal = (result or {}).get("goal")
         if not isinstance(goal, dict):
             raise RuntimeError("codex app-server did not return a goal")
-        return goal
+        self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
+        return self.last_goal
 
     async def clear_goal(self) -> bool:
         assert self.thread_id, "connect() first"
         result = await self._request("thread/goal/clear", {"threadId": self.thread_id})
-        return bool((result or {}).get("cleared"))
+        cleared = bool((result or {}).get("cleared"))
+        if cleared:
+            self.last_goal = None
+        return cleared
+
+    async def _publish_goal(self, goal: Optional[dict[str, Any]]) -> None:
+        """Forward one sanitized goal notification without killing the reader."""
+        callback = self.goal_callback
+        if callback is None:
+            return
+        try:
+            await callback(goal)
+        except Exception as exc:
+            # The app-server stdout reader owns every outstanding RPC response.
+            # A UI transport failure must not terminate it, and raw exception text
+            # may contain relay/provider details.
+            log.warning(
+                "codex goal callback failed",
+                error_type=type(exc).__name__,
+            )
 
     async def get_context_usage(self) -> dict:
         # Real shape (verified, gpt-5.5): tokenUsage = {last:{totalTokens,…},
@@ -848,6 +878,24 @@ class CodexHandle:
                 if self.last_rate_limits is None or not limit_id or current_id == limit_id:
                     self.last_rate_limits = _merge_rate_limit_snapshot(
                         self.last_rate_limits or {}, update)
+        elif method == "thread/goal/updated":
+            params = m.get("params") or {}
+            if params.get("threadId") == self.thread_id:
+                try:
+                    goal = _sanitize_thread_goal(params.get("goal"), self.thread_id)
+                except Exception as exc:
+                    log.warning(
+                        "invalid codex goal notification dropped",
+                        error_type=type(exc).__name__,
+                    )
+                else:
+                    self.last_goal = goal
+                    await self._publish_goal(goal)
+        elif method == "thread/goal/cleared":
+            params = m.get("params") or {}
+            if params.get("threadId") == self.thread_id:
+                self.last_goal = None
+                await self._publish_goal(None)
         if method == "turn/completed":
             self.turn_active = False
         if self._turn_q is not None:
@@ -919,6 +967,37 @@ _RATE_SCALAR_KEYS = (
     "limitId", "limitName", "planType", "rateLimitReachedType",
 )
 _RATE_WINDOW_KEYS = ("usedPercent", "resetsAt", "windowDurationMins")
+
+
+def _sanitize_thread_goal(raw: Any, fallback_thread_id: Optional[str]) -> dict:
+    """Copy the stable public goal contract and reject every unknown field.
+
+    The app-server's experimental response may grow over time.  Constructing a
+    fresh payload here (instead of returning ``raw``) ensures new fields never
+    cross the remote boundary accidentally; ``ThreadGoal`` then enforces types,
+    bounds, and the shared Claude/Codex contract.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("goal must be an object")
+    raw_thread_id = raw.get("threadId")
+    thread_id = raw_thread_id if raw_thread_id is not None else fallback_thread_id
+    if (not isinstance(thread_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(thread_id)
+            or (fallback_thread_id is not None and thread_id != fallback_thread_id)):
+        raise ValueError("goal thread id does not match the active thread")
+
+    payload: dict[str, Any] = {
+        "threadId": thread_id,
+        "objective": raw.get("objective"),
+        "status": raw.get("status"),
+        "engine": "codex",
+        "tokensUsed": raw.get("tokensUsed"),
+        "timeUsedSeconds": raw.get("timeUsedSeconds"),
+    }
+    for key in ("tokenBudget", "createdAt", "updatedAt"):
+        if key in raw:
+            payload[key] = raw[key]
+    return ThreadGoal.model_validate(payload).model_dump()
 
 
 def _app_server_version(initialized: Any) -> Optional[str]:

@@ -59,9 +59,10 @@ def test_transcript_goal_status_recovers_progress_and_clear(tmp_path, monkeypatc
     exists, goal = read_claude_goal("session-1", now=1_783_814_410)
     assert exists is True
     assert goal == {
-        "threadId": "session-1",
-        "objective": "ship it",
-        "status": "active",
+            "threadId": "session-1",
+            "objective": "ship it",
+            "status": "active",
+            "engine": "claude",
         "tokenBudget": None,
         "tokensUsed": 15,
         "timeUsedSeconds": 10,
@@ -182,7 +183,7 @@ def test_machine_routes_claude_goal_commands_through_normal_turn():
         ))
         assert isinstance(result, GoalState)
         assert queries[-1].prompt == "/goal finish tests"
-        assert result.goal["tokensAtStart"] == 123
+        assert result.goal.tokensAtStart == 123
         assert ctx.goal_visible is True
 
         result = await machine._handle_clear_goal(SimpleNamespace(sid=ctx.key))
@@ -198,7 +199,7 @@ def test_machine_routes_claude_goal_commands_through_normal_turn():
         assert len(queries) == count
         states = [message for message in transport.sent
                   if isinstance(message, GoalState)]
-        assert states[-2].goal["objective"] == "finish tests"
+        assert states[-2].goal.objective == "finish tests"
         assert states[-1].goal is None
 
     asyncio.run(run())

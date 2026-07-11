@@ -7,8 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+from pydantic import ValidationError
 
-from cc_remote.protocol import GoalState, Model, NewSession
+from cc_remote.protocol import Error, GoalState, Model, NewSession, ThreadGoal
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
@@ -523,13 +524,20 @@ def test_codex_goal_rpc_uses_official_thread_api():
             if method.endswith("/get"):
                 return {"goal": None}
             if method.endswith("/set"):
-                return {"goal": {"threadId": "thread-1", "objective": "ship", "status": "active", "tokensUsed": 0, "timeUsedSeconds": 0, "createdAt": 1, "updatedAt": 1}}
+                return {"goal": {
+                    "threadId": "thread-1", "objective": "ship",
+                    "status": "active", "tokensUsed": 0,
+                    "timeUsedSeconds": 0, "createdAt": 1, "updatedAt": 1,
+                    "futureSecret": "must-not-cross-the-wire",
+                }}
             return {"cleared": True}
 
         handle._request = request
         assert await handle.get_goal() is None
         goal = await handle.set_goal(objective="ship", status="active", token_budget=12000)
         assert goal["objective"] == "ship"
+        assert goal["engine"] == "codex"
+        assert "futureSecret" not in goal
         assert await handle.clear_goal() is True
         assert requests == [
             ("thread/goal/get", {"threadId": "thread-1"}),
@@ -540,12 +548,76 @@ def test_codex_goal_rpc_uses_official_thread_api():
     asyncio.run(run())
 
 
+def test_goal_wire_model_is_strict_and_shared_by_both_engines():
+    base = {
+        "threadId": "thread-1", "objective": "finish",
+        "status": "active", "engine": "codex", "tokenBudget": None,
+        "tokensUsed": 2, "timeUsedSeconds": 3,
+        "createdAt": 1, "updatedAt": 2,
+    }
+    assert ThreadGoal(**base).engine == "codex"
+    assert ThreadGoal(**{
+        **base, "engine": "claude", "iterations": 4,
+        "lastReason": "still working", "setAt": 1.5,
+        "tokensAtStart": 10,
+    }).iterations == 4
+    with pytest.raises(ValidationError):
+        ThreadGoal(**{**base, "futureSecret": "must-not-pass"})
+    with pytest.raises(ValidationError):
+        GoalState(goal={**base, "tokensUsed": True})
+
+
+def test_codex_goal_notifications_are_sanitized_filtered_and_cleared():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        raw_goal = {
+            "threadId": "thread-1", "objective": "ship",
+            "status": "active", "tokensUsed": 7,
+            "timeUsedSeconds": 9, "createdAt": 1, "updatedAt": 2,
+            "futureSecret": "must-not-cross-the-wire",
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {"threadId": "other-thread", "goal": raw_goal},
+        })
+        assert seen == []
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {"threadId": "thread-1", "turnId": "turn-1",
+                       "goal": raw_goal},
+        })
+        assert seen[0]["engine"] == "codex"
+        assert seen[0]["tokensUsed"] == 7
+        assert "futureSecret" not in seen[0]
+        assert handle.last_goal == seen[0]
+
+        await handle._dispatch({
+            "method": "thread/goal/cleared",
+            "params": {"threadId": "thread-1"},
+        })
+        assert seen[-1] is None
+        assert handle.last_goal is None
+
+    asyncio.run(run())
+
+
 def test_machine_goal_emits_authoritative_state():
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("goal-1", "goal-1")
         ctx.engine = "codex"
-        goal = {"threadId": "goal-1", "objective": "finish", "status": "active", "tokensUsed": 2, "timeUsedSeconds": 3, "createdAt": 1, "updatedAt": 1}
+        goal = {
+            "threadId": "goal-1", "objective": "finish",
+            "status": "active", "engine": "codex", "tokensUsed": 2,
+            "timeUsedSeconds": 3, "createdAt": 1, "updatedAt": 1,
+        }
         ctx.sdk = SimpleNamespace(get_goal=lambda: None)
 
         async def get_goal(): return goal
@@ -555,11 +627,47 @@ def test_machine_goal_emits_authoritative_state():
         ctx.sdk.set_goal = set_goal
         ctx.sdk.clear_goal = clear_goal
         machine.sessions[ctx.key] = ctx
-        await machine._handle_get_goal(SimpleNamespace(sid=ctx.key))
-        await machine._handle_set_goal(SimpleNamespace(sid=ctx.key, objective="finish", status="active", token_budget=None))
-        await machine._handle_clear_goal(SimpleNamespace(sid=ctx.key))
+        await machine._handle_get_goal(SimpleNamespace(
+            sid=ctx.key, client_id="client-1"))
+        await machine._handle_set_goal(SimpleNamespace(
+            sid=ctx.key, client_id="client-1", objective="finish",
+            status="active", token_budget=None))
+        await machine._handle_clear_goal(SimpleNamespace(
+            sid=ctx.key, client_id="client-1"))
         states = [m for m in transport.sent if isinstance(m, GoalState)]
-        assert [state.goal for state in states] == [goal, goal, None]
+        assert [state.goal.model_dump() if state.goal else None for state in states] == [
+            ThreadGoal(**goal).model_dump(), ThreadGoal(**goal).model_dump(), None,
+        ]
+        # Reads are private one-shot responses; mutations are shared state and are
+        # broadcast so another signed-in device updates immediately.
+        assert [state.to for state in states] == ["client-1", None, None]
+
+        await machine._on_codex_goal(ctx, goal)
+        assert isinstance(transport.sent[-1], GoalState)
+        assert transport.sent[-1].to is None
+
+    asyncio.run(run())
+
+
+def test_machine_goal_errors_are_routed_without_raw_exception_text():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("goal-error", "goal-error")
+        ctx.engine = "codex"
+
+        async def fail(**_kwargs):
+            raise RuntimeError("provider sk-secret must not cross the wire")
+
+        ctx.sdk = SimpleNamespace(set_goal=fail)
+        machine.sessions[ctx.key] = ctx
+        await machine._handle_set_goal(SimpleNamespace(
+            sid=ctx.key, client_id="client-1", objective="finish",
+            status="active", token_budget=None))
+        error = next(message for message in transport.sent
+                     if isinstance(message, Error))
+        assert error.to == "client-1"
+        assert error.message == "设置 Goal 失败"
+        assert "secret" not in error.message
 
     asyncio.run(run())
 
