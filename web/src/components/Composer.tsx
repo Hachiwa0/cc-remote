@@ -7,6 +7,7 @@ import { CommandSheet } from "./CommandSheet";
 import { attachmentBytes, pickFiles } from "../img";
 import type { PendingQuery } from "../reducer";
 import { canEnqueueQuery } from "../runtime-drain";
+import { ImeSubmitGuard } from "../ime-submit";
 
 interface Props {
   state: State;
@@ -62,6 +63,8 @@ export function Composer(p: Props) {
   const [dragDepth, setDragDepth] = useState(0);
   const dragOver = dragDepth > 0;
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const imeSubmitRef = useRef(new ImeSubmitGuard());
+  const buttonSendTimerRef = useRef<number | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const pickFilesRef = useRef<(files: FileList | File[] | null) => Promise<void>>(
     async () => {});
@@ -75,6 +78,12 @@ export function Composer(p: Props) {
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
   }, [ctxOpen]);
+
+  useEffect(() => () => {
+    if (buttonSendTimerRef.current !== null) {
+      window.clearTimeout(buttonSendTimerRef.current);
+    }
+  }, []);
 
   const busy = p.state === "running" || p.state === "interrupting";
   const offline = !p.wrapperOnline || p.connState !== "connected";
@@ -250,9 +259,9 @@ export function Composer(p: Props) {
     focusTa(); growTa();
   };
 
-  const send = () => {
+  const send = (value = taRef.current?.value ?? input) => {
     if (locked || importing) return;
-    const raw = input.trim();
+    const raw = value.trim();
     if (raw === "/") return;
     const parsed = parseSlash(raw);
     if (parsed && clientSlashesFor(p.engine).has(parsed.slash)) { runClientSlash(parsed.slash, parsed.args); return; }
@@ -269,6 +278,14 @@ export function Composer(p: Props) {
     if (p.engine === "codex" && parsed) { flash(`Codex 无此指令：/${parsed.slash}`); return; }
     // plain text, or a cc skill slash (/code-review …) forwarded verbatim to cc
     submitPrompt(raw);
+  };
+
+  const requestButtonSend = () => {
+    if (buttonSendTimerRef.current !== null) return;
+    buttonSendTimerRef.current = window.setTimeout(() => {
+      buttonSendTimerRef.current = null;
+      send();
+    }, 0);
   };
 
   const stopping = busy && !hasText && !hasAttachments;
@@ -373,19 +390,33 @@ export function Composer(p: Props) {
               : "发消息…  输入 / 唤起命令"}
             disabled={locked}
             onChange={(e) => onInput(e.target.value)}
+            onCompositionStart={() => imeSubmitRef.current.startComposition()}
+            onCompositionEnd={(e) => {
+              imeSubmitRef.current.endComposition();
+              onInput(e.currentTarget.value);
+            }}
             onPaste={onPaste}
             onKeyDown={(e) => {
               if (e.key === "Escape" && cmdOpen) { setInput(""); resetTaHeight(); return; }
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                // typing a command name (no args) => Enter completes/executes the top match
-                if (cmdOpen && cmdToken) { pickCommand(cmdMatches[0].slash); return; }
-                if (cmdToken === "") return; // just "/" — do nothing
-                send();
-              }
+              if (!imeSubmitRef.current.shouldSubmitKey({
+                key: e.key,
+                shiftKey: e.shiftKey,
+                isComposing: e.nativeEvent.isComposing,
+                keyCode: e.nativeEvent.keyCode,
+              })) return;
+              e.preventDefault();
+              // typing a command name (no args) => Enter completes/executes the top match
+              if (cmdOpen && cmdToken) { pickCommand(cmdMatches[0].slash); return; }
+              if (cmdToken === "") return; // just "/" — do nothing
+              send(e.currentTarget.value);
             }}
           />
-          <button className={sendClass} onClick={send} disabled={disabled} aria-label="发送">
+          <button className={sendClass}
+            onPointerDown={() => {
+              if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
+            }}
+            onClick={requestButtonSend}
+            disabled={disabled} aria-label="发送">
             <Icon name={sendIcon} size={19} />
           </button>
         </div>

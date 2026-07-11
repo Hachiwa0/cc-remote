@@ -17,6 +17,7 @@ import { mergeInitialHistory } from "../src/history-merge.ts";
 import { imageDimensions } from "../src/img.ts";
 import { boundCachedTurns } from "../src/cache.ts";
 import { boundRuntimeTurns, pruneRuntimeMap } from "../src/runtime-bounds.ts";
+import { ImeSubmitGuard, shouldSubmitTextKey } from "../src/ime-submit.ts";
 import {
   classifyBtwOpened,
   consumeDiscardedBtwSnapshot,
@@ -26,6 +27,37 @@ import {
 import { RelayWs } from "../src/ws.ts";
 import { modelsFor } from "../src/data.ts";
 import type { ServerEvent } from "../src/protocol.ts";
+
+assert.equal(shouldSubmitTextKey({
+  key: "Enter", shiftKey: false, isComposing: false, keyCode: 13,
+}), true);
+assert.equal(shouldSubmitTextKey({
+  key: "Enter", shiftKey: true, isComposing: false, keyCode: 13,
+}), false);
+assert.equal(shouldSubmitTextKey({
+  key: "Enter", shiftKey: false, isComposing: true, keyCode: 13,
+}), false);
+assert.equal(shouldSubmitTextKey({
+  key: "Enter", shiftKey: false, isComposing: false, keyCode: 229,
+}), false);
+assert.equal(shouldSubmitTextKey({
+  key: "Space", shiftKey: false, isComposing: false, keyCode: 32,
+}), false);
+
+const imeSubmit = new ImeSubmitGuard();
+assert.equal(imeSubmit.shouldSubmitKey({
+  key: "Enter", shiftKey: false, isComposing: false, keyCode: 13,
+}), true);
+imeSubmit.startComposition();
+assert.equal(imeSubmit.shouldSubmitKey({
+  key: "Enter", shiftKey: false, isComposing: false, keyCode: 13,
+}), false);
+assert.equal(imeSubmit.shouldCommitBeforeButtonSubmit(), true);
+imeSubmit.endComposition();
+assert.equal(imeSubmit.shouldSubmitKey({
+  key: "Enter", shiftKey: false, isComposing: false, keyCode: 13,
+}), true);
+assert.equal(imeSubmit.shouldCommitBeforeButtonSubmit(), false);
 
 let requested = "";
 const authenticated = await probeSession(async (input, init) => {

@@ -1,8 +1,9 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Icon } from "../icons";
 import { PanelTabs } from "./PanelTabs";
 import type { SessionRuntime } from "../reducer";
+import { ImeSubmitGuard } from "../ime-submit";
 
 /** /btw side panel: a mini chat over an ephemeral fork of the current session.
  * Reuses ChatView for the transcript; a minimal textarea for input. Closing
@@ -20,15 +21,30 @@ export function BtwPanel({ sid, rt, engine, opening, active, hasDiff, onTab, onS
 }) {
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const imeSubmitRef = useRef(new ImeSubmitGuard());
+  const buttonSendTimerRef = useRef<number | null>(null);
   const turns = rt?.turns ?? [];
   const busy = !!opening || rt?.state === "running";
 
-  const send = () => {
-    const t = text.trim();
+  useEffect(() => () => {
+    if (buttonSendTimerRef.current !== null) {
+      window.clearTimeout(buttonSendTimerRef.current);
+    }
+  }, []);
+
+  const send = (value = taRef.current?.value ?? text) => {
+    const t = value.trim();
     if (!t || busy) return;
     onSend(t);
     setText("");
     if (taRef.current) taRef.current.style.height = "auto";
+  };
+  const requestButtonSend = () => {
+    if (buttonSendTimerRef.current !== null) return;
+    buttonSendTimerRef.current = window.setTimeout(() => {
+      buttonSendTimerRef.current = null;
+      send();
+    }, 0);
   };
   const grow = (el: HTMLTextAreaElement) => { el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight, 120) + "px"; };
 
@@ -59,9 +75,26 @@ export function BtwPanel({ sid, rt, engine, opening, active, hasDiff, onTab, onS
           placeholder={opening ? "正在打开…" : rt?.state === "running" ? "回答中…" : "问点什么(Enter 发送 · Shift+Enter 换行)"}
           rows={1}
           onChange={(e) => { setText(e.target.value); grow(e.target); }}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+          onCompositionStart={() => imeSubmitRef.current.startComposition()}
+          onCompositionEnd={(e) => {
+            imeSubmitRef.current.endComposition();
+            setText(e.currentTarget.value);
+          }}
+          onKeyDown={(e) => {
+            if (!imeSubmitRef.current.shouldSubmitKey({
+              key: e.key, shiftKey: e.shiftKey,
+              isComposing: e.nativeEvent.isComposing, keyCode: e.nativeEvent.keyCode,
+            })) return;
+            e.preventDefault();
+            send(e.currentTarget.value);
+          }}
         />
-        <button className="btw-send" onClick={send} disabled={busy || !text.trim()} aria-label="发送">
+        <button className="btw-send"
+          onPointerDown={() => {
+            if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
+          }}
+          onClick={requestButtonSend}
+          disabled={busy || !text.trim()} aria-label="发送">
           <Icon name="send" size={18} />
         </button>
       </div>

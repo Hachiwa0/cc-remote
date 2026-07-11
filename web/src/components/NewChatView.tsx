@@ -9,6 +9,7 @@ import { CommandSheet } from "./CommandSheet";
 import { modelsFor, effortsFor, defaultEffortFor, defaultModelFor, type Catalog } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
 import type { QueryImg, QueryFile } from "../protocol";
+import { ImeSubmitGuard } from "../ime-submit";
 
 interface Props {
   cwd: string;
@@ -32,10 +33,19 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
   const [creating, setCreating] = useState(false);
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const imeSubmitRef = useRef(new ImeSubmitGuard());
+  const buttonSendTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (createError) setCreating(false);
   }, [createError]);
+
+  useEffect(() => () => {
+    if (buttonSendTimerRef.current !== null) {
+      window.clearTimeout(buttonSendTimerRef.current);
+    }
+  }, []);
 
   const MODELS_E = modelsFor(engine, catalog);
   // A null model means "the engine's configured default" (codex config.toml's `model`)
@@ -76,12 +86,21 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
     if (fs.length) { e.preventDefault(); void onPick(fs); }
   };
 
-  const send = () => {
-    if (!canSend) return;
+  const send = (value = taRef.current?.value ?? text) => {
+    const prompt = value.trim();
+    if ((!prompt && !hasAttachments) || creating || importing) return;
     setCreating(true);
     const queued = onSend(
-      text.trim(), images.length ? images : undefined, files.length ? files : undefined);
+      prompt, images.length ? images : undefined, files.length ? files : undefined);
     if (!queued) setCreating(false);
+  };
+
+  const requestButtonSend = () => {
+    if (buttonSendTimerRef.current !== null) return;
+    buttonSendTimerRef.current = window.setTimeout(() => {
+      buttonSendTimerRef.current = null;
+      send();
+    }, 0);
   };
 
   return (
@@ -114,10 +133,22 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
           </div>
         )}
 
-        <textarea className="newchat-input" placeholder="发条消息开始…"
+        <textarea className="newchat-input" placeholder="发条消息开始…" ref={taRef}
           value={text} onChange={(e) => setText(e.target.value)} onPaste={onPaste} autoFocus rows={3}
           disabled={creating || importing}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
+          onCompositionStart={() => imeSubmitRef.current.startComposition()}
+          onCompositionEnd={(e) => {
+            imeSubmitRef.current.endComposition();
+            setText(e.currentTarget.value);
+          }}
+          onKeyDown={(e) => {
+            if (!imeSubmitRef.current.shouldSubmitKey({
+              key: e.key, shiftKey: e.shiftKey,
+              isComposing: e.nativeEvent.isComposing, keyCode: e.nativeEvent.keyCode,
+            })) return;
+            e.preventDefault();
+            send(e.currentTarget.value);
+          }} />
 
         <div className="newchat-foot">
           <div className="newchat-ctls">
@@ -132,7 +163,12 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
             <span className="newchat-hint">{createError
               ? `创建失败：${createError}`
               : importing ? "正在导入附件…" : creating ? "正在创建会话…" : "Enter 发送"}</span>
-            <button className="newchat-send" onClick={send} disabled={!canSend}>
+            <button className="newchat-send"
+              onPointerDown={() => {
+                if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
+              }}
+              onClick={requestButtonSend}
+              disabled={!canSend}>
               <Icon name="send" size={16} />开始
             </button>
           </div>
