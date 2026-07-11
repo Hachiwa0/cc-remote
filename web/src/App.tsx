@@ -14,6 +14,7 @@ import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { GoalPanel } from "./components/GoalPanel";
+import { parseGoalCommand } from "./goal-command";
 import { defaultModelFor, defaultEffortFor, permsFor } from "./data";
 import { shouldAcceptSessionList } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
@@ -45,6 +46,9 @@ export default function App() {
   // true from the moment /btw is clicked until the fork's btw_opened arrives — so
   // the panel appears instantly (spinner) instead of waiting ~1s for the fork.
   const [btwOpening, setBtwOpening] = useState(false);
+  // Goal is deliberately opt-in UI: no empty bar and no RPC until /goal runs.
+  // Keep reveal/editor state per session so switching sessions never leaks it.
+  const [goalUiBySid, setGoalUiBySid] = useState<Record<string, { revealed: boolean; open: boolean }>>({});
   const [state, dispatch] = useReducer(reduce, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -78,11 +82,7 @@ export default function App() {
   const allQueued = collectWaitingQueries(state.runtimes);
   const replaceableQueued = collectWaitingQueries(state.runtimes, focusedSid);
 
-  useEffect(() => {
-    if (focusedSid && engine === "codex" && state.connState === "connected") {
-      wsRef.current?.sendGetGoal();
-    }
-  }, [focusedSid, engine, state.connState]);
+  const goalUi = focusedSid ? goalUiBySid[focusedSid] : undefined;
 
   // HttpOnly cookies can't be inspected from JS. Ask the relay whether this
   // browser session is still registered before opening a WebSocket; this also
@@ -226,6 +226,15 @@ export default function App() {
             handleSnapshot(msg);
             return;
           }
+          if (msg.type === "session_rekey") {
+            setGoalUiBySid((current) => {
+              const prior = current[msg.old_key];
+              if (!prior) return current;
+              const next = { ...current, [msg.session_id]: prior };
+              delete next[msg.old_key];
+              return next;
+            });
+          }
           if (msg.type === "session_list") ws.setSessionEngines(msg.sessions);
           if (msg.type === "session_list"
               && !shouldAcceptSessionList(engineRef.current, msg)) return;
@@ -263,6 +272,7 @@ export default function App() {
           btwRequestIdsRef.current.clear();
           discardedBtwSidsRef.current.clear();
           setBtwOpening(false);
+          setGoalUiBySid({});
           dispatch({ type: "reset" });
           setAuthed(false);
           void (async () => {
@@ -527,6 +537,25 @@ export default function App() {
     wsRef.current?.sendSetPerm(perm);
     dispatch({ type: "set_perm", perm });
   };
+  const setGoalUi = (patch: Partial<{ revealed: boolean; open: boolean }>) => {
+    if (!focusedSid) return;
+    setGoalUiBySid((current) => {
+      const previous = current[focusedSid] ?? { revealed: false, open: false };
+      return { ...current, [focusedSid]: { ...previous, ...patch } };
+    });
+  };
+  const runGoal = (args: string) => {
+    if (!focusedSid) return;
+    const command = parseGoalCommand(args);
+    if (command.kind === "clear") {
+      wsRef.current?.sendClearGoal();
+      setGoalUi({ revealed: false, open: false });
+      return;
+    }
+    setGoalUi({ revealed: true, open: true });
+    if (command.kind === "show") wsRef.current?.sendGetGoal();
+    else wsRef.current?.sendSetGoal(command.objective, "active", null);
+  };
   const getDiff = (file: string) => {
     setRightView("diff");
     dispatch({ type: "open_artifact_loading", file, sid: focusedSid });
@@ -654,9 +683,19 @@ export default function App() {
               onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_PAGE); }}
               onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
 
-            {engine === "codex" && <GoalPanel goal={rt.goal}
-              onSave={(objective, status, budget) => wsRef.current?.sendSetGoal(objective, status, budget)}
-              onClear={() => wsRef.current?.sendClearGoal()} />}
+            <GoalPanel engine={engine} goal={rt.goal}
+              revealed={!!goalUi?.revealed} open={!!goalUi?.open}
+              onOpen={() => { wsRef.current?.sendGetGoal(); setGoalUi({ revealed: true, open: true }); }}
+              onClose={() => setGoalUi({ open: false })}
+              onDismiss={() => setGoalUi({ revealed: false, open: false })}
+              onSave={(objective, status, budget) => {
+                wsRef.current?.sendSetGoal(objective, status, engine === "codex" ? budget : null);
+                setGoalUi({ revealed: true, open: false });
+              }}
+              onClear={() => {
+                wsRef.current?.sendClearGoal();
+                setGoalUi({ revealed: false, open: false });
+              }} />
 
             <Composer
           state={rt.state}
@@ -691,6 +730,7 @@ export default function App() {
           onClear={() => dispatch({ type: "enter_new_chat", cwd: state.currentCwd })}
           onContext={() => wsRef.current?.sendGetContext()}
           onOpenBtw={openBtw}
+          onGoal={runGoal}
           contextReport={rt.contextReport}
         />
           </>

@@ -142,7 +142,22 @@ export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }
 export type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
-export interface ThreadGoal { threadId: string; objective: string; status: GoalStatus; tokenBudget?: number | null; tokensUsed: number; timeUsedSeconds: number; createdAt: number; updatedAt: number }
+export interface ThreadGoal {
+  threadId: string;
+  objective: string;
+  status: GoalStatus;
+  engine?: "claude" | "codex";
+  tokenBudget?: number | null;
+  tokensUsed?: number;
+  timeUsedSeconds?: number;
+  createdAt?: number;
+  updatedAt?: number;
+  // Claude Code's native /goal lifecycle fields (active_goal events).
+  iterations?: number;
+  lastReason?: string | null;
+  setAt?: number;
+  tokensAtStart?: number;
+}
 export interface GoalState extends Base { type: "goal_state"; goal?: ThreadGoal | null }
 export interface ContextCategory { name: string; tokens: number; color: string; isDeferred?: boolean }
 export interface ContextReport extends Base {

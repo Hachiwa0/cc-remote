@@ -45,6 +45,7 @@ interface Props {
   onClear: () => void;
   onContext: () => void;
   onOpenBtw?: () => void;
+  onGoal?: (args: string) => void;
   contextReport: ContextReport | null;
 }
 
@@ -237,6 +238,7 @@ export function Composer(p: Props) {
       case "context": p.onContext(); setCtxOpen(true); break;
       // codex /status = session config + token usage; surface the context readout.
       case "status": p.onContext(); setCtxOpen(true); break;
+      case "goal": p.onGoal?.(args); break;
       // /btw: open an ephemeral side-fork panel (both engines).
       case "btw": p.onOpenBtw?.(); break;
       // codex /fast: flip the Fast service tier. The wrapper toggles off the
