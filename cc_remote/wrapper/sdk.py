@@ -8,6 +8,7 @@ id, and bypassPermissions.
 """
 from __future__ import annotations
 
+import os
 import shutil
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, __version__ as SDK_VERSION
@@ -15,10 +16,22 @@ from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
+from cc_remote.wrapper.child_env import child_env_tombstones
 
 log = logger("cc_remote.wrapper.sdk")
 
 REQUIRED_SDK = (0, 2)  # 0.2.x; the interrupt/drain contract is version-sensitive
+
+
+def _explicit_cli_path(value: str) -> str | None:
+    """Normalize an opt-in CLI path without changing blank/PATH behavior."""
+    value = value.strip()
+    if not value:
+        return None
+    path = os.path.expanduser(value)
+    if not os.path.isabs(path):
+        raise RuntimeError("CLAUDE_BIN must be an absolute path")
+    return path
 
 
 class SdkHandle:
@@ -35,8 +48,14 @@ class SdkHandle:
         self.applied_effort: str | None = None
 
     @staticmethod
-    def preflight() -> None:
-        if not shutil.which("claude"):
+    def preflight(cli_path: str = "") -> None:
+        explicit = _explicit_cli_path(cli_path)
+        if explicit:
+            if not os.path.isfile(explicit) or not os.access(explicit, os.X_OK):
+                raise RuntimeError(
+                    f"CLAUDE_BIN is not an executable file: {explicit}"
+                )
+        elif not shutil.which("claude"):
             raise RuntimeError("'claude' CLI not found on PATH; install Claude Code v2.1.51+")
         try:
             parts = SDK_VERSION.split(".")
@@ -55,12 +74,16 @@ class SdkHandle:
             include_partial_messages=True,        # StreamEvent with content_block_delta
             permission_mode="bypassPermissions",  # unattended; matches settings.json
             cwd=cwd or self.cfg.cc_cwd,           # dynamic: must match the resumed session's cwd
+            cli_path=_explicit_cli_path(self.cfg.claude_bin),
             resume=resume_id or None,
             # fork_session=True resumes `resume_id`'s context but writes new turns to
             # a FRESH session id, leaving the original transcript untouched — used for
             # ephemeral /btw side-forks.
             fork_session=fork,
             effort=self.effort,                   # reasoning strength; None -> CLI default (high)
+            # The SDK otherwise copies the wrapper's complete environment into
+            # Claude/tool subprocesses. Never expose relay login/bearer secrets.
+            env=child_env_tombstones(),
             stderr=self._on_stderr,               # surface cc subprocess errors
             # setting_sources left None -> load ~/.claude/settings.json (model link, model id)
             system_prompt={
@@ -86,7 +109,10 @@ class SdkHandle:
 
     @staticmethod
     def _on_stderr(line: str) -> None:
-        log.warning("cc stderr: " + line.rstrip())
+        # Child stderr may contain credentials or a pathological single line.
+        # Preserve only its size; the raw text is never useful enough to justify
+        # copying it into the control-plane logger.
+        log.warning("cc stderr: ***", chars=len(line))
 
     async def connect(self, resume_id: str | None = None, cwd: str | None = None,
                       fork: bool = False) -> None:

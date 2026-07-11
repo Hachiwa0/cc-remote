@@ -8,9 +8,12 @@ under ~/.claude/projects/). Codex writes one rollout .jsonl per thread under
 from __future__ import annotations
 
 import glob
+import heapq
 import json
 import os
 import re
+import stat
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -19,44 +22,51 @@ from cc_remote.log import logger
 log = logger("cc_remote.wrapper.codex_sessions")
 
 _CONFIG = os.path.expanduser("~/.codex/config.toml")
+_CONFIG_MAX_BYTES = 4 * 1024 * 1024
 
 _ROOT = os.path.expanduser("~/.codex/sessions")
 _GLOB = os.path.join(_ROOT, "**", "rollout-*.jsonl")
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+MAX_DISCOVERY_FILES = 20_000
+MAX_JSONL_RECORD_BYTES = 16 * 1024 * 1024
+MAX_META_RECORD_BYTES = 1024 * 1024
 
 
 def list_codex_sessions(limit: int = 60) -> list[dict]:
     """Most-recently-modified Codex sessions -> [{session_id, cwd, last_modified,
     first_prompt}]. Sorted newest first."""
+    limit = max(1, min(limit, 200))
+    cur = codex_current_provider().strip()
+    newest: list[tuple[float, str, dict]] = []
     try:
-        files = glob.glob(_GLOB, recursive=True)
+        paths = glob.iglob(_GLOB, recursive=True)
+        for scanned, path in enumerate(paths, 1):
+            if scanned > MAX_DISCOVERY_FILES:
+                log.warning("codex session discovery capped",
+                            files=MAX_DISCOVERY_FILES)
+                break
+            meta = _read_meta(path)
+            if not meta or not meta.get("id"):
+                continue
+            prov = (meta.get("model_provider") or "").strip()
+            if cur and prov and prov != cur:
+                continue
+            item = (_mtime(path), path, meta)
+            if len(newest) < limit:
+                heapq.heappush(newest, item)
+            elif item[0] > newest[0][0]:
+                heapq.heapreplace(newest, item)
     except Exception:
         return []
-    files.sort(key=_mtime, reverse=True)
-    cur = codex_current_provider().strip()
+    files = sorted(newest, reverse=True)
     out: list[dict] = []
-    hidden = 0
-    for path in files:
-        if len(out) >= limit:
-            break
-        meta = _read_meta(path)
-        if not meta or not meta.get("id"):
-            continue
-        # Different vendor -> different sessions: hide rollouts created under a
-        # provider other than the one configured now (they'd fail to resume —
-        # provider-encrypted reasoning). Unknown/blank provider is shown (can't
-        # classify), and if no current provider is set we don't filter at all.
-        prov = (meta.get("model_provider") or "").strip()
-        if cur and prov and prov != cur:
-            hidden += 1
-            continue
+    for _, path, meta in files:
         out.append({
             "session_id": meta["id"],
             "cwd": meta.get("cwd"),
             "last_modified": _mtime_iso(path),
             "first_prompt": _first_user_prompt(path),
         })
-    if hidden:
-        log.info("codex sessions filtered by provider", provider=cur, hidden=hidden, shown=len(out))
     return out
 
 
@@ -77,19 +87,19 @@ def codex_rollout_path(session_id: str) -> Optional[str]:
 def codex_model(default: str = "gpt-5-codex") -> str:
     """The model Codex is configured to use (from ~/.codex/config.toml). Used to
     show the right model readout for live Codex sessions (not a Claude model)."""
-    return _config_value("model", default)
+    return _config_value("model", default)[:256]
 
 
 def codex_effort(default: str = "high") -> str:
     """The default reasoning effort from ~/.codex/config.toml (model_reasoning_effort)."""
-    return _config_value("model_reasoning_effort", default)
+    return _config_value("model_reasoning_effort", default)[:64]
 
 
 def codex_current_provider() -> str:
     """The provider Codex is configured for right now (config.toml model_provider).
     A codex rollout carries provider-encrypted reasoning, so a session from a
     DIFFERENT provider can't be resumed here — the list is filtered to this one."""
-    return _config_value("model_provider", "")
+    return _config_value("model_provider", "")[:256]
 
 
 def codex_context_window(default: int = 256000) -> int:
@@ -136,9 +146,16 @@ def set_codex_config_key(key: str, value: Optional[str]) -> bool:
     NEW session (and the user's terminal codex) inherits; a session's own model/effort
     live in its rollout. See codex_session_settings().
     """
+    target = os.path.realpath(_CONFIG)
     try:
-        with open(_CONFIG) as f:
-            lines = f.readlines()
+        info = os.stat(target)
+        if info.st_size > _CONFIG_MAX_BYTES:
+            raise ValueError("config.toml exceeds size limit")
+        with open(target) as f:
+            content = f.read(_CONFIG_MAX_BYTES + 1)
+        if len(content.encode("utf-8", "surrogatepass")) > _CONFIG_MAX_BYTES:
+            raise ValueError("config.toml exceeds size limit")
+        lines = content.splitlines(keepends=True)
     except Exception as e:
         log.warning("read config.toml failed", error=str(e))
         return False
@@ -159,17 +176,41 @@ def set_codex_config_key(key: str, value: Optional[str]) -> bool:
         after = next((i for i, l in enumerate(lines)
                       if i < first_table and re.match(r"\s*model\s*=", l)), None)
         lines.insert(after + 1 if after is not None else 0, entry)
+    temp_path = ""
+    temp_fd: int | None = None
     try:
-        with open(_CONFIG, "w") as f:
+        temp_fd, temp_path = tempfile.mkstemp(
+            prefix=".config.toml.cc-remote-", dir=os.path.dirname(target))
+        stream = os.fdopen(temp_fd, "w")
+        temp_fd = None  # stream owns it from here
+        with stream as f:
+            os.fchmod(f.fileno(), stat.S_IMODE(info.st_mode))
             f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, target)
+        temp_path = ""
         log.info("codex config key set", key=key, value=value)
         return True
     except Exception as e:
         log.warning("write config.toml failed", error=str(e))
         return False
+    finally:
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
-def codex_session_settings(session_id: str) -> dict:
+def codex_session_settings(
+    session_id: str, max_bytes: int = 64 * 1024 * 1024,
+) -> dict:
     """The model/effort THIS session last ran with, read from its own rollout.
 
     codex appends a `turn_context` record per turn carrying `model` and `effort`.
@@ -184,10 +225,17 @@ def codex_session_settings(session_id: str) -> dict:
     path = _rollout_path(session_id)
     if not path:
         return {}
+    try:
+        if os.path.getsize(path) > max_bytes:
+            log.warning("codex session settings source too large",
+                        session_id=session_id)
+            return {}
+    except OSError:
+        return {}
     out: dict = {}
     try:
         with open(path) as f:
-            for line in f:
+            for line in _bounded_lines(f, MAX_JSONL_RECORD_BYTES):
                 # cheap prefilter: most lines are messages, not turn contexts
                 if '"turn_context"' not in line:
                     continue
@@ -203,7 +251,8 @@ def codex_session_settings(session_id: str) -> dict:
                 for key in ("model", "effort"):
                     val = payload.get(key)
                     if isinstance(val, str) and val:
-                        out[key] = val      # last one wins = the session's current setting
+                        out[key] = val[:256 if key == "model" else 64]
+                        # last one wins = the session's current setting
     except Exception as e:
         log.warning("read codex session settings failed", session_id=session_id, error=str(e))
     return out
@@ -211,14 +260,18 @@ def codex_session_settings(session_id: str) -> dict:
 
 def _config_value(key: str, default: str) -> str:
     try:
-        with open(_CONFIG) as f:
+        target = os.path.realpath(_CONFIG)
+        if os.path.getsize(target) > _CONFIG_MAX_BYTES:
+            return default
+        with open(target) as f:
             for line in f:
                 s = line.strip()
                 # exact key match: `model = ...` must not match `model_provider = ...`
                 if s.startswith(key) and "=" in s:
                     lhs = s.split("=", 1)[0].strip()
                     if lhs == key:
-                        return s.split("=", 1)[1].strip().strip('"').strip("'") or default
+                        value = s.split("=", 1)[1].strip().strip('"').strip("'")
+                        return value[:4096] or default
     except Exception:
         pass
     return default
@@ -227,8 +280,19 @@ def _config_value(key: str, default: str) -> str:
 # ---- internals ----
 def _rollout_path(session_id: str) -> Optional[str]:
     try:
-        m = glob.glob(os.path.join(_ROOT, "**", f"*{session_id}*.jsonl"), recursive=True)
-        return m[0] if m else None
+        if not _SAFE_SESSION_ID.fullmatch(session_id):
+            return None
+        safe_id = glob.escape(session_id)
+        matches = glob.iglob(
+            os.path.join(_ROOT, "**", f"*{safe_id}*.jsonl"), recursive=True)
+        root = os.path.realpath(_ROOT)
+        for index, match in enumerate(matches):
+            if index >= 1000:
+                break
+            resolved = os.path.realpath(match)
+            if os.path.commonpath((root, resolved)) == root:
+                return match
+        return None
     except Exception:
         return None
 
@@ -236,7 +300,10 @@ def _rollout_path(session_id: str) -> Optional[str]:
 def _read_meta(path: str) -> Optional[dict]:
     try:
         with open(path) as f:
-            d = json.loads(f.readline())
+            line = f.readline(MAX_META_RECORD_BYTES + 1)
+            if len(line.encode("utf-8", "surrogatepass")) > MAX_META_RECORD_BYTES:
+                return None
+            d = json.loads(line)
         if d.get("type") == "session_meta" and isinstance(d.get("payload"), dict):
             return d["payload"]
     except Exception:
@@ -249,10 +316,8 @@ def _first_user_prompt(path: str, max_lines: int = 80) -> Optional[str]:
     envelope messages Codex injects."""
     try:
         with open(path) as f:
-            for _ in range(max_lines):
-                line = f.readline()
-                if not line:
-                    break
+            for _, line in zip(range(max_lines), _bounded_lines(
+                    f, MAX_JSONL_RECORD_BYTES)):
                 try:
                     d = json.loads(line)
                 except Exception:
@@ -268,6 +333,21 @@ def _first_user_prompt(path: str, max_lines: int = 80) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _bounded_lines(file, max_record_bytes: int):
+    """Yield complete JSONL records without ever allocating one unbounded line."""
+    while True:
+        line = file.readline(max_record_bytes + 1)
+        if not line:
+            return
+        if len(line.encode("utf-8", "surrogatepass")) <= max_record_bytes \
+                and (line.endswith("\n") or len(line) < max_record_bytes + 1):
+            yield line
+            continue
+        # Oversized record: consume bounded chunks through its newline and skip it.
+        while line and not line.endswith("\n"):
+            line = file.readline(max_record_bytes + 1)
 
 
 def _mtime(path: str) -> float:

@@ -1,36 +1,41 @@
 // Empty-state "new chat" page: a centered composer (a la Claude app / Codex)
 // with the working directory, model, effort, and attachments chosen UP FRONT.
 // The first message triggers new_session(cwd, engine, model, effort) on the
-// host; once that session is ready the pending query (with its images/files) is
-// fired and the normal chat UI takes over. model/effort are null until the user
-// picks one — null means "use the wrapper's engine default".
-import { useRef, useState, type ClipboardEvent } from "react";
+// host as one protocol-v4 command, including its images/files. model/effort are
+// null until the user picks one — null means "use the wrapper's engine default".
+import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import { Icon } from "../icons";
 import { CommandSheet } from "./CommandSheet";
 import { modelsFor, effortsFor, defaultEffortFor, defaultModelFor, type Catalog } from "../data";
-import { pickFiles } from "../img";
+import { attachmentBytes, pickFiles } from "../img";
 import type { QueryImg, QueryFile } from "../protocol";
 
 interface Props {
   cwd: string;
-  creating: boolean;  // true while the new session is being created (pendingNewQuery set)
   engine?: "claude" | "codex";  // which backend this new chat will use
   catalog?: Catalog;  // engine-reported models/efforts; falls back to data.ts
   catalogDefault?: Record<string, string>;  // engine -> model a NEW session starts on
   model: string | null;   // pre-selected model (null = engine default)
   effort: string | null;  // pre-selected reasoning effort (null = engine default)
+  createError?: string | null;
   onPickCwd: () => void;  // open the directory picker
   onPickModel: (model: string) => void;
   onPickEffort: (effort: string) => void;
-  onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => void;
+  onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
 }
 
-export function NewChatView({ cwd, creating, engine = "claude", catalog, catalogDefault, model, effort, onPickCwd, onPickModel, onPickEffort, onSend }: Props) {
+export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, model, effort, createError, onPickCwd, onPickModel, onPickEffort, onSend }: Props) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
+  const [importing, setImporting] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (createError) setCreating(false);
+  }, [createError]);
 
   const MODELS_E = modelsFor(engine, catalog);
   // A null model means "the engine's configured default" (codex config.toml's `model`)
@@ -44,12 +49,21 @@ export function NewChatView({ cwd, creating, engine = "claude", catalog, catalog
   const effortName = (EFFORTS_E.find((e) => e.id === effort) ?? EFFORTS_E[EFFORTS_E.length - 1]).name;
 
   const hasAttachments = images.length > 0 || files.length > 0;
-  const canSend = (text.trim().length > 0 || hasAttachments) && !creating;
+  const canSend = (text.trim().length > 0 || hasAttachments) && !creating && !importing;
 
-  const onPick = (fl: FileList | File[] | null) =>
-    pickFiles(fl,
-      (img) => setImages((prev) => [...prev, img]),
-      (file) => setFiles((prev) => [...prev, file]));
+  const onPick = async (fl: FileList | File[] | null) => {
+    if (importing) return;
+    setImporting(true);
+    try {
+      const batch = await pickFiles(
+        fl, images.length + files.length, attachmentBytes(images, files));
+      if (batch.images.length) setImages((previous) => [...previous, ...batch.images]);
+      if (batch.files.length) setFiles((previous) => [...previous, ...batch.files]);
+      if (batch.errors.length) window.alert(batch.errors.join("；"));
+    } finally {
+      setImporting(false);
+    }
+  };
 
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData?.items;
@@ -59,12 +73,15 @@ export function NewChatView({ cwd, creating, engine = "claude", catalog, catalog
       const it = items[i];
       if (it.kind === "file") { const f = it.getAsFile(); if (f) fs.push(f); }
     }
-    if (fs.length) { e.preventDefault(); onPick(fs); }
+    if (fs.length) { e.preventDefault(); void onPick(fs); }
   };
 
   const send = () => {
     if (!canSend) return;
-    onSend(text.trim(), images.length ? images : undefined, files.length ? files : undefined);
+    setCreating(true);
+    const queued = onSend(
+      text.trim(), images.length ? images : undefined, files.length ? files : undefined);
+    if (!queued) setCreating(false);
   };
 
   return (
@@ -99,19 +116,22 @@ export function NewChatView({ cwd, creating, engine = "claude", catalog, catalog
 
         <textarea className="newchat-input" placeholder="发条消息开始…"
           value={text} onChange={(e) => setText(e.target.value)} onPaste={onPaste} autoFocus rows={3}
+          disabled={creating || importing}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
 
         <div className="newchat-foot">
           <div className="newchat-ctls">
-            <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="添加图片或文件" title="添加图片或文件" disabled={creating}>
+            <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="添加图片或文件" title="添加图片或文件" disabled={creating || importing}>
               <Icon name="plus" size={18} />
             </button>
-            <input ref={fileRef} type="file" multiple hidden onChange={(e) => { onPick(e.target.files); e.target.value = ""; }} />
+            <input ref={fileRef} type="file" multiple hidden onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
             <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型" disabled={creating}>{modelName}</button>
             <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度" disabled={creating}>{effortName}</button>
           </div>
           <div className="newchat-foot-right">
-            <span className="newchat-hint">{creating ? "正在创建会话…" : "Enter 发送"}</span>
+            <span className="newchat-hint">{createError
+              ? `创建失败：${createError}`
+              : importing ? "正在导入附件…" : creating ? "正在创建会话…" : "Enter 发送"}</span>
             <button className="newchat-send" onClick={send} disabled={!canSend}>
               <Icon name="send" size={16} />开始
             </button>

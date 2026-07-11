@@ -173,13 +173,15 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
         </div>
         {isMenu && (
           <div className="card-menu" onClick={(e) => e.stopPropagation()}>
-            <button onClick={() => startRename(s)}><Icon name="edit" size={15} />重命名</button>
+            {s.engine !== "codex" && (
+              <button onClick={() => startRename(s)}><Icon name="edit" size={15} />重命名</button>
+            )}
             <button onClick={() => doCopyId(s)}><Icon name={copiedId === s.session_id ? "check" : "copy"} size={15} />{copiedId === s.session_id ? "已复制" : "复制 session ID"}</button>
-            {isArchived ? (
+            {s.engine !== "codex" && (isArchived ? (
               <button onClick={() => doArchive(s, false)}><Icon name="archive" size={15} />取消归档</button>
             ) : (
               <button onClick={() => doArchive(s, true)}><Icon name="archive" size={15} />归档</button>
-            )}
+            ))}
           </div>
         )}
       </div>

@@ -2,7 +2,9 @@
 a live codex parent — open_btw -> query(fork) -> inherits context -> close_btw."""
 import asyncio, os, sys
 from types import SimpleNamespace
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+sys.path.insert(0, REPO_ROOT)
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.wrapper.codex_handle import CodexHandle
@@ -33,7 +35,9 @@ async def main():
     print("parent:", parent.key)
 
     # --- OPEN BTW ---
-    await m._handle_open_btw(SimpleNamespace(type="open_btw", sid=parent.key, client_id="c1"))
+    await m._handle_open_btw(SimpleNamespace(
+        type="open_btw", sid=parent.key, client_id="c1",
+        request_id="live-btw-request"))
     opened = [s for s in sent if getattr(s, "type", None) == "btw_opened"]
     assert opened, "no btw_opened emitted"
     btw_sid = opened[0].btw_sid
@@ -65,4 +69,5 @@ async def main():
     await ph.disconnect()
     print("\nWRAPPER /btw E2E PASS")
 
-sys.exit(asyncio.run(main()) or 0)
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()) or 0)

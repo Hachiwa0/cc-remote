@@ -4,14 +4,15 @@ Runs a real turn against the locally-configured codex (gpt-5.5 on the Mac) and
 prints the resulting cc-remote wire-event stream. Proves the two new wrapper files
 work in-tree, no machine.py changes, zero cc risk.
 
-  cd cc-remote && python3 test_codex_live.py
+  cd cc-remote && python3 scripts/live/test_codex_live.py
 """
 import asyncio
 import os
 import sys
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+sys.path.insert(0, REPO_ROOT)
 
 from cc_remote.wrapper.codex_handle import CodexHandle
 from cc_remote.wrapper.codex_stream import (

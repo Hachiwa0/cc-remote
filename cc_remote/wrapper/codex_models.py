@@ -30,6 +30,9 @@ log = logger("cc_remote.wrapper.codex_models")
 
 _TTL = 600.0          # catalog is baked into the binary; re-probe only if it's upgraded
 _RPC_TIMEOUT = 30.0
+_MAX_MODELS = 256
+_MAX_EFFORTS = 16
+_MAX_CATALOG_TEXT = 4096
 
 _cache: Optional[list[dict]] = None
 _cache_ts: float = 0.0
@@ -85,31 +88,48 @@ async def _rpc_model_list() -> list[dict]:
         res = await asyncio.wait_for(await_result(2), _RPC_TIMEOUT)
         return (res or {}).get("data") or []
     finally:
+        if proc.stdin is not None:
+            proc.stdin.close()
         try:
             proc.terminate()
         except ProcessLookupError:
             pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
 
 
 def _normalize(raw: list[dict]) -> list[dict]:
     out: list[dict] = []
     for m in raw:
+        if not isinstance(m, dict):
+            continue
         if m.get("hidden"):
             continue                       # codex's own TUI hides these too
         mid = m.get("id") or m.get("model")
         if not mid:
             continue
-        efforts = [e.get("reasoningEffort")
+        mid = str(mid)[:256]
+        efforts = [str(e.get("reasoningEffort"))[:64]
                    for e in (m.get("supportedReasoningEfforts") or [])
-                   if e.get("reasoningEffort")]
+                   if isinstance(e, dict) and e.get("reasoningEffort")][:_MAX_EFFORTS]
         out.append({
             "id": mid,
-            "display_name": m.get("displayName") or mid,
-            "description": m.get("description") or "",
+            "display_name": str(m.get("displayName") or mid)[:_MAX_CATALOG_TEXT],
+            "description": str(m.get("description") or "")[:_MAX_CATALOG_TEXT],
             "efforts": efforts,
-            "default_effort": m.get("defaultReasoningEffort"),
+            "default_effort": (
+                str(m.get("defaultReasoningEffort"))[:64]
+                if m.get("defaultReasoningEffort") else None),
             "is_default": bool(m.get("isDefault")),
         })
+        if len(out) >= _MAX_MODELS:
+            break
     return out
 
 

@@ -1,14 +1,17 @@
-// WebSocket client to the relay. Browsers can't set Authorization on a
-// WebSocket, so the token goes in ?token=. Auto-reconnects with backoff.
+// WebSocket client to the relay. Browser authentication is carried by the
+// relay's Secure HttpOnly cookie, so no credential appears in JS or the URL.
+// Auto-reconnects with backoff.
 //
 // Multi-session: every inbound frame is demuxed by `msg.sid` (the wrapper
 // stamps it). lastSeq is tracked PER session (lastSeqBySession) so catch-up
 // cursors are per-session. session_focus just sets focusedSid + dispatches —
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
-import type { ServerEvent, QueryImg, QueryFile } from "./protocol";
-import { PROTOCOL_VERSION } from "./protocol";
-import { uuid } from "./util";
+import type { ServerEvent, QueryImg, QueryFile } from "./protocol.ts";
+import { makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
+import { CommandOutbox, planRecoveryReplay } from "./outbox.ts";
+import { probeSession, shouldReconnectAfterSessionProbe } from "./session-auth.ts";
+import { uuid } from "./util.ts";
 
 export type ConnState = "connecting" | "connected" | "reconnecting" | "disconnected";
 
@@ -16,7 +19,18 @@ export interface WsCallbacks {
   onEvent: (msg: ServerEvent) => void;
   onConnState: (s: ConnState, detail?: string) => void;
   onAuthFail?: () => void;
+  onCommandError?: (detail: string) => void;
+  onWrapperGenerationChanged?: () => void;
+  onOutboxChanged?: (protectedSessionIds: string[]) => void;
 }
+
+const OUTBOX_MAX_COMMANDS = 256;
+const OUTBOX_MAX_BYTES = 64 * 1024 * 1024;
+// Keep one browser frame below the relay's 16 MiB WebSocket receive ceiling.
+// The margin covers envelope growth and avoids a reconnect loop for commands
+// that can enter the 64 MiB aggregate outbox but can never cross the relay.
+const OUTBOX_MAX_FRAME_BYTES = 14 * 1024 * 1024;
+const MAX_REPLAY_SESSIONS = 128;
 
 function nowTs(): number {
   return Date.now() / 1000;
@@ -25,30 +39,36 @@ function nowTs(): number {
 export class RelayWs {
   private ws: WebSocket | null = null;
   private lastSeqBySession: Record<string, number> = {};
+  private generationBySession: Record<string, string> = {};
+  private rebuildingSessions = new Set<string>();
+  private replayOrder: string[] = [];
+  private engineBySession: Record<string, "claude" | "codex"> = {};
   private focusedSid: string | null = null;
-  // set while a new_session is in flight: the wrapper assigns + focuses it, so
-  // that ONE SessionFocus must be honored even though it won't match focusedSid.
-  private awaitingNewFocus = false;
+  // Correlates a create response without using SessionFocus as a trigger for the
+  // first query. A later explicit switch clears it, so late create focus cannot
+  // override the user's newer navigation intent.
+  private newSessionFocusRequestId: string | null = null;
+  private newSessionEngine: "claude" | "codex" = "claude";
+  private readonly outbox = new CommandOutbox(
+    OUTBOX_MAX_COMMANDS, OUTBOX_MAX_BYTES, OUTBOX_MAX_FRAME_BYTES);
   private readonly clientId: string;
   private readonly url: string;
   private backoff = 1;
   private stopped = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly token: string;
   private readonly cb: WsCallbacks;
   // Heartbeat: detect a HALF-OPEN link (dead TCP with no close event) and recover.
   private lastRecvAt = 0;
   private hbTimer: ReturnType<typeof setInterval> | null = null;
   private pingSeq = 0;
+  private wrapperGeneration: string | null = null;
+  private lastGenerationChangeNotice: string | null = null;
 
-  constructor(token: string, cb: WsCallbacks) {
-    this.token = token;
+  constructor(cb: WsCallbacks) {
     this.cb = cb;
     this.clientId = uuid();
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const u = new URL(`${proto}//${window.location.host}/ws`);
-    u.searchParams.set("token", this.token);
-    this.url = u.toString();
+    this.url = new URL(`${proto}//${window.location.host}/ws`).toString();
   }
 
   start(): void {
@@ -74,7 +94,7 @@ export class RelayWs {
       const ws = this.ws;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       if (Date.now() - this.lastRecvAt > 45000) { ws.close(); return; }
-      this.send({ v: PROTOCOL_VERSION, type: "ping", n: ++this.pingSeq, ts: nowTs() });
+      this.sendUntracked({ v: PROTOCOL_VERSION, type: "ping", n: ++this.pingSeq, ts: nowTs() });
     }, 20000);
   }
 
@@ -88,53 +108,167 @@ export class RelayWs {
     return vals.length ? Math.max(...vals) : 0;
   }
 
+  /** Highest sequence seen for one session (never borrow another session's cursor). */
+  lastSeqFor(sid: string): number {
+    return this.lastSeqBySession[sid] ?? 0;
+  }
+
+  generationFor(sid: string): string | undefined {
+    return this.generationBySession[sid];
+  }
+
+  /** Runtime ids that must survive client-side reclamation while commands await ACK. */
+  pendingSessionIds(): string[] {
+    return this.outbox.pendingSessionIds();
+  }
+
+  private touchReplay(sid: string): void {
+    this.replayOrder = this.replayOrder.filter((known) => known !== sid);
+    this.replayOrder.push(sid);
+    while (this.replayOrder.length > MAX_REPLAY_SESSIONS) {
+      const expired = this.replayOrder.shift();
+      if (!expired) break;
+      delete this.lastSeqBySession[expired];
+      delete this.generationBySession[expired];
+      delete this.engineBySession[expired];
+      this.rebuildingSessions.delete(expired);
+    }
+  }
+
+  private dropBtwReplayState(): void {
+    for (const knownSid of Object.keys(this.generationBySession)) {
+      if (!knownSid.startsWith("btw-")) continue;
+      delete this.generationBySession[knownSid];
+      delete this.lastSeqBySession[knownSid];
+      delete this.engineBySession[knownSid];
+      this.rebuildingSessions.delete(knownSid);
+      this.replayOrder = this.replayOrder.filter((item) => item !== knownSid);
+    }
+  }
+
+  private noteWrapperGeneration(generation: string): void {
+    const previous = this.wrapperGeneration;
+    this.wrapperGeneration = generation;
+    if (previous === null || previous === generation
+        || this.lastGenerationChangeNotice === generation) return;
+    this.lastGenerationChangeNotice = generation;
+    // BtwOpened precedes the fork's generation-bearing Snapshot. If that second
+    // frame is lost, checking only per-btw generation state leaves a dead fork
+    // visible after restart. Every confirmed wrapper generation change is the
+    // authoritative invalidation boundary for ephemeral forks.
+    this.cb.onWrapperGenerationChanged?.();
+    this.dropBtwReplayState();
+  }
+
+  private noteGeneration(sid: string, generation: string): void {
+    this.noteWrapperGeneration(generation);
+    const previous = this.generationBySession[sid];
+    if (previous !== undefined && previous !== generation) {
+      // seq is monotonic only within a wrapper generation. Snapshot can be the
+      // first per-session proof of a restart, so reset here as well as on an
+      // explicit rebuild envelope.
+      this.lastSeqBySession[sid] = 0;
+    }
+    this.generationBySession[sid] = generation;
+    this.touchReplay(sid);
+  }
+
+  private boundedReplayState(): {
+    cursors: Record<string, number>; generations: Record<string, string>;
+  } {
+    const cursors: Record<string, number> = {};
+    const generations: Record<string, string> = {};
+    for (const sid of this.replayOrder.slice(-MAX_REPLAY_SESSIONS)) {
+      const seq = this.lastSeqBySession[sid];
+      if (typeof seq !== "number") continue;
+      cursors[sid] = seq;
+      const generation = this.generationBySession[sid];
+      if (generation) generations[sid] = generation;
+    }
+    return { cursors, generations };
+  }
+
   /** Track the highest seq seen for a session (so reconnect replays from there). */
   noteSeq(sid: string | null | undefined, seq: number | null | undefined): void {
     if (sid && typeof seq === "number") {
       this.lastSeqBySession[sid] = Math.max(this.lastSeqBySession[sid] ?? 0, seq);
+      this.touchReplay(sid);
     }
   }
 
   /** Seed a session's cursor (e.g. from the IndexedDB cache on load). */
   setLastSeq(sid: string, seq: number): void {
     this.lastSeqBySession[sid] = seq;
+    this.touchReplay(sid);
   }
 
   /** Bulk-seed cursors from the IndexedDB cache BEFORE the first hello, so the
    *  wrapper replays only the delta (seq > lastSeq) instead of the whole history
    *  of every resident session — that flood is what wedged reconnect into a loop. */
-  seedCursors(cursors: Record<string, number>): void {
+  seedReplayState(
+    cursors: Record<string, number>, generations: Record<string, string>,
+  ): void {
     for (const [sid, seq] of Object.entries(cursors)) {
-      if (typeof seq === "number" && seq > (this.lastSeqBySession[sid] ?? 0)) this.lastSeqBySession[sid] = seq;
+      if (typeof seq === "number" && seq > (this.lastSeqBySession[sid] ?? 0)) {
+        this.lastSeqBySession[sid] = seq;
+        this.touchReplay(sid);
+      }
+    }
+    for (const [sid, generation] of Object.entries(generations)) {
+      if (generation && this.lastSeqBySession[sid] != null) {
+        this.generationBySession[sid] = generation;
+        this.touchReplay(sid);
+      }
     }
   }
 
-  setFocusedSid(sid: string | null): void {
+  setFocusedSid(sid: string | null, engine?: "claude" | "codex"): void {
     this.focusedSid = sid;
-    this.awaitingNewFocus = false; // an explicit switch supersedes a pending new-session focus
+    if (sid) {
+      if (engine) this.engineBySession[sid] = engine;
+      this.touchReplay(sid);
+    }
+    this.newSessionFocusRequestId = null;
+  }
+
+  setSessionEngines(sessions: Array<{ session_id: string; engine?: string | null }>): void {
+    for (const session of sessions) {
+      if (session.engine === "codex" || session.engine === "claude") {
+        this.engineBySession[session.session_id] = session.engine;
+      }
+    }
   }
 
   private sidObj(): Record<string, unknown> {
     return this.focusedSid ? { sid: this.focusedSid } : {};
   }
 
-  sendQuery(prompt: string, msg_id: string, images?: QueryImg[], files?: QueryFile[]): void {
+  sendQuery(prompt: string, msg_id: string, images?: QueryImg[], files?: QueryFile[]): boolean {
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "query", prompt, msg_id, ts: nowTs(), ...this.sidObj() };
     if (images && images.length) obj.images = images;
     if (files && files.length) obj.files = files;
-    this.send(obj);
+    return this.send(obj);
   }
 
   // ---- /btw ephemeral side-fork ----
-  sendOpenBtw(parentSid: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "open_btw", sid: parentSid, client_id: this.clientId, ts: nowTs() });
+  sendOpenBtw(parentSid: string, requestId = uuid()): string | null {
+    const queued = this.send({
+      ...makeOpenBtwCommand(parentSid, requestId, nowTs()),
+    });
+    return queued ? requestId : null;
   }
   sendCloseBtw(btwSid: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs() });
   }
   // a turn targeted at an explicit sid (the btw fork), NOT the focused session.
-  sendQueryTo(sid: string, prompt: string, msg_id: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: nowTs() });
+  sendQueryTo(sid: string, prompt: string, msg_id: string,
+              images?: QueryImg[], files?: QueryFile[]): boolean {
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: nowTs(),
+    };
+    if (images && images.length) obj.images = images;
+    if (files && files.length) obj.files = files;
+    return this.send(obj);
   }
 
   sendInterrupt(): void {
@@ -159,6 +293,10 @@ export class RelayWs {
 
   sendGetContext(): void {
     this.send({ v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj() });
+  }
+
+  sendGetContextTo(sid: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs() });
   }
 
   sendGetDiff(file: string, theme: string): void {
@@ -195,23 +333,34 @@ export class RelayWs {
   }
 
   sendSwitchSession(sessionId: string, engine?: "claude" | "codex"): void {
+    if (engine) this.engineBySession[sessionId] = engine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     this.send(obj);
   }
 
-  sendNewSession(cwd?: string | null, engine?: "claude" | "codex", model?: string | null, effort?: string | null): void {
-    this.awaitingNewFocus = true; // honor the wrapper's focus for the freshly-created session
-    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "new_session", ts: nowTs() };
+  sendNewSession(cwd?: string | null, engine?: "claude" | "codex",
+                 model?: string | null, effort?: string | null,
+                 initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] }): boolean {
+    const requestId = initial?.msg_id ?? uuid();
+    this.newSessionFocusRequestId = requestId;
+    this.newSessionEngine = engine ?? "claude";
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "new_session", request_id: requestId, ts: nowTs(),
+    };
     if (cwd) obj.cwd = cwd;
-    // only include `engine` for codex, so claude new_session frames stay byte-identical
-    // (an old relay that doesn't know the field never sees it on cc traffic).
     if (engine && engine !== "claude") obj.engine = engine;
-    // model/effort only when the user explicitly pre-picked one on the new-chat
-    // page; omitted => the wrapper uses its own defaults (no behavior change).
     if (model) obj.model = model;
     if (effort) obj.effort = effort;
-    this.send(obj);
+    if (initial) {
+      obj.prompt = initial.prompt;
+      obj.msg_id = initial.msg_id;
+      if (initial.images?.length) obj.images = initial.images;
+      if (initial.files?.length) obj.files = initial.files;
+    }
+    const queued = this.send(obj);
+    if (!queued) this.newSessionFocusRequestId = null;
+    return queued;
   }
 
   sendRenameSession(sessionId: string, title: string): void {
@@ -229,17 +378,63 @@ export class RelayWs {
   }
 
   /** Send hello with the per-session cursor map (multi-session catch-up). */
-  sendHello(): void {
-    this.send({
+  sendHello(flush = true): void {
+    // Hello must remain the first frame on a fresh relay socket. Once it binds
+    // client_id, replay every still-unacknowledged command in insertion order.
+    const replay = this.boundedReplayState();
+    this.sendUntracked({
       v: PROTOCOL_VERSION, type: "hello", role: "client", client_id: this.clientId,
-      cursors: { ...this.lastSeqBySession }, ts: nowTs(),
+      cursors: replay.cursors, ts: nowTs(), generations: replay.generations,
     });
+    if (flush) this.flushOutbox();
   }
 
-  private send(obj: Record<string, unknown>): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(obj));
+  private sendRecoveryPreamble(): void {
+    // Preserve socket order: Hello/alias recovery, then make each command's
+    // target resident immediately before replaying that exact serialized frame.
+    // Pre-warming all targets first can exceed the wrapper's resident-session
+    // cap and evict early targets before their command arrives.
+    this.sendHello(false);
+    const plan = planRecoveryReplay(
+      this.outbox.pendingFramesWithSessionIds(), this.focusedSid);
+    for (const step of plan) {
+      if (step.type === "switch") this.sendRecoverySwitch(step.sid);
+      else this.sendRaw(step.raw);
     }
+  }
+
+  private sendRecoverySwitch(sid: string): void {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "switch_session", session_id: sid, ts: nowTs(),
+    };
+    if (this.engineBySession[sid] === "codex") frame.engine = "codex";
+    this.sendUntracked(frame);
+  }
+
+  private send(obj: Record<string, unknown>): boolean {
+    const result = this.outbox.enqueue(obj, this.clientId, uuid());
+    if (!result.ok) {
+      const detail = `命令未发送：${result.reason}。请等待连接恢复后重试。`;
+      console.error(detail);
+      this.cb.onCommandError?.(detail);
+      return false;
+    }
+    this.sendRaw(result.raw);
+    return true;
+  }
+
+  private sendUntracked(obj: Record<string, unknown>): void {
+    this.sendRaw(JSON.stringify(obj));
+  }
+
+  private sendRaw(raw: string): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(raw);
+    }
+  }
+
+  private flushOutbox(): void {
+    for (const raw of this.outbox.pendingFrames()) this.sendRaw(raw);
   }
 
   private connect(): void {
@@ -248,7 +443,7 @@ export class RelayWs {
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = 1;
-      this.sendHello();  // cursors = whatever we remember (empty on first connect)
+      this.sendRecoveryPreamble();
       this.startHeartbeat();  // detect a half-open link and auto-recover
       this.cb.onConnState("connected");  // triggers sendListSessions
     };
@@ -266,18 +461,35 @@ export class RelayWs {
           if (w.__CCDEBUG) console.debug(`[ws] ${(msg as { type: string }).type} sid=${(msg as { sid?: string }).sid ?? "-"} seq=${(msg as { seq?: number }).seq ?? "-"}`);
         } catch { /* ignore */ }
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
+        if (msg.type === "command_ack") {
+          if (this.outbox.ack(msg.client_id, msg.cmd_id)) {
+            this.cb.onOutboxChanged?.(this.pendingSessionIds());
+          }
+          return;
+        }
+        if (msg.type === "hello" && msg.role === "wrapper" && msg.wrapper_generation) {
+          this.noteWrapperGeneration(msg.wrapper_generation);
+        }
+        if (msg.type === "wrapper_reconnected") {
+          if (msg.generation) this.noteWrapperGeneration(msg.generation);
+          this.sendRecoveryPreamble();
+        }
         if (msg.type === "session_focus") {
           // Drop a STALE switch-confirmation: when you click through several
           // sessions quickly, the wrapper processes each switch in turn and emits
           // a SessionFocus for every one. Honoring the late ones would "replay"
           // your clicks — yanking the view through each session. Only honor a
-          // focus that matches your current intent (or the one new_session is
-          // waiting for, or the very first focus when we have none yet).
-          if (this.focusedSid != null && msg.session_id !== this.focusedSid && !this.awaitingNewFocus) {
+          // focus that matches your current intent, a correlated create response,
+          // or the very first focus when we have none yet.
+          const isCreatedFocus = !!msg.request_id
+            && msg.request_id === this.newSessionFocusRequestId;
+          if (this.focusedSid != null && msg.session_id !== this.focusedSid && !isCreatedFocus) {
             return; // superseded — ignore
           }
-          this.awaitingNewFocus = false;
+          if (isCreatedFocus) this.newSessionFocusRequestId = null;
           this.focusedSid = msg.session_id;
+          if (isCreatedFocus) this.engineBySession[msg.session_id] = this.newSessionEngine;
+          this.touchReplay(msg.session_id);
           this.cb.onEvent(msg);
           return;
         }
@@ -286,45 +498,113 @@ export class RelayWs {
           // were viewing old_key, the focus. Never a focus change by itself.
           const { old_key, session_id } = msg;
           if (old_key !== session_id) {
-            if (this.lastSeqBySession[old_key] != null && this.lastSeqBySession[session_id] == null) {
-              this.lastSeqBySession[session_id] = this.lastSeqBySession[old_key];
+            const oldSeq = this.lastSeqBySession[old_key];
+            const realSeq = this.lastSeqBySession[session_id];
+            if (oldSeq != null && (realSeq == null || oldSeq >= realSeq)) {
+              this.lastSeqBySession[session_id] = oldSeq;
+              if (this.generationBySession[old_key]) {
+                this.generationBySession[session_id] = this.generationBySession[old_key];
+              }
             }
             delete this.lastSeqBySession[old_key];
+            delete this.generationBySession[old_key];
+            if (this.rebuildingSessions.delete(old_key)) {
+              this.rebuildingSessions.add(session_id);
+            }
+            if (this.engineBySession[old_key] && !this.engineBySession[session_id]) {
+              this.engineBySession[session_id] = this.engineBySession[old_key];
+            }
+            delete this.engineBySession[old_key];
+            this.outbox.rekeySession(old_key, session_id);
+            this.replayOrder = this.replayOrder.filter((sid) => sid !== old_key);
+            this.touchReplay(session_id);
             if (this.focusedSid === old_key) this.focusedSid = session_id;
           }
           this.cb.onEvent(msg);
           return;
         }
-        if (msg.type === "replay_start" && msg.rebuild && msg.sid) {
-          // The wrapper is REBUILDING this session (evicted + re-spawned, seq
-          // reset to 0). Drop our stale cursor so the rebuild frames — whose
-          // seqs restart low — actually advance it instead of being ignored by
-          // the Math.max in noteSeq.
-          this.lastSeqBySession[msg.sid] = 0;
+        if (msg.type === "snapshot") {
+          const sid = msg.sid ?? msg.cc_session_id;
+          if (sid && msg.generation) {
+            this.noteGeneration(sid, msg.generation);
+            this.rebuildingSessions.delete(sid);
+          }
+          if (this.focusedSid == null && sid) this.focusedSid = sid;
         }
-        this.noteSeq(msg.sid, (msg as { seq?: number | null }).seq);
+        if (msg.type === "replay_start" && msg.sid && msg.generation) {
+          this.noteGeneration(msg.sid, msg.generation);
+        }
+        if (msg.type === "replay_start" && msg.sid) {
+          if (msg.rebuild) {
+            // Rebuild is a new seq epoch even when the wrapper generation stayed
+            // constant (for example an evicted session was re-spawned).
+            this.lastSeqBySession[msg.sid] = 0;
+            this.rebuildingSessions.add(msg.sid);
+          } else {
+            // Supersede an interrupted rebuild from an earlier socket.
+            this.rebuildingSessions.delete(msg.sid);
+          }
+        }
+        const eventSeq = (msg as { seq?: number | null }).seq;
+        if (msg.sid && typeof eventSeq === "number"
+            && !this.rebuildingSessions.has(msg.sid)
+            && eventSeq <= (this.lastSeqBySession[msg.sid] ?? 0)) {
+          // A client is registered at the relay before its Hello reaches the
+          // wrapper, so a live event can overlap the ensuing replay. Cached
+          // command responses can also arrive after a newer event. Never feed
+          // either stale frame into the reducer.
+          return;
+        }
+        this.noteSeq(msg.sid, msg.type === "replay_end"
+          ? msg.to_seq : eventSeq);
         this.cb.onEvent(msg);
+        if (msg.type === "replay_end" && msg.sid) {
+          this.rebuildingSessions.delete(msg.sid);
+        }
       } catch (err) {
         console.warn("dropping malformed frame", err);
       }
     };
     ws.onclose = (ev: CloseEvent) => {
-      this.ws = null;
+      if (this.ws === ws) this.ws = null;
       this.stopHeartbeat();
+      if (ev.code === 4406) {
+        window.location.reload();
+        return;
+      }
       if (ev.code === 1008) {
         this.cb.onAuthFail?.();
         return;
       }
-      if (!this.stopped) this.scheduleReconnect();
+      if (!this.stopped) {
+        // Browsers commonly hide an HTTP/WebSocket auth rejection behind 1006,
+        // especially during the opening handshake. Ask the HTTP session endpoint
+        // before retrying so an expired/revoked cookie cannot loop forever.
+        this.cb.onConnState("reconnecting");
+        void this.reconnectAfterSessionProbe();
+      }
     };
     ws.onerror = () => {
       /* onclose will follow */
     };
   }
 
+  private async reconnectAfterSessionProbe(): Promise<void> {
+    const result = await probeSession();
+    if (this.stopped || this.ws !== null) return;
+    if (!shouldReconnectAfterSessionProbe(result)) {
+      this.cb.onAuthFail?.();
+      return;
+    }
+    this.scheduleReconnect();
+  }
+
   private scheduleReconnect(): void {
-    this.cb.onConnState("reconnecting");
-    this.reconnectTimer = setTimeout(() => this.connect(), this.backoff * 1000);
+    if (this.reconnectTimer !== null) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, this.backoff * 1000);
     this.backoff = Math.min(this.backoff * 2, 5);  // cap at 5s so reconnect recovers fast
   }
 }

@@ -82,7 +82,7 @@ export const CODEX_MODELS: Model[] = [
   { id: "gpt-5.4", name: "GPT-5.4", ds: "更早 · 旧会话兼容", ic: "cpu" },
 ];
 export const CODEX_PERMS: Perm[] = [
-  { id: "never", name: "自动", short: "自动", ds: "不询问 · 直接执行", ic: "run" },
+  { id: "never", name: "不询问", short: "不询问", ds: "不询问 · 需要审批时拒绝", ic: "shield" },
   { id: "on-request", name: "按需", short: "按需", ds: "需要时才询问", ic: "shield" },
   { id: "untrusted", name: "严格", short: "严格", ds: "每步都先询问", ic: "shield" },
 ];

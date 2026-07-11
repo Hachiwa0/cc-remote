@@ -6,7 +6,8 @@ Runs real gpt-5.5 turns against the local codex. Zero machine boot needed."""
 import asyncio, os, sys
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+sys.path.insert(0, REPO_ROOT)
 from cc_remote.wrapper.codex_handle import CodexHandle
 from cc_remote.wrapper.codex_stream import CodexStreamTranslator, is_turn_terminal
 
@@ -65,4 +66,5 @@ async def main() -> int:
     return 0
 
 
-sys.exit(asyncio.run(main()))
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

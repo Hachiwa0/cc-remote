@@ -9,11 +9,12 @@ still stream live via StreamEvent.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
+import re
 import uuid
 from datetime import datetime
-from typing import Any
 
 from claude_agent_sdk.types import (
     AssistantMessage, ResultMessage, UserMessage, SystemMessage,
@@ -24,6 +25,13 @@ from cc_remote.protocol import (
     AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, TurnResult, UserMsg,
 )
+from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
+
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_MAX_TRANSCRIPT_MATCHES = 1000
+_MAX_TRANSCRIPT_RECORD_CHARS = 16 * 1024 * 1024
+_MAX_TIMESTAMP_ENTRIES = 200_000
 
 
 class StreamTranslator:
@@ -53,7 +61,8 @@ class StreamTranslator:
                 if isinstance(block, ToolUseBlock):
                     events.append(ToolUse(
                         message_id=self._cur_msg_id,
-                        tool_use_id=block.id, tool=block.name, input=block.input,
+                        tool_use_id=block.id, tool=block.name,
+                        input=bounded_tool_input(block.input, self.tool_result_max),
                     ))
             events.append(AssistantMsgEnd(message_id=self._cur_msg_id))
             self._cur_msg_id = None
@@ -61,11 +70,9 @@ class StreamTranslator:
             content = msg.content if isinstance(msg.content, list) else []
             for block in content:
                 if isinstance(block, ToolResultBlock):
-                    text = _stringify(block.content)
-                    truncated = None
-                    if len(text) > self.tool_result_max:
-                        text = text[:self.tool_result_max]
-                        truncated = True
+                    text, was_truncated = bounded_text(
+                        block.content, self.tool_result_max)
+                    truncated = True if was_truncated else None
                     events.append(ToolResult(
                         tool_use_id=block.tool_use_id,
                         content=text,
@@ -91,22 +98,6 @@ def _cc_img_block(b: dict) -> dict | None:
     if isinstance(src, dict) and src.get("type") == "base64" and src.get("data"):
         return {"media_type": src.get("media_type") or "image/png", "data": src["data"]}
     return None
-
-
-def _stringify(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(item.get("text") or str(item))
-            else:
-                parts.append(str(item))
-        return "\n".join(parts)
-    return str(content)
 
 
 def extract_session_id(msg) -> str | None:
@@ -139,11 +130,35 @@ def transcript_path(session_id: str) -> str | None:
     native `claude` in the user's terminal). Watch st_size, NOT st_mtime: merely
     spawning `claude --resume <id>` touches mtime without changing a byte, so mtime
     would false-positive on every session the wrapper opens."""
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return None
     try:
-        matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
-        return matches[0] if matches else None
+        safe_id = glob.escape(session_id)
+        root = os.path.realpath(os.path.expanduser("~/.claude/projects"))
+        matches = glob.iglob(os.path.join(root, "*", f"{safe_id}.jsonl"))
+        for index, match in enumerate(matches):
+            if index >= _MAX_TRANSCRIPT_MATCHES:
+                break
+            resolved = os.path.realpath(match)
+            if os.path.commonpath((root, resolved)) == root:
+                return resolved
+        return None
     except Exception:
         return None
+
+
+def _bounded_jsonl_lines(file):
+    """Yield complete records while skipping a single pathological long line."""
+    while True:
+        line = file.readline(_MAX_TRANSCRIPT_RECORD_CHARS + 1)
+        if not line:
+            return
+        complete = line.endswith("\n") or len(line) < _MAX_TRANSCRIPT_RECORD_CHARS + 1
+        if complete:
+            yield line
+            continue
+        while line and not line.endswith("\n"):
+            line = file.readline(_MAX_TRANSCRIPT_RECORD_CHARS + 1)
 
 
 def transcript_timestamps(session_id: str) -> dict[str, float]:
@@ -153,12 +168,14 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
     the current time — "like a clock"). Best-effort: {} if not found/readable.
     session_id is globally unique, so a glob across all project dirs locates it."""
     out: dict[str, float] = {}
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return out
     try:
-        matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
-        if not matches:
+        path = transcript_path(session_id)
+        if not path:
             return out
-        with open(matches[0]) as f:
-            for line in f:
+        with open(path) as f:
+            for line in _bounded_jsonl_lines(f):
                 try:
                     d = json.loads(line)
                 except Exception:
@@ -169,6 +186,8 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
                 try:
                     out[uid] = datetime.fromisoformat(
                         ts.replace("Z", "+00:00") if ts.endswith("Z") else ts).timestamp()
+                    if len(out) >= _MAX_TIMESTAMP_ENTRIES:
+                        break
                 except Exception:
                     continue
     except Exception:
@@ -191,6 +210,22 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     turn_open = False
     last_ts = None  # transcript ts of the most-recent message in the open turn
 
+    def _history_id(value, kind: str, position: str) -> str:
+        """Keep valid engine ids; deterministically repair malformed legacy rows.
+
+        Old hand-edited/corrupt transcripts can omit a message/tool id.  WireId is
+        intentionally strict, but one bad block must not make the entire otherwise
+        readable conversation disappear.  Transcript positions are append-stable,
+        so the fallback also remains a valid pagination/dedup key across reparses.
+        """
+        if isinstance(value, str) and _SAFE_WIRE_ID.fullmatch(value):
+            return value
+        raw = value[:1024] if isinstance(value, str) else type(value).__name__
+        digest = hashlib.sha256(
+            f"{kind}\0{position}\0{raw}".encode("utf-8", "surrogatepass")
+        ).hexdigest()[:24]
+        return f"hist-{kind}-{digest}"
+
     def _ts(uid):
         return timestamps.get(uid) if timestamps else None
 
@@ -210,19 +245,21 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
             events.append(te)
             turn_open = False
 
-    for m in messages:
+    for message_index, m in enumerate(messages):
         msg = m.message
         if not isinstance(msg, dict):
             continue
         role = msg.get("role") or m.type
         content = msg.get("content")
+        source_uid = m.uuid if isinstance(m.uuid, str) else ""
+        message_uid = _history_id(source_uid, "msg", str(message_index))
 
         if role == "user":
             if isinstance(content, str):
                 if _is_meta_user_text(content):
                     continue
                 close_turn()
-                events.append(_um(m.uuid, content))
+                events.append(_um(message_uid, content))
                 turn_open = True
             elif isinstance(content, list):
                 # collect any uploaded images up front so they attach to this turn's
@@ -234,18 +271,18 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                         if img:
                             imgs.append(img)
                 made = False
-                for b in content:
+                for block_index, b in enumerate(content):
                     if not isinstance(b, dict):
                         continue
                     bt = b.get("type")
                     if bt == "tool_result":
-                        text = _stringify(b.get("content"))
-                        truncated = None
-                        if len(text) > tool_result_max:
-                            text = text[:tool_result_max]
-                            truncated = True
+                        text, was_truncated = bounded_text(
+                            b.get("content"), tool_result_max)
+                        truncated = True if was_truncated else None
                         events.append(ToolResult(
-                            tool_use_id=b.get("tool_use_id") or "",
+                            tool_use_id=_history_id(
+                                b.get("tool_use_id"), "tool",
+                                f"{message_index}-{block_index}-result"),
                             content=text,
                             is_error=bool(b.get("is_error")),
                             truncated=truncated,
@@ -254,7 +291,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                         txt = b.get("text", "")
                         if txt and not _is_meta_user_text(txt):
                             close_turn()
-                            um = _um(m.uuid, txt)
+                            um = _um(message_uid, txt)
                             if imgs and not made:
                                 um.images = imgs
                                 made = True
@@ -262,16 +299,16 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                             turn_open = True
                 if imgs and not made:   # image-only user turn
                     close_turn()
-                    um = _um(m.uuid, "")
+                    um = _um(message_uid, "")
                     um.images = imgs
                     events.append(um)
                     turn_open = True
         elif role == "assistant":
             if not isinstance(content, list):
                 continue
-            mid = m.uuid
+            mid = message_uid
             started = False
-            for b in content:
+            for block_index, b in enumerate(content):
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
@@ -292,9 +329,15 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                     _inp = b.get("input")
                     events.append(ToolUse(
                         message_id=mid,
-                        tool_use_id=b.get("id") or "",
+                        tool_use_id=_history_id(
+                            b.get("id"), "tool",
+                            f"{message_index}-{block_index}-use"),
                         tool=b.get("name") or "",
-                        input=_inp if isinstance(_inp, dict) else ({} if _inp is None else {"value": _inp}),
+                        input=bounded_tool_input(
+                            _inp if isinstance(_inp, dict)
+                            else ({} if _inp is None else {"value": _inp}),
+                            tool_result_max,
+                        ),
                     ))
                 # thinking / unknown blocks: skipped (MVP)
             if started:
@@ -303,7 +346,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
         # advance last_ts AFTER handling m: a leading close_turn (for the next user
         # msg) stamps the PRIOR turn's tail; the final close_turn stamps this turn's
         # last (assistant) message = answer-done time.
-        mts = _ts(m.uuid)
+        mts = _ts(source_uid)
         if mts is not None:
             last_ts = mts
     close_turn()

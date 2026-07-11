@@ -4,7 +4,7 @@ import { Icon, ClaudeMark } from "../icons";
 export function LoginForm({
   onLogin, theme, onToggleTheme,
 }: {
-  onLogin: (token: string) => void;
+  onLogin: () => void;
   theme: string;
   onToggleTheme: () => void;
 }) {
@@ -19,13 +19,13 @@ export function LoginForm({
     try {
       const r = await fetch("/api/login", {
         method: "POST",
+        credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password }),
       });
       if (r.status === 429) { setError("尝试太频繁，等一分钟再试"); return; }
       if (!r.ok) { setError("密码错误"); return; }
-      const data = await r.json();
-      onLogin(data.token as string);
+      onLogin();
     } catch {
       setError("网络错误");
     } finally {

@@ -1,0 +1,697 @@
+"""Zero-token regressions for Codex approvals and cross-engine controls."""
+from __future__ import annotations
+
+import asyncio
+import stat
+from types import SimpleNamespace
+
+import pytest
+
+from cc_remote.protocol import Model, NewSession
+from cc_remote.wrapper import codex_handle as codex_handle_module
+from cc_remote.wrapper import codex_models as codex_models_module
+from cc_remote.wrapper import codex_sessions as codex_sessions_module
+from cc_remote.wrapper import machine as machine_module
+from cc_remote.wrapper.codex_handle import CodexHandle
+from cc_remote.wrapper.sdk import SdkHandle
+from tests.test_multisession import _mk_ctx, _mk_machine
+
+
+class _Cfg:
+    cc_cwd = "/tmp"
+    tool_result_max = 8000
+
+
+@pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-5.6-luna"])
+def test_codex_model_id_is_exact_through_wrapper_and_turn_start(model):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("codex-model", "codex-model")
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "codex-model"
+        ctx.sdk = handle
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        async def keep_effort(_ctx, effort):
+            return effort
+
+        machine._apply_codex_effort = keep_effort
+        await machine._handle_set_model(SimpleNamespace(
+            sid=ctx.key, model=model))
+
+        assert handle.model == model
+        assert ctx.announced_model == model
+        assert isinstance(transport.sent[-1], Model)
+        assert transport.sent[-1].model == model
+
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            return {"turn": {"id": "turn-model"}}
+
+        handle._request = request
+        await handle.query("which model")
+        assert requests[-1][0] == "turn/start"
+        assert requests[-1][1]["model"] == model
+
+    asyncio.run(run())
+
+
+def test_codex_app_server_uses_and_cleans_its_own_process_group(monkeypatch):
+    if codex_handle_module.os.name != "posix":
+        pytest.skip("POSIX process groups only")
+
+    async def run():
+        spawn_kwargs = {}
+
+        async def fail_after_capture(*_args, **kwargs):
+            spawn_kwargs.update(kwargs)
+            raise RuntimeError("capture spawn options")
+
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec", fail_after_capture)
+        with pytest.raises(RuntimeError, match="capture spawn options"):
+            await CodexHandle(_Cfg()).connect()
+        assert spawn_kwargs["start_new_session"] is True
+
+        class FakeProcess:
+            pid = 424242
+            returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+            def terminate(self):
+                raise AssertionError("POSIX cleanup must signal the process group")
+
+            def kill(self):
+                raise AssertionError("POSIX cleanup must signal the process group")
+
+        signals = []
+        monkeypatch.setattr(
+            codex_handle_module.os, "killpg",
+            lambda pgid, sig: signals.append((pgid, sig)),
+        )
+        handle = CodexHandle(_Cfg())
+        handle.proc = FakeProcess()
+        handle._process_group = handle.proc.pid
+        await handle.disconnect()
+
+        assert signals == [
+            (424242, codex_handle_module.signal.SIGTERM),
+            (424242, codex_handle_module.signal.SIGKILL),
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_stderr_drain_records_only_byte_count(monkeypatch):
+    class NoDecode(bytes):
+        def decode(self, *_args, **_kwargs):
+            raise AssertionError("stderr content must not be decoded")
+
+    class Stderr:
+        def __init__(self):
+            self.lines = [NoDecode(b"secret stderr payload\n"), b""]
+
+        async def readline(self):
+            return self.lines.pop(0)
+
+    seen = []
+    monkeypatch.setattr(
+        codex_handle_module.log, "debug",
+        lambda message, **fields: seen.append((message, fields)),
+    )
+    handle = CodexHandle(_Cfg())
+    process = SimpleNamespace(stderr=Stderr())
+
+    asyncio.run(handle._drain_stderr(process, handle._generation))
+
+    assert seen == [("codex stderr", {"bytes": len(b"secret stderr payload\n")})]
+
+
+def test_codex_catalog_normalization_is_structurally_bounded(monkeypatch):
+    monkeypatch.setattr(codex_models_module, "_MAX_MODELS", 2)
+    monkeypatch.setattr(codex_models_module, "_MAX_EFFORTS", 2)
+    monkeypatch.setattr(codex_models_module, "_MAX_CATALOG_TEXT", 8)
+    raw = [
+        "not-a-model",
+        {
+            "id": "model-one",
+            "displayName": "display-name-too-long",
+            "description": "description-too-long",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low"},
+                {"reasoningEffort": "high"},
+                {"reasoningEffort": "ultra"},
+                "bad",
+            ],
+        },
+        {"id": "model-two"},
+        {"id": "model-three"},
+    ]
+
+    normalized = codex_models_module._normalize(raw)
+
+    assert [model["id"] for model in normalized] == ["model-one", "model-two"]
+    assert normalized[0]["display_name"] == "display-"
+    assert normalized[0]["description"] == "descript"
+    assert normalized[0]["efforts"] == ["low", "high"]
+
+
+def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
+        monkeypatch):
+    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE", None)
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setattr(
+        codex_handle_module, "_codex_candidates", lambda: ["old", "new", "broken"])
+    versions = {"old": (0, 140, 0), "new": (0, 144, 1), "broken": (-1,)}
+    monkeypatch.setattr(
+        codex_handle_module, "_codex_version", lambda path: versions[path])
+
+    assert codex_handle_module._resolve_codex_bin() == "new"
+
+
+def test_codex_config_update_is_atomic_bounded_and_preserves_mode(
+        monkeypatch, tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text('model = "gpt-test"\n\n[provider]\nname = "local"\n')
+    config.chmod(0o640)
+    monkeypatch.setattr(codex_sessions_module, "_CONFIG", str(config))
+
+    assert codex_sessions_module.set_codex_config_key("service_tier", "fast")
+    assert config.read_text() == (
+        'model = "gpt-test"\nservice_tier = "fast"\n\n'
+        '[provider]\nname = "local"\n'
+    )
+    assert stat.S_IMODE(config.stat().st_mode) == 0o640
+    assert not list(tmp_path.glob(".config.toml.cc-remote-*"))
+
+    monkeypatch.setattr(codex_sessions_module, "_CONFIG_MAX_BYTES", 8)
+    before = config.read_text()
+    assert not codex_sessions_module.set_codex_config_key("service_tier", None)
+    assert config.read_text() == before
+
+
+async def _dispatch_request(handle: CodexHandle, method: str, params) -> dict:
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    handle._send = send  # type: ignore[method-assign]
+    await handle._dispatch({
+        "jsonrpc": "2.0", "id": 7, "method": method, "params": params,
+    })
+    if handle._server_request_tasks:
+        await asyncio.gather(*list(handle._server_request_tasks))
+    assert len(sent) == 1
+    return sent[0]
+
+
+def test_codex_approval_does_not_block_stdout_response_dispatch():
+    async def run():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def approve(_method, _params):
+            started.set()
+            await release.wait()
+            return "accept"
+
+        handle = CodexHandle(_Cfg(), approval_callback=approve)
+        handle.approval = "on-request"
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        handle._send = send
+        await handle._dispatch({
+            "jsonrpc": "2.0", "id": 7,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"command": "true"},
+        })
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        # The approval is still waiting for the user, but the sole reader can
+        # already dispatch an unrelated response (not deadlock behind it).
+        pending = asyncio.get_running_loop().create_future()
+        handle._pending[99] = pending
+        await handle._dispatch({"jsonrpc": "2.0", "id": 99, "result": {"ok": True}})
+        assert await asyncio.wait_for(pending, timeout=1) == {"ok": True}
+
+        release.set()
+        await asyncio.gather(*list(handle._server_request_tasks))
+        assert sent[-1] == {
+            "jsonrpc": "2.0", "id": 7,
+            "result": {"decision": "accept"},
+        }
+
+    asyncio.run(run())
+
+
+def test_codex_server_request_tasks_are_capped_and_fail_closed(monkeypatch):
+    async def run():
+        release = asyncio.Event()
+
+        async def approve(_method, _params):
+            await release.wait()
+            return "accept"
+
+        monkeypatch.setattr(codex_handle_module, "_MAX_SERVER_REQUEST_TASKS", 2)
+        handle = CodexHandle(_Cfg(), approval_callback=approve)
+        handle.approval = "on-request"
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        handle._send = send
+        for rid in (1, 2, 3):
+            await handle._dispatch({
+                "jsonrpc": "2.0", "id": rid,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"command": "true"},
+            })
+
+        assert len(handle._server_request_tasks) == 2
+        assert sent == [{
+            "jsonrpc": "2.0", "id": 3,
+            "result": {"decision": "decline"},
+        }]
+
+        release.set()
+        await asyncio.gather(*list(handle._server_request_tasks))
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("decision", [
+    "accept", "acceptForSession", "decline", "cancel",
+])
+def test_current_codex_approval_schema_returns_exact_decision(decision):
+    async def run():
+        calls = []
+
+        async def approve(method, params):
+            calls.append((method, params))
+            return decision
+
+        handle = CodexHandle(_Cfg(), approval_callback=approve)
+        handle.approval = "on-request"
+        response = await _dispatch_request(
+            handle,
+            "item/commandExecution/requestApproval",
+            {"threadId": "t", "turnId": "u", "itemId": "i",
+             "command": "rm -rf build", "cwd": "/tmp"},
+        )
+        assert response == {
+            "jsonrpc": "2.0", "id": 7,
+            "result": {"decision": decision},
+        }
+        assert calls and calls[0][0] == "item/commandExecution/requestApproval"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("decision", "legacy"), [
+    ("accept", "approved"),
+    ("acceptForSession", "approved_for_session"),
+    ("decline", "denied"),
+    ("cancel", "abort"),
+])
+def test_legacy_codex_approval_schema_maps_decisions(decision, legacy):
+    async def run():
+        async def approve(_method, _params):
+            return decision
+
+        handle = CodexHandle(_Cfg(), approval_callback=approve)
+        handle.approval = "untrusted"
+        response = await _dispatch_request(
+            handle, "applyPatchApproval",
+            {"callId": "call", "fileChanges": {"x.py": {}}},
+        )
+        assert response["result"] == {"decision": legacy}
+
+    asyncio.run(run())
+
+
+def test_never_policy_and_unknown_requests_fail_closed():
+    async def run():
+        called = False
+
+        async def should_not_run(_method, _params):
+            nonlocal called
+            called = True
+            return "accept"
+
+        handle = CodexHandle(_Cfg(), approval_callback=should_not_run)
+        handle.approval = "never"
+        current = await _dispatch_request(
+            handle, "item/fileChange/requestApproval",
+            {"threadId": "t", "turnId": "u", "itemId": "i"},
+        )
+        assert current["result"] == {"decision": "decline"}
+        legacy = await _dispatch_request(
+            handle, "execCommandApproval", {"callId": "c", "command": ["id"]},
+        )
+        assert legacy["result"] == {"decision": "denied"}
+        assert called is False
+
+        # Unknown server requests are rejected before the approval callback, even
+        # under an interactive policy. They can never masquerade as an approvable
+        # command and gain a user-driven allow response.
+        handle.approval = "on-request"
+        unknown = await _dispatch_request(handle, "account/deleteEverything", {})
+        assert unknown["error"]["code"] == -32601
+        assert "unsupported server request" in unknown["error"]["message"]
+        assert called is False
+
+    asyncio.run(run())
+
+
+def test_codex_approval_timeout_declines(monkeypatch):
+    async def run():
+        monkeypatch.setattr(codex_handle_module, "_APPROVAL_TIMEOUT", 0.01)
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("codex-timeout", "codex-timeout")
+        ctx.engine = "codex"
+        handle = CodexHandle(_Cfg())
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.approval_callback = (
+            lambda method, params: machine._on_codex_approval(
+                ctx, method, params))
+        handle.approval = "on-request"
+        response = await _dispatch_request(
+            handle, "item/commandExecution/requestApproval",
+            {"threadId": "t", "turnId": "u", "itemId": "i"},
+        )
+        assert response["result"] == {"decision": "decline"}
+        assert any(message.type == "ask_user" for message in transport.sent)
+        assert ctx.pending_asks == {}
+
+    asyncio.run(run())
+
+
+def test_machine_codex_approval_uses_ask_user_choices():
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("codex-1", "codex-1")
+        ctx.engine = "codex"
+        captured = []
+        answers = iter(["允许一次", "本会话允许", "拒绝", "取消", "unexpected"])
+
+        async def ask(_ctx, question, options):
+            captured.append((question, options))
+            return next(answers)
+
+        machine._on_ask = ask  # type: ignore[method-assign]
+        decisions = []
+        for _ in range(5):
+            decisions.append(await machine._on_codex_approval(
+                ctx, "item/commandExecution/requestApproval",
+                {"command": "git clean -fd", "cwd": "/work", "reason": "cleanup"},
+            ))
+        assert decisions == [
+            "accept", "acceptForSession", "decline", "cancel", "decline",
+        ]
+        assert [o["label"] for o in captured[0][1]] == [
+            "允许一次", "本会话允许", "拒绝", "取消",
+        ]
+        assert "git clean -fd" in captured[0][0]
+        assert "目录：/work" in captured[0][0]
+
+    asyncio.run(run())
+
+
+class _ControlSdk:
+    def __init__(self, approval="never", fail_perm=False):
+        self.approval = approval
+        self.fail_perm = fail_perm
+        self.permission_calls: list[str] = []
+        self.service_tier_calls: list[str | None] = []
+        self.tier_dirty = False
+        self.disconnected = False
+
+    async def set_permission_mode(self, mode):
+        self.permission_calls.append(mode)
+        if self.fail_perm:
+            raise RuntimeError("apply failed")
+        self.approval = mode
+
+    async def set_service_tier(self, tier):
+        self.service_tier_calls.append(tier)
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
+def _control_ctx(key: str, engine: str, sdk=None):
+    ctx = _mk_ctx(key, key)
+    ctx.engine = engine
+    ctx.sdk = sdk or _ControlSdk()
+    return ctx
+
+
+def test_permission_modes_are_engine_strict_and_broadcast_after_apply():
+    async def run():
+        machine, transport = _mk_machine()
+        codex = _control_ctx("codex", "codex")
+        claude = _control_ctx("claude", "claude")
+        machine.sessions = {"codex": codex, "claude": claude}
+
+        await machine._handle_set_perm(
+            SimpleNamespace(sid="codex", mode="bypassPermissions"))
+        assert codex.sdk.permission_calls == []
+        assert transport.sent[-1].type == "error"
+
+        await machine._handle_set_perm(
+            SimpleNamespace(sid="codex", mode="on-request"))
+        assert codex.sdk.permission_calls == ["on-request"]
+        assert transport.sent[-1].type == "perm"
+        assert transport.sent[-1].mode == "on-request"
+
+        await machine._handle_set_perm(
+            SimpleNamespace(sid="claude", mode="untrusted"))
+        assert claude.sdk.permission_calls == []
+        assert transport.sent[-1].type == "error"
+
+        await machine._handle_set_perm(
+            SimpleNamespace(sid="claude", mode="plan"))
+        assert claude.sdk.permission_calls == ["plan"]
+        assert transport.sent[-1].type == "perm"
+        assert transport.sent[-1].mode == "plan"
+
+        failing = _control_ctx("failing", "codex", _ControlSdk(fail_perm=True))
+        machine.sessions["failing"] = failing
+        await machine._handle_set_perm(
+            SimpleNamespace(sid="failing", mode="on-request"))
+        assert failing.announced_perm is None
+        assert transport.sent[-1].type == "error"
+
+    asyncio.run(run())
+
+
+def test_fast_toggle_updates_every_resident_codex_handle(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        one = _control_ctx("c1", "codex")
+        two = _control_ctx("c2", "codex")
+        claude = _control_ctx("cc", "claude")
+        machine.sessions = {"c1": one, "c2": two, "cc": claude}
+        monkeypatch.setattr(machine_module, "set_codex_config_fast", lambda on: True)
+
+        await machine._handle_set_service_tier(
+            SimpleNamespace(sid="c1", service_tier="fast"))
+
+        assert one.sdk.service_tier_calls == ["fast"]
+        assert two.sdk.service_tier_calls == ["fast"]
+        assert claude.sdk.service_tier_calls == []
+        assert one.sdk.tier_dirty is True and two.sdk.tier_dirty is True
+        fast = [message for message in transport.sent if message.type == "fast"]
+        assert {message.sid for message in fast} == {"c1", "c2"}
+        assert all(message.on is True for message in fast)
+
+    asyncio.run(run())
+
+
+def test_failed_fast_config_write_does_not_mutate_handles(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _control_ctx("c1", "codex")
+        machine.sessions = {"c1": ctx}
+        monkeypatch.setattr(machine_module, "set_codex_config_fast", lambda on: False)
+
+        await machine._handle_set_service_tier(
+            SimpleNamespace(sid="c1", service_tier="fast"))
+
+        assert ctx.sdk.service_tier_calls == []
+        assert ctx.sdk.tier_dirty is False
+        assert transport.sent[-1].type == "error"
+        assert not [message for message in transport.sent if message.type == "fast"]
+
+    asyncio.run(run())
+
+
+def test_codex_rename_and_archive_never_call_claude_sdk(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _control_ctx("codex-id", "codex")
+        machine.sessions = {"codex-id": ctx}
+        called = []
+
+        def rename(*args):
+            called.append(("rename", args))
+
+        def tag(*args):
+            called.append(("tag", args))
+
+        monkeypatch.setattr(machine_module, "rename_session", rename)
+        monkeypatch.setattr(machine_module, "tag_session", tag)
+        await machine._handle_rename_session(SimpleNamespace(
+            session_id="codex-id", title="new"))
+        await machine._handle_archive_session(SimpleNamespace(
+            session_id="codex-id", archived=True))
+
+        # Sidebar rows need not be resident. A rollout match must still keep a
+        # stale/hostile client command away from the Claude SDK.
+        machine.sessions.clear()
+        monkeypatch.setattr(
+            machine_module, "codex_rollout_path",
+            lambda session_id: "/tmp/rollout.jsonl"
+            if session_id == "cold-codex-id" else None,
+        )
+        await machine._handle_rename_session(SimpleNamespace(
+            session_id="cold-codex-id", title="new"))
+
+        assert called == []
+        errors = [message for message in transport.sent if message.type == "error"]
+        assert len(errors) == 3
+        assert all("Codex app-server" in message.message for message in errors)
+
+    asyncio.run(run())
+
+
+class _FiniteTransport:
+    def __init__(self, commands=()):
+        self.sent = []
+        self.commands = list(commands)
+        self.on_connected = None
+        self.started = False
+        self.stopped = False
+
+    async def start(self):
+        self.started = True
+        if self.on_connected:
+            await self.on_connected()
+
+    async def stop(self):
+        self.stopped = True
+
+    async def send(self, message):
+        self.sent.append(message)
+
+    async def incoming(self):
+        for command in self.commands:
+            yield command
+
+
+def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
+        monkeypatch, tmp_path):
+    async def run():
+        def fail(_cli_path):
+            raise RuntimeError("claude unavailable")
+
+        monkeypatch.setattr(SdkHandle, "preflight", staticmethod(fail))
+        machine, _ = _mk_machine()
+        transport = _FiniteTransport()
+        machine.transport = transport
+        transport.on_connected = machine._on_transport_connected
+        machine.cfg.state_dir = tmp_path / "state"
+        machine.cfg.cc_cwd = str(tmp_path)
+
+        await machine.run()
+
+        assert transport.started is True and transport.stopped is True
+        assert machine.sessions == {} and machine.focused_sid is None
+        assert any(message.type == "hello" for message in transport.sent)
+        assert any(message.type == "error" and "Claude 引擎不可用" in message.message
+                   for message in transport.sent)
+
+    asyncio.run(run())
+
+
+def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
+        monkeypatch, tmp_path):
+    class FakeCodexHandle:
+        def __init__(self, _cfg, cwd=None):
+            self.cwd = cwd
+            self.model = "gpt-test"
+            self.effort = "high"
+            self.applied_effort = "high"
+            self.approval = "never"
+            self.approval_callback = None
+            self.disconnected = False
+
+        async def connect(self, **_kwargs):
+            return None
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def run():
+        def fail(_cli_path):
+            raise RuntimeError("claude unavailable")
+
+        monkeypatch.setattr(SdkHandle, "preflight", staticmethod(fail))
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        machine, _ = _mk_machine()
+        transport = _FiniteTransport([NewSession(engine="codex")])
+        machine.transport = transport
+        transport.on_connected = machine._on_transport_connected
+        machine.cfg.state_dir = tmp_path / "state"
+        machine.cfg.cc_cwd = str(tmp_path)
+
+        await machine.run()
+
+        assert len(machine.sessions) == 1
+        ctx = next(iter(machine.sessions.values()))
+        assert ctx.engine == "codex"
+        assert machine.focused_sid == ctx.key
+        assert any(message.type == "session_focus" for message in transport.sent)
+        assert any(message.type == "perm" and message.mode == "never"
+                   for message in transport.sent)
+        assert ctx.sdk.disconnected is True
+
+    asyncio.run(run())
+
+
+def test_failed_claude_preflight_does_not_evict_codex(monkeypatch):
+    async def run():
+        def fail(cli_path):
+            assert cli_path == "/opt/cc-remote/bin/claude"
+            raise RuntimeError("claude unavailable")
+
+        monkeypatch.setattr(SdkHandle, "preflight", staticmethod(fail))
+        machine, _ = _mk_machine()
+        machine.cfg.claude_bin = "/opt/cc-remote/bin/claude"
+        machine.cfg.max_concurrent_sessions = 1
+        codex = _control_ctx("codex-id", "codex")
+        machine.sessions = {"codex-id": codex}
+
+        spawned = await machine._spawn(
+            resume_id=None, cwd="/tmp", engine="claude")
+
+        assert spawned is None
+        assert machine.sessions == {"codex-id": codex}
+        assert codex.sdk.disconnected is False
+
+    asyncio.run(run())

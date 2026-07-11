@@ -13,10 +13,13 @@ import { NewChatView } from "./components/NewChatView";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
-import { defaultModelFor, defaultEffortFor } from "./data";
-import type { Snapshot, QueryImg, QueryFile } from "./protocol";
+import { defaultModelFor, defaultEffortFor, permsFor } from "./data";
+import { shouldAcceptSessionList } from "./session-list";
+import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
+import { collectWaitingQueries, selectDrainCandidates } from "./runtime-drain";
+import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
+import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest, type Snapshot, type QueryImg, type QueryFile } from "./protocol";
 
-const SESSION_KEY = "cc_remote_session";
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const HISTORY_PAGE = 60;  // turns fetched per GetHistory (initial load + each "load more")
@@ -30,9 +33,11 @@ export default function App() {
   const [theme, setTheme] = useState<string>(() => localStorage.getItem(THEME_KEY) || "light");
   const [engine, setEngine] = useState<"claude" | "codex">(
     () => (localStorage.getItem(ENGINE_KEY) as "claude" | "codex") || "claude");
-  const [authed, setAuthed] = useState<boolean>(() => !!localStorage.getItem(SESSION_KEY));
+  const [authed, setAuthed] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   // right slot is shared by diff + /btw; rightView picks which shows.
   const [rightView, setRightView] = useState<"diff" | "btw">("diff");
@@ -40,16 +45,73 @@ export default function App() {
   // the panel appears instantly (spinner) instead of waiting ~1s for the fork.
   const [btwOpening, setBtwOpening] = useState(false);
   const [state, dispatch] = useReducer(reduce, initialState);
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const wsRef = useRef<RelayWs | null>(null);
-  const drainingRef = useRef(false);
+  const drainingRef = useRef<Set<string>>(new Set());
+  const pendingCreateRef = useRef<string | null>(null);
+  const pendingBtwRef = useRef<string | null>(null);
+  const activeBtwRef = useRef<{ requestId: string; sid: string } | null>(null);
+  // Retain recently cancelled ids so a late response can be identified and
+  // discarded (and a late successful fork can be closed) without disturbing a
+  // newer opening spinner. Bounded because a peer may disappear permanently.
+  const btwRequestIdsRef = useRef<Set<string>>(new Set());
+  const discardedBtwSidsRef = useRef<Set<string>>(new Set());
   const touchStartX = useRef(0);
   // guards the once-per-connection "land on the latest session" auto-focus below
   const didInitFocusRef = useRef(false);
+  const shortcutRef = useRef<{
+    artifact: typeof state.artifact;
+    btwSid: string | null;
+    rightView: "diff" | "btw";
+    getDiff: (file: string) => void;
+    openBtw: () => void;
+    closeBtw: () => void;
+  }>({ artifact: null, btwSid: null, rightView: "diff",
+    getDiff: () => {}, openBtw: () => {}, closeBtw: () => {} });
 
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
   const focusedSid = state.focusedSid;
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
+  const allQueued = collectWaitingQueries(state.runtimes);
+  const replaceableQueued = collectWaitingQueries(state.runtimes, focusedSid);
+
+  // HttpOnly cookies can't be inspected from JS. Ask the relay whether this
+  // browser session is still registered before opening a WebSocket; this also
+  // makes relay restarts (which intentionally revoke old sessions) fail closed.
+  useEffect(() => {
+    // Never retain credentials/markers from the pre-HttpOnly implementation.
+    clearLegacyAuthMarkers(localStorage);
+    let cancelled = false;
+    let timer: number | null = null;
+    let backoff = 1000;
+    const check = async () => {
+      const result = await probeSession();
+      if (cancelled) return;
+      if (result === "unavailable") {
+        setAuthReady(false);
+        timer = window.setTimeout(check, backoff);
+        backoff = Math.min(backoff * 2, 5000);
+        return;
+      }
+      if (result === "unauthorized") {
+        clearLegacyAuthMarkers(localStorage);
+        // Do not expose the login form until prior-session prompts and
+        // attachments are gone. A fast login must not race cache hydration.
+        try { await import("./cache").then((module) => module.clearCache()); }
+        catch { /* best-effort local cleanup */ }
+        if (cancelled) return;
+      }
+      setAuthed(result === "authenticated");
+      setAuthReady(true);
+    };
+    void check();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
 
   // swipe right -> open sidebar, swipe left -> close (mobile)
   const onTouchStart = (e: TouchEvent) => { touchStartX.current = e.touches[0].clientX; };
@@ -68,8 +130,8 @@ export default function App() {
   // `engine` selects the backend (Claude Code / Codex): the whole UI re-skins via
   // data-engine, and the sidebar re-lists that engine's own sessions.
   const engineRef = useRef(engine);
+  engineRef.current = engine;
   useEffect(() => {
-    engineRef.current = engine;
     document.documentElement.setAttribute("data-engine", engine);
     localStorage.setItem(ENGINE_KEY, engine);
     wsRef.current?.sendListSessions(engine);  // codex sessions vs claude sessions
@@ -78,6 +140,8 @@ export default function App() {
   // it — otherwise "switch to Codex" silently only affects the *next* new session,
   // which reads as "nothing happened". Existing sessions stay in the sidebar.
   const toggleEngine = () => {
+    pendingCreateRef.current = null;
+    setCreateError(null);
     setEngine((e) => (e === "codex" ? "claude" : "codex"));
     dispatch({ type: "enter_new_chat", cwd: "~" });  // fresh chat defaults to home
     if (isMobile()) setSidebarOpen(false);
@@ -86,8 +150,8 @@ export default function App() {
   // WebSocket lifecycle
   useEffect(() => {
     if (!authed) return;
+    const draining = drainingRef.current;
     didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
-    const token = localStorage.getItem(SESSION_KEY) || "";
 
     let cancelled = false;
 
@@ -100,16 +164,78 @@ export default function App() {
     }
 
     (async () => {
-      let seeded: Record<string, number> = {};
-      try { seeded = await import("./cache").then((m) => m.loadAllCursors()); } catch { /* best-effort */ }
+      let seeded = { cursors: {} as Record<string, number>,
+        generations: {} as Record<string, string> };
+      try { seeded = await import("./cache").then((m) => m.loadAllReplayState()); } catch { /* best-effort */ }
       if (cancelled) return;
-      const ws = new RelayWs(token, {
+      const ws = new RelayWs({
         onEvent: (msg) => {
-          if (msg.type === "snapshot") { handleSnapshot(msg); return; }
+          if (msg.type === "btw_opened") {
+            const disposition = classifyBtwOpened(
+              pendingBtwRef.current, activeBtwRef.current, msg);
+            if (disposition === "duplicate") {
+              return; // cached replay after a lost ACK; the fork is already open
+            }
+            if (disposition === "stale") {
+              // The user cancelled, navigated, or started a newer request while
+              // this fork was connecting. Never let the stale response open the
+              // panel, and tear down the now-unowned ephemeral session.
+              const discarded = discardedBtwSidsRef.current;
+              discarded.add(msg.btw_sid);
+              while (discarded.size > 64) {
+                const oldest = discarded.values().next().value as string | undefined;
+                if (!oldest) break;
+                discarded.delete(oldest);
+              }
+              ws.sendCloseBtw(msg.btw_sid);
+              return;
+            }
+            pendingBtwRef.current = null;
+            activeBtwRef.current = {
+              requestId: msg.request_id,
+              sid: msg.btw_sid,
+            };
+            setBtwOpening(false);
+          } else if (msg.type === "error" && msg.request_id
+              && btwRequestIdsRef.current.has(msg.request_id)) {
+            const matches = matchesBtwRequest(
+              pendingBtwRef.current, msg.request_id);
+            if (!matches) return; // obsolete /btw failure; keep any newer spinner
+            pendingBtwRef.current = null;
+            setBtwOpening(false);
+          }
+          if (msg.type === "session_focus" && msg.request_id
+              && msg.request_id === pendingCreateRef.current) {
+            pendingCreateRef.current = null;
+            setCreateError(null);
+            dispatch({ type: "exit_new_chat" });
+          } else if (msg.type === "error" && msg.code !== "wrapper_offline" && msg.request_id
+              && msg.request_id === pendingCreateRef.current) {
+            pendingCreateRef.current = null;
+            setCreateError(msg.message);
+          }
+          if (msg.type === "snapshot") {
+            if (consumeDiscardedBtwSnapshot(discardedBtwSidsRef.current, msg)) return;
+            handleSnapshot(msg);
+            return;
+          }
+          if (msg.type === "session_list") ws.setSessionEngines(msg.sessions);
+          if (msg.type === "session_list"
+              && !shouldAcceptSessionList(engineRef.current, msg)) return;
+          if ((msg.type === "turn_end"
+              || (msg.type === "error" && msg.code !== "wrapper_offline"))
+              && msg.sid) {
+            draining.delete(msg.sid);
+          }
           dispatch({ type: "event", event: msg });
-          if (msg.type === "wrapper_reconnected") { ws.sendHello(); ws.sendListSessions(engineRef.current); ws.sendGetModels("codex"); }
+          if (msg.type === "wrapper_reconnected") {
+            ws.sendListSessions(engineRef.current);
+            ws.sendGetModels("codex");
+            const currentSid = stateRef.current.focusedSid;
+            if (currentSid) ws.sendGetHistory(currentSid, undefined, HISTORY_PAGE);
+          }
           // refresh the context ring after each turn (local SDK query, no model tokens)
-          if (msg.type === "turn_end") ws.sendGetContext();
+          if (msg.type === "turn_end" && msg.sid) ws.sendGetContextTo(msg.sid);
         },
         onConnState: (s, detail) => {
           dispatch({ type: "conn", connState: s, detail });
@@ -122,11 +248,40 @@ export default function App() {
           }
         },
         onAuthFail: () => {
-          localStorage.removeItem(SESSION_KEY);
+          setAuthReady(false);
+          clearLegacyAuthMarkers(localStorage);
+          pendingCreateRef.current = null;
+          pendingBtwRef.current = null;
+          activeBtwRef.current = null;
+          btwRequestIdsRef.current.clear();
+          discardedBtwSidsRef.current.clear();
+          setBtwOpening(false);
+          dispatch({ type: "reset" });
           setAuthed(false);
+          void (async () => {
+            try { await import("./cache").then((module) => module.clearCache()); }
+            catch { /* best-effort local cleanup */ }
+            setAuthReady(true);
+          })();
+        },
+        onCommandError: (detail) => dispatch({ type: "command_error", detail }),
+        onOutboxChanged: (protectedSids) => {
+          dispatch({ type: "prune_runtimes", protectedSids });
+        },
+        onWrapperGenerationChanged: () => {
+          discardedBtwSidsRef.current.clear();
+          if (stateRef.current.btwSid || pendingBtwRef.current
+              || activeBtwRef.current) {
+            pendingBtwRef.current = null;
+            activeBtwRef.current = null;
+            setBtwOpening(false);
+            if (stateRef.current.btwSid) dispatch({ type: "clear_btw" });
+            dispatch({ type: "command_error",
+              detail: "wrapper 已重启，临时 /btw 会话已关闭，请重新打开。" });
+          }
         },
       });
-      ws.seedCursors(seeded);  // delta-only reconnect
+      ws.seedReplayState(seeded.cursors, seeded.generations);
       wsRef.current = ws;
       ws.start();
     })();
@@ -135,7 +290,7 @@ export default function App() {
       cancelled = true;
       wsRef.current?.stop();
       wsRef.current = null;
-      drainingRef.current = false;
+      draining.clear();
     };
   }, [authed]);
 
@@ -158,45 +313,48 @@ export default function App() {
       wsRef.current.setFocusedSid(latest.session_id);
       wsRef.current.sendSwitchSession(latest.session_id, (latest.engine as "claude" | "codex") || engineRef.current);
     }
-  }, [state.sessions]);
+  }, [state.sessions, state.focusedSid]);
 
-  // interrupt-and-send: when the focused session returns to idle, fire its pending message
+  // Drain every resident session, not just the one currently visible. A queued
+  // background turn must resume when that runtime becomes idle even if the user
+  // has switched elsewhere. Never remove work merely because the socket or
+  // wrapper is offline; accepted commands are retained by RelayWs's outbox.
   useEffect(() => {
-    if (rt.state === "idle" && rt.pendingSend && wsRef.current) {
-      const prompt = rt.pendingSend;
-      const msg_id = uuid();
-      wsRef.current.sendQuery(prompt, msg_id);
-      dispatch({ type: "query_sent", prompt, msg_id, ts: Date.now() });
-      dispatch({ type: "clear_pending" });
+    const draining = drainingRef.current;
+    for (const sid of draining) {
+      const runtime = state.runtimes[sid];
+      if (!runtime || runtime.state !== "idle") draining.delete(sid);
     }
-  }, [focusedSid, rt.state, rt.pendingSend]);
 
-  // queue drain for the focused session
-  useEffect(() => {
-    if (rt.state === "idle" && rt.queue.length > 0 && !drainingRef.current && wsRef.current) {
-      drainingRef.current = true;
-      const next = rt.queue[0];
+    const ws = wsRef.current;
+    if (!ws) return;
+    const candidates = selectDrainCandidates(
+      state.runtimes,
+      draining,
+      state.connState === "connected",
+      state.wrapperOnline,
+    );
+    for (const { sid, source, query } of candidates) {
       const msg_id = uuid();
-      wsRef.current.sendQuery(next, msg_id);
-      dispatch({ type: "query_sent", prompt: next, msg_id, ts: Date.now() });
-      dispatch({ type: "dequeue_at", i: 0 });
+      if (!ws.sendQueryTo(sid, query.prompt, msg_id, query.images, query.files)) continue;
+      draining.add(sid);
+      dispatch({ type: "query_sent", sid, prompt: query.prompt, msg_id,
+        images: query.images, files: query.files, ts: Date.now() });
+      if (source === "pending") dispatch({ type: "clear_pending", sid });
+      else dispatch({ type: "dequeue_at", sid, i: 0 });
     }
-    if (rt.state !== "idle") drainingRef.current = false;
-  }, [focusedSid, rt.state, rt.queue]);
+  }, [state.runtimes, state.connState, state.wrapperOnline]);
 
-  // new-chat first message: the wrapper's new_session → session_focus bumps
-  // switchTick; this effect then fires the held query (ws stamps sid=focused).
+  // Keep a long-lived tab bounded without evicting anything that can still be
+  // acted on. ACK callbacks run the same prune when an outbox target becomes
+  // reclaimable; otherwise an idle runtime protected during retry would linger.
   useEffect(() => {
-    if (!state.pendingNewQuery || !wsRef.current) return;
-    const q = state.pendingNewQuery;
-    wsRef.current.sendQuery(q.prompt, q.msg_id, q.images, q.files);
-    dispatch({ type: "query_sent", prompt: q.prompt, msg_id: q.msg_id, images: q.images, files: q.files, ts: Date.now() });
-    // Reflect the pre-picked model/effort on the freshly-focused runtime's chips
-    // (display only — the wrapper already spawned the session with them).
-    if (q.model) dispatch({ type: "set_model", model: q.model });
-    if (q.effort) dispatch({ type: "set_effort", effort: q.effort });
-    dispatch({ type: "clear_pending_new_query" });
-  }, [state.switchTick]);
+    if (Object.keys(state.runtimes).length <= MAX_RUNTIME_SESSIONS) return;
+    dispatch({
+      type: "prune_runtimes",
+      protectedSids: wsRef.current?.pendingSessionIds() ?? [],
+    });
+  }, [state.runtimes, focusedSid, state.btwSid, state.artifact?.sid]);
 
   // Persist the focused session's turns to IndexedDB (Phase-2 will write through
   // background sessions too). Coalesced in cache.ts.
@@ -204,8 +362,8 @@ export default function App() {
     const sid = rt.ccSessionId;
     if (!sid || rt.turns.length === 0) return;
     import("./cache").then(({ saveSession }) => {
-      const live = wsRef.current?.lastSeqValue || 0;
-      saveSession(sid, rt.turns, live);
+      const live = wsRef.current?.lastSeqFor(sid) || 0;
+      saveSession(sid, rt.turns, live, wsRef.current?.generationFor(sid));
     });
   }, [focusedSid, rt.turns, rt.ccSessionId]);
 
@@ -244,38 +402,37 @@ export default function App() {
       const k = e.key.toLowerCase();
       if (k === "b" && e.shiftKey) {           // diff (shared right slot)
         e.preventDefault();
-        if (state.artifact && rightView === "diff") dispatch({ type: "clear_artifact" });
-        else getDiff("");
+        const latest = shortcutRef.current;
+        if (latest.artifact && latest.rightView === "diff") dispatch({ type: "clear_artifact" });
+        else latest.getDiff("");
       } else if (k === "b") {                    // toggle sidebar
         e.preventDefault();
         setSidebarOpen((v) => !v);
       } else if (k === "k" && e.shiftKey) {      // /btw side panel (shared right slot)
         e.preventDefault();
-        if (state.btwSid && rightView === "btw") closeBtw();
-        else openBtw();
+        const latest = shortcutRef.current;
+        if (latest.btwSid && latest.rightView === "btw") latest.closeBtw();
+        else latest.openBtw();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [authed, state.artifact, state.btwSid, rightView]);
+  }, [authed]);
 
   // Shift+Tab => cycle permission mode for the focused session
   useEffect(() => {
     if (!authed) return;
-    const CYCLE: Record<string, string> = {
-      bypassPermissions: "acceptEdits",
-      acceptEdits: "plan",
-      plan: "bypassPermissions",
-    };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Tab" && e.shiftKey) {
         e.preventDefault();
-        setPerm(CYCLE[rt.perm] || "bypassPermissions");
+        const modes = permsFor(engine).map((p) => p.id);
+        const current = modes.indexOf(rt.perm);
+        setPerm(modes[current < 0 ? 0 : (current + 1) % modes.length]);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [authed, focusedSid, rt.perm]);
+  }, [authed, focusedSid, rt.perm, engine]);
 
   // ---- /btw effects ----
   // These MUST stay ABOVE the `!authed` early return below. Hooks have to run
@@ -285,8 +442,6 @@ export default function App() {
   // expected"). Logging back in tripped the mirror image. Refreshing "fixed" it
   // only because a fresh mount has no previous render to disagree with.
   //
-  // the fork is ready once btw_opened lands its sid -> drop the opening spinner.
-  useEffect(() => { if (state.btwSid) setBtwOpening(false); }, [state.btwSid]);
   // A /btw fork belongs to the session it was forked from. When you switch session
   // or toggle engine, discard it — else a codex btw would linger while you view a
   // cc session ("cc shows codex btw"). Read via ref so opening btw (no focus
@@ -294,27 +449,34 @@ export default function App() {
   const btwSidRef = useRef<string | null>(null);
   btwSidRef.current = state.btwSid;
   useEffect(() => {
+    pendingBtwRef.current = null;
+    activeBtwRef.current = null;
     setBtwOpening(false);
     const s = btwSidRef.current;
     if (s) { wsRef.current?.sendCloseBtw(s); dispatch({ type: "clear_btw" }); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusedSid, engine]);
 
-  if (!authed) {
-    return <LoginForm onLogin={(t) => { localStorage.setItem(SESSION_KEY, t); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
+  if (!authReady) {
+    return <div className="login" aria-busy="true">正在连接中继…</div>;
   }
 
-  const sendQuery = (prompt: string, images?: QueryImg[], files?: QueryFile[]) => {
-    if (!wsRef.current) return;
+  if (!authed) {
+    return <LoginForm onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
+  }
+
+  const sendQuery = (prompt: string, images?: QueryImg[], files?: QueryFile[]): boolean => {
+    if (!wsRef.current || !focusedSid) return false;
     const msg_id = uuid();
-    wsRef.current.sendQuery(prompt, msg_id, images, files);
-    dispatch({ type: "query_sent", prompt, msg_id, images, files, ts: Date.now() });
+    if (!wsRef.current.sendQuery(prompt, msg_id, images, files)) return false;
+    dispatch({ type: "query_sent", sid: focusedSid, prompt, msg_id, images, files, ts: Date.now() });
+    return true;
   };
-  // First message of a new chat: create the session in the chosen cwd with the
-  // pre-selected model/effort; the switchTick effect fires the actual query
-  // (with its attachments) once session_focus arrives.
-  const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[]) => {
-    if (!wsRef.current || !state.newChat) return;
+  // Protocol v4 creates the session and starts its first query atomically. The
+  // wrapper targets the new temp-keyed ctx directly; no later focus event is used
+  // to route or trigger this message.
+  const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[]): boolean => {
+    if (!wsRef.current || !state.newChat) return false;
     const { cwd } = state.newChat;
     // Resolve what the new-chat page is actually showing: an unpicked model means the
     // engine's first entry, and an unpicked effort means that model's HIGHEST level
@@ -323,8 +485,13 @@ export default function App() {
     const model = state.newChat.model ?? defaultModelFor(engine, state.catalog, state.catalogDefault);
     const effort = state.newChat.effort ?? defaultEffortFor(engine, model, state.catalog);
     const msg_id = uuid();
-    dispatch({ type: "start_new_query", prompt, msg_id, images, files, model, effort });
-    wsRef.current.sendNewSession(cwd, engine, model, effort);
+    const queued = wsRef.current.sendNewSession(
+      cwd, engine, model, effort, { prompt, msg_id, images, files });
+    if (queued) {
+      pendingCreateRef.current = msg_id;
+      setCreateError(null);
+    }
+    return queued;
   };
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
@@ -353,18 +520,63 @@ export default function App() {
     wsRef.current?.sendSetPerm(perm);
     dispatch({ type: "set_perm", perm });
   };
-  const getDiff = (file: string) => { setRightView("diff"); dispatch({ type: "open_artifact_loading", file }); wsRef.current?.sendGetDiff(file, theme); };
+  const getDiff = (file: string) => {
+    setRightView("diff");
+    dispatch({ type: "open_artifact_loading", file, sid: focusedSid });
+    wsRef.current?.sendGetDiff(file, theme);
+  };
   // /btw: fork the focused session into an ephemeral side panel (wrapper replies
   // BtwOpened → reducer opens the panel). Send/close target the fork by its sid.
-  const openBtw = () => { setRightView("btw"); setBtwOpening(true); if (focusedSid && !state.btwSid) wsRef.current?.sendOpenBtw(focusedSid); };
+  const openBtw = () => {
+    setRightView("btw");
+    if (!focusedSid || state.btwSid || pendingBtwRef.current) return;
+    const requestId = wsRef.current?.sendOpenBtw(focusedSid) ?? null;
+    if (!requestId) { setBtwOpening(false); return; }
+    pendingBtwRef.current = requestId;
+    const requestIds = btwRequestIdsRef.current;
+    requestIds.add(requestId);
+    while (requestIds.size > 64) {
+      const oldest = requestIds.values().next().value as string | undefined;
+      if (!oldest) break;
+      requestIds.delete(oldest);
+    }
+    setBtwOpening(true);
+  };
   const sendBtw = (prompt: string) => { if (state.btwSid) wsRef.current?.sendQueryTo(state.btwSid, prompt, uuid()); };
-  const closeBtw = () => { setBtwOpening(false); if (state.btwSid) { wsRef.current?.sendCloseBtw(state.btwSid); dispatch({ type: "clear_btw" }); } };
+  const closeBtw = () => {
+    pendingBtwRef.current = null;
+    activeBtwRef.current = null;
+    setBtwOpening(false);
+    if (state.btwSid) {
+      wsRef.current?.sendCloseBtw(state.btwSid);
+      dispatch({ type: "clear_btw" });
+    }
+  };
   // Header tab switch between the two right-slot views (opening the target lazily).
   const switchRight = (v: "diff" | "btw") => { if (v === "diff") getDiff(""); else openBtw(); };
-  const logout = () => {
-    localStorage.removeItem(SESSION_KEY);
-    wsRef.current?.stop();
-    setAuthed(false);
+  shortcutRef.current = {
+    artifact: state.artifact, btwSid: state.btwSid, rightView,
+    getDiff, openBtw, closeBtw,
+  };
+  const logout = async () => {
+    try {
+      const response = await fetch("/api/logout", {
+        method: "POST", credentials: "same-origin", cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await import("./cache").then((module) => module.clearCache());
+      wsRef.current?.stop();
+      pendingCreateRef.current = null;
+      pendingBtwRef.current = null;
+      activeBtwRef.current = null;
+      btwRequestIdsRef.current.clear();
+      discardedBtwSidsRef.current.clear();
+      setCreateError(null);
+      dispatch({ type: "reset" });
+      setAuthed(false);
+    } catch {
+      dispatch({ type: "command_error", detail: "退出失败：服务暂不可用，请稍后重试" });
+    }
   };
 
   return (
@@ -374,9 +586,9 @@ export default function App() {
         sessions={state.sessions}
         liveStates={Object.fromEntries(Object.entries(state.runtimes).map(([sid, r]) => [sid, r.state]))}
         activeSessionId={focusedSid}
-        onSelect={(id) => { dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id); wsRef.current?.sendSwitchSession(id, (state.sessions.find((s) => s.session_id === id)?.engine as "claude" | "codex") || engine); if (isMobile()) setSidebarOpen(false); }}
-        onNew={() => { dispatch({ type: "enter_new_chat", cwd: "~" }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
+        onSelect={(id) => { pendingCreateRef.current = null; setCreateError(null); dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id); wsRef.current?.sendSwitchSession(id, (state.sessions.find((s) => s.session_id === id)?.engine as "claude" | "codex") || engine); if (isMobile()) setSidebarOpen(false); }}
+        onNew={() => { pendingCreateRef.current = null; setCreateError(null); dispatch({ type: "enter_new_chat", cwd: "~" }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { pendingCreateRef.current = null; setCreateError(null); dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title)}
         onArchive={(id, archived) => { dispatch({ type: "set_session_tag", sid: id, tag: archived ? "archived" : null }); wsRef.current?.sendArchiveSession(id, archived); }}
@@ -407,13 +619,14 @@ export default function App() {
           <button className="iconbtn" onClick={toggleTheme} aria-label="切换主题">
             <Icon name={theme === "dark" ? "sun" : "moon"} />
           </button>
-          <button className="iconbtn" onClick={logout} aria-label="退出"><Icon name="dots" /></button>
+          <button className="iconbtn" onClick={() => void logout()} aria-label="退出"><Icon name="dots" /></button>
         </header>
 
         <ReconnectBanner banner={state.banner} replaying={rt.replaying} truncated={rt.truncated} />
 
         {state.newChat ? (
-          <NewChatView cwd={state.newChat.cwd} creating={!!state.pendingNewQuery}
+          <NewChatView cwd={state.newChat.cwd}
+            createError={createError}
             engine={engine}
             catalog={state.catalog}
             catalogDefault={state.catalogDefault}
@@ -442,6 +655,8 @@ export default function App() {
           sendMode={state.sendMode}
           setSendMode={(m) => dispatch({ type: "set_send_mode", mode: m })}
           queue={rt.queue}
+          allQueued={allQueued}
+          replaceableQueued={replaceableQueued}
           model={rt.model}
           effort={rt.effort}
           perm={rt.perm}
@@ -453,9 +668,9 @@ export default function App() {
           onEditConsumed={() => setEditPrompt(null)}
           onSendQuery={sendQuery}
           onInterrupt={interrupt}
-          onEnqueue={(prompt) => dispatch({ type: "enqueue", prompt })}
-          onSetPending={(prompt) => dispatch({ type: "set_pending", prompt })}
-          onDequeue={(i) => dispatch({ type: "dequeue_at", i })}
+          onEnqueue={(query) => dispatch({ type: "enqueue", query })}
+          onSetPending={(query) => dispatch({ type: "set_pending", query })}
+          onDequeue={(i) => { if (focusedSid) dispatch({ type: "dequeue_at", sid: focusedSid, i }); }}
           onSetModel={setModel}
           onSetEffort={setEffort}
           onSetServiceTier={setServiceTier}

@@ -9,6 +9,8 @@ interface Base {
   sid?: string | null;
   seq?: number | null;
   to?: string | null;
+  cmd_id?: string | null;
+  client_id?: string | null;
 }
 
 export interface Hello extends Base {
@@ -17,10 +19,12 @@ export interface Hello extends Base {
   client_id?: string | null;
   last_seq?: number | null;
   cursors?: Record<string, number> | null;
+  generations?: Record<string, string> | null;
   cc_session_id?: string | null;
   state?: State | null;
   buffer_head_seq?: number | null;
   buffer_tail_seq?: number | null;
+  wrapper_generation?: string | null;
 }
 export interface QueryImg { media_type: string; data: string }
 export interface QueryFile { filename: string; data: string }
@@ -31,17 +35,24 @@ export interface SetEffort extends Base { type: "set_effort"; effort: string }
 export interface SetServiceTier extends Base { type: "set_service_tier"; service_tier: string }
 export interface Ping extends Base { type: "ping"; n: number }
 export interface Pong extends Base { type: "pong"; n: number }
-export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean; rebuild?: boolean }
+export interface CommandAck extends Base { type: "command_ack"; cmd_id: string; client_id: string }
+export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean; rebuild?: boolean; generation?: string | null }
 export interface ReplayEnd extends Base { type: "replay_end"; to_seq: number; truncated: boolean }
-export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string; cwd?: string | null }
-export interface StateEvent extends Base { type: "state"; state: State }
+export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string; cwd?: string | null; generation?: string | null }
+export interface StateEvent extends Base {
+  type: "state";
+  state: State;
+  phase?: "retrying" | "waiting" | null;
+  detail?: string | null;
+  msg_id?: string | null;
+}
 export interface Model extends Base { type: "model"; model: string }
 export interface Effort extends Base { type: "effort"; effort: string }
 export interface Fast extends Base { type: "fast"; on: boolean }
-export interface OpenBtw extends Base { type: "open_btw"; client_id?: string }
+export interface OpenBtw extends Base { type: "open_btw"; request_id: string; client_id?: string }
 export interface CloseBtw extends Base { type: "close_btw" }
-export interface BtwOpened extends Base { type: "btw_opened"; btw_sid: string; parent_sid: string; engine: string }
-export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null }
+export interface BtwOpened extends Base { type: "btw_opened"; request_id: string; btw_sid: string; parent_sid: string; engine: string }
+export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string }
 export interface ToolUse extends Base { type: "tool_use"; message_id: string; tool_use_id: string; tool: string; input: Record<string, unknown> }
@@ -49,9 +60,15 @@ export interface ToolResult extends Base { type: "tool_result"; tool_use_id: str
 export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string }
 export interface TurnResult { subtype: string; duration_ms: number; is_error: boolean; total_cost_usd?: number | null; num_turns?: number | null }
 export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult }
-export interface ErrorMsg extends Base { type: "error"; code: string; message: string }
+export interface ErrorMsg extends Base {
+  type: "error";
+  code: string;
+  message: string;
+  request_id?: string | null;
+  msg_id?: string | null;
+}
 export interface WrapperDisconnected extends Base { type: "wrapper_disconnected" }
-export interface WrapperReconnected extends Base { type: "wrapper_reconnected"; cc_session_id?: string | null; state: State }
+export interface WrapperReconnected extends Base { type: "wrapper_reconnected"; cc_session_id?: string | null; state: State; generation?: string | null }
 
 // sessions
 export interface SessionInfo {
@@ -67,9 +84,20 @@ export interface SessionInfo {
 }
 export interface ListSessions extends Base { type: "list_sessions"; engine?: "claude" | "codex" }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: "claude" | "codex" }
-export interface NewSession extends Base { type: "new_session"; cwd?: string | null; engine?: "claude" | "codex"; model?: string | null; effort?: string | null }
-export interface SessionList extends Base { type: "session_list"; sessions: SessionInfo[] }
-export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null }
+export interface NewSession extends Base {
+  type: "new_session";
+  request_id?: string | null;
+  cwd?: string | null;
+  engine?: "claude" | "codex";
+  model?: string | null;
+  effort?: string | null;
+  prompt?: string | null;
+  msg_id?: string | null;
+  images?: QueryImg[] | null;
+  files?: QueryFile[] | null;
+}
+export interface SessionList extends Base { type: "session_list"; engine: "claude" | "codex"; sessions: SessionInfo[] }
+export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null; request_id?: string | null }
 // NON-focusing re-key: a temp-keyed new session captured its real cc id. Rename
 // the runtime old_key -> session_id + migrate the cursor; focus only follows if
 // we were already viewing old_key. Prevents focus-steal by background sessions.
@@ -90,7 +118,7 @@ export interface GetHistory extends Base { type: "get_history"; session_id: stri
 // `external`: this session's transcript is being appended to by a native `claude`/
 // `codex` in the user's terminal. The wrapper mirrors those appends by broadcasting
 // a fresh History; we render the session read-only (a cc session has one owner).
-export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; external?: boolean }
+export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; external?: boolean; in_progress?: boolean }
 // The engine's own model catalog. codex's app-server reports, per model, exactly
 // which reasoning levels it accepts — and `turn/start` does NOT validate the level
 // (it accepts `bogus-zzz`), so one we invent client-side only fails later inside the
@@ -123,11 +151,59 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History | Models
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History | Models
   | AskUser
   | SessionList | SessionFocus | SessionRekey
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
+
+/** Build the correlated command used to open one ephemeral /btw fork. */
+export function makeOpenBtwCommand(
+  parentSid: string, requestId: string, ts: number,
+): OpenBtw {
+  return {
+    v: PROTOCOL_VERSION,
+    type: "open_btw",
+    sid: parentSid,
+    request_id: requestId,
+    ts,
+  };
+}
+
+/** Exact guard for accepting a one-shot /btw response in the UI. */
+export function matchesBtwRequest(
+  pendingRequestId: string | null, responseRequestId: string | null | undefined,
+): boolean {
+  return pendingRequestId !== null && responseRequestId === pendingRequestId;
+}
+
+export type BtwOpenedDisposition = "accept" | "duplicate" | "stale";
+
+/** Classify success replies so an ACK-loss replay cannot close the active fork. */
+export function classifyBtwOpened(
+  pendingRequestId: string | null,
+  active: { requestId: string; sid: string } | null,
+  response: Pick<BtwOpened, "request_id" | "btw_sid">,
+): BtwOpenedDisposition {
+  if (active?.requestId === response.request_id && active.sid === response.btw_sid) {
+    return "duplicate";
+  }
+  return matchesBtwRequest(pendingRequestId, response.request_id)
+    ? "accept" : "stale";
+}
+
+/** A successful OpenBtw reply is followed by a Snapshot.  When the success is
+ * stale we close the fork and remember its sid so that trailing Snapshot cannot
+ * recreate an unreferenced runtime in the reducer. */
+export function consumeDiscardedBtwSnapshot(
+  discardedSids: Set<string>,
+  snapshot: Pick<Snapshot, "sid">,
+): boolean {
+  const sid = snapshot.sid;
+  if (!sid || !discardedSids.has(sid)) return false;
+  discardedSids.delete(sid);
+  return true;
+}

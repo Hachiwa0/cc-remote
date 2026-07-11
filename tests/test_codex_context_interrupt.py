@@ -59,13 +59,15 @@ def test_interrupt_status_maps_to_cc_vocab():
     print(f"  interrupted -> subtype={te.result.subtype} is_error={te.result.is_error}  OK")
 
     tr2 = CodexStreamTranslator(8000)
+    tr2.feed({"method": "item/agentMessage/delta", "params": {
+        "itemId": "answer-1", "delta": "done"}})
     ok = tr2.feed({"method": "turn/completed", "params": {"turn": {"status": "completed", "durationMs": 500}}})
-    assert ok[0].result.subtype == "success" and ok[0].result.is_error is False
+    assert ok[-1].result.subtype == "success" and ok[-1].result.is_error is False
     print(f"  completed -> subtype=success is_error=False  OK")
 
     tr3 = CodexStreamTranslator(8000)
     fail = tr3.feed({"method": "turn/completed", "params": {"turn": {"status": "failed"}}})
-    assert fail[0].result.subtype == "error" and fail[0].result.is_error is True
+    assert fail[-1].result.subtype == "error" and fail[-1].result.is_error is True
     print(f"  failed -> subtype=error is_error=True  OK")
 
 
@@ -99,11 +101,18 @@ def test_config_fast_toggle_preserves_file():
 
 def test_codex_errors_surface():
     """A failed codex turn (provider timeout / 401 / stream drop) must reach the
-    client as an Error, not silence. Transient retries (willRetry) stay quiet."""
+    client as an Error, not silence. Transient retries remain non-terminal but
+    visible so a provider outage does not look like a frozen UI."""
     from cc_remote.protocol import Error
     tr = CodexStreamTranslator(8000)
-    # transient retry -> nothing
-    assert tr.feed({"method": "error", "params": {"willRetry": True, "error": {"message": "Reconnecting... 2/5"}}}) == []
+    # transient retry -> progress, never a terminal Error/TurnEnd
+    retry = tr.feed({"method": "error", "params": {"willRetry": True,
+        "error": {"message": "Reconnecting... 2/5", "codexErrorInfo": {
+            "responseStreamDisconnected": {"httpStatusCode": 503}}}}})
+    assert [e.type for e in retry] == ["state"]
+    assert retry[0].state == "running"
+    assert "503" in retry[0].detail and "2/5" in retry[0].detail
+    assert retry[0].phase == "retrying"
     # terminal error -> Error
     evs = tr.feed({"method": "error", "params": {"willRetry": False,
         "error": {"message": "unexpected status 401 Unauthorized", "additionalDetails": "Incorrect API key"}}})
@@ -113,7 +122,42 @@ def test_codex_errors_surface():
     out = tr2.feed({"method": "turn/completed", "params": {"turn": {"status": "failed", "error": {"message": "request timed out"}}}})
     assert any(isinstance(e, Error) and "request timed out" in e.message for e in out), out
     assert out[-1].result.is_error is True and out[-1].result.subtype == "error"
-    print("  codex errors surface: retry silent, 401 + failed-turn -> Error  OK")
+    print("  codex errors surface: retry visible, 401 + failed-turn -> Error  OK")
+
+
+def test_codex_empty_completed_is_an_error_but_tool_activity_is_not():
+    """The production 503 incident ended as completed/error=null with no agent
+    item. That shape must never become a silent success."""
+    from cc_remote.protocol import Error, TurnEnd
+
+    empty = CodexStreamTranslator(8000).feed({
+        "method": "turn/completed",
+        "params": {"turn": {"status": "completed", "durationMs": 237252}},
+    })
+    assert isinstance(empty[0], Error)
+    assert "没有返回任何内容" in empty[0].message
+    assert isinstance(empty[-1], TurnEnd)
+    assert empty[-1].result.subtype == "error"
+    assert empty[-1].result.is_error is True
+
+    tool_only = CodexStreamTranslator(8000)
+    tool_only.feed({"method": "item/started", "params": {"item": {
+        "type": "commandExecution", "id": "tool-1", "command": "true"}}})
+    done = tool_only.feed({"method": "turn/completed", "params": {
+        "turn": {"status": "completed", "durationMs": 10}}})
+    assert not any(isinstance(event, Error) for event in done)
+    assert done[-1].result.subtype == "success"
+    assert done[-1].result.is_error is False
+
+    completed_only = CodexStreamTranslator(8000)
+    answer = completed_only.feed({"method": "item/completed", "params": {
+        "item": {"type": "agentMessage", "id": "answer-only",
+                 "text": "provider sent no deltas"}}})
+    assert [event.type for event in answer] == [
+        "assistant_msg_start", "delta", "assistant_msg_end"]
+    final = completed_only.feed({"method": "turn/completed", "params": {
+        "turn": {"status": "completed", "durationMs": 20}}})
+    assert final[-1].result.subtype == "success"
 
 
 if __name__ == "__main__":

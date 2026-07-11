@@ -40,12 +40,21 @@ class SessionContext:
     state: State = "idle"
     engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
     turn_task: Optional[asyncio.Task] = None
+    # Correlates asynchronous turn crashes/drain failures with the optimistic
+    # client turn. Control-command errors must never terminate an unrelated turn.
+    active_msg_id: Optional[str] = None
+    # Interrupt must wake a consumer that is already blocked in queue.get().  The
+    # absolute monotonic deadline prevents each subsequent queue item from
+    # restarting the drain timeout.
+    interrupt_event: asyncio.Event = field(default_factory=asyncio.Event)
+    interrupt_deadline: Optional[float] = None
     translator: Optional[StreamTranslator] = None
     # /btw ephemeral fork: a throwaway side-session forked from `parent_sid` that
     # inherits its context. Never persisted, excluded from the session list, and
     # discarded on close. Its turns reuse the normal _run_turn path.
     btw: bool = False
     parent_sid: Optional[str] = None
+    owner_client_id: Optional[str] = None
     # cc fork_session persists a transcript under a new id (unlike codex's
     # ephemeral fork); capture it here so close_btw can hard-delete it.
     btw_real_id: Optional[str] = None
@@ -66,6 +75,11 @@ class SessionContext:
     last_turn_end: float = 0.0
     pending_asks: dict = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serialize the tiny "final preflight check -> query accepted by engine"
+    # window against interrupt().  Reconnects happen before this lock; once held,
+    # interrupt either marks the event before query (so the turn aborts) or waits
+    # until query() has returned and can interrupt the newly-created live turn.
+    launch_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def next_seq(self) -> int:
         self.seq += 1

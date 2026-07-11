@@ -180,7 +180,7 @@ export function ChatView({ sid, turns, loading, hasMore, onLoadMore, onEdit, onG
                   )
                 )}
                 {!t.done && (
-                  <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">思考中</span></div>
+                  <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">{t.progress ?? "思考中"}</span></div>
                 )}
                 {t.done && (
                   <>
@@ -193,7 +193,7 @@ export function ChatView({ sid, turns, loading, hasMore, onLoadMore, onEdit, onG
                 )}
               </>
             ) : (!t.done && t.prompt) ? (
-              <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">思考中</span></div>
+              <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">{t.progress ?? "思考中"}</span></div>
             ) : null}
             {fileChips(t)}
             {t.interrupted && <div className="note interrupted">— 已打断 —</div>}

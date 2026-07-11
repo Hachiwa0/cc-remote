@@ -4,7 +4,9 @@ import type { ConnState } from "../ws";
 import { Icon } from "../icons";
 import { clientSlashesFor, CODEX_PROMPTS, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor, type Catalog } from "../data";
 import { CommandSheet } from "./CommandSheet";
-import { pickFiles } from "../img";
+import { attachmentBytes, pickFiles } from "../img";
+import type { PendingQuery } from "../reducer";
+import { canEnqueueQuery } from "../runtime-drain";
 
 interface Props {
   state: State;
@@ -12,7 +14,9 @@ interface Props {
   wrapperOnline: boolean;
   sendMode: "interrupt" | "queue";
   setSendMode: (m: "interrupt" | "queue") => void;
-  queue: string[];
+  queue: PendingQuery[];
+  allQueued: PendingQuery[];
+  replaceableQueued: PendingQuery[];
   model: string;
   effort: string;
   perm: string;
@@ -26,10 +30,10 @@ interface Props {
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   editPrompt: string | null;
   onEditConsumed: () => void;
-  onSendQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => void;
+  onSendQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
   onInterrupt: () => void;
-  onEnqueue: (prompt: string) => void;
-  onSetPending: (prompt: string) => void;
+  onEnqueue: (query: PendingQuery) => void;
+  onSetPending: (query: PendingQuery) => void;
   onDequeue: (i: number) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
@@ -42,6 +46,8 @@ interface Props {
 }
 
 export function Composer(p: Props) {
+  const editPrompt = p.editPrompt;
+  const onEditConsumed = p.onEditConsumed;
   const [input, setInput] = useState("");
   // Only the modal pickers live in state now; the "/" command palette is a live
   // popover DERIVED from the composer text (no second input box).
@@ -52,10 +58,13 @@ export function Composer(p: Props) {
   const noticeTimer = useRef<number | null>(null);
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
+  const [importing, setImporting] = useState(false);
   const [dragDepth, setDragDepth] = useState(0);
   const dragOver = dragDepth > 0;
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const pickFilesRef = useRef<(files: FileList | File[] | null) => Promise<void>>(
+    async () => {});
 
   // context popover: close on outside click
   useEffect(() => {
@@ -67,34 +76,8 @@ export function Composer(p: Props) {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [ctxOpen]);
 
-  // Whole-window drag-drop overlay (ChatGPT/Claude-app style): any file drag
-  // over the window shows a drop overlay; drop anywhere to attach. A depth
-  // counter avoids flicker when the pointer crosses child element boundaries.
-  useEffect(() => {
-    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes("Files");
-    const onEnter = (e: DragEvent) => { if (hasFiles(e)) setDragDepth((d) => d + 1); };
-    const onLeave = (e: DragEvent) => { if (hasFiles(e)) setDragDepth((d) => Math.max(0, d - 1)); };
-    const onOver = (e: DragEvent) => { if (hasFiles(e)) e.preventDefault(); };  // allow drop
-    const onDrop = (e: DragEvent) => {
-      if (!hasFiles(e)) return;
-      e.preventDefault();
-      setDragDepth(0);
-      if (e.dataTransfer?.files?.length) onPickFiles(e.dataTransfer.files);
-    };
-    window.addEventListener("dragenter", onEnter);
-    window.addEventListener("dragleave", onLeave);
-    window.addEventListener("dragover", onOver);
-    window.addEventListener("drop", onDrop);
-    return () => {
-      window.removeEventListener("dragenter", onEnter);
-      window.removeEventListener("dragleave", onLeave);
-      window.removeEventListener("dragover", onOver);
-      window.removeEventListener("drop", onDrop);
-    };
-  }, []);
-
   const busy = p.state === "running" || p.state === "interrupting";
-  const offline = !p.wrapperOnline;
+  const offline = !p.wrapperOnline || p.connState !== "connected";
   // `locked` = we must not write to this session: the machine is offline, OR a native
   // `claude` in the terminal owns it (we mirror it read-only).
   const locked = offline || !!p.external;
@@ -103,16 +86,16 @@ export function Composer(p: Props) {
 
   // edit: refill the input box with a past prompt (user-bubble edit button)
   useEffect(() => {
-    if (p.editPrompt != null) {
-      setInput(p.editPrompt);
-      p.onEditConsumed();
+    if (editPrompt != null) {
+      setInput(editPrompt);
+      onEditConsumed();
       setTimeout(() => taRef.current?.focus(), 0);
       if (taRef.current) {
         taRef.current.style.height = "auto";
         taRef.current.style.height = Math.min(taRef.current.scrollHeight, 132) + "px";
       }
     }
-  }, [p.editPrompt]);
+  }, [editPrompt, onEditConsumed]);
 
   const resetTaHeight = () => { if (taRef.current) taRef.current.style.height = "auto"; };
   const growTa = () => {
@@ -141,10 +124,46 @@ export function Composer(p: Props) {
   const cmdMatches = cmdToken !== null ? matchCommands(cmdToken, p.engine) : [];
   const cmdOpen = cmdMatches.length > 0;
 
-  const onPickFiles = (fl: FileList | File[] | null) =>
-    pickFiles(fl,
-      (img) => setImages((prev) => [...prev, img]),   // images downscaled in pickFiles
-      (file) => setFiles((prev) => [...prev, file]));
+  const onPickFiles = async (fl: FileList | File[] | null) => {
+    if (importing) { flash("附件正在导入，请稍候"); return; }
+    setImporting(true);
+    try {
+      const batch = await pickFiles(
+        fl, images.length + files.length, attachmentBytes(images, files));
+      if (batch.images.length) setImages((previous) => [...previous, ...batch.images]);
+      if (batch.files.length) setFiles((previous) => [...previous, ...batch.files]);
+      if (batch.errors.length) flash(batch.errors.join("；"));
+    } finally {
+      setImporting(false);
+    }
+  };
+  pickFilesRef.current = onPickFiles;
+
+  // Whole-window drag-drop overlay. The effect is refreshed with the current
+  // attachment limits/import state so its async drop handler never uses a stale
+  // count or appends after a send.
+  useEffect(() => {
+    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes("Files");
+    const onEnter = (e: DragEvent) => { if (hasFiles(e)) setDragDepth((d) => d + 1); };
+    const onLeave = (e: DragEvent) => { if (hasFiles(e)) setDragDepth((d) => Math.max(0, d - 1)); };
+    const onOver = (e: DragEvent) => { if (hasFiles(e)) e.preventDefault(); };
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      setDragDepth(0);
+      if (e.dataTransfer?.files?.length) void pickFilesRef.current(e.dataTransfer.files);
+    };
+    window.addEventListener("dragenter", onEnter);
+    window.addEventListener("dragleave", onLeave);
+    window.addEventListener("dragover", onOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onEnter);
+      window.removeEventListener("dragleave", onLeave);
+      window.removeEventListener("dragover", onOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
 
   // paste images/files straight into the textarea (clipboard API)
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
@@ -158,22 +177,39 @@ export function Composer(p: Props) {
         if (f) files.push(f);
       }
     }
-    if (files.length) { e.preventDefault(); onPickFiles(files); }
+    if (files.length) { e.preventDefault(); void onPickFiles(files); }
   };
 
   // Send prompt text to cc, honoring busy/queue/interrupt rules.
   const submitPrompt = (prompt: string) => {
+    if (importing) { flash("请等待附件导入完成"); return; }
+    const query: PendingQuery = {
+      prompt,
+      images: images.length ? images : undefined,
+      files: files.length ? files : undefined,
+    };
     if (busy) {
       // empty input while busy => stop (interrupt); non-empty => interrupt+send or enqueue
       if (!prompt && !hasAttachments) { p.onInterrupt(); return; }
-      if (p.sendMode === "queue") { p.onEnqueue(prompt); setInput(""); return; }
-      p.onInterrupt(); p.onSetPending(prompt);
+      const existing = p.sendMode === "queue" ? p.allQueued : p.replaceableQueued;
+      if (!canEnqueueQuery(existing, query)) {
+        flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
+        return;
+      }
+      if (p.sendMode === "queue") {
+        p.onEnqueue(query);
+        setInput(""); setImages([]); setFiles([]); resetTaHeight();
+        return;
+      }
+      p.onInterrupt(); p.onSetPending(query);
       setInput(""); setImages([]); setFiles([]); resetTaHeight();
       return;
     }
     if (!prompt && !hasAttachments) return;
-    p.onSendQuery(prompt, images.length ? images : undefined, files.length ? files : undefined);
-    setInput(""); setImages([]); setFiles([]); resetTaHeight();
+    if (p.onSendQuery(
+        prompt, images.length ? images : undefined, files.length ? files : undefined)) {
+      setInput(""); setImages([]); setFiles([]); resetTaHeight();
+    }
   };
 
   // Client-side slash commands — never forwarded to cc. "/model <id>" passes the
@@ -215,7 +251,7 @@ export function Composer(p: Props) {
   };
 
   const send = () => {
-    if (locked) return;
+    if (locked || importing) return;
     const raw = input.trim();
     if (raw === "/") return;
     const parsed = parseSlash(raw);
@@ -238,7 +274,7 @@ export function Composer(p: Props) {
   const stopping = busy && !hasText && !hasAttachments;
   const sendIcon = !busy ? "send" : stopping ? "stop" : p.sendMode === "interrupt" ? "bolt" : "queue";
   const sendClass = "sendbtn" + ((stopping || (busy && p.sendMode === "interrupt" && (hasText || hasAttachments))) ? " interrupt" : "");
-  const disabled = locked || (!busy && !hasText && !hasAttachments);
+  const disabled = locked || importing || (!busy && !hasText && !hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
   const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
@@ -286,7 +322,7 @@ export function Composer(p: Props) {
             {p.queue.map((m, i) => (
               <span className="qchip" key={i}>
                 <span className="qbadge">排队</span>
-                <span className="qt">{m}</span>
+                <span className="qt">{m.prompt || (m.images?.length ? "图片" : "附件")}</span>
                 <span className="qx" onClick={() => p.onDequeue(i)}><Icon name="close" size={12} /></span>
               </span>
             ))}
@@ -325,13 +361,14 @@ export function Composer(p: Props) {
         )}
 
         <div className="inrow">
-          <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="附件" disabled={locked}><Icon name="plus" size={19} /></button>
-          <input ref={fileRef} type="file" multiple hidden onChange={(e) => { onPickFiles(e.target.files); e.target.value = ""; }} />
+          <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="附件" disabled={locked || importing}><Icon name="plus" size={19} /></button>
+          <input ref={fileRef} type="file" multiple hidden onChange={(e) => { void onPickFiles(e.target.files); e.target.value = ""; }} />
           <textarea
             ref={taRef}
             rows={1}
             value={input}
-            placeholder={offline ? "机器离线 — 等待重连…"
+            placeholder={importing ? "正在安全导入附件…"
+              : offline ? "机器离线 — 等待重连…"
               : p.external ? "终端占用中 — 只读镜像,无法在此发送"
               : "发消息…  输入 / 唤起命令"}
             disabled={locked}

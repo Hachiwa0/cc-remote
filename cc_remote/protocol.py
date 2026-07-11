@@ -4,7 +4,8 @@ One JSON object per WebSocket text frame. Common envelope fields on every
 message: `v` (protocol version), `type`, `ts`, optional `sid` (cc session id
 once known), optional `seq` (monotonic per-session int assigned by the wrapper
 to every downstream event; absent on command messages). Auth is NOT in the
-envelope — it's a Bearer header at WS upgrade and is never logged.
+envelope: wrappers use a Bearer header and browser clients use an HttpOnly
+cookie at WS upgrade; neither credential is logged.
 
 Discriminated by `type`. `extra="forbid"` so unknown fields fail fast.
 """
@@ -12,13 +13,114 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing_extensions import NotRequired, TypedDict
 
-PROTOCOL_VERSION = 3
+from pydantic import (
+    AfterValidator, BaseModel, ConfigDict, Field, StringConstraints, ValidationError,
+    model_validator,
+)
+
+from cc_remote.attachments import (
+    MAX_ATTACHMENT_COUNT,
+    MAX_FILENAME_BYTES,
+    MAX_SINGLE_ATTACHMENT_BYTES,
+)
+
+PROTOCOL_VERSION = 4
 
 State = Literal["idle", "running", "interrupting", "draining"]
+Engine = Literal["claude", "codex"]
+EffortLevel = Literal[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+]
+PermissionMode = Literal[
+    "default", "acceptEdits", "plan", "auto", "bypassPermissions",
+    "never", "on-request", "untrusted",
+]
+ModelName = Annotated[str, StringConstraints(min_length=1, max_length=256)]
+WireId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$",
+    ),
+]
+
+MAX_ENCODED_ATTACHMENT_CHARS = ((MAX_SINGLE_ATTACHMENT_BYTES + 2) // 3) * 4
+ASK_QUESTION_MAX_CHARS = 16 * 1024
+ASK_OPTION_LABEL_MAX_CHARS = 512
+ASK_OPTION_DESCRIPTION_MAX_CHARS = 2 * 1024
+ASK_ANSWER_MAX_CHARS = 4 * 1024
+ASK_OPTION_MIN_COUNT = 2
+ASK_OPTION_MAX_COUNT = 5
+
+
+def _valid_attachment_filename(value: str) -> str:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("attachment filename must be valid UTF-8") from exc
+    if len(encoded) > MAX_FILENAME_BYTES:
+        raise ValueError(
+            f"attachment filename exceeds {MAX_FILENAME_BYTES} UTF-8 bytes")
+    return value
+
+
+AttachmentFilename = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=MAX_FILENAME_BYTES),
+    AfterValidator(_valid_attachment_filename),
+]
+AttachmentData = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=MAX_ENCODED_ATTACHMENT_CHARS),
+]
+AskQuestionText = Annotated[
+    str, StringConstraints(min_length=1, max_length=ASK_QUESTION_MAX_CHARS),
+]
+AskOptionLabel = Annotated[
+    str, StringConstraints(min_length=1, max_length=ASK_OPTION_LABEL_MAX_CHARS),
+]
+AskOptionDescription = Annotated[
+    str, StringConstraints(max_length=ASK_OPTION_DESCRIPTION_MAX_CHARS),
+]
+AskAnswerText = Annotated[
+    str, StringConstraints(min_length=1, max_length=ASK_ANSWER_MAX_CHARS),
+]
+
+
+class QueryImage(TypedDict):
+    """Strict image attachment shape; validation returns a plain ``dict``."""
+
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    media_type: Literal["image/png", "image/jpeg", "image/jpg", "image/webp"]
+    data: AttachmentData
+
+
+class QueryFile(TypedDict):
+    """Strict uploaded-file shape; validation returns a plain ``dict``."""
+
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    filename: AttachmentFilename
+    data: AttachmentData
+
+
+class UserFileMeta(TypedDict):
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    filename: AttachmentFilename
+
+
+class AskOption(TypedDict):
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    label: AskOptionLabel
+    ds: NotRequired[AskOptionDescription]
+
+
+def _attachment_count(images, files) -> int:
+    return len(images or ()) + len(files or ())
 
 # Error codes
 ERR_BUSY = "busy"
@@ -37,11 +139,25 @@ class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid")
     v: int = PROTOCOL_VERSION
     ts: float = Field(default_factory=time.time)
-    sid: Optional[str] = None
+    sid: Optional[WireId] = None
     seq: Optional[int] = None
     # `to` routes a frame to a single client (by client_id) instead of
     # broadcasting. Used for per-client replay frames; null = broadcast.
-    to: Optional[str] = None
+    to: Optional[WireId] = None
+    # Relay-generated WebSocket generation. Only Hello replay/catch-up frames
+    # echo this value; the relay drops them if `client_id` has since reconnected
+    # onto another socket. Clients must not treat it as a durable identity.
+    route_id: Optional[WireId] = None
+
+
+class _Command(_Base):
+    """Reliable client command envelope (hello and heartbeat are excluded).
+
+    The relay overwrites ``client_id`` with the identity bound by client hello;
+    ``cmd_id`` remains stable across WebSocket reconnect retries.
+    """
+    cmd_id: Optional[WireId] = None
+    client_id: Optional[WireId] = None
 
 
 # ---- client -> wrapper (via relay); no seq ----
@@ -49,67 +165,87 @@ class _Base(BaseModel):
 class Hello(_Base):
     """First frame after upgrade. `role` distinguishes client vs wrapper.
 
-    Client role sends `client_id` (for routed frames). `last_seq`/`cursors` are
-    LEGACY — hello no longer replays history; it only prompts the wrapper to send
-    a lightweight Snapshot per resident session (state dot). History is fetched
-    on demand via GetHistory (one bulk frame read from the transcript), like a
-    web chat's GET /conversation. Wrapper role announces its cc session id,
-    current state, and ring-buffer bounds.
+    Client role sends `client_id` (for routed frames). A session with no supplied
+    cursor gets one lightweight Snapshot; a named `cursors[sid]` receives only
+    the missing live ring tail (`seq > cursor`). `last_seq` is the legacy focused-
+    session form. Authoritative history remains an on-demand GetHistory transcript
+    read. Wrapper role announces its cc session id, current state, and ring bounds.
     """
     type: Literal["hello"] = "hello"
     role: Literal["client", "wrapper"]
-    client_id: Optional[str] = None  # client
+    client_id: Optional[WireId] = None  # client
     last_seq: Optional[int] = None  # client (legacy: focused session only)
-    cursors: Optional[dict[str, int]] = None  # client: per-session last_seq for multi-session catch-up
-    cc_session_id: Optional[str] = None  # wrapper
+    cursors: Optional[dict[WireId, int]] = None  # client: per-session last_seq for multi-session catch-up
+    generations: Optional[dict[WireId, WireId]] = None  # client: wrapper generation paired with each cursor
+    cc_session_id: Optional[WireId] = None  # wrapper
+    wrapper_generation: Optional[WireId] = None  # wrapper process lifetime id
     state: Optional[State] = None  # wrapper
     buffer_head_seq: Optional[int] = None  # wrapper
     buffer_tail_seq: Optional[int] = None  # wrapper
 
+    @model_validator(mode="after")
+    def bounded_cursors(self):
+        if self.cursors is not None:
+            if len(self.cursors) > 128:
+                raise ValueError("hello cursors exceed 128 sessions")
+            if any(seq < 0 for seq in self.cursors.values()):
+                raise ValueError("hello cursors must be non-negative")
+        if self.generations is not None and len(self.generations) > 128:
+            raise ValueError("hello generations exceed 128 sessions")
+        return self
 
-class Query(_Base):
+
+class Query(_Command):
     type: Literal["query"] = "query"
-    prompt: str
-    msg_id: str
-    images: Optional[list[dict[str, str]]] = None  # [{media_type, data(base64)}] — multimodal image blocks
-    files: Optional[list[dict[str, str]]] = None   # [{filename, data(base64)}] — written to /tmp, prompt gets @path
+    prompt: str = Field(max_length=2 * 1024 * 1024)
+    msg_id: WireId
+    images: Optional[list[QueryImage]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
+    files: Optional[list[QueryFile]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
+
+    @model_validator(mode="after")
+    def bounded_attachment_count(self):
+        if _attachment_count(self.images, self.files) > MAX_ATTACHMENT_COUNT:
+            raise ValueError(
+                f"query attachments exceed {MAX_ATTACHMENT_COUNT} items")
+        return self
 
 
-class Interrupt(_Base):
+class Interrupt(_Command):
     type: Literal["interrupt"] = "interrupt"
 
 
-class SetModel(_Base):
+class SetModel(_Command):
     type: Literal["set_model"] = "set_model"
-    model: str
+    model: ModelName
 
 
-class SetEffort(_Base):
+class SetEffort(_Command):
     """client -> wrapper: set the session's reasoning effort (thinking strength).
     Unlike set_model, effort is a spawn-time CLI flag (--effort), so applying it
     respawns the cc subprocess with resume — done lazily at the next turn."""
     type: Literal["set_effort"] = "set_effort"
-    effort: str  # low | medium | high | xhigh | max
+    effort: EffortLevel
 
 
-class SetServiceTier(_Base):
+class SetServiceTier(_Command):
     """client -> wrapper: set the Codex service tier (codex only). "fast" maps to
     codex's Fast mode via turn/start's `serviceTier` param; "" / "default" turns it
     off. Applied on the NEXT turn (a per-turn turn/start override, like model)."""
     type: Literal["set_service_tier"] = "set_service_tier"
-    service_tier: str  # fast | default (or "" = off)
+    service_tier: Literal["", "default", "fast", "toggle"]
 
 
-class OpenBtw(_Base):
+class OpenBtw(_Command):
     """client -> wrapper: open a /btw ephemeral side-fork of `sid` (the parent
     session). The wrapper forks it (inherits context) and replies BtwOpened
     routed to=<client_id> (only the requester opens the panel)."""
     type: Literal["open_btw"] = "open_btw"
-    client_id: Optional[str] = None  # requester, for routing BtwOpened back
+    request_id: WireId
+    client_id: Optional[WireId] = None  # requester, for routing BtwOpened back
     # `sid` (inherited) = the parent session to fork.
 
 
-class CloseBtw(_Base):
+class CloseBtw(_Command):
     """client -> wrapper: discard the /btw fork `sid` (tear down, never persisted)."""
     type: Literal["close_btw"] = "close_btw"
     # `sid` (inherited) = the btw fork to close.
@@ -117,12 +253,29 @@ class CloseBtw(_Base):
 
 class Ping(_Base):
     type: Literal["ping"] = "ping"
-    n: int
+    n: int = Field(ge=0, le=2_147_483_647)
 
 
 class Pong(_Base):
     type: Literal["pong"] = "pong"
-    n: int
+    n: int = Field(ge=0, le=2_147_483_647)
+
+
+class CommandAck(_Base):
+    """Wrapper -> originating client after a reliable handler returns.
+
+    Routed with ``to=client_id`` and intentionally not sequenced or buffered.
+    Duplicate processed commands receive this again without re-execution.
+    """
+    type: Literal["command_ack"] = "command_ack"
+    cmd_id: WireId
+    client_id: WireId
+
+    @model_validator(mode="after")
+    def must_be_routed_to_origin(self):
+        if self.to != self.client_id:
+            raise ValueError("command_ack.to must equal client_id")
+        return self
 
 
 # ---- wrapper -> client (via relay); all carry seq ----
@@ -137,6 +290,7 @@ class ReplayStart(_Base):
     # from this full-buffer replay. Distinct from `truncated` (which means the
     # buffer evicted events the client wanted -> data may be lost -> show banner).
     rebuild: bool = False
+    generation: Optional[WireId] = None
 
 
 class ReplayEnd(_Base):
@@ -147,15 +301,22 @@ class ReplayEnd(_Base):
 
 class Snapshot(_Base):
     type: Literal["snapshot"] = "snapshot"
-    cc_session_id: Optional[str] = None
+    cc_session_id: Optional[WireId] = None
     state: State
     tail_text: str = ""
     cwd: Optional[str] = None  # active cc cwd, so the client knows the current project
+    generation: Optional[WireId] = None
 
 
 class StateEvent(_Base):
     type: Literal["state"] = "state"
     state: State
+    # Optional non-terminal activity for the current turn. Additive on protocol
+    # v4: older clients still consume `state`, while newer clients replace the
+    # generic spinner with retry/wait detail without treating it as an Error.
+    phase: Optional[Literal["retrying", "waiting"]] = None
+    detail: Optional[str] = Field(default=None, max_length=4096)
+    msg_id: Optional[WireId] = None
 
 
 class Model(_Base):
@@ -184,8 +345,9 @@ class BtwOpened(_Base):
     """wrapper -> client: a /btw fork is ready. `btw_sid` is the stable routing key
     for the side panel (send Query{sid=btw_sid} for its turns, CloseBtw to end)."""
     type: Literal["btw_opened"] = "btw_opened"
-    btw_sid: str
-    parent_sid: str
+    request_id: WireId
+    btw_sid: WireId
+    parent_sid: WireId
     engine: str
 
 
@@ -195,33 +357,36 @@ class UserMsg(_Base):
     (it already created the turn optimistically on send). Carries images so
     other devices / fresh replays render the attachment."""
     type: Literal["user_msg"] = "user_msg"
-    msg_id: str
+    msg_id: WireId
     prompt: str
-    images: Optional[list[dict[str, str]]] = None  # [{media_type, data(base64)}]
+    images: Optional[list[QueryImage]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
+    # Metadata only: file bodies stay out of replay/cache, while names remain
+    # visible across devices and after transcript history reload.
+    files: Optional[list[UserFileMeta]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
 
 
 class AssistantMsgStart(_Base):
     type: Literal["assistant_msg_start"] = "assistant_msg_start"
-    message_id: str
+    message_id: WireId
 
 
 class Delta(_Base):
     type: Literal["delta"] = "delta"
-    message_id: str
+    message_id: WireId
     text: str
 
 
 class ToolUse(_Base):
     type: Literal["tool_use"] = "tool_use"
-    message_id: str
-    tool_use_id: str
+    message_id: WireId
+    tool_use_id: WireId
     tool: str
     input: dict[str, Any]
 
 
 class ToolResult(_Base):
     type: Literal["tool_result"] = "tool_result"
-    tool_use_id: str
+    tool_use_id: WireId
     content: str
     is_error: bool
     truncated: Optional[bool] = None
@@ -229,7 +394,7 @@ class ToolResult(_Base):
 
 class AssistantMsgEnd(_Base):
     type: Literal["assistant_msg_end"] = "assistant_msg_end"
-    message_id: str
+    message_id: WireId
 
 
 class TurnResult(BaseModel):
@@ -249,8 +414,13 @@ class TurnEnd(_Base):
 
 class Error(_Base):
     type: Literal["error"] = "error"
-    code: str
-    message: str
+    code: str = Field(min_length=1, max_length=128)
+    message: str = Field(max_length=64 * 1024)
+    # Optional correlation for terminal command rejection. NewSession uses
+    # request_id so the draft stays open on failure; Query uses msg_id so the
+    # exact optimistic turn can be marked done instead of leaving a spinner.
+    request_id: Optional[WireId] = None
+    msg_id: Optional[WireId] = None
 
 
 # ---- relay -> client (control); no seq ----
@@ -261,8 +431,9 @@ class WrapperDisconnected(_Base):
 
 class WrapperReconnected(_Base):
     type: Literal["wrapper_reconnected"] = "wrapper_reconnected"
-    cc_session_id: Optional[str] = None
+    cc_session_id: Optional[WireId] = None
     state: State
+    generation: Optional[WireId] = None
 
 
 # ---- sessions (list / switch / new) ----
@@ -270,7 +441,7 @@ class WrapperReconnected(_Base):
 class SessionInfo(BaseModel):
     """A row in the sessions sidebar (subset of SDK SDKSessionInfo)."""
     model_config = ConfigDict(extra="forbid")
-    session_id: str
+    session_id: WireId
     summary: Optional[str] = None
     last_modified: Optional[str] = None
     first_prompt: Optional[str] = None
@@ -281,7 +452,7 @@ class SessionInfo(BaseModel):
     engine: Optional[str] = None  # "claude" | "codex"; None = claude (legacy sidebar badge)
 
 
-class ListSessions(_Base):
+class ListSessions(_Command):
     """client -> wrapper: request the session list. `engine` picks the backend's
     session store (Claude ~/.claude/projects vs Codex ~/.codex/sessions);
     optional, default claude."""
@@ -292,31 +463,48 @@ class ListSessions(_Base):
 class SessionList(_Base):
     """wrapper -> client: the sessions (downstream so a reconnect restores it)."""
     type: Literal["session_list"] = "session_list"
+    engine: Literal["claude", "codex"]
     sessions: list[SessionInfo]
 
 
-class SwitchSession(_Base):
+class SwitchSession(_Command):
     """client -> wrapper: resume a different existing session. `engine` tells the
     wrapper which backend to resume it with (codex threads resume differently)."""
     type: Literal["switch_session"] = "switch_session"
-    session_id: str
-    engine: Optional[str] = None
+    session_id: WireId
+    engine: Optional[Engine] = None
 
 
-class NewSession(_Base):
+class NewSession(_Command):
     """client -> wrapper: start a fresh session (no resume). Optional `cwd`
     spawns it in that directory (default = the wrapper's current cc_cwd).
     `engine` selects the backend — Claude Code (default) or Codex. Optional
     `model`/`effort` pre-select the model and reasoning strength AT SPAWN — so
     the very first turn already uses them (effort especially: applying it at
     spawn avoids the respawn-with-resume that a post-spawn set_effort forces).
-    All fields optional and backward-compatible (no PROTOCOL_VERSION bump): an
-    old client omits them and gets the wrapper's defaults, exactly as before."""
+    Protocol v4 can carry the first query atomically. The wrapper starts it on
+    the newly-created context rather than waiting for a later SessionFocus and
+    a separately-routed Query. Omitting query fields still creates a blank
+    session, preserving the existing new-session command."""
     type: Literal["new_session"] = "new_session"
-    cwd: Optional[str] = None
-    engine: Literal["claude", "codex"] = "claude"
-    model: Optional[str] = None    # None -> engine default (settings.json / codex config)
-    effort: Optional[str] = None   # low|medium|high|xhigh|max; None -> engine default
+    request_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+    engine: Engine = "claude"
+    model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
+    effort: Optional[EffortLevel] = None  # None -> engine default
+    prompt: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
+    msg_id: Optional[WireId] = None
+    images: Optional[list[QueryImage]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
+    files: Optional[list[QueryFile]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
+
+    @model_validator(mode="after")
+    def initial_query_requires_message_id(self):
+        if _attachment_count(self.images, self.files) > MAX_ATTACHMENT_COUNT:
+            raise ValueError(
+                f"new_session attachments exceed {MAX_ATTACHMENT_COUNT} items")
+        if (self.prompt is not None or self.images or self.files) and not self.msg_id:
+            raise ValueError("msg_id is required when new_session carries a query")
+        return self
 
 
 class SessionFocus(_Base):
@@ -329,8 +517,11 @@ class SessionFocus(_Base):
     change, so it uses SessionRekey (below), else a background session capturing
     its id would yank the user's view (focus-steal)."""
     type: Literal["session_focus"] = "session_focus"
-    session_id: str
+    session_id: WireId
     cwd: Optional[str] = None
+    # Echoed from NewSession so clients accept only the focus belonging to the
+    # create request they initiated; ordinary switch confirmations leave it null.
+    request_id: Optional[WireId] = None
 
 
 class SessionRekey(_Base):
@@ -343,33 +534,33 @@ class SessionRekey(_Base):
     SessionFocus is what prevents focus-steal when a *background* new session
     captures its id."""
     type: Literal["session_rekey"] = "session_rekey"
-    old_key: str
-    session_id: str
+    old_key: WireId
+    session_id: WireId
     cwd: Optional[str] = None
 
 
-class RenameSession(_Base):
+class RenameSession(_Command):
     """client -> wrapper: set a session's custom title (appended to its jsonl)."""
     type: Literal["rename_session"] = "rename_session"
-    session_id: str
-    title: str
+    session_id: WireId
+    title: str = Field(min_length=1, max_length=200)
 
 
-class ArchiveSession(_Base):
+class ArchiveSession(_Command):
     """client -> wrapper: toggle the "archived" tag on a session."""
     type: Literal["archive_session"] = "archive_session"
-    session_id: str
+    session_id: WireId
     archived: bool
 
 
 # ---- directory picker (for creating a session in an arbitrary cwd) ----
 
-class ListDir(_Base):
+class ListDir(_Command):
     """client -> wrapper: list subdirectories of a path on the wrapper host.
     Used by the directory picker when creating a session in an arbitrary cwd.
     path=None starts at $HOME."""
     type: Literal["list_dir"] = "list_dir"
-    path: Optional[str] = None
+    path: Optional[str] = Field(default=None, max_length=4096)
 
 
 class DirList(_Base):
@@ -384,15 +575,15 @@ class DirList(_Base):
 
 # ---- model catalog (the engine is the source of truth, not the client) ----
 
-class GetModels(_Base):
+class GetModels(_Command):
     """client -> wrapper: what models does this engine actually offer?
 
     Only `codex` answers with real data: its app-server's `model/list` reports each
     model's `supportedReasoningEfforts` + `defaultReasoningEffort`. cc has no such
     RPC, so the client keeps its static table for engine="cc"."""
     type: Literal["get_models"] = "get_models"
-    engine: Optional[str] = None
-    client_id: Optional[str] = None  # requester, so the wrapper routes Models back to=<client_id>
+    engine: Optional[Literal["cc", "claude", "codex"]] = None
+    client_id: Optional[WireId] = None  # requester, so the wrapper routes Models back to=<client_id>
 
 
 class Models(_Base):
@@ -412,10 +603,10 @@ class Models(_Base):
     default_model: Optional[str] = None
 
 
-class SetPerm(_Base):
+class SetPerm(_Command):
     """client -> wrapper: switch the cc session's permission mode (runtime, no reconnect)."""
     type: Literal["set_perm"] = "set_perm"
-    mode: str
+    mode: PermissionMode
 
 
 class Perm(_Base):
@@ -425,7 +616,7 @@ class Perm(_Base):
     mode: str
 
 
-class GetContext(_Base):
+class GetContext(_Command):
     """client -> wrapper: request current context window usage."""
     type: Literal["get_context"] = "get_context"
 
@@ -442,12 +633,12 @@ class ContextReport(_Base):
     categories: list[dict[str, Any]] = []
 
 
-class GetDiff(_Base):
+class GetDiff(_Command):
     """client -> wrapper: request a git diff (context + line numbers) for a file.
     `theme` picks delta's light/dark rendering so the panel matches the app."""
     type: Literal["get_diff"] = "get_diff"
-    file: str
-    theme: str = "light"
+    file: str = Field(max_length=4096)
+    theme: Literal["light", "dark"] = "light"
 
 
 class DiffReport(_Base):
@@ -457,18 +648,18 @@ class DiffReport(_Base):
     diff: str
 
 
-class GetHistory(_Base):
+class GetHistory(_Command):
     """client -> wrapper: request a session's history, read ON-DEMAND from its
     transcript (NOT the ring buffer, NOT requiring the session to be resident).
     This replaces per-session buffer replay on hello — history is fetched once
     when a session is opened, like a web chat's GET /conversation. `before`/
     `limit` page older turns (load-more); omit both for the whole history."""
     type: Literal["get_history"] = "get_history"
-    session_id: str
-    client_id: Optional[str] = None  # requester, so the wrapper routes History back to=<client_id>
-    cwd: Optional[str] = None
-    before: Optional[str] = None  # oldest already-loaded turn's msg_id — page strictly older than this
-    limit: Optional[int] = None   # max turns to return (null = all)
+    session_id: WireId
+    client_id: Optional[WireId] = None  # requester, so the wrapper routes History back to=<client_id>
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+    before: Optional[WireId] = None  # oldest already-loaded turn's msg_id — page strictly older than this
+    limit: Optional[int] = Field(default=None, ge=1, le=200)
 
 
 class History(_Base):
@@ -479,7 +670,7 @@ class History(_Base):
     by msg_id/message_id against any live tail. Routed to=<client_id>, EXCEPT the
     mirror push below, which is broadcast."""
     type: Literal["history"] = "history"
-    session_id: str
+    session_id: WireId
     events: list[dict[str, Any]] = []
     has_more: bool = False            # older turns exist beyond what's returned (pagination)
     oldest_id: Optional[str] = None   # first returned turn's msg_id — cursor for load-more
@@ -491,6 +682,10 @@ class History(_Base):
     # session READ-ONLY, since a cc session has a single owner and typing here would
     # fork the conversation. Additive + defaulted, so no PROTOCOL_VERSION bump.
     external: bool = False
+    # True while the resident wrapper context is running/interrupting. Claude's
+    # transcript has no ResultMessage, so the final History TurnEnd is synthetic;
+    # clients must not let it close their matching live tail while this is true.
+    in_progress: bool = False
 
 
 class AskUser(_Base):
@@ -499,21 +694,24 @@ class AskUser(_Base):
     the user's pick is returned via AnswerQuestion. ask_id correlates the two.
     The wrapper's MCP handler awaits a Future keyed by ask_id."""
     type: Literal["ask_user"] = "ask_user"
-    ask_id: str
-    question: str
-    options: list[dict[str, str]] = []  # each: {label, ds?}
+    ask_id: WireId
+    question: AskQuestionText
+    options: list[AskOption] = Field(
+        min_length=ASK_OPTION_MIN_COUNT,
+        max_length=ASK_OPTION_MAX_COUNT,
+    )
 
 
-class AnswerQuestion(_Base):
+class AnswerQuestion(_Command):
     """client -> wrapper: the user's answer to an AskUser prompt. answer is the
     selected option's label (or free text if the agent allowed it)."""
     type: Literal["answer_question"] = "answer_question"
-    ask_id: str
-    answer: str
+    ask_id: WireId
+    answer: AskAnswerText
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong,
+    Hello, Query, Interrupt, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, History, Models, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
@@ -554,6 +752,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "dir_list": DirList,
     "ping": Ping,
     "pong": Pong,
+    "command_ack": CommandAck,
     "replay_start": ReplayStart,
     "replay_end": ReplayEnd,
     "snapshot": Snapshot,
@@ -588,19 +787,31 @@ class ProtocolError(Exception):
 
 
 def deserialize(raw: str | bytes) -> AnyMessage:
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, TypeError) as exc:
+        raise ProtocolError("invalid JSON payload") from exc
     if not isinstance(data, dict):
         raise ProtocolError("payload must be a JSON object")
     if data.get("v") != PROTOCOL_VERSION:
-        raise ProtocolError(f"protocol version mismatch: got {data.get('v')!r}, want {PROTOCOL_VERSION}")
+        raise ProtocolError(f"protocol version mismatch; expected v{PROTOCOL_VERSION}")
     t = data.get("type")
     cls = _TYPE_MAP.get(t)
     if cls is None:
-        raise ProtocolError(f"unknown message type: {t!r}")
+        raise ProtocolError("unknown message type")
     try:
         return cls.model_validate(data)  # type: ignore[return-value]
-    except Exception as e:
-        raise ProtocolError(f"invalid {t} message: {e}") from e
+    except ValidationError as exc:
+        # Pydantic's default string includes attacker-controlled input_value.
+        # Keep only bounded field locations and stable error kinds so malformed
+        # prompts/attachments can never be copied into relay or wrapper logs.
+        summaries = []
+        for error in exc.errors(
+            include_url=False, include_context=False, include_input=False)[:8]:
+            location = ".".join(str(part) for part in error.get("loc", ())) or "payload"
+            summaries.append(f"{location}:{error.get('type', 'invalid')}")
+        detail = ", ".join(summaries) or "validation failed"
+        raise ProtocolError(f"invalid {t} message ({detail})") from exc
 
 
 def serialize(msg: BaseModel) -> str:
@@ -609,3 +820,22 @@ def serialize(msg: BaseModel) -> str:
 
 def is_downstream(msg: BaseModel) -> bool:
     return msg.type in DOWNSTREAM_TYPES
+
+
+def is_reliable_command(msg: BaseModel) -> bool:
+    """True only for client commands that participate in cmd_id ACK/retry."""
+    return isinstance(msg, _Command)
+
+
+def is_client_message(msg: BaseModel) -> bool:
+    """Whether a browser/TUI is allowed to originate this wire message.
+
+    Deserialization covers both directions, so the relay must still enforce the
+    role boundary. This prevents an authenticated client from feeding large
+    wrapper-only History/tool/result frames into the wrapper's command queue.
+    """
+    return (
+        isinstance(msg, _Command)
+        or isinstance(msg, Ping)
+        or (isinstance(msg, Hello) and msg.role == "client")
+    )
