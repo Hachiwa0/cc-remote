@@ -644,9 +644,10 @@ body{
 .sgroup-toggle .label{ font-size:11.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .sgroup-toggle .count{ font-size:10.5px; color:var(--faint); font-weight:500; flex:none; }
 @media (min-width:980px){
-  /* animate the column width 0→352 (2 tracks always so it interpolates) instead
-     of snapping 1fr → 352px 1fr; .sessions clips its content while collapsed. */
-  .shell{ display:grid; grid-template-columns:0px 1fr; transition:grid-template-columns .3s var(--ease); height:var(--app-height,100dvh); }
+  /* Keep the desktop track switch discrete. Chromium can leave an interpolated
+     0px/1fr grid transition stuck at its first frame, making the visible
+     sidebar inaccessible even though React has applied sidebar-open. */
+  .shell{ display:grid; grid-template-columns:0px 1fr; height:var(--app-height,100dvh); }
   .shell.sidebar-open{ grid-template-columns:352px 1fr; }
   .sessions{ position:static; transform:none; width:auto; height:var(--app-height,100dvh); overflow:hidden; }
   .s-inner{ width:352px; }
