@@ -43,6 +43,7 @@ _MAX_STANDALONE_CANDIDATES = 6
 _MAX_NVM_CANDIDATES = 3
 _CODEX_VERSION_TIMEOUT = 5
 _OWNED_TURN_IDS_MAX = 512
+_STATUS_RATE_LIMIT_MAX = 16
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
@@ -191,6 +192,10 @@ class CodexHandle:
         self.interaction_callback = interaction_callback
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
+        self.app_server_version: Optional[str] = None
+        self.last_thread_status: Optional[dict] = None
+        self.last_rate_limits: Optional[dict] = None
+        self.last_rate_limits_by_id: dict[str, dict] = {}
         # per-session codex settings, applied on thread/start + turn/start — the
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
@@ -226,11 +231,21 @@ class CodexHandle:
         self._generation += 1
         generation = self._generation
         self._dead = False
+        # A new app-server/account generation must not inherit a stale runtime
+        # snapshot if its first status refresh partially fails.
+        self.app_server_version = None
+        self.last_thread_status = None
+        self.last_rate_limits = None
+        self.last_rate_limits_by_id = {}
+        self.last_token_usage = None
+        self.context_window = None
         self._reader = asyncio.create_task(self._read_loop(proc, generation))
         self._stderr_task = asyncio.create_task(self._drain_stderr(proc, generation))
 
         try:
-            await self._request("initialize", {"clientInfo": {"name": "cc-remote", "version": "0.1.0"}})
+            initialized = await self._request(
+                "initialize", {"clientInfo": {"name": "cc-remote", "version": "0.1.0"}})
+            self.app_server_version = _app_server_version(initialized)
             await self._notify("initialized")
 
             if fork and resume_id:
@@ -451,6 +466,158 @@ class CodexHandle:
         win = self.context_window or u.get("modelContextWindow") or codex_context_window()
         return {"used_tokens": used, "context_window": win, "raw": u}
 
+    async def get_status(self) -> dict:
+        """Return a sanitized status composed from official app-server RPCs.
+
+        The five reads are independent and therefore concurrent. A missing or
+        unsupported account endpoint must not suppress thread/config/context
+        state. Raw responses never leave this method: every returned field is
+        copied through a small allow-list and raw errors become generic labels.
+        """
+        assert self.thread_id, "connect() first"
+        config_params: dict[str, Any] = {"includeLayers": False}
+        if self._cwd:
+            config_params["cwd"] = self._cwd
+        specs = (
+            ("thread", "thread/read", {
+                "threadId": self.thread_id, "includeTurns": False}),
+            ("config", "config/read", config_params),
+            ("account", "account/read", {"refreshToken": False}),
+            ("rate_limits", "account/rateLimits/read", None),
+            ("usage", "account/usage/read", None),
+        )
+        results = await asyncio.gather(*(
+            self._request(method, params) if params is not None
+            else self._request(method)
+            for _component, method, params in specs
+        ), return_exceptions=True)
+
+        responses: dict[str, dict] = {}
+        errors: list[str] = []
+        for (component, _method, _params), result in zip(specs, results):
+            if isinstance(result, BaseException):
+                errors.append(f"{component}: {_status_error_message(result)}")
+            elif isinstance(result, dict):
+                responses[component] = result
+            else:
+                errors.append(f"{component}: app-server returned an invalid response")
+
+        thread_response = responses.get("thread") or {}
+        raw_thread = thread_response.get("thread")
+        if not isinstance(raw_thread, dict):
+            raw_thread = {}
+            _append_status_error(errors, "thread", "app-server returned an invalid response")
+        raw_status = raw_thread.get("status")
+        if isinstance(raw_status, dict):
+            self.last_thread_status = _copy_thread_status(raw_status)
+        thread = _sanitize_thread(
+            raw_thread,
+            fallback_id=self.thread_id,
+            fallback_cwd=self._cwd,
+            fallback_status=self.last_thread_status,
+        )
+
+        config_response = responses.get("config") or {}
+        raw_config = config_response.get("config")
+        if not isinstance(raw_config, dict):
+            raw_config = {}
+            _append_status_error(errors, "config", "app-server returned an invalid response")
+
+        context_usage = await self.get_context_usage()
+        used_tokens = _nonnegative_int(context_usage.get("used_tokens"))
+        max_tokens = _nonnegative_int(context_usage.get("context_window"))
+        context = {
+            "used_tokens": used_tokens,
+            "max_tokens": max_tokens,
+            "percentage": (
+                used_tokens / max_tokens * 100.0
+                if used_tokens is not None and max_tokens else None
+            ),
+        }
+
+        runtime = {
+            "app_server_version": _bounded_string(self.app_server_version, 128),
+            "model": _bounded_string(self.model or raw_config.get("model"), 256),
+            "model_provider": _bounded_string(
+                raw_thread.get("modelProvider") or raw_config.get("model_provider"), 256),
+            "reasoning_effort": _bounded_string(
+                self.effort or raw_config.get("model_reasoning_effort"), 64),
+            "service_tier": _bounded_string(
+                self.service_tier or raw_config.get("service_tier"), 64),
+            "approval_policy": _approval_policy_name(
+                self.approval if self.approval else raw_config.get("approval_policy")),
+            "sandbox_mode": _bounded_string(raw_config.get("sandbox_mode"), 64),
+            "web_search": _bounded_string(raw_config.get("web_search"), 64),
+        }
+
+        account = None
+        account_response = responses.get("account")
+        if account_response is not None:
+            raw_account = account_response.get("account")
+            if raw_account is not None and not isinstance(raw_account, dict):
+                _append_status_error(errors, "account", "app-server returned an invalid response")
+            else:
+                raw_account = raw_account or {}
+                auth_type = raw_account.get("type")
+                if auth_type not in {"apiKey", "chatgpt", "amazonBedrock"}:
+                    auth_type = "unknown"
+                account = {
+                    "auth_type": auth_type,
+                    "plan_type": _bounded_string(raw_account.get("planType"), 128),
+                    "requires_openai_auth": bool(account_response.get("requiresOpenaiAuth")),
+                }
+
+        rate_response = responses.get("rate_limits")
+        if rate_response is not None:
+            if isinstance(rate_response.get("rateLimits"), dict):
+                self._remember_rate_limits(rate_response)
+            else:
+                _append_status_error(
+                    errors, "rate_limits", "app-server returned an invalid response")
+        rate_limits = _sanitize_rate_limits(
+            rate_response if rate_response is not None else {
+                "rateLimits": self.last_rate_limits,
+                "rateLimitsByLimitId": self.last_rate_limits_by_id,
+            })
+
+        usage = None
+        usage_response = responses.get("usage")
+        if usage_response is not None:
+            summary = usage_response.get("summary")
+            if not isinstance(summary, dict):
+                _append_status_error(errors, "usage", "app-server returned an invalid response")
+            else:
+                usage = {
+                    "lifetime_tokens": _nonnegative_int(summary.get("lifetimeTokens")),
+                    "peak_daily_tokens": _nonnegative_int(summary.get("peakDailyTokens")),
+                    "current_streak_days": _nonnegative_int(summary.get("currentStreakDays")),
+                    "longest_streak_days": _nonnegative_int(summary.get("longestStreakDays")),
+                    "longest_running_turn_sec": _nonnegative_int(
+                        summary.get("longestRunningTurnSec")),
+                }
+
+        return {
+            "thread": thread,
+            "runtime": runtime,
+            "context": context,
+            "account": account,
+            "rate_limits": rate_limits,
+            "usage": usage,
+            "component_errors": errors[:5],
+        }
+
+    def _remember_rate_limits(self, response: dict) -> None:
+        single = response.get("rateLimits")
+        self.last_rate_limits = (
+            _copy_rate_limit_snapshot(single) if isinstance(single, dict) else None)
+        raw_by_id = response.get("rateLimitsByLimitId")
+        remembered: dict[str, dict] = {}
+        if isinstance(raw_by_id, dict):
+            for key, value in list(raw_by_id.items())[:_STATUS_RATE_LIMIT_MAX]:
+                if isinstance(key, str) and isinstance(value, dict):
+                    remembered[key[:128]] = _copy_rate_limit_snapshot(value)
+        self.last_rate_limits_by_id = remembered
+
     # ---- internals ----
     async def _request(self, method: str, params: Optional[dict] = None):
         self._id += 1
@@ -659,6 +826,28 @@ class CodexHandle:
                 mcw = tu.get("modelContextWindow")
                 if mcw:
                     self.context_window = mcw
+        elif method == "thread/status/changed":
+            params = m.get("params") or {}
+            status = params.get("status")
+            if params.get("threadId") == self.thread_id and isinstance(status, dict):
+                self.last_thread_status = _copy_thread_status(status)
+        elif method == "account/rateLimits/updated":
+            snapshot = (m.get("params") or {}).get("rateLimits")
+            if isinstance(snapshot, dict):
+                update = _copy_rate_limit_snapshot(snapshot)
+                limit_id = update.get("limitId")
+                if isinstance(limit_id, str) and limit_id:
+                    previous = self.last_rate_limits_by_id.get(limit_id, {})
+                    self.last_rate_limits_by_id[limit_id] = _merge_rate_limit_snapshot(
+                        previous, update)
+                    while len(self.last_rate_limits_by_id) > _STATUS_RATE_LIMIT_MAX:
+                        self.last_rate_limits_by_id.pop(next(iter(self.last_rate_limits_by_id)))
+                current_id = (
+                    self.last_rate_limits.get("limitId")
+                    if isinstance(self.last_rate_limits, dict) else None)
+                if self.last_rate_limits is None or not limit_id or current_id == limit_id:
+                    self.last_rate_limits = _merge_rate_limit_snapshot(
+                        self.last_rate_limits or {}, update)
         if method == "turn/completed":
             self.turn_active = False
         if self._turn_q is not None:
@@ -720,3 +909,200 @@ def _thread_id_of_notif(m: dict) -> Optional[str]:
     if isinstance(th, dict):
         return th.get("id") or th.get("sessionId")
     return None
+
+
+_STATUS_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_THREAD_STATUSES = frozenset({"notLoaded", "idle", "systemError", "active"})
+_THREAD_ACTIVE_FLAGS = frozenset({"waitingOnApproval", "waitingOnUserInput"})
+_SESSION_SOURCES = frozenset({"cli", "vscode", "exec", "appServer", "unknown"})
+_RATE_SCALAR_KEYS = (
+    "limitId", "limitName", "planType", "rateLimitReachedType",
+)
+_RATE_WINDOW_KEYS = ("usedPercent", "resetsAt", "windowDurationMins")
+
+
+def _app_server_version(initialized: Any) -> Optional[str]:
+    """Extract only the semantic version, never the full user-agent/codexHome."""
+    if not isinstance(initialized, dict):
+        return None
+    user_agent = initialized.get("userAgent")
+    if not isinstance(user_agent, str):
+        return None
+    match = re.search(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)", user_agent)
+    return match.group(1)[:128] if match else None
+
+
+def _bounded_string(value: Any, limit: int) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value[:limit] if value else None
+
+
+def _nonnegative_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _status_error_message(error: BaseException) -> str:
+    """Map arbitrary provider/app-server errors to a bounded non-sensitive label."""
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return "app-server request timed out"
+    text = str(error)[:1024].lower()
+    if "-32601" in text or "method not found" in text or "unsupported" in text:
+        return "unsupported by this Codex app-server"
+    if any(token in text for token in ("401", "403", "unauthorized", "not logged")):
+        return "unavailable for the current account"
+    return "app-server request failed"
+
+
+def _append_status_error(errors: list[str], component: str,
+                         message: str) -> None:
+    prefix = f"{component}:"
+    if not any(item.startswith(prefix) for item in errors):
+        errors.append(f"{component}: {message}")
+
+
+def _copy_thread_status(status: dict) -> dict:
+    status_type = status.get("type")
+    if status_type not in _THREAD_STATUSES:
+        return {"type": "unknown", "activeFlags": []}
+    flags = status.get("activeFlags") if status_type == "active" else []
+    return {
+        "type": status_type,
+        "activeFlags": [
+            flag for flag in (flags if isinstance(flags, list) else [])
+            if flag in _THREAD_ACTIVE_FLAGS
+        ][:8],
+    }
+
+
+def _sanitize_thread(raw: dict, *, fallback_id: str,
+                     fallback_cwd: Optional[str], fallback_status: Optional[dict]) -> dict:
+    raw_id = raw.get("id")
+    thread_id = raw_id if (
+        isinstance(raw_id, str) and _STATUS_WIRE_ID.fullmatch(raw_id)
+    ) else fallback_id
+    raw_session_id = raw.get("sessionId")
+    session_id = raw_session_id if (
+        isinstance(raw_session_id, str) and _STATUS_WIRE_ID.fullmatch(raw_session_id)
+    ) else None
+    raw_status = raw.get("status")
+    status = _copy_thread_status(raw_status) if isinstance(raw_status, dict) else (
+        fallback_status or {"type": "unknown", "activeFlags": []})
+
+    source = raw.get("source")
+    if isinstance(source, str):
+        source = source if source in _SESSION_SOURCES else "unknown"
+    elif isinstance(source, dict) and "custom" in source:
+        source = "custom"
+    elif isinstance(source, dict) and "subAgent" in source:
+        source = "subAgent"
+    else:
+        source = None
+
+    cwd = _bounded_string(raw.get("cwd") or fallback_cwd, 4096)
+    return {
+        "thread_id": thread_id,
+        "session_id": session_id,
+        "cwd": cwd,
+        "source": source,
+        "cli_version": _bounded_string(raw.get("cliVersion"), 128),
+        "status": status.get("type", "unknown"),
+        "active_flags": status.get("activeFlags", []),
+        "ephemeral": raw.get("ephemeral") if isinstance(raw.get("ephemeral"), bool) else None,
+        "created_at": _nonnegative_int(raw.get("createdAt")),
+        "updated_at": _nonnegative_int(raw.get("updatedAt")),
+    }
+
+
+def _approval_policy_name(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return _bounded_string(value, 64)
+    if isinstance(value, dict) and isinstance(value.get("granular"), dict):
+        return "granular"
+    return None
+
+
+def _copy_rate_limit_snapshot(snapshot: dict) -> dict:
+    """Copy only display-safe rate fields used by StatusReport."""
+    copied: dict[str, Any] = {}
+    for key in _RATE_SCALAR_KEYS:
+        value = snapshot.get(key)
+        if isinstance(value, str):
+            copied[key] = value[:256]
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key)
+        if not isinstance(window, dict):
+            continue
+        safe_window: dict[str, int] = {}
+        for window_key in _RATE_WINDOW_KEYS:
+            value = _nonnegative_int(window.get(window_key))
+            if value is not None:
+                safe_window[window_key] = value
+        if safe_window:
+            copied[key] = safe_window
+    return copied
+
+
+def _merge_rate_limit_snapshot(previous: dict, update: dict) -> dict:
+    """Merge a sparse notification without treating null as field deletion."""
+    merged = _copy_rate_limit_snapshot(previous)
+    for key, value in _copy_rate_limit_snapshot(update).items():
+        if key in {"primary", "secondary"} and isinstance(value, dict):
+            window = merged.get(key)
+            merged[key] = {
+                **(window if isinstance(window, dict) else {}),
+                **value,
+            }
+        elif value is not None:
+            merged[key] = value
+    return merged
+
+
+def _sanitize_rate_window(window: Any) -> Optional[dict]:
+    if not isinstance(window, dict):
+        return None
+    out = {
+        "used_percent": _nonnegative_int(window.get("usedPercent")),
+        "resets_at": _nonnegative_int(window.get("resetsAt")),
+        "window_duration_mins": _nonnegative_int(window.get("windowDurationMins")),
+    }
+    return out if any(value is not None for value in out.values()) else None
+
+
+def _sanitize_rate_limits(response: dict) -> list[dict]:
+    entries: list[dict] = []
+    seen: set[str] = set()
+    raw_by_id = response.get("rateLimitsByLimitId")
+    if isinstance(raw_by_id, dict):
+        for map_id, snapshot in list(raw_by_id.items())[:_STATUS_RATE_LIMIT_MAX]:
+            if not isinstance(snapshot, dict):
+                continue
+            copied = _copy_rate_limit_snapshot(snapshot)
+            if not copied.get("limitId") and isinstance(map_id, str):
+                copied["limitId"] = map_id[:128]
+            limit_id = copied.get("limitId")
+            if isinstance(limit_id, str):
+                seen.add(limit_id)
+            entries.append(copied)
+    single = response.get("rateLimits")
+    if isinstance(single, dict):
+        copied = _copy_rate_limit_snapshot(single)
+        limit_id = copied.get("limitId")
+        if not isinstance(limit_id, str) or limit_id not in seen:
+            entries.append(copied)
+
+    out: list[dict] = []
+    for snapshot in entries[:_STATUS_RATE_LIMIT_MAX]:
+        out.append({
+            "limit_id": _bounded_string(snapshot.get("limitId"), 128),
+            "limit_name": _bounded_string(snapshot.get("limitName"), 256),
+            "plan_type": _bounded_string(snapshot.get("planType"), 128),
+            "rate_limit_reached_type": _bounded_string(
+                snapshot.get("rateLimitReachedType"), 128),
+            "primary": _sanitize_rate_window(snapshot.get("primary")),
+            "secondary": _sanitize_rate_window(snapshot.get("secondary")),
+        })
+    return out

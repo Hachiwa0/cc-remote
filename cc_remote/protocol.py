@@ -90,6 +90,9 @@ AskOptionDescription = Annotated[
 AskAnswerText = Annotated[
     str, StringConstraints(min_length=1, max_length=ASK_ANSWER_MAX_CHARS),
 ]
+StatusErrorText = Annotated[
+    str, StringConstraints(min_length=1, max_length=384),
+]
 GoalStatus = Literal[
     "active", "paused", "blocked", "usageLimited", "budgetLimited", "complete",
 ]
@@ -657,6 +660,105 @@ class ContextReport(_Base):
     categories: list[dict[str, Any]] = []
 
 
+class GetStatus(_Command):
+    """client -> wrapper: read the authoritative Codex app-server status.
+
+    Unlike GetContext this is a composed, one-shot control response. It never
+    enters transcript history and is safe for the reliable command layer to
+    re-run when a response/ACK is lost.
+    """
+    type: Literal["get_status"] = "get_status"
+
+
+class _StatusPart(BaseModel):
+    """Strict nested payload shared by StatusReport's allow-listed sections."""
+    model_config = ConfigDict(extra="forbid")
+
+
+class StatusThread(_StatusPart):
+    thread_id: WireId
+    session_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+    source: Optional[Literal[
+        "cli", "vscode", "exec", "appServer", "unknown", "custom", "subAgent",
+    ]] = None
+    cli_version: Optional[str] = Field(default=None, max_length=128)
+    status: Literal["notLoaded", "idle", "systemError", "active", "unknown"] = "unknown"
+    active_flags: list[Literal[
+        "waitingOnApproval", "waitingOnUserInput",
+    ]] = Field(default_factory=list, max_length=8)
+    ephemeral: Optional[bool] = None
+    created_at: Optional[int] = Field(default=None, ge=0)
+    updated_at: Optional[int] = Field(default=None, ge=0)
+
+
+class StatusRuntime(_StatusPart):
+    app_server_version: Optional[str] = Field(default=None, max_length=128)
+    model: Optional[str] = Field(default=None, max_length=256)
+    model_provider: Optional[str] = Field(default=None, max_length=256)
+    reasoning_effort: Optional[str] = Field(default=None, max_length=64)
+    service_tier: Optional[str] = Field(default=None, max_length=64)
+    approval_policy: Optional[str] = Field(default=None, max_length=64)
+    sandbox_mode: Optional[str] = Field(default=None, max_length=64)
+    web_search: Optional[str] = Field(default=None, max_length=64)
+
+
+class StatusContext(_StatusPart):
+    used_tokens: Optional[int] = Field(default=None, ge=0)
+    max_tokens: Optional[int] = Field(default=None, ge=0)
+    percentage: Optional[float] = Field(default=None, ge=0)
+
+
+class StatusAccount(_StatusPart):
+    auth_type: Literal["apiKey", "chatgpt", "amazonBedrock", "unknown"]
+    plan_type: Optional[str] = Field(default=None, max_length=128)
+    requires_openai_auth: bool
+
+
+class StatusRateLimitWindow(_StatusPart):
+    used_percent: Optional[int] = Field(default=None, ge=0)
+    resets_at: Optional[int] = Field(default=None, ge=0)
+    window_duration_mins: Optional[int] = Field(default=None, ge=0)
+
+
+class StatusRateLimit(_StatusPart):
+    limit_id: Optional[str] = Field(default=None, max_length=128)
+    limit_name: Optional[str] = Field(default=None, max_length=256)
+    plan_type: Optional[str] = Field(default=None, max_length=128)
+    rate_limit_reached_type: Optional[str] = Field(default=None, max_length=128)
+    primary: Optional[StatusRateLimitWindow] = None
+    secondary: Optional[StatusRateLimitWindow] = None
+
+
+class StatusUsage(_StatusPart):
+    lifetime_tokens: Optional[int] = Field(default=None, ge=0)
+    peak_daily_tokens: Optional[int] = Field(default=None, ge=0)
+    current_streak_days: Optional[int] = Field(default=None, ge=0)
+    longest_streak_days: Optional[int] = Field(default=None, ge=0)
+    longest_running_turn_sec: Optional[int] = Field(default=None, ge=0)
+
+
+class StatusReport(_Base):
+    """wrapper -> client: sanitized Codex app-server status snapshot.
+
+    Every nested model forbids extras. The wrapper copies only explicitly
+    approved display fields; account email, credentials, config instructions,
+    rollout paths/previews, credit balances and daily usage rows never cross the
+    wire. ``component_errors`` makes partial RPC failure visible without hiding
+    the successful sections.
+    """
+    type: Literal["status_report"] = "status_report"
+    thread: StatusThread
+    runtime: StatusRuntime
+    context: StatusContext
+    account: Optional[StatusAccount] = None
+    rate_limits: list[StatusRateLimit] = Field(default_factory=list, max_length=16)
+    usage: Optional[StatusUsage] = None
+    # Entries are ``<component>: <generic reason>``. Raw RPC error text is never
+    # allowed, because it may contain provider or account details.
+    component_errors: list[StatusErrorText] = Field(default_factory=list, max_length=5)
+
+
 class GetDiff(_Command):
     """client -> wrapper: request a git diff (context + line numbers) for a file.
     `theme` picks delta's light/dark rendering so the panel matches the app."""
@@ -765,8 +867,8 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, DiffReport, History, Models, AskUser, AnswerQuestion,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, DiffReport, History, Models, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
@@ -796,6 +898,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "btw_opened": BtwOpened,
     "set_perm": SetPerm,
     "get_context": GetContext,
+    "get_status": GetStatus,
     "get_diff": GetDiff,
     "get_history": GetHistory,
     "get_models": GetModels,
@@ -819,6 +922,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "fast": Fast,
     "perm": Perm,
     "context_report": ContextReport,
+    "status_report": StatusReport,
     "diff_report": DiffReport,
     "history": History,
     "ask_user": AskUser,

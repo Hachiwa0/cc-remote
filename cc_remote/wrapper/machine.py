@@ -61,7 +61,7 @@ from cc_remote.attachments import decode_attachment, validate_attachments
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    ASK_OPTION_MAX_COUNT, Error, Hello, Query, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
+    ASK_OPTION_MAX_COUNT, Error, Hello, Query, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, StatusReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH,
@@ -125,7 +125,7 @@ class WrapperMachine:
     BG_JOB_STATE_MAX_BYTES = 64 * 1024
     SAFE_RETRY_COMMANDS = frozenset({
         "list_sessions", "get_history", "get_models",
-        "get_context", "get_diff", "get_goal", "list_dir",
+        "get_context", "get_status", "get_diff", "get_goal", "list_dir",
     })
     # Commands whose target is a runtime ``sid``.  A /btw runtime is private to
     # the client that created it, so every operation against that sid must pass
@@ -133,7 +133,7 @@ class WrapperMachine:
     BTW_SID_COMMANDS = frozenset({
         "query", "interrupt", "takeover", "set_model", "set_effort",
         "set_service_tier", "open_btw", "close_btw", "set_perm",
-        "get_context", "get_diff", "answer_question", "get_goal", "set_goal", "clear_goal",
+        "get_context", "get_status", "get_diff", "answer_question", "get_goal", "set_goal", "clear_goal",
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
@@ -723,6 +723,8 @@ class WrapperMachine:
             await self._handle_set_perm(cmd)
         elif t == "get_context":
             await self._handle_get_context(cmd)
+        elif t == "get_status":
+            return await self._handle_get_status(cmd)
         elif t == "get_diff":
             await self._handle_get_diff(cmd)
         elif t == "get_history":
@@ -2045,6 +2047,36 @@ class WrapperMachine:
         except Exception as e:
             log.exception("get_context_usage failed", error=str(e))
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"get_context failed: {e}"))
+
+    async def _handle_get_status(self, cmd) -> None:
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return
+        if ctx.engine != "codex":
+            await self._emit(ctx, Error(
+                code=ERR_INTERNAL,
+                message="/status 需要 Codex app-server 会话",
+            ))
+            return
+        try:
+            event = StatusReport(
+                **await ctx.sdk.get_status(),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, event)
+            return event
+        except Exception:
+            # get_status already degrades individual RPC failures. Reaching this
+            # path means the composed report itself could not be produced; do not
+            # copy a raw provider/app-server exception onto the wire.
+            log.exception("get_status failed")
+            error = Error(
+                code=ERR_INTERNAL,
+                message="Codex status unavailable",
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
 
     async def _goal_ctx(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
