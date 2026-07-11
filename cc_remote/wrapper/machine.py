@@ -64,7 +64,7 @@ from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, Error, Hello, Query, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, StatusReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
-    ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH,
+    ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.ask import make_ask_server
@@ -2080,14 +2080,6 @@ class WrapperMachine:
 
     async def _goal_ctx(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
-        if ctx is None:
-            return None
-        if ctx.engine != "codex":
-            await self._emit(ctx, Error(
-                code=ERR_INTERNAL,
-                message="Claude SDK 没有 Codex thread goal API；不能伪造同名能力",
-            ))
-            return None
         return ctx
 
     async def _handle_get_goal(self, cmd) -> None:
@@ -2095,7 +2087,10 @@ class WrapperMachine:
         if ctx is None:
             return
         try:
-            event = GoalState(goal=await ctx.sdk.get_goal())
+            ctx.goal_visible = True
+            goal = (await ctx.sdk.get_goal() if ctx.engine == "codex"
+                    else await ctx.sdk.refresh_goal(ctx.session_id))
+            event = GoalState(goal=goal)
             await self._emit(ctx, event)
             return event
         except Exception as e:
@@ -2106,6 +2101,57 @@ class WrapperMachine:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
             return
+        if ctx.engine != "codex":
+            if getattr(cmd, "token_budget", None) is not None:
+                error = Error(
+                    code=ERR_PROTOCOL,
+                    message="Claude /goal 不支持 token budget",
+                )
+                await self._emit(ctx, error)
+                return error
+            if getattr(cmd, "status", None) not in (None, "active"):
+                error = Error(
+                    code=ERR_PROTOCOL,
+                    message="Claude /goal 只支持设置目标或 clear，不支持暂停/状态切换",
+                )
+                await self._emit(ctx, error)
+                return error
+            objective = (getattr(cmd, "objective", None) or "").strip()
+            if not objective:
+                error = Error(
+                    code=ERR_BAD_PROMPT,
+                    message="Claude /goal 需要非空完成条件",
+                )
+                await self._emit(ctx, error)
+                return error
+            if ctx.state != "idle":
+                error = Error(code=ERR_BUSY, message="该会话正忙,先 interrupt")
+                await self._emit(ctx, error)
+                return error
+
+            previous = dict(ctx.sdk.goal) if ctx.sdk.goal is not None else None
+            try:
+                goal = await ctx.sdk.prepare_goal(
+                    ctx.session_id or ctx.key, objective)
+                query_result = await self._handle_query(Query(
+                    sid=ctx.key,
+                    prompt=f"/goal {objective}",
+                    msg_id=f"goal-{uuid4().hex}",
+                ))
+                if isinstance(query_result, Error):
+                    ctx.sdk.restore_goal_state(previous)
+                    return query_result
+                ctx.goal_visible = True
+                event = GoalState(goal=goal)
+                await self._emit(ctx, event)
+                return event
+            except Exception as e:
+                ctx.sdk.restore_goal_state(previous)
+                log.exception("Claude set_goal failed", error=str(e))
+                error = Error(
+                    code=ERR_INTERNAL, message=f"set_goal failed: {e}")
+                await self._emit(ctx, error)
+                return error
         try:
             goal = await ctx.sdk.set_goal(
                 objective=cmd.objective, status=cmd.status,
@@ -2121,6 +2167,33 @@ class WrapperMachine:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
             return
+        if ctx.engine != "codex":
+            if ctx.state != "idle":
+                error = Error(code=ERR_BUSY, message="该会话正忙,先 interrupt")
+                await self._emit(ctx, error)
+                return error
+            previous = dict(ctx.sdk.goal) if ctx.sdk.goal is not None else None
+            ctx.sdk.clear_goal_state()
+            try:
+                query_result = await self._handle_query(Query(
+                    sid=ctx.key,
+                    prompt="/goal clear",
+                    msg_id=f"goal-{uuid4().hex}",
+                ))
+                if isinstance(query_result, Error):
+                    ctx.sdk.restore_goal_state(previous)
+                    return query_result
+                ctx.goal_visible = False
+                event = GoalState(goal=None)
+                await self._emit(ctx, event)
+                return event
+            except Exception as e:
+                ctx.sdk.restore_goal_state(previous)
+                log.exception("Claude clear_goal failed", error=str(e))
+                error = Error(
+                    code=ERR_INTERNAL, message=f"clear_goal failed: {e}")
+                await self._emit(ctx, error)
+                return error
         try:
             await ctx.sdk.clear_goal()
             event = GoalState(goal=None)
@@ -2746,6 +2819,9 @@ class WrapperMachine:
         old_key = ctx.key
         ctx.session_id = sid
         if ctx.engine != "codex":
+            rekey_goal = getattr(ctx.sdk, "rekey_goal", None)
+            if rekey_goal is not None:
+                rekey_goal(sid)
             save_session_id(self.cfg.state_dir, ctx.cwd, sid)
         if old_key and old_key != sid:
             self._remember_session_alias(old_key, sid, ctx.cwd)
@@ -3735,11 +3811,26 @@ class WrapperMachine:
                     ctx.announced_model = mdl
                     await self._emit(ctx, Model(model=mdl))
 
+                goal_changed, goal = ctx.sdk.observe_goal_message(
+                    msg, ctx.session_id or ctx.key)
+                if goal_changed and ctx.goal_visible:
+                    await self._emit(ctx, GoalState(goal=goal))
+
                 for ev in ctx.translator.feed(msg):
                     await self._emit(ctx, ev)
 
                 if isinstance(msg, ResultMessage):
                     break
+
+            if not is_codex and ctx.session_id:
+                # ResultMessage closes the SDK response iterator; wait for its
+                # reader task to release the single consumer before consulting
+                # the transcript that Claude has just flushed.
+                if reader_task is not None:
+                    await reader_task
+                goal = await ctx.sdk.refresh_goal(ctx.session_id)
+                if ctx.goal_visible:
+                    await self._emit(ctx, GoalState(goal=goal))
 
             await self._set_state(ctx, "idle")
         except asyncio.TimeoutError:

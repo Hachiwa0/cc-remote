@@ -8,6 +8,7 @@ id, and bypassPermissions.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 from typing import Any, Awaitable, Callable
@@ -16,11 +17,21 @@ from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions, PermissionResultDeny,
     __version__ as SDK_VERSION,
 )
+from claude_agent_sdk._internal.message_parser import parse_message as _parse_sdk_message
+from claude_agent_sdk.types import ResultMessage, SystemMessage
 from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.wrapper.child_env import child_env_tombstones
+from cc_remote.wrapper.claude_goal import (
+    NO_GOAL_EVENT,
+    active_goal_from_message,
+    current_goal,
+    goal_message_update,
+    make_claude_goal,
+    read_claude_goal,
+)
 
 log = logger("cc_remote.wrapper.sdk")
 
@@ -51,6 +62,12 @@ class SdkHandle:
         self.effort: str | None = "max"
         self.applied_effort: str | None = None
         self.permission_callback: Callable[[str, dict[str, Any], Any], Awaitable[Any]] | None = None
+        # Claude has no goal RPC.  This cache is reconstructed from native
+        # goal_status transcript attachments on resume and updated by the live
+        # /goal turn.  It is never persisted separately by cc-remote.
+        self.goal: dict[str, Any] | None = None
+        self.goal_session_id: str | None = None
+        self._goal_message_tokens: dict[str, int] = {}
 
     async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any):
         callback = self.permission_callback
@@ -132,6 +149,11 @@ class SdkHandle:
         opts = self._options(resume_id, cwd, fork=fork)
         self.client = ClaudeSDKClient(options=opts)
         await self.client.connect()
+        self.goal_session_id = None if fork else resume_id
+        self.goal = None
+        self._goal_message_tokens.clear()
+        if resume_id and not fork:
+            await self.refresh_goal(resume_id)
         self.applied_effort = self.effort  # the live subprocess now reflects this effort
         log.info("sdk connected", resume=bool(resume_id), fork=fork, cwd=opts.cwd,
                  effort=self.effort, sdk_version=SDK_VERSION)
@@ -164,9 +186,97 @@ class SdkHandle:
         assert self.client is not None
         return await self.client.get_context_usage()
 
+    async def prepare_goal(self, thread_id: str, objective: str) -> dict[str, Any]:
+        """Install the immediate state for a soon-to-be-submitted native /goal.
+
+        The machine submits the actual ``/goal <condition>`` through the normal
+        turn path immediately after this call.  Capturing context usage first
+        preserves the same baseline that Claude's in-memory activeGoal tracks.
+        """
+        tokens_at_start = None
+        try:
+            usage = await self.get_context_usage()
+            value = usage.get("totalTokens") if isinstance(usage, dict) else None
+            if isinstance(value, int) and not isinstance(value, bool):
+                tokens_at_start = max(0, value)
+        except Exception as exc:
+            # Goal execution must not fail just because the optional baseline
+            # control request is unavailable on an older CLI.
+            log.warning("goal context baseline unavailable", error=str(exc))
+        self.goal_session_id = thread_id
+        self.goal = make_claude_goal(
+            thread_id, objective, tokens_at_start=tokens_at_start)
+        self._goal_message_tokens.clear()
+        return current_goal(self.goal)
+
+    def clear_goal_state(self) -> None:
+        self.goal = None
+        self._goal_message_tokens.clear()
+
+    def restore_goal_state(self, goal: dict[str, Any] | None) -> None:
+        self.goal = dict(goal) if goal is not None else None
+        self.goal_session_id = (
+            self.goal.get("threadId") if self.goal is not None else self.goal_session_id)
+        self._goal_message_tokens.clear()
+
+    def rekey_goal(self, session_id: str) -> None:
+        self.goal_session_id = session_id
+        if self.goal is not None:
+            self.goal["threadId"] = session_id
+
+    async def refresh_goal(self, session_id: str | None = None):
+        """Refresh cached state from Claude's native transcript if it exists."""
+        target = session_id or self.goal_session_id
+        if target:
+            exists, goal = await asyncio.to_thread(read_claude_goal, target)
+            if exists:
+                self.goal = goal
+                self.goal_session_id = target
+                self._goal_message_tokens.clear()
+        return current_goal(self.goal)
+
+    def observe_goal_message(self, msg: Any, thread_id: str):
+        """Apply a native active_goal event or live Stop-hook feedback."""
+        update = active_goal_from_message(msg, thread_id)
+        if update is not NO_GOAL_EVENT:
+            self.goal = update
+            self.goal_session_id = thread_id
+            self._goal_message_tokens.clear()
+            return True, current_goal(self.goal)
+        changed = goal_message_update(
+            msg, self.goal, self._goal_message_tokens)
+        return changed, current_goal(self.goal)
+
+    async def _receive_response_compat(self):
+        """Preserve raw active_goal frames dropped by SDK <= 0.2.116.
+
+        The SDK's public ``receive_response`` parses messages only after reading
+        its private Query queue.  Its forward-compatible parser intentionally
+        returns None for unknown top-level types, including ``active_goal``.
+        Reading the same queue here and wrapping only that one known schema as a
+        SystemMessage is the smallest compatibility layer; all other messages
+        still use the SDK parser verbatim.
+        """
+        assert self.client is not None
+        query = getattr(self.client, "_query", None)
+        if query is None or not hasattr(query, "receive_messages"):
+            async for message in self.client.receive_response():
+                yield message
+            return
+        async for data in query.receive_messages():
+            if isinstance(data, dict) and data.get("type") == "active_goal":
+                message = SystemMessage(subtype="active_goal", data=data)
+            else:
+                message = _parse_sdk_message(data)
+            if message is None:
+                continue
+            yield message
+            if isinstance(message, ResultMessage):
+                return
+
     def receive_response(self):
         assert self.client is not None
-        return self.client.receive_response()
+        return self._receive_response_compat()
 
     async def disconnect(self) -> None:
         if self.client is not None:

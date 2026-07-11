@@ -861,7 +861,12 @@ class ClearGoal(_Command):
 
 
 class GoalState(_Base):
-    """Authoritative Codex thread goal. goal=None means no active goal."""
+    """Authoritative engine goal. goal=None means no active goal.
+
+    Both engines expose the common camelCase fields used by Codex
+    (threadId/objective/status/tokensUsed/timeUsedSeconds). Claude may add
+    iterations, lastReason, setAt, and tokensAtStart.
+    """
     type: Literal["goal_state"] = "goal_state"
     goal: Optional[dict[str, Any]] = None
 

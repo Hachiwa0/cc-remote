@@ -61,6 +61,10 @@ class SessionContext:
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
     announced_perm: Optional[str] = None
+    # Goal state is restored silently.  The remote UI only reveals it after the
+    # user explicitly invokes /goal (get/set); this avoids a permanent empty
+    # panel above the composer merely because a Claude/Codex session was opened.
+    goal_visible: bool = False
     # ---- external-write mirroring (a native `claude`/`codex` in the user's
     # terminal owns this session and is appending to its transcript) ----
     # epoch of the last append this wrapper did NOT make. Recent => the session is
