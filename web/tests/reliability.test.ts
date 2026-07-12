@@ -461,6 +461,8 @@ try {
   }));
   assert.match(codexMarkup, /aria-label="复制"/);
   assert.match(codexMarkup, /aria-label="派生"/);
+  assert.match(codexMarkup, /data-tooltip="从此回复派生新会话"/);
+  assert.doesNotMatch(codexMarkup, /title="从此回复派生/);
   assert.ok(codexMarkup.indexOf('aria-label="派生"')
     > codexMarkup.indexOf('aria-label="复制"'));
   const claudeMarkup = renderToStaticMarkup(createElement(ChatView, {

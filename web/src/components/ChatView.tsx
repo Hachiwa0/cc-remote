@@ -202,7 +202,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                       <button className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")} onClick={() => copyText(t.id + "-ai", aiText(t))} aria-label="复制"><Icon name="check" size={13} /></button>
                       {onFork && canForkCodexTurn(engine, t) && (
                         <button className="ubub-act" aria-label="派生"
-                          title="从此回复派生"
+                          data-tooltip="从此回复派生新会话"
                           aria-busy={forkingTurnId === t.codexTurnId}
                           disabled={!!forkingTurnId}
                           onClick={() => onFork(t.codexTurnId)}>
