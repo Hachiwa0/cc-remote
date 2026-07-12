@@ -65,6 +65,7 @@ from cc_remote.protocol import (
     SessionInfo, SessionList, SessionFocus, SessionRekey, SessionForked, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
+    ERR_FORK_RECONCILING,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.ask import make_ask_server
@@ -84,9 +85,15 @@ from cc_remote.wrapper.codex_sessions import (
     codex_session_settings, set_codex_config_fast, codex_fast_enabled,
 )
 from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
-from cc_remote.wrapper.codex_rpc import codex_rpc
+from cc_remote.wrapper.codex_rpc import (
+    CodexRpcOutcomeUnknown, CodexRpcRejected, codex_rpc,
+)
 from cc_remote.wrapper.codex_worktrees import (
     WorktreeError, prepare_worktree, rollback_worktree,
+)
+from cc_remote.wrapper.codex_forks import (
+    CodexForkJournal, ForkJournalError, find_rollout_fork,
+    fork_thread_source,
 )
 from cc_remote.wrapper.codex_external import (
     ProcessIdentity, parse_turn_markers, process_identity,
@@ -119,6 +126,10 @@ class _BtwSpawnFailure(Exception):
         self.message = message
 
 
+class _ForkOutcomeUncertain(RuntimeError):
+    """A persistent fork may have committed and must not be ACKed/replayed."""
+
+
 class WrapperMachine:
     # Browser/TUI outboxes hold at most 256 commands. Keep a 2x retry window per
     # client and at most the relay's configured maximum of 64 client identities;
@@ -135,6 +146,10 @@ class WrapperMachine:
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
     BG_JOB_SCAN_MAX = 1_000
     BG_JOB_STATE_MAX_BYTES = 64 * 1024
+    FORK_RECONCILE_ATTEMPTS = 4
+    FORK_RECONCILE_DELAY = 0.1
+    FORK_BACKGROUND_ATTEMPTS = 100
+    UNCERTAIN_FORK_CAP = 4096
     SAFE_RETRY_COMMANDS = frozenset({
         "list_sessions", "get_history", "get_models",
         "get_context", "get_status", "get_diff", "get_goal", "list_dir",
@@ -150,7 +165,7 @@ class WrapperMachine:
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
         "get_history", "switch_session", "rename_session", "archive_session",
-        "fork_session_worktree",
+        "fork_session", "fork_session_worktree",
     })
 
     def __init__(self, cfg: WrapperConfig, transport: WrapperTransport):
@@ -179,6 +194,16 @@ class WrapperMachine:
         # if its one live send is lost after NewSession was ACKed, the next Hello
         # uses this map to replay the rekey before cursor catch-up.
         self._session_aliases = self._load_session_aliases()
+        # Persistent thread/fork is a mutation. Journal it independently of the
+        # in-memory command ACK cache so a wrapper restart cannot duplicate a
+        # fork whose response was lost.
+        self._codex_forks = CodexForkJournal(self.cfg.state_dir)
+        # Volatile supplement for a transient journal write failure. The rollout
+        # marker remains the cross-process authority; this map prevents a same-
+        # process reliable-command retry from issuing a second mutation first.
+        self._uncertain_codex_forks: OrderedDict[str, Optional[str]] = OrderedDict()
+        self._codex_fork_tasks: dict[str, asyncio.Task] = {}
+        self._codex_fork_locks: dict[str, asyncio.Lock] = {}
         # Claude fork_session writes a real transcript even though /btw is an
         # ephemeral, owner-only UI. Persist tombstones until that transcript is
         # deleted so a crash or failed cleanup cannot expose it in SessionList or
@@ -499,6 +524,12 @@ class WrapperMachine:
                 except Exception:
                     log.exception("command handling failed", type=cmd.type)
         finally:
+            fork_tasks = list(self._codex_fork_tasks.values())
+            for task in fork_tasks:
+                task.cancel()
+            if fork_tasks:
+                await asyncio.gather(*fork_tasks, return_exceptions=True)
+            self._codex_fork_tasks.clear()
             if self._watch_task:
                 self._watch_task.cancel()
                 try:
@@ -764,6 +795,8 @@ class WrapperMachine:
             await self._handle_rename_session(cmd)
         elif t == "archive_session":
             await self._handle_archive_session(cmd)
+        elif t == "fork_session":
+            return await self._handle_fork_session(cmd)
         elif t == "fork_session_worktree":
             return await self._handle_fork_session_worktree(cmd)
         elif t == "ping":
@@ -3121,7 +3154,7 @@ class WrapperMachine:
                         session_id=session_id, error=str(exc))
             return False
 
-    async def _send_worktree_fork_error(
+    async def _send_session_fork_error(
         self, cmd, code: str, message: str,
     ) -> Error:
         client_id = getattr(cmd, "client_id", None)
@@ -3135,8 +3168,358 @@ class WrapperMachine:
         if client_id:
             await self.transport.send(error)
         else:
-            log.warning("dropping unroutable worktree fork error", code=code)
+            log.warning("dropping unroutable session fork error", code=code)
         return error
+
+    async def _send_worktree_fork_error(
+        self, cmd, code: str, message: str,
+    ) -> Error:
+        return await self._send_session_fork_error(cmd, code, message)
+
+    def _remember_uncertain_codex_fork(
+        self, request_id: str, child_session_id: Optional[str],
+    ) -> None:
+        existing = self._uncertain_codex_forks.get(request_id)
+        if existing and child_session_id and existing != child_session_id:
+            raise _ForkOutcomeUncertain(
+                "one fork request resolved to multiple child sessions")
+        if (request_id not in self._uncertain_codex_forks
+                and len(self._uncertain_codex_forks) >= self.UNCERTAIN_FORK_CAP):
+            raise _ForkOutcomeUncertain("uncertain fork cache capacity exhausted")
+        self._uncertain_codex_forks[request_id] = child_session_id or existing
+        self._uncertain_codex_forks.move_to_end(request_id)
+
+    def _ensure_codex_fork_reconciler(
+        self, cmd, sid: str, cwd: str, marker: str,
+    ) -> None:
+        current = self._codex_fork_tasks.get(cmd.request_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._reconcile_codex_fork_command(cmd, sid, cwd, marker),
+            name=f"codex-fork-reconcile-{cmd.request_id}",
+        )
+        self._codex_fork_tasks[cmd.request_id] = task
+
+    async def _reconcile_codex_fork_command(
+        self, cmd, sid: str, cwd: str, marker: str,
+    ) -> None:
+        """Resolve an unknown mutation on the current client connection."""
+        request_id = cmd.request_id
+        try:
+            for attempt in range(self.FORK_BACKGROUND_ATTEMPTS):
+                if attempt:
+                    await asyncio.sleep(self.FORK_RECONCILE_DELAY)
+                lock = self._codex_fork_locks[request_id]
+                async with lock:
+                    client_id = getattr(cmd, "client_id", None)
+                    cmd_id = getattr(cmd, "cmd_id", None)
+                    if client_id and cmd_id:
+                        seen, _ = self._command_seen(client_id, cmd_id)
+                        if seen:
+                            return
+                    entry = self._codex_forks.get(request_id) or {}
+                    child = self._uncertain_codex_forks.get(request_id)
+                    if not child and entry.get("status") == "complete":
+                        child = entry.get("session_id")
+                    if not child:
+                        meta = await asyncio.to_thread(
+                            find_rollout_fork, marker, sid, cwd)
+                        child = (
+                            meta.get("session_id")
+                            if isinstance(meta, dict) else None)
+                    if not isinstance(child, str) or not child:
+                        continue
+                    try:
+                        event = await self._finish_same_cwd_fork(
+                            cmd, sid, cwd, child)
+                    except _ForkOutcomeUncertain:
+                        continue
+                    if client_id and cmd_id:
+                        self._remember_command(
+                            client_id, cmd_id,
+                            (event.model_copy(deep=True),),
+                        )
+                        await self._send_command_ack(client_id, cmd_id)
+                    return
+
+            # Keep the durable submitted/uncertain state and outbox command for
+            # future reconnect reconciliation, but end the current spinner with
+            # a truthful, non-ACKed status. The same request is never re-forked.
+            await self._send_session_fork_error(
+                cmd,
+                ERR_FORK_RECONCILING,
+                "派生结果仍无法确认；请求已安全保留，重新连接后会继续核对",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("codex fork background reconcile failed",
+                          request_id=request_id, error=str(exc))
+        finally:
+            current = asyncio.current_task()
+            if self._codex_fork_tasks.get(request_id) is current:
+                self._codex_fork_tasks.pop(request_id, None)
+
+    async def _finish_same_cwd_fork(
+        self, cmd, sid: str, cwd: str, child_session_id: str,
+    ) -> SessionForked | Error:
+        try:
+            await asyncio.to_thread(
+                self._codex_forks.complete, cmd.request_id, child_session_id)
+        except ForkJournalError as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError:
+                pass
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, cwd, fork_thread_source(cmd.request_id))
+            log.exception("codex fork result journal failed", error=str(exc))
+            # Returning Error would make _process_command ACK a mutation whose
+            # durable child correlation was not written. Bubble instead: the
+            # reliable command remains pending and retries only reconciliation.
+            raise _ForkOutcomeUncertain(
+                "fork completed but its durable result is not yet recorded"
+            ) from exc
+        self._uncertain_codex_forks.pop(cmd.request_id, None)
+        event = SessionForked(
+            parent_session_id=sid,
+            session_id=child_session_id,
+            cwd=cwd,
+            target="same_cwd",
+            last_turn_id=cmd.last_turn_id,
+            request_id=cmd.request_id,
+            to=cmd.client_id,
+        )
+        await self.transport.send(event)
+        try:
+            await self._list_codex_sessions(cmd)
+        except Exception as exc:
+            # The correlated fork result is already durable and delivered. A
+            # sidebar refresh is read-only and must not suppress its ACK.
+            log.warning("forked session list refresh failed", error=str(exc))
+        return event
+
+    async def _handle_fork_session(self, cmd):
+        request_id = cmd.request_id
+        lock = self._codex_fork_locks.get(request_id)
+        if lock is None:
+            if len(self._codex_fork_locks) >= self.UNCERTAIN_FORK_CAP:
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL, "派生请求锁容量已满，请稍后重试")
+            lock = asyncio.Lock()
+            self._codex_fork_locks[request_id] = lock
+        async with lock:
+            # A background reconciler may have resolved this reliable command
+            # after _process_command's initial dedupe check but before this lock.
+            client_id = getattr(cmd, "client_id", None)
+            cmd_id = getattr(cmd, "cmd_id", None)
+            if client_id and cmd_id:
+                seen, cached = self._command_seen(client_id, cmd_id)
+                if seen:
+                    # The background resolver published the correlated event and
+                    # ACK before releasing this same lock. Return its cached
+                    # response so outer _process_command preserves the cache and
+                    # emits only its harmless duplicate ACK, not a second event.
+                    return cached
+            return await self._handle_fork_session_locked(cmd)
+
+    async def _handle_fork_session_locked(self, cmd):
+        """Persistently fork Codex after one selected completed turn."""
+        if not getattr(cmd, "client_id", None):
+            return await self._send_session_fork_error(
+                cmd, ERR_AUTH, "派生会话需要已绑定的客户端")
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        if not await self._is_codex_session(sid):
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, "目前仅支持派生 Codex 会话")
+
+        ctx = self._ctx_by_sid(sid)
+        source_cwd = (
+            ctx.cwd if ctx is not None
+            else await asyncio.to_thread(codex_session_cwd, sid)
+        )
+        if not source_cwd:
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, "无法确定源会话的工作目录")
+        source_cwd = os.path.realpath(source_cwd)
+
+        try:
+            entry = await asyncio.to_thread(
+                self._codex_forks.begin,
+                cmd.request_id,
+                sid,
+                cmd.last_turn_id,
+                source_cwd,
+            )
+        except ForkJournalError as exc:
+            log.warning("codex fork intent rejected", error=str(exc))
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, f"无法记录派生请求: {exc}")
+
+        if entry.get("status") == "complete":
+            child = entry.get("session_id")
+            return await self._finish_same_cwd_fork(
+                cmd, sid, source_cwd, child)
+        if entry.get("status") == "rejected":
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL,
+                entry.get("error_message") or "Codex 会话派生已被拒绝")
+
+        marker = entry["thread_source"]
+
+        async def recover(attempts: int = 1) -> Optional[str]:
+            for attempt in range(max(1, attempts)):
+                meta = await asyncio.to_thread(
+                    find_rollout_fork, marker, sid, source_cwd)
+                child = meta.get("session_id") if isinstance(meta, dict) else None
+                if isinstance(child, str):
+                    return child
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(self.FORK_RECONCILE_DELAY)
+            return None
+
+        volatile_child = self._uncertain_codex_forks.get(cmd.request_id)
+        if (entry.get("status") in {"submitted", "uncertain"}
+                or cmd.request_id in self._uncertain_codex_forks):
+            recovered = volatile_child or await recover(
+                self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_same_cwd_fork(
+                    cmd, sid, source_cwd, recovered)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, source_cwd, marker)
+            raise _ForkOutcomeUncertain(
+                "fork outcome is still waiting for rollout reconciliation")
+
+        recovered = await recover()
+        if recovered:
+            log.info("codex fork recovered from rollout marker",
+                     parent=sid, session_id=recovered,
+                     last_turn_id=cmd.last_turn_id)
+            return await self._finish_same_cwd_fork(
+                cmd, sid, source_cwd, recovered)
+
+        try:
+            claimed_submission = await asyncio.to_thread(
+                self._codex_forks.claim_submission, cmd.request_id)
+        except ForkJournalError as exc:
+            # No request write has happened in this handler, so this is a proven
+            # terminal local failure rather than an ambiguous mutation.
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, f"无法持久记录派生提交状态: {exc}")
+        if not claimed_submission:
+            # Another handler with the same canonical identity crossed the
+            # durable submitted boundary first. Never issue a second RPC; this
+            # request becomes another correlated waiter for the same child.
+            refreshed = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            if refreshed and refreshed.get("status") == "complete":
+                return await self._finish_same_cwd_fork(
+                    cmd, sid, source_cwd, refreshed.get("session_id"))
+            if refreshed and refreshed.get("status") == "rejected":
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL,
+                    refreshed.get("error_message") or "Codex 会话派生已被拒绝")
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_same_cwd_fork(
+                    cmd, sid, source_cwd, recovered)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, source_cwd, marker)
+            raise _ForkOutcomeUncertain(
+                "canonical fork request is still being reconciled")
+
+        params = {
+            "threadId": sid,
+            "lastTurnId": cmd.last_turn_id,
+            "ephemeral": False,
+            "threadSource": marker,
+        }
+        try:
+            raw_result = await codex_rpc("thread/fork", params)
+        except CodexRpcRejected as exc:
+            # An explicit JSON-RPC validation/business rejection proves the
+            # mutation did not commit and is safe to surface as terminal Error.
+            log.warning("codex same-cwd fork rejected", parent=sid,
+                        last_turn_id=cmd.last_turn_id, error=str(exc))
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.reject, cmd.request_id,
+                    f"Codex 会话派生失败: {exc}")
+            except ForkJournalError as journal_exc:
+                log.warning("codex fork rejection journal failed",
+                            error=str(journal_exc))
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, f"Codex 会话派生失败: {exc}")
+        except CodexRpcOutcomeUnknown as exc:
+            # A timeout may happen after app-server committed the fork. Its
+            # session_meta marker is the durable authority across processes.
+            self._remember_uncertain_codex_fork(cmd.request_id, None)
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError as journal_exc:
+                log.warning("codex uncertain fork journal failed",
+                            error=str(journal_exc))
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_same_cwd_fork(
+                    cmd, sid, source_cwd, recovered)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, source_cwd, marker)
+            log.warning("codex same-cwd fork outcome unknown", parent=sid,
+                        last_turn_id=cmd.last_turn_id, error=str(exc))
+            raise _ForkOutcomeUncertain(
+                "fork request outcome is not yet visible in the rollout"
+            ) from exc
+        except Exception as exc:
+            # codex_rpc reserves CodexRpcOutcomeUnknown for failures after the
+            # request write. Resolve/spawn/initialize failures are pre-submit and
+            # therefore proven safe to terminate and ACK.
+            log.warning("codex same-cwd fork could not start", parent=sid,
+                        last_turn_id=cmd.last_turn_id, error=str(exc))
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.reject, cmd.request_id,
+                    f"无法发起 Codex 会话派生: {exc}")
+            except ForkJournalError as journal_exc:
+                log.warning("codex pre-submit rejection journal failed",
+                            error=str(journal_exc))
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, f"无法发起 Codex 会话派生: {exc}")
+
+        thread = raw_result.get("thread") if isinstance(raw_result, dict) else None
+        child = thread.get("id") if isinstance(thread, dict) else None
+        if not isinstance(child, str) or not child:
+            # A success-shaped response without a child id is malformed, but it
+            # does not prove the mutation failed. Reconcile exactly like a
+            # response-stream loss and keep the reliable command unacknowledged.
+            self._remember_uncertain_codex_fork(cmd.request_id, None)
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError as journal_exc:
+                log.warning("codex malformed-result journal failed",
+                            error=str(journal_exc))
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if not recovered:
+                self._ensure_codex_fork_reconciler(
+                    cmd, sid, source_cwd, marker)
+                raise _ForkOutcomeUncertain(
+                    "fork response omitted its child id and is not reconciled")
+            child = recovered
+
+        event = await self._finish_same_cwd_fork(
+            cmd, sid, source_cwd, child)
+        if isinstance(event, SessionForked):
+            log.info("codex session forked",
+                     parent=sid, session_id=child,
+                     last_turn_id=cmd.last_turn_id)
+        return event
 
     async def _find_codex_worktree_fork(
         self, parent_session_id: str, cwd: str,
@@ -3197,7 +3580,11 @@ class WrapperMachine:
             return await self._send_worktree_fork_error(
                 cmd, ERR_INTERNAL, "目前仅支持派生 Codex 会话到新工作树")
         ctx = self._ctx_by_sid(sid)
-        if ctx is not None and ctx.state != "idle":
+        # The session menu (no turn id) still means "fork the current complete
+        # thread" and must wait for idle. A message action names an already
+        # completed historical turn, which remains safe while a newer turn runs.
+        if (not getattr(cmd, "last_turn_id", None)
+                and ctx is not None and ctx.state != "idle"):
             return await self._send_worktree_fork_error(
                 cmd, ERR_BUSY, "会话仍在运行，请等待当前回合结束后再派生")
 
@@ -3242,7 +3629,10 @@ class WrapperMachine:
                 "threadId": sid,
                 "cwd": spec.cwd,
                 "ephemeral": False,
+                "threadSource": fork_thread_source(cmd.request_id),
             }
+            if getattr(cmd, "last_turn_id", None):
+                params["lastTurnId"] = cmd.last_turn_id
             parent_model = (
                 getattr(ctx.sdk, "model", None) if ctx is not None else None
             ) or (await asyncio.to_thread(codex_session_settings, sid)).get("model")
@@ -3323,6 +3713,8 @@ class WrapperMachine:
             session_id=new_session_id,
             cwd=spec.cwd,
             git_branch=spec.branch,
+            target="worktree",
+            last_turn_id=getattr(cmd, "last_turn_id", None),
             request_id=cmd.request_id,
             to=cmd.client_id,
         )

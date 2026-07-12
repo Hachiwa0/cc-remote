@@ -11,7 +11,8 @@ from types import SimpleNamespace
 import pytest
 
 from cc_remote.protocol import (
-    ERR_DRAIN_TIMEOUT, Error, Interrupt, StateEvent, TurnEnd, UserMsg,
+    AssistantMsgStart, ERR_DRAIN_TIMEOUT, Error, Interrupt, StateEvent,
+    TurnEnd, UserMsg,
 )
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import codex_stream as codex_stream_module
@@ -640,6 +641,8 @@ def test_codex_rollout_ids_are_stable_and_terminal_statuses_are_preserved(tmp_pa
         ("error_during_execution", 3000, True),
         ("error", 4000, True),
     ]
+    assert [e.turn_id for e in first if e.type == "turn_end"] == [
+        "turn-1", "turn-2", "turn-3"]
     # No synthetic TurnEnd for turn-4: the client reducer must keep it not-done.
     assert len([e for e in first if e.type == "user_msg"]) == len(results) + 1
     assert first[-1].type == "assistant_msg_end"
@@ -671,6 +674,8 @@ def test_codex_empty_completed_history_is_a_correlated_error(tmp_path):
     result = [event.result for event in first if isinstance(event, TurnEnd)][0]
     assert (result.subtype, result.duration_ms, result.is_error) == (
         "error", 237000, True)
+    assert next(event for event in first
+                if isinstance(event, TurnEnd)).turn_id == "turn-empty"
     assert [(event.type, getattr(event, "msg_id", None)) for event in first] == [
         (event.type, getattr(event, "msg_id", None)) for event in second]
 
@@ -701,6 +706,102 @@ def test_codex_tool_only_completed_history_remains_success(tmp_path):
     assert not any(isinstance(event, Error) for event in events)
     result = [event.result for event in events if isinstance(event, TurnEnd)][0]
     assert (result.subtype, result.is_error) == ("success", False)
+    assert next(event for event in events
+                if isinstance(event, TurnEnd)).turn_id == "turn-tool"
+
+
+def test_codex_history_uses_final_automatic_continuation_turn_id(tmp_path):
+    rollout = tmp_path / "rollout-continuation.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-continuation"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-first"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "continue it"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "first part"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-cont"}},
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "turn_context",
+         "payload": {"turn_id": "turn-cont", "model": "gpt-test"}},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "last part"}},
+        {"timestamp": "2026-01-01T00:00:07Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-cont"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    terminal = next(event for event in events if isinstance(event, TurnEnd))
+    assert terminal.turn_id == "turn-cont"
+
+
+def test_codex_history_synthetic_boundary_never_steals_next_turn_id(tmp_path):
+    rollout = tmp_path / "rollout-missing-terminal.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-missing-terminal"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-old"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "old"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "old answer"}},
+        # No terminal for turn-old. Codex begins the next real user turn.
+        {"timestamp": "2026-01-01T00:01:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-next"}},
+        {"timestamp": "2026-01-01T00:01:02Z", "type": "turn_context",
+         "payload": {"turn_id": "turn-next", "model": "gpt-test"}},
+        {"timestamp": "2026-01-01T00:01:03Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "next"}},
+        {"timestamp": "2026-01-01T00:01:04Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "next answer"}},
+        {"timestamp": "2026-01-01T00:01:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-next"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    terminals = [event for event in events if isinstance(event, TurnEnd)]
+    assert [event.turn_id for event in terminals] == [None, "turn-next"]
+    assert [event.result.subtype for event in terminals] == ["error", "success"]
+
+
+def test_codex_history_goal_continuation_after_completed_turn_is_own_turn(tmp_path):
+    rollout = tmp_path / "rollout-goal-continuation.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-goal-continuation"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-user"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "start goal"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "first answer"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-user"}},
+        {"timestamp": "2026-01-01T00:01:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-goal"}},
+        {"timestamp": "2026-01-01T00:01:02Z", "type": "turn_context",
+         "payload": {"turn_id": "turn-goal", "model": "gpt-test"}},
+        # No user_message: this is an app-server goal/background continuation.
+        {"timestamp": "2026-01-01T00:01:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "goal progress"}},
+        {"timestamp": "2026-01-01T00:01:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-goal"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    assert len([event for event in events if isinstance(event, UserMsg)]) == 1
+    assert len([event for event in events
+                if isinstance(event, AssistantMsgStart)]) == 2
+    assert [event.turn_id for event in events if isinstance(event, TurnEnd)] == [
+        "turn-user", "turn-goal"]
 
 
 def test_codex_history_restores_final_text_after_tools_from_task_complete(tmp_path):

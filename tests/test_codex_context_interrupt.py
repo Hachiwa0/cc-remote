@@ -51,18 +51,22 @@ def test_context_uses_last_not_cumulative_total():
 
 def test_interrupt_status_maps_to_cc_vocab():
     tr = CodexStreamTranslator(8000)
-    evs = tr.feed({"method": "turn/completed", "params": {"turn": {"status": "interrupted", "durationMs": 3000}}})
+    evs = tr.feed({"method": "turn/completed", "params": {"turn": {
+        "id": "turn-interrupted", "status": "interrupted", "durationMs": 3000}}})
     assert len(evs) == 1
     te = evs[0]
     assert te.result.subtype == "error_during_execution", te.result.subtype
     assert te.result.is_error is True
+    assert te.turn_id == "turn-interrupted"
     print(f"  interrupted -> subtype={te.result.subtype} is_error={te.result.is_error}  OK")
 
     tr2 = CodexStreamTranslator(8000)
     tr2.feed({"method": "item/agentMessage/delta", "params": {
         "itemId": "answer-1", "delta": "done"}})
-    ok = tr2.feed({"method": "turn/completed", "params": {"turn": {"status": "completed", "durationMs": 500}}})
+    ok = tr2.feed({"method": "turn/completed", "params": {"turn": {
+        "id": "turn-completed", "status": "completed", "durationMs": 500}}})
     assert ok[-1].result.subtype == "success" and ok[-1].result.is_error is False
+    assert ok[-1].turn_id == "turn-completed"
     print(f"  completed -> subtype=success is_error=False  OK")
 
     tr3 = CodexStreamTranslator(8000)

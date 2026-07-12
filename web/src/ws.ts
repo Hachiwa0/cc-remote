@@ -8,7 +8,7 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type { ServerEvent, QueryImg, QueryFile } from "./protocol.ts";
-import { makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
+import { makeForkSessionCommand, makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
 import { CommandOutbox, planRecoveryReplay } from "./outbox.ts";
 import { probeSession, shouldReconnectAfterSessionProbe } from "./session-auth.ts";
 import { uuid } from "./util.ts";
@@ -262,9 +262,18 @@ export class RelayWs {
   }
 
   sendForkSessionWorktree(parentSessionId: string, name: string,
-                          requestId = uuid()): string | null {
+                          requestId = uuid(), lastTurnId?: string): string | null {
     const queued = this.send({
-      ...makeForkSessionWorktreeCommand(parentSessionId, name, requestId, nowTs()),
+      ...makeForkSessionWorktreeCommand(
+        parentSessionId, name, requestId, nowTs(), lastTurnId),
+    });
+    return queued ? requestId : null;
+  }
+
+  sendForkSession(parentSessionId: string, lastTurnId: string,
+                  requestId = uuid()): string | null {
+    const queued = this.send({
+      ...makeForkSessionCommand(parentSessionId, lastTurnId, requestId, nowTs()),
     });
     return queued ? requestId : null;
   }

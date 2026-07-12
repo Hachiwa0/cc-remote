@@ -140,6 +140,7 @@ ERR_INTERNAL = "internal"
 ERR_WRAPPER_OFFLINE = "wrapper_offline"
 ERR_WRAPPER_ALREADY_CONNECTED = "wrapper_already_connected"
 ERR_AUTH = "auth"
+ERR_FORK_RECONCILING = "fork_reconciling"
 
 
 class _Base(BaseModel):
@@ -438,6 +439,11 @@ class TurnResult(BaseModel):
 class TurnEnd(_Base):
     type: Literal["turn_end"] = "turn_end"
     result: TurnResult
+    # Codex app-server's authoritative turn id. Claude and synthetic legacy
+    # history boundaries leave it unset. Message-level fork uses this value as
+    # thread/fork.lastTurnId, so it must identify the completed turn rather than
+    # an assistant item or the optimistic browser message id.
+    turn_id: Optional[WireId] = None
 
 
 class Error(_Base):
@@ -583,6 +589,19 @@ class ArchiveSession(_Command):
     archived: bool
 
 
+class ForkSession(_Command):
+    """client -> wrapper: persistently fork Codex at one completed turn.
+
+    Unlike ``ForkSessionWorktree``, this is the app-server's ordinary thread
+    fork and inherits the source thread's working directory. ``last_turn_id``
+    comes from the selected message's authoritative ``TurnEnd.turn_id``.
+    """
+    type: Literal["fork_session"] = "fork_session"
+    session_id: WireId
+    request_id: WireId
+    last_turn_id: WireId
+
+
 class ForkSessionWorktree(_Command):
     """client -> wrapper: persistently fork a Codex thread into a new Git worktree.
 
@@ -594,15 +613,20 @@ class ForkSessionWorktree(_Command):
     session_id: WireId
     request_id: WireId
     name: Optional[str] = Field(default=None, max_length=80)
+    # Present for a message-level action. Omitted by the session menu, whose
+    # historical behavior remains "fork the complete current thread".
+    last_turn_id: Optional[WireId] = None
 
 
 class SessionForked(_Base):
-    """wrapper -> requesting client: persistent worktree fork is ready."""
+    """wrapper -> requesting client: a persistent Codex fork is ready."""
     type: Literal["session_forked"] = "session_forked"
     parent_session_id: WireId
     session_id: WireId
     cwd: str = Field(min_length=1, max_length=4096)
-    git_branch: str = Field(min_length=1, max_length=500)
+    target: Literal["same_cwd", "worktree"]
+    git_branch: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    last_turn_id: Optional[WireId] = None
     request_id: WireId
 
 
@@ -932,7 +956,7 @@ AnyMessage = Union[
     Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, DiffReport, History, Models, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession,
-    ForkSessionWorktree, SessionForked, DirList,
+    ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
@@ -971,6 +995,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "new_session": NewSession,
     "rename_session": RenameSession,
     "archive_session": ArchiveSession,
+    "fork_session": ForkSession,
     "fork_session_worktree": ForkSessionWorktree,
     "session_forked": SessionForked,
     "list_dir": ListDir,

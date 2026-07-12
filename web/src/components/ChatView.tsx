@@ -3,6 +3,7 @@ import type { Turn, Block, TextBlock, ToolBlock } from "../reducer";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
+import { canForkCodexTurn } from "../session-worktree";
 
 type Segment = { kind: "text"; block: TextBlock } | { kind: "tools"; tools: ToolBlock[] };
 
@@ -28,7 +29,19 @@ function formatTime(ts: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-export function ChatView({ sid, turns, loading, hasMore, onLoadMore, onEdit, onGetDiff }: { sid: string | null; turns: Turn[]; loading?: boolean; hasMore?: boolean; onLoadMore?: () => void; onEdit: (prompt: string) => void; onGetDiff: (file: string) => void }) {
+export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
+  onLoadMore, onEdit, onGetDiff, onFork, forkingTurnId }: {
+  sid: string | null;
+  turns: Turn[];
+  engine?: "claude" | "codex";
+  loading?: boolean;
+  hasMore?: boolean;
+  onLoadMore?: () => void;
+  onEdit: (prompt: string) => void;
+  onGetDiff: (file: string) => void;
+  onFork?: (lastTurnId: string) => void;
+  forkingTurnId?: string | null;
+}) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -187,6 +200,15 @@ export function ChatView({ sid, turns, loading, hasMore, onLoadMore, onEdit, onG
                     <div className="ubub-meta ai-meta">
                       {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
                       <button className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")} onClick={() => copyText(t.id + "-ai", aiText(t))} aria-label="复制"><Icon name="check" size={13} /></button>
+                      {onFork && canForkCodexTurn(engine, t) && (
+                        <button className="ubub-act" aria-label="派生"
+                          title="从此回复派生"
+                          aria-busy={forkingTurnId === t.codexTurnId}
+                          disabled={!!forkingTurnId}
+                          onClick={() => onFork(t.codexTurnId)}>
+                          <Icon name="branch" size={13} />
+                        </button>
+                      )}
                     </div>
                     {ti === turns.length - 1 && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
                   </>

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 import {
@@ -342,6 +344,7 @@ assert.deepEqual(
 // transcript without creating a second assistant-only turn.
 const partialHistory = {
   id: "engine-active", prompt: "在？", done: true, ts: 10_000, doneTs: 11_000,
+  codexTurnId: "codex-turn-a",
   blocks: [] as Array<{ kind: "text"; message_id: string; text: string; done: boolean }>,
 };
 const liveActive = {
@@ -354,6 +357,7 @@ const activeMerge = mergeInitialHistory(
 assert.equal(activeMerge.length, 1);
 assert.equal(activeMerge[0].done, false);
 assert.equal(activeMerge[0].doneTs, undefined);
+assert.equal(activeMerge[0].codexTurnId, "codex-turn-a");
 const liveFinished = [{
   ...activeMerge[0], done: true, doneTs: 12_000,
   blocks: activeMerge[0].blocks.map((block) => block.kind === "text"
@@ -411,17 +415,18 @@ try {
     type: "history", sid, session_id: sid, in_progress: true, has_more: false,
     events: [
       event({ type: "user_msg", sid, msg_id: "engine-a", prompt: "在？", ts: 10 }),
-      event({ type: "turn_end", sid, ts: 11,
+      event({ type: "turn_end", sid, ts: 11, turn_id: "codex-turn-a",
         result: { subtype: "success", duration_ms: 0, is_error: false } }),
     ],
   }) });
   assert.equal(state.runtimes[sid].turns.length, 1);
   assert.equal(state.runtimes[sid].turns[0].done, false);
+  assert.equal(state.runtimes[sid].turns[0].codexTurnId, "codex-turn-a");
 
   for (const live of [
     event({ type: "delta", sid, message_id: "live-answer", text: "only once" }),
     event({ type: "assistant_msg_end", sid, message_id: "live-answer" }),
-    event({ type: "turn_end", sid, ts: 12,
+    event({ type: "turn_end", sid, ts: 12, turn_id: "codex-turn-a",
       result: { subtype: "success", duration_ms: 2000, is_error: false } }),
   ]) state = reduce(state, { type: "event", event: live });
 
@@ -432,15 +437,37 @@ try {
       event({ type: "assistant_msg_start", sid, message_id: "engine-answer" }),
       event({ type: "delta", sid, message_id: "engine-answer", text: "only once" }),
       event({ type: "assistant_msg_end", sid, message_id: "engine-answer" }),
-      event({ type: "turn_end", sid, ts: 12,
+      event({ type: "turn_end", sid, ts: 12, turn_id: "codex-turn-a",
         result: { subtype: "success", duration_ms: 2000, is_error: false } }),
     ],
   }) });
   assert.equal(state.runtimes[sid].turns.length, 1);
+  assert.equal(state.runtimes[sid].turns[0].codexTurnId, "codex-turn-a");
   assert.deepEqual(state.runtimes[sid].turns[0].blocks.map(
     (block: { kind: string; text?: string }) => block.kind === "text" ? block.text : "tool"),
   ["only once"]);
   assert.deepEqual(state.runtimes[otherSid].turns, [untouched]);
+
+  const { ChatView } = await reducerHarness.ssrLoadModule(
+    "/src/components/ChatView.tsx");
+  const forkableTurn = {
+    id: "message-a", codexTurnId: "codex-turn-a", prompt: "在？",
+    done: true, doneTs: 12_000,
+    blocks: [{ kind: "text", message_id: "answer-a", text: "在的", done: true }],
+  };
+  const codexMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid, turns: [forkableTurn], engine: "codex",
+    onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
+  }));
+  assert.match(codexMarkup, /aria-label="复制"/);
+  assert.match(codexMarkup, /aria-label="派生"/);
+  assert.ok(codexMarkup.indexOf('aria-label="派生"')
+    > codexMarkup.indexOf('aria-label="复制"'));
+  const claudeMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid, turns: [forkableTurn], engine: "claude",
+    onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
+  }));
+  assert.doesNotMatch(claudeMarkup, /aria-label="派生"/);
 
   state = reduce(state, { type: "event", event: event({
     type: "takeover_state", sid, pending: true, message: "等待当前回复结束",

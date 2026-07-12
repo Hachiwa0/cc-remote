@@ -173,11 +173,13 @@ class CodexStreamTranslator:
             subtype = ("success" if st == "completed"
                        else "error_during_execution" if st == "interrupted"
                        else "error")
+            completed_turn_id = turn.get("id")
             out.append(TurnEnd(result=TurnResult(
                 subtype=subtype,
                 duration_ms=int(turn.get("durationMs") or 0),
                 is_error=(st != "completed"),
-            )))
+            ), turn_id=(completed_turn_id
+                        if isinstance(completed_turn_id, str) else None)))
 
         # everything else (reasoning, userMessage, hook/*, mcpServer/startupStatus,
         # thread/status, account/rateLimits, tokenUsage, remoteControl…) -> skip.
@@ -363,14 +365,50 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         assistant_open = False
         cur_mid = None
 
-    def close_turn(subtype: str, duration_ms: int, is_error: bool, completed_ts=None):
+    def open_assistant_only_turn():
+        """Start a visible continuation that has no user_message record.
+
+        Goal/background continuations can begin with task_started after the
+        previous user turn is already complete. The first visible assistant or
+        tool item proves this is a separate assistant-only turn.
+        """
+        nonlocal turn_open, active_turn_id, active_msg_id
+        nonlocal turn_visible, turn_text_visible
+        if turn_open:
+            return
+        turn_open = True
+        active_turn_id = pending_turn_id
+        active_msg_id = None
+        turn_visible = False
+        turn_text_visible = False
+
+    def close_turn(
+        subtype: str,
+        duration_ms: int,
+        is_error: bool,
+        completed_ts=None,
+        completed_turn_id=None,
+        authoritative_boundary: bool = True,
+    ):
         nonlocal turn_open, active_turn_id, active_msg_id, pending_turn_id
         nonlocal assistant_open, cur_mid, turn_visible, turn_text_visible
         if not turn_open:
             return
         close_assistant()
+        # Automatic continuations may replace the initially-visible turn id.
+        # The message action must fork after the last internal turn that actually
+        # completed this visible reply, so prefer the terminal record, then the
+        # latest task_started/turn_context id, and only then the first user turn.
+        terminal_turn_id = (
+            completed_turn_id or pending_turn_id
+            if authoritative_boundary else None
+        )
+        if (not isinstance(terminal_turn_id, str)
+                or not _SAFE_WIRE_ID.fullmatch(terminal_turn_id)):
+            terminal_turn_id = None
         te = TurnEnd(result=TurnResult(
-            subtype=subtype, duration_ms=duration_ms, is_error=is_error))
+            subtype=subtype, duration_ms=duration_ms, is_error=is_error),
+            turn_id=terminal_turn_id)
         terminal_ts = completed_ts if completed_ts is not None else last_ts
         if terminal_ts is not None:
             te.ts = terminal_ts
@@ -429,7 +467,13 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                 if msg and not msg.lstrip().startswith("<"):
                     next_turn_id = p.get("turn_id") or pending_turn_id
                     if turn_open:
-                        close_turn("error", 0, True)
+                        # No terminal record proved where the previous visible
+                        # reply ended. In particular, pending_turn_id now often
+                        # belongs to this NEW user turn; never attach it to the
+                        # synthetic error boundary.
+                        close_turn(
+                            "error", 0, True,
+                            authoritative_boundary=False)
                     active_turn_id = str(next_turn_id) if next_turn_id else None
                     pending_turn_id = active_turn_id
                     uid = _history_id(active_turn_id, "user", line_no, raw_ts)
@@ -443,6 +487,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                     turn_open = True
                 pending_images = []   # consume (per user turn)
             elif t == "response_item" and p.get("type") == "function_call":
+                open_assistant_only_turn()
                 ensure_assistant(line_no, raw_ts)
                 turn_visible = True
                 events.append(ToolUse(
@@ -466,6 +511,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                     truncated=truncated,
                 ))
             elif t == "event_msg" and payload_type == "agent_message":
+                open_assistant_only_turn()
                 ensure_assistant(line_no, raw_ts, p.get("id") or p.get("message_id"))
                 txt = p.get("message") or ""
                 if txt:
@@ -473,8 +519,10 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                     turn_text_visible = True
                     events.append(Delta(message_id=cur_mid, text=txt))
             elif t == "event_msg" and payload_type == "task_complete":
+                last = p.get("last_agent_message")
+                if (not turn_open and isinstance(last, str) and last):
+                    open_assistant_only_turn()
                 if turn_open:
-                    last = p.get("last_agent_message")
                     if not turn_text_visible and isinstance(last, str) and last:
                         ensure_assistant(line_no, raw_ts)
                         events.append(Delta(message_id=cur_mid, text=last))
@@ -482,7 +530,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                         turn_text_visible = True
                     if turn_visible:
                         close_turn("success", _duration(p), False,
-                                   _completed_ts(p, ts))
+                                   _completed_ts(p, ts), p.get("turn_id"))
                     else:
                         events.append(Error(
                             code=ERR_CC_CRASH,
@@ -490,17 +538,19 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                             msg_id=active_msg_id,
                         ))
                         close_turn("error", _duration(p), True,
-                                   _completed_ts(p, ts))
+                                   _completed_ts(p, ts), p.get("turn_id"))
             elif t == "event_msg" and payload_type == "turn_aborted":
                 if turn_open:
                     interrupted = p.get("reason") == "interrupted"
                     close_turn(
                         "error_during_execution" if interrupted else "error",
-                        _duration(p), True, _completed_ts(p, ts))
+                        _duration(p), True, _completed_ts(p, ts),
+                        p.get("turn_id"))
             elif t == "event_msg" and payload_type in {
                     "task_failed", "turn_failed", "task_error"}:
                 if turn_open:
-                    close_turn("error", _duration(p), True, _completed_ts(p, ts))
+                    close_turn("error", _duration(p), True,
+                               _completed_ts(p, ts), p.get("turn_id"))
             # session_meta / world_state / reasoning / token_count / task_* : skipped
             if ts is not None:
                 last_ts = ts

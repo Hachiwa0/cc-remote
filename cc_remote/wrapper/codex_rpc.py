@@ -11,6 +11,14 @@ _RPC_TIMEOUT = 30.0
 _STREAM_LIMIT = 16 * 1024 * 1024
 
 
+class CodexRpcRejected(RuntimeError):
+    """The app-server returned an explicit JSON-RPC rejection."""
+
+
+class CodexRpcOutcomeUnknown(RuntimeError):
+    """The mutating request may have committed before transport failure."""
+
+
 def _resolve_codex_bin() -> str:
     # Lazy imports avoid a cycle: CodexHandle imports codex_sessions, which uses
     # this module for thread/list.
@@ -25,14 +33,14 @@ def _codex_env(bin_path: str) -> dict[str, str]:
     return build_env(bin_path)
 
 
-def _rpc_error(error: Any) -> RuntimeError:
+def _rpc_error(error: Any) -> CodexRpcRejected:
     if not isinstance(error, dict):
-        return RuntimeError("codex app-server request failed")
+        return CodexRpcRejected("codex app-server request failed")
     code = error.get("code")
     message = str(error.get("message") or "request failed")[:512]
     if isinstance(code, int):
-        return RuntimeError(f"codex app-server error {code}: {message}")
-    return RuntimeError(f"codex app-server error: {message}")
+        return CodexRpcRejected(f"codex app-server error {code}: {message}")
+    return CodexRpcRejected(f"codex app-server error: {message}")
 
 
 async def _stop_process(proc: asyncio.subprocess.Process) -> None:
@@ -123,7 +131,17 @@ async def codex_rpc(
         }
         if params is not None:
             request["params"] = params
-        await send(request)
-        return await asyncio.wait_for(result(2), timeout=_RPC_TIMEOUT)
+        try:
+            # From the first write onward a broken pipe, EOF, or timeout cannot
+            # prove whether a mutating request committed. Preserve that semantic
+            # distinction for callers that must not ACK/replay the mutation.
+            await send(request)
+            return await asyncio.wait_for(result(2), timeout=_RPC_TIMEOUT)
+        except CodexRpcRejected:
+            raise
+        except Exception as exc:
+            raise CodexRpcOutcomeUnknown(
+                "codex app-server closed before the request outcome was known"
+            ) from exc
     finally:
         await _stop_process(proc)

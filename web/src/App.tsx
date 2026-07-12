@@ -22,7 +22,9 @@ import { shouldAcceptSessionList } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
 import { collectWaitingQueries, selectDrainCandidates } from "./runtime-drain";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
-import { isTerminalWorktreeForkError, matchesWorktreeForkRequest, type PendingWorktreeFork } from "./session-worktree";
+import { isTerminalWorktreeForkError, matchesSessionForkRequest,
+  matchesWorktreeForkRequest, type PendingSessionFork,
+  type PendingWorktreeFork } from "./session-worktree";
 import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest, type Snapshot, type QueryImg, type QueryFile, type SessionInfo } from "./protocol";
 
 const THEME_KEY = "cc_remote_theme";
@@ -56,6 +58,7 @@ export default function App() {
   const [forkWorktreeSession, setForkWorktreeSession] = useState<SessionInfo | null>(null);
   const [forkWorktreeCreating, setForkWorktreeCreating] = useState(false);
   const [forkWorktreeError, setForkWorktreeError] = useState<string | null>(null);
+  const [forkingTurnId, setForkingTurnId] = useState<string | null>(null);
   const [state, dispatch] = useReducer(reduce, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -63,6 +66,7 @@ export default function App() {
   const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
   const pendingBtwRef = useRef<string | null>(null);
+  const pendingSessionForkRef = useRef<PendingSessionFork | null>(null);
   const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
   const activeBtwRef = useRef<{ requestId: string; sid: string } | null>(null);
   // Retain recently cancelled ids so a late response can be identified and
@@ -87,6 +91,8 @@ export default function App() {
   // to an empty runtime before any session is focused.
   const focusedSid = state.focusedSid;
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
+  const focusedEngine = (state.sessions.find(
+    (session) => session.session_id === focusedSid)?.engine ?? engine) as "claude" | "codex";
   const allQueued = collectWaitingQueries(state.runtimes);
   const replaceableQueued = collectWaitingQueries(state.runtimes, focusedSid);
 
@@ -220,12 +226,25 @@ export default function App() {
             setBtwOpening(false);
           }
           if (msg.type === "session_forked") {
-            if (!matchesWorktreeForkRequest(
-                pendingWorktreeForkRef.current, msg.request_id, msg.parent_session_id)) return;
-            pendingWorktreeForkRef.current = null;
-            setForkWorktreeCreating(false);
-            setForkWorktreeError(null);
-            setForkWorktreeSession(null);
+            const matchesMessageFork = msg.target === "same_cwd"
+              && matchesSessionForkRequest(
+              pendingSessionForkRef.current, msg.request_id,
+              msg.parent_session_id, msg.last_turn_id);
+            const matchesWorktreeFork = msg.target === "worktree"
+              && matchesWorktreeForkRequest(
+              pendingWorktreeForkRef.current, msg.request_id,
+              msg.parent_session_id);
+            if (!matchesMessageFork && !matchesWorktreeFork) return;
+            if (matchesMessageFork) {
+              pendingSessionForkRef.current = null;
+              setForkingTurnId(null);
+            }
+            if (matchesWorktreeFork) {
+              pendingWorktreeForkRef.current = null;
+              setForkWorktreeCreating(false);
+              setForkWorktreeError(null);
+              setForkWorktreeSession(null);
+            }
             setEngine("codex");
             dispatch({ type: "exit_new_chat" });
             dispatch({ type: "focus_session", sid: msg.session_id });
@@ -234,6 +253,14 @@ export default function App() {
             ws.sendListSessions("codex");
             ws.sendSwitchSession(msg.session_id, "codex");
             if (isMobile()) setSidebarOpen(false);
+            return;
+          }
+          if (msg.type === "error" && isTerminalWorktreeForkError(msg.code)
+              && matchesSessionForkRequest(
+                pendingSessionForkRef.current, msg.request_id)) {
+            pendingSessionForkRef.current = null;
+            setForkingTurnId(null);
+            dispatch({ type: "command_error", detail: `${msg.code}: ${msg.message}` });
             return;
           }
           if (msg.type === "error" && isTerminalWorktreeForkError(msg.code)
@@ -301,11 +328,13 @@ export default function App() {
           clearLegacyAuthMarkers(localStorage);
           pendingCreateRef.current = null;
           pendingBtwRef.current = null;
+          pendingSessionForkRef.current = null;
           pendingWorktreeForkRef.current = null;
           activeBtwRef.current = null;
           btwRequestIdsRef.current.clear();
           discardedBtwSidsRef.current.clear();
           setBtwOpening(false);
+          setForkingTurnId(null);
           setForkWorktreeSession(null);
           setForkWorktreeCreating(false);
           setForkWorktreeError(null);
@@ -599,8 +628,25 @@ export default function App() {
     setStatusOpenSid(focusedSid);
     wsRef.current?.sendGetStatus();
   };
+  const forkFromTurn = (lastTurnId: string) => {
+    if (!focusedSid || focusedEngine !== "codex"
+        || pendingSessionForkRef.current || pendingWorktreeForkRef.current) return;
+    const requestId = wsRef.current?.sendForkSession(
+      focusedSid, lastTurnId) ?? null;
+    if (!requestId) {
+      dispatch({ type: "command_error",
+        detail: "派生请求未发送，请等待连接恢复后重试。" });
+      return;
+    }
+    pendingSessionForkRef.current = {
+      requestId,
+      parentSessionId: focusedSid,
+      lastTurnId,
+    };
+    setForkingTurnId(lastTurnId);
+  };
   const openForkWorktree = (session: SessionInfo) => {
-    if (pendingWorktreeForkRef.current) return;
+    if (pendingSessionForkRef.current || pendingWorktreeForkRef.current) return;
     setForkWorktreeError(null);
     setForkWorktreeSession(session);
   };
@@ -672,11 +718,13 @@ export default function App() {
       wsRef.current?.stop();
       pendingCreateRef.current = null;
       pendingBtwRef.current = null;
+      pendingSessionForkRef.current = null;
       pendingWorktreeForkRef.current = null;
       activeBtwRef.current = null;
       btwRequestIdsRef.current.clear();
       discardedBtwSidsRef.current.clear();
       setCreateError(null);
+      setForkingTurnId(null);
       setForkWorktreeSession(null);
       setForkWorktreeCreating(false);
       setForkWorktreeError(null);
@@ -752,9 +800,11 @@ export default function App() {
         ) : (
           <>
             <ChatView sid={focusedSid} turns={rt.turns} loading={!!rt.loading}
+              engine={focusedEngine} forkingTurnId={forkingTurnId}
               hasMore={!!rt.hasMore}
               onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_PAGE); }}
-              onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff} />
+              onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff}
+              onFork={forkFromTurn} />
 
             <GoalPanel engine={engine} goal={rt.goal}
               revealed={!!goalUi?.revealed} open={!!goalUi?.open}

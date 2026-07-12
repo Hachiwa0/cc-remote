@@ -38,6 +38,9 @@ export type Block = TextBlock | ToolBlock;
 
 export interface Turn {
   id: string;
+  // Codex app-server turn id. Unlike the client message id, this is the
+  // authoritative branch point accepted by thread/fork.
+  codexTurnId?: string;
   prompt: string; // empty when we joined mid-turn (no user bubble rendered)
   blocks: Block[];
   done: boolean;
@@ -705,6 +708,7 @@ function reduceEvent(
         const t = turns[turns.length - 1];
         if (t) {
           t.done = true;
+          if (e.turn_id) t.codexTurnId = e.turn_id;
           t.progress = undefined;
           if (e.result.subtype === "error_during_execution") t.interrupted = true;
           // Stamp completion time from the event's own server ts (seconds -> ms).

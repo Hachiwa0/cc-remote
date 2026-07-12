@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from cc_remote.wrapper import codex_rpc as codex_rpc_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 
@@ -93,6 +95,39 @@ def test_codex_rpc_initializes_sends_exact_shape_and_reaps(monkeypatch, tmp_path
         ]
         assert process.stdin.closed is True
         assert process.terminated is True and process.killed is False
+
+    asyncio.run(run())
+
+
+def test_codex_rpc_distinguishes_rejection_from_unknown_post_submit_outcome(
+    monkeypatch, tmp_path,
+):
+    async def invoke(messages):
+        process = _FakeProcess(messages)
+
+        async def create_subprocess_exec(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(codex_rpc_module, "_resolve_codex_bin", lambda: "/bin/codex")
+        monkeypatch.setattr(codex_rpc_module, "_codex_env", lambda _path: {})
+        monkeypatch.setattr(
+            codex_rpc_module.asyncio, "create_subprocess_exec", create_subprocess_exec)
+        return await codex_rpc_module.codex_rpc(
+            "thread/fork", {"threadId": "parent"}, cwd=str(tmp_path))
+
+    async def run():
+        with pytest.raises(codex_rpc_module.CodexRpcRejected):
+            await invoke([
+                {"jsonrpc": "2.0", "id": 1, "result": {}},
+                {"jsonrpc": "2.0", "id": 2,
+                 "error": {"code": -32602, "message": "invalid params"}},
+            ])
+
+        with pytest.raises(codex_rpc_module.CodexRpcOutcomeUnknown):
+            await invoke([
+                {"jsonrpc": "2.0", "id": 1, "result": {}},
+                # EOF after request id=2 was written: commit status is unknown.
+            ])
 
     asyncio.run(run())
 

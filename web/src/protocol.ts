@@ -54,19 +54,28 @@ export interface Fast extends Base { type: "fast"; on: boolean }
 export interface OpenBtw extends Base { type: "open_btw"; request_id: string; client_id?: string }
 export interface CloseBtw extends Base { type: "close_btw" }
 export interface BtwOpened extends Base { type: "btw_opened"; request_id: string; btw_sid: string; parent_sid: string; engine: string }
+export interface ForkSession extends Base {
+  type: "fork_session";
+  session_id: string;
+  request_id: string;
+  last_turn_id: string;
+}
 export interface ForkSessionWorktree extends Base {
   type: "fork_session_worktree";
   session_id: string;
   name: string;
   request_id: string;
+  last_turn_id?: string | null;
 }
 export interface SessionForked extends Base {
   type: "session_forked";
   parent_session_id: string;
   session_id: string;
   cwd: string;
-  git_branch: string;
+  git_branch?: string | null;
   request_id: string;
+  last_turn_id?: string | null;
+  target: "same_cwd" | "worktree";
 }
 export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
@@ -75,7 +84,7 @@ export interface ToolUse extends Base { type: "tool_use"; message_id: string; to
 export interface ToolResult extends Base { type: "tool_result"; tool_use_id: string; content: string; is_error: boolean; truncated?: boolean | null }
 export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string }
 export interface TurnResult { subtype: string; duration_ms: number; is_error: boolean; total_cost_usd?: number | null; num_turns?: number | null }
-export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult }
+export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null }
 export interface ErrorMsg extends Base {
   type: "error";
   code: string;
@@ -231,6 +240,20 @@ export type ServerEvent =
 
 export const PROTOCOL_VERSION = 5;
 
+/** Build the correlated command behind Codex App's message-level "fork" action. */
+export function makeForkSessionCommand(
+  sessionId: string, lastTurnId: string, requestId: string, ts: number,
+): ForkSession {
+  return {
+    v: PROTOCOL_VERSION,
+    type: "fork_session",
+    session_id: sessionId,
+    request_id: requestId,
+    last_turn_id: lastTurnId,
+    ts,
+  };
+}
+
 /** Build the correlated command used to open one ephemeral /btw fork. */
 export function makeOpenBtwCommand(
   parentSid: string, requestId: string, ts: number,
@@ -248,8 +271,9 @@ export function makeOpenBtwCommand(
  * a new Git worktree. The wrapper owns worktree creation and name validation. */
 export function makeForkSessionWorktreeCommand(
   sessionId: string, name: string, requestId: string, ts: number,
+  lastTurnId?: string,
 ): ForkSessionWorktree {
-  return {
+  const command: ForkSessionWorktree = {
     v: PROTOCOL_VERSION,
     type: "fork_session_worktree",
     session_id: sessionId,
@@ -257,6 +281,8 @@ export function makeForkSessionWorktreeCommand(
     request_id: requestId,
     ts,
   };
+  if (lastTurnId) command.last_turn_id = lastTurnId;
+  return command;
 }
 
 /** Exact guard for accepting a one-shot /btw response in the UI. */

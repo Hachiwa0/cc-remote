@@ -13,6 +13,10 @@ export interface PendingWorktreeFork {
   parentSessionId: string;
 }
 
+export interface PendingSessionFork extends PendingWorktreeFork {
+  lastTurnId: string;
+}
+
 export function sessionMenuCapabilities(session: SessionInfo): SessionMenuCapabilities {
   return {
     rename: true,
@@ -44,8 +48,26 @@ export function matchesWorktreeForkRequest(
     && (parentSessionId == null || parentSessionId === pending.parentSessionId);
 }
 
-/** Relay-side offline errors are provisional: the reliable command remains in
- * the outbox and will be replayed after the wrapper reconnects. */
+export function matchesSessionForkRequest(
+  pending: PendingSessionFork | null,
+  requestId: string | null | undefined,
+  parentSessionId?: string | null,
+  lastTurnId?: string | null,
+): boolean {
+  return matchesWorktreeForkRequest(pending, requestId, parentSessionId)
+    && (lastTurnId == null || lastTurnId === pending!.lastTurnId);
+}
+
+export function canForkCodexTurn<T extends { done: boolean; codexTurnId?: string }>(
+  engine: "claude" | "codex",
+  turn: T,
+): turn is T & { done: true; codexTurnId: string } {
+  return engine === "codex" && turn.done && !!turn.codexTurnId;
+}
+
+/** Provisional errors keep the reliable command and its UI ownership pending.
+ * `fork_reconciling` means app-server may have committed the mutation, so the
+ * same request id is being reconciled and the user must not launch a second. */
 export function isTerminalWorktreeForkError(code: string): boolean {
-  return code !== "wrapper_offline";
+  return code !== "wrapper_offline" && code !== "fork_reconciling";
 }

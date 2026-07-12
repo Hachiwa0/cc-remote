@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import type { SessionInfo } from "../src/protocol.ts";
-import { makeForkSessionWorktreeCommand } from "../src/protocol.ts";
+import { makeForkSessionCommand, makeForkSessionWorktreeCommand } from "../src/protocol.ts";
 import {
+  canForkCodexTurn,
   isWorktreeForkNameValid,
   isWorktreeForkBlockedByState,
   isTerminalWorktreeForkError,
+  matchesSessionForkRequest,
   matchesWorktreeForkRequest,
   normalizeWorktreeForkName,
   sessionMenuCapabilities,
@@ -37,6 +39,18 @@ assert.equal(isWorktreeForkNameValid("x".repeat(WORKTREE_FORK_NAME_MAX)), true);
 assert.equal(isWorktreeForkNameValid("x".repeat(WORKTREE_FORK_NAME_MAX + 1)), false);
 
 assert.deepEqual(
+  makeForkSessionCommand("codex-parent", "turn-7", "request-message", 122),
+  {
+    v: 5,
+    type: "fork_session",
+    session_id: "codex-parent",
+    request_id: "request-message",
+    last_turn_id: "turn-7",
+    ts: 122,
+  },
+);
+
+assert.deepEqual(
   makeForkSessionWorktreeCommand("codex-parent", "fix-login", "request-1", 123),
   {
     v: 5,
@@ -47,6 +61,11 @@ assert.deepEqual(
     ts: 123,
   },
 );
+assert.equal(
+  makeForkSessionWorktreeCommand(
+    "codex-parent", "fix-login", "request-1", 123, "turn-7").last_turn_id,
+  "turn-7",
+);
 
 const pending = { requestId: "request-1", parentSessionId: "codex-parent" };
 assert.equal(matchesWorktreeForkRequest(pending, "request-1", "codex-parent"), true);
@@ -54,7 +73,29 @@ assert.equal(matchesWorktreeForkRequest(pending, "request-2", "codex-parent"), f
 assert.equal(matchesWorktreeForkRequest(pending, "request-1", "other-parent"), false);
 assert.equal(matchesWorktreeForkRequest(pending, "request-1"), true);
 assert.equal(matchesWorktreeForkRequest(null, "request-1"), false);
+const pendingMessage = {
+  requestId: "request-message",
+  parentSessionId: "codex-parent",
+  lastTurnId: "turn-7",
+};
+assert.equal(matchesSessionForkRequest(
+  pendingMessage, "request-message", "codex-parent", "turn-7"), true);
+assert.equal(matchesSessionForkRequest(
+  pendingMessage, "request-message", "codex-parent", "turn-other"), false);
+assert.equal(matchesSessionForkRequest(
+  pendingMessage, "request-message", "codex-parent"), true);
+assert.equal(matchesSessionForkRequest(
+  pendingMessage, "request-other", "codex-parent", "turn-7"), false);
+assert.equal(canForkCodexTurn(
+  "codex", { done: true, codexTurnId: "turn-7" }), true);
+assert.equal(canForkCodexTurn(
+  "codex", { done: false, codexTurnId: "turn-7" }), false);
+assert.equal(canForkCodexTurn(
+  "codex", { done: true }), false);
+assert.equal(canForkCodexTurn(
+  "claude", { done: true, codexTurnId: "turn-7" }), false);
 assert.equal(isTerminalWorktreeForkError("wrapper_offline"), false);
+assert.equal(isTerminalWorktreeForkError("fork_reconciling"), false);
 assert.equal(isTerminalWorktreeForkError("internal"), true);
 
 console.log("session worktree tests passed");
