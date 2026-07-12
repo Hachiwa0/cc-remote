@@ -3144,16 +3144,39 @@ class WrapperMachine:
             }, cwd=cwd)
             for archived in (False, True)
         ]
+        candidates: list[dict] = []
         for result in await asyncio.gather(*requests):
             rows = result.get("data") if isinstance(result, dict) else None
             for thread in rows or ():
                 if not isinstance(thread, dict):
                     continue
                 thread_cwd = thread.get("cwd")
-                if (thread.get("forkedFromId") == parent_session_id
-                        and isinstance(thread_cwd, str)
-                        and os.path.realpath(thread_cwd) == os.path.realpath(cwd)):
+                if (not isinstance(thread_cwd, str)
+                        or os.path.realpath(thread_cwd) != os.path.realpath(cwd)):
+                    continue
+                if thread.get("forkedFromId") == parent_session_id:
                     return thread
+                # 0.144.1's state-DB thread/list currently drops forkedFromId,
+                # even though thread/fork and thread/read return it. Keep exact-cwd
+                # candidates and verify their rollout metadata through thread/read.
+                if isinstance(thread.get("id"), str):
+                    candidates.append(thread)
+        if not candidates:
+            return None
+        reads = await asyncio.gather(*[
+            codex_rpc("thread/read", {
+                "threadId": candidate["id"],
+                "includeTurns": False,
+            }, cwd=cwd)
+            for candidate in candidates[:20]
+        ])
+        for candidate, result in zip(candidates, reads):
+            thread = result.get("thread") if isinstance(result, dict) else None
+            if (isinstance(thread, dict)
+                    and thread.get("forkedFromId") == parent_session_id
+                    and isinstance(thread.get("cwd"), str)
+                    and os.path.realpath(thread["cwd"]) == os.path.realpath(cwd)):
+                return thread
         return None
 
     async def _handle_fork_session_worktree(self, cmd):

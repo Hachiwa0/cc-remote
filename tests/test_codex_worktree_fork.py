@@ -119,9 +119,17 @@ def test_codex_worktree_fork_recovers_existing_thread_without_refork(monkeypatch
             if method == "thread/list":
                 return {"data": [{
                     "id": "existing-fork",
-                    "forkedFromId": "parent",
+                    # app-server 0.144.1 omits this field from thread/list even
+                    # though thread/read returns it.
+                    "forkedFromId": None,
                     "cwd": "/state/worktrees/repo/fork-1/component",
                 }] if params["archived"] is False else []}
+            if method == "thread/read":
+                return {"thread": {
+                    "id": "existing-fork",
+                    "forkedFromId": "parent",
+                    "cwd": "/state/worktrees/repo/fork-1/component",
+                }}
             if method == "thread/name/set":
                 return {}
             raise AssertionError("thread/fork must not run during recovery")

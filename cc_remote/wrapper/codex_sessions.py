@@ -24,7 +24,7 @@ _CONFIG = os.path.expanduser("~/.codex/config.toml")
 _CONFIG_MAX_BYTES = 4 * 1024 * 1024
 
 _ROOT = os.path.expanduser("~/.codex/sessions")
-_GLOB = os.path.join(_ROOT, "**", "rollout-*.jsonl")
+_ARCHIVE_ROOT = os.path.expanduser("~/.codex/archived_sessions")
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 MAX_JSONL_RECORD_BYTES = 16 * 1024 * 1024
 MAX_META_RECORD_BYTES = 1024 * 1024
@@ -352,15 +352,23 @@ def _rollout_path(session_id: str) -> Optional[str]:
         if not _SAFE_SESSION_ID.fullmatch(session_id):
             return None
         safe_id = glob.escape(session_id)
-        matches = glob.iglob(
-            os.path.join(_ROOT, "**", f"*{safe_id}*.jsonl"), recursive=True)
-        root = os.path.realpath(_ROOT)
-        for index, match in enumerate(matches):
-            if index >= 1000:
-                break
-            resolved = os.path.realpath(match)
-            if os.path.commonpath((root, resolved)) == root:
-                return match
+        scanned = 0
+        # thread/archive moves the rollout out of ``sessions``. Archived rows
+        # still need history, cwd lookup, and engine detection so unarchive never
+        # falls through to the Claude SDK.
+        for source_root in (_ROOT, _ARCHIVE_ROOT):
+            matches = glob.iglob(
+                os.path.join(source_root, "**", f"*{safe_id}*.jsonl"),
+                recursive=True,
+            )
+            root = os.path.realpath(source_root)
+            for match in matches:
+                if scanned >= 1000:
+                    return None
+                scanned += 1
+                resolved = os.path.realpath(match)
+                if os.path.commonpath((root, resolved)) == root:
+                    return match
         return None
     except Exception:
         return None
