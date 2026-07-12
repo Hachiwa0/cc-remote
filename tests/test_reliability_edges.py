@@ -78,8 +78,11 @@ def test_session_lists_echo_engine_and_are_unicast_to_each_requester(monkeypatch
         calls.append((threading.get_ident(), limit))
         return []
 
+    async def list_codex_sessions(_limit):
+        return []
+
     monkeypatch.setattr(mm, "list_sessions", list_claude_sessions)
-    monkeypatch.setattr(mm, "list_codex_sessions", lambda limit: [])
+    monkeypatch.setattr(mm, "list_codex_sessions", list_codex_sessions)
 
     async def run():
         machine, transport = _mk_machine()

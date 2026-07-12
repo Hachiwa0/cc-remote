@@ -1,23 +1,22 @@
-"""List Codex sessions from ~/.codex/sessions rollout files.
+"""Codex session metadata and rollout helpers.
 
-The Codex analog of the SDK's list_sessions (which only knows Claude sessions
-under ~/.claude/projects/). Codex writes one rollout .jsonl per thread under
-~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl; the first line is a
-`session_meta` record carrying the thread id + cwd. Read-only + best-effort.
+The app-server state DB is authoritative for sidebar metadata such as names and
+archive state. Rollout files remain the source for history, cwd fallback, and
+per-turn settings.
 """
 from __future__ import annotations
 
 import glob
-import heapq
 import json
+import math
 import os
 import re
 import stat
 import tempfile
-from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from cc_remote.log import logger
+from cc_remote.wrapper.codex_rpc import codex_rpc
 
 log = logger("cc_remote.wrapper.codex_sessions")
 
@@ -27,47 +26,117 @@ _CONFIG_MAX_BYTES = 4 * 1024 * 1024
 _ROOT = os.path.expanduser("~/.codex/sessions")
 _GLOB = os.path.join(_ROOT, "**", "rollout-*.jsonl")
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
-MAX_DISCOVERY_FILES = 20_000
 MAX_JSONL_RECORD_BYTES = 16 * 1024 * 1024
 MAX_META_RECORD_BYTES = 1024 * 1024
+_LIST_PAGE_SIZE = 100
+_LIST_MAX_PER_ARCHIVE_STATE = 200
+_LIST_MAX_PAGES = 20
+_THREAD_STATUSES = frozenset({"notLoaded", "idle", "systemError", "active"})
 
 
-def list_codex_sessions(limit: int = 60) -> list[dict]:
-    """Most-recently-modified Codex sessions -> [{session_id, cwd, last_modified,
-    first_prompt}]. Sorted newest first."""
-    limit = max(1, min(limit, 200))
-    cur = codex_current_provider().strip()
-    newest: list[tuple[float, str, dict]] = []
-    try:
-        paths = glob.iglob(_GLOB, recursive=True)
-        for scanned, path in enumerate(paths, 1):
-            if scanned > MAX_DISCOVERY_FILES:
-                log.warning("codex session discovery capped",
-                            files=MAX_DISCOVERY_FILES)
+async def list_codex_sessions(limit: int = 60) -> list[dict[str, Any]]:
+    """List active and archived app-server threads, newest first.
+
+    ``limit`` is applied independently to active and archived threads so a busy
+    active list cannot make the archived group disappear. Both result sets are
+    bounded and paginated with opaque app-server cursors.
+    """
+    per_state_limit = max(1, min(limit, _LIST_MAX_PER_ARCHIVE_STATE))
+    provider = codex_current_provider().strip()
+    by_id: dict[str, dict[str, Any]] = {}
+
+    for archived in (False, True):
+        cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+        received = 0
+        for _ in range(_LIST_MAX_PAGES):
+            remaining = per_state_limit - received
+            if remaining <= 0:
                 break
-            meta = _read_meta(path)
-            if not meta or not meta.get("id"):
-                continue
-            prov = (meta.get("model_provider") or "").strip()
-            if cur and prov and prov != cur:
-                continue
-            item = (_mtime(path), path, meta)
-            if len(newest) < limit:
-                heapq.heappush(newest, item)
-            elif item[0] > newest[0][0]:
-                heapq.heapreplace(newest, item)
-    except Exception:
-        return []
-    files = sorted(newest, reverse=True)
-    out: list[dict] = []
-    for _, path, meta in files:
-        out.append({
-            "session_id": meta["id"],
-            "cwd": meta.get("cwd"),
-            "last_modified": _mtime_iso(path),
-            "first_prompt": _first_user_prompt(path),
-        })
-    return out
+            params: dict[str, Any] = {
+                "limit": min(_LIST_PAGE_SIZE, remaining),
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "archived": archived,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            if provider:
+                params["modelProviders"] = [provider]
+
+            response = await codex_rpc("thread/list", params)
+            if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+                raise RuntimeError("codex thread/list returned an invalid response")
+            page = response["data"][:remaining]
+            received += len(page)
+            for thread in page:
+                normalized = _normalize_thread(thread, archived=archived)
+                if normalized is not None:
+                    by_id[normalized["session_id"]] = normalized
+
+            next_cursor = response.get("nextCursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                raise RuntimeError("codex thread/list repeated its pagination cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+    return sorted(
+        by_id.values(), key=lambda item: _updated_sort_key(item.get("last_modified")),
+        reverse=True,
+    )
+
+
+def _normalize_thread(thread: Any, *, archived: bool) -> Optional[dict[str, Any]]:
+    if not isinstance(thread, dict):
+        return None
+    session_id = thread.get("id")
+    if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(session_id):
+        return None
+
+    git_info = thread.get("gitInfo")
+    branch = git_info.get("branch") if isinstance(git_info, dict) else None
+    forked_from = thread.get("forkedFromId")
+    if not isinstance(forked_from, str) or not _SAFE_SESSION_ID.fullmatch(forked_from):
+        forked_from = None
+    raw_status = thread.get("status")
+    status = raw_status.get("type") if isinstance(raw_status, dict) else None
+    if status not in _THREAD_STATUSES:
+        status = None
+
+    updated_at = thread.get("updatedAt")
+    if (isinstance(updated_at, bool) or not isinstance(updated_at, (int, float))
+            or not math.isfinite(updated_at) or updated_at < 0):
+        last_modified = None
+    else:
+        last_modified = str(updated_at)
+
+    return {
+        "session_id": session_id,
+        "summary": _bounded_text(thread.get("name"), 500),
+        "first_prompt": _bounded_text(thread.get("preview"), 2000),
+        "cwd": _bounded_text(thread.get("cwd"), 4096),
+        "last_modified": last_modified,
+        "git_branch": _bounded_text(branch, 500),
+        "forked_from_id": forked_from,
+        "status": status,
+        "tag": "archived" if archived else None,
+    }
+
+
+def _bounded_text(value: Any, limit: int) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    return value[:limit] or None
+
+
+def _updated_sort_key(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return -1.0
+    return parsed if math.isfinite(parsed) else -1.0
 
 
 def codex_session_cwd(session_id: str) -> Optional[str]:
@@ -311,30 +380,6 @@ def _read_meta(path: str) -> Optional[dict]:
     return None
 
 
-def _first_user_prompt(path: str, max_lines: int = 80) -> Optional[str]:
-    """First real user text — skips the <environment_context>/<permissions>
-    envelope messages Codex injects."""
-    try:
-        with open(path) as f:
-            for _, line in zip(range(max_lines), _bounded_lines(
-                    f, MAX_JSONL_RECORD_BYTES)):
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if d.get("type") != "response_item":
-                    continue
-                p = d.get("payload") or {}
-                if p.get("type") == "message" and p.get("role") == "user":
-                    for c in (p.get("content") or []):
-                        t = c.get("text") if isinstance(c, dict) else None
-                        if t and not t.lstrip().startswith("<"):
-                            return " ".join(t.split())[:100]
-    except Exception:
-        pass
-    return None
-
-
 def _bounded_lines(file, max_record_bytes: int):
     """Yield complete JSONL records without ever allocating one unbounded line."""
     while True:
@@ -348,17 +393,3 @@ def _bounded_lines(file, max_record_bytes: int):
         # Oversized record: consume bounded chunks through its newline and skip it.
         while line and not line.endswith("\n"):
             line = file.readline(max_record_bytes + 1)
-
-
-def _mtime(path: str) -> float:
-    try:
-        return os.path.getmtime(path)
-    except Exception:
-        return 0.0
-
-
-def _mtime_iso(path: str) -> Optional[str]:
-    try:
-        return datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc).isoformat()
-    except Exception:
-        return None

@@ -32,6 +32,7 @@ PROTOCOL_VERSION = 5
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
+CodexThreadStatus = Literal["notLoaded", "idle", "systemError", "active"]
 EffortLevel = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ]
@@ -477,6 +478,8 @@ class SessionInfo(BaseModel):
     tag: Optional[str] = None  # SDK session tag; "archived" hides the card in the sidebar
     state: Optional[State] = None  # if resident: this session's idle/running/... (sidebar status dot)
     engine: Optional[str] = None  # "claude" | "codex"; None = claude (legacy sidebar badge)
+    forked_from_id: Optional[WireId] = None  # Codex thread/fork parent, when present
+    codex_status: Optional[CodexThreadStatus] = None  # authoritative app-server status
 
 
 class ListSessions(_Command):

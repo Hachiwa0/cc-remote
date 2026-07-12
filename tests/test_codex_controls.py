@@ -1081,41 +1081,110 @@ def test_failed_fast_config_write_does_not_mutate_handles(monkeypatch):
     asyncio.run(run())
 
 
-def test_codex_rename_and_archive_never_call_claude_sdk(monkeypatch):
+def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sessions(
+        monkeypatch):
     async def run():
         machine, transport = _mk_machine()
         ctx = _control_ctx("codex-id", "codex")
         machine.sessions = {"codex-id": ctx}
-        called = []
+        rpc_calls = []
+        refreshes = []
 
-        def rename(*args):
-            called.append(("rename", args))
+        async def rpc(method, params, cwd=None):
+            rpc_calls.append((method, params, cwd))
+            return {}
 
-        def tag(*args):
-            called.append(("tag", args))
+        async def refresh(cmd):
+            refreshes.append(cmd)
 
-        monkeypatch.setattr(machine_module, "rename_session", rename)
-        monkeypatch.setattr(machine_module, "tag_session", tag)
-        await machine._handle_rename_session(SimpleNamespace(
-            session_id="codex-id", title="new"))
-        await machine._handle_archive_session(SimpleNamespace(
-            session_id="codex-id", archived=True))
+        def claude_only(*_args, **_kwargs):
+            raise AssertionError("Codex control must not call the Claude SDK")
 
-        # Sidebar rows need not be resident. A rollout match must still keep a
-        # stale/hostile client command away from the Claude SDK.
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        monkeypatch.setattr(machine_module, "rename_session", claude_only)
+        monkeypatch.setattr(machine_module, "tag_session", claude_only)
+        machine._list_codex_sessions = refresh
+
+        rename_hot = SimpleNamespace(session_id="codex-id", title="new")
+        archive_hot = SimpleNamespace(session_id="codex-id", archived=True)
+        await machine._handle_rename_session(rename_hot)
+        await machine._handle_archive_session(archive_hot)
+
+        # Sidebar rows need not be resident. A rollout match still routes the
+        # mutation through the app-server instead of the Claude SDK.
         machine.sessions.clear()
         monkeypatch.setattr(
             machine_module, "codex_rollout_path",
             lambda session_id: "/tmp/rollout.jsonl"
             if session_id == "cold-codex-id" else None,
         )
-        await machine._handle_rename_session(SimpleNamespace(
-            session_id="cold-codex-id", title="new"))
+        rename_cold = SimpleNamespace(
+            session_id="cold-codex-id", title="cold new")
+        unarchive_cold = SimpleNamespace(
+            session_id="cold-codex-id", archived=False)
+        await machine._handle_rename_session(rename_cold)
+        await machine._handle_archive_session(unarchive_cold)
 
-        assert called == []
-        errors = [message for message in transport.sent if message.type == "error"]
-        assert len(errors) == 3
-        assert all("Codex app-server" in message.message for message in errors)
+        assert rpc_calls == [
+            ("thread/name/set", {"threadId": "codex-id", "name": "new"}, None),
+            ("thread/archive", {"threadId": "codex-id"}, None),
+            (
+                "thread/name/set",
+                {"threadId": "cold-codex-id", "name": "cold new"},
+                None,
+            ),
+            ("thread/unarchive", {"threadId": "cold-codex-id"}, None),
+        ]
+        assert refreshes == [rename_hot, archive_hot, rename_cold, unarchive_cold]
+        assert not [message for message in transport.sent if message.type == "error"]
+
+    asyncio.run(run())
+
+
+def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        resident = _control_ctx("resident-id", "codex")
+        resident.state = "interrupting"
+        machine.sessions = {"resident-id": resident}
+
+        async def listed(_limit):
+            return [
+                {
+                    "session_id": "resident-id",
+                    "summary": "resident",
+                    "first_prompt": "prompt",
+                    "cwd": "/repo",
+                    "last_modified": "20",
+                    "git_branch": "main",
+                    "tag": None,
+                    "forked_from_id": "parent-id",
+                    "status": "active",
+                },
+                {
+                    "session_id": "cold-id",
+                    "summary": "cold",
+                    "first_prompt": None,
+                    "cwd": "/cold",
+                    "last_modified": "10",
+                    "git_branch": None,
+                    "tag": "archived",
+                    "forked_from_id": None,
+                    "status": "active",
+                },
+            ]
+
+        monkeypatch.setattr(machine_module, "list_codex_sessions", listed)
+        await machine._list_codex_sessions(SimpleNamespace(client_id="client-1"))
+
+        session_list = transport.sent[-1]
+        assert session_list.type == "session_list"
+        assert session_list.engine == "codex" and session_list.to == "client-1"
+        hot, cold = session_list.sessions
+        assert hot.summary == "resident" and hot.git_branch == "main"
+        assert hot.forked_from_id == "parent-id" and hot.codex_status == "active"
+        assert hot.state == "interrupting"
+        assert cold.tag == "archived" and cold.state == "running"
 
     asyncio.run(run())
 

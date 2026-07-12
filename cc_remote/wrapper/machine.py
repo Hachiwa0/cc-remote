@@ -84,6 +84,7 @@ from cc_remote.wrapper.codex_sessions import (
     codex_session_settings, set_codex_config_fast, codex_fast_enabled,
 )
 from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
+from cc_remote.wrapper.codex_rpc import codex_rpc
 from cc_remote.wrapper.codex_external import (
     ProcessIdentity, parse_turn_markers, process_identity,
     writable_rollout_holders,
@@ -96,6 +97,14 @@ CLAUDE_PERMISSION_MODES = frozenset({
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
 })
 CODEX_PERMISSION_MODES = frozenset({"never", "on-request", "untrusted"})
+
+
+def _codex_list_state(status: Optional[str]) -> Optional[State]:
+    if status == "active":
+        return "running"
+    if status == "idle":
+        return "idle"
+    return None
 
 
 class _BtwSpawnFailure(Exception):
@@ -2769,19 +2778,25 @@ class WrapperMachine:
             await self._emit_focused(Error(code=ERR_INTERNAL, message=f"list_sessions failed: {e}"))
 
     async def _list_codex_sessions(self, cmd) -> None:
-        """Sidebar list for the Codex engine: threads from ~/.codex/sessions."""
+        """Sidebar list from the app-server's authoritative thread state DB."""
         try:
-            raw = await asyncio.to_thread(list_codex_sessions, 60)
+            raw = await list_codex_sessions(60)
             resident_state = {c.session_id: c.state for c in self.sessions.values()
                               if c.session_id and c.engine == "codex"}
             sessions = [
                 SessionInfo(
                     session_id=r["session_id"],
+                    summary=r.get("summary"),
                     first_prompt=r.get("first_prompt"),
                     cwd=r.get("cwd"),
                     last_modified=r.get("last_modified"),
+                    git_branch=r.get("git_branch"),
+                    tag=r.get("tag"),
                     engine="codex",
-                    state=resident_state.get(r["session_id"]),
+                    state=(resident_state.get(r["session_id"])
+                           or _codex_list_state(r.get("status"))),
+                    forked_from_id=r.get("forked_from_id"),
+                    codex_status=r.get("status"),
                 )
                 for r in raw
             ]
@@ -3028,10 +3043,17 @@ class WrapperMachine:
     async def _handle_rename_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         if await self._is_codex_session(sid):
-            await self._emit_to_sid(sid, Error(
-                code=ERR_INTERNAL,
-                message="当前 Codex app-server 不支持重命名会话",
-            ))
+            try:
+                await codex_rpc("thread/name/set", {
+                    "threadId": sid, "name": cmd.title,
+                })
+                log.info("codex session renamed", session_id=sid,
+                         title_length=len(cmd.title))
+                await self._list_codex_sessions(cmd)
+            except Exception as e:
+                log.exception("codex rename_session failed", error=str(e))
+                await self._emit_to_sid(sid, Error(
+                    code=ERR_INTERNAL, message=f"rename failed: {e}"))
             return
         try:
             await asyncio.to_thread(rename_session, sid, cmd.title)
@@ -3047,10 +3069,16 @@ class WrapperMachine:
     async def _handle_archive_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         if await self._is_codex_session(sid):
-            await self._emit_to_sid(sid, Error(
-                code=ERR_INTERNAL,
-                message="当前 Codex app-server 不支持归档会话",
-            ))
+            method = "thread/archive" if cmd.archived else "thread/unarchive"
+            try:
+                await codex_rpc(method, {"threadId": sid})
+                log.info("codex session archive toggled", session_id=sid,
+                         archived=cmd.archived)
+                await self._list_codex_sessions(cmd)
+            except Exception as e:
+                log.exception("codex archive_session failed", error=str(e))
+                await self._emit_to_sid(sid, Error(
+                    code=ERR_INTERNAL, message=f"archive failed: {e}"))
             return
         try:
             tag = "archived" if cmd.archived else None
