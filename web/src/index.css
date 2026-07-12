@@ -627,6 +627,7 @@ body{
   border:1px solid var(--border); border-radius:14px; box-shadow:var(--shadow); padding:5px; }
 .card-menu button{ display:flex; align-items:center; gap:9px; width:100%; text-align:left; padding:8px 10px; border-radius:8px; font-size:13px; color:var(--text); }
 .card-menu button:hover{ background:var(--accent-weak); }
+.card-menu button:disabled{ opacity:.42; cursor:not-allowed; background:transparent; }
 .card-menu button svg{ width:15px; height:15px; flex:none; color:var(--dim); }
 .scard.archived{ opacity:.55; }
 .scard.menu-open{ z-index:6; }

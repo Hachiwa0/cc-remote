@@ -727,6 +727,7 @@ function reduceEvent(
       });
     case "pong":
     case "command_ack":
+    case "session_forked":
     case "hello":
       return state;
   }

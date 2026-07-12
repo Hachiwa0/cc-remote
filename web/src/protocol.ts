@@ -54,6 +54,20 @@ export interface Fast extends Base { type: "fast"; on: boolean }
 export interface OpenBtw extends Base { type: "open_btw"; request_id: string; client_id?: string }
 export interface CloseBtw extends Base { type: "close_btw" }
 export interface BtwOpened extends Base { type: "btw_opened"; request_id: string; btw_sid: string; parent_sid: string; engine: string }
+export interface ForkSessionWorktree extends Base {
+  type: "fork_session_worktree";
+  session_id: string;
+  name: string;
+  request_id: string;
+}
+export interface SessionForked extends Base {
+  type: "session_forked";
+  parent_session_id: string;
+  session_id: string;
+  cwd: string;
+  git_branch: string;
+  request_id: string;
+}
 export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string }
@@ -210,7 +224,7 @@ export interface ContextReport extends Base {
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History | Models | TakeoverState
   | AskUser | GoalState | StatusReport
-  | SessionList | SessionFocus | SessionRekey
+  | SessionList | SessionFocus | SessionRekey | SessionForked
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
@@ -225,6 +239,21 @@ export function makeOpenBtwCommand(
     v: PROTOCOL_VERSION,
     type: "open_btw",
     sid: parentSid,
+    request_id: requestId,
+    ts,
+  };
+}
+
+/** Build the correlated command used to persistently fork a Codex session into
+ * a new Git worktree. The wrapper owns worktree creation and name validation. */
+export function makeForkSessionWorktreeCommand(
+  sessionId: string, name: string, requestId: string, ts: number,
+): ForkSessionWorktree {
+  return {
+    v: PROTOCOL_VERSION,
+    type: "fork_session_worktree",
+    session_id: sessionId,
+    name,
     request_id: requestId,
     ts,
   };

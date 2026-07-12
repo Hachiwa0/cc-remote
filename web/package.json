@@ -11,7 +11,7 @@
     "lint": "oxlint",
     "test:compile": "tsc -p tsconfig.tests.json",
     "test:outbox": "npm run test:compile --silent && node node_modules/.tmp/cc-remote-tests/tests/outbox.test.js",
-    "test:reliability": "npm run test:compile --silent && node node_modules/.tmp/cc-remote-tests/tests/outbox.test.js && node node_modules/.tmp/cc-remote-tests/tests/reliability.test.js && node node_modules/.tmp/cc-remote-tests/tests/goal-command.test.js && node node_modules/.tmp/cc-remote-tests/tests/status-capabilities.test.js",
+    "test:reliability": "npm run test:compile --silent && node node_modules/.tmp/cc-remote-tests/tests/outbox.test.js && node node_modules/.tmp/cc-remote-tests/tests/reliability.test.js && node node_modules/.tmp/cc-remote-tests/tests/goal-command.test.js && node node_modules/.tmp/cc-remote-tests/tests/status-capabilities.test.js && node node_modules/.tmp/cc-remote-tests/tests/session-worktree.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

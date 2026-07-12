@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type TouchEvent } from "react";
 import type { SessionInfo, State } from "../protocol";
 import { Icon, ClaudeMark } from "../icons";
+import { isWorktreeForkBlockedByState, sessionMenuCapabilities } from "../session-worktree";
 
 interface Props {
   open: boolean;
@@ -15,6 +16,7 @@ interface Props {
   onClose: () => void;
   onRename: (id: string, title: string) => void;
   onArchive: (id: string, archived: boolean) => void;
+  onForkWorktree: (session: SessionInfo) => void;
 }
 
 function basename(cwd?: string | null): string {
@@ -23,7 +25,7 @@ function basename(cwd?: string | null): string {
   return parts[parts.length - 1] || cwd;
 }
 
-export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive }: Props) {
+export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive, onForkWorktree }: Props) {
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
@@ -67,6 +69,10 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
   };
   const doArchive = (s: SessionInfo, archived: boolean) => {
     onArchive(s.session_id, archived);
+    setMenuCardId(null); setLifting(false);
+  };
+  const doForkWorktree = (s: SessionInfo) => {
+    onForkWorktree(s);
     setMenuCardId(null); setLifting(false);
   };
   const doCopyId = (s: SessionInfo) => {
@@ -120,6 +126,7 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
     const isActive = s.session_id === activeSessionId;
     const isArchived = s.tag === "archived";
     const isMenu = menuCardId === s.session_id;
+    const capabilities = sessionMenuCapabilities(s);
     if (renaming && renaming.id === s.session_id) {
       return (
         <div key={s.session_id} className={"scard" + (isActive ? " active" : "")}>
@@ -145,6 +152,7 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
     };
     // Prefer live runtime state (resident session) over the list snapshot.
     const st = liveStates?.[s.session_id] ?? s.state;
+    const forkBlocked = isWorktreeForkBlockedByState(st);
     return (
       <div
         key={s.session_id}
@@ -173,11 +181,17 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
         </div>
         {isMenu && (
           <div className="card-menu" onClick={(e) => e.stopPropagation()}>
-            {s.engine !== "codex" && (
+            {capabilities.rename && (
               <button onClick={() => startRename(s)}><Icon name="edit" size={15} />重命名</button>
             )}
+            {capabilities.forkWorktree && (
+              <button onClick={() => doForkWorktree(s)} disabled={forkBlocked}
+                title={forkBlocked ? "请等待当前任务结束" : "从当前 Git HEAD 创建新工作树"}>
+                <Icon name="branch" size={15} />派生到新工作树…
+              </button>
+            )}
             <button onClick={() => doCopyId(s)}><Icon name={copiedId === s.session_id ? "check" : "copy"} size={15} />{copiedId === s.session_id ? "已复制" : "复制 session ID"}</button>
-            {s.engine !== "codex" && (isArchived ? (
+            {capabilities.archive && (isArchived ? (
               <button onClick={() => doArchive(s, false)}><Icon name="archive" size={15} />取消归档</button>
             ) : (
               <button onClick={() => doArchive(s, true)}><Icon name="archive" size={15} />归档</button>

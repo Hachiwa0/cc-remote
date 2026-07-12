@@ -8,7 +8,7 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type { ServerEvent, QueryImg, QueryFile } from "./protocol.ts";
-import { makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
+import { makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
 import { CommandOutbox, planRecoveryReplay } from "./outbox.ts";
 import { probeSession, shouldReconnectAfterSessionProbe } from "./session-auth.ts";
 import { uuid } from "./util.ts";
@@ -260,6 +260,15 @@ export class RelayWs {
   sendCloseBtw(btwSid: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs() });
   }
+
+  sendForkSessionWorktree(parentSessionId: string, name: string,
+                          requestId = uuid()): string | null {
+    const queued = this.send({
+      ...makeForkSessionWorktreeCommand(parentSessionId, name, requestId, nowTs()),
+    });
+    return queued ? requestId : null;
+  }
+
   // a turn targeted at an explicit sid (the btw fork), NOT the focused session.
   sendQueryTo(sid: string, prompt: string, msg_id: string,
               images?: QueryImg[], files?: QueryFile[]): boolean {

@@ -15,13 +15,15 @@ import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { GoalPanel } from "./components/GoalPanel";
 import { StatusSheet } from "./components/StatusSheet";
+import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { parseGoalCommand } from "./goal-command";
 import { defaultModelFor, defaultEffortFor, permsFor } from "./data";
 import { shouldAcceptSessionList } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
 import { collectWaitingQueries, selectDrainCandidates } from "./runtime-drain";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
-import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest, type Snapshot, type QueryImg, type QueryFile } from "./protocol";
+import { matchesWorktreeForkRequest, type PendingWorktreeFork } from "./session-worktree";
+import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest, type Snapshot, type QueryImg, type QueryFile, type SessionInfo } from "./protocol";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -51,6 +53,9 @@ export default function App() {
   // Keep reveal/editor state per session so switching sessions never leaks it.
   const [goalUiBySid, setGoalUiBySid] = useState<Record<string, { revealed: boolean; open: boolean }>>({});
   const [statusOpenSid, setStatusOpenSid] = useState<string | null>(null);
+  const [forkWorktreeSession, setForkWorktreeSession] = useState<SessionInfo | null>(null);
+  const [forkWorktreeCreating, setForkWorktreeCreating] = useState(false);
+  const [forkWorktreeError, setForkWorktreeError] = useState<string | null>(null);
   const [state, dispatch] = useReducer(reduce, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -58,6 +63,7 @@ export default function App() {
   const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
   const pendingBtwRef = useRef<string | null>(null);
+  const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
   const activeBtwRef = useRef<{ requestId: string; sid: string } | null>(null);
   // Retain recently cancelled ids so a late response can be identified and
   // discarded (and a late successful fork can be closed) without disturbing a
@@ -213,6 +219,30 @@ export default function App() {
             pendingBtwRef.current = null;
             setBtwOpening(false);
           }
+          if (msg.type === "session_forked") {
+            if (!matchesWorktreeForkRequest(
+                pendingWorktreeForkRef.current, msg.request_id, msg.parent_session_id)) return;
+            pendingWorktreeForkRef.current = null;
+            setForkWorktreeCreating(false);
+            setForkWorktreeError(null);
+            setForkWorktreeSession(null);
+            setEngine("codex");
+            dispatch({ type: "exit_new_chat" });
+            dispatch({ type: "focus_session", sid: msg.session_id });
+            ws.setSessionEngines([{ session_id: msg.session_id, engine: "codex" }]);
+            ws.setFocusedSid(msg.session_id, "codex");
+            ws.sendListSessions("codex");
+            ws.sendSwitchSession(msg.session_id, "codex");
+            if (isMobile()) setSidebarOpen(false);
+            return;
+          }
+          if (msg.type === "error" && matchesWorktreeForkRequest(
+              pendingWorktreeForkRef.current, msg.request_id)) {
+            pendingWorktreeForkRef.current = null;
+            setForkWorktreeCreating(false);
+            setForkWorktreeError(msg.message);
+            return;
+          }
           if (msg.type === "session_focus" && msg.request_id
               && msg.request_id === pendingCreateRef.current) {
             pendingCreateRef.current = null;
@@ -270,10 +300,14 @@ export default function App() {
           clearLegacyAuthMarkers(localStorage);
           pendingCreateRef.current = null;
           pendingBtwRef.current = null;
+          pendingWorktreeForkRef.current = null;
           activeBtwRef.current = null;
           btwRequestIdsRef.current.clear();
           discardedBtwSidsRef.current.clear();
           setBtwOpening(false);
+          setForkWorktreeSession(null);
+          setForkWorktreeCreating(false);
+          setForkWorktreeError(null);
           setGoalUiBySid({});
           setStatusOpenSid(null);
           dispatch({ type: "reset" });
@@ -564,6 +598,31 @@ export default function App() {
     setStatusOpenSid(focusedSid);
     wsRef.current?.sendGetStatus();
   };
+  const openForkWorktree = (session: SessionInfo) => {
+    if (pendingWorktreeForkRef.current) return;
+    setForkWorktreeError(null);
+    setForkWorktreeSession(session);
+  };
+  const submitForkWorktree = (name: string) => {
+    const source = forkWorktreeSession;
+    if (!source || pendingWorktreeForkRef.current) return;
+    setForkWorktreeError(null);
+    const requestId = wsRef.current?.sendForkSessionWorktree(source.session_id, name) ?? null;
+    if (!requestId) {
+      setForkWorktreeError("请求未发送，请等待连接恢复后重试。");
+      return;
+    }
+    pendingWorktreeForkRef.current = {
+      requestId,
+      parentSessionId: source.session_id,
+    };
+    setForkWorktreeCreating(true);
+  };
+  const closeForkWorktree = () => {
+    if (pendingWorktreeForkRef.current) return;
+    setForkWorktreeSession(null);
+    setForkWorktreeError(null);
+  };
   const getDiff = (file: string) => {
     setRightView("diff");
     dispatch({ type: "open_artifact_loading", file, sid: focusedSid });
@@ -612,10 +671,14 @@ export default function App() {
       wsRef.current?.stop();
       pendingCreateRef.current = null;
       pendingBtwRef.current = null;
+      pendingWorktreeForkRef.current = null;
       activeBtwRef.current = null;
       btwRequestIdsRef.current.clear();
       discardedBtwSidsRef.current.clear();
       setCreateError(null);
+      setForkWorktreeSession(null);
+      setForkWorktreeCreating(false);
+      setForkWorktreeError(null);
       dispatch({ type: "reset" });
       setAuthed(false);
     } catch {
@@ -636,6 +699,7 @@ export default function App() {
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title)}
         onArchive={(id, archived) => { dispatch({ type: "set_session_tag", sid: id, tag: archived ? "archived" : null }); wsRef.current?.sendArchiveSession(id, archived); }}
+        onForkWorktree={openForkWorktree}
       />
       <DirPicker
         open={dirPickerOpen}
@@ -777,6 +841,9 @@ export default function App() {
       <StatusSheet open={statusOpenSid === focusedSid} report={rt.statusReport}
         onClose={() => setStatusOpenSid(null)}
         onRefresh={() => wsRef.current?.sendGetStatus()} />
+      <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
+        creating={forkWorktreeCreating} error={forkWorktreeError}
+        onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
     </div>
   );
 }
