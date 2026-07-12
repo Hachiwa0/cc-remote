@@ -52,7 +52,7 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
   return {
     ...history,
     id: live.id,
-    codexTurnId: history.codexTurnId ?? live.codexTurnId,
+    forkPointId: history.forkPointId ?? live.forkPointId,
     prompt: history.prompt || live.prompt,
     blocks: mergeBlocks(history.blocks, live.blocks),
     // A transcript has no ResultMessage, so its EOF is represented by a

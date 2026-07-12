@@ -9,12 +9,21 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+
 from cc_remote.protocol import (
     serialize, deserialize,
     GetHistory, History, UserMsg, AssistantMsgStart, Delta, TurnEnd, TurnResult,
 )
 from cc_remote.wrapper import machine as mm
-from cc_remote.wrapper.stream import translate_history
+from cc_remote.wrapper.stream import StreamTranslator, translate_history
 from tests.test_multisession import _mk_machine, _mk_ctx
 
 
@@ -287,6 +296,129 @@ def test_translate_history_stamps_real_timestamps():
     assert te.ts == 1005.0        # answer-done = last (assistant) message time
     # missing timestamps must not crash (falls back to the _Base default)
     assert any(e.type == "user_msg" for e in translate_history(msgs, 10000))
+
+
+def test_live_claude_turn_end_uses_last_assistant_transcript_uuid():
+    """Tools can split one turn across several assistant transcript records.
+
+    The branch point is the final transcript UUID, never the API message id.
+    """
+    first_uuid = "11111111-1111-4111-8111-111111111111"
+    final_uuid = "22222222-2222-4222-8222-222222222222"
+    translator = StreamTranslator(10_000)
+
+    translator.feed(AssistantMessage(
+        content=[ToolUseBlock(id="tool-1", name="Read", input={"path": "x"})],
+        model="claude-test",
+        message_id="api-message-id",
+        uuid=first_uuid,
+    ))
+    translator.feed(UserMessage(
+        content=[ToolResultBlock(tool_use_id="tool-1", content="ok")],
+        uuid="33333333-3333-4333-8333-333333333333",
+    ))
+    translator.feed(AssistantMessage(
+        content=[TextBlock(text="done")],
+        model="claude-test",
+        message_id="same-or-new-api-id",
+        uuid=final_uuid,
+    ))
+    events = translator.feed(ResultMessage(
+        subtype="success",
+        duration_ms=10,
+        duration_api_ms=9,
+        is_error=False,
+        num_turns=2,
+        session_id="session-1",
+    ))
+
+    terminal = next(event for event in events if isinstance(event, TurnEnd))
+    assert terminal.turn_id == final_uuid
+    assert terminal.turn_id not in {"api-message-id", "same-or-new-api-id"}
+
+
+def test_live_claude_turn_end_does_not_publish_non_uuid_fallback():
+    translator = StreamTranslator(10_000)
+    translator.feed(AssistantMessage(
+        content=[TextBlock(text="partial")],
+        model="claude-test",
+        message_id="api-message-id",
+        uuid=None,
+    ))
+    events = translator.feed(ResultMessage(
+        subtype="error_during_execution",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="session-1",
+    ))
+
+    assert next(event for event in events if isinstance(event, TurnEnd)).turn_id is None
+
+
+def test_claude_history_turn_end_uses_final_assistant_uuid_after_tools():
+    first_uuid = "44444444-4444-4444-8444-444444444444"
+    final_uuid = "55555555-5555-4555-8555-555555555555"
+    messages = [
+        SimpleNamespace(
+            uuid="66666666-6666-4666-8666-666666666666",
+            type="user",
+            message={"role": "user", "content": "run it"},
+        ),
+        SimpleNamespace(
+            uuid=first_uuid,
+            type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use", "id": "tool-1", "name": "Read",
+                "input": {"path": "x"},
+            }]},
+        ),
+        SimpleNamespace(
+            uuid="77777777-7777-4777-8777-777777777777",
+            type="user",
+            message={"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "tool-1", "content": "ok",
+            }]},
+        ),
+        SimpleNamespace(
+            uuid=final_uuid,
+            type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "text", "text": "done",
+            }]},
+        ),
+    ]
+
+    terminals = [
+        event for event in translate_history(messages, 10_000)
+        if isinstance(event, TurnEnd)
+    ]
+    assert len(terminals) == 1
+    assert terminals[0].turn_id == final_uuid
+
+
+def test_claude_history_never_uses_repaired_legacy_id_as_fork_point():
+    messages = [
+        SimpleNamespace(
+            uuid="88888888-8888-4888-8888-888888888888",
+            type="user",
+            message={"role": "user", "content": "hello"},
+        ),
+        SimpleNamespace(
+            uuid="",
+            type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "text", "text": "answer",
+            }]},
+        ),
+    ]
+
+    terminal = next(
+        event for event in translate_history(messages, 10_000)
+        if isinstance(event, TurnEnd)
+    )
+    assert terminal.turn_id is None
 
 
 def test_legacy_history_repairs_missing_message_and_tool_ids_stably():

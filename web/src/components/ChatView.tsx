@@ -3,7 +3,7 @@ import type { Turn, Block, TextBlock, ToolBlock } from "../reducer";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
-import { canForkCodexTurn } from "../session-worktree";
+import { canForkTurn } from "../session-worktree";
 
 type Segment = { kind: "text"; block: TextBlock } | { kind: "tools"; tools: ToolBlock[] };
 
@@ -30,7 +30,7 @@ function formatTime(ts: number): string {
 }
 
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
-  onLoadMore, onEdit, onGetDiff, onFork, forkingTurnId }: {
+  onLoadMore, onEdit, onGetDiff, onFork, forkingPointId }: {
   sid: string | null;
   turns: Turn[];
   engine?: "claude" | "codex";
@@ -39,8 +39,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onLoadMore?: () => void;
   onEdit: (prompt: string) => void;
   onGetDiff: (file: string) => void;
-  onFork?: (lastTurnId: string) => void;
-  forkingTurnId?: string | null;
+  onFork?: (forkPointId: string) => void;
+  forkingPointId?: string | null;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -200,12 +200,12 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                     <div className="ubub-meta ai-meta">
                       {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
                       <button className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")} onClick={() => copyText(t.id + "-ai", aiText(t))} aria-label="复制"><Icon name="check" size={13} /></button>
-                      {onFork && canForkCodexTurn(engine, t) && (
+                      {onFork && canForkTurn(engine, t) && (
                         <button className="ubub-act" aria-label="派生"
                           data-tooltip="从此回复派生新会话"
-                          aria-busy={forkingTurnId === t.codexTurnId}
-                          disabled={!!forkingTurnId}
-                          onClick={() => onFork(t.codexTurnId)}>
+                          aria-busy={forkingPointId === t.forkPointId}
+                          disabled={!!forkingPointId}
+                          onClick={() => onFork(t.forkPointId)}>
                           <Icon name="branch" size={13} />
                         </button>
                       )}

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { SessionInfo } from "../src/protocol.ts";
 import { makeForkSessionCommand, makeForkSessionWorktreeCommand } from "../src/protocol.ts";
 import {
-  canForkCodexTurn,
+  canForkTurn,
   isWorktreeForkNameValid,
   isWorktreeForkBlockedByState,
   isTerminalWorktreeForkError,
@@ -76,7 +76,8 @@ assert.equal(matchesWorktreeForkRequest(null, "request-1"), false);
 const pendingMessage = {
   requestId: "request-message",
   parentSessionId: "codex-parent",
-  lastTurnId: "turn-7",
+  forkPointId: "turn-7",
+  engine: "codex" as const,
 };
 assert.equal(matchesSessionForkRequest(
   pendingMessage, "request-message", "codex-parent", "turn-7"), true);
@@ -86,14 +87,16 @@ assert.equal(matchesSessionForkRequest(
   pendingMessage, "request-message", "codex-parent"), true);
 assert.equal(matchesSessionForkRequest(
   pendingMessage, "request-other", "codex-parent", "turn-7"), false);
-assert.equal(canForkCodexTurn(
-  "codex", { done: true, codexTurnId: "turn-7" }), true);
-assert.equal(canForkCodexTurn(
-  "codex", { done: false, codexTurnId: "turn-7" }), false);
-assert.equal(canForkCodexTurn(
+assert.equal(canForkTurn(
+  "codex", { done: true, forkPointId: "turn-7" }), true);
+assert.equal(canForkTurn(
+  "codex", { done: false, forkPointId: "turn-7" }), false);
+assert.equal(canForkTurn(
   "codex", { done: true }), false);
-assert.equal(canForkCodexTurn(
-  "claude", { done: true, codexTurnId: "turn-7" }), false);
+assert.equal(canForkTurn(
+  "claude", { done: true, forkPointId: "assistant-uuid" }), true);
+assert.equal(canForkTurn(
+  "claude", { done: true }), false);
 assert.equal(isTerminalWorktreeForkError("wrapper_offline"), false);
 assert.equal(isTerminalWorktreeForkError("fork_reconciling"), false);
 assert.equal(isTerminalWorktreeForkError("internal"), true);

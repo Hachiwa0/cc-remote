@@ -270,10 +270,10 @@ export class RelayWs {
     return queued ? requestId : null;
   }
 
-  sendForkSession(parentSessionId: string, lastTurnId: string,
+  sendForkSession(parentSessionId: string, forkPointId: string,
                   requestId = uuid()): string | null {
     const queued = this.send({
-      ...makeForkSessionCommand(parentSessionId, lastTurnId, requestId, nowTs()),
+      ...makeForkSessionCommand(parentSessionId, forkPointId, requestId, nowTs()),
     });
     return queued ? requestId : null;
   }

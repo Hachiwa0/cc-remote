@@ -38,8 +38,11 @@ export type Block = TextBlock | ToolBlock;
 
 export interface Turn {
   id: string;
-  // Codex app-server turn id. Unlike the client message id, this is the
-  // authoritative branch point accepted by thread/fork.
+  // Engine-specific authoritative branch point: a Codex app-server turn id or
+  // a Claude transcript assistant UUID. The wire keeps the legacy `turn_id`
+  // name so already-deployed protocol-v5 peers remain compatible.
+  forkPointId?: string;
+  /** @deprecated Read only while migrating CACHE_VER=5 entries. */
   codexTurnId?: string;
   prompt: string; // empty when we joined mid-turn (no user bubble rendered)
   blocks: Block[];
@@ -325,7 +328,11 @@ export function reduce(state: AppState, action: Action): AppState {
       // only if still empty (never clobber live/streaming or already-replayed turns).
       return patch(state, action.sid, (rt) => {
         if (rt.turns.length === 0 && action.turns.length) {
-          replaceWithBoundedTurns(rt, action.turns);
+          replaceWithBoundedTurns(rt, action.turns.map((turn) => (
+            !turn.forkPointId && turn.codexTurnId
+              ? { ...turn, forkPointId: turn.codexTurnId }
+              : turn
+          )));
         }
         rt.loading = false;
       }, true);
@@ -708,7 +715,7 @@ function reduceEvent(
         const t = turns[turns.length - 1];
         if (t) {
           t.done = true;
-          if (e.turn_id) t.codexTurnId = e.turn_id;
+          if (e.turn_id) t.forkPointId = e.turn_id;
           t.progress = undefined;
           if (e.result.subtype === "error_during_execution") t.interrupted = true;
           // Stamp completion time from the event's own server ts (seconds -> ms).

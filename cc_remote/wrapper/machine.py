@@ -52,8 +52,8 @@ from typing import Optional
 
 from claude_agent_sdk import (
     PermissionResultAllow, PermissionResultDeny, delete_session,
-    get_session_info, get_session_messages, list_sessions, rename_session,
-    tag_session,
+    fork_session, get_session_info, get_session_messages, list_sessions,
+    rename_session, tag_session,
 )
 from claude_agent_sdk.types import ResultMessage
 
@@ -94,6 +94,10 @@ from cc_remote.wrapper.codex_worktrees import (
 from cc_remote.wrapper.codex_forks import (
     CodexForkJournal, ForkJournalError, find_rollout_fork,
     fork_thread_source,
+)
+from cc_remote.wrapper.claude_forks import (
+    ClaudeForkJournal, ClaudeForkJournalError, claude_fork_marker,
+    find_claude_fork,
 )
 from cc_remote.wrapper.codex_external import (
     ProcessIdentity, parse_turn_markers, process_identity,
@@ -204,6 +208,14 @@ class WrapperMachine:
         self._uncertain_codex_forks: OrderedDict[str, Optional[str]] = OrderedDict()
         self._codex_fork_tasks: dict[str, asyncio.Task] = {}
         self._codex_fork_locks: dict[str, asyncio.Lock] = {}
+        # Claude's SDK chooses the child id itself. A separate durable journal
+        # plus an atomically-written temporary title marker closes the crash
+        # window between ``fork_session`` creating the transcript and the
+        # browser receiving its correlated result.
+        self._claude_forks = ClaudeForkJournal(self.cfg.state_dir)
+        self._uncertain_claude_forks: OrderedDict[str, Optional[str]] = OrderedDict()
+        self._claude_fork_tasks: dict[str, asyncio.Task] = {}
+        self._claude_fork_locks: dict[str, asyncio.Lock] = {}
         # Claude fork_session writes a real transcript even though /btw is an
         # ephemeral, owner-only UI. Persist tombstones until that transcript is
         # deleted so a crash or failed cleanup cannot expose it in SessionList or
@@ -524,12 +536,16 @@ class WrapperMachine:
                 except Exception:
                     log.exception("command handling failed", type=cmd.type)
         finally:
-            fork_tasks = list(self._codex_fork_tasks.values())
+            fork_tasks = [
+                *self._codex_fork_tasks.values(),
+                *self._claude_fork_tasks.values(),
+            ]
             for task in fork_tasks:
                 task.cancel()
             if fork_tasks:
                 await asyncio.gather(*fork_tasks, return_exceptions=True)
             self._codex_fork_tasks.clear()
+            self._claude_fork_tasks.clear()
             if self._watch_task:
                 self._watch_task.cancel()
                 try:
@@ -3304,6 +3320,411 @@ class WrapperMachine:
         return event
 
     async def _handle_fork_session(self, cmd):
+        """Dispatch a message-level persistent fork to the owning engine."""
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        if await self._is_codex_session(sid):
+            return await self._handle_codex_fork_session(cmd)
+        return await self._handle_claude_fork_session(cmd, sid)
+
+    @staticmethod
+    def _claude_fork_title(info) -> str:
+        """Match the SDK's human title without sacrificing its recovery marker."""
+        base = (
+            getattr(info, "custom_title", None)
+            or getattr(info, "summary", None)
+            or getattr(info, "first_prompt", None)
+            or "派生会话"
+        ).strip() or "派生会话"
+        suffix = " (fork)"
+        # Keep parity with RenameSession's public title bound.
+        return f"{base[:200 - len(suffix)].rstrip()}{suffix}"
+
+    def _remember_uncertain_claude_fork(
+        self, request_id: str, child_session_id: Optional[str],
+    ) -> None:
+        existing = self._uncertain_claude_forks.get(request_id)
+        if existing and child_session_id and existing != child_session_id:
+            raise _ForkOutcomeUncertain(
+                "one Claude fork request resolved to multiple child sessions")
+        if (request_id not in self._uncertain_claude_forks
+                and len(self._uncertain_claude_forks) >= self.UNCERTAIN_FORK_CAP):
+            raise _ForkOutcomeUncertain(
+                "uncertain Claude fork cache capacity exhausted")
+        self._uncertain_claude_forks[request_id] = child_session_id or existing
+        self._uncertain_claude_forks.move_to_end(request_id)
+
+    def _release_terminal_claude_fork_lock(
+        self, request_id: str, expected: Optional[asyncio.Lock] = None,
+    ) -> None:
+        """Keep only unresolved request locks; terminal journal state is enough."""
+        try:
+            entry = self._claude_forks.get(request_id)
+        except ClaudeForkJournalError as exc:
+            log.warning("Claude fork lock cleanup skipped", error=str(exc))
+            return
+        task = self._claude_fork_tasks.get(request_id)
+        lock = self._claude_fork_locks.get(request_id)
+        terminal_or_unrecorded = (
+            entry is None
+            or entry.get("status") in {"complete", "rejected"}
+        )
+        if (terminal_or_unrecorded
+                and (task is None or task.done())
+                and lock is not None
+                and (expected is None or lock is expected)):
+            self._claude_fork_locks.pop(request_id, None)
+
+    def _ensure_claude_fork_reconciler(
+        self, cmd, sid: str, cwd: str, title: Optional[str],
+    ) -> None:
+        current = self._claude_fork_tasks.get(cmd.request_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._reconcile_claude_fork_command(cmd, sid, cwd, title),
+            name=f"claude-fork-reconcile-{cmd.request_id}",
+        )
+        self._claude_fork_tasks[cmd.request_id] = task
+
+    async def _recover_claude_fork(
+        self, marker: str, sid: str, cutoff: str, cwd: str,
+        attempts: int = 1,
+    ) -> Optional[str]:
+        for attempt in range(max(1, attempts)):
+            meta = await asyncio.to_thread(
+                find_claude_fork, marker, sid, cutoff, cwd)
+            child = meta.get("session_id") if isinstance(meta, dict) else None
+            if isinstance(child, str) and child:
+                return child
+            if attempt + 1 < attempts:
+                await asyncio.sleep(self.FORK_RECONCILE_DELAY)
+        return None
+
+    async def _reconcile_claude_fork_command(
+        self, cmd, sid: str, cwd: str, title: Optional[str],
+    ) -> None:
+        """Resolve a submitted SDK fork without ever replaying the mutation."""
+        request_id = cmd.request_id
+        try:
+            for attempt in range(self.FORK_BACKGROUND_ATTEMPTS):
+                if attempt:
+                    await asyncio.sleep(self.FORK_RECONCILE_DELAY)
+                lock = self._claude_fork_locks[request_id]
+                async with lock:
+                    client_id = getattr(cmd, "client_id", None)
+                    cmd_id = getattr(cmd, "cmd_id", None)
+                    if client_id and cmd_id:
+                        seen, _ = self._command_seen(client_id, cmd_id)
+                        if seen:
+                            return
+                    entry = self._claude_forks.get(request_id) or {}
+                    child = self._uncertain_claude_forks.get(request_id)
+                    if not child and entry.get("status") == "complete":
+                        child = entry.get("session_id")
+                    if not child:
+                        marker = entry.get("marker") or claude_fork_marker(request_id)
+                        try:
+                            child = await self._recover_claude_fork(
+                                marker, sid, cmd.last_turn_id, cwd)
+                        except ClaudeForkJournalError as exc:
+                            # list_sessions/transcript reads can fail briefly.
+                            # A submitted mutation must keep reconciling and must
+                            # never become replayable because of one bad scan.
+                            if attempt == 0:
+                                log.warning(
+                                    "Claude fork recovery scan unavailable",
+                                    request_id=request_id, error=str(exc))
+                            continue
+                    if not isinstance(child, str) or not child:
+                        continue
+                    try:
+                        event = await self._finish_claude_fork(
+                            cmd, sid, cwd, child, title)
+                    except _ForkOutcomeUncertain:
+                        continue
+                    if client_id and cmd_id:
+                        self._remember_command(
+                            client_id, cmd_id, (event.model_copy(deep=True),))
+                        await self._send_command_ack(client_id, cmd_id)
+                    return
+            await self._send_session_fork_error(
+                cmd,
+                ERR_FORK_RECONCILING,
+                "派生结果仍无法确认；请求已安全保留，重新连接后会继续核对",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Claude fork background reconcile failed",
+                          request_id=request_id, error=str(exc))
+        finally:
+            current = asyncio.current_task()
+            if self._claude_fork_tasks.get(request_id) is current:
+                self._claude_fork_tasks.pop(request_id, None)
+            self._release_terminal_claude_fork_lock(request_id)
+
+    async def _finish_claude_fork(
+        self, cmd, sid: str, cwd: str, child_session_id: str,
+        title: Optional[str],
+    ) -> SessionForked:
+        try:
+            await asyncio.to_thread(
+                self._claude_forks.complete, cmd.request_id, child_session_id)
+        except ClaudeForkJournalError as exc:
+            self._remember_uncertain_claude_fork(
+                cmd.request_id, child_session_id)
+            try:
+                await asyncio.to_thread(
+                    self._claude_forks.mark_uncertain, cmd.request_id)
+            except ClaudeForkJournalError:
+                pass
+            self._ensure_claude_fork_reconciler(cmd, sid, cwd, title)
+            log.exception("Claude fork result journal failed", error=str(exc))
+            raise _ForkOutcomeUncertain(
+                "Claude fork completed but its durable result is not recorded"
+            ) from exc
+
+        self._uncertain_claude_forks.pop(cmd.request_id, None)
+        # The marker must remain list-visible until the child id is durable.
+        # Replace only that exact marker: after SessionForked is delivered, an
+        # ACK-loss retry must never overwrite a title the user chose meanwhile.
+        try:
+            fork_entry = self._claude_forks.get(cmd.request_id) or {}
+            marker = fork_entry.get("marker")
+            child_info = await asyncio.to_thread(
+                get_session_info, child_session_id, directory=cwd)
+            current_title = getattr(child_info, "custom_title", None)
+            if child_info is not None and marker and current_title == marker:
+                await asyncio.to_thread(
+                    rename_session, child_session_id,
+                    title or "派生会话 (fork)", directory=cwd)
+        except Exception as exc:
+            log.warning("Claude fork title finalization failed",
+                        session_id=child_session_id, error=str(exc))
+
+        event = SessionForked(
+            parent_session_id=sid,
+            session_id=child_session_id,
+            cwd=cwd,
+            target="same_cwd",
+            last_turn_id=cmd.last_turn_id,
+            request_id=cmd.request_id,
+            to=cmd.client_id,
+        )
+        await self.transport.send(event)
+        try:
+            await self._handle_list_sessions(cmd)
+        except Exception as exc:
+            log.warning("Claude forked session list refresh failed", error=str(exc))
+        return event
+
+    async def _handle_claude_fork_session(self, cmd, sid: str):
+        request_id = cmd.request_id
+        lock = self._claude_fork_locks.get(request_id)
+        if lock is None:
+            if len(self._claude_fork_locks) >= self.UNCERTAIN_FORK_CAP:
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL, "派生请求锁容量已满，请稍后重试")
+            lock = asyncio.Lock()
+            self._claude_fork_locks[request_id] = lock
+        try:
+            async with lock:
+                client_id = getattr(cmd, "client_id", None)
+                cmd_id = getattr(cmd, "cmd_id", None)
+                if client_id and cmd_id:
+                    seen, cached = self._command_seen(client_id, cmd_id)
+                    if seen:
+                        return cached
+                return await self._handle_claude_fork_session_locked(cmd, sid)
+        finally:
+            self._release_terminal_claude_fork_lock(request_id, lock)
+
+    async def _handle_claude_fork_session_locked(self, cmd, sid: str):
+        if not getattr(cmd, "client_id", None):
+            return await self._send_session_fork_error(
+                cmd, ERR_AUTH, "派生会话需要已绑定的客户端")
+        ctx = self._ctx_by_sid(sid)
+        if ctx is not None and ctx.engine != "claude":
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, "源会话不属于 Claude")
+
+        try:
+            entry = await asyncio.to_thread(
+                self._claude_forks.get, cmd.request_id)
+            canonical = await asyncio.to_thread(
+                self._claude_forks.get_canonical, cmd.request_id)
+        except ClaudeForkJournalError as exc:
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, f"无法读取派生请求状态: {exc}")
+
+        if entry is not None:
+            if (entry.get("parent_session_id") != sid
+                    or entry.get("cutoff_message_id") != cmd.last_turn_id):
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL,
+                    "派生 request_id 已用于另一个源会话或回复")
+            source_cwd = entry["cwd"]
+            canonical_status = (canonical or entry).get("status")
+            title: Optional[str] = None
+        else:
+            source_cwd = ""
+            canonical_status = "intent"
+            title = None
+
+        # A submitted/complete journal is authoritative even if the parent was
+        # later deleted or temporarily unreadable. Source lookup is needed only
+        # before the first SDK mutation, and to derive the initial human title.
+        if entry is None or canonical_status == "intent":
+            lookup_cwd = (
+                ctx.cwd if ctx is not None
+                else (source_cwd or None)
+            )
+            try:
+                info = await asyncio.to_thread(
+                    get_session_info, sid, directory=lookup_cwd)
+            except Exception as exc:
+                log.warning("Claude fork source lookup failed", session_id=sid,
+                            error=str(exc))
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL, f"无法读取 Claude 源会话: {exc}")
+            if info is None:
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL, "Claude 源会话不存在")
+            raw_cwd = source_cwd or (ctx.cwd if ctx is not None else info.cwd)
+            if not raw_cwd:
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL, "无法确定源会话的工作目录")
+            source_cwd = os.path.realpath(raw_cwd)
+            title = self._claude_fork_title(info)
+            try:
+                entry = await asyncio.to_thread(
+                    self._claude_forks.begin,
+                    cmd.request_id, sid, cmd.last_turn_id, source_cwd)
+                canonical = await asyncio.to_thread(
+                    self._claude_forks.get_canonical, cmd.request_id)
+                canonical_status = (canonical or entry).get("status")
+            except ClaudeForkJournalError as exc:
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL, f"无法记录派生请求: {exc}")
+
+        assert entry is not None
+
+        if canonical_status == "complete":
+            return await self._finish_claude_fork(
+                cmd, sid, source_cwd,
+                entry.get("session_id") or (canonical or {}).get("session_id"),
+                title)
+        if canonical_status == "rejected":
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL,
+                entry.get("error_message")
+                or (canonical or {}).get("error_message")
+                or "Claude 会话派生已被拒绝")
+
+        marker = entry["marker"]
+        volatile_child = self._uncertain_claude_forks.get(cmd.request_id)
+        if (canonical_status in {"submitted", "uncertain"}
+                or cmd.request_id in self._uncertain_claude_forks):
+            try:
+                recovered = volatile_child or await self._recover_claude_fork(
+                    marker, sid, cmd.last_turn_id, source_cwd,
+                    self.FORK_RECONCILE_ATTEMPTS)
+            except ClaudeForkJournalError:
+                recovered = None
+            if recovered:
+                return await self._finish_claude_fork(
+                    cmd, sid, source_cwd, recovered, title)
+            self._ensure_claude_fork_reconciler(
+                cmd, sid, source_cwd, title)
+            raise _ForkOutcomeUncertain(
+                "Claude fork outcome is waiting for transcript reconciliation")
+
+        try:
+            claimed = await asyncio.to_thread(
+                self._claude_forks.claim_submission, cmd.request_id)
+        except ClaudeForkJournalError as exc:
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, f"无法持久记录派生提交状态: {exc}")
+        if not claimed:
+            refreshed = await asyncio.to_thread(
+                self._claude_forks.get, cmd.request_id)
+            refreshed_canonical = await asyncio.to_thread(
+                self._claude_forks.get_canonical, cmd.request_id)
+            refreshed_status = (
+                refreshed_canonical or refreshed or {}).get("status")
+            if refreshed and refreshed_status == "complete":
+                return await self._finish_claude_fork(
+                    cmd, sid, source_cwd,
+                    refreshed.get("session_id")
+                    or (refreshed_canonical or {}).get("session_id"),
+                    title)
+            if refreshed and refreshed_status == "rejected":
+                return await self._send_session_fork_error(
+                    cmd, ERR_INTERNAL,
+                    refreshed.get("error_message")
+                    or (refreshed_canonical or {}).get("error_message")
+                    or "Claude 会话派生已被拒绝")
+            self._ensure_claude_fork_reconciler(
+                cmd, sid, source_cwd, title)
+            raise _ForkOutcomeUncertain(
+                "canonical Claude fork request is being reconciled")
+
+        try:
+            result = await asyncio.to_thread(
+                fork_session,
+                sid,
+                directory=source_cwd,
+                up_to_message_id=cmd.last_turn_id,
+                title=marker,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            # SDK validates and builds the complete output before opening the
+            # child file, so these failures are proven pre-mutation.
+            try:
+                await asyncio.to_thread(
+                    self._claude_forks.reject, cmd.request_id,
+                    f"Claude 会话派生失败: {exc}")
+            except ClaudeForkJournalError as journal_exc:
+                log.warning("Claude fork rejection journal failed",
+                            error=str(journal_exc))
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, f"Claude 会话派生失败: {exc}")
+        except Exception as exc:
+            # os.open/os.write may have crossed the mutation boundary. Never
+            # replay after an ambiguous exception; only marker reconciliation
+            # may resolve it.
+            try:
+                await asyncio.to_thread(
+                    self._claude_forks.mark_uncertain, cmd.request_id)
+            except ClaudeForkJournalError as journal_exc:
+                log.warning("Claude uncertain fork journal failed",
+                            error=str(journal_exc))
+            self._ensure_claude_fork_reconciler(
+                cmd, sid, source_cwd, title)
+            log.warning("Claude fork outcome unknown", parent=sid,
+                        cutoff=cmd.last_turn_id, error=str(exc))
+            raise _ForkOutcomeUncertain(
+                "Claude fork request outcome is not yet visible") from exc
+
+        child = getattr(result, "session_id", None)
+        if not isinstance(child, str) or not child:
+            try:
+                await asyncio.to_thread(
+                    self._claude_forks.mark_uncertain, cmd.request_id)
+            except ClaudeForkJournalError:
+                pass
+            self._ensure_claude_fork_reconciler(
+                cmd, sid, source_cwd, title)
+            raise _ForkOutcomeUncertain(
+                "Claude fork response omitted the child session id")
+
+        event = await self._finish_claude_fork(
+            cmd, sid, source_cwd, child, title)
+        log.info("Claude session forked", parent=sid, session_id=child,
+                 cutoff=cmd.last_turn_id)
+        return event
+
+    async def _handle_codex_fork_session(self, cmd):
         request_id = cmd.request_id
         lock = self._codex_fork_locks.get(request_id)
         if lock is None:

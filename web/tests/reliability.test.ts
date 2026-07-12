@@ -344,7 +344,7 @@ assert.deepEqual(
 // transcript without creating a second assistant-only turn.
 const partialHistory = {
   id: "engine-active", prompt: "在？", done: true, ts: 10_000, doneTs: 11_000,
-  codexTurnId: "codex-turn-a",
+  forkPointId: "codex-turn-a",
   blocks: [] as Array<{ kind: "text"; message_id: string; text: string; done: boolean }>,
 };
 const liveActive = {
@@ -357,7 +357,7 @@ const activeMerge = mergeInitialHistory(
 assert.equal(activeMerge.length, 1);
 assert.equal(activeMerge[0].done, false);
 assert.equal(activeMerge[0].doneTs, undefined);
-assert.equal(activeMerge[0].codexTurnId, "codex-turn-a");
+assert.equal(activeMerge[0].forkPointId, "codex-turn-a");
 const liveFinished = [{
   ...activeMerge[0], done: true, doneTs: 12_000,
   blocks: activeMerge[0].blocks.map((block) => block.kind === "text"
@@ -403,6 +403,12 @@ try {
       [otherSid]: { ...createRuntime(), turns: [untouched], syncReady: true },
     },
   };
+  const cachedSid = "cached-v5-codex";
+  state = reduce(state, { type: "hydrate_cache", sid: cachedSid, turns: [{
+    id: "cached-turn", codexTurnId: "legacy-turn-id", prompt: "旧缓存",
+    done: true, blocks: [],
+  }] });
+  assert.equal(state.runtimes[cachedSid].turns[0].forkPointId, "legacy-turn-id");
   state = reduce(state, {
     type: "query_sent", sid, prompt: "在？", msg_id: "client-a", ts: 10_000,
   });
@@ -421,7 +427,7 @@ try {
   }) });
   assert.equal(state.runtimes[sid].turns.length, 1);
   assert.equal(state.runtimes[sid].turns[0].done, false);
-  assert.equal(state.runtimes[sid].turns[0].codexTurnId, "codex-turn-a");
+  assert.equal(state.runtimes[sid].turns[0].forkPointId, "codex-turn-a");
 
   for (const live of [
     event({ type: "delta", sid, message_id: "live-answer", text: "only once" }),
@@ -442,7 +448,7 @@ try {
     ],
   }) });
   assert.equal(state.runtimes[sid].turns.length, 1);
-  assert.equal(state.runtimes[sid].turns[0].codexTurnId, "codex-turn-a");
+  assert.equal(state.runtimes[sid].turns[0].forkPointId, "codex-turn-a");
   assert.deepEqual(state.runtimes[sid].turns[0].blocks.map(
     (block: { kind: string; text?: string }) => block.kind === "text" ? block.text : "tool"),
   ["only once"]);
@@ -451,7 +457,7 @@ try {
   const { ChatView } = await reducerHarness.ssrLoadModule(
     "/src/components/ChatView.tsx");
   const forkableTurn = {
-    id: "message-a", codexTurnId: "codex-turn-a", prompt: "在？",
+    id: "message-a", forkPointId: "codex-turn-a", prompt: "在？",
     done: true, doneTs: 12_000,
     blocks: [{ kind: "text", message_id: "answer-a", text: "在的", done: true }],
   };
@@ -469,7 +475,13 @@ try {
     sid, turns: [forkableTurn], engine: "claude",
     onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
   }));
-  assert.doesNotMatch(claudeMarkup, /aria-label="派生"/);
+  assert.match(claudeMarkup, /aria-label="派生"/);
+  assert.match(claudeMarkup, /data-tooltip="从此回复派生新会话"/);
+  const noForkPointMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid, turns: [{ ...forkableTurn, forkPointId: undefined }], engine: "claude",
+    onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
+  }));
+  assert.doesNotMatch(noForkPointMarkup, /aria-label="派生"/);
 
   state = reduce(state, { type: "event", event: event({
     type: "takeover_state", sid, pending: true, message: "等待当前回复结束",

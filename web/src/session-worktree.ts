@@ -14,7 +14,8 @@ export interface PendingWorktreeFork {
 }
 
 export interface PendingSessionFork extends PendingWorktreeFork {
-  lastTurnId: string;
+  forkPointId: string;
+  engine: "claude" | "codex";
 }
 
 export function sessionMenuCapabilities(session: SessionInfo): SessionMenuCapabilities {
@@ -52,17 +53,18 @@ export function matchesSessionForkRequest(
   pending: PendingSessionFork | null,
   requestId: string | null | undefined,
   parentSessionId?: string | null,
-  lastTurnId?: string | null,
+  forkPointId?: string | null,
 ): boolean {
   return matchesWorktreeForkRequest(pending, requestId, parentSessionId)
-    && (lastTurnId == null || lastTurnId === pending!.lastTurnId);
+    && (forkPointId == null || forkPointId === pending!.forkPointId);
 }
 
-export function canForkCodexTurn<T extends { done: boolean; codexTurnId?: string }>(
+export function canForkTurn<T extends { done: boolean; forkPointId?: string }>(
   engine: "claude" | "codex",
   turn: T,
-): turn is T & { done: true; codexTurnId: string } {
-  return engine === "codex" && turn.done && !!turn.codexTurnId;
+): turn is T & { done: true; forkPointId: string } {
+  return (engine === "claude" || engine === "codex")
+    && turn.done && !!turn.forkPointId;
 }
 
 /** Provisional errors keep the reliable command and its UI ownership pending.

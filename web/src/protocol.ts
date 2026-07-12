@@ -240,16 +240,18 @@ export type ServerEvent =
 
 export const PROTOCOL_VERSION = 5;
 
-/** Build the correlated command behind Codex App's message-level "fork" action. */
+/** Build the correlated message-level fork command for either engine.
+ * `last_turn_id` is the protocol-v5 legacy wire name; for Claude its value is
+ * the selected reply's transcript UUID rather than a Codex turn id. */
 export function makeForkSessionCommand(
-  sessionId: string, lastTurnId: string, requestId: string, ts: number,
+  sessionId: string, forkPointId: string, requestId: string, ts: number,
 ): ForkSession {
   return {
     v: PROTOCOL_VERSION,
     type: "fork_session",
     session_id: sessionId,
     request_id: requestId,
-    last_turn_id: lastTurnId,
+    last_turn_id: forkPointId,
     ts,
   };
 }

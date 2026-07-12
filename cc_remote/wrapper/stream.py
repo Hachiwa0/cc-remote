@@ -29,6 +29,10 @@ from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
 
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_CLAUDE_MESSAGE_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 _MAX_TRANSCRIPT_MATCHES = 1000
 _MAX_TRANSCRIPT_RECORD_CHARS = 16 * 1024 * 1024
 _MAX_TIMESTAMP_ENTRIES = 200_000
@@ -38,6 +42,12 @@ class StreamTranslator:
     def __init__(self, tool_result_max: int):
         self.tool_result_max = tool_result_max
         self._cur_msg_id: str | None = None
+        # Claude can emit several AssistantMessage records in one user turn
+        # (thinking/text/tool_use, then more assistant records after tool results).
+        # fork_session(up_to_message_id=...) accepts the transcript UUID, not the
+        # API message_id used to assemble streamed blocks, so retain the last one
+        # until the terminal ResultMessage arrives.
+        self._last_assistant_uuid: str | None = None
 
     def feed(self, msg) -> list:
         events: list = []
@@ -53,6 +63,9 @@ class StreamTranslator:
                             events.append(AssistantMsgStart(message_id=self._cur_msg_id))
                         events.append(Delta(message_id=self._cur_msg_id, text=text))
         elif isinstance(msg, AssistantMessage):
+            if (isinstance(msg.uuid, str)
+                    and _CLAUDE_MESSAGE_UUID.fullmatch(msg.uuid)):
+                self._last_assistant_uuid = msg.uuid
             if self._cur_msg_id is None:
                 # tool-only message with no text deltas — start a block now
                 self._cur_msg_id = msg.message_id or uuid.uuid4().hex
@@ -86,7 +99,8 @@ class StreamTranslator:
                 is_error=msg.is_error,
                 total_cost_usd=msg.total_cost_usd,
                 num_turns=msg.num_turns,
-            )))
+            ), turn_id=self._last_assistant_uuid))
+            self._last_assistant_uuid = None
         # SystemMessage (init, etc.) and RateLimitEvent: ignored for MVP
         return events
 
@@ -209,6 +223,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     events: list = []
     turn_open = False
     last_ts = None  # transcript ts of the most-recent message in the open turn
+    last_assistant_uuid = None
 
     def _history_id(value, kind: str, position: str) -> str:
         """Keep valid engine ids; deterministically repair malformed legacy rows.
@@ -237,13 +252,18 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
         return um
 
     def close_turn():
-        nonlocal turn_open
+        nonlocal turn_open, last_assistant_uuid
         if turn_open:
-            te = TurnEnd(result=TurnResult(subtype="success", duration_ms=0, is_error=False))
+            te = TurnEnd(
+                result=TurnResult(
+                    subtype="success", duration_ms=0, is_error=False),
+                turn_id=last_assistant_uuid,
+            )
             if last_ts is not None:
                 te.ts = last_ts   # answer-done time = last message of the turn
             events.append(te)
             turn_open = False
+            last_assistant_uuid = None
 
     for message_index, m in enumerate(messages):
         msg = m.message
@@ -306,6 +326,8 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
         elif role == "assistant":
             if not isinstance(content, list):
                 continue
+            if _CLAUDE_MESSAGE_UUID.fullmatch(source_uid):
+                last_assistant_uuid = source_uid
             mid = message_uid
             started = False
             for block_index, b in enumerate(content):

@@ -439,10 +439,10 @@ class TurnResult(BaseModel):
 class TurnEnd(_Base):
     type: Literal["turn_end"] = "turn_end"
     result: TurnResult
-    # Codex app-server's authoritative turn id. Claude and synthetic legacy
-    # history boundaries leave it unset. Message-level fork uses this value as
-    # thread/fork.lastTurnId, so it must identify the completed turn rather than
-    # an assistant item or the optimistic browser message id.
+    # Engine-specific authoritative fork point. Codex sends app-server's turn
+    # id; Claude sends the final assistant transcript UUID in this user turn.
+    # Synthetic/legacy boundaries without a real engine id leave it unset.
+    # The legacy wire name stays stable for protocol-v5 browser compatibility.
     turn_id: Optional[WireId] = None
 
 
@@ -590,11 +590,12 @@ class ArchiveSession(_Command):
 
 
 class ForkSession(_Command):
-    """client -> wrapper: persistently fork Codex at one completed turn.
+    """client -> wrapper: persistently fork a session at one completed turn.
 
-    Unlike ``ForkSessionWorktree``, this is the app-server's ordinary thread
-    fork and inherits the source thread's working directory. ``last_turn_id``
-    comes from the selected message's authoritative ``TurnEnd.turn_id``.
+    The child inherits the source working directory. ``last_turn_id`` is the
+    selected message's engine-specific ``TurnEnd.turn_id``: Codex turn id or
+    Claude assistant transcript UUID. The field name remains unchanged on the
+    v5 wire for backward compatibility.
     """
     type: Literal["fork_session"] = "fork_session"
     session_id: WireId
@@ -619,7 +620,7 @@ class ForkSessionWorktree(_Command):
 
 
 class SessionForked(_Base):
-    """wrapper -> requesting client: a persistent Codex fork is ready."""
+    """wrapper -> requesting client: a persistent engine fork is ready."""
     type: Literal["session_forked"] = "session_forked"
     parent_session_id: WireId
     session_id: WireId
