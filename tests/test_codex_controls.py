@@ -1147,8 +1147,10 @@ def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
         resident = _control_ctx("resident-id", "codex")
         resident.state = "interrupting"
         machine.sessions = {"resident-id": resident}
+        requested_limits = []
 
-        async def listed(_limit):
+        async def listed(limit):
+            requested_limits.append(limit)
             return [
                 {
                     "session_id": "resident-id",
@@ -1185,6 +1187,34 @@ def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
         assert hot.forked_from_id == "parent-id" and hot.codex_status == "active"
         assert hot.state == "interrupting"
         assert cold.tag == "archived" and cold.state == "running"
+        assert requested_limits == [200]
+
+    asyncio.run(run())
+
+
+def test_codex_session_mutation_failure_refreshes_authoritative_list(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        machine.sessions = {"codex-id": _control_ctx("codex-id", "codex")}
+        refreshed = []
+
+        async def rpc(_method, _params, cwd=None):
+            raise RuntimeError("request rejected")
+
+        async def refresh(cmd):
+            refreshed.append(cmd)
+
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        machine._list_codex_sessions = refresh
+        rename = SimpleNamespace(session_id="codex-id", title="new")
+        archive = SimpleNamespace(session_id="codex-id", archived=True)
+
+        await machine._handle_rename_session(rename)
+        await machine._handle_archive_session(archive)
+
+        assert refreshed == [rename, archive]
+        errors = [message for message in transport.sent if message.type == "error"]
+        assert len(errors) == 2
 
     asyncio.run(run())
 

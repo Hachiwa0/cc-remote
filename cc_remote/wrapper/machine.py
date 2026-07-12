@@ -2786,7 +2786,10 @@ class WrapperMachine:
     async def _list_codex_sessions(self, cmd) -> None:
         """Sidebar list from the app-server's authoritative thread state DB."""
         try:
-            raw = await list_codex_sessions(60)
+            # Load the bounded app-server maximum for each archive state. Search
+            # is client-side, so stopping at the old 60-row page made older
+            # threads impossible to rename, restore, or fork.
+            raw = await list_codex_sessions(200)
             resident_state = {c.session_id: c.state for c in self.sessions.values()
                               if c.session_id and c.engine == "codex"}
             sessions = [
@@ -3060,6 +3063,7 @@ class WrapperMachine:
                 log.exception("codex rename_session failed", error=str(e))
                 await self._emit_to_sid(sid, Error(
                     code=ERR_INTERNAL, message=f"rename failed: {e}"))
+                await self._list_codex_sessions(cmd)
             return
         try:
             await asyncio.to_thread(rename_session, sid, cmd.title)
@@ -3085,6 +3089,10 @@ class WrapperMachine:
                 log.exception("codex archive_session failed", error=str(e))
                 await self._emit_to_sid(sid, Error(
                     code=ERR_INTERNAL, message=f"archive failed: {e}"))
+                # The UI waits for this authoritative result instead of moving
+                # the card optimistically. It also reconciles a timeout where the
+                # app-server committed the mutation but its response was lost.
+                await self._list_codex_sessions(cmd)
             return
         try:
             tag = "archived" if cmd.archived else None

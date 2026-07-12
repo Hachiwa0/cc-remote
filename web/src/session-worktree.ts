@@ -43,3 +43,9 @@ export function matchesWorktreeForkRequest(
     && requestId === pending.requestId
     && (parentSessionId == null || parentSessionId === pending.parentSessionId);
 }
+
+/** Relay-side offline errors are provisional: the reliable command remains in
+ * the outbox and will be replayed after the wrapper reconnects. */
+export function isTerminalWorktreeForkError(code: string): boolean {
+  return code !== "wrapper_offline";
+}

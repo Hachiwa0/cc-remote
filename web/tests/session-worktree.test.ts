@@ -4,6 +4,7 @@ import { makeForkSessionWorktreeCommand } from "../src/protocol.ts";
 import {
   isWorktreeForkNameValid,
   isWorktreeForkBlockedByState,
+  isTerminalWorktreeForkError,
   matchesWorktreeForkRequest,
   normalizeWorktreeForkName,
   sessionMenuCapabilities,
@@ -53,5 +54,7 @@ assert.equal(matchesWorktreeForkRequest(pending, "request-2", "codex-parent"), f
 assert.equal(matchesWorktreeForkRequest(pending, "request-1", "other-parent"), false);
 assert.equal(matchesWorktreeForkRequest(pending, "request-1"), true);
 assert.equal(matchesWorktreeForkRequest(null, "request-1"), false);
+assert.equal(isTerminalWorktreeForkError("wrapper_offline"), false);
+assert.equal(isTerminalWorktreeForkError("internal"), true);
 
 console.log("session worktree tests passed");

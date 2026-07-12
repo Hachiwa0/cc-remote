@@ -22,7 +22,7 @@ import { shouldAcceptSessionList } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
 import { collectWaitingQueries, selectDrainCandidates } from "./runtime-drain";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
-import { matchesWorktreeForkRequest, type PendingWorktreeFork } from "./session-worktree";
+import { isTerminalWorktreeForkError, matchesWorktreeForkRequest, type PendingWorktreeFork } from "./session-worktree";
 import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest, type Snapshot, type QueryImg, type QueryFile, type SessionInfo } from "./protocol";
 
 const THEME_KEY = "cc_remote_theme";
@@ -236,7 +236,8 @@ export default function App() {
             if (isMobile()) setSidebarOpen(false);
             return;
           }
-          if (msg.type === "error" && matchesWorktreeForkRequest(
+          if (msg.type === "error" && isTerminalWorktreeForkError(msg.code)
+              && matchesWorktreeForkRequest(
               pendingWorktreeForkRef.current, msg.request_id)) {
             pendingWorktreeForkRef.current = null;
             setForkWorktreeCreating(false);
@@ -698,7 +699,7 @@ export default function App() {
         onNewInDir={(cwd) => { pendingCreateRef.current = null; setCreateError(null); dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title)}
-        onArchive={(id, archived) => { dispatch({ type: "set_session_tag", sid: id, tag: archived ? "archived" : null }); wsRef.current?.sendArchiveSession(id, archived); }}
+        onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived); }}
         onForkWorktree={openForkWorktree}
       />
       <DirPicker
