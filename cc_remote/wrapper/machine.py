@@ -62,7 +62,7 @@ from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, StatusReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
-    SessionInfo, SessionList, SessionFocus, SessionRekey, DirList,
+    SessionInfo, SessionList, SessionFocus, SessionRekey, SessionForked, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
 )
@@ -85,6 +85,9 @@ from cc_remote.wrapper.codex_sessions import (
 )
 from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
 from cc_remote.wrapper.codex_rpc import codex_rpc
+from cc_remote.wrapper.codex_worktrees import (
+    WorktreeError, prepare_worktree, rollback_worktree,
+)
 from cc_remote.wrapper.codex_external import (
     ProcessIdentity, parse_turn_markers, process_identity,
     writable_rollout_holders,
@@ -147,6 +150,7 @@ class WrapperMachine:
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
         "get_history", "switch_session", "rename_session", "archive_session",
+        "fork_session_worktree",
     })
 
     def __init__(self, cfg: WrapperConfig, transport: WrapperTransport):
@@ -760,6 +764,8 @@ class WrapperMachine:
             await self._handle_rename_session(cmd)
         elif t == "archive_session":
             await self._handle_archive_session(cmd)
+        elif t == "fork_session_worktree":
+            return await self._handle_fork_session_worktree(cmd)
         elif t == "ping":
             await self._emit_focused(Pong(n=cmd.n))
         else:
@@ -3106,6 +3112,196 @@ class WrapperMachine:
             log.warning("codex session capability check failed",
                         session_id=session_id, error=str(exc))
             return False
+
+    async def _send_worktree_fork_error(
+        self, cmd, code: str, message: str,
+    ) -> Error:
+        client_id = getattr(cmd, "client_id", None)
+        error = Error(
+            code=code,
+            message=message,
+            request_id=getattr(cmd, "request_id", None),
+            sid=getattr(cmd, "session_id", None),
+            to=client_id,
+        )
+        if client_id:
+            await self.transport.send(error)
+        else:
+            log.warning("dropping unroutable worktree fork error", code=code)
+        return error
+
+    async def _find_codex_worktree_fork(
+        self, parent_session_id: str, cwd: str,
+    ) -> Optional[dict]:
+        """Recover a completed fork after an ACK loss or wrapper restart."""
+        requests = [
+            codex_rpc("thread/list", {
+                "archived": archived,
+                "cwd": cwd,
+                "limit": 20,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            }, cwd=cwd)
+            for archived in (False, True)
+        ]
+        for result in await asyncio.gather(*requests):
+            rows = result.get("data") if isinstance(result, dict) else None
+            for thread in rows or ():
+                if not isinstance(thread, dict):
+                    continue
+                thread_cwd = thread.get("cwd")
+                if (thread.get("forkedFromId") == parent_session_id
+                        and isinstance(thread_cwd, str)
+                        and os.path.realpath(thread_cwd) == os.path.realpath(cwd)):
+                    return thread
+        return None
+
+    async def _handle_fork_session_worktree(self, cmd):
+        """Create a wrapper-owned Git worktree and persistently fork Codex into it."""
+        if not getattr(cmd, "client_id", None):
+            return await self._send_worktree_fork_error(
+                cmd, ERR_AUTH, "派生工作树需要已绑定的客户端")
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        if not await self._is_codex_session(sid):
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, "目前仅支持派生 Codex 会话到新工作树")
+        ctx = self._ctx_by_sid(sid)
+        if ctx is not None and ctx.state != "idle":
+            return await self._send_worktree_fork_error(
+                cmd, ERR_BUSY, "会话仍在运行，请等待当前回合结束后再派生")
+
+        source_cwd = (
+            ctx.cwd if ctx is not None
+            else await asyncio.to_thread(codex_session_cwd, sid)
+        )
+        if not source_cwd:
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, "无法确定源会话的工作目录")
+
+        name = (getattr(cmd, "name", None) or "").strip()
+        try:
+            spec = await asyncio.to_thread(
+                prepare_worktree,
+                source_cwd,
+                name,
+                cmd.request_id,
+                self.cfg.state_dir,
+            )
+        except WorktreeError as exc:
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, f"创建 Git 工作树失败: {exc}")
+
+        existing: Optional[dict] = None
+        try:
+            existing = await self._find_codex_worktree_fork(sid, spec.cwd)
+        except Exception as exc:
+            if not spec.created:
+                log.warning("worktree fork recovery lookup failed",
+                            parent=sid, cwd=spec.cwd, error=str(exc))
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_INTERNAL,
+                    "工作树已存在，但暂时无法确认派生会话；请稍后重试",
+                )
+            log.warning("fresh worktree pre-fork lookup failed; continuing",
+                        parent=sid, cwd=spec.cwd, error=str(exc))
+
+        fork_result: Optional[dict] = None
+        if existing is None:
+            params: dict = {
+                "threadId": sid,
+                "cwd": spec.cwd,
+                "ephemeral": False,
+            }
+            parent_model = (
+                getattr(ctx.sdk, "model", None) if ctx is not None else None
+            ) or (await asyncio.to_thread(codex_session_settings, sid)).get("model")
+            if parent_model:
+                params["model"] = parent_model
+            try:
+                raw_result = await codex_rpc(
+                    "thread/fork", params, cwd=spec.cwd)
+                fork_result = raw_result if isinstance(raw_result, dict) else None
+            except Exception as exc:
+                recovered: Optional[dict] = None
+                recovery_failed = False
+                try:
+                    recovered = await self._find_codex_worktree_fork(sid, spec.cwd)
+                except Exception as recovery_exc:
+                    recovery_failed = True
+                    log.warning("worktree fork post-error recovery failed",
+                                parent=sid, cwd=spec.cwd,
+                                error=str(recovery_exc))
+                if recovered is not None:
+                    existing = recovered
+                else:
+                    if spec.created and not recovery_failed:
+                        await asyncio.to_thread(rollback_worktree, spec)
+                    detail = (
+                        "派生结果暂时无法确认，工作树已保留；请稍后重试"
+                        if recovery_failed
+                        else f"Codex 会话派生失败: {exc}"
+                    )
+                    return await self._send_worktree_fork_error(
+                        cmd, ERR_INTERNAL, detail)
+
+        thread = existing
+        if thread is None and fork_result is not None:
+            candidate = fork_result.get("thread")
+            thread = candidate if isinstance(candidate, dict) else None
+        new_session_id = thread.get("id") if isinstance(thread, dict) else None
+        if not isinstance(new_session_id, str) or not new_session_id:
+            # A malformed/lost response can still follow a committed fork. Query
+            # the state DB once before removing its cwd and potentially orphaning
+            # the new thread.
+            recovery_failed = False
+            try:
+                recovered = await self._find_codex_worktree_fork(sid, spec.cwd)
+            except Exception as recovery_exc:
+                recovered = None
+                recovery_failed = True
+                log.warning("worktree fork id recovery failed",
+                            parent=sid, cwd=spec.cwd, error=str(recovery_exc))
+            new_session_id = (
+                recovered.get("id") if isinstance(recovered, dict) else None)
+            if not isinstance(new_session_id, str) or not new_session_id:
+                if spec.created and not recovery_failed:
+                    await asyncio.to_thread(rollback_worktree, spec)
+                detail = (
+                    "派生结果暂时无法确认，工作树已保留；请稍后重试"
+                    if recovery_failed
+                    else "Codex 会话派生成功但未返回新会话 ID"
+                )
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_INTERNAL, detail)
+
+        if name:
+            try:
+                await codex_rpc("thread/name/set", {
+                    "threadId": new_session_id,
+                    "name": name,
+                }, cwd=spec.cwd)
+            except Exception as exc:
+                # The persistent fork and its worktree are already valid. A title
+                # can be retried through the normal rename action without risking
+                # user work, so never roll the fork back here.
+                log.warning("forked thread name set failed",
+                            thread_id=new_session_id, error=str(exc))
+
+        event = SessionForked(
+            parent_session_id=sid,
+            session_id=new_session_id,
+            cwd=spec.cwd,
+            git_branch=spec.branch,
+            request_id=cmd.request_id,
+            to=cmd.client_id,
+        )
+        await self.transport.send(event)
+        await self._list_codex_sessions(cmd)
+        log.info("codex session forked into worktree",
+                 parent=sid, session_id=new_session_id,
+                 cwd=spec.cwd, branch=spec.branch,
+                 recovered=existing is not None)
+        return event
 
     # ---- directory picker (arbitrary-cwd session creation) ----
 
