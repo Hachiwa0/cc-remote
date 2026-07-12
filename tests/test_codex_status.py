@@ -17,7 +17,11 @@ from cc_remote.protocol import (
     deserialize,
     serialize,
 )
-from cc_remote.wrapper.codex_handle import CodexHandle, _app_server_version
+from cc_remote.wrapper.codex_handle import (
+    CodexHandle,
+    _app_server_version,
+    _status_error_message,
+)
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -75,7 +79,7 @@ def test_app_server_version_extracts_only_version():
     assert _app_server_version(initialized) == "0.144.1"
 
 
-def test_status_rpcs_are_concurrent_and_sensitive_fields_are_dropped():
+def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
     async def run():
         handle = CodexHandle(_Cfg())
         handle.thread_id = "thread-1"
@@ -90,7 +94,8 @@ def test_status_rpcs_are_concurrent_and_sensitive_fields_are_dropped():
         }
 
         started: list[str] = []
-        all_started = asyncio.Event()
+        core_started = asyncio.Event()
+        stats_started = asyncio.Event()
         replies = {
             "thread/read": {"thread": {
                 "id": "thread-1", "sessionId": "session-1",
@@ -128,9 +133,15 @@ def test_status_rpcs_are_concurrent_and_sensitive_fields_are_dropped():
 
         async def request(method, params=None):
             started.append(method)
-            if len(started) == 5:
-                all_started.set()
-            await asyncio.wait_for(all_started.wait(), timeout=1)
+            if method in {"thread/read", "config/read", "account/read"}:
+                if len(started) == 3:
+                    core_started.set()
+                await asyncio.wait_for(core_started.wait(), timeout=1)
+            else:
+                assert "account/read" in started
+                if len(started) == 5:
+                    stats_started.set()
+                await asyncio.wait_for(stats_started.wait(), timeout=1)
             return replies[method]
 
         handle._request = request
@@ -167,6 +178,89 @@ def test_status_rpcs_are_concurrent_and_sensitive_fields_are_dropped():
         StatusReport(**status)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("auth_type", ["apiKey", "amazonBedrock"])
+def test_status_skips_chatgpt_stats_for_explicit_non_chatgpt_auth(auth_type):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        handle.last_rate_limits = {
+            "limitId": "stale-chatgpt", "primary": {"usedPercent": 99},
+        }
+        calls: list[str] = []
+
+        async def request(method, params=None):
+            calls.append(method)
+            if method == "thread/read":
+                return {"thread": {"id": "thread-1", "status": {"type": "idle"}}}
+            if method == "config/read":
+                return {"config": {}, "origins": {}}
+            if method == "account/read":
+                return {"account": {"type": auth_type}, "requiresOpenaiAuth": False}
+            raise AssertionError(f"unexpected ChatGPT-only request: {method}")
+
+        handle._request = request
+        status = await handle.get_status()
+        assert set(calls) == {"thread/read", "config/read", "account/read"}
+        assert status["account"]["auth_type"] == auth_type
+        assert status["rate_limits"] == []
+        assert status["usage"] is None
+        assert status["component_errors"] == []
+        StatusReport(**status)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("account_mode", ["unknown", "failure"])
+def test_status_attempts_chatgpt_stats_when_account_is_unknown_or_fails(account_mode):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        calls: list[str] = []
+
+        async def request(method, params=None):
+            calls.append(method)
+            if method == "thread/read":
+                return {"thread": {"id": "thread-1", "status": {"type": "idle"}}}
+            if method == "config/read":
+                return {"config": {}, "origins": {}}
+            if method == "account/read":
+                if account_mode == "failure":
+                    raise RuntimeError("account endpoint failed with secret")
+                return {
+                    "account": {"type": "futureAuth"},
+                    "requiresOpenaiAuth": False,
+                }
+            if method == "account/rateLimits/read":
+                return {"rateLimits": {
+                    "limitId": "codex", "primary": {"usedPercent": 7},
+                }}
+            if method == "account/usage/read":
+                return {"summary": {"lifetimeTokens": 123}}
+            raise AssertionError(method)
+
+        handle._request = request
+        status = await handle.get_status()
+        assert set(calls) == {
+            "thread/read", "config/read", "account/read",
+            "account/rateLimits/read", "account/usage/read",
+        }
+        assert status["rate_limits"][0]["primary"]["used_percent"] == 7
+        assert status["usage"]["lifetime_tokens"] == 123
+        expected_errors = (
+            ["account: app-server request failed"] if account_mode == "failure" else []
+        )
+        assert status["component_errors"] == expected_errors
+        StatusReport(**status)
+
+    asyncio.run(run())
+
+
+def test_status_error_maps_chatgpt_auth_requirement_to_account_unavailable():
+    assert _status_error_message(RuntimeError(
+        "chatgpt authentication required to read rate limits"
+    )) == "unavailable for the current account"
 
 
 def test_status_partial_rpc_failure_uses_notification_cache_without_raw_error():

@@ -522,10 +522,13 @@ class CodexHandle:
     async def get_status(self) -> dict:
         """Return a sanitized status composed from official app-server RPCs.
 
-        The five reads are independent and therefore concurrent. A missing or
-        unsupported account endpoint must not suppress thread/config/context
-        state. Raw responses never leave this method: every returned field is
-        copied through a small allow-list and raw errors become generic labels.
+        Thread, config and account are read concurrently first. ChatGPT-only
+        account statistics are then skipped for explicit API key/Bedrock auth;
+        unknown or failed account reads still attempt them for forward
+        compatibility. A missing or unsupported account endpoint must not
+        suppress thread/config/context state. Raw responses never leave this
+        method: every returned field is copied through a small allow-list and
+        raw errors become generic labels.
         """
         assert self.thread_id, "connect() first"
         config_params: dict[str, Any] = {"includeLayers": False}
@@ -536,8 +539,6 @@ class CodexHandle:
                 "threadId": self.thread_id, "includeTurns": False}),
             ("config", "config/read", config_params),
             ("account", "account/read", {"refreshToken": False}),
-            ("rate_limits", "account/rateLimits/read", None),
-            ("usage", "account/usage/read", None),
         )
         results = await asyncio.gather(*(
             self._request(method, params) if params is not None
@@ -554,6 +555,36 @@ class CodexHandle:
                 responses[component] = result
             else:
                 errors.append(f"{component}: app-server returned an invalid response")
+
+        account_response = responses.get("account")
+        raw_account_for_auth = (
+            account_response.get("account")
+            if isinstance(account_response, dict) else None
+        )
+        account_auth_type = (
+            raw_account_for_auth.get("type")
+            if isinstance(raw_account_for_auth, dict) else None
+        )
+        skip_chatgpt_stats = account_auth_type in {"apiKey", "amazonBedrock"}
+        if not skip_chatgpt_stats:
+            stats_specs = (
+                ("rate_limits", "account/rateLimits/read", None),
+                ("usage", "account/usage/read", None),
+            )
+            stats_results = await asyncio.gather(*(
+                self._request(method, params) if params is not None
+                else self._request(method)
+                for _component, method, params in stats_specs
+            ), return_exceptions=True)
+            for (component, _method, _params), result in zip(
+                    stats_specs, stats_results):
+                if isinstance(result, BaseException):
+                    errors.append(f"{component}: {_status_error_message(result)}")
+                elif isinstance(result, dict):
+                    responses[component] = result
+                else:
+                    errors.append(
+                        f"{component}: app-server returned an invalid response")
 
         thread_response = responses.get("thread") or {}
         raw_thread = thread_response.get("thread")
@@ -604,7 +635,6 @@ class CodexHandle:
         }
 
         account = None
-        account_response = responses.get("account")
         if account_response is not None:
             raw_account = account_response.get("account")
             if raw_account is not None and not isinstance(raw_account, dict):
@@ -627,7 +657,7 @@ class CodexHandle:
             else:
                 _append_status_error(
                     errors, "rate_limits", "app-server returned an invalid response")
-        rate_limits = _sanitize_rate_limits(
+        rate_limits = [] if skip_chatgpt_stats else _sanitize_rate_limits(
             rate_response if rate_response is not None else {
                 "rateLimits": self.last_rate_limits,
                 "rateLimitsByLimitId": self.last_rate_limits_by_id,
@@ -1081,7 +1111,10 @@ def _status_error_message(error: BaseException) -> str:
     text = str(error)[:1024].lower()
     if "-32601" in text or "method not found" in text or "unsupported" in text:
         return "unsupported by this Codex app-server"
-    if any(token in text for token in ("401", "403", "unauthorized", "not logged")):
+    if (
+        "chatgpt authentication required" in text
+        or any(token in text for token in ("401", "403", "unauthorized", "not logged"))
+    ):
         return "unavailable for the current account"
     return "app-server request failed"
 
