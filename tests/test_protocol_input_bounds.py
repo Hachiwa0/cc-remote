@@ -12,6 +12,7 @@ from cc_remote.attachments import MAX_ATTACHMENT_COUNT, validate_attachments
 from cc_remote.protocol import (
     ASK_ANSWER_MAX_CHARS,
     AnswerQuestion,
+    ForkSessionWorktree,
     GetDiff,
     GetModels,
     NewSession,
@@ -103,6 +104,8 @@ def test_surrogate_filename_is_a_clean_validation_error():
         lambda: GetDiff(file="x", theme="bogus"),
         lambda: AnswerQuestion(
             ask_id="ask-1", answer="x" * (ASK_ANSWER_MAX_CHARS + 1)),
+        lambda: ForkSessionWorktree(
+            session_id="sid-1", request_id="request-1", name="x" * 81),
     ],
 )
 def test_client_command_scalars_are_bounded_or_enumerated(factory):
@@ -115,3 +118,6 @@ def test_known_dynamic_control_values_remain_supported():
     assert SetServiceTier(service_tier="toggle").service_tier == "toggle"
     assert SetPerm(mode="on-request").mode == "on-request"
     assert GetModels(engine="cc").engine == "cc"
+    assert ForkSessionWorktree(
+        session_id="sid-1", request_id="request-1", name="feature",
+    ).name == "feature"

@@ -580,6 +580,29 @@ class ArchiveSession(_Command):
     archived: bool
 
 
+class ForkSessionWorktree(_Command):
+    """client -> wrapper: persistently fork a Codex thread into a new Git worktree.
+
+    The wrapper chooses the target path and branch. ``request_id`` is stable
+    across transport retries and therefore also keys deterministic worktree
+    recovery.
+    """
+    type: Literal["fork_session_worktree"] = "fork_session_worktree"
+    session_id: WireId
+    request_id: WireId
+    name: Optional[str] = Field(default=None, max_length=80)
+
+
+class SessionForked(_Base):
+    """wrapper -> requesting client: persistent worktree fork is ready."""
+    type: Literal["session_forked"] = "session_forked"
+    parent_session_id: WireId
+    session_id: WireId
+    cwd: str = Field(min_length=1, max_length=4096)
+    git_branch: str = Field(min_length=1, max_length=500)
+    request_id: WireId
+
+
 # ---- directory picker (for creating a session in an arbitrary cwd) ----
 
 class ListDir(_Command):
@@ -905,7 +928,8 @@ class GoalState(_Base):
 AnyMessage = Union[
     Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, DiffReport, History, Models, AskUser, AnswerQuestion,
-    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, DirList,
+    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession,
+    ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
@@ -944,6 +968,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "new_session": NewSession,
     "rename_session": RenameSession,
     "archive_session": ArchiveSession,
+    "fork_session_worktree": ForkSessionWorktree,
+    "session_forked": SessionForked,
     "list_dir": ListDir,
     "dir_list": DirList,
     "ping": Ping,
