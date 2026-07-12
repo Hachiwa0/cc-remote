@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import type { StatusRateLimit, StatusRateWindow, StatusReport } from "../protocol";
 import { Icon } from "../icons";
+import { accountStatsNote } from "../status-capabilities";
 
 interface Props {
   open: boolean;
@@ -53,6 +54,7 @@ export function StatusSheet({ open, report, onClose, onRefresh }: Props) {
   const runtime = report?.runtime;
   const context = report?.context;
   const usage = report?.usage;
+  const statsNote = accountStatsNote(report?.account);
   return <>
     <div className="scrim show" onClick={onClose} />
     <section className="sheet show status-sheet" role="dialog" aria-modal="true" aria-label="Codex Status">
@@ -63,7 +65,7 @@ export function StatusSheet({ open, report, onClose, onRefresh }: Props) {
         <button className="status-refresh" onClick={onRefresh}>刷新</button>
         <button onClick={onClose} aria-label="关闭"><Icon name="close" size={17} /></button>
       </header>
-      {!report ? <div className="status-loading"><span />正在读取 thread、config、account 和 rate limits…</div> :
+      {!report ? <div className="status-loading"><span />正在读取 thread、config 和 account…</div> :
       <div className="status-sheet-scroll">
         <section className="status-section">
           <h3>线程</h3>
@@ -108,6 +110,8 @@ export function StatusSheet({ open, report, onClose, onRefresh }: Props) {
             <Row label="订阅计划">{show(report.account.plan_type)}</Row>
             <Row label="需要 OpenAI 登录">{yesNo(report.account.requires_openai_auth)}</Row>
           </div>
+          {statsNote && report.rate_limits.length === 0 && !usage &&
+            <div className="status-capability-note">{statsNote}</div>}
         </section>}
 
         {report.rate_limits.length > 0 && <section className="status-section">
