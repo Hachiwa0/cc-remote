@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import hashlib
 import json
 import os
 import re
@@ -29,8 +30,14 @@ from itertools import islice
 from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote.log import logger
-from cc_remote.protocol import ThreadGoal
-from cc_remote.wrapper.codex_sessions import codex_model, codex_effort, codex_context_window
+from cc_remote.protocol import Notice, RateLimitUpdate, ThreadGoal
+from cc_remote.wrapper.codex_sessions import (
+    codex_approval,
+    codex_context_window,
+    codex_effort,
+    codex_fast_enabled,
+    codex_model,
+)
 from cc_remote.wrapper.child_env import sanitized_child_env
 
 log = logger("cc_remote.wrapper.codex_handle")
@@ -43,8 +50,15 @@ _MAX_CODEX_CANDIDATES = 16
 _MAX_STANDALONE_CANDIDATES = 6
 _MAX_NVM_CANDIDATES = 3
 _CODEX_VERSION_TIMEOUT = 5
+_THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
+_RUNTIME_EVENT_PENDING_MAX = 32
+_RUNTIME_EVENT_SEEN_MAX = 128
+_NOTICE_MESSAGE_MAX = 2 * 1024
+_NOTICE_DETAIL_MAX = 4 * 1024
+_NOTICE_PATH_MAX = 1024
+_NOTICE_PATH_SAMPLE_MAX = 3
 _SPONTANEOUS_QUEUE_MIN_ITEMS = 64
 _SPONTANEOUS_QUEUE_MAX_ITEMS = 256
 _SPONTANEOUS_QUEUE_MIN_BYTES = 4 * 1024 * 1024
@@ -53,6 +67,8 @@ ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
 GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
+RuntimeEvent = Notice | RateLimitUpdate
+RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
 
 class CodexSpontaneousOverflow:
@@ -145,7 +161,14 @@ _LEGACY_DECISIONS = {
 
 _TURN_NOTIFICATION_PREFIXES = ("item/", "turn/", "hook/")
 _TURN_QUEUE_PREFIXES = ("item/", "turn/", "hook/")
-_TURN_QUEUE_METHODS = frozenset({"error", "thread/compacted"})
+_MODEL_TURN_METHODS = frozenset({
+    "model/rerouted",
+    "model/safetyBuffering/updated",
+    "model/verification",
+})
+_TURN_QUEUE_METHODS = frozenset({
+    "error", "thread/compacted", *_MODEL_TURN_METHODS,
+})
 
 
 def _notification_thread_id(message: dict) -> Optional[str]:
@@ -179,8 +202,11 @@ def _notification_turn_id(message: dict) -> Optional[str]:
 
 
 def _is_turn_notification(method: Any) -> bool:
-    return isinstance(method, str) and method.startswith(
-        _TURN_NOTIFICATION_PREFIXES)
+    return (
+        isinstance(method, str)
+        and (method in _MODEL_TURN_METHODS
+             or method.startswith(_TURN_NOTIFICATION_PREFIXES))
+    )
 
 
 def _is_turn_queue_notification(method: Any) -> bool:
@@ -292,7 +318,8 @@ class CodexHandle:
                  approval_callback: Optional[ApprovalCallback] = None,
                  interaction_callback: Optional[InteractionCallback] = None,
                  goal_callback: Optional[GoalCallback] = None,
-                 turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None):
+                 turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
+                 runtime_event_callback: Optional[RuntimeEventCallback] = None):
         self.cfg = cfg
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
@@ -309,6 +336,7 @@ class CodexHandle:
         self._turn_q: Optional[asyncio.Queue] = None
         self._reader: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self._thread_settings_updated = asyncio.Event()
         # Human approval can take minutes.  It must not block the sole stdout
         # reader, which still has to consume turn/interrupt and other RPC replies.
         # Keep detached request handlers generation-owned and cancel them on
@@ -323,6 +351,16 @@ class CodexHandle:
         self.interaction_callback = interaction_callback
         self.goal_callback = goal_callback
         self.turn_lifecycle_callback = turn_lifecycle_callback
+        # App-server can emit initialize/config warnings before thread/start has
+        # returned.  Machine binds this callback immediately but activates it only
+        # after the SessionContext has a non-null routing key.  Until then, keep a
+        # bounded, deduplicated queue so no notice can be broadcast with sid=None.
+        self.runtime_event_callback = runtime_event_callback
+        self._runtime_events_active = False
+        self._runtime_event_pending: OrderedDict[str, RuntimeEvent] = OrderedDict()
+        self._runtime_event_seen: OrderedDict[str, None] = OrderedDict()
+        self._runtime_rate_keys: OrderedDict[str, str] = OrderedDict()
+        self._runtime_event_lock = asyncio.Lock()
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
         self.app_server_version: Optional[str] = None
@@ -338,16 +376,98 @@ class CodexHandle:
         self._spontaneous_q: Optional[_SpontaneousNotificationQueue] = None
         self._spontaneous_queue_turn_id: Optional[str] = None
         self._spontaneous_overflow = False
-        # per-session codex settings, applied on thread/start + turn/start — the
+        # Per-session Codex settings, persisted through the official
+        # thread/settings/update API and repeated on turn/start for an atomic first
+        # turn. Config.toml is read-only here and supplies fresh-thread defaults.
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
         self.model: Optional[str] = codex_model()
         self.effort: Optional[str] = codex_effort()         # low | medium | high | xhigh
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
-        self.approval: str = "never"                        # untrusted | on-request | never
+        self.approval: str = codex_approval()                # UI/callback projection
         self.collaboration_mode: str = "default"            # default | plan; independent of approval
-        self.service_tier: Optional[str] = None             # "fast" = Codex Fast mode; None = default
-        self.tier_dirty: bool = False                       # service_tier changed -> reconnect next turn to reload config
+        self.service_tier: Optional[str] = (
+            "fast" if codex_fast_enabled() else None
+        )                                                    # thread-scoped; None = standard
+
+    async def activate_runtime_events(self) -> None:
+        """Release initialization-time notices after Machine can route them.
+
+        Activation is deliberately separate from assigning the callback: a new
+        SessionContext does not receive its temp/real key until connect() has
+        completed.  The pending queue stays bounded even if activation never
+        happens because connect failed.
+        """
+        async with self._runtime_event_lock:
+            callback = self.runtime_event_callback
+            if callback is None:
+                return
+            self._runtime_events_active = True
+            pending = list(self._runtime_event_pending.values())
+            self._runtime_event_pending.clear()
+        for event in pending:
+            if (isinstance(event, Notice) and event.thread_id is not None
+                    and self.thread_id is not None
+                    and event.thread_id != self.thread_id):
+                log.warning(
+                    "foreign pending codex notice dropped",
+                    event_type=event.type,
+                    category=event.category,
+                )
+                continue
+            try:
+                await callback(event)
+            except Exception as exc:
+                log.warning(
+                    "codex runtime event callback failed",
+                    event_type=event.type,
+                    error_type=type(exc).__name__,
+                )
+
+    async def _publish_runtime_event(self, event: RuntimeEvent) -> None:
+        key = _runtime_event_key(event)
+        async with self._runtime_event_lock:
+            if isinstance(event, RateLimitUpdate):
+                # Rate values can legitimately cycle (99 -> 100 -> 99). Dedup
+                # only a consecutive identical snapshot for the same public
+                # limit, not every value observed in the global LRU window.
+                identity = event.limit_id or "__default__"
+                previous = self._runtime_rate_keys.get(identity)
+                if previous == key and key in self._runtime_event_seen:
+                    self._runtime_event_seen.move_to_end(key)
+                    self._runtime_rate_keys.move_to_end(identity)
+                    return
+                if previous is not None:
+                    self._runtime_event_seen.pop(previous, None)
+                self._runtime_rate_keys[identity] = key
+                self._runtime_rate_keys.move_to_end(identity)
+                while len(self._runtime_rate_keys) > _STATUS_RATE_LIMIT_MAX:
+                    _, evicted_key = self._runtime_rate_keys.popitem(last=False)
+                    self._runtime_event_seen.pop(evicted_key, None)
+            if key in self._runtime_event_seen:
+                self._runtime_event_seen.move_to_end(key)
+                return
+            self._runtime_event_seen[key] = None
+            while len(self._runtime_event_seen) > _RUNTIME_EVENT_SEEN_MAX:
+                self._runtime_event_seen.popitem(last=False)
+            callback = self.runtime_event_callback
+            if not self._runtime_events_active or callback is None:
+                self._runtime_event_pending[key] = event
+                while len(self._runtime_event_pending) > _RUNTIME_EVENT_PENDING_MAX:
+                    dropped, _ = self._runtime_event_pending.popitem(last=False)
+                    # A capacity drop was never delivered; allow a later repeat
+                    # to re-enter after Machine has activated the route.
+                    self._runtime_event_seen.pop(dropped, None)
+                return
+        try:
+            await callback(event)
+        except Exception as exc:
+            # Never include exception text: transports may echo payload details.
+            log.warning(
+                "codex runtime event callback failed",
+                event_type=event.type,
+                error_type=type(exc).__name__,
+            )
 
     async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
                       fork: bool = False) -> None:
@@ -399,18 +519,50 @@ class CodexHandle:
                 # from parent context, parent stays coherent).
                 res = await self._request("thread/fork", {
                     "threadId": resume_id, "ephemeral": True,
-                    "cwd": self._cwd, "approvalPolicy": self.approval})
+                    "cwd": self._cwd,
+                    "approvalPolicy": self.approval_policy})
                 self.thread_id = _thread_id_of(res)
             elif resume_id:
+                # Do not send local/config defaults here: omitted fields tell
+                # app-server to resume the thread's persisted settings. The
+                # authoritative response is adopted below.
                 res = await self._request("thread/resume", {
-                    "threadId": resume_id, "cwd": self._cwd, "approvalPolicy": self.approval})
+                    "threadId": resume_id, "cwd": self._cwd})
                 self.thread_id = _thread_id_of(res) or resume_id
             else:
-                res = await self._request("thread/start", {
-                    "cwd": self._cwd, "approvalPolicy": self.approval})
+                params: dict[str, Any] = {
+                    "cwd": self._cwd,
+                    "approvalPolicy": self.approval_policy,
+                    "serviceTier": self.service_tier,
+                }
+                if self.model:
+                    params["model"] = self.model
+                res = await self._request("thread/start", params)
                 self.thread_id = _thread_id_of(res)
             if not self.thread_id:
                 raise RuntimeError("codex app-server did not return a thread id")
+            if isinstance(res, dict):
+                authoritative = res
+                if not resume_id:
+                    # thread/start has no effort/collaboration params in 0.144.1.
+                    # Preserve an explicit new-session first-turn selection instead
+                    # of replacing it with the response's config-derived default.
+                    authoritative = dict(res)
+                    authoritative.pop("reasoningEffort", None)
+                self._apply_thread_settings(authoritative)
+            if not resume_id:
+                # thread/start cannot carry effort or collaborationMode in 0.144.1.
+                # Persist both before the new-session command can return, so even a
+                # blank session that is evicted before its first query retains the
+                # complete selection. turn/start still repeats the same values.
+                sticky: dict[str, Any] = {
+                    "collaborationMode": self._collaboration_setting(
+                        self.collaboration_mode),
+                }
+                if self.effort:
+                    sticky["effort"] = self.effort
+                await self._update_thread_settings(
+                    wait_for_notification=True, **sticky)
         except BaseException:
             await self.disconnect()
             raise
@@ -428,7 +580,7 @@ class CodexHandle:
         params = {
             "threadId": self.thread_id,
             "input": _to_input(prompt, images),
-            "approvalPolicy": self.approval,
+            "approvalPolicy": self.approval_policy,
         }
         if self.model:
             params["model"] = self.model
@@ -451,8 +603,9 @@ class CodexHandle:
             }
         elif self.collaboration_mode == "plan":
             raise RuntimeError("Codex Plan mode requires an active model")
-        if self.service_tier:
-            params["serviceTier"] = self.service_tier   # codex Fast mode
+        # null is intentional: in app-server 0.144.1 it clears a persisted Fast
+        # override, while omission would leave the previous tier unchanged.
+        params["serviceTier"] = self.service_tier
         # Mark the turn active before awaiting the RPC.  app-server may dispatch
         # turn/completed immediately after the response, before this coroutine is
         # scheduled again; setting this afterwards would resurrect a completed
@@ -715,28 +868,160 @@ class CodexHandle:
         await self.disconnect()
         await self.connect(resume_id=target, cwd=cwd or self._cwd)
 
-    # --- live controls (applied on the NEXT turn via turn/start overrides) ---
+    # --- live controls (persisted for this thread by app-server 0.144.1) ---
+    @property
+    def approval(self) -> str:
+        return self._approval
+
+    @approval.setter
+    def approval(self, value: str) -> None:
+        # Existing machine/tests assign this projection directly. Keep the raw
+        # policy in lockstep for named policies; granular snapshots set _approval
+        # directly so turn/start can preserve their full official object.
+        self._approval = value
+        self.approval_policy: Any = value
+
+    async def _update_thread_settings(
+        self, *, wait_for_notification: bool = False, **settings: Any,
+    ) -> bool:
+        if not self.thread_id:
+            raise RuntimeError("connect() first")
+        if wait_for_notification:
+            self._thread_settings_updated.clear()
+        await self._request(
+            "thread/settings/update",
+            {"threadId": self.thread_id, **settings},
+        )
+        # The response is intentionally empty in 0.144.1. Its full authoritative
+        # snapshot arrives on thread/settings/updated and may include a model-driven
+        # effort adjustment. Wait only on a real connected reader; isolated unit
+        # fakes and older servers fall back to the requested value without hanging.
+        if wait_for_notification and self._reader is not None:
+            try:
+                await asyncio.wait_for(
+                    self._thread_settings_updated.wait(),
+                    timeout=_THREAD_SETTINGS_NOTIFY_TIMEOUT,
+                )
+                return True
+            except asyncio.TimeoutError:
+                log.warning("codex thread settings notification timed out")
+        return False
+
+    def _collaboration_setting(self, mode: str) -> dict[str, Any]:
+        model = self.model or codex_model()
+        if not model:
+            raise RuntimeError("Codex collaboration mode requires an active model")
+        settings: dict[str, Any] = {
+            "model": model,
+            "developer_instructions": None,
+        }
+        if self.effort:
+            settings["reasoning_effort"] = self.effort
+        return {"mode": mode, "settings": settings}
+
+    def _apply_thread_settings(self, settings: dict[str, Any]) -> None:
+        """Adopt a resume response or thread/settings/updated snapshot.
+
+        Resume responses use ``reasoningEffort`` while notification snapshots
+        use ``effort``. Both expose the remaining settings with the same names.
+        Granular approval objects are preserved in ``approval_policy`` while the
+        current UI receives their lossless-compatible ``on-request`` projection.
+        """
+        model = settings.get("model")
+        if isinstance(model, str) and model:
+            self.model = model[:256]
+
+        effort_key = "effort" if "effort" in settings else "reasoningEffort"
+        if effort_key in settings:
+            effort = settings.get(effort_key)
+            if effort is None:
+                self.effort = None
+                self.applied_effort = None
+            elif isinstance(effort, str) and effort:
+                self.effort = effort[:64]
+                self.applied_effort = self.effort
+
+        approval = settings.get("approvalPolicy")
+        if isinstance(approval, str) and approval in {
+            "untrusted",
+            "on-request",
+            "never",
+        }:
+            self.approval = approval
+        else:
+            granular = _copy_granular_approval(approval)
+            if granular is not None:
+                self.approval_policy = granular
+                # Remote's current wire has only named modes. Project granular to
+                # the interactive behavior without destroying the raw policy.
+                self._approval = "on-request"
+
+        if "serviceTier" in settings:
+            tier = settings.get("serviceTier")
+            if tier is None:
+                self.service_tier = None
+            elif isinstance(tier, str) and tier:
+                self.service_tier = tier[:64]
+
+        collaboration = settings.get("collaborationMode")
+        if isinstance(collaboration, dict):
+            mode = collaboration.get("mode")
+            if mode in {"default", "plan"}:
+                self.collaboration_mode = mode
+
     async def set_model(self, model: str) -> None:
-        self.model = model
-        log.info("codex model set (applies next turn)", model=model)
+        if not isinstance(model, str) or not model:
+            raise ValueError("Codex model must be non-empty")
+        authoritative = await self._update_thread_settings(
+            model=model, wait_for_notification=True)
+        if not authoritative:
+            self.model = model
+        log.info("codex thread model set", requested=model, applied=self.model)
+
+    async def set_effort(self, effort: str) -> None:
+        if not isinstance(effort, str) or not effort:
+            raise ValueError("Codex effort must be non-empty")
+        authoritative = await self._update_thread_settings(
+            effort=effort, wait_for_notification=True)
+        if not authoritative:
+            self.effort = effort
+            self.applied_effort = effort
+        log.info("codex thread effort set", requested=effort,
+                 applied=self.effort)
 
     async def set_service_tier(self, tier: Optional[str]) -> None:
-        # "" / "default" -> None (off); "fast" -> Codex Fast mode. Applies next turn.
-        self.service_tier = tier if tier and tier != "default" else None
-        log.info("codex service tier set (applies next turn)", service_tier=self.service_tier)
+        normalized = tier if tier and tier != "default" else None
+        if normalized not in {None, "fast"}:
+            raise ValueError(f"unsupported Codex service tier: {tier}")
+        authoritative = await self._update_thread_settings(
+            serviceTier=normalized, wait_for_notification=True)
+        if not authoritative:
+            self.service_tier = normalized
+        log.info("codex thread service tier set", requested=normalized,
+                 applied=self.service_tier)
 
     async def set_permission_mode(self, mode: str) -> None:
         # Codex "mode" = approval policy (untrusted | on-request | never).
         if mode not in ("untrusted", "on-request", "never"):
             raise ValueError(f"unsupported codex approval policy: {mode}")
-        self.approval = mode
-        log.info("codex approval set (applies next turn)", approval=mode)
+        authoritative = await self._update_thread_settings(
+            approvalPolicy=mode, wait_for_notification=True)
+        if not authoritative:
+            self.approval = mode
+        log.info("codex thread approval set", requested=mode,
+                 applied=self.approval)
 
     async def set_collaboration_mode(self, mode: str) -> None:
         if mode not in ("default", "plan"):
             raise ValueError(f"unsupported codex collaboration mode: {mode}")
-        self.collaboration_mode = mode
-        log.info("codex collaboration mode set (applies next turn)", mode=mode)
+        authoritative = await self._update_thread_settings(
+            collaborationMode=self._collaboration_setting(mode),
+            wait_for_notification=True,
+        )
+        if not authoritative:
+            self.collaboration_mode = mode
+        log.info("codex thread collaboration mode set", requested=mode,
+                 applied=self.collaboration_mode)
 
     async def get_goal(self) -> Optional[dict]:
         assert self.thread_id, "connect() first"
@@ -928,9 +1213,10 @@ class CodexHandle:
             "reasoning_effort": _bounded_string(
                 self.effort or raw_config.get("model_reasoning_effort"), 64),
             "service_tier": _bounded_string(
-                self.service_tier or raw_config.get("service_tier"), 64),
+                self.service_tier, 64),
             "approval_policy": _approval_policy_name(
-                self.approval if self.approval else raw_config.get("approval_policy")),
+                self.approval_policy if self.approval_policy
+                else raw_config.get("approval_policy")),
             "sandbox_mode": _bounded_string(raw_config.get("sandbox_mode"), 64),
             "web_search": _bounded_string(raw_config.get("web_search"), 64),
         }
@@ -1181,6 +1467,14 @@ class CodexHandle:
         """
         method = message.get("method")
         target_thread_id = _notification_thread_id(message)
+        if (method in _MODEL_TURN_METHODS
+                and (target_thread_id is None or self.thread_id is None)):
+            # These 0.144.1 notifications require both threadId and turnId.
+            # Unlike legacy error/hook frames, there is no valid thread-scoped
+            # form, so a partial payload must never be guessed into this session.
+            log.warning("unattributed codex model notification dropped",
+                        method=method)
+            return False
         if (target_thread_id is not None and self.thread_id is not None
                 and target_thread_id != self.thread_id):
             log.warning("foreign codex thread notification dropped", method=method)
@@ -1266,6 +1560,11 @@ class CodexHandle:
         completed_spontaneous_turn_id: Optional[str] = None
         if method == "thread/started" and not self.thread_id:
             self.thread_id = _thread_id_of_notif(m)
+        elif method in _NOTICE_METHODS:
+            notice = _notice_from_notification(
+                method, m.get("params"), self.thread_id)
+            if notice is not None:
+                await self._publish_runtime_event(notice)
         elif method == "turn/started":
             # Automatic continuations can start without a new local turn/start
             # response.  Remember the authoritative notification id so delayed
@@ -1298,6 +1597,13 @@ class CodexHandle:
                 mcw = tu.get("modelContextWindow")
                 if mcw:
                     self.context_window = mcw
+        elif method == "thread/settings/updated":
+            params = m.get("params") or {}
+            settings = params.get("threadSettings")
+            if (params.get("threadId") == self.thread_id
+                    and isinstance(settings, dict)):
+                self._apply_thread_settings(settings)
+                self._thread_settings_updated.set()
         elif method == "thread/status/changed":
             params = m.get("params") or {}
             status = params.get("status")
@@ -1308,10 +1614,11 @@ class CodexHandle:
             if isinstance(snapshot, dict):
                 update = _copy_rate_limit_snapshot(snapshot)
                 limit_id = update.get("limitId")
+                merged = update
                 if isinstance(limit_id, str) and limit_id:
                     previous = self.last_rate_limits_by_id.get(limit_id, {})
-                    self.last_rate_limits_by_id[limit_id] = _merge_rate_limit_snapshot(
-                        previous, update)
+                    merged = _merge_rate_limit_snapshot(previous, update)
+                    self.last_rate_limits_by_id[limit_id] = merged
                     while len(self.last_rate_limits_by_id) > _STATUS_RATE_LIMIT_MAX:
                         self.last_rate_limits_by_id.pop(next(iter(self.last_rate_limits_by_id)))
                 current_id = (
@@ -1320,6 +1627,13 @@ class CodexHandle:
                 if self.last_rate_limits is None or not limit_id or current_id == limit_id:
                     self.last_rate_limits = _merge_rate_limit_snapshot(
                         self.last_rate_limits or {}, update)
+                    merged = self.last_rate_limits
+                event = _rate_limit_update_from_snapshot(merged)
+                if event is not None:
+                    await self._publish_runtime_event(event)
+                    reached = _rate_limit_notice(event, self.thread_id)
+                    if reached is not None:
+                        await self._publish_runtime_event(reached)
         elif method == "thread/goal/updated":
             params = m.get("params") or {}
             if params.get("threadId") == self.thread_id:
@@ -1429,6 +1743,13 @@ _RATE_SCALAR_KEYS = (
     "limitId", "limitName", "planType", "rateLimitReachedType",
 )
 _RATE_WINDOW_KEYS = ("usedPercent", "resetsAt", "windowDurationMins")
+_NOTICE_METHODS = frozenset({
+    "warning",
+    "guardianWarning",
+    "configWarning",
+    "deprecationNotice",
+    "windows/worldWritableWarning",
+})
 
 
 def _sanitize_thread_goal(raw: Any, fallback_thread_id: Optional[str]) -> dict:
@@ -1478,6 +1799,158 @@ def _bounded_string(value: Any, limit: int) -> Optional[str]:
         return None
     value = value.strip()
     return value[:limit] if value else None
+
+
+def _safe_notice_thread_id(value: Any) -> Optional[str]:
+    if isinstance(value, str) and _STATUS_WIRE_ID.fullmatch(value):
+        return value
+    return None
+
+
+def _stable_notice_id(method: str, payload: dict[str, Any]) -> str:
+    # Routing metadata may be unknown during initialize and appear on the same
+    # warning later. Keep identity tied to user-visible content so that timing
+    # difference cannot create a duplicate bar after thread/start.
+    identity_payload = {
+        key: value for key, value in payload.items() if key != "thread_id"
+    }
+    canonical = json.dumps(
+        {"method": method, **identity_payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"codex-notice-{hashlib.sha256(canonical).hexdigest()[:24]}"
+
+
+def _notice_from_notification(
+    method: Any, params: Any, fallback_thread_id: Optional[str],
+) -> Optional[Notice]:
+    """Convert only the five official user-notice notifications.
+
+    Each branch constructs a fresh allow-listed payload.  In particular,
+    configWarning.details/range never leave this function, and the Windows
+    warning samples only three bounded paths.
+    """
+    if method not in _NOTICE_METHODS or not isinstance(params, dict):
+        return None
+    raw_thread_id = params.get("threadId")
+    thread_id = _safe_notice_thread_id(
+        fallback_thread_id if raw_thread_id is None else raw_thread_id)
+    severity = "warning"
+    detail: Optional[str] = None
+
+    if method == "warning":
+        category = "runtime"
+        title = "Codex 运行警告"
+        message = _bounded_string(params.get("message"), _NOTICE_MESSAGE_MAX)
+    elif method == "guardianWarning":
+        category = "guardian"
+        title = "Codex 安全守护提示"
+        message = _bounded_string(params.get("message"), _NOTICE_MESSAGE_MAX)
+    elif method == "configWarning":
+        category = "config"
+        title = "Codex 配置警告"
+        message = _bounded_string(params.get("summary"), _NOTICE_MESSAGE_MAX)
+        # Deliberately ignore details and range.  Only the bounded path joins the
+        # public summary, as required by the remote privacy boundary.
+        detail = _bounded_string(params.get("path"), _NOTICE_PATH_MAX)
+    elif method == "deprecationNotice":
+        category = "deprecation"
+        severity = "info"
+        title = "Codex 兼容性提示"
+        message = _bounded_string(params.get("summary"), _NOTICE_MESSAGE_MAX)
+        detail = _bounded_string(params.get("details"), _NOTICE_DETAIL_MAX)
+    else:
+        category = "security"
+        title = "Codex 目录权限警告"
+        samples = params.get("samplePaths")
+        safe_paths: list[str] = []
+        if isinstance(samples, list):
+            for path in samples[:_NOTICE_PATH_SAMPLE_MAX]:
+                safe_path = _bounded_string(path, _NOTICE_PATH_MAX)
+                if safe_path is not None:
+                    safe_paths.append(safe_path)
+        extra = _nonnegative_int(params.get("extraCount")) or 0
+        failed = params.get("failedScan") is True
+        total = len(safe_paths) + extra
+        if failed:
+            message = "Codex 未能完整扫描可被所有用户写入的目录"
+        elif total:
+            message = f"Codex 检测到 {total} 个可被所有用户写入的目录"
+        else:
+            message = "Codex 检测到可被所有用户写入的目录"
+        if safe_paths:
+            detail = "\n".join(safe_paths)[:_NOTICE_DETAIL_MAX]
+
+    if message is None:
+        return None
+    public = {
+        "severity": severity,
+        "category": category,
+        "title": title,
+        "message": message,
+        "detail": detail,
+        "thread_id": thread_id,
+    }
+    return Notice(
+        notice_id=_stable_notice_id(str(method), public),
+        **public,
+    )
+
+
+def _rate_limit_update_from_snapshot(snapshot: Any) -> Optional[RateLimitUpdate]:
+    if not isinstance(snapshot, dict):
+        return None
+    sanitized = _sanitize_rate_limits({"rateLimits": snapshot})
+    if not sanitized:
+        return None
+    limit = sanitized[0]
+    payload = {
+        "limit_id": limit.get("limit_id"),
+        "name": limit.get("limit_name"),
+        "plan_type": limit.get("plan_type"),
+        "reached_type": limit.get("rate_limit_reached_type"),
+        "primary": limit.get("primary"),
+        "secondary": limit.get("secondary"),
+    }
+    if all(value is None for value in payload.values()):
+        return None
+    return RateLimitUpdate(**payload)
+
+
+def _rate_limit_notice(
+    update: RateLimitUpdate, thread_id: Optional[str],
+) -> Optional[Notice]:
+    if not update.reached_type:
+        return None
+    name = update.name or update.limit_id or "Codex"
+    message = _bounded_string(f"{name} 已达到使用限额", _NOTICE_MESSAGE_MAX)
+    assert message is not None
+    public = {
+        "severity": "warning",
+        "category": "rate_limit",
+        "title": "Codex 使用限额已达到",
+        "message": message,
+        "detail": update.reached_type,
+        "thread_id": _safe_notice_thread_id(thread_id),
+    }
+    return Notice(
+        notice_id=_stable_notice_id("rate_limit", public),
+        **public,
+    )
+
+
+def _runtime_event_key(event: RuntimeEvent) -> str:
+    if isinstance(event, Notice):
+        return f"notice:{event.notice_id}"
+    payload = event.model_dump(exclude={
+        "v", "ts", "sid", "seq", "to", "route_id",
+    })
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return f"rate:{hashlib.sha256(canonical).hexdigest()[:32]}"
 
 
 def _nonnegative_int(value: Any) -> Optional[int]:
@@ -1567,6 +2040,21 @@ def _approval_policy_name(value: Any) -> Optional[str]:
     if isinstance(value, dict) and isinstance(value.get("granular"), dict):
         return "granular"
     return None
+
+
+def _copy_granular_approval(value: Any) -> Optional[dict[str, Any]]:
+    """Copy the bounded 0.144.1 granular approval shape, or reject it."""
+    if not isinstance(value, dict) or not isinstance(value.get("granular"), dict):
+        return None
+    raw = value["granular"]
+    required = ("mcp_elicitations", "rules", "sandbox_approval")
+    if any(not isinstance(raw.get(key), bool) for key in required):
+        return None
+    copied = {key: raw[key] for key in required}
+    for key in ("request_permissions", "skill_approval"):
+        if isinstance(raw.get(key), bool):
+            copied[key] = raw[key]
+    return {"granular": copied}
 
 
 def _copy_rate_limit_snapshot(snapshot: dict) -> dict:

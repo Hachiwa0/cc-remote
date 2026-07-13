@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 8
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -38,7 +38,8 @@ ToolCategory = Literal[
 ]
 ProcessKind = Literal[
     "reasoning", "plan", "command", "file_change", "mcp", "agent", "hook",
-    "server_tool", "web_search", "task", "terminal", "diff", "compaction",
+    "server_tool", "web_search", "task", "terminal", "model", "safety",
+    "diff", "compaction",
 ]
 ProcessPhase = Literal["start", "update", "end", "snapshot"]
 ProcessStatus = Literal[
@@ -108,6 +109,19 @@ AskAnswerText = Annotated[
 ]
 StatusErrorText = Annotated[
     str, StringConstraints(min_length=1, max_length=384),
+]
+NoticeTitle = Annotated[
+    str, StringConstraints(min_length=1, max_length=256),
+]
+NoticeMessage = Annotated[
+    str, StringConstraints(min_length=1, max_length=2 * 1024),
+]
+NoticeDetail = Annotated[
+    str, StringConstraints(min_length=1, max_length=4 * 1024),
+]
+NoticeSeverity = Literal["info", "warning"]
+NoticeCategory = Literal[
+    "runtime", "guardian", "config", "deprecation", "security", "rate_limit",
 ]
 GoalStatus = Literal[
     "active", "paused", "blocked", "usageLimited", "budgetLimited", "complete",
@@ -279,8 +293,8 @@ class SetEffort(_Command):
 
 class SetServiceTier(_Command):
     """client -> wrapper: set the Codex service tier (codex only). "fast" maps to
-    codex's Fast mode via turn/start's `serviceTier` param; "" / "default" turns it
-    off. Applied on the NEXT turn (a per-turn turn/start override, like model)."""
+    app-server's persisted per-thread service tier; "" / "default" clears the
+    override. 0.144.1 reports the applied Fast tier as ``priority``."""
     type: Literal["set_service_tier"] = "set_service_tier"
     service_tier: Literal["", "default", "fast", "toggle"]
 
@@ -627,7 +641,7 @@ class NewSession(_Command):
     `model`/`effort` pre-select the model and reasoning strength AT SPAWN — so
     the very first turn already uses them (effort especially: applying it at
     spawn avoids the respawn-with-resume that a post-spawn set_effort forces).
-    Protocol v4 can carry the first query atomically. The wrapper starts it on
+    The command can carry the first query atomically. The wrapper starts it on
     the newly-created context rather than waiting for a later SessionFocus and
     a separately-routed Query. Omitting query fields still creates a blank
     session, preserving the existing new-session command."""
@@ -638,6 +652,10 @@ class NewSession(_Command):
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
     effort: Optional[EffortLevel] = None  # None -> engine default
     collaboration_mode: Optional[CollaborationModeName] = None  # Codex only; first turn included
+    permission_mode: Optional[
+        Literal["never", "on-request", "untrusted"]
+    ] = None  # Codex only; persisted before the first turn
+    service_tier: Optional[Literal["default", "fast"]] = None  # Codex only
     prompt: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
     msg_id: Optional[WireId] = None
     images: Optional[list[QueryImage]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
@@ -650,8 +668,16 @@ class NewSession(_Command):
                 f"new_session attachments exceed {MAX_ATTACHMENT_COUNT} items")
         if (self.prompt is not None or self.images or self.files) and not self.msg_id:
             raise ValueError("msg_id is required when new_session carries a query")
-        if self.collaboration_mode is not None and self.engine != "codex":
-            raise ValueError("collaboration_mode is only supported for Codex sessions")
+        codex_only = {
+            "collaboration_mode": self.collaboration_mode,
+            "permission_mode": self.permission_mode,
+            "service_tier": self.service_tier,
+        }
+        invalid = [name for name, value in codex_only.items()
+                   if value is not None and self.engine != "codex"]
+        if invalid:
+            raise ValueError(
+                f"{', '.join(invalid)} only supported for Codex sessions")
         return self
 
 
@@ -768,12 +794,16 @@ class DirList(_Base):
 class GetModels(_Command):
     """client -> wrapper: what models does this engine actually offer?
 
-    Only `codex` answers with real data: its app-server's `model/list` reports each
-    model's `supportedReasoningEfforts` + `defaultReasoningEffort`. cc has no such
-    RPC, so the client keeps its static table for engine="cc"."""
+    `codex` answers with app-server's real catalog. Claude has no equivalent
+    catalog RPC, but can resolve explicit no-override settings for a cwd;
+    its model list therefore remains empty and the client keeps the static table.
+    """
     type: Literal["get_models"] = "get_models"
     engine: Optional[Literal["cc", "claude", "codex"]] = None
     client_id: Optional[WireId] = None  # requester, so the wrapper routes Models back to=<client_id>
+    # Claude defaults can depend on project/local settings, so resolve them in
+    # the same directory the prospective new session will use.
+    cwd: Optional[str] = Field(default=None, max_length=4096)
 
 
 class Models(_Base):
@@ -784,13 +814,16 @@ class Models(_Base):
     only fails later inside the model API. Empty list = we couldn't read it; the
     client falls back to its static table rather than rendering nothing.
 
-    `default_model` is what a NEW session starts on — codex's ~/.codex/config.toml
-    `model`, i.e. the same default the user's terminal codex inherits. It is NOT the
-    focused session's model (that's per-session, carried in its own rollout)."""
+    `default_model`/`default_effort` are what a NEW no-override session starts on.
+    They are NOT the focused session's controls (those are per-session events)."""
     type: Literal["models"] = "models"
     engine: str
     models: list[dict[str, Any]] = []
-    default_model: Optional[str] = None
+    default_model: Optional[str] = Field(default=None, max_length=256)
+    default_effort: Optional[str] = Field(default=None, max_length=64)
+    # Echoes GetModels.cwd for cwd-sensitive Claude defaults so a late response
+    # can never be rendered against a different directory in the new-chat form.
+    cwd: Optional[str] = Field(default=None, max_length=4096)
 
 
 class SetPerm(_Command):
@@ -922,6 +955,49 @@ class StatusReport(_Base):
     component_errors: list[StatusErrorText] = Field(default_factory=list, max_length=5)
 
 
+class Notice(_Base):
+    """Ephemeral, per-session app-server notice.
+
+    Notices are control-plane UI state rather than transcript narrative: the
+    wrapper routes them to one resident session but never puts them in history
+    or its replay ring.  Every text field is deliberately bounded before it can
+    reach a browser.
+    """
+    type: Literal["notice"] = "notice"
+    notice_id: WireId
+    severity: NoticeSeverity
+    category: NoticeCategory
+    title: NoticeTitle
+    message: NoticeMessage
+    detail: Optional[NoticeDetail] = None
+    thread_id: Optional[WireId] = None
+
+
+class RateLimitUpdate(_Base):
+    """Sparse-safe, sanitized rolling Codex rate-limit state.
+
+    The app-server's credits, individual spend control and future unknown
+    fields are intentionally absent.  Names differ slightly from StatusReport
+    so the live event remains concise; the Web reducer projects them into the
+    existing StatusRateLimit view model.
+    """
+    type: Literal["rate_limit_update"] = "rate_limit_update"
+    limit_id: Optional[str] = Field(default=None, max_length=128)
+    name: Optional[str] = Field(default=None, max_length=256)
+    plan_type: Optional[str] = Field(default=None, max_length=128)
+    reached_type: Optional[str] = Field(default=None, max_length=128)
+    primary: Optional[StatusRateLimitWindow] = None
+    secondary: Optional[StatusRateLimitWindow] = None
+
+    @model_validator(mode="after")
+    def has_public_field(self):
+        if all(getattr(self, field) is None for field in (
+            "limit_id", "name", "plan_type", "reached_type", "primary", "secondary",
+        )):
+            raise ValueError("rate_limit_update requires a public field")
+        return self
+
+
 class GetDiff(_Command):
     """client -> wrapper: request a git diff (context + line numbers) for a file.
     `theme` picks delta's light/dark rendering so the panel matches the app."""
@@ -971,7 +1047,7 @@ class History(_Base):
     # (a native `claude`/`codex` in the user's terminal), not by us. The wrapper
     # mirrors those appends by broadcasting a fresh History; the client renders the
     # session READ-ONLY, since a cc session has a single owner and typing here would
-    # fork the conversation. Additive + defaulted, so no PROTOCOL_VERSION bump.
+    # fork the conversation.
     external: bool = False
     # Authoritative current takeover intent. Unlike TakeoverState this survives
     # a GetHistory refresh without becoming replayable transcript narrative.
@@ -1069,7 +1145,7 @@ class GoalState(_Base):
 
 AnyMessage = Union[
     Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, DiffReport, History, Models, AskUser, AnswerQuestion,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, History, Models, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
@@ -1133,6 +1209,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "perm": Perm,
     "context_report": ContextReport,
     "status_report": StatusReport,
+    "notice": Notice,
+    "rate_limit_update": RateLimitUpdate,
     "diff_report": DiffReport,
     "history": History,
     "ask_user": AskUser,

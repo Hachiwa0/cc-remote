@@ -5,6 +5,7 @@ import uvicorn
 
 from cc_remote.config import relay_config, validate_relay_config
 from cc_remote.log import logger
+from cc_remote.relay.log_safety import uvicorn_log_config
 from cc_remote.relay.server import create_app
 
 log = logger("cc_remote.relay")
@@ -22,6 +23,7 @@ def main() -> None:
         host=cfg.host,
         port=cfg.port,
         log_level="info",
+        log_config=uvicorn_log_config(),
         access_log=False,
         ws_max_size=cfg.ws_max_size_bytes,
         ws_max_queue=2,

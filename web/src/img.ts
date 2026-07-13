@@ -110,7 +110,9 @@ export async function downscaleImage(file: File): Promise<QueryImg> {
 
   const dataUrl = await readDataUrl(file);
   const raw = (): QueryImg => ({
-    media_type: file.type === "image/jpg" ? "image/jpeg" : file.type,
+    // The allow-list check above narrows the runtime value; File.type itself is
+    // declared as a broad string by lib.dom.d.ts.
+    media_type: (file.type === "image/jpg" ? "image/jpeg" : file.type) as QueryImg["media_type"],
     data: dataUrl.split(",", 2)[1] || "",
   });
   if (Math.max(sourceWidth, sourceHeight) <= IMG_MAX_EDGE) return raw();

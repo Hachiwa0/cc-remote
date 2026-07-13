@@ -26,6 +26,9 @@ from cc_remote.relay.auth import (
     session_token_expiry,
     verify_session_token,
 )
+from cc_remote.relay.log_safety import (
+    SensitiveLogFilter, redact_log_text, uvicorn_log_config,
+)
 from cc_remote.relay.server import create_app
 
 
@@ -142,6 +145,50 @@ def test_login_sets_httponly_secure_strict_cookie_without_returning_token():
     assert "samesite=strict" in cookie
     cookie_value = response.cookies[SESSION_COOKIE_NAME].strip('"')
     assert verify_session_token(cookie_value, cfg.session_secret)
+
+
+def test_login_and_logout_reject_cross_origin_browser_posts():
+    cfg = _cfg()
+    with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
+        rejected_login = client.post(
+            "/api/login",
+            json={"password": cfg.login_password},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert rejected_login.status_code == 403
+
+        login = _login(client, cfg)
+        assert login.status_code == 200
+        rejected_logout = client.post(
+            "/api/logout", headers={"Origin": "https://evil.example"})
+        assert rejected_logout.status_code == 403
+        assert client.get("/api/session").status_code == 200
+
+
+@pytest.mark.parametrize("message", [
+    "WebSocket /ws?token=unique-secret-marker accepted",
+    "wss://remote.example/ws?password=unique-secret-marker",
+    'payload={"password":"unique-secret-marker"}',
+    "Authorization: Bearer unique-secret-marker",
+    "Cookie: cc_remote_session=unique-secret-marker",
+])
+def test_relay_log_redaction_removes_secret_markers(message):
+    assert "unique-secret-marker" not in redact_log_text(message)
+
+
+def test_relay_log_filter_redacts_format_arguments_and_scope():
+    record = logging.LogRecord(
+        "uvicorn.error", logging.INFO, __file__, 1,
+        "WebSocket %s", ("/ws?token=unique-secret-marker",), None,
+    )
+    record.scope = {
+        "headers": {"authorization": "Bearer unique-secret-marker"},
+        "query_string": b"token=unique-secret-marker",
+    }
+
+    assert SensitiveLogFilter().filter(record) is True
+    assert "unique-secret-marker" not in record.getMessage()
+    assert "unique-secret-marker" not in repr(record.scope)
 
 
 def test_login_read_has_total_timeout_and_releases_capacity(monkeypatch):
@@ -611,5 +658,10 @@ def test_uvicorn_access_log_is_disabled(monkeypatch):
 
     assert called["args"] == (app,)
     assert called["kwargs"]["access_log"] is False
+    configured = called["kwargs"]["log_config"]
+    expected = uvicorn_log_config()
+    assert configured.keys() == expected.keys()
+    for handler in configured["handlers"].values():
+        assert "cc_remote_sensitive_log_redaction" in handler["filters"]
     assert called["kwargs"]["ws_max_size"] == cfg.ws_max_size_bytes
     assert called["kwargs"]["ws_max_queue"] == 2

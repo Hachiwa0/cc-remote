@@ -7,7 +7,9 @@
 // cursors are per-session. session_focus just sets focusedSid + dispatches —
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
-import type { ServerEvent, QueryImg, QueryFile } from "./protocol.ts";
+import type {
+  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent,
+} from "./protocol.ts";
 import { makeForkSessionCommand, makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
 import { CommandOutbox, planRecoveryReplay } from "./outbox.ts";
 import { probeSession, shouldReconnectAfterSessionProbe } from "./session-auth.ts";
@@ -325,7 +327,7 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs() });
   }
 
-  sendGetDiff(file: string, theme: string): void {
+  sendGetDiff(file: string, theme: DiffTheme): void {
     this.send({ v: PROTOCOL_VERSION, type: "get_diff", file, theme, ts: nowTs(), ...this.sidObj() });
   }
 
@@ -342,10 +344,15 @@ export class RelayWs {
     this.send(obj);
   }
 
-  /** Ask the engine which models it really has, and which reasoning levels each
-   *  one takes. Only codex answers; cc keeps the static table in data.ts. */
-  sendGetModels(engine: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_models", engine, client_id: this.clientId, ts: nowTs() });
+  /** Ask the engine for its catalog and explicit new-session defaults. Claude
+   *  needs cwd because project/local settings can change the selected model. */
+  sendGetModels(engine: "cc" | "claude" | "codex", cwd?: string | null): void {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_models", engine,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (cwd) frame.cwd = cwd;
+    this.send(frame);
   }
 
   sendAnswerQuestion(askId: string, answer: string): void {
@@ -360,7 +367,7 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "get_status", client_id: this.clientId, ts: nowTs(), ...this.sidObj() });
   }
 
-  sendSetGoal(objective: string | null, status: string | null, tokenBudget: number | null): void {
+  sendSetGoal(objective: string | null, status: GoalStatus | null, tokenBudget: number | null): void {
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "set_goal", ts: nowTs(), ...this.sidObj() };
     if (objective !== null) obj.objective = objective;
     if (status !== null) obj.status = status;
@@ -388,7 +395,9 @@ export class RelayWs {
   sendNewSession(cwd?: string | null, engine?: "claude" | "codex",
                  model?: string | null, effort?: string | null,
                  initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] },
-                 collaborationMode?: "default" | "plan"): boolean {
+                 collaborationMode?: "default" | "plan",
+                 permissionMode?: "never" | "on-request" | "untrusted",
+                 serviceTier?: "default" | "fast"): boolean {
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
     this.newSessionEngine = engine ?? "claude";
@@ -401,6 +410,12 @@ export class RelayWs {
     if (effort) obj.effort = effort;
     if (engine === "codex" && collaborationMode) {
       obj.collaboration_mode = collaborationMode;
+    }
+    if (engine === "codex" && permissionMode) {
+      obj.permission_mode = permissionMode;
+    }
+    if (engine === "codex" && serviceTier) {
+      obj.service_tier = serviceTier;
     }
     if (initial) {
       obj.prompt = initial.prompt;

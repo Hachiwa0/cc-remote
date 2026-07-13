@@ -75,9 +75,8 @@ def test_interrupt_status_maps_to_cc_vocab():
     print(f"  failed -> subtype=error is_error=True  OK")
 
 
-def test_config_fast_toggle_preserves_file():
-    """/fast edits ~/.codex/config.toml (top-level service_tier) without touching
-    the rest of the file. Runs against a temp copy — never the real config."""
+def test_config_fast_default_read_never_writes_file():
+    """Reading a fresh-thread Fast default is strictly read-only."""
     import os, tempfile, cc_remote.wrapper.codex_sessions as cs
     src = ('model_provider = "cubence"\nmodel = "gpt-5.5"\n'
            'model_reasoning_effort = "xhigh"\nservice_tier = "fast"\n\n'
@@ -87,17 +86,9 @@ def test_config_fast_toggle_preserves_file():
     orig = cs._CONFIG
     cs._CONFIG = tf.name
     try:
+        before = open(tf.name).read()
         assert cs.codex_fast_enabled() is True
-        assert cs.set_codex_config_fast(False)
-        body = open(tf.name).read()
-        assert "service_tier" not in body and "[model_providers.cubence]" in body and 'model = "gpt-5.5"' in body
-        assert cs.codex_fast_enabled() is False
-        assert cs.set_codex_config_fast(True)
-        body = open(tf.name).read()
-        assert body.count("service_tier") == 1
-        assert body.index("service_tier") < body.index("[model_providers")  # top-level
-        assert cs.codex_fast_enabled() is True
-        print("  config /fast toggle: off removes, on re-adds top-level, file preserved  OK")
+        assert open(tf.name).read() == before
     finally:
         cs._CONFIG = orig
         os.unlink(tf.name)

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { AskOption } from "../protocol";
 import { Icon } from "../icons";
+import { useImeSubmit } from "../use-ime-submit";
 
 interface Props {
   question: string;
@@ -13,6 +14,9 @@ interface Props {
 
 export function QuestionSheet({ question, header, options, allowText, secret, onAnswer }: Props) {
   const [text, setText] = useState("");
+  const imeSubmit = useImeSubmit<HTMLInputElement>((value) => {
+    if (value.trim()) onAnswer(value);
+  });
   return (
     <>
       <div className="scrim show" />
@@ -33,11 +37,27 @@ export function QuestionSheet({ question, header, options, allowText, secret, on
             ))}
           </div>
           {allowText && <div className="qa-text-answer">
-            <input type={secret ? "password" : "text"} value={text}
+            <input ref={imeSubmit.inputRef} type={secret ? "password" : "text"} value={text}
               autoFocus={options.length === 0} placeholder={secret ? "输入敏感内容" : "输入回答"}
               onChange={(e) => setText(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) onAnswer(text); }} />
-            <button disabled={!text.trim()} onClick={() => onAnswer(text)}>确定</button>
+              onCompositionStart={imeSubmit.startComposition}
+              onCompositionEnd={(e) => {
+                imeSubmit.endComposition();
+                setText(e.currentTarget.value);
+              }}
+              onKeyDown={(e) => {
+                if (!imeSubmit.shouldSubmitKey({
+                  key: e.key,
+                  shiftKey: e.shiftKey,
+                  isComposing: e.nativeEvent.isComposing,
+                  keyCode: e.nativeEvent.keyCode,
+                })) return;
+                e.preventDefault();
+                imeSubmit.requestSubmit();
+              }} />
+            <button disabled={!text.trim()}
+              onPointerDown={imeSubmit.commitCompositionBeforePointerSubmit}
+              onClick={imeSubmit.requestSubmit}>确定</button>
           </div>}
         </div>
       </div>

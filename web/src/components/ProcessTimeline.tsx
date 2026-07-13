@@ -38,6 +38,8 @@ const PROCESS_IC: Record<ProcessBlock["processKind"], string> = {
   web_search: "research",
   task: "plan",
   terminal: "bash",
+  model: "cpu",
+  safety: "shield",
   diff: "edit",
   compaction: "simplify",
 };

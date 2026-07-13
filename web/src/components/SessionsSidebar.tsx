@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type TouchEvent } from "react";
 import type { SessionInfo, State } from "../protocol";
 import { Icon, ClaudeMark } from "../icons";
 import { isWorktreeForkBlockedByState, sessionMenuCapabilities } from "../session-worktree";
+import { useImeSubmit } from "../use-ime-submit";
 
 interface Props {
   open: boolean;
@@ -59,10 +60,11 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
   const groupKeys = Object.keys(groups).sort();
 
   const toggleGroup = (key: string) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
-  const commitRename = () => {
-    if (renaming && renaming.value.trim()) onRename(renaming.id, renaming.value.trim());
+  const commitRename = (value = renaming?.value ?? "") => {
+    if (renaming && value.trim()) onRename(renaming.id, value.trim());
     setRenaming(null);
   };
+  const renameIme = useImeSubmit<HTMLInputElement>(commitRename);
   const startRename = (s: SessionInfo) => {
     setRenaming({ id: s.session_id, value: s.summary || s.first_prompt || "" });
     setMenuCardId(null); setLifting(false);
@@ -132,15 +134,32 @@ export function SessionsSidebar({ open, sessions, liveStates, activeSessionId, o
         <div key={s.session_id} className={"scard" + (isActive ? " active" : "")}>
           <div className="scard-top">
             <input
+              ref={renameIme.inputRef}
               className="scard-rename"
               autoFocus
               value={renaming.value}
               onChange={(e) => setRenaming({ ...renaming, value: e.target.value })}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") commitRename();
-                else if (e.key === "Escape") setRenaming(null);
+              onCompositionStart={renameIme.startComposition}
+              onCompositionEnd={(e) => {
+                renameIme.endComposition();
+                setRenaming({ ...renaming, value: e.currentTarget.value });
               }}
-              onBlur={commitRename}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && !e.nativeEvent.isComposing
+                    && e.nativeEvent.keyCode !== 229) {
+                  setRenaming(null);
+                  return;
+                }
+                if (!renameIme.shouldSubmitKey({
+                  key: e.key,
+                  shiftKey: e.shiftKey,
+                  isComposing: e.nativeEvent.isComposing,
+                  keyCode: e.nativeEvent.keyCode,
+                })) return;
+                e.preventDefault();
+                renameIme.requestSubmit();
+              }}
+              onBlur={(e) => commitRename(e.currentTarget.value)}
             />
           </div>
         </div>

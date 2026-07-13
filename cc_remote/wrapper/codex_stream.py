@@ -2,7 +2,8 @@
 
 Only app-server fields that are explicitly part of its public client protocol are
 forwarded.  In particular, reasoning *summary* is visible, while raw/encrypted
-reasoning and terminal stdin are deliberately ignored.
+reasoning and terminal stdin are deliberately hidden.  A terminal-interaction
+marker is still forwarded so the remote timeline does not silently omit the step.
 """
 from __future__ import annotations
 
@@ -59,6 +60,10 @@ _MAX_FINISHED_DELTA_ITEMS = 4096
 _MAX_LIVE_ITEMS = 4096
 _LIVE_ITEMS_OMITTED_ID = "cc-remote-live-items-omitted"
 _DELTA_TRUNCATION_NOTICE = "\n…（后续输出已截断）"
+_MODEL_NAME_MAX_CHARS = 256
+_MODEL_ENUM_MAX_CHARS = 256
+_MODEL_LIST_MAX_ITEMS = 32
+_MODEL_DETAIL_MAX_CHARS = 16 * 1024
 
 
 def _bounded_jsonl_records(file):
@@ -367,6 +372,118 @@ class CodexStreamTranslator:
                     delta=progress,
                 ))
 
+        elif method == "item/commandExecution/terminalInteraction":
+            # The official payload's only interaction body is `stdin`.  It may
+            # contain a password, token, or an answer to a secret prompt, so never
+            # copy it to the wire.  Preserve a visible, sanitized timeline marker
+            # instead of making the interaction look like a stalled command.
+            command_id = _live_id(p.get("itemId"), "command-tool")
+            iid = _live_id(f"{command_id}:terminal", "terminal")
+            if not self._admit_live_item(iid, out):
+                return out
+            self._visible_output = True
+            out.append(ProcessEvent(
+                item_id=iid,
+                kind="terminal",
+                phase="snapshot",
+                status="succeeded",
+                turn_id=_optional_wire_id(p.get("turnId"), "turn"),
+                parent_id=command_id,
+                title="终端交互",
+                summary="已向运行中的终端进程写入输入（内容已隐藏）",
+            ))
+
+        elif method == "model/rerouted":
+            turn_id = _optional_wire_id(p.get("turnId"), "turn")
+            from_model = _bounded_model_field(
+                p.get("fromModel"), _MODEL_NAME_MAX_CHARS)
+            to_model = _bounded_model_field(
+                p.get("toModel"), _MODEL_NAME_MAX_CHARS)
+            reason = _bounded_model_field(
+                p.get("reason"), _MODEL_ENUM_MAX_CHARS)
+            if turn_id and from_model and to_model and reason:
+                iid = _live_id(
+                    f"reroute:{turn_id}:{from_model}:{to_model}:{reason}",
+                    "model-reroute",
+                )
+                if not self._admit_live_item(iid, out):
+                    return out
+                summary, _ = bounded_text(
+                    f"{from_model} → {to_model}", 1024)
+                detail, _ = bounded_text(
+                    f"原因：{reason}", _MODEL_DETAIL_MAX_CHARS)
+                self._visible_output = True
+                out.append(ProcessEvent(
+                    item_id=iid,
+                    kind="model",
+                    phase="snapshot",
+                    status="succeeded",
+                    turn_id=turn_id,
+                    title="模型已重路由",
+                    summary=summary,
+                    detail=detail,
+                ))
+
+        elif method == "model/safetyBuffering/updated":
+            turn_id = _optional_wire_id(p.get("turnId"), "turn")
+            model = _bounded_model_field(
+                p.get("model"), _MODEL_NAME_MAX_CHARS)
+            showing = p.get("showBufferingUi")
+            if turn_id and model and isinstance(showing, bool):
+                # One card follows the lifecycle of one turn/model pair. Repeated
+                # updates therefore merge instead of filling the timeline.
+                iid = _live_id(
+                    f"safety-buffering:{turn_id}:{model}",
+                    "model-safety-buffering",
+                )
+                if not self._admit_live_item(iid, out):
+                    return out
+                reasons = _bounded_model_list(p.get("reasons"))
+                use_cases = _bounded_model_list(p.get("useCases"))
+                faster_model = _bounded_model_field(
+                    p.get("fasterModel"), _MODEL_NAME_MAX_CHARS)
+                detail_parts = []
+                if reasons:
+                    detail_parts.append("原因：" + "、".join(reasons))
+                if use_cases:
+                    detail_parts.append("使用场景：" + "、".join(use_cases))
+                if faster_model:
+                    detail_parts.append(f"可用的更快模型：{faster_model}")
+                detail, _ = bounded_text(
+                    "\n".join(detail_parts), _MODEL_DETAIL_MAX_CHARS)
+                self._visible_output = True
+                out.append(ProcessEvent(
+                    item_id=iid,
+                    kind="safety",
+                    phase="start" if showing else "end",
+                    status="running" if showing else "succeeded",
+                    turn_id=turn_id,
+                    title="模型安全缓冲",
+                    summary=f"模型：{model}",
+                    detail=detail or None,
+                ))
+
+        elif method == "model/verification":
+            turn_id = _optional_wire_id(p.get("turnId"), "turn")
+            verifications = _bounded_model_list(p.get("verifications"))
+            if turn_id and verifications:
+                iid = _live_id(
+                    f"model-verification:{turn_id}", "model-verification")
+                if not self._admit_live_item(iid, out):
+                    return out
+                summary, _ = bounded_text(
+                    "、".join(verifications), _MODEL_DETAIL_MAX_CHARS)
+                self._visible_output = True
+                out.append(ProcessEvent(
+                    item_id=iid,
+                    kind="safety",
+                    phase="snapshot",
+                    status="succeeded",
+                    turn_id=turn_id,
+                    title="模型验证",
+                    summary=summary,
+                ))
+
         elif method in {"hook/started", "hook/completed"}:
             event = _hook_event(p, completed=(method == "hook/completed"))
             if event is not None and self._admit_live_item(event.item_id, out):
@@ -392,8 +509,7 @@ class CodexStreamTranslator:
 
         # Raw reasoning text is intentionally ignored. Only the public summary
         # notifications above and the summary array on a completed item cross the
-        # remote boundary. terminalInteraction is likewise skipped because it
-        # contains stdin.
+        # remote boundary.
 
         elif method == "error":
             # Retrying provider failures are progress, not terminal errors. Emit a
@@ -470,7 +586,7 @@ class CodexStreamTranslator:
             self._clear_all_delta_budgets()
             self._turn_closed = True
 
-        # everything else (reasoning, userMessage, hook/*, mcpServer/startupStatus,
+        # everything else (raw reasoning, userMessage, mcpServer/startupStatus,
         # thread/status, account/rateLimits, tokenUsage, remoteControl…) -> skip.
         return out
 
@@ -712,6 +828,25 @@ def _retry_detail(error: dict) -> str:
     if attempt:
         text += f"（{attempt.group(1).replace(' ', '')}）"
     return text + "…"
+
+
+def _bounded_model_field(value, max_chars: int) -> str:
+    """Copy one declared model-notification string, never arbitrary payloads."""
+    if not isinstance(value, str) or not value:
+        return ""
+    return bounded_text(value, max_chars)[0]
+
+
+def _bounded_model_list(value) -> list[str]:
+    """Bound declared string arrays by item count and per-item length."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in islice(value, _MODEL_LIST_MAX_ITEMS):
+        text = _bounded_model_field(item, _MODEL_ENUM_MAX_CHARS)
+        if text:
+            out.append(text)
+    return out
 
 
 def _structured_http_status(error: dict) -> str | None:

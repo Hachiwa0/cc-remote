@@ -13,7 +13,8 @@ import type { ConnState } from "./ws";
 import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ToolCategory, ProcessKind,
-  ProcessStatus, PlanEntry, CollaborationModeName,
+  ProcessStatus, PlanEntry, CollaborationModeName, Notice, RateLimitUpdate,
+  StatusRateLimit, StatusRateWindow,
 } from "./protocol";
 import type { Catalog } from "./data";
 import type { DiffLine, GitDiffSection } from "./diff";
@@ -90,6 +91,10 @@ export type Block = TextBlock | ToolBlock | ProcessBlock;
 export const MAX_TURN_BLOCKS = 256;
 export const MAX_TURN_BLOCK_CHARS = 16 * 1024 * 1024;
 export const OMITTED_PROCESS_ITEM_ID = "__cc_remote_earlier_process_omitted__";
+// Notices are ephemeral UI control state, not transcript history.  Eight keeps
+// simultaneous startup/config/security warnings available without allowing a
+// noisy app-server to grow every resident session indefinitely.
+export const MAX_SESSION_NOTICES = 8;
 
 export interface Turn {
   id: string;
@@ -127,7 +132,7 @@ export interface SessionRuntime {
   effort: string;
   perm: string;
   collaborationMode: CollaborationModeName;
-  fast: boolean;   // codex Fast-mode (service tier) on/off
+  fast: boolean | null;   // null until the wrapper reports the real service tier
   replaying: boolean;
   // True only after this connection has received this sid's Snapshot or
   // ReplayEnd. Prevents stale local "idle" state from draining work early.
@@ -150,6 +155,7 @@ export interface SessionRuntime {
   contextReport: ContextReport | null;
   goal: ThreadGoal | null;
   statusReport: StatusReport | null;
+  notices: Notice[];
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
 }
@@ -174,22 +180,31 @@ export interface AppState {
   // `runtimes[btwSid]`) + engine, or null when no side panel is open.
   btwSid: string | null;
   btwEngine?: string;
-  // Model catalogs the ENGINE reported (codex only). Absent until the `models`
-  // frame lands; data.ts falls back to its static table until then.
+  // Model catalogs the engine reported (currently Codex only). Claude still sends
+  // an empty catalog plus its cwd-aware defaults; data.ts keeps the static list.
   catalog: Catalog;
-  // engine -> the model a NEW session starts on (codex config.toml's `model`).
+  // engine -> the model a NEW no-override session starts on.
   // Never the focused session's model — that one is per-session.
   catalogDefault: Record<string, string>;
+  // engine -> effective reasoning strength for a no-override NEW session.
+  catalogDefaultEffort: Record<string, string>;
+  // engine -> cwd those defaults were resolved for. Claude defaults are only
+  // rendered when this still matches the new-chat form's directory.
+  catalogDefaultCwd: Record<string, string>;
 }
 
 export function createRuntime(): SessionRuntime {
   return {
-    turns: [], state: "idle", model: "claude-mythos-5", effort: "max", perm: "bypassPermissions",
+    // These are authoritative engine settings.  A newly-created browser runtime
+    // has not heard them yet, so keep them unknown instead of briefly claiming a
+    // model, effort, or permission policy that may not match the native CLI.
+    turns: [], state: "idle", model: "", effort: "", perm: "",
     collaborationMode: "default",
-    fast: false,
+    fast: null,
     takeoverPending: false, takeoverMessage: null,
     replaying: false, syncReady: false, truncated: false,
     pendingQuestion: null, contextReport: null, goal: null, statusReport: null,
+    notices: [],
     queue: [], pendingSend: null,
   };
 }
@@ -220,6 +235,7 @@ export type Action =
   | { type: "hydrate_cache"; sid: string; turns: Turn[] }
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question" }
+  | { type: "dismiss_notice"; sid: string; noticeId: string }
   | { type: "enter_new_chat"; cwd: string; model?: string | null; effort?: string | null }
   | { type: "set_new_chat_cwd"; cwd: string }
   | { type: "set_new_chat_model"; model: string | null }
@@ -242,6 +258,8 @@ export const initialState: AppState = {
   btwSid: null,
   catalog: {},
   catalogDefault: {},
+  catalogDefaultEffort: {},
+  catalogDefaultCwd: {},
 };
 
 function cloneTurns(turns: Turn[]): Turn[] {
@@ -526,6 +544,56 @@ function patch(state: AppState, sid: string | null | undefined,
   return { ...state, runtimes: { ...state.runtimes, [key]: rt } };
 }
 
+function mergeNotices(...groups: Notice[][]): Notice[] {
+  const merged: Notice[] = [];
+  for (const notice of groups.flat()) {
+    const prior = merged.findIndex((item) => item.notice_id === notice.notice_id);
+    if (prior >= 0) merged.splice(prior, 1);
+    merged.push(notice);
+  }
+  return merged.slice(-MAX_SESSION_NOTICES);
+}
+
+function mergeRateWindow(
+  current: StatusRateWindow | null | undefined,
+  update: StatusRateWindow | null | undefined,
+): StatusRateWindow | null | undefined {
+  if (!update) return current;
+  const next = { ...(current ?? {}) };
+  if (update.used_percent != null) next.used_percent = update.used_percent;
+  if (update.resets_at != null) next.resets_at = update.resets_at;
+  if (update.window_duration_mins != null) {
+    next.window_duration_mins = update.window_duration_mins;
+  }
+  return next;
+}
+
+function mergeRateLimitUpdate(
+  report: StatusReport | null, update: RateLimitUpdate,
+): StatusReport | null {
+  if (!report) return null;
+  const limits = report.rate_limits.map((limit) => ({ ...limit }));
+  let index = update.limit_id
+    ? limits.findIndex((limit) => limit.limit_id === update.limit_id)
+    : limits.length === 1 ? 0 : -1;
+  if (index < 0) {
+    index = limits.length;
+    limits.push({});
+  }
+  const current = limits[index];
+  const next: StatusRateLimit = { ...current };
+  if (update.limit_id != null) next.limit_id = update.limit_id;
+  if (update.name != null) next.limit_name = update.name;
+  if (update.plan_type != null) next.plan_type = update.plan_type;
+  if (update.reached_type != null) {
+    next.rate_limit_reached_type = update.reached_type;
+  }
+  next.primary = mergeRateWindow(current.primary, update.primary);
+  next.secondary = mergeRateWindow(current.secondary, update.secondary);
+  limits[index] = next;
+  return { ...report, rate_limits: limits.slice(-16) };
+}
+
 export function reduce(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "reset":
@@ -533,6 +601,7 @@ export function reduce(state: AppState, action: Action): AppState {
         ...initialState,
         sessions: [], runtimes: {}, artifact: null, dirPicker: null,
         newChat: null, btwSid: null, catalog: {}, catalogDefault: {},
+        catalogDefaultEffort: {}, catalogDefaultCwd: {},
       };
     case "conn": {
       let banner = state.banner;
@@ -658,6 +727,11 @@ export function reduce(state: AppState, action: Action): AppState {
     }
     case "answer_question":
       return patch(state, state.focusedSid, (rt) => { rt.pendingQuestion = null; });
+    case "dismiss_notice":
+      return patch(state, action.sid, (rt) => {
+        rt.notices = rt.notices.filter(
+          (notice) => notice.notice_id !== action.noticeId);
+      });
     case "enter_new_chat":
       return { ...state, newChat: { cwd: action.cwd, model: action.model ?? null, effort: action.effort ?? null } };
     case "set_new_chat_cwd":
@@ -735,6 +809,7 @@ function reduceEvent(
             turns: mergedTurns,
             queue: [...source.queue, ...target.queue],
             pendingSend: source.pendingSend ?? target.pendingSend,
+            notices: mergeNotices(target.notices, source.notices),
           };
           replaceWithBoundedTurns(mergedRuntime, mergedTurns);
           runtimes[session_id] = mergedRuntime;
@@ -793,7 +868,9 @@ function reduceEvent(
       const boundedTurns = boundRuntimeTurns(turns);
       const historyTrimmed = boundedTurns.length < turns.length;
       turns = boundedTurns;
+      const acceptsControlState = !e.before;
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
+      const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
       return {
         ...state,
         banner: scratch.banner ?? state.banner,
@@ -801,7 +878,8 @@ function reduceEvent(
           ...state.runtimes,
           [sid]: {
             ...base, turns, loading: false,
-            model: hadModel ? built.model : base.model,
+            model: acceptsControlState && hadModel ? built.model : base.model,
+            effort: acceptsControlState && hadEffort ? built.effort : base.effort,
             hasMore: historyTrimmed ? false : e.has_more,
             oldestId: historyTrimmed
               ? (turns[0]?.id ?? null)
@@ -822,12 +900,50 @@ function reduceEvent(
     // The engine's real model catalog. Empty => the wrapper couldn't read it; keep
     // what we have (data.ts's static table) rather than blanking the pickers.
     case "models": {
-      if (!e.models.length) return state;
-      const catalog = { ...state.catalog, [e.engine]: e.models };
-      const catalogDefault = e.default_model
-        ? { ...state.catalogDefault, [e.engine]: e.default_model }
-        : state.catalogDefault;
-      return { ...state, catalog, catalogDefault };
+      const catalog = e.models.length
+        ? { ...state.catalog, [e.engine]: e.models }
+        : state.catalog;
+      if (e.cwd && e.cwd !== state.newChat?.cwd) {
+        // Cwd-aware reads run concurrently. Never let a late response for a
+        // directory the user has left replace the still-current result.
+        return catalog === state.catalog ? state : { ...state, catalog };
+      }
+      let catalogDefault = state.catalogDefault;
+      let catalogDefaultEffort = state.catalogDefaultEffort;
+      let catalogDefaultCwd = state.catalogDefaultCwd;
+      if (e.cwd) {
+        // A Claude response is authoritative even when probing failed and the
+        // value is null: clear an older cwd's value instead of showing stale data.
+        catalogDefault = { ...catalogDefault };
+        catalogDefaultEffort = { ...catalogDefaultEffort };
+        if (e.default_model) {
+          catalogDefault[e.engine] = matchModelId(e.default_model, e.engine);
+        } else {
+          delete catalogDefault[e.engine];
+        }
+        if (e.default_effort) {
+          catalogDefaultEffort[e.engine] = e.default_effort;
+        } else {
+          delete catalogDefaultEffort[e.engine];
+        }
+        catalogDefaultCwd = {
+          ...catalogDefaultCwd, [e.engine]: e.cwd,
+        };
+      } else {
+        if (e.default_model) {
+          catalogDefault = { ...catalogDefault,
+            [e.engine]: matchModelId(e.default_model, e.engine) };
+        }
+        if (e.default_effort) {
+          catalogDefaultEffort = {
+            ...catalogDefaultEffort, [e.engine]: e.default_effort,
+          };
+        }
+      }
+      return {
+        ...state, catalog, catalogDefault, catalogDefaultEffort,
+        catalogDefaultCwd,
+      };
     }
     case "wrapper_disconnected":
       return {
@@ -896,6 +1012,14 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => { rt.goal = e.goal ?? null; });
     case "status_report":
       return patch(state, e.sid, (rt) => { rt.statusReport = e; });
+    case "notice":
+      return patch(state, e.sid, (rt) => {
+        rt.notices = mergeNotices(rt.notices, [e]);
+      });
+    case "rate_limit_update":
+      return patch(state, e.sid, (rt) => {
+        rt.statusReport = mergeRateLimitUpdate(rt.statusReport, e);
+      });
     case "replay_start":
       return { ...patch(state, e.sid, (rt) => {
         rt.replaying = true;

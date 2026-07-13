@@ -39,9 +39,9 @@ def test_protocol_v6_get_history_and_history_roundtrip():
     assert got.in_progress is True
 
 
-def test_hello_sends_only_snapshots_no_replay_flood():
-    """The core fix: hello sends ONE snapshot per resident session and NO buffer
-    replay — even though each session's buffer holds narrative events."""
+def test_hello_sends_snapshots_and_control_state_without_replay_flood():
+    """Hello sends one snapshot plus authoritative control state per resident
+    session, but no buffered narrative replay."""
     async def go():
         m, tr = _mk_machine()
         for key in ("s1", "s2"):
@@ -53,7 +53,7 @@ def test_hello_sends_only_snapshots_no_replay_flood():
             m.sessions[key] = ctx
         await m._handle_client_hello(SimpleNamespace(client_id="c1"))
         types = [msg.type for msg in tr.sent]
-        assert types == ["snapshot", "snapshot"]          # one per session, nothing else
+        assert types == ["snapshot", "perm", "snapshot", "perm"]
         assert "replay_start" not in types and "user_msg" not in types
         assert all(msg.to == "c1" for msg in tr.sent)     # routed to the requesting client
     asyncio.run(go())
@@ -76,7 +76,7 @@ def test_hello_with_cursor_replays_only_missing_tail():
             generations={"s1": m.instance_id}, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
-            "replay_start", "user_msg", "replay_end"]
+            "replay_start", "user_msg", "replay_end", "perm"]
         assert tr.sent[1].msg_id == "m3"
         assert all(msg.to == "c1" for msg in tr.sent)
 
@@ -101,7 +101,8 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
             client_id="c1", cursors=None, generations=None, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
-            "snapshot", "replay_start", "user_msg", "delta", "replay_end"]
+            "snapshot", "replay_start", "user_msg", "delta", "replay_end",
+            "perm"]
         assert tr.sent[2].prompt == "current"
         assert all(msg.to == "c1" for msg in tr.sent)
 
@@ -117,11 +118,14 @@ def test_get_history_returns_one_bulk_frame(monkeypatch):
     ]
     monkeypatch.setattr(mm, "get_session_messages", lambda sid, directory=None: ["m"])
     monkeypatch.setattr(mm, "translate_history", lambda msgs, mx, timestamps=None: [e.model_copy() for e in canned])
-    monkeypatch.setattr(mm, "last_assistant_model", lambda msgs: "claude-opus-4-8")
+    # A proxy transcript may expose its upstream model. The resident SDK control
+    # state remains authoritative for both the selected Claude alias and effort.
+    monkeypatch.setattr(mm, "last_assistant_model", lambda msgs: "glm-5.2")
 
     async def go():
         m, tr = _mk_machine()
         ctx = _mk_ctx("sX", "sX")
+        ctx.sdk = SimpleNamespace(model="claude-opus-4-8", effort="max")
         ctx.state = "running"
         m.sessions["sX"] = ctx
         await m._handle_get_history(SimpleNamespace(
@@ -132,9 +136,11 @@ def test_get_history_returns_one_bulk_frame(monkeypatch):
         assert hist.has_more is False
         assert hist.in_progress is True
         assert hist.oldest_id == "u1" and hist.newest_id == "u1"
-        # Model prepended (restores the readout), then the 4 translated events
-        assert hist.events[0]["type"] == "model"
-        assert [e["type"] for e in hist.events[1:]] == [
+        # Current model + effort precede the translated transcript narrative.
+        assert [(event["type"], event.get("model") or event.get("effort"))
+                for event in hist.events[:2]] == [
+                    ("model", "claude-opus-4-8"), ("effort", "max")]
+        assert [e["type"] for e in hist.events[2:]] == [
             "user_msg", "assistant_msg_start", "delta", "turn_end"]
         # every event is stamped with the session id so the client routes them right
         assert all(e["sid"] == "sX" for e in hist.events)

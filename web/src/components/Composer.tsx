@@ -22,7 +22,7 @@ interface Props {
   effort: string;
   perm: string;
   collaborationMode: CollaborationModeName;
-  fast?: boolean;   // codex Fast-mode state (from wrapper)
+  fast?: boolean | null;   // null until the wrapper reports the real service tier
   // A native `claude`/`codex` in the terminal owns this session and is appending to
   // its transcript. We mirror it live but must NOT write: a cc session has a single
   // owner, so sending from here would fork the conversation.
@@ -232,7 +232,7 @@ export function Composer(p: Props) {
   const runClientSlash = (slash: string, args: string) => {
     switch (slash) {
       case "model":
-        if (args) { p.onSetModel(args); flash(`已切换模型：${args}`); }
+        if (args) { p.onSetModel(args); flash(`正在切换模型：${args}`); }
         else setSheetKind("models");
         break;
       case "permissions": setSheetKind("perms"); break;
@@ -243,18 +243,17 @@ export function Composer(p: Props) {
       case "goal": p.onGoal?.(args); break;
       // /btw: open an ephemeral side-fork panel (both engines).
       case "btw": p.onOpenBtw?.(); break;
-      // codex /fast: flip the Fast service tier. The wrapper toggles off the
-      // actual config (source of truth); p.fast is the current state, so the
-      // resulting state is its negation. Applies on the next message.
+      // Codex /fast flips only this thread's persisted service tier. The UI
+      // waits for the wrapper's authoritative Fast event before changing state.
       case "fast": {
         p.onSetServiceTier?.("toggle");
-        flash(!p.fast ? "⚡ 已开启快速模式 · 下条生效" : "已回到标准模式 · 下条生效");
+        flash("正在切换快速模式…");
         break;
       }
       case "plan":
         if (p.engine === "codex") {
           p.onSetCollaborationMode("plan");
-          flash("已进入 Plan 模式 · 下条消息生效");
+          flash("正在切换到 Plan 模式…");
         } else {
           p.onSetPerm("plan");
         }
@@ -263,7 +262,7 @@ export function Composer(p: Props) {
       case "normal":
         if (p.engine === "codex") {
           p.onSetCollaborationMode("default");
-          flash("已退出 Plan 模式 · 下条消息生效");
+          flash("正在退出 Plan 模式…");
         } else {
           p.onSetPerm("bypassPermissions");
         }
@@ -317,17 +316,24 @@ export function Composer(p: Props) {
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
   const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
-  // Codex: if the session hasn't reported a codex model yet (or it's a stale
-  // claude id), show the codex default instead of a leftover "Mythos 5".
-  const model = MODELS_E.find((m) => m.id === p.model)
-    || (p.engine === "codex" ? MODELS_E[0] : { id: p.model, name: p.model || MODELS_E[0].name, ds: "", ic: "cpu" });
-  // Effort levels come from the RESOLVED model, and the fallback is the highest
-  // level that model supports.
-  const EFFORTS_E = effortsFor(p.engine, model.id, p.catalog);
-  const effort = EFFORTS_E.find((e) => e.id === p.effort) || EFFORTS_E[EFFORTS_E.length - 1];
-  const perm = PERMS_E.find((x) => x.id === p.perm) || PERMS_E[0];
+  // Do not substitute catalog defaults for an existing session.  Until the
+  // wrapper reports its authoritative settings, the controls explicitly show
+  // that they are still being read.  Unknown/hidden ids remain visible verbatim.
+  const model = p.model
+    ? (MODELS_E.find((m) => m.id === p.model)
+      || { id: p.model, name: p.model, ds: "", ic: "cpu" })
+    : null;
+  const EFFORTS_E = effortsFor(p.engine, model?.id, p.catalog);
+  const effort = p.effort
+    ? (EFFORTS_E.find((e) => e.id === p.effort)
+      || { id: p.effort, name: p.effort, ds: "", ic: "gauge3" })
+    : null;
+  const perm = p.perm
+    ? (PERMS_E.find((x) => x.id === p.perm)
+      || { id: p.perm, name: p.perm, short: p.perm, ds: "", ic: "shield" })
+    : null;
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
-  const modeCls = perm.id === "plan" ? " plan" : perm.danger ? " danger" : "";
+  const modeCls = perm?.id === "plan" ? " plan" : perm?.danger ? " danger" : "";
   const hintBusy = p.state !== "idle";
 
   return (
@@ -454,12 +460,12 @@ export function Composer(p: Props) {
             onClick={() => setSheetKind("perms")}
             title="点击切换权限模式"
           >
-            {perm.short}模式 · {stateZh[p.state]} <span className="hint-mode-ch">▾</span>
+            {perm ? `${perm.short}模式` : "权限读取中"} · {stateZh[p.state]} <span className="hint-mode-ch">▾</span>
           </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令</span>
           <div className="hint-right" ref={ctxWrapRef}>
-            <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型">{model.name}</button>
-            <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度">{effort.name}</button>
+            <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型">{model?.name ?? "模型读取中"}</button>
+            <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度">{effort?.name ?? "强度读取中"}</button>
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"
@@ -473,7 +479,7 @@ export function Composer(p: Props) {
                 className={"hint-ctl fast-chip" + (p.fast ? " on" : "")}
                 onClick={() => p.onSetServiceTier?.("toggle")}
                 title="Fast 服务档位:快 / 标准(下条消息生效)"
-              >{p.fast ? "⚡ 快" : "标准"}</button>
+              >{p.fast == null ? "档位读取中" : p.fast ? "⚡ 快" : "标准"}</button>
             )}
             <button
               className="hint-ring"

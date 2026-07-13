@@ -7,16 +7,26 @@ per-turn settings.
 from __future__ import annotations
 
 import glob
+from importlib import import_module
 import json
 import math
 import os
 import re
-import stat
-import tempfile
 from typing import Any, Optional
 
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_rpc import codex_rpc
+
+
+def _load_tomllib():
+    """Load TOML support on every advertised Python version."""
+    try:
+        return import_module("tomllib")
+    except ModuleNotFoundError:  # Python 3.10 has no stdlib tomllib.
+        return import_module("tomli")
+
+
+tomllib = _load_tomllib()
 
 log = logger("cc_remote.wrapper.codex_sessions")
 
@@ -184,110 +194,29 @@ def codex_context_window(default: int = 256000) -> int:
 
 
 def codex_fast_enabled() -> bool:
-    """True if ~/.codex/config.toml currently has a top-level service_tier = "fast"."""
-    return (_config_value("service_tier", "") or "").lower() == "fast"
+    """True for either accepted/reported top-level Codex Fast tier name."""
+    return (_config_value("service_tier", "") or "").lower() in {
+        "fast", "priority",
+    }
 
 
-def set_codex_config_fast(on: bool) -> bool:
-    """Toggle a top-level `service_tier = "fast"` line in ~/.codex/config.toml.
-
-    Unlike model/effort — which are per-turn turn/start params, so the live session
-    honors a change immediately — codex reads `service_tier` ONCE at app-server
-    start. A per-turn override can't turn it back OFF while the config still says
-    "fast", so this really must be written, and the caller reconnects to apply it.
-    """
-    ok = set_codex_config_key("service_tier", "fast" if on else None)
-    if ok:
-        log.info("codex config service_tier toggled", fast=on)
-    return ok
-
-
-def set_codex_config_key(key: str, value: Optional[str]) -> bool:
-    """Set/replace a TOP-LEVEL `key = "value"` line in ~/.codex/config.toml
-    (value=None removes it). Only that one line is touched; every other line — and
-    the file's line ORDER — is kept byte-for-byte. Top-level keys live before the
-    first [table] header, so we never inject into a [section].
-
-    NOTE we deliberately do NOT write `model`/`model_reasoning_effort` here on a
-    per-session switch. codex keeps those two concerns apart — `thread/settings/update`
-    changes one thread and never touches config.toml (measured), while `config/write`
-    is a separate, explicit "change my default" call. config.toml is the default a
-    NEW session (and the user's terminal codex) inherits; a session's own model/effort
-    live in its rollout. See codex_session_settings().
-    """
-    target = os.path.realpath(_CONFIG)
-    try:
-        info = os.stat(target)
-        if info.st_size > _CONFIG_MAX_BYTES:
-            raise ValueError("config.toml exceeds size limit")
-        with open(target) as f:
-            content = f.read(_CONFIG_MAX_BYTES + 1)
-        if len(content.encode("utf-8", "surrogatepass")) > _CONFIG_MAX_BYTES:
-            raise ValueError("config.toml exceeds size limit")
-        lines = content.splitlines(keepends=True)
-    except Exception as e:
-        log.warning("read config.toml failed", error=str(e))
-        return False
-    first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), len(lines))
-    # `model\s*=` never matches model_provider / model_reasoning_effort (they have
-    # more name chars before the `=`), so anchoring on the key name is exact.
-    pat = re.compile(r"\s*" + re.escape(key) + r"\s*=")
-    hits = [i for i, l in enumerate(lines) if i < first_table and pat.match(l)]
-    entry = f'{key} = "{value}"\n'
-    if value is None:
-        for i in reversed(hits):
-            del lines[i]
-    elif hits:
-        lines[hits[0]] = entry              # replace IN PLACE — never reshuffle the file
-        for i in reversed(hits[1:]):
-            del lines[i]                    # drop any duplicate (invalid TOML anyway)
-    else:
-        after = next((i for i, l in enumerate(lines)
-                      if i < first_table and re.match(r"\s*model\s*=", l)), None)
-        lines.insert(after + 1 if after is not None else 0, entry)
-    temp_path = ""
-    temp_fd: int | None = None
-    try:
-        temp_fd, temp_path = tempfile.mkstemp(
-            prefix=".config.toml.cc-remote-", dir=os.path.dirname(target))
-        stream = os.fdopen(temp_fd, "w")
-        temp_fd = None  # stream owns it from here
-        with stream as f:
-            os.fchmod(f.fileno(), stat.S_IMODE(info.st_mode))
-            f.writelines(lines)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_path, target)
-        temp_path = ""
-        log.info("codex config key set", key=key, value=value)
-        return True
-    except Exception as e:
-        log.warning("write config.toml failed", error=str(e))
-        return False
-    finally:
-        if temp_fd is not None:
-            try:
-                os.close(temp_fd)
-            except OSError:
-                pass
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+def codex_approval(default: str = "never") -> str:
+    """The top-level Codex approval policy used for a new thread."""
+    value = _config_value("approval_policy", default)
+    return value if value in {"untrusted", "on-request", "never"} else default
 
 
 def codex_session_settings(
     session_id: str, max_bytes: int = 64 * 1024 * 1024,
 ) -> dict:
-    """The model/effort/collaboration mode this session last ran with.
+    """The per-thread settings carried by the latest bounded rollout tail.
 
     Codex appends a `turn_context` record per turn carrying `model`, `effort`,
     and the nested `collaboration_mode` selected for that turn.
-    That — not config.toml — is a resumed session's truth. config.toml holds ONE
-    global default, so seeding a resumed session from it silently reverted a session
-    the user had switched to gpt-5.6-luna back to the config's gpt-5.6-sol, and in
-    multi-session it leaked one session's pick into another.
+    The official thread/resume response is authoritative for settings it exposes;
+    this bounded tail is the fallback and remains necessary for collaboration mode,
+    which 0.144.1 does not include in that response. Config.toml is never a valid
+    resume source because it holds only fresh-thread global defaults.
 
     Returns {} when the rollout is missing/unreadable; the caller falls back to the
     config defaults (correct for a brand-new session).
@@ -296,16 +225,39 @@ def codex_session_settings(
     if not path:
         return {}
     try:
-        if os.path.getsize(path) > max_bytes:
-            log.warning("codex session settings source too large",
-                        session_id=session_id)
-            return {}
+        size = os.path.getsize(path)
     except OSError:
         return {}
     out: dict = {}
     try:
-        with open(path) as f:
-            for line in _bounded_lines(f, MAX_JSONL_RECORD_BYTES):
+        # A long-running thread can easily exceed 64 MiB. Only its newest
+        # turn_context matters, so seek to a bounded tail and discard the first
+        # partial JSONL record instead of rejecting the entire rollout.
+        tail_bytes = max(1, int(max_bytes))
+        start = max(0, size - tail_bytes)
+        with open(path, "rb") as f:
+            if start:
+                f.seek(start - 1)
+                starts_at_record = f.read(1) == b"\n"
+                f.seek(start)
+                if not starts_at_record:
+                    discarded = f.readline(MAX_JSONL_RECORD_BYTES + 1)
+                    if not discarded.endswith(b"\n"):
+                        return {}
+            while True:
+                raw = f.readline(MAX_JSONL_RECORD_BYTES + 1)
+                if not raw:
+                    break
+                if len(raw) > MAX_JSONL_RECORD_BYTES:
+                    if not raw.endswith(b"\n"):
+                        # The remainder is still the same oversized record. Stop:
+                        # a boundary cannot be recovered without exceeding our cap.
+                        break
+                    continue
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
                 # cheap prefilter: most lines are messages, not turn contexts
                 if '"turn_context"' not in line:
                     continue
@@ -323,6 +275,15 @@ def codex_session_settings(
                     if isinstance(val, str) and val:
                         out[key] = val[:256 if key == "model" else 64]
                         # last one wins = the session's current setting
+                approval = payload.get("approval_policy")
+                if approval in {"untrusted", "on-request", "never"}:
+                    out["approval_policy"] = approval
+                if "service_tier" in payload:
+                    tier = payload.get("service_tier")
+                    if tier is None:
+                        out["service_tier"] = None
+                    elif isinstance(tier, str) and tier:
+                        out["service_tier"] = tier[:64]
                 collaboration = payload.get("collaboration_mode")
                 if isinstance(collaboration, dict):
                     mode = collaboration.get("mode")
@@ -338,15 +299,16 @@ def _config_value(key: str, default: str) -> str:
         target = os.path.realpath(_CONFIG)
         if os.path.getsize(target) > _CONFIG_MAX_BYTES:
             return default
-        with open(target) as f:
-            for line in f:
-                s = line.strip()
-                # exact key match: `model = ...` must not match `model_provider = ...`
-                if s.startswith(key) and "=" in s:
-                    lhs = s.split("=", 1)[0].strip()
-                    if lhs == key:
-                        value = s.split("=", 1)[1].strip().strip('"').strip("'")
-                        return value[:4096] or default
+        with open(target, "rb") as f:
+            config = tomllib.load(f)
+        # tomllib preserves table boundaries. Looking only at the root prevents
+        # a profile/provider's nested `model`, effort or service tier from being
+        # mistaken for the user's default.
+        value = config.get(key)
+        if isinstance(value, str):
+            return value[:4096] or default
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)[:4096]
     except Exception:
         pass
     return default

@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { ChatView } from "./ChatView";
 import { Icon } from "../icons";
 import { PanelTabs } from "./PanelTabs";
+import { NoticeStack } from "./NoticeStack";
 import type { SessionRuntime } from "../reducer";
 import { ImeSubmitGuard } from "../ime-submit";
 
 /** /btw side panel: a mini chat over an ephemeral fork of the current session.
  * Reuses ChatView for the transcript; a minimal textarea for input. Closing
  * discards the fork (the main thread never sees any of this). */
-export function BtwPanel({ sid, rt, engine, opening, active, hasDiff, onTab, onSend, onClose }: {
+export function BtwPanel({ sid, rt, engine, opening, active, hasDiff, onTab, onSend, onClose, onDismissNotice }: {
   sid?: string;
   rt: SessionRuntime | undefined;
   engine?: string;
@@ -18,6 +19,7 @@ export function BtwPanel({ sid, rt, engine, opening, active, hasDiff, onTab, onS
   onTab: (v: "diff" | "btw") => void;
   onSend: (prompt: string) => void;
   onClose: () => void;
+  onDismissNotice: (noticeId: string) => void;
 }) {
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -61,6 +63,7 @@ export function BtwPanel({ sid, rt, engine, opening, active, hasDiff, onTab, onS
           <Icon name="chevrons-right" />
         </button>
       </div>
+      <NoticeStack notices={rt?.notices ?? []} onDismiss={onDismissNotice} />
       <div className="btw-body">
         {opening
           ? <div className="btw-empty"><span className="thinking"><span/><span/><span/></span> 正在打开侧边对话…</div>

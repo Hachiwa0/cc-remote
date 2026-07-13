@@ -1,39 +1,29 @@
 // Empty-state "new chat" page: a centered composer (a la Claude app / Codex)
-// with the working directory, model, effort, and attachments chosen UP FRONT.
-// The first message triggers new_session(cwd, engine, model, effort) on the
-// host as one protocol-v4 command, including its images/files. model/effort are
-// null until the user picks one — null means "use the wrapper's engine default".
+// with a working directory and optional attachments. Model, effort, and Codex
+// modes use the local defaults; users can change them after the session starts.
 import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import { Icon } from "../icons";
-import { CommandSheet } from "./CommandSheet";
-import { modelsFor, effortsFor, defaultEffortFor, defaultModelFor, type Catalog } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
-import type { CollaborationModeName, QueryImg, QueryFile } from "../protocol";
+import type { CodexPermissionMode, CodexServiceTier, CollaborationModeName, QueryImg, QueryFile } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 
 interface Props {
   cwd: string;
   engine?: "claude" | "codex";  // which backend this new chat will use
-  catalog?: Catalog;  // engine-reported models/efforts; falls back to data.ts
-  catalogDefault?: Record<string, string>;  // engine -> model a NEW session starts on
-  model: string | null;   // pre-selected model (null = engine default)
-  effort: string | null;  // pre-selected reasoning effort (null = engine default)
   createError?: string | null;
   onPickCwd: () => void;  // open the directory picker
-  onPickModel: (model: string) => void;
-  onPickEffort: (effort: string) => void;
   onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[],
-           collaborationMode?: CollaborationModeName) => boolean;
+           collaborationMode?: CollaborationModeName,
+           permissionMode?: CodexPermissionMode,
+           serviceTier?: CodexServiceTier) => boolean;
 }
 
-export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, model, effort, createError, onPickCwd, onPickModel, onPickEffort, onSend }: Props) {
+export function NewChatView({ cwd, engine = "claude", createError, onPickCwd, onSend }: Props) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
   const [importing, setImporting] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [collaborationMode, setCollaborationMode] = useState<CollaborationModeName>("default");
-  const [sheetKind, setSheetKind] = useState<"models" | "efforts" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const imeSubmitRef = useRef(new ImeSubmitGuard());
@@ -43,26 +33,11 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
     if (createError) setCreating(false);
   }, [createError]);
 
-  useEffect(() => {
-    if (engine !== "codex") setCollaborationMode("default");
-  }, [engine]);
-
   useEffect(() => () => {
     if (buttonSendTimerRef.current !== null) {
       window.clearTimeout(buttonSendTimerRef.current);
     }
   }, []);
-
-  const MODELS_E = modelsFor(engine, catalog);
-  // A null model means "the engine's configured default" (codex config.toml's `model`)
-  // — the same thing the wrapper will start the session on.
-  const selModelId = model ?? defaultModelFor(engine, catalog, catalogDefault);
-  // Effort levels are per-model — read them off the resolved model, not the engine.
-  const EFFORTS_E = effortsFor(engine, selModelId, catalog);
-  const modelName = MODELS_E.find((m) => m.id === selModelId)?.name ?? MODELS_E[0].name;
-  // A null effort means "the model's highest level" (product rule: default to max
-  // thinking, whatever the model supports).
-  const effortName = (EFFORTS_E.find((e) => e.id === effort) ?? EFFORTS_E[EFFORTS_E.length - 1]).name;
 
   const hasAttachments = images.length > 0 || files.length > 0;
   const canSend = (text.trim().length > 0 || hasAttachments) && !creating && !importing;
@@ -98,7 +73,9 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
     setCreating(true);
     const queued = onSend(
       prompt, images.length ? images : undefined, files.length ? files : undefined,
-      engine === "codex" ? collaborationMode : undefined);
+      engine === "codex" ? "default" : undefined,
+      engine === "codex" ? "never" : undefined,
+      engine === "codex" ? "default" : undefined);
     if (!queued) setCreating(false);
   };
 
@@ -163,17 +140,6 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
               <Icon name="plus" size={18} />
             </button>
             <input ref={fileRef} type="file" multiple hidden onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
-            <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型" disabled={creating}>{modelName}</button>
-            <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度" disabled={creating}>{effortName}</button>
-            {engine === "codex" && (
-              <button
-                className={"hint-ctl collaboration-chip" + (collaborationMode === "plan" ? " plan" : "")}
-                onClick={() => setCollaborationMode((mode) => mode === "plan" ? "default" : "plan")}
-                title={collaborationMode === "plan" ? "Plan 模式已开启；点击恢复默认模式" : "让第一回合先调研并制定计划"}
-                aria-pressed={collaborationMode === "plan"}
-                disabled={creating}
-              >Plan</button>
-            )}
           </div>
           <div className="newchat-foot-right">
             <span className="newchat-hint">{createError
@@ -191,17 +157,6 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
         </div>
       </div>
 
-      <CommandSheet
-        open={sheetKind !== null}
-        kind={sheetKind ?? "models"}
-        engine={engine}
-        catalog={catalog}
-        onClose={() => setSheetKind(null)}
-        currentModel={selModelId}
-        onPickModel={(m) => { onPickModel(m); setSheetKind(null); }}
-        currentEffort={effort ?? defaultEffortFor(engine, selModelId, catalog)}
-        onPickEffort={(ef) => { onPickEffort(ef); setSheetKind(null); }}
-      />
     </div>
   );
 }

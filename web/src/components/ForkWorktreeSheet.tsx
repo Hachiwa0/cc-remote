@@ -6,6 +6,7 @@ import {
   WORKTREE_FORK_NAME_MAX,
 } from "../session-worktree";
 import { Icon } from "../icons";
+import { useImeSubmit } from "../use-ime-submit";
 
 interface Props {
   open: boolean;
@@ -23,14 +24,19 @@ export function ForkWorktreeSheet({ open, session, creating, error, onConfirm, o
     if (open) setName("");
   }, [open, session?.session_id]);
 
+  const valid = isWorktreeForkNameValid(name);
+  const imeSubmit = useImeSubmit<HTMLInputElement>((value) => {
+    if (!creating && isWorktreeForkNameValid(value)) {
+      onConfirm(normalizeWorktreeForkName(value));
+    }
+  });
+
   if (!open || !session) return null;
 
-  const normalized = normalizeWorktreeForkName(name);
-  const valid = isWorktreeForkNameValid(name);
   const close = () => { if (!creating) onClose(); };
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!creating && valid) onConfirm(normalized);
+    imeSubmit.requestSubmit();
   };
 
   return <>
@@ -55,16 +61,32 @@ export function ForkWorktreeSheet({ open, session, creating, error, onConfirm, o
           </div>
           <label className="fork-worktree-field">
             <span>名称</span>
-            <input autoFocus value={name} maxLength={WORKTREE_FORK_NAME_MAX}
+            <input ref={imeSubmit.inputRef} autoFocus value={name} maxLength={WORKTREE_FORK_NAME_MAX}
               disabled={creating} placeholder="例如：fix-login-flow"
-              onChange={(event) => setName(event.target.value)} />
+              onChange={(event) => setName(event.target.value)}
+              onCompositionStart={imeSubmit.startComposition}
+              onCompositionEnd={(event) => {
+                imeSubmit.endComposition();
+                setName(event.currentTarget.value);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                if (!imeSubmit.shouldSubmitKey({
+                  key: event.key,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                  keyCode: event.nativeEvent.keyCode,
+                })) event.preventDefault();
+              }} />
             <small>用于生成新分支和工作树目录，最多 {WORKTREE_FORK_NAME_MAX} 个字符。</small>
           </label>
           {error && <div className="fork-worktree-error" role="alert">{error}</div>}
         </div>
         <footer className="fork-worktree-actions">
           <button type="button" className="fork-worktree-cancel" onClick={close} disabled={creating}>取消</button>
-          <button type="submit" className="fork-worktree-primary" disabled={!valid || creating}>
+          <button type="submit" className="fork-worktree-primary"
+            onPointerDown={imeSubmit.commitCompositionBeforePointerSubmit}
+            disabled={!valid || creating}>
             {creating && <span className="fork-worktree-spinner" />}
             {creating ? "创建中…" : "创建工作树并派生"}
           </button>

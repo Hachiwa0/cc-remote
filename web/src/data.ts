@@ -40,7 +40,7 @@ export const MODELS: Model[] = [
   { id: "claude-opus-4-8", name: "Opus 4.8", ds: "最强推理", ic: "gem" },
   { id: "claude-sonnet-5", name: "Sonnet 5", ds: "均衡 · 更快", ic: "balance" },
   { id: "claude-haiku-4-5", name: "Haiku 4.5", ds: "轻量 · 极速", ic: "bolt" },
-  { id: "claude-fable-5", name: "Fable 5", ds: "大便", ic: "book" },
+  { id: "claude-fable-5", name: "Fable 5", ds: "实验模型", ic: "book" },
 ];
 
 // Reasoning effort (思考强度). `name` is the RAW level id on purpose: it's what
@@ -125,7 +125,11 @@ export const defaultModelFor = (engine?: string, catalog?: Catalog,
                                 defaults?: Record<string, string>): string => {
   const list = modelsFor(engine, catalog);
   const want = engine ? defaults?.[engine] : undefined;
-  return want && list.some((m) => m.id === want) ? want : list[0].id;
+  // Codex defaults are accepted only when app-server's live catalog contains
+  // them. Claude may legitimately use a custom/hidden alias absent from our
+  // static presentation table, so preserve its wrapper-resolved id.
+  return want && (engine !== "codex" || list.some((m) => m.id === want))
+    ? want : list[0].id;
 };
 
 /** Effort levels the SELECTED model actually accepts. Unknown/unset model falls back
@@ -181,7 +185,7 @@ export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions",
 // thread's token window; /status is a separate app-server snapshot (thread,
 // config, account and rate limits). Forwarded
 // ones (review/init) expand to a prompt codex handles agentically — the app-server
-// has no TUI slash layer. NB: /fast is a codex keybinding (not an app-server knob),
+// has no TUI slash layer. /fast maps to app-server's per-thread service tier,
 // and /hook is Claude-only. /plan and /normal are handled locally by the web
 // client and mapped to app-server collaborationMode, not sent as prompt text.
 export const CODEX_COMMANDS: Command[] = [

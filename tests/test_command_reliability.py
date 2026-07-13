@@ -17,6 +17,7 @@ from cc_remote.protocol import (
     Hello,
     ListSessions,
     OpenBtw,
+    Perm,
     Ping,
     Query,
     Snapshot,
@@ -360,6 +361,15 @@ def test_open_btw_success_response_is_correlated_and_replayed_without_refork():
             and message.to == "client-1"
             and message.generation == machine.instance_id
             for message in snapshots
+        )
+        permissions = [message for message in transport.sent
+                       if isinstance(message, Perm)]
+        assert len(permissions) == 2
+        assert all(
+            message.sid == fork.key
+            and message.to == "client-1"
+            and message.mode == "bypassPermissions"
+            for message in permissions
         )
         assert len([message for message in transport.sent
                     if isinstance(message, CommandAck)]) == 2

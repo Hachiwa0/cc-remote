@@ -489,6 +489,12 @@ def test_codex_mcp_collaboration_and_hook_are_structured_and_sanitized():
     hook = next(event for event in events
                 if isinstance(event, ProcessEvent) and event.kind == "hook")
     assert hook.status == "succeeded" and hook.duration_ms == 4
+    terminal = next(event for event in events
+                    if isinstance(event, ProcessEvent)
+                    and event.kind == "terminal")
+    assert terminal.parent_id == "command-1"
+    assert terminal.status == "succeeded"
+    assert terminal.summary == "已向运行中的终端进程写入输入（内容已隐藏）"
     wire = "\n".join(event.model_dump_json() for event in events)
     for secret in (
         "MCP_META_SECRET", "LIVE_PASSWORD_SECRET", "LIVE_TOKEN_SECRET",
@@ -525,6 +531,40 @@ def test_codex_handle_filters_foreign_thread_and_turn_before_queueing():
             "params": {"threadId": "thread-current",
                        "turn": {"id": "turn-foreign", "status": "completed"}},
         })
+        for method, params in (
+            ("model/rerouted", {
+                "fromModel": "gpt-old", "toModel": "gpt-safe",
+                "reason": "highRiskCyberActivity",
+            }),
+            ("model/safetyBuffering/updated", {
+                "model": "gpt-safe", "useCases": [], "reasons": [],
+                "showBufferingUi": True, "fasterModel": None,
+            }),
+            ("model/verification", {
+                "verifications": ["trustedAccessForCyber"],
+            }),
+        ):
+            await handle._dispatch({
+                "method": method,
+                "params": {
+                    "threadId": "thread-current", "turnId": "turn-foreign",
+                    **params,
+                },
+            })
+        await handle._dispatch({
+            "method": "model/verification",
+            "params": {
+                "turnId": "turn-current",
+                "verifications": ["trustedAccessForCyber"],
+            },
+        })
+        await handle._dispatch({
+            "method": "model/verification",
+            "params": {
+                "threadId": "thread-current",
+                "verifications": ["trustedAccessForCyber"],
+            },
+        })
         assert queue.empty()
         assert handle.turn_active is True
         assert handle.turn_id == "turn-current"
@@ -536,6 +576,37 @@ def test_codex_handle_filters_foreign_thread_and_turn_before_queueing():
         }
         await handle._dispatch(current)
         assert queue.get_nowait() == current
+
+        current_model_events = [
+            {
+                "method": "model/rerouted",
+                "params": {
+                    "threadId": "thread-current", "turnId": "turn-current",
+                    "fromModel": "gpt-old", "toModel": "gpt-safe",
+                    "reason": "highRiskCyberActivity",
+                },
+            },
+            {
+                "method": "model/safetyBuffering/updated",
+                "params": {
+                    "threadId": "thread-current", "turnId": "turn-current",
+                    "model": "gpt-safe", "useCases": ["cyber"],
+                    "reasons": ["review"], "showBufferingUi": True,
+                    "fasterModel": None,
+                },
+            },
+            {
+                "method": "model/verification",
+                "params": {
+                    "threadId": "thread-current", "turnId": "turn-current",
+                    "verifications": ["trustedAccessForCyber"],
+                },
+            },
+        ]
+        for message in current_model_events:
+            await handle._dispatch(message)
+        assert [queue.get_nowait() for _ in current_model_events] == (
+            current_model_events)
 
         terminal = {
             "method": "turn/completed",
@@ -549,6 +620,100 @@ def test_codex_handle_filters_foreign_thread_and_turn_before_queueing():
         assert handle.turn_id is None
 
     asyncio.run(run())
+
+
+def test_codex_model_safety_notifications_enter_spontaneous_queue():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-current"
+        started = {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-current", "turnId": "turn-auto",
+                "turn": {"id": "turn-auto"},
+            },
+        }
+        verification = {
+            "method": "model/verification",
+            "params": {
+                "threadId": "thread-current", "turnId": "turn-auto",
+                "verifications": ["trustedAccessForCyber"],
+            },
+        }
+        completed = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-current", "turnId": "turn-auto",
+                "turn": {"id": "turn-auto", "status": "completed"},
+            },
+        }
+        for message in (started, verification, completed):
+            await handle._dispatch(message)
+
+        queued = [message async for message in
+                  handle.receive_spontaneous_response("turn-auto")]
+        assert queued == [started, verification, completed]
+
+    asyncio.run(run())
+
+
+def test_codex_model_safety_events_are_bounded_and_never_change_model_chip():
+    translator = CodexStreamTranslator(8_000)
+    oversized = "x" * 4_096
+    events = _feed(translator, [
+        {"method": "model/rerouted", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "fromModel": "gpt-source", "toModel": "gpt-safe",
+            "reason": "highRiskCyberActivity",
+            "unknownSecret": "REROUTE_UNKNOWN_SECRET",
+        }},
+        {"method": "model/safetyBuffering/updated", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "model": oversized,
+            "useCases": ["trusted-cyber", *([oversized] * 64)],
+            "reasons": ["policy-review", *([oversized] * 64)],
+            "showBufferingUi": True, "fasterModel": oversized,
+            "unknownSecret": "BUFFER_UNKNOWN_SECRET",
+        }},
+        {"method": "model/safetyBuffering/updated", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "model": oversized,
+            "useCases": ["trusted-cyber"], "reasons": ["policy-review"],
+            "showBufferingUi": False, "fasterModel": None,
+        }},
+        {"method": "model/verification", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "verifications": ["trustedAccessForCyber", oversized],
+            "unknownSecret": "VERIFICATION_UNKNOWN_SECRET",
+        }},
+    ])
+
+    assert len(events) == 4
+    assert all(isinstance(event, ProcessEvent) for event in events)
+    reroute = next(event for event in events if event.kind == "model")
+    assert reroute.summary == "gpt-source → gpt-safe"
+    assert reroute.detail == "原因：highRiskCyberActivity"
+
+    buffering = [event for event in events
+                 if event.kind == "safety" and event.title == "模型安全缓冲"]
+    assert len(buffering) == 2
+    assert buffering[0].item_id == buffering[1].item_id
+    assert (buffering[0].phase, buffering[0].status) == ("start", "running")
+    assert (buffering[1].phase, buffering[1].status) == ("end", "succeeded")
+    assert len(buffering[0].summary or "") <= 64 * 1024
+    assert len(buffering[0].detail or "") <= 16 * 1024
+
+    verification = next(event for event in events
+                        if event.title == "模型验证")
+    assert "trustedAccessForCyber" in (verification.summary or "")
+    assert len(verification.summary or "") <= 16 * 1024
+    wire = "\n".join(event.model_dump_json() for event in events)
+    assert '"type":"model"' not in wire
+    for secret in (
+        "REROUTE_UNKNOWN_SECRET", "BUFFER_UNKNOWN_SECRET",
+        "VERIFICATION_UNKNOWN_SECRET",
+    ):
+        assert secret not in wire
 
 
 def test_codex_history_preserves_phase_tools_and_public_reasoning_once(tmp_path):

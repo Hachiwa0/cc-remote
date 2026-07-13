@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
@@ -25,6 +27,8 @@ import {
   consumeDiscardedBtwSnapshot,
   makeOpenBtwCommand,
   matchesBtwRequest,
+  normalizeDiffTheme,
+  normalizeEngine,
 } from "../src/protocol.ts";
 import { RelayWs } from "../src/ws.ts";
 import {
@@ -187,6 +191,24 @@ assert.equal(imeSubmit.shouldSubmitKey({
   key: "Enter", shiftKey: false, isComposing: false, keyCode: 13,
 }), true);
 assert.equal(imeSubmit.shouldCommitBeforeButtonSubmit(), false);
+
+// Every text-entry surface that can submit outside the three composers must use
+// the same IME guard. Browser-level composition ordering remains an E2E release
+// gate; this integration check prevents a raw Enter handler from bypassing the
+// shared path before that suite runs.
+for (const filename of [
+  "QuestionSheet.tsx",
+  "SessionsSidebar.tsx",
+  "DirPicker.tsx",
+  "LoginForm.tsx",
+  "ForkWorktreeSheet.tsx",
+]) {
+  const source = readFileSync(resolve(process.cwd(), "src/components", filename), "utf8");
+  assert.match(source, /useImeSubmit/);
+  assert.match(source, /onCompositionStart/);
+  assert.match(source, /nativeEvent\.isComposing/);
+  assert.match(source, /nativeEvent\.keyCode/);
+}
 
 let requested = "";
 const authenticated = await probeSession(async (input, init) => {
@@ -469,8 +491,13 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 6, ts: 10, ...body,
+    v: 8, ts: 10, ...body,
   } as ServerEvent);
+  const unannounced = createRuntime();
+  assert.equal(unannounced.model, "");
+  assert.equal(unannounced.effort, "");
+  assert.equal(unannounced.perm, "");
+  assert.equal(unannounced.fast, null);
   const sid = "race-a";
   const otherSid = "race-b";
   const untouched = {
@@ -481,11 +508,81 @@ try {
     connState: "connected",
     wrapperOnline: true,
     focusedSid: sid,
+    newChat: { cwd: "~", model: null, effort: null },
     runtimes: {
       [sid]: { ...createRuntime(), state: "running", syncReady: true },
       [otherSid]: { ...createRuntime(), turns: [untouched], syncReady: true },
     },
   };
+  // Claude has a static presentation catalog, but its explicit defaults come
+  // from cwd-aware settings. An empty models array must still update them.
+  state = reduce(state, { type: "event", event: event({
+    type: "models", engine: "claude", models: [],
+    default_model: "claude-mythos-5[1m]", default_effort: "max",
+    cwd: "~",
+  }) });
+  assert.equal(state.catalogDefault.claude, "claude-mythos-5");
+  assert.equal(state.catalogDefaultEffort.claude, "max");
+  const { NewChatView } = await reducerHarness.ssrLoadModule(
+    "/src/components/NewChatView.tsx");
+  const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
+    cwd: "~", engine: "claude",
+    onPickCwd: () => {},
+    onSend: () => true,
+  }));
+  const codexNewChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
+    cwd: "~", engine: "codex",
+    onPickCwd: () => {},
+    onSend: () => true,
+  }));
+  for (const markup of [newChatMarkup, codexNewChatMarkup]) {
+    assert.match(markup, /添加图片或文件/);
+    assert.match(markup, />开始</);
+    assert.doesNotMatch(markup, /本机默认|默认 ·|选择模型|思考强度/);
+  }
+  assert.doesNotMatch(codexNewChatMarkup, /不询问|Plan|标准/);
+  state = { ...state,
+    newChat: { cwd: "/other", model: null, effort: null } };
+  state = reduce(state, { type: "event", event: event({
+    type: "models", engine: "claude", models: [],
+    default_model: "claude-sonnet-5", default_effort: "high", cwd: "/other",
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "models", engine: "claude", models: [],
+    default_model: "claude-mythos-5", default_effort: "max", cwd: "~",
+  }) });
+  assert.equal(state.catalogDefault.claude, "claude-sonnet-5");
+  assert.equal(state.catalogDefaultEffort.claude, "high");
+  assert.equal(state.catalogDefaultCwd.claude, "/other");
+  state = reduce(state, { type: "event", event: event({
+    type: "models", engine: "claude", models: [],
+    default_model: null, default_effort: null, cwd: "/other",
+  }) });
+  assert.equal(state.catalogDefault.claude, undefined);
+  assert.equal(state.catalogDefaultEffort.claude, undefined);
+  assert.equal(state.catalogDefaultCwd.claude, "/other");
+  // The newest history page restores both authoritative settings. An older
+  // pagination page cannot roll either one back, even if a stale server includes
+  // control rows that should only appear on the newest page.
+  state = reduce(state, { type: "event", event: event({
+    type: "history", sid, session_id: sid, has_more: true,
+    events: [
+      event({ type: "model", sid, model: "claude-mythos-5" }),
+      event({ type: "effort", sid, effort: "max" }),
+    ],
+  }) });
+  assert.equal(state.runtimes[sid].model, "claude-mythos-5");
+  assert.equal(state.runtimes[sid].effort, "max");
+  state = reduce(state, { type: "event", event: event({
+    type: "history", sid, session_id: sid, before: "older-turn",
+    has_more: false,
+    events: [
+      event({ type: "model", sid, model: "claude-sonnet-5" }),
+      event({ type: "effort", sid, effort: "low" }),
+    ],
+  }) });
+  assert.equal(state.runtimes[sid].model, "claude-mythos-5");
+  assert.equal(state.runtimes[sid].effort, "max");
   const approvalBeforePlan = state.runtimes[sid].perm;
   state = reduce(state, { type: "event", event: event({
     type: "collaboration_mode", sid, mode: "plan",
@@ -1171,7 +1268,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 6, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 8, ts: 1, ...frame }) });
   }
 }
 
@@ -1224,12 +1321,38 @@ assert.equal(typeof collaborationFrame.client_id, "string");
 relay.sendNewSession(
   "/tmp/project", "codex", "gpt-5.6-sol", "xhigh",
   { prompt: "先制定计划", msg_id: "first-plan-message" }, "plan",
+  "on-request", "fast",
 );
 const newPlanFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(newPlanFrame.type, "new_session");
 assert.equal(newPlanFrame.engine, "codex");
 assert.equal(newPlanFrame.collaboration_mode, "plan");
+assert.equal(newPlanFrame.permission_mode, "on-request");
+assert.equal(newPlanFrame.service_tier, "fast");
 assert.equal(newPlanFrame.prompt, "先制定计划");
+
+relay.sendNewSession(
+  "/tmp/project", "claude", null, null,
+  { prompt: "使用本机默认设置", msg_id: "default-settings-message" },
+);
+const defaultSessionFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(defaultSessionFrame.type, "new_session");
+assert.equal("model" in defaultSessionFrame, false);
+assert.equal("effort" in defaultSessionFrame, false);
+
+relay.sendGetModels("claude", "/tmp/project");
+const claudeDefaultsFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(claudeDefaultsFrame.type, "get_models");
+assert.equal(claudeDefaultsFrame.engine, "claude");
+assert.equal(claudeDefaultsFrame.cwd, "/tmp/project");
+assert.equal(typeof claudeDefaultsFrame.cmd_id, "string");
+assert.equal(typeof claudeDefaultsFrame.client_id, "string");
+
+const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
+for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
+  assert.doesNotMatch(appSource, new RegExp(`dispatch\\(\\{ type: ["']${optimisticAction}["']`));
+}
+assert.match(appSource, /const \{ cwd, model, effort \} = state\.newChat/);
 
 assert.equal(relay.sendTakeover("codex-model-session"), true);
 const takeoverFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
@@ -1237,6 +1360,35 @@ assert.equal(takeoverFrame.type, "takeover");
 assert.equal(takeoverFrame.sid, "codex-model-session");
 assert.equal(typeof takeoverFrame.cmd_id, "string");
 assert.equal(typeof takeoverFrame.client_id, "string");
+
+// Stale/user-edited localStorage values must never reach strict Pydantic
+// command literals. The App applies these guards before listing sessions or
+// requesting a themed diff.
+assert.equal(normalizeEngine("codex"), "codex");
+assert.equal(normalizeEngine("legacy-engine"), "claude");
+assert.equal(normalizeEngine(null), "claude");
+assert.equal(normalizeDiffTheme("dark"), "dark");
+assert.equal(normalizeDiffTheme("sepia"), "light");
+assert.equal(normalizeDiffTheme(null), "light");
+
+// These one-shot commands are just as reliable as chat mutations: each must
+// carry the outbox identity needed for reconnect replay and wrapper dedupe.
+relay.setFocusedSid("codex-control-session", "codex");
+const reliableControlFrames: Array<[string, () => void]> = [
+  ["get_status", () => relay.sendGetStatus()],
+  ["get_goal", () => relay.sendGetGoal()],
+  ["set_goal", () => relay.sendSetGoal("ship it", "active", 1024)],
+  ["clear_goal", () => relay.sendClearGoal()],
+  ["get_diff", () => relay.sendGetDiff("src/App.tsx", "dark")],
+];
+for (const [type, sendCommand] of reliableControlFrames) {
+  sendCommand();
+  const frame = JSON.parse(socket.sent.at(-1) ?? "{}");
+  assert.equal(frame.type, type);
+  assert.equal(frame.sid, "codex-control-session");
+  assert.equal(typeof frame.cmd_id, "string");
+  assert.equal(typeof frame.client_id, "string");
+}
 
 socket.receive({
   type: "snapshot", sid: "s1", cc_session_id: "s1", generation: "g1",

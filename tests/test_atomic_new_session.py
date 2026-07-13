@@ -1,4 +1,4 @@
-"""Zero-token tests for protocol-v6 atomic new-session first queries."""
+"""Zero-token tests for atomic new-session first queries."""
 from __future__ import annotations
 
 import asyncio
@@ -19,8 +19,8 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
-def test_protocol_v6_new_session_query_roundtrip_and_validation():
-    assert PROTOCOL_VERSION == 6
+def test_protocol_v8_new_session_query_roundtrip_and_validation():
+    assert PROTOCOL_VERSION == 8
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",
@@ -28,6 +28,8 @@ def test_protocol_v6_new_session_query_roundtrip_and_validation():
         model="gpt-test",
         effort="high",
         collaboration_mode="plan",
+        permission_mode="on-request",
+        service_tier="fast",
         prompt="hello",
         msg_id="msg-1",
         images=[{"media_type": "image/png", "data": _PNG_1X1}],
@@ -39,6 +41,10 @@ def test_protocol_v6_new_session_query_roundtrip_and_validation():
         NewSession(prompt="missing message id")
     with pytest.raises(ValidationError):
         NewSession(engine="claude", collaboration_mode="plan")
+    with pytest.raises(ValidationError):
+        NewSession(engine="claude", permission_mode="on-request")
+    with pytest.raises(ValidationError):
+        NewSession(engine="claude", service_tier="fast")
 
 
 def test_new_session_starts_initial_query_on_the_new_ctx():
@@ -110,6 +116,8 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             "model": "claude-test",
             "effort": "high",
             "collaboration_mode": None,
+            "permission_mode": None,
+            "service_tier": None,
         }
         turn_ctx, prompt, images, files = captured["turn"]
         assert turn_ctx is ctx and prompt == "first prompt"
@@ -132,7 +140,8 @@ def test_blank_new_session_does_not_start_a_turn():
 
         assert ctx.turn_task is None
         assert [msg.type for msg in transport.sent] == [
-            "snapshot", "session_focus"]
+            "snapshot", "session_focus", "perm"]
         assert transport.sent[1].request_id == "req-blank"
+        assert transport.sent[2].mode == "bypassPermissions"
 
     asyncio.run(run())

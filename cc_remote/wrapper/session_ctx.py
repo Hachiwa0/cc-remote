@@ -86,9 +86,10 @@ class SessionContext:
     # context. Reload (force_reconnect with resume) before running another turn,
     # else we'd continue from a conversation that has since moved on.
     needs_reload: bool = False
-    # epoch the last turn we ran finished — writes within a short grace window
-    # after it are OURS, not external.
-    last_turn_end: float = 0.0
+    # True only while this wrapper's Claude SDK child is expected to append to
+    # the transcript. ``state=running`` starts earlier, during reconnect and
+    # final ownership checks, so it is not sufficient write attribution.
+    claude_write_active: bool = False
     pending_asks: dict = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Serialize the tiny "final preflight check -> query accepted by engine"

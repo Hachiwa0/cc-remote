@@ -64,7 +64,7 @@ from cc_remote.attachments import decode_attachment, validate_attachments
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    ASK_OPTION_MAX_COUNT, Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast, CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
+    ASK_OPTION_MAX_COUNT, Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast, CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, SessionFocus, SessionRekey, SessionForked, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
@@ -72,7 +72,7 @@ from cc_remote.protocol import (
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.ask import make_ask_server
-from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.sdk import CLAUDE_DEFAULT_EFFORT, SdkHandle
 from cc_remote.wrapper.session import load_session_id, save_session_id
 from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.wrapper.stream import (
@@ -88,7 +88,7 @@ from cc_remote.wrapper.codex_stream import (
 )
 from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
-    codex_session_settings, set_codex_config_fast, codex_fast_enabled,
+    codex_session_settings,
 )
 from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
 from cc_remote.wrapper.codex_rpc import (
@@ -105,6 +105,7 @@ from cc_remote.wrapper.claude_forks import (
     ClaudeForkJournal, ClaudeForkJournalError, claude_fork_marker,
     find_claude_fork,
 )
+from cc_remote.wrapper.claude_external import claude_session_holders
 from cc_remote.wrapper.codex_external import (
     ProcessIdentity, parse_turn_markers, process_identity,
     writable_rollout_holders,
@@ -118,6 +119,31 @@ CLAUDE_PERMISSION_MODES = frozenset({
 })
 CODEX_PERMISSION_MODES = frozenset({"never", "on-request", "untrusted"})
 CODEX_COLLABORATION_MODES = frozenset({"default", "plan"})
+CODEX_FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
+
+
+def _codex_fast_on(value: Optional[str]) -> bool:
+    """0.144.1 accepts ``fast`` but reports the persisted tier as ``priority``."""
+    return value in CODEX_FAST_SERVICE_TIERS
+
+
+def _session_permission_mode(ctx: SessionContext) -> str:
+    """Return the permission mode actually configured on this live engine."""
+    if ctx.engine == "codex":
+        return getattr(ctx.sdk, "approval", "never")
+    return getattr(ctx.sdk, "permission_mode", "bypassPermissions")
+
+
+def _session_model(ctx: SessionContext) -> Optional[str]:
+    """Return the live engine's authoritative per-session model, if known."""
+    value = getattr(ctx.sdk, "model", None) or ctx.announced_model
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _session_effort(ctx: SessionContext) -> Optional[str]:
+    """Return the live engine's desired reasoning strength, if known."""
+    value = getattr(ctx.sdk, "effort", None) or ctx.announced_effort
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _codex_list_state(status: Optional[str]) -> Optional[State]:
@@ -155,6 +181,7 @@ class WrapperMachine:
     # number of resident sessions allowed by config validation.
     PRIVATE_BTW_CAP = 64
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
+    CLAUDE_SETTINGS_MAX_BYTES = 1024 * 1024
     BG_JOB_SCAN_MAX = 1_000
     BG_JOB_STATE_MAX_BYTES = 64 * 1024
     FORK_RECONCILE_ATTEMPTS = 4
@@ -195,6 +222,7 @@ class WrapperMachine:
         self._watch_task: Optional[asyncio.Task] = None
         self._codex_watch_lock = asyncio.Lock()
         self._codex_probe_warned = False
+        self._claude_probe_warned = False
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
         # resets this window (documented residual risk, not durable exactly-once).
@@ -228,6 +256,12 @@ class WrapperMachine:
         # deleted so a crash or failed cleanup cannot expose it in SessionList or
         # let another client cold-resume it as a normal session.
         self._private_btw_sessions = self._load_private_btw_sessions()
+        # Catalog/default reads stay off the serial mutation/query command lane
+        # so opening New Chat can never delay an immediate NewSession or Interrupt.
+        # Reliable command ids coalesce retries until the original task ACKs.
+        self._models_command_tasks: dict[
+            tuple[str, str], asyncio.Task
+        ] = {}
 
     # ---- pool helpers ----
 
@@ -538,11 +572,17 @@ class WrapperMachine:
 
             self._watch_task = asyncio.create_task(self._watch_loop())
             async for cmd in self.transport.incoming():
-                try:
-                    await self._process_command(cmd)
-                except Exception:
-                    log.exception("command handling failed", type=cmd.type)
+                if cmd.type == "get_models":
+                    self._start_models_command(cmd)
+                    continue
+                await self._process_command_safely(cmd)
         finally:
+            models_tasks = list(self._models_command_tasks.values())
+            for task in models_tasks:
+                task.cancel()
+            if models_tasks:
+                await asyncio.gather(*models_tasks, return_exceptions=True)
+            self._models_command_tasks.clear()
             fork_tasks = [
                 *self._codex_fork_tasks.values(),
                 *self._claude_fork_tasks.values(),
@@ -707,6 +747,38 @@ class WrapperMachine:
             client_id=client_id,
             to=client_id,
         ))
+
+    async def _process_command_safely(self, cmd) -> None:
+        """Run one command without letting a handler failure stop the loop."""
+        try:
+            await self._process_command(cmd)
+        except Exception:
+            log.exception("command handling failed", type=cmd.type)
+
+    def _start_models_command(self, cmd) -> None:
+        """Resolve catalogs/defaults without blocking the serial command lane.
+
+        Keep the normal reliable-command lifecycle inside the task: Models is
+        queued before CommandAck, and a reconnect retry with the same command id
+        coalesces onto the still-running task instead of duplicating the read.
+        """
+        client_id = getattr(cmd, "client_id", None) or ""
+        cmd_id = getattr(cmd, "cmd_id", None) or f"untracked-{id(cmd)}"
+        key = (client_id, cmd_id)
+        current = self._models_command_tasks.get(key)
+        if current is not None and not current.done():
+            log.debug("models command already resolving",
+                      client_id=client_id, cmd_id=cmd_id)
+            return
+
+        task = asyncio.create_task(self._process_command_safely(cmd))
+        self._models_command_tasks[key] = task
+
+        def forget(done: asyncio.Task) -> None:
+            if self._models_command_tasks.get(key) is done:
+                self._models_command_tasks.pop(key, None)
+
+        task.add_done_callback(forget)
 
     def _refresh_cached_response(self, response):
         """Copy a cached one-shot response, refreshing volatile snapshots.
@@ -915,9 +987,35 @@ class WrapperMachine:
                             "sid": sid,
                             "route_id": getattr(cmd, "route_id", None),
                         }))
-                # Collaboration mode is session control state, not transcript
-                # history.  Always seed it on hello even when the browser's replay
-                # cursor is already at the ring tail (for example after a refresh).
+                # Permission/collaboration modes are live control state, not
+                # transcript history. Always seed them on hello even when the
+                # browser's replay cursor is already at the ring tail.
+                permission_mode = _session_permission_mode(ctx)
+                ctx.announced_perm = permission_mode
+                await self.transport.send(Perm(
+                    mode=permission_mode,
+                    sid=sid,
+                    to=cmd.client_id,
+                    route_id=getattr(cmd, "route_id", None),
+                ))
+                model = _session_model(ctx)
+                if model:
+                    ctx.announced_model = model
+                    await self.transport.send(Model(
+                        model=model,
+                        sid=sid,
+                        to=cmd.client_id,
+                        route_id=getattr(cmd, "route_id", None),
+                    ))
+                effort = _session_effort(ctx)
+                if effort:
+                    ctx.announced_effort = effort
+                    await self.transport.send(Effort(
+                        effort=effort,
+                        sid=sid,
+                        to=cmd.client_id,
+                        route_id=getattr(cmd, "route_id", None),
+                    ))
                 if ctx.engine == "codex":
                     await self.transport.send(CollaborationMode(
                         mode=getattr(ctx.sdk, "collaboration_mode", "default"),
@@ -930,8 +1028,9 @@ class WrapperMachine:
 
     # ---- history: on-demand transcript read + EXTERNAL-append mirror ----
 
-    EXTERNAL_TTL = 60.0     # Claude/fallback unlock after the last external append
-    OWN_WRITE_GRACE = 10.0  # Claude appends this soon after our turn are still ours
+    # Codex-only fallback for an orphan task marker whose writer disappeared.
+    # Claude ownership never expires by time; it follows stable process identity.
+    EXTERNAL_TTL = 60.0
     CODEX_TURN_TRACK_MAX = 512
     CODEX_TURN_ATTRIBUTION_GRACE = 3.0
     WATCH_READ_MAX = 4 * 1024 * 1024
@@ -945,21 +1044,22 @@ class WrapperMachine:
             (c for c in self.sessions.values() if c.session_id == sid), None)
 
     def _is_external(self, sid: str) -> bool:
-        """This session's transcript was appended to by someone other than us, recently."""
+        """Whether a stable external owner (or incomplete scan) blocks Remote."""
         w = self._watch.get(sid)
         if w and w.get("engine") == "codex":
             return bool(w.get("external"))
-        return bool(w) and (time.time() - w["external_ts"]) < self.EXTERNAL_TTL
+        return bool(w) and bool(
+            w.get("external")
+            or not w.get("scan_complete", False)
+            or not w.get("file_available", True)
+        )
 
     def _own_write(self, sid: str) -> bool:
-        """True if WE plausibly produced the append: a turn is streaming, or one just
-        finished (cc keeps writing for a moment after the result)."""
+        """True only after this wrapper has launched the current Claude query."""
         ctx = self._ctx_by_sid(sid)
         if ctx is None:
             return False                       # not resident => we cannot have written it
-        if ctx.state != "idle":
-            return True
-        return (time.time() - ctx.last_turn_end) < self.OWN_WRITE_GRACE
+        return bool(ctx.engine == "claude" and ctx.claude_write_active)
 
     def _resync_watch(self, sid: str) -> None:
         """Re-baseline a watched transcript's size after WE appended to it outside of
@@ -970,16 +1070,20 @@ class WrapperMachine:
         if not w:
             return
         try:
-            w["size"] = os.path.getsize(w["path"])
+            st = os.stat(w["path"])
         except OSError:
-            pass
+            w["file_available"] = False
+            return
+        w["size"] = st.st_size
+        w["file_id"] = (st.st_dev, st.st_ino)
+        w["file_available"] = True
 
     def _watch_session(self, sid: str) -> None:
         """Start mirroring a session transcript when a client opens it.
 
-        Claude ownership is inferred from unattributed file growth. Codex cannot use
-        that heuristic because app-server flushes its own rollout asynchronously; its
-        primary ownership signal is a second writable FD for the same rollout inode.
+        Claude combines stable CLI process identity with unattributed file growth.
+        Codex cannot use that growth heuristic because app-server flushes its own
+        rollout asynchronously; its primary signal is a second writable FD.
         """
         if not sid or sid.startswith("tmp-"):
             return
@@ -987,6 +1091,9 @@ class WrapperMachine:
         existing = self._watch.get(sid)
         if existing is not None:
             if ctx is None or existing.get("engine") == ctx.engine:
+                if (ctx is not None and ctx.engine == "claude"
+                        and not existing.get("cwd")):
+                    existing["cwd"] = ctx.cwd
                 return
             # A cold history request may have registered before the resident
             # engine was known. Correct the watcher once the real context exists.
@@ -1019,7 +1126,7 @@ class WrapperMachine:
             self._watch.pop(victim, None)
         watch = {
             "path": path, "size": st.st_size, "file_id": (st.st_dev, st.st_ino),
-            "engine": engine, "external_ts": 0.0, "flagged": False,
+            "engine": engine, "external_ts": 0.0,
         }
         if engine == "codex":
             own_turn_ids = set(
@@ -1046,6 +1153,16 @@ class WrapperMachine:
             })
             if active_turns:
                 watch["external_ts"] = time.time()
+        else:
+            watch.update({
+                "cwd": ctx.cwd if ctx is not None else None,
+                "external": False,
+                "holders": set(),
+                "takeover_pending": False,
+                "file_available": True,
+                # Fail closed until the first real process scan completes.
+                "scan_complete": False,
+            })
         self._watch[sid] = watch
         log.info("watching transcript", session_id=sid, engine=engine, size=st.st_size)
 
@@ -1091,6 +1208,60 @@ class WrapperMachine:
             log.info("codex rollout owner scan recovered")
             self._codex_probe_warned = False
         return scan
+
+    def _claude_watch_inputs(
+        self, only_sid: Optional[str] = None,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        paths: dict[str, str] = {}
+        cwds: dict[str, str] = {}
+        for sid, watch in self._watch.items():
+            if (watch.get("engine") != "claude"
+                    or (only_sid is not None and sid != only_sid)):
+                continue
+            paths[sid] = watch["path"]
+            cwd = watch.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                cwds[sid] = cwd
+        return paths, cwds
+
+    async def _probe_claude_holders(
+        self, paths: dict[str, str], cwds: dict[str, str],
+    ):
+        scan = await asyncio.to_thread(
+            claude_session_holders,
+            paths,
+            cwds,
+            wrapper_pid=os.getpid(),
+        )
+        if not scan.complete:
+            if not self._claude_probe_warned:
+                log.warning(
+                    "Claude process owner scan incomplete; failing closed")
+                self._claude_probe_warned = True
+        elif self._claude_probe_warned:
+            log.info("Claude process owner scan recovered")
+            self._claude_probe_warned = False
+        return scan
+
+    async def _prime_claude_ownership(self, sid: str) -> bool:
+        """Synchronously close the watcher interval before History/Query."""
+        watch = self._watch.get(sid)
+        if not watch or watch.get("engine") != "claude":
+            return False
+        async with self._codex_watch_lock:
+            paths, cwds = self._claude_watch_inputs(sid)
+            scan = await self._probe_claude_holders(paths, cwds)
+            holders = set(scan.holders.get(sid, ()))
+            if not scan.complete:
+                holders.update(watch.get("holders", ()))
+            await self._poll_claude_watch(
+                sid,
+                watch,
+                holders,
+                time.time(),
+                ownership_scan_complete=scan.complete,
+            )
+            return self._is_external(sid)
 
     @staticmethod
     def _codex_holder_sets(
@@ -1416,28 +1587,95 @@ class WrapperMachine:
             await self._emit(ctx, TakeoverState(
                 pending=False, message=takeover_clear_message))
 
-    async def _poll_claude_watch(self, sid: str, w: dict) -> None:
-        try:
-            size = await asyncio.to_thread(os.path.getsize, w["path"])
-        except OSError:
-            return
-        if size < w["size"]:
-            w["size"] = size
-            return
-        if size == w["size"]:
-            return
-        grew, w["size"] = size - w["size"], size
-        if self._own_write(sid):
-            return
-        w["external_ts"] = time.time()
-        w["flagged"] = True
+    async def _poll_claude_watch(
+        self,
+        sid: str,
+        w: dict,
+        holders: set[ProcessIdentity],
+        now: float,
+        *,
+        ownership_scan_complete: bool,
+    ) -> None:
+        was_external = self._is_external(sid)
+        was_file_available = w.get("file_available", True)
         ctx = self._ctx_by_sid(sid)
-        if ctx is not None:
-            ctx.external_ts = w["external_ts"]
+        external_growth = False
+        try:
+            file_stat = await asyncio.to_thread(os.stat, w["path"])
+        except OSError:
+            file_stat = None
+        w["file_available"] = file_stat is not None
+
+        takeover_cleared = False
+        if ownership_scan_complete:
+            w["scan_complete"] = True
+            w["holders"] = set(holders)
+            # A queued handoff is only safe once both the exact owner is gone
+            # and the transcript is still available for an authoritative mirror.
+            if (w.get("takeover_pending") and not holders
+                    and file_stat is not None):
+                w["takeover_pending"] = False
+                takeover_cleared = True
+            w["external"] = bool(holders or w.get("takeover_pending"))
+        else:
+            # A partial /proc view must never manufacture an unlock. Retain
+            # every previously-known identity and let _is_external fail closed.
+            w["scan_complete"] = False
+            w.setdefault("holders", set()).update(holders)
+
+        if file_stat is None:
+            if was_file_available:
+                log.warning(
+                    "Claude transcript became unavailable; failing closed",
+                    session_id=sid,
+                )
+        else:
+            file_id = (file_stat.st_dev, file_stat.st_ino)
+            size = file_stat.st_size
+            if file_id != w.get("file_id") or size < w["size"]:
+                w["file_id"] = file_id
+                w["size"] = size
+                external_growth = True
+            elif size > w["size"]:
+                grew = size - w["size"]
+                w["size"] = size
+                # A stable foreign process always wins. With no foreign process,
+                # only a query that this wrapper has actually launched may claim
+                # growth as its own; generic running state and post-turn TTLs are
+                # deliberately insufficient.
+                external_growth = bool(holders) or not self._own_write(sid)
+                log.info(
+                    "Claude transcript append observed",
+                    session_id=sid,
+                    bytes=grew,
+                    external=external_growth,
+                    holders=len(holders),
+                    resident=ctx is not None,
+                )
+
+        if external_growth and ctx is not None:
+            w["external_ts"] = now
+            ctx.external_ts = now
             ctx.needs_reload = True
-        log.info("external transcript append -> mirroring", session_id=sid,
-                 bytes=grew, resident=ctx is not None)
-        await self._push_mirrored_history(sid)
+
+        is_external = self._is_external(sid)
+        if (external_growth or is_external != was_external or takeover_cleared
+                or w["file_available"] != was_file_available):
+            log.info(
+                "Claude external ownership changed"
+                if is_external != was_external
+                else "Claude transcript append -> mirroring",
+                session_id=sid,
+                external=is_external,
+                holders=len(w.get("holders", ())),
+                scan_complete=ownership_scan_complete,
+            )
+            await self._push_mirrored_history(sid)
+        if takeover_cleared and ctx is not None:
+            await self._emit(ctx, TakeoverState(
+                pending=False,
+                message="终端进程已退出，会话已安全交给 Remote",
+            ))
 
     async def _poll_watches_once(self) -> None:
         paths = self._codex_watch_paths()
@@ -1457,29 +1695,33 @@ class WrapperMachine:
                         sid, w, holders, now, writers=writers,
                         ownership_scan_complete=scan.complete)
 
-        for sid, w in list(self._watch.items()):
-            if w.get("engine") != "codex":
-                await self._poll_claude_watch(sid, w)
-
-        # Claude's activity heuristic requires an explicit unlock notification.
-        for sid, w in list(self._watch.items()):
-            if w.get("engine") == "codex":
-                continue
-            if not w.get("flagged") or self._is_external(sid):
-                continue
-            w["flagged"] = False
-            ctx = self._ctx_by_sid(sid)
-            if ctx is not None:
-                ctx.external_ts = 0.0
-            log.info("external window expired -> unlocking", session_id=sid)
-            await self._push_mirrored_history(sid)
+        claude_paths, claude_cwds = self._claude_watch_inputs()
+        if claude_paths:
+            async with self._codex_watch_lock:
+                scan = await self._probe_claude_holders(
+                    claude_paths, claude_cwds)
+                now = time.time()
+                for sid, path in claude_paths.items():
+                    watch = self._watch.get(sid)
+                    if watch is None or watch.get("path") != path:
+                        continue
+                    holders = set(scan.holders.get(sid, ()))
+                    if not scan.complete:
+                        holders.update(watch.get("holders", ()))
+                    await self._poll_claude_watch(
+                        sid,
+                        watch,
+                        holders,
+                        now,
+                        ownership_scan_complete=scan.complete,
+                    )
 
     async def _watch_loop(self) -> None:
         """Mirror EXTERNAL appends to watched transcripts.
 
-        Claude uses unattributed st_size growth (mtime is touched on resume without a
-        write). Codex uses a writable-holder scan plus turn-id attribution because its
-        own app-server keeps flushing rollout records after turn/completed. External
+        Claude uses stable process identities plus conservative cwd association.
+        Codex uses a writable-holder scan plus turn-id attribution because its own
+        app-server keeps flushing rollout records after turn/completed. External
         growth rebuilds history and marks the resident context stale before reuse."""
         while True:
             try:
@@ -1624,18 +1866,24 @@ class WrapperMachine:
         start = max(0, end - limit) if isinstance(limit, int) and limit > 0 else 0
         page = turns[start:end]
 
-        # Prepend the model readout only on the newest page (initial load). For cc,
-        # only announce Claude-branded models: the user's cc-switch may proxy a
-        # Claude alias to a different upstream, whose raw name must not replace the
-        # selected alias. Codex announces its real model (gpt-*).
-        model_row = None
-        if before is None and mdl and (is_codex_hist or mdl.startswith("claude-")):
-            model_event = Model(model=mdl)
-            model_event.sid = sid
-            model_row = model_event.model_dump(mode="json")
+        # Prepend live control readouts only on the newest page (initial load).
+        # Claude's SDK model is the selected alias; its transcript may instead
+        # contain a proxy's raw upstream model and must not replace that alias.
+        authoritative_model = _session_model(ctx) if ctx is not None else None
+        history_model = authoritative_model or mdl
+        control_rows: list[dict] = []
+        if (before is None and history_model
+                and (authoritative_model or is_codex_hist
+                     or history_model.startswith("claude-"))):
+            model_event = Model(model=history_model, sid=sid)
+            control_rows.append(model_event.model_dump(mode="json"))
+        history_effort = _session_effort(ctx) if ctx is not None else None
+        if before is None and history_effort:
+            effort_event = Effort(effort=history_effort, sid=sid)
+            control_rows.append(effort_event.model_dump(mode="json"))
 
         def make_history(selected: list[list], effective_start: int) -> History:
-            payload: list[dict] = ([model_row.copy()] if model_row else [])
+            payload: list[dict] = [row.copy() for row in control_rows]
             for group in selected:
                 payload.extend(ev.model_dump(mode="json") for ev in group)
             return History(
@@ -1694,7 +1942,7 @@ class WrapperMachine:
                     row["images"] = None
             frame_size = len(history.model_dump_json().encode())
             if frame_size > frame_budget:
-                compact: list[dict] = ([model_row.copy()] if model_row else [])
+                compact: list[dict] = [row.copy() for row in control_rows]
                 for row in history.events:
                     if row.get("type") == "user_msg":
                         kept = row.copy()
@@ -1738,9 +1986,12 @@ class WrapperMachine:
         stream through to every client (read-only)."""
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         self._watch_session(sid)   # snapshot size before we read, so no append is missed
-        if (self._watch.get(sid) or {}).get("engine") == "codex":
-            # Do not leave a short writable window while waiting for the 1.5s poll.
+        watched_engine = (self._watch.get(sid) or {}).get("engine")
+        # Do not leave a short ownership window while waiting for the 1.5s poll.
+        if watched_engine == "codex":
             await self._prime_codex_ownership(sid)
+        elif watched_engine == "claude":
+            await self._prime_claude_ownership(sid)
         hist = await self._build_history(
             sid, before=getattr(cmd, "before", None), limit=getattr(cmd, "limit", None),
             cwd_hint=getattr(cmd, "cwd", None))
@@ -1756,10 +2007,10 @@ class WrapperMachine:
     async def _handle_takeover(self, cmd):
         """Explicitly transfer a read-only terminal session back to Remote.
 
-        The exact current external process identities are ignored until they
-        exit. A later unknown task_started marker still re-locks the session, so
-        a terminal that speaks again becomes the newest owner without being
-        killed or silently racing forever.
+        Codex can attribute terminal turns and capture an idle process identity.
+        Claude has no equivalent control channel, so its takeover is deliberately
+        fail-closed: record the user's intent while a terminal is alive and grant
+        ownership only after that exact process exits.
         """
         sid = getattr(cmd, "sid", None)
         ctx = self._ctx_for(sid)
@@ -1817,10 +2068,46 @@ class WrapperMachine:
                 w["external"] = bool(holders)
                 ctx.needs_reload = True
         else:
-            w["external_ts"] = 0.0
-            w["flagged"] = False
-            ctx.external_ts = 0.0
-            ctx.needs_reload = True
+            async with self._codex_watch_lock:
+                paths, cwds = self._claude_watch_inputs(resolved_sid)
+                scan = await self._probe_claude_holders(paths, cwds)
+                holders = set(scan.holders.get(resolved_sid, ()))
+                if not scan.complete:
+                    holders.update(w.get("holders", ()))
+                await self._poll_claude_watch(
+                    resolved_sid,
+                    w,
+                    holders,
+                    time.time(),
+                    ownership_scan_complete=scan.complete,
+                )
+                if not scan.complete or not w.get("file_available", False):
+                    error = Error(
+                        code=ERR_BUSY,
+                        message="终端状态或会话文件暂不可确认，未执行接管，请重试",
+                    )
+                    await self._emit(ctx, error)
+                    return error
+                if holders:
+                    w["takeover_pending"] = True
+                    w["external"] = True
+                    await self._push_mirrored_history(resolved_sid)
+                    await self._emit(ctx, TakeoverState(
+                        pending=True,
+                        message=("已登记接管；退出当前终端 Claude 后会自动交给 "
+                                 "Remote，期间不会允许双端同时发送"),
+                    ))
+                    log.info(
+                        "Claude takeover queued until terminal exit",
+                        session_id=resolved_sid,
+                        holders=len(holders),
+                    )
+                    return None
+                w["takeover_pending"] = False
+                w["external"] = False
+                w["scan_complete"] = True
+                ctx.external_ts = 0.0
+                ctx.needs_reload = True
 
         log.info("session manually taken over", session_id=resolved_sid,
                  engine=ctx.engine)
@@ -1851,12 +2138,19 @@ class WrapperMachine:
                 msg_id=getattr(cmd, "msg_id", None))
             await self._emit(ctx, error)
             return error
-        if ctx.engine == "codex" and ctx.session_id:
+        if ctx.session_id:
             self._watch_session(ctx.session_id)
-            if await self._prime_codex_ownership(ctx.session_id):
+            external = (
+                await self._prime_codex_ownership(ctx.session_id)
+                if ctx.engine == "codex"
+                else await self._prime_claude_ownership(ctx.session_id)
+            )
+            if external:
+                engine_name = "Codex" if ctx.engine == "codex" else "Claude"
                 error = Error(
                     code=ERR_BUSY,
-                    message="该 Codex 会话正在被本机终端使用；请退出终端或点击『接管』",
+                    message=(f"该 {engine_name} 会话正在被本机终端使用，或终端状态"
+                             "暂不可确认；请退出终端或点击『接管』"),
                     msg_id=getattr(cmd, "msg_id", None),
                 )
                 await self._emit(ctx, error)
@@ -1919,13 +2213,171 @@ class WrapperMachine:
                     code=ERR_INTERNAL, message=f"interrupt failed: {e}"))
                 # leave interrupting; the drain timeout will recover
 
+    @classmethod
+    def _read_claude_settings(cls, path: str) -> Optional[dict]:
+        """Read one settings object without trusting an unbounded config file."""
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(cls.CLAUDE_SETTINGS_MAX_BYTES + 1)
+        except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+            return None
+        if len(raw) > cls.CLAUDE_SETTINGS_MAX_BYTES:
+            log.warning("Claude settings ignored: file too large", path=path)
+            return None
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            log.warning("Claude settings ignored: invalid JSON", path=path)
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _claude_project_root(cwd: str) -> str:
+        """Find Claude's project scope (git root, else nearest .claude scope)."""
+        current = os.path.realpath(cwd)
+        nearest_settings = None
+        for _ in range(64):
+            if os.path.exists(os.path.join(current, ".git")):
+                return current
+            if nearest_settings is None and any(os.path.exists(path) for path in (
+                os.path.join(current, ".claude", "settings.json"),
+                os.path.join(current, ".claude", "settings.local.json"),
+            )):
+                nearest_settings = current
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        return nearest_settings or os.path.realpath(cwd)
+
+    @staticmethod
+    def _claude_managed_settings_paths() -> list[str]:
+        """Return file-managed policy sources in their documented merge order."""
+        result: list[str] = []
+        for root in (
+            "/etc/claude-code",
+            "/Library/Application Support/ClaudeCode",
+        ):
+            result.append(os.path.join(root, "managed-settings.json"))
+            drop_in = os.path.join(root, "managed-settings.d")
+            try:
+                with os.scandir(drop_in) as entries:
+                    names = sorted(
+                        entry.name for entry in entries
+                        if entry.is_file() and not entry.name.startswith(".")
+                        and entry.name.endswith(".json"))
+            except OSError:
+                continue
+            result.extend(os.path.join(drop_in, name) for name in names)
+        return result
+
+    @classmethod
+    def _claude_configured_model(cls, cwd: str) -> Optional[str]:
+        """Resolve an explicit new-session model without starting Claude CLI.
+
+        Claude's account/organization runtime Default cannot be read without a
+        live CLI, so an absent explicit value deliberately returns None. The UI
+        then keeps the honest generic "local default" label.
+        """
+        root = cls._claude_project_root(cwd)
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        if config_dir:
+            user_settings = os.path.join(
+                os.path.realpath(os.path.expanduser(config_dir)),
+                "settings.json")
+        else:
+            user_settings = os.path.expanduser("~/.claude/settings.json")
+        ordinary_paths = [
+            user_settings,
+            os.path.join(root, ".claude", "settings.json"),
+            os.path.join(root, ".claude", "settings.local.json"),
+        ]
+
+        def explicit_model(value) -> tuple[bool, Optional[str]]:
+            if not isinstance(value, str):
+                return False, None
+            value = value.strip()
+            if not 0 < len(value) <= 256:
+                return False, None
+            return True, None if value.lower() == "default" else value
+
+        model = None
+        model_set = False
+        settings_env_model = None
+        settings_env_model_set = False
+        for path in ordinary_paths:
+            settings = cls._read_claude_settings(path)
+            if settings is None:
+                continue
+            present, candidate = explicit_model(settings.get("model"))
+            if present:
+                model_set = True
+                model = candidate
+            env = settings.get("env")
+            present, candidate = explicit_model(
+                env.get("ANTHROPIC_MODEL") if isinstance(env, dict) else None)
+            if present:
+                settings_env_model_set = True
+                settings_env_model = candidate
+
+        managed_model = None
+        managed_model_set = False
+        managed_env_model = None
+        managed_env_model_set = False
+        for path in cls._claude_managed_settings_paths():
+            settings = cls._read_claude_settings(path)
+            if settings is None:
+                continue
+            present, candidate = explicit_model(settings.get("model"))
+            if present:
+                managed_model_set = True
+                managed_model = candidate
+            env = settings.get("env")
+            present, candidate = explicit_model(
+                env.get("ANTHROPIC_MODEL") if isinstance(env, dict) else None)
+            if present:
+                managed_env_model_set = True
+                managed_env_model = candidate
+
+        # Managed policy cannot be overridden. Otherwise the launch environment
+        # wins over settings, and settings-provided ANTHROPIC_MODEL wins over the
+        # scalar model field just as it does in Claude Code.
+        external_model_set, external_model = explicit_model(
+            os.environ.get("ANTHROPIC_MODEL"))
+        if managed_env_model_set:
+            return managed_env_model
+        if managed_model_set:
+            return managed_model
+        if external_model_set:
+            return external_model
+        if settings_env_model_set:
+            return settings_env_model
+        return model if model_set else None
+
+    async def _claude_new_session_defaults(
+        self, cwd: Optional[str],
+    ) -> tuple[Optional[str], str]:
+        raw_cwd = cwd or self.cfg.cc_cwd
+        target_cwd = os.path.realpath(os.path.expanduser(raw_cwd))
+        if not os.path.isdir(target_cwd):
+            return None, CLAUDE_DEFAULT_EFFORT
+        model = await asyncio.to_thread(
+            self._claude_configured_model, target_cwd)
+        return model, CLAUDE_DEFAULT_EFFORT
+
     async def _handle_get_models(self, cmd) -> None:
-        """Answer with the ENGINE's own catalog. codex's app-server knows exactly
-        which reasoning levels each model takes; cc has no equivalent RPC, so we
-        return nothing and the client keeps its static table."""
+        """Answer with the engine's catalog and effective new-session defaults.
+
+        Codex exposes its catalog through app-server. Claude has no side-effect-
+        free catalog/default RPC, so its list stays empty while bounded settings
+        reads resolve an explicit cwd-aware model; the client keeps its static
+        presentation table.
+        """
         engine = getattr(cmd, "engine", None) or "cc"
         models = await codex_catalog() if engine == "codex" else []
         default_model = None
+        default_effort = None
+        defaults_cwd = None
         if engine == "codex":
             # config.toml's `model` = what a NEW session (and the terminal codex)
             # starts on. Only offer it if the catalog actually has it, so a stale
@@ -1933,13 +2385,21 @@ class WrapperMachine:
             cfg_model = await asyncio.to_thread(codex_model, "")
             if cfg_model and any(m["id"] == cfg_model for m in models):
                 default_model = cfg_model
-        msg = Models(engine=engine, models=models, default_model=default_model)
+        elif engine in {"cc", "claude"}:
+            defaults_cwd = getattr(cmd, "cwd", None) or self.cfg.cc_cwd
+            default_model, default_effort = (
+                await self._claude_new_session_defaults(
+                    defaults_cwd))
+        msg = Models(
+            engine=engine, models=models, default_model=default_model,
+            default_effort=default_effort, cwd=defaults_cwd)
         client_id = getattr(cmd, "client_id", None)
         if client_id:
             msg.to = client_id           # relay routes it to just this client
         await self.transport.send(msg)
         log.info("models sent", engine=engine, count=len(models),
-                 default_model=default_model, client_id=client_id)
+                 default_model=default_model, default_effort=default_effort,
+                 client_id=client_id)
 
     async def _handle_set_model(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -1947,13 +2407,14 @@ class WrapperMachine:
             return
         try:
             await ctx.sdk.set_model(cmd.model)
-            ctx.announced_model = cmd.model
-            await self._emit(ctx, Model(model=cmd.model))
+            applied_model = getattr(ctx.sdk, "model", None) or cmd.model
+            ctx.announced_model = applied_model
+            await self._emit(ctx, Model(model=applied_model))
             if ctx.engine == "codex":
-                # The new model may not support the level we're carrying (sol has
-                # `ultra`, luna tops out at `max`). Clamp before the next turn/start
-                # sends it — codex accepts any string here and only fails at the API.
-                applied = await self._apply_codex_effort(ctx, ctx.announced_effort)
+                # thread/settings/updated is authoritative. app-server may adjust
+                # effort when the selected model cannot use the old level; never
+                # overwrite that decision with a Web-side guess or stale chip.
+                applied = getattr(ctx.sdk, "effort", None)
                 if applied and applied != ctx.announced_effort:
                     ctx.announced_effort = applied
                     await self._emit(ctx, Effort(effort=applied))
@@ -1974,11 +2435,10 @@ class WrapperMachine:
         applied = await clamp_effort(getattr(ctx.sdk, "model", None), effort)
         if not applied:
             return applied
-        # codex effort is a per-turn turn/start param, so keep applied_effort in
-        # lockstep — _run_turn's "effort != applied" check must not force a respawn.
-        ctx.sdk.effort = applied
-        ctx.sdk.applied_effort = applied
-        return applied
+        # Persist through app-server's official thread setting. turn/start repeats
+        # it defensively, but a restart/eviction no longer loses the selection.
+        await ctx.sdk.set_effort(applied)
+        return getattr(ctx.sdk, "effort", None) or applied
 
     async def _handle_set_effort(self, cmd) -> None:
         # cc: effort is a spawn-time flag (--effort), so we can't flip it on the live
@@ -2002,43 +2462,23 @@ class WrapperMachine:
         log.info("effort set", sid=ctx.session_id, effort=cmd.effort, engine=ctx.engine)
 
     async def _handle_set_service_tier(self, cmd) -> None:
-        # Codex Fast mode. codex reads `service_tier` from ~/.codex/config.toml at
-        # app-server startup, so a simple per-turn param can't turn it OFF when the
-        # config still says "fast" (it just falls back to config). So we: (1) edit
-        # config.toml — what the user validates against — (2) set the per-turn
-        # override on the handle (belt+suspenders), and (3) mark the session for a
-        # reconnect so the next turn respawns the app-server against the new config
-        # (lazy, like an effort change: no cost until the user actually sends).
-        # cc has no service tier — ignore there.
+        # Codex Fast is a thread setting in app-server 0.144.1. Never mutate the
+        # user's global config.toml and never leak one session's choice to another.
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None or ctx.engine != "codex":
             return
-        # "toggle" flips whatever config.toml currently says (source of truth the
-        # user sees/edits), so the web needs no synced on/off state; "fast"/other
-        # still set an explicit state.
         if cmd.service_tier == "toggle":
-            on = not codex_fast_enabled()
+            on = not _codex_fast_on(
+                getattr(ctx.sdk, "service_tier", None))
         else:
             on = (cmd.service_tier == "fast")
         try:
-            ok = await asyncio.to_thread(set_codex_config_fast, on)
-            if not ok:
-                raise RuntimeError("Codex config.toml was not updated")
-
-            # Fast is a global Codex config switch, not a per-session preference.
-            # Every resident app-server must reconnect before its next turn or the
-            # UI/config/actual process can disagree depending on which session runs.
-            codex_contexts = [
-                resident for resident in list(self.sessions.values())
-                if resident.engine == "codex"
-            ]
-            for resident in codex_contexts:
-                await resident.sdk.set_service_tier("fast" if on else None)
-                resident.sdk.tier_dirty = True
-            for resident in codex_contexts:
-                await self._emit(resident, Fast(on=on))
-            log.info("codex service tier set", sid=ctx.session_id, fast=on,
-                     resident_handles=len(codex_contexts))
+            await ctx.sdk.set_service_tier("fast" if on else None)
+            applied_on = _codex_fast_on(
+                getattr(ctx.sdk, "service_tier", None))
+            await self._emit(ctx, Fast(on=applied_on))
+            log.info("codex thread service tier set", sid=ctx.session_id,
+                     requested=on, applied=applied_on)
         except Exception as e:
             log.exception("set_service_tier failed", error=str(e))
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_service_tier failed: {e}"))
@@ -2056,8 +2496,9 @@ class WrapperMachine:
             return
         try:
             await ctx.sdk.set_collaboration_mode(cmd.mode)
-            ctx.announced_collaboration_mode = cmd.mode
-            await self._emit(ctx, CollaborationMode(mode=cmd.mode))
+            applied = getattr(ctx.sdk, "collaboration_mode", cmd.mode)
+            ctx.announced_collaboration_mode = applied
+            await self._emit(ctx, CollaborationMode(mode=applied))
         except Exception as e:
             log.exception("set_collaboration_mode failed", error=str(e))
             await self._emit(ctx, Error(
@@ -2067,20 +2508,41 @@ class WrapperMachine:
 
     async def _refresh_codex_collaboration_mode(
             self, ctx: SessionContext) -> None:
-        """Adopt a native Codex turn's last persisted collaboration mode."""
+        """Adopt settings persisted by a native Codex turn's rollout tail."""
         if ctx.engine != "codex" or not ctx.session_id:
             return
         settings = await asyncio.to_thread(
             codex_session_settings, ctx.session_id,
             self.cfg.history_source_max_bytes)
+        model = settings.get("model")
+        if isinstance(model, str) and model and ctx.sdk.model != model:
+            ctx.sdk.model = model
+            ctx.announced_model = model
+            await self._emit(ctx, Model(model=model))
+        effort = settings.get("effort")
+        if isinstance(effort, str) and effort and ctx.sdk.effort != effort:
+            ctx.sdk.effort = effort
+            ctx.sdk.applied_effort = effort
+            ctx.announced_effort = effort
+            await self._emit(ctx, Effort(effort=effort))
+        approval = settings.get("approval_policy")
+        if (approval in CODEX_PERMISSION_MODES
+                and ctx.sdk.approval != approval):
+            ctx.sdk.approval = approval
+            ctx.announced_perm = approval
+            await self._emit(ctx, Perm(mode=approval))
+        if "service_tier" in settings:
+            tier = settings.get("service_tier")
+            if tier is None or isinstance(tier, str):
+                if ctx.sdk.service_tier != tier:
+                    ctx.sdk.service_tier = tier
+                    await self._emit(ctx, Fast(on=_codex_fast_on(tier)))
         mode = settings.get("collaboration_mode")
-        if mode not in CODEX_COLLABORATION_MODES:
-            return
-        if getattr(ctx.sdk, "collaboration_mode", "default") == mode:
-            return
-        ctx.sdk.collaboration_mode = mode
-        ctx.announced_collaboration_mode = mode
-        await self._emit(ctx, CollaborationMode(mode=mode))
+        if (mode in CODEX_COLLABORATION_MODES
+                and getattr(ctx.sdk, "collaboration_mode", "default") != mode):
+            ctx.sdk.collaboration_mode = mode
+            ctx.announced_collaboration_mode = mode
+            await self._emit(ctx, CollaborationMode(mode=mode))
 
     async def _send_btw_error(self, cmd, code: str, message: str) -> Error:
         """Send a one-request /btw rejection without polluting another session.
@@ -2139,10 +2601,18 @@ class WrapperMachine:
         if cid:
             snap.to = cid
         await self.transport.send(snap)
+        permission_mode = _session_permission_mode(btw)
+        btw.announced_perm = permission_mode
+        permission = Perm(mode=permission_mode, sid=btw.key, to=cid)
+        await self.transport.send(permission)
+        if btw.engine == "codex":
+            # BtwOpened + Snapshot create the owner-only browser runtime before
+            # pending app-server notices are released into that route.
+            await btw.sdk.activate_runtime_events()
         log.info("btw opened", btw_sid=btw.key, parent=parent.session_id, client_id=cid)
-        # Both one-shot frames are required to reconstruct the fork after a lost
-        # response. Reliable-command retries replay this pair without re-forking.
-        return ev, snap
+        # All three one-shot frames are required to reconstruct the fork after a
+        # lost response. Reliable-command retries replay them without re-forking.
+        return ev, snap, permission
 
     async def _handle_close_btw(self, cmd) -> None:
         sid = getattr(cmd, "sid", None)
@@ -2189,8 +2659,9 @@ class WrapperMachine:
             return
         try:
             await ctx.sdk.set_permission_mode(cmd.mode)
-            ctx.announced_perm = cmd.mode
-            await self._emit(ctx, Perm(mode=cmd.mode))
+            applied = getattr(ctx.sdk, "approval", cmd.mode)
+            ctx.announced_perm = applied
+            await self._emit(ctx, Perm(mode=applied))
         except Exception as e:
             log.exception("set_permission_mode failed", error=str(e))
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_perm failed: {e}"))
@@ -2278,6 +2749,23 @@ class WrapperMachine:
         automatically routes private /btw updates to their owning client.
         """
         await self._emit(ctx, GoalState(goal=goal))
+
+    async def _on_codex_runtime_event(
+        self, ctx: SessionContext, event: Notice | RateLimitUpdate,
+    ) -> None:
+        """Route sanitized app-server notices only after ctx has an identity."""
+        if not isinstance(event, (Notice, RateLimitUpdate)):
+            return
+        if not (ctx.session_id or ctx.key):
+            # An absent sid is a broadcast at the relay.  Initialization events
+            # must stay inside CodexHandle's pending queue until _spawn assigns a
+            # temp/real key; fail closed if a caller activates out of order.
+            log.warning(
+                "codex runtime event has no session route; dropped",
+                event_type=event.type,
+            )
+            return
+        await self._emit(ctx, event)
 
     async def _on_claude_background_message(
         self, ctx: SessionContext, message, turn_id: str | None,
@@ -3223,18 +3711,31 @@ class WrapperMachine:
             session_id=ctx.session_id or self.focused_sid or sid, cwd=ctx.cwd)
         await self._emit(ctx, focus)
         cached_responses = [snap, focus] if snap is not None else [focus]
-        # Seed the chips on entering a codex session so they're right before the first
-        # turn. Fast is global (config.toml); model/effort are per-session (restored
-        # from the rollout in _spawn). Without the Model frame the composer falls back
+        permission_mode = _session_permission_mode(ctx)
+        ctx.announced_perm = permission_mode
+        permission_event = Perm(mode=permission_mode)
+        await self._emit(ctx, permission_event)
+        cached_responses.append(permission_event)
+        if ctx.engine != "codex":
+            model = _session_model(ctx)
+            if model:
+                ctx.announced_model = model
+                model_event = Model(model=model)
+                await self._emit(ctx, model_event)
+                cached_responses.append(model_event)
+            effort = _session_effort(ctx)
+            if effort:
+                ctx.announced_effort = effort
+                effort_event = Effort(effort=effort)
+                await self._emit(ctx, effort_event)
+                cached_responses.append(effort_event)
+        # Seed the chips on entering a Codex session from the authoritative
+        # thread-local settings restored in _spawn. Without the Model frame the composer falls back
         # to the engine's first model, so a luna session came up labelled "Sol".
         if ctx.engine == "codex":
-            fast_event = Fast(on=codex_fast_enabled())
+            fast_event = Fast(on=_codex_fast_on(ctx.sdk.service_tier))
             await self._emit(ctx, fast_event)
             cached_responses.append(fast_event)
-            ctx.announced_perm = ctx.sdk.approval
-            perm_event = Perm(mode=ctx.sdk.approval)
-            await self._emit(ctx, perm_event)
-            cached_responses.append(perm_event)
             collaboration_mode = getattr(
                 ctx.sdk, "collaboration_mode", "default")
             ctx.announced_collaboration_mode = collaboration_mode
@@ -3252,6 +3753,9 @@ class WrapperMachine:
                 effort_event = Effort(effort=ctx.sdk.effort)
                 await self._emit(ctx, effort_event)
                 cached_responses.append(effort_event)
+            # Snapshot/SessionFocus has now created the browser runtime. Release
+            # initialize-time warnings only after that routing state exists.
+            await ctx.sdk.activate_runtime_events()
         return tuple(cached_responses)
 
     async def _capture_session_id(self, ctx: SessionContext, sid: str) -> None:
@@ -3336,6 +3840,11 @@ class WrapperMachine:
                 self.focused_sid = sid
             await self._emit(ctx, SessionRekey(old_key=old_key, session_id=sid, cwd=ctx.cwd))
             self._rekey_cached_create_responses(old_key, sid, ctx.cwd)
+        if ctx.engine == "claude":
+            # The real id becomes visible before the first turn necessarily ends.
+            # Start ownership monitoring at capture so a terminal resume during
+            # that first response cannot wait until the next Remote query.
+            self._watch_session(sid)
         log.info("captured cc session id", sid=sid, focus_followed=(self.focused_sid == sid))
 
     async def _handle_new_session(self, cmd) -> None:
@@ -3355,7 +3864,11 @@ class WrapperMachine:
                                 model=getattr(cmd, "model", None),
                                 effort=getattr(cmd, "effort", None),
                                 collaboration_mode=getattr(
-                                    cmd, "collaboration_mode", None))
+                                    cmd, "collaboration_mode", None),
+                                permission_mode=getattr(
+                                    cmd, "permission_mode", None),
+                                service_tier=getattr(
+                                    cmd, "service_tier", None))
         if ctx is None:
             error = Error(
                 code=ERR_CC_CRASH,
@@ -3390,22 +3903,25 @@ class WrapperMachine:
         # SessionFocus has created the temp-keyed client runtime; otherwise the
         # removed client-side pending-query effect would leave its chips stale.
         cached_responses = [snap, focus]
-        if getattr(cmd, "model", None):
-            model_event = Model(model=cmd.model)
+        initial_model = _session_model(ctx)
+        if initial_model:
+            ctx.announced_model = initial_model
+            model_event = Model(model=initial_model)
             await self._emit(ctx, model_event)
             cached_responses.append(model_event)
-        if getattr(cmd, "effort", None):
-            effort_event = Effort(effort=cmd.effort)
+        initial_effort = _session_effort(ctx)
+        if initial_effort:
+            ctx.announced_effort = initial_effort
+            effort_event = Effort(effort=initial_effort)
             await self._emit(ctx, effort_event)
             cached_responses.append(effort_event)
-        # A fresh Codex runtime otherwise inherits the web's Claude-only fallback
-        # (`bypassPermissions`). Claude already uses that fallback as its real
-        # spawn-time mode, so only Codex needs an explicit initial frame here.
+        permission_mode = _session_permission_mode(ctx)
+        ctx.announced_perm = permission_mode
+        permission_event = Perm(mode=permission_mode)
+        await self._emit(ctx, permission_event)
+        cached_responses.append(permission_event)
+        # Collaboration mode is a separate Codex-only control.
         if ctx.engine == "codex":
-            ctx.announced_perm = ctx.sdk.approval
-            perm_event = Perm(mode=ctx.sdk.approval)
-            await self._emit(ctx, perm_event)
-            cached_responses.append(perm_event)
             collaboration_mode = getattr(
                 ctx.sdk, "collaboration_mode", "default")
             ctx.announced_collaboration_mode = collaboration_mode
@@ -3413,6 +3929,12 @@ class WrapperMachine:
                 mode=collaboration_mode)
             await self._emit(ctx, collaboration_event)
             cached_responses.append(collaboration_event)
+            fast_event = Fast(on=_codex_fast_on(ctx.sdk.service_tier))
+            await self._emit(ctx, fast_event)
+            cached_responses.append(fast_event)
+            # SessionFocus precedes this point, so the temp-keyed browser runtime
+            # exists before initialize/config warnings are released.
+            await ctx.sdk.activate_runtime_events()
 
         prompt = getattr(cmd, "prompt", None)
         images = getattr(cmd, "images", None)
@@ -4559,7 +5081,9 @@ class WrapperMachine:
     async def _spawn(self, resume_id: Optional[str], cwd: Optional[str] = None,
                      bootstrap: bool = False, engine: str = "claude",
                      model: Optional[str] = None, effort: Optional[str] = None,
-                     collaboration_mode: Optional[str] = None) -> Optional[SessionContext]:
+                     collaboration_mode: Optional[str] = None,
+                     permission_mode: Optional[str] = None,
+                     service_tier: Optional[str] = None) -> Optional[SessionContext]:
         """Create a SessionContext, connect its SDK subprocess, load history.
         Returns the ctx (added to the pool under its real or temp key) or None
         on failure (an Error has been emitted). `bootstrap` exempts the cap and
@@ -4667,17 +5191,29 @@ class WrapperMachine:
         if engine == "codex":
             if collaboration_mode in CODEX_COLLABORATION_MODES:
                 sdk.collaboration_mode = collaboration_mode
-            # A resumed codex session's model/effort live in ITS OWN rollout (codex
-            # writes a `turn_context` per turn). CodexHandle seeds them from
-            # config.toml, which is a single GLOBAL default — so resuming used to
-            # silently drag a session the user had switched to luna back to sol, and
-            # in multi-session one session's pick leaked into another.
+            if permission_mode in CODEX_PERMISSION_MODES:
+                sdk.approval = permission_mode
+            if service_tier in {"default", "fast"}:
+                sdk.service_tier = (
+                    "fast" if service_tier == "fast" else None)
+            # Seed from the session's own bounded rollout tail, never config.toml.
+            # CodexHandle.connect then adopts thread/resume's authoritative fields;
+            # the rollout remains required for collaboration mode, which 0.144.1's
+            # resume response does not expose.
             if resume_id:
                 prev = await asyncio.to_thread(
                     codex_session_settings, resume_id,
                     self.cfg.history_source_max_bytes)
                 model = model or prev.get("model")
                 effort = effort or prev.get("effort")
+                approval = prev.get("approval_policy")
+                if (permission_mode is None
+                        and approval in CODEX_PERMISSION_MODES):
+                    sdk.approval = approval
+                if service_tier is None and "service_tier" in prev:
+                    tier = prev.get("service_tier")
+                    if tier is None or isinstance(tier, str):
+                        sdk.service_tier = tier
                 mode = prev.get("collaboration_mode")
                 if mode in CODEX_COLLABORATION_MODES:
                     sdk.collaboration_mode = mode
@@ -4723,6 +5259,8 @@ class WrapperMachine:
             ctx.sdk.turn_lifecycle_callback = (
                 lambda phase, turn_id: self._on_codex_turn_lifecycle(
                     ctx, phase, turn_id))
+            ctx.sdk.runtime_event_callback = (
+                lambda event: self._on_codex_runtime_event(ctx, event))
 
         try:
             await ctx.sdk.connect(resume_id=resume_id, cwd=target_cwd)
@@ -4758,15 +5296,17 @@ class WrapperMachine:
         key = resume_id or f"tmp-{uuid4().hex}"
         self.sessions[key] = ctx
         ctx.key = key
-        if resume_id and engine == "codex":
+        if resume_id:
             self._watch_session(resume_id)
-            await self._prime_codex_ownership(resume_id)
+            if engine == "codex":
+                await self._prime_codex_ownership(resume_id)
+            else:
+                await self._prime_claude_ownership(resume_id)
         if resume_id and engine != "codex":
             save_session_id(self.cfg.state_dir, target_cwd, resume_id)
         await self._load_history(ctx, resume_id)
         if bootstrap:
-            ctx.announced_perm = (ctx.sdk.approval if engine == "codex"
-                                  else "bypassPermissions")
+            ctx.announced_perm = _session_permission_mode(ctx)
             await self._emit(ctx, Perm(mode=ctx.announced_perm))
             if engine == "codex":
                 collaboration_mode = getattr(
@@ -4774,6 +5314,8 @@ class WrapperMachine:
                 ctx.announced_collaboration_mode = collaboration_mode
                 await self._emit(ctx, CollaborationMode(
                     mode=collaboration_mode))
+                await self._emit(ctx, Fast(
+                    on=_codex_fast_on(ctx.sdk.service_tier)))
         log.info("session spawned", resume=resume_id, cwd=target_cwd, key=key,
                  resident=len(self.sessions))
         return ctx
@@ -4821,6 +5363,9 @@ class WrapperMachine:
                 pass
             log.info("evicted idle session for btw", key=victim)
         sdk = CodexHandle(self.cfg, cwd=parent.cwd) if engine == "codex" else SdkHandle(self.cfg)
+        if engine != "codex":
+            sdk.permission_mode = getattr(
+                parent.sdk, "permission_mode", "bypassPermissions")
         # /btw is a quick side question — run the fork at LOW effort so the first
         # reply is snappy (the parent's own effort can be high/xhigh, which makes a
         # context-inheriting fork slow). Applied at connect (cc) / per-turn (codex).
@@ -4844,6 +5389,7 @@ class WrapperMachine:
                     ctx, message, turn_id))
         else:
             ctx.sdk.approval = parent.sdk.approval
+            ctx.sdk.approval_policy = parent.sdk.approval_policy
             ctx.sdk.approval_callback = (
                 lambda method, params: self._on_codex_approval(
                     ctx, method, params))
@@ -4855,6 +5401,8 @@ class WrapperMachine:
             ctx.sdk.turn_lifecycle_callback = (
                 lambda phase, turn_id: self._on_codex_turn_lifecycle(
                     ctx, phase, turn_id))
+            ctx.sdk.runtime_event_callback = (
+                lambda event: self._on_codex_runtime_event(ctx, event))
         try:
             await ctx.sdk.connect(resume_id=parent_id, cwd=parent.cwd, fork=True)
         except Exception as e:
@@ -4902,12 +5450,22 @@ class WrapperMachine:
                 if restored_files and not event.files:
                     event.files = restored_files
         async with ctx.emit_lock:
-            if mdl and mdl.startswith("claude-") and mdl != ctx.announced_model:
-                ctx.announced_model = mdl
-                m = Model(model=mdl)
+            authoritative_model = _session_model(ctx)
+            history_model = authoritative_model or (
+                mdl if mdl and mdl.startswith("claude-") else None)
+            if history_model and history_model != ctx.announced_model:
+                ctx.announced_model = history_model
+                m = Model(model=history_model)
                 m.seq = ctx.next_seq()
                 m.sid = ctx.session_id
                 ctx.buffer.append(m)
+            effort = _session_effort(ctx)
+            if effort and effort != ctx.announced_effort:
+                ctx.announced_effort = effort
+                e = Effort(effort=effort)
+                e.seq = ctx.next_seq()
+                e.sid = ctx.session_id
+                ctx.buffer.append(e)
             for ev in events:
                 ev.seq = ctx.next_seq()
                 ev.sid = ctx.session_id
@@ -5065,6 +5623,7 @@ class WrapperMachine:
         reader_task: Optional[asyncio.Task] = None
         temp_dir: Optional[str] = None
         notice_active = False
+        claude_turn_completed = False
 
         async def reader() -> None:
             cancelled = False
@@ -5139,6 +5698,21 @@ class WrapperMachine:
             elif isinstance(event, Error):
                 notice_active = False
 
+        async def reconnect_claude(reason: str) -> None:
+            """Reconnect without hiding transcript changes during the await."""
+            await ctx.sdk.force_reconnect(
+                resume_id=ctx.session_id, cwd=ctx.cwd, reason=reason,
+                preserve_model=not reason.startswith(
+                    "external transcript change"))
+            model = _session_model(ctx)
+            if model and model != ctx.announced_model:
+                ctx.announced_model = model
+                await self._emit(ctx, Model(model=model))
+            effort = _session_effort(ctx)
+            if effort and effort != ctx.announced_effort:
+                ctx.announced_effort = effort
+                await self._emit(ctx, Effort(effort=effort))
+
         try:
             # An EXTERNAL process (a native `claude`/`codex` in the user's terminal)
             # appended to this session's transcript since we resumed it, so our child's
@@ -5149,9 +5723,15 @@ class WrapperMachine:
                          sid=ctx.session_id)
                 if is_codex:
                     await self._refresh_codex_collaboration_mode(ctx)
-                await ctx.sdk.force_reconnect(resume_id=ctx.session_id, cwd=ctx.cwd,
-                                              reason="external transcript change")
-                ctx.needs_reload = False
+                    await ctx.sdk.force_reconnect(
+                        resume_id=ctx.session_id, cwd=ctx.cwd,
+                        reason="external transcript change")
+                    ctx.needs_reload = False
+                else:
+                    # Clear first so a watcher that observes a new external write
+                    # during reconnect can set it again without being overwritten.
+                    ctx.needs_reload = False
+                    await reconnect_claude("external transcript change")
             # apply a pending effort change: --effort is spawn-time, so respawn the
             # cc subprocess (resume preserves context) before issuing this turn. Only
             # fires when the level actually changed since the live client was spawned;
@@ -5159,14 +5739,7 @@ class WrapperMachine:
             if not is_codex and ctx.sdk.effort != ctx.sdk.applied_effort:
                 log.info("applying effort change via reconnect", sid=ctx.session_id,
                          effort=ctx.sdk.effort, was=ctx.sdk.applied_effort)
-                await ctx.sdk.force_reconnect(resume_id=ctx.session_id, cwd=ctx.cwd, reason="effort change")
-            # codex Fast-mode toggle changed ~/.codex/config.toml; respawn the
-            # app-server so it reloads the new service_tier (resume keeps context).
-            if is_codex and getattr(ctx.sdk, "tier_dirty", False):
-                log.info("applying codex service tier via reconnect", sid=ctx.session_id,
-                         service_tier=ctx.sdk.service_tier)
-                await ctx.sdk.force_reconnect(resume_id=ctx.session_id, cwd=ctx.cwd, reason="service tier change")
-                ctx.sdk.tier_dirty = False
+                await reconnect_claude("effort change")
             # Serialize the final launch window against interrupt().  An interrupt
             # may have arrived while one of the reconnects above was in flight; in
             # that case it targeted no live turn and we must not submit the prompt
@@ -5216,6 +5789,67 @@ class WrapperMachine:
                     )))
                     await self._set_idle_after_managed_turn(ctx)
                     return
+                if not is_codex and ctx.session_id:
+                    # A terminal can append after _handle_query's probe but before
+                    # this task reaches sdk.query(). Consume both process state and
+                    # transcript growth again at the final launch boundary.
+                    external = await self._prime_claude_ownership(ctx.session_id)
+                    if (ctx.interrupt_event.is_set()
+                            or ctx.state == "interrupting"):
+                        await self._emit(ctx, TurnEnd(result=TurnResult(
+                            subtype="error_during_execution",
+                            duration_ms=0,
+                            is_error=True,
+                        )))
+                        await self._set_idle_after_managed_turn(ctx)
+                        return
+                    if external:
+                        await self._emit(ctx, Error(
+                            code=ERR_BUSY,
+                            message=("该 Claude 会话刚被本机终端打开，本次发送已取消；"
+                                     "请退出终端或点击『接管』后重试"),
+                            msg_id=ctx.active_msg_id,
+                        ))
+                        await self._set_idle_after_managed_turn(ctx)
+                        return
+                    if ctx.needs_reload:
+                        log.info(
+                            "reloading Claude session after transcript change "
+                            "found at final preflight",
+                            sid=ctx.session_id,
+                        )
+                        ctx.needs_reload = False
+                        await reconnect_claude(
+                            "external transcript change at final preflight")
+                        if (ctx.interrupt_event.is_set()
+                                or ctx.state == "interrupting"):
+                            await self._emit(ctx, TurnEnd(result=TurnResult(
+                                subtype="error_during_execution",
+                                duration_ms=0,
+                                is_error=True,
+                            )))
+                            await self._set_idle_after_managed_turn(ctx)
+                            return
+                        external = await self._prime_claude_ownership(
+                            ctx.session_id)
+                        if (ctx.interrupt_event.is_set()
+                                or ctx.state == "interrupting"):
+                            await self._emit(ctx, TurnEnd(result=TurnResult(
+                                subtype="error_during_execution",
+                                duration_ms=0,
+                                is_error=True,
+                            )))
+                            await self._set_idle_after_managed_turn(ctx)
+                            return
+                        if external or ctx.needs_reload:
+                            await self._emit(ctx, Error(
+                                code=ERR_BUSY,
+                                message=("该 Claude 会话在重载期间又被本机终端更新，"
+                                         "本次发送已取消；请退出终端后重试"),
+                                msg_id=ctx.active_msg_id,
+                            ))
+                            await self._set_idle_after_managed_turn(ctx)
+                            return
                 if is_codex:
                     # codex: images -> private temp dir -> localImage items; files already
                     # referenced by path in the prompt text above.
@@ -5301,9 +5935,11 @@ class WrapperMachine:
                                "parent_tool_use_id": None}
 
                     ctx.sdk.next_turn_id = ctx.active_msg_id
+                    ctx.claude_write_active = True
                     await ctx.sdk.query(msg_stream())
                 else:
                     ctx.sdk.next_turn_id = ctx.active_msg_id
+                    ctx.claude_write_active = True
                     await ctx.sdk.query(prompt)
             # Codex sessions don't emit a Model event like cc's init SystemMessage,
             # so announce the configured codex model (gpt-*) once — else the header
@@ -5321,8 +5957,8 @@ class WrapperMachine:
                     ctx.announced_collaboration_mode = collaboration_mode
                     await self._emit(ctx, CollaborationMode(
                         mode=collaboration_mode))
-                # seed/refresh the Fast-mode chip from the live config each turn.
-                await self._emit(ctx, Fast(on=codex_fast_enabled()))
+                await self._emit(ctx, Fast(
+                    on=_codex_fast_on(ctx.sdk.service_tier)))
             reader_task = asyncio.create_task(reader())
             while True:
                 msg = await next_turn_message()
@@ -5363,7 +5999,14 @@ class WrapperMachine:
                 # Claude-branded models so a cc-switch proxy's raw upstream name
                 # (e.g. glm-5.2) never replaces the user's Claude alias in the chip.
                 mdl = extract_model(msg)
-                if mdl and mdl != ctx.announced_model and mdl.startswith("claude-"):
+                if (mdl and not getattr(ctx.sdk, "model", None)
+                        and mdl.startswith("claude-")):
+                    # get_context_usage owns the selected alias. Init/transcript
+                    # metadata can expose a gateway's Claude upstream model; use
+                    # it only as a fallback when the control-plane read failed.
+                    ctx.sdk.model = mdl
+                if (mdl and mdl == getattr(ctx.sdk, "model", None)
+                        and mdl != ctx.announced_model):
                     ctx.announced_model = mdl
                     await self._emit(ctx, Model(model=mdl))
 
@@ -5386,6 +6029,10 @@ class WrapperMachine:
                 # the UI before a delayed task/hook update from the same queue.
                 if reader_task is not None:
                     await reader_task
+                # Only an authoritative Result permits a clean re-baseline in
+                # finally. Query/send or reader failures remain ambiguous and
+                # their growth must be consumed as a reload on the next probe.
+                claude_turn_completed = True
 
             if not is_codex and ctx.session_id:
                 goal = await ctx.sdk.refresh_goal(ctx.session_id)
@@ -5440,9 +6087,11 @@ class WrapperMachine:
                 ctx.interrupt_deadline = None
                 ctx.interrupt_event.clear()
             # cc keeps flushing this turn's lines to the transcript for a moment after
-            # the result; the watcher uses this stamp to attribute those bytes to US
-            # instead of mistaking them for an external writer.
-            ctx.last_turn_end = time.time()
+            # the result. Re-baseline only after its authoritative Result arrived;
+            # preflight/query/reader failures must not hide an external append.
+            ctx.claude_write_active = False
+            if not is_codex and claude_turn_completed and ctx.session_id:
+                self._resync_watch(ctx.session_id)
             if temp_dir is not None:
                 try:
                     shutil.rmtree(temp_dir)

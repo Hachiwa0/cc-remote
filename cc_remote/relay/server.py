@@ -193,6 +193,12 @@ def _rate_limited(ip: str) -> bool:
     return _login_limiter.limited(ip)
 
 
+def _request_origin_allowed(req: Request, cfg: RelayConfig) -> bool:
+    """Reject browser cross-origin POSTs while retaining non-browser CLI use."""
+    origin = req.headers.get("origin", "").strip()
+    return not origin or origin == cfg.public_origin
+
+
 def _request_ip(req: Request) -> str:
     """Use Caddy's client address only when the direct peer is loopback.
 
@@ -288,6 +294,12 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
 
     @app.post("/api/login")
     async def login(req: Request) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse(
+                {"error": "origin_rejected"},
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
         ip = _request_ip(req)
         if _rate_limited(ip):
             return JSONResponse(
@@ -376,6 +388,12 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
 
     @app.post("/api/logout")
     async def logout(req: Request) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse(
+                {"error": "origin_rejected"},
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
         token = req.cookies.get(SESSION_COOKIE_NAME, "")
         claims = session_token_claims(token, cfg.session_secret)
         if claims is not None:

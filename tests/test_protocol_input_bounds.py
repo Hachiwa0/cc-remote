@@ -124,7 +124,7 @@ def test_known_dynamic_control_values_remain_supported():
     assert SetCollaborationMode(mode="plan").mode == "plan"
     assert SetCollaborationMode(mode="default").mode == "default"
     assert SetPerm(mode="on-request").mode == "on-request"
-    assert GetModels(engine="cc").engine == "cc"
+    assert GetModels(engine="cc", cwd="/tmp/project").cwd == "/tmp/project"
     assert ForkSessionWorktree(
         session_id="sid-1", request_id="request-1", name="feature",
     ).name == "feature"

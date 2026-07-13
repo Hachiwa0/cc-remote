@@ -158,14 +158,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v6:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v8:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
-> Any already-open v5 page also needs one **hard refresh** to load the new hashed
+> Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v6 relay and v6 wrapper so the old wrapper cannot occupy the
+> then start the v8 relay and v8 wrapper so the old wrapper cannot occupy the
 > relay's single wrapper slot.
 
 ### 3) Publish from staging during a maintenance stop
@@ -176,7 +176,7 @@ rsync -av --delete --exclude='.git' --exclude='.venv' \
   --exclude='web/node_modules' --exclude='.env' \
   ./ <vps-user>@<vps>:~/cc-remote-upload/
 
-# VPS: publish protocol-v6 Python + web/dist together while relay is stopped
+# VPS: publish protocol-v8 Python + web/dist together while relay is stopped
 ssh <vps-user>@<vps>
 sudo systemctl stop cc-remote-relay 2>/dev/null || true
 sudo mkdir -p /opt/cc-remote

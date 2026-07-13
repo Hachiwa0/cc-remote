@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import stat
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +33,23 @@ def test_codex_initialize_declares_experimental_api_for_collaboration_mode():
     }
 
 
+def test_codex_sessions_toml_loader_falls_back_on_python_310(monkeypatch):
+    fallback = object()
+    imports: list[str] = []
+
+    def fake_import(name: str):
+        imports.append(name)
+        if name == "tomllib":
+            raise ModuleNotFoundError("No module named 'tomllib'", name=name)
+        assert name == "tomli"
+        return fallback
+
+    monkeypatch.setattr(codex_sessions_module, "import_module", fake_import)
+
+    assert codex_sessions_module._load_tomllib() is fallback
+    assert imports == ["tomllib", "tomli"]
+
+
 @pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-5.6-luna"])
 def test_codex_model_id_is_exact_through_wrapper_and_turn_start(model):
     async def run():
@@ -45,19 +61,6 @@ def test_codex_model_id_is_exact_through_wrapper_and_turn_start(model):
         ctx.sdk = handle
         ctx.engine = "codex"
         machine.sessions[ctx.key] = ctx
-
-        async def keep_effort(_ctx, effort):
-            return effort
-
-        machine._apply_codex_effort = keep_effort
-        await machine._handle_set_model(SimpleNamespace(
-            sid=ctx.key, model=model))
-
-        assert handle.model == model
-        assert ctx.announced_model == model
-        assert isinstance(transport.sent[-1], Model)
-        assert transport.sent[-1].model == model
-
         requests = []
 
         async def request(method, params=None):
@@ -65,6 +68,18 @@ def test_codex_model_id_is_exact_through_wrapper_and_turn_start(model):
             return {"turn": {"id": "turn-model"}}
 
         handle._request = request
+        await machine._handle_set_model(SimpleNamespace(
+            sid=ctx.key, model=model))
+
+        assert handle.model == model
+        assert ctx.announced_model == model
+        model_event = next(event for event in transport.sent
+                           if isinstance(event, Model))
+        assert model_event.model == model
+        assert requests == [("thread/settings/update", {
+            "threadId": "codex-model", "model": model,
+        })]
+        requests.clear()
         await handle.query("which model")
         assert requests[-1][0] == "turn/start"
         assert requests[-1][1]["model"] == model
@@ -331,25 +346,360 @@ def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
     assert codex_handle_module._resolve_codex_bin() == "new"
 
 
-def test_codex_config_update_is_atomic_bounded_and_preserves_mode(
+def test_codex_config_defaults_use_only_top_level_toml_keys(
         monkeypatch, tmp_path):
     config = tmp_path / "config.toml"
-    config.write_text('model = "gpt-test"\n\n[provider]\nname = "local"\n')
-    config.chmod(0o640)
+    config.write_text(
+        'model = "gpt-top"\nmodel_reasoning_effort = "high"\n\n'
+        '[profiles.work]\nmodel = "gpt-nested"\n'
+        'model_reasoning_effort = "low"\nservice_tier = "fast"\n')
     monkeypatch.setattr(codex_sessions_module, "_CONFIG", str(config))
 
-    assert codex_sessions_module.set_codex_config_key("service_tier", "fast")
-    assert config.read_text() == (
-        'model = "gpt-test"\nservice_tier = "fast"\n\n'
-        '[provider]\nname = "local"\n'
-    )
-    assert stat.S_IMODE(config.stat().st_mode) == 0o640
-    assert not list(tmp_path.glob(".config.toml.cc-remote-*"))
+    assert codex_sessions_module.codex_model() == "gpt-top"
+    assert codex_sessions_module.codex_effort() == "high"
+    assert codex_sessions_module.codex_fast_enabled() is False
 
-    monkeypatch.setattr(codex_sessions_module, "_CONFIG_MAX_BYTES", 8)
-    before = config.read_text()
-    assert not codex_sessions_module.set_codex_config_key("service_tier", None)
-    assert config.read_text() == before
+
+def test_codex_thread_settings_update_uses_official_01441_shapes():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-settings"
+        handle.model = "gpt-before"
+        handle.effort = "high"
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            return {}
+
+        handle._request = request
+        await handle.set_permission_mode("on-request")
+        await handle.set_model("gpt-after")
+        await handle.set_effort("ultra")
+        await handle.set_collaboration_mode("plan")
+        await handle.set_service_tier("fast")
+        await handle.set_service_tier(None)
+
+        assert requests == [
+            ("thread/settings/update", {
+                "threadId": "thread-settings", "approvalPolicy": "on-request",
+            }),
+            ("thread/settings/update", {
+                "threadId": "thread-settings", "model": "gpt-after",
+            }),
+            ("thread/settings/update", {
+                "threadId": "thread-settings", "effort": "ultra",
+            }),
+            ("thread/settings/update", {
+                "threadId": "thread-settings",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-after",
+                        "developer_instructions": None,
+                        "reasoning_effort": "ultra",
+                    },
+                },
+            }),
+            ("thread/settings/update", {
+                "threadId": "thread-settings", "serviceTier": "fast",
+            }),
+            ("thread/settings/update", {
+                "threadId": "thread-settings", "serviceTier": None,
+            }),
+        ]
+        assert handle.approval == "on-request"
+        assert handle.model == "gpt-after"
+        assert handle.effort == "ultra"
+        assert handle.collaboration_mode == "plan"
+        assert handle.service_tier is None
+
+    asyncio.run(run())
+
+
+def test_codex_authoritative_thread_settings_restore_after_resume_or_notification():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.model = "stale-model"
+        handle.effort = "low"
+        handle.approval = "never"
+        handle.service_tier = None
+
+        handle._apply_thread_settings({
+            "model": "persisted-model",
+            "reasoningEffort": "xhigh",
+            "approvalPolicy": "on-request",
+            "serviceTier": "fast",
+        })
+        assert (handle.model, handle.effort, handle.approval,
+                handle.service_tier) == (
+            "persisted-model", "xhigh", "on-request", "fast")
+
+        handle.thread_id = "thread-settings"
+        await handle._dispatch({
+            "method": "thread/settings/updated",
+            "params": {
+                "threadId": "thread-settings",
+                "threadSettings": {
+                    "model": "notification-model",
+                    "effort": "ultra",
+                    "approvalPolicy": "untrusted",
+                    "serviceTier": None,
+                    "collaborationMode": {
+                        "mode": "plan",
+                        "settings": {"model": "notification-model"},
+                    },
+                },
+            },
+        })
+        assert (handle.model, handle.effort, handle.approval,
+                handle.service_tier, handle.collaboration_mode) == (
+            "notification-model", "ultra", "untrusted", None, "plan")
+
+    asyncio.run(run())
+
+
+def test_codex_granular_approval_survives_resume_and_turn_start():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "granular-thread"
+        granular = {"granular": {
+            "mcp_elicitations": True,
+            "rules": False,
+            "sandbox_approval": True,
+            "request_permissions": True,
+        }}
+        handle._apply_thread_settings({"approvalPolicy": granular})
+        assert handle.approval == "on-request"
+        assert handle.approval_policy == granular
+
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            return {"turn": {"id": "granular-turn"}}
+
+        handle._request = request
+        await handle.query("keep granular")
+        assert requests[-1][1]["approvalPolicy"] == granular
+
+    asyncio.run(run())
+
+
+def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
+        monkeypatch):
+    class FakeProcess:
+        pid = 424243
+        returncode = None
+        stdin = stdout = stderr = SimpleNamespace()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = 0
+
+    async def run():
+        process = FakeProcess()
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec",
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
+        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+
+        handle = CodexHandle(_Cfg())
+        calls = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            if method == "initialize":
+                return {"serverInfo": {"version": "0.144.1"}}
+            if method == "thread/resume":
+                return {
+                    "thread": {"id": "resume-thread"},
+                    "model": "persisted-model",
+                    "reasoningEffort": "ultra",
+                    "approvalPolicy": "on-request",
+                    "serviceTier": "fast",
+                }
+            raise AssertionError(method)
+
+        handle._read_loop = idle
+        handle._drain_stderr = idle
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+        await handle.connect(resume_id="resume-thread", cwd="/tmp")
+
+        assert calls[1] == ("thread/resume", {
+            "threadId": "resume-thread", "cwd": "/tmp",
+        })
+        assert (handle.model, handle.effort, handle.approval,
+                handle.service_tier) == (
+            "persisted-model", "ultra", "on-request", "fast")
+        await handle.disconnect()
+
+    asyncio.run(run())
+
+
+def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
+        monkeypatch):
+    class FakeProcess:
+        pid = 424244
+        returncode = None
+        stdin = stdout = stderr = SimpleNamespace()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = 0
+
+    async def run():
+        process = FakeProcess()
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec",
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
+        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+
+        handle = CodexHandle(_Cfg())
+        handle.model = "first-model"
+        handle.effort = "ultra"
+        handle.applied_effort = "ultra"
+        handle.approval = "on-request"
+        handle.collaboration_mode = "plan"
+        handle.service_tier = "fast"
+        calls = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            if method == "initialize":
+                return {"serverInfo": {"version": "0.144.1"}}
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "fresh-thread"},
+                    "model": "first-model",
+                    "reasoningEffort": "low",
+                    "approvalPolicy": "on-request",
+                    "serviceTier": "priority",
+                }
+            if method == "thread/settings/update":
+                await handle._dispatch({
+                    "method": "thread/settings/updated",
+                    "params": {
+                        "threadId": "fresh-thread",
+                        "threadSettings": {
+                            "model": "first-model",
+                            "effort": "ultra",
+                            "approvalPolicy": "on-request",
+                            "serviceTier": "priority",
+                            "collaborationMode": {
+                                "mode": "plan",
+                                "settings": {"model": "first-model"},
+                            },
+                        },
+                    },
+                })
+                return {}
+            raise AssertionError(method)
+
+        handle._read_loop = idle
+        handle._drain_stderr = idle
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+        await handle.connect(cwd="/tmp")
+
+        assert calls[1] == ("thread/start", {
+            "cwd": "/tmp",
+            "approvalPolicy": "on-request",
+            "serviceTier": "fast",
+            "model": "first-model",
+        })
+        assert calls[2] == ("thread/settings/update", {
+            "threadId": "fresh-thread",
+            "collaborationMode": {
+                "mode": "plan",
+                "settings": {
+                    "model": "first-model",
+                    "developer_instructions": None,
+                    "reasoning_effort": "ultra",
+                },
+            },
+            "effort": "ultra",
+        })
+        assert (handle.model, handle.effort, handle.approval,
+                handle.collaboration_mode, handle.service_tier) == (
+            "first-model", "ultra", "on-request", "plan", "priority")
+        await handle.disconnect()
+
+    asyncio.run(run())
+
+
+def test_codex_model_change_emits_app_server_adjusted_effort():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("codex-model", "codex-model")
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "codex-model"
+        handle.model = "gpt-before"
+        handle.effort = "ultra"
+        handle._reader = asyncio.create_task(asyncio.Event().wait())
+        ctx.sdk = handle
+        ctx.engine = "codex"
+        ctx.announced_effort = "ultra"
+        machine.sessions[ctx.key] = ctx
+
+        async def request(method, params=None):
+            assert (method, params) == ("thread/settings/update", {
+                "threadId": "codex-model", "model": "gpt-after",
+            })
+            await handle._dispatch({
+                "method": "thread/settings/updated",
+                "params": {
+                    "threadId": "codex-model",
+                    "threadSettings": {
+                        "model": "gpt-provider-fallback",
+                        "effort": "max",
+                        "approvalPolicy": "never",
+                        "serviceTier": None,
+                    },
+                },
+            })
+            return {}
+
+        handle._request = request
+        await machine._handle_set_model(SimpleNamespace(
+            sid="codex-model", model="gpt-after"))
+
+        assert handle.model == "gpt-provider-fallback"
+        assert handle.effort == "max"
+        assert [(event.type, getattr(event, "model", None),
+                 getattr(event, "effort", None))
+                for event in transport.sent] == [
+            ("model", "gpt-provider-fallback", None),
+            ("effort", None, "max"),
+        ]
+        handle._reader.cancel()
+        await asyncio.gather(handle._reader, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 async def _dispatch_request(handle: CodexHandle, method: str, params) -> dict:
@@ -1040,6 +1390,7 @@ class _ControlSdk:
         self.fail_perm = fail_perm
         self.fail_collaboration = fail_collaboration
         self.collaboration_mode = "default"
+        self.service_tier = None
         self.permission_calls: list[str] = []
         self.collaboration_calls: list[str] = []
         self.service_tier_calls: list[str | None] = []
@@ -1054,6 +1405,7 @@ class _ControlSdk:
 
     async def set_service_tier(self, tier):
         self.service_tier_calls.append(tier)
+        self.service_tier = tier
 
     async def set_collaboration_mode(self, mode):
         self.collaboration_calls.append(mode)
@@ -1188,43 +1540,81 @@ def test_external_codex_turn_refreshes_collaboration_mode_without_changing_appro
     asyncio.run(run())
 
 
-def test_fast_toggle_updates_every_resident_codex_handle(monkeypatch):
+def test_fast_toggle_updates_only_target_codex_thread():
     async def run():
         machine, transport = _mk_machine()
         one = _control_ctx("c1", "codex")
         two = _control_ctx("c2", "codex")
         claude = _control_ctx("cc", "claude")
         machine.sessions = {"c1": one, "c2": two, "cc": claude}
-        monkeypatch.setattr(machine_module, "set_codex_config_fast", lambda on: True)
-
         await machine._handle_set_service_tier(
             SimpleNamespace(sid="c1", service_tier="fast"))
 
         assert one.sdk.service_tier_calls == ["fast"]
-        assert two.sdk.service_tier_calls == ["fast"]
+        assert two.sdk.service_tier_calls == []
         assert claude.sdk.service_tier_calls == []
-        assert one.sdk.tier_dirty is True and two.sdk.tier_dirty is True
         fast = [message for message in transport.sent if message.type == "fast"]
-        assert {message.sid for message in fast} == {"c1", "c2"}
+        assert {message.sid for message in fast} == {"c1"}
         assert all(message.on is True for message in fast)
 
     asyncio.run(run())
 
 
-def test_failed_fast_config_write_does_not_mutate_handles(monkeypatch):
+def test_fast_toggle_uses_target_thread_state_and_can_clear_override():
     async def run():
         machine, transport = _mk_machine()
         ctx = _control_ctx("c1", "codex")
+        ctx.sdk.service_tier = "fast"
         machine.sessions = {"c1": ctx}
-        monkeypatch.setattr(machine_module, "set_codex_config_fast", lambda on: False)
 
         await machine._handle_set_service_tier(
-            SimpleNamespace(sid="c1", service_tier="fast"))
+            SimpleNamespace(sid="c1", service_tier="toggle"))
 
-        assert ctx.sdk.service_tier_calls == []
-        assert ctx.sdk.tier_dirty is False
-        assert transport.sent[-1].type == "error"
-        assert not [message for message in transport.sent if message.type == "fast"]
+        assert ctx.sdk.service_tier_calls == [None]
+        assert transport.sent[-1].type == "fast"
+        assert transport.sent[-1].on is False
+
+    asyncio.run(run())
+
+
+def test_fast_accepts_app_server_priority_normalization():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("c1", "c1")
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "c1"
+        handle._reader = asyncio.create_task(asyncio.Event().wait())
+        ctx.engine = "codex"
+        ctx.sdk = handle
+        machine.sessions = {"c1": ctx}
+
+        async def request(method, params=None):
+            assert (method, params) == ("thread/settings/update", {
+                "threadId": "c1", "serviceTier": "fast",
+            })
+            await handle._dispatch({
+                "method": "thread/settings/updated",
+                "params": {
+                    "threadId": "c1",
+                    "threadSettings": {
+                        "model": handle.model,
+                        "effort": handle.effort,
+                        "approvalPolicy": handle.approval,
+                        "serviceTier": "priority",
+                    },
+                },
+            })
+            return {}
+
+        handle._request = request
+        await machine._handle_set_service_tier(SimpleNamespace(
+            sid="c1", service_tier="fast"))
+
+        assert handle.service_tier == "priority"
+        assert transport.sent[-1].type == "fast"
+        assert transport.sent[-1].on is True
+        handle._reader.cancel()
+        await asyncio.gather(handle._reader, return_exceptions=True)
 
     asyncio.run(run())
 
@@ -1429,6 +1819,9 @@ def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
             self.disconnected = False
 
         async def connect(self, **_kwargs):
+            return None
+
+        async def activate_runtime_events(self):
             return None
 
         async def disconnect(self):

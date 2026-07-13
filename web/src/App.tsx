@@ -6,6 +6,7 @@ import { Icon, ClaudeMark } from "./icons";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { ReconnectBanner } from "./components/ReconnectBanner";
+import { NoticeStack } from "./components/NoticeStack";
 import { LoginForm } from "./components/LoginForm";
 import { SessionsSidebar } from "./components/SessionsSidebar";
 import { DirPicker } from "./components/DirPicker";
@@ -17,7 +18,7 @@ import { GoalPanel } from "./components/GoalPanel";
 import { StatusSheet } from "./components/StatusSheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { parseGoalCommand } from "./goal-command";
-import { defaultModelFor, defaultEffortFor, permsFor } from "./data";
+import { permsFor } from "./data";
 import { shouldAcceptSessionList } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
 import { collectWaitingQueries, selectDrainCandidates } from "./runtime-drain";
@@ -25,7 +26,11 @@ import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
 import { isTerminalWorktreeForkError, matchesSessionForkRequest,
   matchesWorktreeForkRequest, type PendingSessionFork,
   type PendingWorktreeFork } from "./session-worktree";
-import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest, type Snapshot, type QueryImg, type QueryFile, type SessionInfo, type CollaborationModeName } from "./protocol";
+import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
+  normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
+  type QueryFile, type SessionInfo, type CodexPermissionMode,
+  type CodexServiceTier, type CollaborationModeName,
+  type DiffTheme, type Engine } from "./protocol";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -37,9 +42,10 @@ const HISTORY_PAGE = 60;  // turns fetched per GetHistory (initial load + each "
 const isMobile = () => window.matchMedia("(max-width: 979px)").matches;
 
 export default function App() {
-  const [theme, setTheme] = useState<string>(() => localStorage.getItem(THEME_KEY) || "light");
-  const [engine, setEngine] = useState<"claude" | "codex">(
-    () => (localStorage.getItem(ENGINE_KEY) as "claude" | "codex") || "claude");
+  const [theme, setTheme] = useState<DiffTheme>(
+    () => normalizeDiffTheme(localStorage.getItem(THEME_KEY)));
+  const [engine, setEngine] = useState<Engine>(
+    () => normalizeEngine(localStorage.getItem(ENGINE_KEY)));
   const [authed, setAuthed] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -566,23 +572,24 @@ export default function App() {
     dispatch({ type: "query_sent", sid: focusedSid, prompt, msg_id, images, files, ts: Date.now() });
     return true;
   };
-  // Protocol v4 creates the session and starts its first query atomically. The
+  // One command creates the session and starts its first query atomically. The
   // wrapper targets the new temp-keyed ctx directly; no later focus event is used
   // to route or trigger this message.
   const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[],
-                            collaborationMode?: CollaborationModeName): boolean => {
+                            collaborationMode?: CollaborationModeName,
+                            permissionMode?: CodexPermissionMode,
+                            serviceTier?: CodexServiceTier): boolean => {
     if (!wsRef.current || !state.newChat) return false;
-    const { cwd } = state.newChat;
-    // Resolve what the new-chat page is actually showing: an unpicked model means the
-    // engine's first entry, and an unpicked effort means that model's HIGHEST level
-    // (product rule). Send both explicitly so the spawned session matches the UI —
-    // effort levels are per-model, so we can only pick the max once the model is known.
-    const model = state.newChat.model ?? defaultModelFor(engine, state.catalog, state.catalogDefault);
-    const effort = state.newChat.effort ?? defaultEffortFor(engine, model, state.catalog);
+    const { cwd, model, effort } = state.newChat;
+    // Null is meaningful: let the local CLI/app-server use its configured defaults.
+    // Only explicit user choices cross the wire; otherwise a stale fallback catalog
+    // could silently override the machine's real model or reasoning configuration.
     const msg_id = uuid();
     const queued = wsRef.current.sendNewSession(
       cwd, engine, model, effort, { prompt, msg_id, images, files },
-      engine === "codex" ? collaborationMode : undefined);
+      engine === "codex" ? collaborationMode : undefined,
+      engine === "codex" ? permissionMode : undefined,
+      engine === "codex" ? serviceTier : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       setCreateError(null);
@@ -592,33 +599,20 @@ export default function App() {
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
     wsRef.current?.sendSetModel(model);
-    dispatch({ type: "set_model", model });
-    // Effort levels are PER MODEL. Carrying the old level across a model switch can
-    // send one the new model doesn't support (sol's "ultra" to luna, which stops at
-    // "max"), and codex only rejects it deep inside the model API. Reset to the new
-    // model's highest level — "default to the max thinking the model allows".
-    const effort = defaultEffortFor(engine, model, state.catalog);
-    if (effort !== rt.effort) {
-      wsRef.current?.sendSetEffort(effort);
-      dispatch({ type: "set_effort", effort });
-    }
   };
   const setEffort = (effort: string) => {
     wsRef.current?.sendSetEffort(effort);
-    dispatch({ type: "set_effort", effort });
   };
-  // codex Fast mode (service tier). No chip/reducer state — the Composer tracks
-  // the on/off locally; here we just forward it to the wrapper.
+  // Codex Fast mode is persisted by app-server per thread. The runtime's Fast
+  // event owns the chip state; here we only forward the requested transition.
   const setServiceTier = (tier: string) => {
     wsRef.current?.sendSetServiceTier(tier);
   };
   const setPerm = (perm: string) => {
     wsRef.current?.sendSetPerm(perm);
-    dispatch({ type: "set_perm", perm });
   };
   const setCollaborationMode = (mode: CollaborationModeName) => {
     wsRef.current?.sendSetCollaborationMode(mode);
-    dispatch({ type: "set_collaboration_mode", mode });
   };
   const setGoalUi = (patch: Partial<{ revealed: boolean; open: boolean }>) => {
     if (!focusedSid) return;
@@ -797,22 +791,16 @@ export default function App() {
         </header>
 
         <ReconnectBanner banner={state.banner} replaying={rt.replaying} truncated={rt.truncated} />
+        <NoticeStack notices={rt.notices}
+          onDismiss={(noticeId) => {
+            if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
+          }} />
 
         {state.newChat ? (
           <NewChatView cwd={state.newChat.cwd}
             createError={createError}
             engine={engine}
-            catalog={state.catalog}
-            catalogDefault={state.catalogDefault}
-            model={state.newChat.model} effort={state.newChat.effort}
             onPickCwd={() => setDirPickerOpen(true)}
-            onPickModel={(m) => {
-              dispatch({ type: "set_new_chat_model", model: m });
-              // effort levels are per-model — drop the pick so it re-defaults to the
-              // new model's highest level (and can never be an unsupported one).
-              dispatch({ type: "set_new_chat_effort", effort: null });
-            }}
-            onPickEffort={(ef) => dispatch({ type: "set_new_chat_effort", effort: ef })}
             onSend={sendFirstMessage} />
         ) : (
           <>
@@ -889,7 +877,10 @@ export default function App() {
           return <BtwPanel sid={state.btwSid ?? undefined} rt={state.btwSid ? state.runtimes[state.btwSid] : undefined}
             engine={state.btwEngine} opening={btwOpening && !state.btwSid}
             active="btw" hasDiff={!!state.artifact} onTab={switchRight}
-            onSend={sendBtw} onClose={closeBtw} />;
+            onSend={sendBtw} onClose={closeBtw}
+            onDismissNotice={(noticeId) => {
+              if (state.btwSid) dispatch({ type: "dismiss_notice", sid: state.btwSid, noticeId });
+            }} />;
         if (view === "diff" && state.artifact)
           return <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!state.btwSid}
             onTab={switchRight} onClose={() => dispatch({ type: "clear_artifact" })} />;

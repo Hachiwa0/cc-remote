@@ -66,7 +66,10 @@ def test_interrupt_during_preflight_reconnect_never_submits_query():
             self.queries = 0
             self.interrupts = 0
 
-        async def force_reconnect(self, resume_id, cwd, reason=""):
+        async def force_reconnect(
+            self, resume_id, cwd, reason="", preserve_model=True,
+        ):
+            assert preserve_model is True
             self.reconnect_started.set()
             await self.release_reconnect.wait()
             self.applied_effort = self.effort
@@ -919,16 +922,34 @@ def test_codex_history_cursor_remains_valid_across_reparse(monkeypatch, tmp_path
     asyncio.run(run())
 
 
-def test_codex_session_settings_rejects_an_oversized_source(monkeypatch, tmp_path):
+def test_codex_session_settings_reads_bounded_tail_of_oversized_source(
+        monkeypatch, tmp_path):
     rollout = tmp_path / "rollout-session-1.jsonl"
-    rollout.write_text(json.dumps({
+    old = json.dumps({
         "type": "turn_context",
-        "payload": {"model": "must-not-be-read", "effort": "high"},
-    }) + "\n")
+        "payload": {"model": "gpt-old", "effort": "low"},
+    }) + "\n"
+    latest = json.dumps({
+        "type": "turn_context",
+        "payload": {
+            "model": "gpt-latest",
+            "effort": "ultra",
+            "approval_policy": "on-request",
+            "service_tier": "fast",
+            "collaboration_mode": {"mode": "plan"},
+        },
+    }) + "\n"
+    rollout.write_text(old + ("x" * 4096) + "\n" + latest)
     monkeypatch.setattr(
         codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
 
-    assert codex_session_settings("session-1", max_bytes=4) == {}
+    assert codex_session_settings("session-1", max_bytes=len(latest)) == {
+        "model": "gpt-latest",
+        "effort": "ultra",
+        "approval_policy": "on-request",
+        "service_tier": "fast",
+        "collaboration_mode": "plan",
+    }
 
 
 def test_codex_session_settings_restores_last_valid_collaboration_mode(

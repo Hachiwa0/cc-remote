@@ -3,8 +3,8 @@
 Isolates the one version-sensitive call site (`include_partial_messages` on
 ClaudeAgentOptions) so an SDK upgrade touches only this file. The wrapper does
 NOT set ANTHROPIC_BASE_URL or setting_sources — it wants ~/.claude/settings.json
-loaded so cc inherits the model link (127.0.0.1:19191 -> z.AI GLM), the model
-id, and bypassPermissions.
+loaded so cc inherits the user's model link and model id. Permission mode is
+explicit live session state and survives reconnects.
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from cc_remote.wrapper.claude_goal import (
 log = logger("cc_remote.wrapper.sdk")
 
 REQUIRED_SDK = (0, 2)  # 0.2.x; the interrupt/drain contract is version-sensitive
+CLAUDE_DEFAULT_EFFORT = "max"
 
 
 class _MessagePumpFailure:
@@ -67,8 +68,21 @@ class SdkHandle:
         # was spawned with — they differ after set_effort until the next reconnect.
         # Default to "max" so new sessions get the strongest reasoning out of the
         # box (matches the client's default chip); the user can lower it per session.
-        self.effort: str | None = "max"
+        self.effort: str | None = CLAUDE_DEFAULT_EFFORT
         self.applied_effort: str | None = None
+        # Authoritative selected Claude alias for this session.  The transcript
+        # may expose a proxy's upstream model (for example glm-5.2), so recover
+        # this from the SDK control plane and preserve it across reconnects.
+        self.model: str | None = None
+        # Desired and live Claude permission mode. Runtime changes update this
+        # only after the CLI accepts them; every later reconnect passes the same
+        # value back through ClaudeAgentOptions instead of silently reverting.
+        self.permission_mode = "bypassPermissions"
+        # A SetPerm can arrive while a turn task is respawning Claude for effort
+        # or stale history. Serialize those two control paths so a successful
+        # runtime change cannot land on the old child after the new options were
+        # already captured.
+        self._permission_reconnect_lock = asyncio.Lock()
         self.permission_callback: Callable[[str, dict[str, Any], Any], Awaitable[Any]] | None = None
         # Claude has no goal RPC.  This cache is reconstructed from native
         # goal_status transcript attachments on resume and updated by the live
@@ -126,14 +140,15 @@ class SdkHandle:
             )
 
     def _options(self, resume_id: str | None, cwd: str | None = None,
-                 fork: bool = False) -> ClaudeAgentOptions:
+                 fork: bool = False,
+                 model_override: str | None = None) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             include_partial_messages=True,        # StreamEvent with content_block_delta
             # Emit hook lifecycle metadata into the SDK stream. StreamTranslator
             # forwards only the hook name/status/exit/duration; raw callback data,
             # output, commands, and environment values never cross the wire.
             include_hook_events=True,
-            permission_mode="bypassPermissions",  # unattended; matches settings.json
+            permission_mode=self.permission_mode,
             can_use_tool=self._can_use_tool,
             cwd=cwd or self.cfg.cc_cwd,           # dynamic: must match the resumed session's cwd
             cli_path=_explicit_cli_path(self.cfg.claude_bin),
@@ -142,6 +157,7 @@ class SdkHandle:
             # a FRESH session id, leaving the original transcript untouched — used for
             # ephemeral /btw side-forks.
             fork_session=fork,
+            model=model_override,
             effort=self.effort,                   # reasoning strength; None -> CLI default (high)
             # The SDK otherwise copies the wrapper's complete environment into
             # Claude/tool subprocesses. Never expose relay login/bearer secrets.
@@ -177,10 +193,31 @@ class SdkHandle:
         log.warning("cc stderr: ***", chars=len(line))
 
     async def connect(self, resume_id: str | None = None, cwd: str | None = None,
-                      fork: bool = False) -> None:
-        opts = self._options(resume_id, cwd, fork=fork)
+                      fork: bool = False,
+                      model_override: str | None = None) -> None:
+        opts = self._options(
+            resume_id, cwd, fork=fork, model_override=model_override)
         self.client = ClaudeSDKClient(options=opts)
         await self.client.connect()
+        try:
+            # claude-agent-sdk 0.2.110's public helper hardcodes a 60s timeout.
+            # This project pins and preflights that SDK, so use the same control
+            # request with a bounded timeout; its implementation also cleans both
+            # pending maps on timeout instead of leaking a cancelled request.
+            query = getattr(self.client, "_query", None)
+            send_control = getattr(query, "_send_control_request", None)
+            if not callable(send_control):
+                raise RuntimeError("bounded model control request unavailable")
+            usage = await send_control(
+                {"subtype": "get_context_usage"}, timeout=5.0)
+            model = usage.get("model") if isinstance(usage, dict) else None
+            if isinstance(model, str) and 0 < len(model.strip()) <= 256:
+                self.model = model.strip()
+        except Exception as exc:
+            # Model readout is useful control state, but failure to obtain it
+            # must not make an otherwise healthy Claude session unusable.
+            log.warning("Claude model state unavailable",
+                        error=type(exc).__name__)
         self.goal_session_id = None if fork else resume_id
         self.goal = None
         self._goal_message_tokens.clear()
@@ -189,7 +226,8 @@ class SdkHandle:
         self.applied_effort = self.effort  # the live subprocess now reflects this effort
         self._start_message_pump()
         log.info("sdk connected", resume=bool(resume_id), fork=fork, cwd=opts.cwd,
-                 effort=self.effort, sdk_version=SDK_VERSION)
+                 effort=self.effort, permission_mode=self.permission_mode,
+                 sdk_version=SDK_VERSION)
 
     async def query(self, prompt) -> None:
         """Send a request. `prompt` is a string, or an async iterable of user-
@@ -227,12 +265,15 @@ class SdkHandle:
         no reconnect)."""
         assert self.client is not None
         await self.client.set_model(model)
+        self.model = model
         log.info("model set", model=model)
 
     async def set_permission_mode(self, mode: str) -> None:
         """Switch the permission mode for the live cc subprocess (runtime, no reconnect)."""
-        assert self.client is not None
-        await self.client.set_permission_mode(mode)
+        async with self._permission_reconnect_lock:
+            assert self.client is not None
+            await self.client.set_permission_mode(mode)
+            self.permission_mode = mode
         log.info("permission mode set", mode=mode)
 
     async def get_context_usage(self) -> dict:
@@ -474,12 +515,21 @@ class SdkHandle:
                 self.client = None
 
     async def force_reconnect(self, resume_id: str | None, cwd: str | None = None,
-                              reason: str = "drain timeout") -> None:
+                              reason: str = "drain timeout",
+                              preserve_model: bool = True) -> None:
         """Tear down and reconnect with resume. Used after a drain timeout, and to
         apply a spawn-time option change (e.g. effort) to a live session."""
-        log.warning("force-reconnecting SDK client", reason=reason)
-        try:
-            await self.disconnect()
-        except Exception as e:
-            log.warning("disconnect during force-reconnect failed", error=str(e))
-        await self.connect(resume_id=resume_id, cwd=cwd)
+        async with self._permission_reconnect_lock:
+            log.warning("force-reconnecting SDK client", reason=reason)
+            try:
+                await self.disconnect()
+            except Exception as e:
+                log.warning("disconnect during force-reconnect failed", error=str(e))
+            model_override = self.model if preserve_model else None
+            if not preserve_model:
+                # An external terminal may have changed this session's model.
+                # Let resume recover it instead of forcing our stale cache back.
+                self.model = None
+            await self.connect(
+                resume_id=resume_id, cwd=cwd,
+                model_override=model_override)
