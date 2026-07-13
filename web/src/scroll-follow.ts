@@ -115,12 +115,16 @@ export class ScrollFollowController {
   observeScroll(metrics: ScrollMetrics): ScrollFollowSnapshot {
     const movingTowardHistory =
       metrics.scrollTop < this.lastScrollTop - SCROLL_DIRECTION_EPSILON_PX;
+    const movingTowardLatest =
+      metrics.scrollTop > this.lastScrollTop + SCROLL_DIRECTION_EPSILON_PX;
     const measurement = measureBottom(metrics);
 
     let followOutput = this.current.followOutput;
-    if (movingTowardHistory) {
+    // Layout shrinkage can clamp scrollTop downward while the viewport remains
+    // at the real bottom. That is geometry, not an upward reading gesture.
+    if (movingTowardHistory && !measurement.atBottom) {
       followOutput = false;
-    } else if (!followOutput && measurement.atBottom) {
+    } else if (!followOutput && movingTowardLatest && measurement.atBottom) {
       followOutput = true;
     }
 

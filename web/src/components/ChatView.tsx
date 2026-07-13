@@ -267,17 +267,18 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   }
 
   return (
-    <div className="thread" ref={scrollRef} onScroll={onScroll} onWheel={onWheel}
-      onTouchStart={onTouchStart} onTouchMove={onTouchMove}
-      onTouchEnd={clearTouch} onTouchCancel={clearTouch}>
-      <div className="thread-in" ref={threadInRef}>
-        {hasMore && (
-          <div className="load-more-wrap">
-            <button className="load-more-btn" onClick={doLoadMore}>加载更早的历史</button>
-          </div>
-        )}
-        {turns.map((t, ti) => (
-          <div className="turn" key={t.id}>
+    <div className="thread-shell">
+      <div className="thread" ref={scrollRef} onScroll={onScroll} onWheel={onWheel}
+        onTouchStart={onTouchStart} onTouchMove={onTouchMove}
+        onTouchEnd={clearTouch} onTouchCancel={clearTouch}>
+        <div className="thread-in" ref={threadInRef}>
+          {hasMore && (
+            <div className="load-more-wrap">
+              <button className="load-more-btn" onClick={doLoadMore}>加载更早的历史</button>
+            </div>
+          )}
+          {turns.map((t, ti) => (
+            <div className="turn" key={t.id}>
             {(t.prompt || (t.images && t.images.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
                 {t.prompt && <div className="ubub">{t.prompt}</div>}
@@ -337,11 +338,12 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
             ) : (!t.done && t.prompt) ? (
               <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">{t.progress ?? "思考中"}</span></div>
             ) : null}
-            {fileChips(t)}
-            {t.interrupted && <div className="note interrupted">— 已打断 —</div>}
-            {t.error && <div className="note interrupted">{t.error}</div>}
-          </div>
-        ))}
+              {fileChips(t)}
+              {t.interrupted && <div className="note interrupted">— 已打断 —</div>}
+              {t.error && <div className="note interrupted">{t.error}</div>}
+            </div>
+          ))}
+        </div>
       </div>
       {(!scrollState.followOutput || !scrollState.nearBottom) && (
         <div className="scroll-bottom-wrap">

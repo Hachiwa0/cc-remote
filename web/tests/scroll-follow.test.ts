@@ -69,6 +69,64 @@ assert.deepEqual(controller.observeScroll({
   clientHeight: 600,
 }), { followOutput: false, nearBottom: true });
 
+// Hiding an in-flow bottom control can shrink scrollHeight and make the
+// browser clamp scrollTop by the same amount. The viewport is still at the
+// real bottom, so that geometry-only movement must not be treated as an
+// upward user scroll and restart the show/hide feedback loop.
+const layoutClampController = new ScrollFollowController();
+layoutClampController.pause({
+  scrollHeight: 1_040,
+  scrollTop: 400,
+  clientHeight: 600,
+});
+assert.deepEqual(layoutClampController.observeScroll({
+  scrollHeight: 1_040,
+  scrollTop: 440,
+  clientHeight: 600,
+}), { followOutput: true, nearBottom: true });
+assert.deepEqual(layoutClampController.observeScroll({
+  scrollHeight: 1_000,
+  scrollTop: 400,
+  clientHeight: 600,
+}), { followOutput: true, nearBottom: true });
+
+// A process card can collapse while the user is reading history. Reaching the
+// bottom because the layout shrank is not a deliberate downward gesture, no
+// matter whether ResizeObserver or the browser's scroll event arrives first.
+const shrinkLayoutFirst = new ScrollFollowController();
+shrinkLayoutFirst.pause({
+  scrollHeight: 1_200,
+  scrollTop: 500,
+  clientHeight: 600,
+});
+assert.deepEqual(shrinkLayoutFirst.observeLayout({
+  scrollHeight: 1_000,
+  scrollTop: 400,
+  clientHeight: 600,
+}), { followOutput: false, nearBottom: true });
+assert.deepEqual(shrinkLayoutFirst.observeScroll({
+  scrollHeight: 1_000,
+  scrollTop: 400,
+  clientHeight: 600,
+}), { followOutput: false, nearBottom: true });
+
+const shrinkScrollFirst = new ScrollFollowController();
+shrinkScrollFirst.pause({
+  scrollHeight: 1_200,
+  scrollTop: 500,
+  clientHeight: 600,
+});
+assert.deepEqual(shrinkScrollFirst.observeScroll({
+  scrollHeight: 1_000,
+  scrollTop: 400,
+  clientHeight: 600,
+}), { followOutput: false, nearBottom: true });
+assert.deepEqual(shrinkScrollFirst.observeLayout({
+  scrollHeight: 1_000,
+  scrollTop: 400,
+  clientHeight: 600,
+}), { followOutput: false, nearBottom: true });
+
 // History anchoring writes scrollTop programmatically and must preserve the
 // paused intent. A session reset intentionally restores following.
 assert.deepEqual(controller.recordProgrammaticScroll({
@@ -123,5 +181,19 @@ const bannerRule = css.match(/\.banner\{[^}]+\}/)?.[0] ?? "";
 assert.match(bannerRule, /position:relative/);
 assert.match(bannerRule, /color:var\(--text\)/);
 assert.match(bannerRule, /safe-area-inset-left/);
+
+// The bottom control must overlay the scroll viewport instead of participating
+// in its content flow. Conditional visibility may then never change
+// scrollHeight and feed another synthetic scroll back into the controller.
+const chatViewSource = readFileSync(
+  new URL("../../../../src/components/ChatView.tsx", import.meta.url),
+  "utf8",
+);
+assert.match(chatViewSource, /className="thread-shell"/);
+const threadShellRule = css.match(/\.thread-shell\{[^}]+\}/)?.[0] ?? "";
+assert.match(threadShellRule, /position:relative/);
+const scrollBottomRule = css.match(/\.scroll-bottom-wrap\{[^}]+\}/)?.[0] ?? "";
+assert.match(scrollBottomRule, /position:absolute/);
+assert.doesNotMatch(scrollBottomRule, /position:sticky/);
 
 console.log("scroll follow tests passed");
