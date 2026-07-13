@@ -67,6 +67,7 @@ class SessionContext:
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
     announced_perm: Optional[str] = None
+    announced_collaboration_mode: Optional[str] = None
     # Goal state is restored silently.  The remote UI only reveals it after the
     # user explicitly invokes /goal (get/set); this avoids a permanent empty
     # panel above the composer merely because a Claude/Codex session was opened.

@@ -309,6 +309,10 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_service_tier", service_tier, ts: nowTs(), ...this.sidObj() });
   }
 
+  sendSetCollaborationMode(mode: "default" | "plan"): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_collaboration_mode", mode, ts: nowTs(), ...this.sidObj() });
+  }
+
   sendSetPerm(mode: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }
@@ -383,7 +387,8 @@ export class RelayWs {
 
   sendNewSession(cwd?: string | null, engine?: "claude" | "codex",
                  model?: string | null, effort?: string | null,
-                 initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] }): boolean {
+                 initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] },
+                 collaborationMode?: "default" | "plan"): boolean {
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
     this.newSessionEngine = engine ?? "claude";
@@ -394,6 +399,9 @@ export class RelayWs {
     if (engine && engine !== "claude") obj.engine = engine;
     if (model) obj.model = model;
     if (effort) obj.effort = effort;
+    if (engine === "codex" && collaborationMode) {
+      obj.collaboration_mode = collaborationMode;
+    }
     if (initial) {
       obj.prompt = initial.prompt;
       obj.msg_id = initial.msg_id;

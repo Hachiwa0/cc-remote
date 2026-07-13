@@ -10,7 +10,8 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from pydantic import ValidationError
 
 from cc_remote.protocol import (
-    Error, GoalState, Model, NewSession, StateEvent, ThreadGoal,
+    CollaborationMode, Error, GoalState, Model, NewSession, StateEvent,
+    ThreadGoal,
 )
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
@@ -24,6 +25,13 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 class _Cfg:
     cc_cwd = "/tmp"
     tool_result_max = 8000
+
+
+def test_codex_initialize_declares_experimental_api_for_collaboration_mode():
+    assert codex_handle_module._initialize_params() == {
+        "clientInfo": {"name": "cc-remote", "version": "0.1.0"},
+        "capabilities": {"experimentalApi": True},
+    }
 
 
 @pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-5.6-luna"])
@@ -67,6 +75,56 @@ def test_codex_model_id_is_exact_through_wrapper_and_turn_start(model):
             "params": {"turn": {"id": "turn-model", "status": "completed"}},
         })
         assert handle.turn_active is False
+
+    asyncio.run(run())
+
+
+def test_codex_collaboration_mode_is_dynamic_and_separate_from_approval():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "codex-plan"
+        handle.model = "gpt-plan"
+        handle.effort = "xhigh"
+        handle.approval = "on-request"
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            return {"turn": {"id": f"turn-{len(requests)}"}}
+
+        handle._request = request
+        await handle.set_collaboration_mode("plan")
+        await handle.query("make a plan")
+        plan = requests[-1][1]
+        assert plan["approvalPolicy"] == "on-request"
+        assert plan["collaborationMode"] == {
+            "mode": "plan",
+            "settings": {
+                "model": "gpt-plan",
+                "reasoning_effort": "xhigh",
+                "developer_instructions": None,
+            },
+        }
+
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "completed"}},
+        })
+        handle.model = "gpt-next"
+        handle.effort = "high"
+        await handle.set_collaboration_mode("default")
+        await handle.query("implement")
+        normal = requests[-1][1]
+        assert normal["approvalPolicy"] == "on-request"
+        assert normal["collaborationMode"] == {
+            "mode": "default",
+            "settings": {
+                "model": "gpt-next",
+                "reasoning_effort": "high",
+                "developer_instructions": None,
+            },
+        }
 
     asyncio.run(run())
 
@@ -976,10 +1034,14 @@ def test_machine_codex_mcp_elicitation_form_returns_typed_content():
 
 
 class _ControlSdk:
-    def __init__(self, approval="never", fail_perm=False):
+    def __init__(self, approval="never", fail_perm=False,
+                 fail_collaboration=False):
         self.approval = approval
         self.fail_perm = fail_perm
+        self.fail_collaboration = fail_collaboration
+        self.collaboration_mode = "default"
         self.permission_calls: list[str] = []
+        self.collaboration_calls: list[str] = []
         self.service_tier_calls: list[str | None] = []
         self.tier_dirty = False
         self.disconnected = False
@@ -992,6 +1054,12 @@ class _ControlSdk:
 
     async def set_service_tier(self, tier):
         self.service_tier_calls.append(tier)
+
+    async def set_collaboration_mode(self, mode):
+        self.collaboration_calls.append(mode)
+        if self.fail_collaboration:
+            raise RuntimeError("apply failed")
+        self.collaboration_mode = mode
 
     async def disconnect(self):
         self.disconnected = True
@@ -1039,6 +1107,83 @@ def test_permission_modes_are_engine_strict_and_broadcast_after_apply():
             SimpleNamespace(sid="failing", mode="on-request"))
         assert failing.announced_perm is None
         assert transport.sent[-1].type == "error"
+
+    asyncio.run(run())
+
+
+def test_collaboration_modes_are_codex_only_and_broadcast_after_apply():
+    async def run():
+        machine, transport = _mk_machine()
+        codex = _control_ctx("codex", "codex")
+        claude = _control_ctx("claude", "claude")
+        machine.sessions = {"codex": codex, "claude": claude}
+
+        await machine._handle_set_collaboration_mode(
+            SimpleNamespace(sid="codex", mode="plan"))
+        assert codex.sdk.collaboration_calls == ["plan"]
+        assert codex.sdk.permission_calls == []
+        assert codex.sdk.approval == "never"
+        assert codex.announced_collaboration_mode == "plan"
+        assert isinstance(transport.sent[-1], CollaborationMode)
+        assert transport.sent[-1].mode == "plan"
+
+        await machine._handle_set_collaboration_mode(
+            SimpleNamespace(sid="claude", mode="plan"))
+        assert claude.sdk.collaboration_calls == []
+        assert transport.sent[-1].type == "error"
+
+        failing = _control_ctx(
+            "failing", "codex", _ControlSdk(fail_collaboration=True))
+        machine.sessions["failing"] = failing
+        await machine._handle_set_collaboration_mode(
+            SimpleNamespace(sid="failing", mode="plan"))
+        assert failing.announced_collaboration_mode is None
+        assert transport.sent[-1].type == "error"
+
+    asyncio.run(run())
+
+
+def test_client_hello_always_seeds_resident_codex_collaboration_mode():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _control_ctx("codex", "codex")
+        ctx.sdk.collaboration_mode = "plan"
+        machine.sessions = {"codex": ctx}
+
+        await machine._handle_client_hello(SimpleNamespace(
+            cursors={"codex": 0}, generations={"codex": machine.instance_id},
+            last_seq=None, client_id="client-1", route_id="route-1",
+        ))
+
+        modes = [message for message in transport.sent
+                 if message.type == "collaboration_mode"]
+        assert len(modes) == 1
+        assert modes[0].mode == "plan"
+        assert modes[0].sid == "codex"
+        assert modes[0].to == "client-1"
+        assert modes[0].route_id == "route-1"
+
+    asyncio.run(run())
+
+
+def test_external_codex_turn_refreshes_collaboration_mode_without_changing_approval(
+        monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _control_ctx("codex", "codex")
+        ctx.sdk.approval = "on-request"
+        machine.sessions = {"codex": ctx}
+        monkeypatch.setattr(
+            machine_module, "codex_session_settings",
+            lambda *_args, **_kwargs: {"collaboration_mode": "plan"})
+
+        await machine._refresh_codex_collaboration_mode(ctx)
+
+        assert ctx.sdk.collaboration_mode == "plan"
+        assert ctx.sdk.approval == "on-request"
+        assert ctx.announced_collaboration_mode == "plan"
+        assert isinstance(transport.sent[-1], CollaborationMode)
+        assert transport.sent[-1].mode == "plan"
 
     asyncio.run(run())
 

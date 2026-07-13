@@ -25,7 +25,7 @@ import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
 import { isTerminalWorktreeForkError, matchesSessionForkRequest,
   matchesWorktreeForkRequest, type PendingSessionFork,
   type PendingWorktreeFork } from "./session-worktree";
-import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest, type Snapshot, type QueryImg, type QueryFile, type SessionInfo } from "./protocol";
+import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest, type Snapshot, type QueryImg, type QueryFile, type SessionInfo, type CollaborationModeName } from "./protocol";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -507,20 +507,26 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [authed]);
 
-  // Shift+Tab => cycle permission mode for the focused session
+  // Shift+Tab follows each engine's real mode control: Claude cycles permission
+  // modes; Codex toggles collaboration mode without touching approvalPolicy.
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Tab" && e.shiftKey) {
         e.preventDefault();
-        const modes = permsFor(engine).map((p) => p.id);
+        if (focusedEngine === "codex") {
+          setCollaborationMode(
+            rt.collaborationMode === "plan" ? "default" : "plan");
+          return;
+        }
+        const modes = permsFor(focusedEngine).map((p) => p.id);
         const current = modes.indexOf(rt.perm);
         setPerm(modes[current < 0 ? 0 : (current + 1) % modes.length]);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [authed, focusedSid, rt.perm, engine]);
+  }, [authed, focusedSid, rt.perm, rt.collaborationMode, focusedEngine]);
 
   // ---- /btw effects ----
   // These MUST stay ABOVE the `!authed` early return below. Hooks have to run
@@ -563,7 +569,8 @@ export default function App() {
   // Protocol v4 creates the session and starts its first query atomically. The
   // wrapper targets the new temp-keyed ctx directly; no later focus event is used
   // to route or trigger this message.
-  const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[]): boolean => {
+  const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[],
+                            collaborationMode?: CollaborationModeName): boolean => {
     if (!wsRef.current || !state.newChat) return false;
     const { cwd } = state.newChat;
     // Resolve what the new-chat page is actually showing: an unpicked model means the
@@ -574,7 +581,8 @@ export default function App() {
     const effort = state.newChat.effort ?? defaultEffortFor(engine, model, state.catalog);
     const msg_id = uuid();
     const queued = wsRef.current.sendNewSession(
-      cwd, engine, model, effort, { prompt, msg_id, images, files });
+      cwd, engine, model, effort, { prompt, msg_id, images, files },
+      engine === "codex" ? collaborationMode : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       setCreateError(null);
@@ -607,6 +615,10 @@ export default function App() {
   const setPerm = (perm: string) => {
     wsRef.current?.sendSetPerm(perm);
     dispatch({ type: "set_perm", perm });
+  };
+  const setCollaborationMode = (mode: CollaborationModeName) => {
+    wsRef.current?.sendSetCollaborationMode(mode);
+    dispatch({ type: "set_collaboration_mode", mode });
   };
   const setGoalUi = (patch: Partial<{ revealed: boolean; open: boolean }>) => {
     if (!focusedSid) return;
@@ -838,12 +850,13 @@ export default function App() {
           model={rt.model}
           effort={rt.effort}
           perm={rt.perm}
+          collaborationMode={rt.collaborationMode}
           fast={rt.fast}
           external={rt.external}
           takeoverPending={rt.takeoverPending}
           takeoverMessage={rt.takeoverMessage}
           onTakeover={() => { if (focusedSid) wsRef.current?.sendTakeover(focusedSid); }}
-          engine={engine}
+          engine={focusedEngine}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
           onSendQuery={sendQuery}
@@ -855,6 +868,7 @@ export default function App() {
           onSetEffort={setEffort}
           onSetServiceTier={setServiceTier}
           onSetPerm={setPerm}
+          onSetCollaborationMode={setCollaborationMode}
           onClear={() => dispatch({ type: "enter_new_chat", cwd: state.currentCwd })}
           onContext={() => wsRef.current?.sendGetContext()}
           onOpenBtw={openBtw}

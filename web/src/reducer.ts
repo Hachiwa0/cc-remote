@@ -13,7 +13,7 @@ import type { ConnState } from "./ws";
 import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ToolCategory, ProcessKind,
-  ProcessStatus, PlanEntry,
+  ProcessStatus, PlanEntry, CollaborationModeName,
 } from "./protocol";
 import type { Catalog } from "./data";
 import type { DiffLine, GitDiffSection } from "./diff";
@@ -126,6 +126,7 @@ export interface SessionRuntime {
   model: string;
   effort: string;
   perm: string;
+  collaborationMode: CollaborationModeName;
   fast: boolean;   // codex Fast-mode (service tier) on/off
   replaying: boolean;
   // True only after this connection has received this sid's Snapshot or
@@ -184,6 +185,7 @@ export interface AppState {
 export function createRuntime(): SessionRuntime {
   return {
     turns: [], state: "idle", model: "claude-mythos-5", effort: "max", perm: "bypassPermissions",
+    collaborationMode: "default",
     fast: false,
     takeoverPending: false, takeoverMessage: null,
     replaying: false, syncReady: false, truncated: false,
@@ -206,6 +208,7 @@ export type Action =
   | { type: "set_model"; model: string }
   | { type: "set_effort"; effort: string }
   | { type: "set_perm"; perm: string }
+  | { type: "set_collaboration_mode"; mode: CollaborationModeName }
   | { type: "set_context"; report: ContextReport }
   | { type: "clear_context" }
   | { type: "set_turns"; sid: string; turns: Turn[] }
@@ -595,6 +598,10 @@ export function reduce(state: AppState, action: Action): AppState {
       return patch(state, state.focusedSid, (rt) => { rt.effort = action.effort; });
     case "set_perm":
       return patch(state, state.focusedSid, (rt) => { rt.perm = action.perm; });
+    case "set_collaboration_mode":
+      return patch(state, state.focusedSid, (rt) => {
+        rt.collaborationMode = action.mode;
+      });
     case "set_turns":
       return patch(state, action.sid, (rt) => {
         replaceWithBoundedTurns(rt, action.turns);
@@ -869,6 +876,10 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => { rt.effort = e.effort; });
     case "fast":
       return patch(state, e.sid, (rt) => { rt.fast = e.on; });
+    case "collaboration_mode":
+      return patch(state, e.sid, (rt) => {
+        rt.collaborationMode = e.mode;
+      });
     case "btw_opened": {
       // open the side panel + ensure a runtime for the fork; do NOT change focus
       // (the main view stays put — the fork lives only in the panel).

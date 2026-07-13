@@ -12,6 +12,7 @@ from cc_remote.attachments import MAX_ATTACHMENT_COUNT, validate_attachments
 from cc_remote.protocol import (
     ASK_ANSWER_MAX_CHARS,
     AnswerQuestion,
+    CollaborationMode,
     ForkSessionWorktree,
     GetDiff,
     GetModels,
@@ -20,11 +21,14 @@ from cc_remote.protocol import (
     ProtocolError,
     Query,
     SetEffort,
+    SetCollaborationMode,
     SetModel,
     SetPerm,
     SetServiceTier,
     SwitchSession,
     deserialize,
+    is_downstream,
+    serialize,
 )
 
 
@@ -98,6 +102,7 @@ def test_surrogate_filename_is_a_clean_validation_error():
         lambda: SetModel(model="m" * 257),
         lambda: SetEffort(effort="bogus"),
         lambda: SetServiceTier(service_tier="bogus"),
+        lambda: SetCollaborationMode(mode="bogus"),
         lambda: SetPerm(mode="bogus"),
         lambda: SwitchSession(session_id="sid-1", engine="bogus"),
         lambda: GetModels(engine="bogus"),
@@ -116,8 +121,16 @@ def test_client_command_scalars_are_bounded_or_enumerated(factory):
 def test_known_dynamic_control_values_remain_supported():
     assert SetEffort(effort="ultra").effort == "ultra"
     assert SetServiceTier(service_tier="toggle").service_tier == "toggle"
+    assert SetCollaborationMode(mode="plan").mode == "plan"
+    assert SetCollaborationMode(mode="default").mode == "default"
     assert SetPerm(mode="on-request").mode == "on-request"
     assert GetModels(engine="cc").engine == "cc"
     assert ForkSessionWorktree(
         session_id="sid-1", request_id="request-1", name="feature",
     ).name == "feature"
+
+
+def test_collaboration_mode_state_roundtrips_as_downstream():
+    state = CollaborationMode(mode="plan")
+    assert deserialize(serialize(state)) == state
+    assert is_downstream(state) is True

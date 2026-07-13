@@ -279,6 +279,14 @@ def _codex_env(bin_path: str) -> dict:
     return env
 
 
+def _initialize_params() -> dict[str, Any]:
+    """Declare the capability required by collaborationMode/list and turn/start."""
+    return {
+        "clientInfo": {"name": "cc-remote", "version": "0.1.0"},
+        "capabilities": {"experimentalApi": True},
+    }
+
+
 class CodexHandle:
     def __init__(self, cfg, cwd: Optional[str] = None,
                  approval_callback: Optional[ApprovalCallback] = None,
@@ -337,6 +345,7 @@ class CodexHandle:
         self.effort: Optional[str] = codex_effort()         # low | medium | high | xhigh
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
         self.approval: str = "never"                        # untrusted | on-request | never
+        self.collaboration_mode: str = "default"            # default | plan; independent of approval
         self.service_tier: Optional[str] = None             # "fast" = Codex Fast mode; None = default
         self.tier_dirty: bool = False                       # service_tier changed -> reconnect next turn to reload config
 
@@ -380,7 +389,7 @@ class CodexHandle:
 
         try:
             initialized = await self._request(
-                "initialize", {"clientInfo": {"name": "cc-remote", "version": "0.1.0"}})
+                "initialize", _initialize_params())
             self.app_server_version = _app_server_version(initialized)
             await self._notify("initialized")
 
@@ -425,6 +434,23 @@ class CodexHandle:
             params["model"] = self.model
         if self.effort:
             params["effort"] = self.effort
+        # Codex Plan mode is a collaboration-mode override, not an approval
+        # policy.  The app-server schema requires settings.model; null developer
+        # instructions selects Codex's built-in instructions for the chosen mode.
+        collaboration_model = self.model or codex_model()
+        if collaboration_model:
+            settings: dict[str, Any] = {
+                "model": collaboration_model,
+                "developer_instructions": None,
+            }
+            if self.effort:
+                settings["reasoning_effort"] = self.effort
+            params["collaborationMode"] = {
+                "mode": self.collaboration_mode,
+                "settings": settings,
+            }
+        elif self.collaboration_mode == "plan":
+            raise RuntimeError("Codex Plan mode requires an active model")
         if self.service_tier:
             params["serviceTier"] = self.service_tier   # codex Fast mode
         # Mark the turn active before awaiting the RPC.  app-server may dispatch
@@ -705,6 +731,12 @@ class CodexHandle:
             raise ValueError(f"unsupported codex approval policy: {mode}")
         self.approval = mode
         log.info("codex approval set (applies next turn)", approval=mode)
+
+    async def set_collaboration_mode(self, mode: str) -> None:
+        if mode not in ("default", "plan"):
+            raise ValueError(f"unsupported codex collaboration mode: {mode}")
+        self.collaboration_mode = mode
+        log.info("codex collaboration mode set (applies next turn)", mode=mode)
 
     async def get_goal(self) -> Optional[dict]:
         assert self.thread_id, "connect() first"

@@ -8,7 +8,7 @@ import { Icon } from "../icons";
 import { CommandSheet } from "./CommandSheet";
 import { modelsFor, effortsFor, defaultEffortFor, defaultModelFor, type Catalog } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
-import type { QueryImg, QueryFile } from "../protocol";
+import type { CollaborationModeName, QueryImg, QueryFile } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 
 interface Props {
@@ -22,7 +22,8 @@ interface Props {
   onPickCwd: () => void;  // open the directory picker
   onPickModel: (model: string) => void;
   onPickEffort: (effort: string) => void;
-  onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
+  onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[],
+           collaborationMode?: CollaborationModeName) => boolean;
 }
 
 export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, model, effort, createError, onPickCwd, onPickModel, onPickEffort, onSend }: Props) {
@@ -31,6 +32,7 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
   const [files, setFiles] = useState<QueryFile[]>([]);
   const [importing, setImporting] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [collaborationMode, setCollaborationMode] = useState<CollaborationModeName>("default");
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -40,6 +42,10 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
   useEffect(() => {
     if (createError) setCreating(false);
   }, [createError]);
+
+  useEffect(() => {
+    if (engine !== "codex") setCollaborationMode("default");
+  }, [engine]);
 
   useEffect(() => () => {
     if (buttonSendTimerRef.current !== null) {
@@ -91,7 +97,8 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
     if ((!prompt && !hasAttachments) || creating || importing) return;
     setCreating(true);
     const queued = onSend(
-      prompt, images.length ? images : undefined, files.length ? files : undefined);
+      prompt, images.length ? images : undefined, files.length ? files : undefined,
+      engine === "codex" ? collaborationMode : undefined);
     if (!queued) setCreating(false);
   };
 
@@ -158,6 +165,15 @@ export function NewChatView({ cwd, engine = "claude", catalog, catalogDefault, m
             <input ref={fileRef} type="file" multiple hidden onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
             <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型" disabled={creating}>{modelName}</button>
             <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度" disabled={creating}>{effortName}</button>
+            {engine === "codex" && (
+              <button
+                className={"hint-ctl collaboration-chip" + (collaborationMode === "plan" ? " plan" : "")}
+                onClick={() => setCollaborationMode((mode) => mode === "plan" ? "default" : "plan")}
+                title={collaborationMode === "plan" ? "Plan 模式已开启；点击恢复默认模式" : "让第一回合先调研并制定计划"}
+                aria-pressed={collaborationMode === "plan"}
+                disabled={creating}
+              >Plan</button>
+            )}
           </div>
           <div className="newchat-foot-right">
             <span className="newchat-hint">{createError

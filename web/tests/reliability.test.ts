@@ -27,7 +27,12 @@ import {
   matchesBtwRequest,
 } from "../src/protocol.ts";
 import { RelayWs } from "../src/ws.ts";
-import { modelsFor } from "../src/data.ts";
+import {
+  clientSlashesFor,
+  commandsFor,
+  matchCommands,
+  modelsFor,
+} from "../src/data.ts";
 import {
   createMobileViewportSync,
   type MobileViewportBindings,
@@ -481,6 +486,16 @@ try {
       [otherSid]: { ...createRuntime(), turns: [untouched], syncReady: true },
     },
   };
+  const approvalBeforePlan = state.runtimes[sid].perm;
+  state = reduce(state, { type: "event", event: event({
+    type: "collaboration_mode", sid, mode: "plan",
+  }) });
+  assert.equal(state.runtimes[sid].collaborationMode, "plan");
+  assert.equal(state.runtimes[sid].perm, approvalBeforePlan);
+  assert.equal(state.runtimes[otherSid].collaborationMode, "default");
+  state = reduce(state, { type: "set_collaboration_mode", mode: "default" });
+  assert.equal(state.runtimes[sid].collaborationMode, "default");
+  assert.equal(state.runtimes[sid].perm, approvalBeforePlan);
   const cachedSid = "cached-v5-codex";
   state = reduce(state, { type: "hydrate_cache", sid: cachedSid, turns: [{
     id: "cached-turn", codexTurnId: "legacy-turn-id", prompt: "旧缓存",
@@ -1180,6 +1195,12 @@ assert.ok(socket);
 socket.onopen?.();
 
 const codexModels = modelsFor("codex");
+assert.equal(clientSlashesFor("codex").has("plan"), true);
+assert.equal(clientSlashesFor("codex").has("normal"), true);
+assert.equal(commandsFor("codex").some((command) => (
+  "slash" in command && command.slash === "plan"
+)), true);
+assert.deepEqual(matchCommands("pla", "codex").map((command) => command.slash), ["plan"]);
 for (const id of ["gpt-5.6-terra", "gpt-5.6-luna"]) {
   const selected = codexModels.find((model) => model.id === id);
   assert.ok(selected);
@@ -1190,6 +1211,25 @@ for (const id of ["gpt-5.6-terra", "gpt-5.6-luna"]) {
   assert.equal(frame.sid, "codex-model-session");
   assert.equal(frame.model, id);
 }
+
+relay.setFocusedSid("codex-plan-session", "codex");
+relay.sendSetCollaborationMode("plan");
+const collaborationFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(collaborationFrame.type, "set_collaboration_mode");
+assert.equal(collaborationFrame.sid, "codex-plan-session");
+assert.equal(collaborationFrame.mode, "plan");
+assert.equal(typeof collaborationFrame.cmd_id, "string");
+assert.equal(typeof collaborationFrame.client_id, "string");
+
+relay.sendNewSession(
+  "/tmp/project", "codex", "gpt-5.6-sol", "xhigh",
+  { prompt: "先制定计划", msg_id: "first-plan-message" }, "plan",
+);
+const newPlanFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(newPlanFrame.type, "new_session");
+assert.equal(newPlanFrame.engine, "codex");
+assert.equal(newPlanFrame.collaboration_mode, "plan");
+assert.equal(newPlanFrame.prompt, "先制定计划");
 
 assert.equal(relay.sendTakeover("codex-model-session"), true);
 const takeoverFrame = JSON.parse(socket.sent.at(-1) ?? "{}");

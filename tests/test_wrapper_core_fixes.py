@@ -931,6 +931,34 @@ def test_codex_session_settings_rejects_an_oversized_source(monkeypatch, tmp_pat
     assert codex_session_settings("session-1", max_bytes=4) == {}
 
 
+def test_codex_session_settings_restores_last_valid_collaboration_mode(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout-session-1.jsonl"
+    rollout.write_text("\n".join(json.dumps(row) for row in [
+        {"type": "turn_context", "payload": {
+            "model": "gpt-old", "effort": "high",
+            "collaboration_mode": {"mode": "plan", "settings": {
+                "model": "gpt-old", "developer_instructions": "do not replay",
+            }},
+        }},
+        {"type": "turn_context", "payload": {
+            "model": "gpt-new", "effort": "xhigh",
+            "collaboration_mode": {"mode": "unsupported"},
+        }},
+        {"type": "turn_context", "payload": {
+            "collaboration_mode": {"mode": "default"},
+        }},
+    ]) + "\n")
+    monkeypatch.setattr(
+        codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
+
+    assert codex_session_settings("session-1") == {
+        "model": "gpt-new",
+        "effort": "xhigh",
+        "collaboration_mode": "default",
+    }
+
+
 def test_codex_history_skips_one_oversized_record_and_continues(
         monkeypatch, tmp_path):
     rollout = tmp_path / "rollout.jsonl"

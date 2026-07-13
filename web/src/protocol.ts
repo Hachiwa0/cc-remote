@@ -6,6 +6,7 @@ export type ToolCategory = "tool" | "command" | "file" | "mcp" | "agent" | "serv
 export type ProcessKind = "reasoning" | "plan" | "command" | "file_change" | "mcp" | "agent" | "hook" | "server_tool" | "web_search" | "task" | "terminal" | "diff" | "compaction";
 export type ProcessPhase = "start" | "update" | "end" | "snapshot";
 export type ProcessStatus = "pending" | "running" | "succeeded" | "failed" | "declined" | "cancelled" | "interrupted" | "unknown";
+export type CollaborationModeName = "default" | "plan";
 
 interface Base {
   v: number;
@@ -40,6 +41,7 @@ export interface TakeoverState extends Base { type: "takeover_state"; pending: b
 export interface SetModel extends Base { type: "set_model"; model: string }
 export interface SetEffort extends Base { type: "set_effort"; effort: string }
 export interface SetServiceTier extends Base { type: "set_service_tier"; service_tier: string }
+export interface SetCollaborationMode extends Base { type: "set_collaboration_mode"; mode: CollaborationModeName }
 export interface Ping extends Base { type: "ping"; n: number }
 export interface Pong extends Base { type: "pong"; n: number }
 export interface CommandAck extends Base { type: "command_ack"; cmd_id: string; client_id: string }
@@ -56,6 +58,7 @@ export interface StateEvent extends Base {
 export interface Model extends Base { type: "model"; model: string }
 export interface Effort extends Base { type: "effort"; effort: string }
 export interface Fast extends Base { type: "fast"; on: boolean }
+export interface CollaborationMode extends Base { type: "collaboration_mode"; mode: CollaborationModeName }
 export interface OpenBtw extends Base { type: "open_btw"; request_id: string; client_id?: string }
 export interface CloseBtw extends Base { type: "close_btw" }
 export interface BtwOpened extends Base { type: "btw_opened"; request_id: string; btw_sid: string; parent_sid: string; engine: string }
@@ -176,6 +179,7 @@ export interface NewSession extends Base {
   engine?: "claude" | "codex";
   model?: string | null;
   effort?: string | null;
+  collaboration_mode?: CollaborationModeName | null;
   prompt?: string | null;
   msg_id?: string | null;
   images?: QueryImg[] | null;
@@ -291,7 +295,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | BtwOpened | Perm | ContextReport | DiffReport | History | Models | TakeoverState
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | History | Models | TakeoverState
   | AskUser | GoalState | StatusReport
   | SessionList | SessionFocus | SessionRekey | SessionForked
   | DirList

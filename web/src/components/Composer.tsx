@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ClipboardEvent } from "react";
-import type { State, QueryImg, QueryFile, ContextReport } from "../protocol";
+import type { State, QueryImg, QueryFile, ContextReport, CollaborationModeName } from "../protocol";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
 import { clientSlashesFor, CODEX_PROMPTS, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor, type Catalog } from "../data";
@@ -21,6 +21,7 @@ interface Props {
   model: string;
   effort: string;
   perm: string;
+  collaborationMode: CollaborationModeName;
   fast?: boolean;   // codex Fast-mode state (from wrapper)
   // A native `claude`/`codex` in the terminal owns this session and is appending to
   // its transcript. We mirror it live but must NOT write: a cc session has a single
@@ -42,6 +43,7 @@ interface Props {
   onSetEffort: (effort: string) => void;
   onSetServiceTier?: (tier: string) => void;
   onSetPerm: (perm: string) => void;
+  onSetCollaborationMode: (mode: CollaborationModeName) => void;
   onClear: () => void;
   onContext: () => void;
   onOpenBtw?: () => void;
@@ -249,8 +251,24 @@ export function Composer(p: Props) {
         flash(!p.fast ? "⚡ 已开启快速模式 · 下条生效" : "已回到标准模式 · 下条生效");
         break;
       }
-      case "plan": p.onSetPerm("plan"); if (args) { submitPrompt(args); return; } break;
-      case "normal": p.onSetPerm("bypassPermissions"); if (args) { submitPrompt(args); return; } break;
+      case "plan":
+        if (p.engine === "codex") {
+          p.onSetCollaborationMode("plan");
+          flash("已进入 Plan 模式 · 下条消息生效");
+        } else {
+          p.onSetPerm("plan");
+        }
+        if (args) { submitPrompt(args); return; }
+        break;
+      case "normal":
+        if (p.engine === "codex") {
+          p.onSetCollaborationMode("default");
+          flash("已退出 Plan 模式 · 下条消息生效");
+        } else {
+          p.onSetPerm("bypassPermissions");
+        }
+        if (args) { submitPrompt(args); return; }
+        break;
     }
     setInput(""); resetTaHeight();
   };
@@ -442,6 +460,14 @@ export function Composer(p: Props) {
           <div className="hint-right" ref={ctxWrapRef}>
             <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型">{model.name}</button>
             <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度">{effort.name}</button>
+            {p.engine === "codex" && p.collaborationMode === "plan" && (
+              <button
+                className="hint-ctl collaboration-chip plan"
+                onClick={() => p.onSetCollaborationMode("default")}
+                title="Plan 模式已开启；点击恢复默认模式（下条消息生效）"
+                aria-pressed="true"
+              >Plan</button>
+            )}
             {p.engine === "codex" && (
               <button
                 className={"hint-ctl fast-chip" + (p.fast ? " on" : "")}

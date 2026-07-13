@@ -27,6 +27,7 @@ def test_protocol_v6_new_session_query_roundtrip_and_validation():
         engine="codex",
         model="gpt-test",
         effort="high",
+        collaboration_mode="plan",
         prompt="hello",
         msg_id="msg-1",
         images=[{"media_type": "image/png", "data": _PNG_1X1}],
@@ -36,6 +37,8 @@ def test_protocol_v6_new_session_query_roundtrip_and_validation():
     assert NewSession().prompt is None  # blank-session creation stays supported
     with pytest.raises(ValidationError):
         NewSession(prompt="missing message id")
+    with pytest.raises(ValidationError):
+        NewSession(engine="claude", collaboration_mode="plan")
 
 
 def test_new_session_starts_initial_query_on_the_new_ctx():
@@ -106,6 +109,7 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             "engine": "claude",
             "model": "claude-test",
             "effort": "high",
+            "collaboration_mode": None,
         }
         turn_ctx, prompt, images, files = captured["turn"]
         assert turn_ctx is ctx and prompt == "first prompt"

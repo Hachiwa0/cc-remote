@@ -54,6 +54,7 @@ PermissionMode = Literal[
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
     "never", "on-request", "untrusted",
 ]
+CollaborationModeName = Literal["default", "plan"]
 ModelName = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 WireId = Annotated[
     str,
@@ -284,6 +285,17 @@ class SetServiceTier(_Command):
     service_tier: Literal["", "default", "fast", "toggle"]
 
 
+class SetCollaborationMode(_Command):
+    """client -> wrapper: select Codex's real collaboration mode.
+
+    This is deliberately separate from SetPerm: collaboration mode controls how
+    Codex approaches the next turn (default vs plan), while approvalPolicy controls
+    whether tools require confirmation.
+    """
+    type: Literal["set_collaboration_mode"] = "set_collaboration_mode"
+    mode: CollaborationModeName
+
+
 class OpenBtw(_Command):
     """client -> wrapper: open a /btw ephemeral side-fork of `sid` (the parent
     session). The wrapper forks it (inherits context) and replies BtwOpened
@@ -388,6 +400,12 @@ class Fast(_Base):
     the fast tier or standard — not just that it was 'toggled'."""
     type: Literal["fast"] = "fast"
     on: bool
+
+
+class CollaborationMode(_Base):
+    """The Codex session's collaboration mode, restored across reconnects."""
+    type: Literal["collaboration_mode"] = "collaboration_mode"
+    mode: CollaborationModeName
 
 
 class BtwOpened(_Base):
@@ -619,6 +637,7 @@ class NewSession(_Command):
     engine: Engine = "claude"
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
     effort: Optional[EffortLevel] = None  # None -> engine default
+    collaboration_mode: Optional[CollaborationModeName] = None  # Codex only; first turn included
     prompt: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
     msg_id: Optional[WireId] = None
     images: Optional[list[QueryImage]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
@@ -631,6 +650,8 @@ class NewSession(_Command):
                 f"new_session attachments exceed {MAX_ATTACHMENT_COUNT} items")
         if (self.prompt is not None or self.images or self.files) and not self.msg_id:
             raise ValueError("msg_id is required when new_session carries a query")
+        if self.collaboration_mode is not None and self.engine != "codex":
+            raise ValueError("collaboration_mode is only supported for Codex sessions")
         return self
 
 
@@ -1047,7 +1068,7 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetPerm, Fast, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, DiffReport, History, Models, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
@@ -1061,7 +1082,8 @@ AnyMessage = Union[
 # control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "state", "model", "effort", "perm", "fast", "btw_opened",
+    "user_msg", "state", "model", "effort", "perm", "fast",
+    "collaboration_mode", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_end",
     "error", "ask_user",
@@ -1076,6 +1098,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "set_model": SetModel,
     "set_effort": SetEffort,
     "set_service_tier": SetServiceTier,
+    "set_collaboration_mode": SetCollaborationMode,
     "open_btw": OpenBtw,
     "close_btw": CloseBtw,
     "btw_opened": BtwOpened,
@@ -1106,6 +1129,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "model": Model,
     "effort": Effort,
     "fast": Fast,
+    "collaboration_mode": CollaborationMode,
     "perm": Perm,
     "context_report": ContextReport,
     "status_report": StatusReport,

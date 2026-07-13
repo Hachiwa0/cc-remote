@@ -64,7 +64,7 @@ from cc_remote.attachments import decode_attachment, validate_attachments
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    ASK_OPTION_MAX_COUNT, Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast, Perm, BtwOpened, ContextReport, StatusReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
+    ASK_OPTION_MAX_COUNT, Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast, CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, DiffReport, History, AskUser, GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg, TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, SessionFocus, SessionRekey, SessionForked, DirList,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
@@ -117,6 +117,7 @@ CLAUDE_PERMISSION_MODES = frozenset({
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
 })
 CODEX_PERMISSION_MODES = frozenset({"never", "on-request", "untrusted"})
+CODEX_COLLABORATION_MODES = frozenset({"default", "plan"})
 
 
 def _codex_list_state(status: Optional[str]) -> Optional[State]:
@@ -169,7 +170,7 @@ class WrapperMachine:
     # the owner check before its handler is allowed to read or mutate state.
     BTW_SID_COMMANDS = frozenset({
         "query", "interrupt", "takeover", "set_model", "set_effort",
-        "set_service_tier", "open_btw", "close_btw", "set_perm",
+        "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw", "set_perm",
         "get_context", "get_status", "get_diff", "answer_question", "get_goal", "set_goal", "clear_goal",
     })
     # These commands address a session through ``session_id`` instead.
@@ -790,6 +791,8 @@ class WrapperMachine:
             await self._handle_set_effort(cmd)
         elif t == "set_service_tier":
             await self._handle_set_service_tier(cmd)
+        elif t == "set_collaboration_mode":
+            await self._handle_set_collaboration_mode(cmd)
         elif t == "open_btw":
             return await self._handle_open_btw(cmd)
         elif t == "close_btw":
@@ -912,6 +915,16 @@ class WrapperMachine:
                             "sid": sid,
                             "route_id": getattr(cmd, "route_id", None),
                         }))
+                # Collaboration mode is session control state, not transcript
+                # history.  Always seed it on hello even when the browser's replay
+                # cursor is already at the ring tail (for example after a refresh).
+                if ctx.engine == "codex":
+                    await self.transport.send(CollaborationMode(
+                        mode=getattr(ctx.sdk, "collaboration_mode", "default"),
+                        sid=sid,
+                        to=cmd.client_id,
+                        route_id=getattr(cmd, "route_id", None),
+                    ))
         log.info("client hello handled", client_id=cmd.client_id,
                  sessions=len(self.sessions), replayed=replayed)
 
@@ -1383,6 +1396,9 @@ class WrapperMachine:
         w["external"] = is_external
         if (external_growth or (is_external and not was_external)) and ctx is not None:
             ctx.needs_reload = True
+            # A native Codex turn may itself switch `/plan`. Mirror that control
+            # state with the transcript so Remote does not keep a stale override.
+            await self._refresh_codex_collaboration_mode(ctx)
 
         if external_growth or is_external != was_external or takeover_cleared:
             log.info(
@@ -2026,6 +2042,45 @@ class WrapperMachine:
         except Exception as e:
             log.exception("set_service_tier failed", error=str(e))
             await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_service_tier failed: {e}"))
+
+    async def _handle_set_collaboration_mode(self, cmd) -> None:
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return
+        if ctx.engine != "codex" or cmd.mode not in CODEX_COLLABORATION_MODES:
+            await self._emit(ctx, Error(
+                code=ERR_INTERNAL,
+                message=(f"{ctx.engine} 不支持 Codex 协作模式 {cmd.mode!r}; "
+                         "可选: default, plan"),
+            ))
+            return
+        try:
+            await ctx.sdk.set_collaboration_mode(cmd.mode)
+            ctx.announced_collaboration_mode = cmd.mode
+            await self._emit(ctx, CollaborationMode(mode=cmd.mode))
+        except Exception as e:
+            log.exception("set_collaboration_mode failed", error=str(e))
+            await self._emit(ctx, Error(
+                code=ERR_INTERNAL,
+                message=f"set_collaboration_mode failed: {e}",
+            ))
+
+    async def _refresh_codex_collaboration_mode(
+            self, ctx: SessionContext) -> None:
+        """Adopt a native Codex turn's last persisted collaboration mode."""
+        if ctx.engine != "codex" or not ctx.session_id:
+            return
+        settings = await asyncio.to_thread(
+            codex_session_settings, ctx.session_id,
+            self.cfg.history_source_max_bytes)
+        mode = settings.get("collaboration_mode")
+        if mode not in CODEX_COLLABORATION_MODES:
+            return
+        if getattr(ctx.sdk, "collaboration_mode", "default") == mode:
+            return
+        ctx.sdk.collaboration_mode = mode
+        ctx.announced_collaboration_mode = mode
+        await self._emit(ctx, CollaborationMode(mode=mode))
 
     async def _send_btw_error(self, cmd, code: str, message: str) -> Error:
         """Send a one-request /btw rejection without polluting another session.
@@ -3180,6 +3235,13 @@ class WrapperMachine:
             perm_event = Perm(mode=ctx.sdk.approval)
             await self._emit(ctx, perm_event)
             cached_responses.append(perm_event)
+            collaboration_mode = getattr(
+                ctx.sdk, "collaboration_mode", "default")
+            ctx.announced_collaboration_mode = collaboration_mode
+            collaboration_event = CollaborationMode(
+                mode=collaboration_mode)
+            await self._emit(ctx, collaboration_event)
+            cached_responses.append(collaboration_event)
             if ctx.sdk.model:
                 ctx.announced_model = ctx.sdk.model
                 model_event = Model(model=ctx.sdk.model)
@@ -3291,7 +3353,9 @@ class WrapperMachine:
         ctx = await self._spawn(resume_id=None, cwd=getattr(cmd, "cwd", None),
                                 engine=getattr(cmd, "engine", "claude"),
                                 model=getattr(cmd, "model", None),
-                                effort=getattr(cmd, "effort", None))
+                                effort=getattr(cmd, "effort", None),
+                                collaboration_mode=getattr(
+                                    cmd, "collaboration_mode", None))
         if ctx is None:
             error = Error(
                 code=ERR_CC_CRASH,
@@ -3342,6 +3406,13 @@ class WrapperMachine:
             perm_event = Perm(mode=ctx.sdk.approval)
             await self._emit(ctx, perm_event)
             cached_responses.append(perm_event)
+            collaboration_mode = getattr(
+                ctx.sdk, "collaboration_mode", "default")
+            ctx.announced_collaboration_mode = collaboration_mode
+            collaboration_event = CollaborationMode(
+                mode=collaboration_mode)
+            await self._emit(ctx, collaboration_event)
+            cached_responses.append(collaboration_event)
 
         prompt = getattr(cmd, "prompt", None)
         images = getattr(cmd, "images", None)
@@ -4487,7 +4558,8 @@ class WrapperMachine:
 
     async def _spawn(self, resume_id: Optional[str], cwd: Optional[str] = None,
                      bootstrap: bool = False, engine: str = "claude",
-                     model: Optional[str] = None, effort: Optional[str] = None) -> Optional[SessionContext]:
+                     model: Optional[str] = None, effort: Optional[str] = None,
+                     collaboration_mode: Optional[str] = None) -> Optional[SessionContext]:
         """Create a SessionContext, connect its SDK subprocess, load history.
         Returns the ctx (added to the pool under its real or temp key) or None
         on failure (an Error has been emitted). `bootstrap` exempts the cap and
@@ -4593,17 +4665,22 @@ class WrapperMachine:
         # sees the first turn as already-applied (cc's connect re-syncs it anyway;
         # this is what keeps codex from a spurious first-turn reconnect).
         if engine == "codex":
+            if collaboration_mode in CODEX_COLLABORATION_MODES:
+                sdk.collaboration_mode = collaboration_mode
             # A resumed codex session's model/effort live in ITS OWN rollout (codex
             # writes a `turn_context` per turn). CodexHandle seeds them from
             # config.toml, which is a single GLOBAL default — so resuming used to
             # silently drag a session the user had switched to luna back to sol, and
             # in multi-session one session's pick leaked into another.
-            if resume_id and (not model or not effort):
+            if resume_id:
                 prev = await asyncio.to_thread(
                     codex_session_settings, resume_id,
                     self.cfg.history_source_max_bytes)
                 model = model or prev.get("model")
                 effort = effort or prev.get("effort")
+                mode = prev.get("collaboration_mode")
+                if mode in CODEX_COLLABORATION_MODES:
+                    sdk.collaboration_mode = mode
             if model:
                 sdk.model = model
                 # A stale client can ask for a level this model doesn't have (it used
@@ -4691,6 +4768,12 @@ class WrapperMachine:
             ctx.announced_perm = (ctx.sdk.approval if engine == "codex"
                                   else "bypassPermissions")
             await self._emit(ctx, Perm(mode=ctx.announced_perm))
+            if engine == "codex":
+                collaboration_mode = getattr(
+                    ctx.sdk, "collaboration_mode", "default")
+                ctx.announced_collaboration_mode = collaboration_mode
+                await self._emit(ctx, CollaborationMode(
+                    mode=collaboration_mode))
         log.info("session spawned", resume=resume_id, cwd=target_cwd, key=key,
                  resident=len(self.sessions))
         return ctx
@@ -5064,6 +5147,8 @@ class WrapperMachine:
             if ctx.needs_reload and ctx.session_id:
                 log.info("reloading session after external transcript change",
                          sid=ctx.session_id)
+                if is_codex:
+                    await self._refresh_codex_collaboration_mode(ctx)
                 await ctx.sdk.force_reconnect(resume_id=ctx.session_id, cwd=ctx.cwd,
                                               reason="external transcript change")
                 ctx.needs_reload = False
@@ -5165,6 +5250,7 @@ class WrapperMachine:
                                 "found at final preflight",
                                 sid=ctx.session_id,
                             )
+                            await self._refresh_codex_collaboration_mode(ctx)
                             await ctx.sdk.force_reconnect(
                                 resume_id=ctx.session_id, cwd=ctx.cwd,
                                 reason="external transcript change at final preflight",
@@ -5223,12 +5309,18 @@ class WrapperMachine:
             # so announce the configured codex model (gpt-*) once — else the header
             # would keep showing a stale Claude model.
             if is_codex:
+                collaboration_mode = getattr(
+                    ctx.sdk, "collaboration_mode", "default")
                 if ctx.announced_model != ctx.sdk.model:
                     ctx.announced_model = ctx.sdk.model
                     await self._emit(ctx, Model(model=ctx.announced_model))
                 if ctx.announced_effort != ctx.sdk.effort:
                     ctx.announced_effort = ctx.sdk.effort
                     await self._emit(ctx, Effort(effort=ctx.sdk.effort))
+                if ctx.announced_collaboration_mode != collaboration_mode:
+                    ctx.announced_collaboration_mode = collaboration_mode
+                    await self._emit(ctx, CollaborationMode(
+                        mode=collaboration_mode))
                 # seed/refresh the Fast-mode chip from the live config each turn.
                 await self._emit(ctx, Fast(on=codex_fast_enabled()))
             reader_task = asyncio.create_task(reader())

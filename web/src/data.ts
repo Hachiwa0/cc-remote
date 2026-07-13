@@ -182,13 +182,16 @@ export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions",
 // config, account and rate limits). Forwarded
 // ones (review/init) expand to a prompt codex handles agentically — the app-server
 // has no TUI slash layer. NB: /fast is a codex keybinding (not an app-server knob),
-// and /hook /plan are Claude-only — so they're intentionally omitted.
+// and /hook is Claude-only. /plan and /normal are handled locally by the web
+// client and mapped to app-server collaborationMode, not sent as prompt text.
 export const CODEX_COMMANDS: Command[] = [
   { g: "审查" },
   { slash: "review", name: "代码审查", ds: "审当前 git 改动的 bug 与改进", ic: "review" },
   { g: "项目" },
   { slash: "init", name: "初始化 AGENTS.md", ds: "生成/更新代码库说明", ic: "init" },
   { g: "模式" },
+  { slash: "plan", name: "Plan mode", ds: "先调研并给出方案 · 下条消息生效", ic: "plan" },
+  { slash: "normal", name: "默认模式", ds: "退出 Plan，恢复正常执行 · 下条消息生效", ic: "run" },
   { slash: "model", name: "切换模型", ds: "选择模型与思考强度", ic: "cpu" },
   { slash: "permissions", name: "权限模式", ds: "选择 Codex 的审批策略(自动/按需/严格)", ic: "shield" },
   { slash: "fast", name: "Fast 模式", ds: "开/关 Fast 服务档位(更快响应),下条消息生效", ic: "bolt" },
@@ -200,7 +203,7 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
-export const CODEX_CLIENT_SLASHES = new Set(["model", "clear", "context", "status", "permissions", "fast", "goal", "btw"]);
+export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw"]);
 export const commandsFor = (engine?: string): Command[] => (engine === "codex" ? CODEX_COMMANDS : COMMANDS);
 export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
 // codex slash -> the prompt actually sent to codex (agentic; no TUI slash layer).

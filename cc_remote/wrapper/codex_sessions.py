@@ -280,9 +280,10 @@ def set_codex_config_key(key: str, value: Optional[str]) -> bool:
 def codex_session_settings(
     session_id: str, max_bytes: int = 64 * 1024 * 1024,
 ) -> dict:
-    """The model/effort THIS session last ran with, read from its own rollout.
+    """The model/effort/collaboration mode this session last ran with.
 
-    codex appends a `turn_context` record per turn carrying `model` and `effort`.
+    Codex appends a `turn_context` record per turn carrying `model`, `effort`,
+    and the nested `collaboration_mode` selected for that turn.
     That — not config.toml — is a resumed session's truth. config.toml holds ONE
     global default, so seeding a resumed session from it silently reverted a session
     the user had switched to gpt-5.6-luna back to the config's gpt-5.6-sol, and in
@@ -322,6 +323,11 @@ def codex_session_settings(
                     if isinstance(val, str) and val:
                         out[key] = val[:256 if key == "model" else 64]
                         # last one wins = the session's current setting
+                collaboration = payload.get("collaboration_mode")
+                if isinstance(collaboration, dict):
+                    mode = collaboration.get("mode")
+                    if mode in ("default", "plan"):
+                        out["collaboration_mode"] = mode
     except Exception as e:
         log.warning("read codex session settings failed", session_id=session_id, error=str(e))
     return out
