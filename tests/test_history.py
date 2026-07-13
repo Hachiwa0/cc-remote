@@ -27,7 +27,7 @@ from cc_remote.wrapper.stream import StreamTranslator, translate_history
 from tests.test_multisession import _mk_machine, _mk_ctx
 
 
-def test_protocol_v5_get_history_and_history_roundtrip():
+def test_protocol_v6_get_history_and_history_roundtrip():
     gh = GetHistory(session_id="s1", client_id="c1", limit=50)
     assert deserialize(serialize(gh)) == gh
     h = History(session_id="s1", events=[{"type": "user_msg", "msg_id": "u1"}],

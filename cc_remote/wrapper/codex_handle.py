@@ -23,7 +23,7 @@ import re
 import signal
 import shutil
 import subprocess
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from typing import Any, Awaitable, Callable, Optional
@@ -45,11 +45,82 @@ _MAX_NVM_CANDIDATES = 3
 _CODEX_VERSION_TIMEOUT = 5
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
+_SPONTANEOUS_QUEUE_MIN_ITEMS = 64
+_SPONTANEOUS_QUEUE_MAX_ITEMS = 256
+_SPONTANEOUS_QUEUE_MIN_BYTES = 4 * 1024 * 1024
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
 GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
+
+
+class CodexSpontaneousOverflow:
+    """Internal bridge signal: live detail was shed to protect stdout reading."""
+
+    __slots__ = ("turn_id",)
+
+    def __init__(self, turn_id: str):
+        self.turn_id = turn_id
+
+
+class CodexSpontaneousClosed:
+    """Internal bridge signal: app-server ended before a terminal notification."""
+
+    __slots__ = ("turn_id",)
+
+    def __init__(self, turn_id: str):
+        self.turn_id = turn_id
+
+
+class _SpontaneousNotificationQueue:
+    """Single-loop FIFO bounded by both parsed frames and original wire bytes.
+
+    The app-server stdout reader must keep draining even if the relay is slow.  A
+    regular ``asyncio.Queue.put`` would transfer relay backpressure all the way to
+    stdout and can deadlock JSON-RPC responses/approvals.  This queue therefore has
+    a synchronous, fail-fast producer and one asynchronous consumer.
+    """
+
+    def __init__(self, max_items: int, max_bytes: int):
+        self.max_items = max(2, max_items)
+        self.max_bytes = max(1024, max_bytes)
+        self._items: deque[tuple[object, int]] = deque()
+        self._bytes = 0
+        self._ready = asyncio.Event()
+
+    @property
+    def byte_size(self) -> int:
+        return self._bytes
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def put_nowait(self, item: object, size: int = 0) -> bool:
+        size = max(0, size)
+        if (size > self.max_bytes or len(self._items) >= self.max_items
+                or self._bytes + size > self.max_bytes):
+            return False
+        self._items.append((item, size))
+        self._bytes += size
+        self._ready.set()
+        return True
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._bytes = 0
+        self._ready.clear()
+
+    async def get(self) -> object:
+        while not self._items:
+            self._ready.clear()
+            if not self._items:
+                await self._ready.wait()
+        item, size = self._items.popleft()
+        self._bytes = max(0, self._bytes - size)
+        if not self._items:
+            self._ready.clear()
+        return item
 
 _NEW_APPROVAL_METHODS = frozenset({
     "item/commandExecution/requestApproval",
@@ -71,6 +142,53 @@ _LEGACY_DECISIONS = {
     "decline": "denied",
     "cancel": "abort",
 }
+
+_TURN_NOTIFICATION_PREFIXES = ("item/", "turn/", "hook/")
+_TURN_QUEUE_PREFIXES = ("item/", "turn/", "hook/")
+_TURN_QUEUE_METHODS = frozenset({"error", "thread/compacted"})
+
+
+def _notification_thread_id(message: dict) -> Optional[str]:
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    value = params.get("threadId")
+    if isinstance(value, str) and value:
+        return value
+    thread = params.get("thread")
+    if isinstance(thread, dict):
+        value = thread.get("id") or thread.get("sessionId")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _notification_turn_id(message: dict) -> Optional[str]:
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    value = params.get("turnId")
+    if isinstance(value, str) and value:
+        return value
+    turn = params.get("turn")
+    if isinstance(turn, dict):
+        value = turn.get("id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _is_turn_notification(method: Any) -> bool:
+    return isinstance(method, str) and method.startswith(
+        _TURN_NOTIFICATION_PREFIXES)
+
+
+def _is_turn_queue_notification(method: Any) -> bool:
+    return (
+        isinstance(method, str)
+        and (method in _TURN_QUEUE_METHODS
+             or method.startswith(_TURN_QUEUE_PREFIXES))
+    )
 
 
 def _codex_candidates() -> list[str]:
@@ -209,6 +327,9 @@ class CodexHandle:
         # separately so the machine can lock the session, expose interrupt, and
         # return to idle at its authoritative turn/completed notification.
         self._spontaneous_turn_id: Optional[str] = None
+        self._spontaneous_q: Optional[_SpontaneousNotificationQueue] = None
+        self._spontaneous_queue_turn_id: Optional[str] = None
+        self._spontaneous_overflow = False
         # per-session codex settings, applied on thread/start + turn/start — the
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
@@ -310,6 +431,11 @@ class CodexHandle:
         # turn/completed immediately after the response, before this coroutine is
         # scheduled again; setting this afterwards would resurrect a completed
         # turn and leave ownership attribution stuck on "ours".
+        # The previous completed turn id is never a valid owner for notifications
+        # emitted while this turn/start is pending. Clear it before the RPC so an
+        # early turn/started (or even turn/completed) can claim the new id without
+        # being mistaken for a stale cross-turn frame.
+        self.turn_id = None
         self.turn_active = True
         self.turn_start_pending = True
         try:
@@ -320,9 +446,14 @@ class CodexHandle:
         finally:
             self.turn_start_pending = False
         turn = (res or {}).get("turn") or {}
-        self.turn_id = turn.get("id")
-        if self.turn_id:
-            self.remember_owned_turn_id(self.turn_id)
+        returned_turn_id = turn.get("id")
+        if isinstance(returned_turn_id, str) and returned_turn_id:
+            self.remember_owned_turn_id(returned_turn_id)
+            # A very fast turn can complete before the turn/start response. Do
+            # not resurrect it as interruptible after its authoritative terminal
+            # notification already cleared turn_active.
+            if self.turn_active:
+                self.turn_id = returned_turn_id
 
     def remember_owned_turn_id(self, turn_id: str) -> None:
         self._owned_turn_ids[turn_id] = None
@@ -348,7 +479,139 @@ class CodexHandle:
         finally:
             if self._turn_q is q:
                 self._turn_q = None
-            self.turn_active = False
+            # An automatic continuation may have started after this managed
+            # queue received its terminal sentinel but before its consumer
+            # unwound. Do not let the old generator clear the new turn's active
+            # ownership (thread-scoped hooks depend on this flag).
+            if self._spontaneous_turn_id is None:
+                self.turn_active = False
+
+    def _open_spontaneous_stream(self, turn_id: str) -> None:
+        """Create the bounded raw-notification bridge before announcing a turn."""
+        if self._spontaneous_q is not None:
+            self._close_spontaneous_stream(self._spontaneous_queue_turn_id)
+        reader_cap = max(1, int(getattr(self.cfg, "turn_reader_queue_cap", 4)))
+        item_cap = min(
+            _SPONTANEOUS_QUEUE_MAX_ITEMS,
+            max(_SPONTANEOUS_QUEUE_MIN_ITEMS, reader_cap * 16),
+        )
+        ws_cap = max(1024, int(getattr(
+            self.cfg, "ws_max_size_bytes", 16 * 1024 * 1024)))
+        tool_cap = max(1024, int(getattr(self.cfg, "tool_result_max", 65536)))
+        byte_cap = min(
+            ws_cap,
+            max(_SPONTANEOUS_QUEUE_MIN_BYTES, tool_cap * 16),
+        )
+        self._spontaneous_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
+        self._spontaneous_queue_turn_id = turn_id
+        self._spontaneous_overflow = False
+
+    @staticmethod
+    def _notification_wire_size(message: dict) -> int:
+        try:
+            return len(json.dumps(
+                message, ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8", errors="surrogatepass"))
+        except Exception:
+            # Invalid/non-JSON values are already unusable as app-server frames.
+            # Charging the full single-frame allowance fails closed without
+            # copying arbitrary object representations into logs.
+            return 16 * 1024 * 1024
+
+    @staticmethod
+    def _minimal_turn_completed(message: dict) -> dict:
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        raw_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+        turn: dict[str, Any] = {}
+        turn_id = raw_turn.get("id") or params.get("turnId")
+        if isinstance(turn_id, str) and turn_id:
+            turn["id"] = turn_id
+        status = raw_turn.get("status")
+        if status in {"completed", "interrupted", "failed"}:
+            turn["status"] = status
+        duration = raw_turn.get("durationMs")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            turn["durationMs"] = max(0, int(duration))
+        out_params: dict[str, Any] = {"turn": turn}
+        thread_id = params.get("threadId")
+        if isinstance(thread_id, str) and thread_id:
+            out_params["threadId"] = thread_id
+        if isinstance(turn_id, str) and turn_id:
+            out_params["turnId"] = turn_id
+        return {"method": "turn/completed", "params": out_params}
+
+    def _queue_spontaneous_notification(
+        self, message: dict, raw_size: Optional[int] = None,
+    ) -> bool:
+        """Offer one current-turn frame without ever awaiting relay backpressure."""
+        q = self._spontaneous_q
+        turn_id = self._spontaneous_queue_turn_id
+        if q is None or turn_id is None:
+            return False
+        method = message.get("method")
+        terminal = method == "turn/completed"
+        if self._spontaneous_overflow and not terminal:
+            return True
+        size = (
+            raw_size if isinstance(raw_size, int) and raw_size >= 0
+            else self._notification_wire_size(message)
+        )
+        if q.put_nowait(message, size):
+            return True
+
+        if not self._spontaneous_overflow:
+            log.warning(
+                "codex spontaneous notification bridge overflow",
+                turn_id=turn_id,
+                queued=q.qsize(),
+                queued_bytes=q.byte_size,
+            )
+        self._spontaneous_overflow = True
+        q.clear()
+        q.put_nowait(CodexSpontaneousOverflow(turn_id))
+        if terminal:
+            terminal_message = message
+            terminal_size = size
+            if terminal_size > q.max_bytes:
+                terminal_message = self._minimal_turn_completed(message)
+                terminal_size = self._notification_wire_size(terminal_message)
+            # The queue always reserves at least two item slots. Byte overflow is
+            # impossible for the bounded minimal fallback above.
+            q.put_nowait(terminal_message, terminal_size)
+        return True
+
+    def _close_spontaneous_stream(self, turn_id: Optional[str]) -> None:
+        """Wake the bridge consumer after disconnect/EOF, without blocking stdout."""
+        q = self._spontaneous_q
+        current = self._spontaneous_queue_turn_id
+        if q is None or current is None or (turn_id and turn_id != current):
+            return
+        closed = CodexSpontaneousClosed(current)
+        if q.put_nowait(closed):
+            return
+        self._spontaneous_overflow = True
+        q.clear()
+        q.put_nowait(CodexSpontaneousOverflow(current))
+        q.put_nowait(closed)
+
+    async def receive_spontaneous_response(self, turn_id: str):
+        """Yield exactly one spontaneous turn's raw frames and internal signals."""
+        q = self._spontaneous_q
+        if q is None or self._spontaneous_queue_turn_id != turn_id:
+            return
+        try:
+            while True:
+                item = await q.get()
+                yield item
+                if isinstance(item, CodexSpontaneousClosed):
+                    break
+                if isinstance(item, dict) and item.get("method") == "turn/completed":
+                    break
+        finally:
+            if self._spontaneous_q is q:
+                self._spontaneous_q = None
+                self._spontaneous_queue_turn_id = None
+                self._spontaneous_overflow = False
 
     async def interrupt(self) -> None:
         if self.proc and self.thread_id and self.turn_id:
@@ -360,6 +623,9 @@ class CodexHandle:
     async def disconnect(self) -> None:
         proc = self.proc
         process_group = self._process_group
+        spontaneous_turn_id = self._spontaneous_turn_id
+        self._close_spontaneous_stream(spontaneous_turn_id)
+        self._spontaneous_turn_id = None
         tasks = [t for t in (self._reader, self._stderr_task)
                  if t is not None and t is not asyncio.current_task()]
         server_tasks = [
@@ -412,6 +678,9 @@ class CodexHandle:
         self.turn_id = None
         self.turn_start_pending = False
         self.turn_active = False
+        if spontaneous_turn_id is not None:
+            await self._publish_turn_lifecycle(
+                "completed", spontaneous_turn_id)
 
     async def force_reconnect(self, resume_id: Optional[str], cwd: Optional[str] = None,
                               reason: str = "reconnect") -> None:
@@ -834,7 +1103,13 @@ class CodexHandle:
                     continue
                 if generation != self._generation:
                     return
-                await self._dispatch(m)
+                await self._dispatch(m, raw_size=len(line))
+                if self._spontaneous_q is not None:
+                    # StreamReader can satisfy many buffered readline() calls
+                    # without yielding. Give the independent bridge consumer one
+                    # scheduling opportunity per frame; never wait for its relay
+                    # I/O or for queue capacity.
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -848,6 +1123,7 @@ class CodexHandle:
                 self._dead = True
                 spontaneous_turn_id = self._spontaneous_turn_id
                 self._spontaneous_turn_id = None
+                self._close_spontaneous_stream(spontaneous_turn_id)
                 self.turn_active = False
                 # The process can no longer receive approval responses.  Release
                 # any AskUser callbacks tied to this generation immediately.
@@ -863,7 +1139,66 @@ class CodexHandle:
                     await self._publish_turn_lifecycle(
                         "completed", spontaneous_turn_id)
 
-    async def _dispatch(self, m: dict) -> None:
+    def _notification_is_current(self, message: dict) -> bool:
+        """Fail closed for app-server notifications owned by another turn.
+
+        One app-server process can report delayed activity for a thread/turn that
+        is not the response currently consumed by ``Machine._run_turn``. Filter
+        before state updates and queueing so those frames cannot reset the idle
+        watchdog, close the active queue, or appear in the wrong conversation.
+        """
+        method = message.get("method")
+        target_thread_id = _notification_thread_id(message)
+        if (target_thread_id is not None and self.thread_id is not None
+                and target_thread_id != self.thread_id):
+            log.warning("foreign codex thread notification dropped", method=method)
+            return False
+        target_turn_id = _notification_turn_id(message)
+        if (not _is_turn_notification(method)
+                and method not in {"error", "thread/compacted"}):
+            return True
+
+        if method == "turn/started":
+            if target_turn_id is None:
+                log.warning("unattributed codex turn notification dropped",
+                            method=method)
+                return False
+            if (self.turn_active and self.turn_id is not None
+                    and self.turn_id != target_turn_id):
+                log.warning("foreign codex turn notification dropped",
+                            method=method)
+                return False
+            self.turn_id = target_turn_id
+            self.remember_owned_turn_id(target_turn_id)
+            return True
+
+        if target_turn_id is not None:
+            if self.turn_id is None:
+                if not (self.turn_active or self.turn_start_pending):
+                    log.warning("orphan codex turn notification dropped",
+                                method=method)
+                    return False
+                # app-server may deliver item/completed before the turn/start RPC
+                # response is scheduled. The first attributed frame claims it.
+                self.turn_id = target_turn_id
+                self.remember_owned_turn_id(target_turn_id)
+            if target_turn_id != self.turn_id:
+                log.warning("foreign codex turn notification dropped",
+                            method=method)
+                return False
+            return True
+
+        # Thread-scoped hooks legitimately use turnId=null. All other item/turn
+        # notifications in the v2 schema are attributable; dropping a malformed
+        # one is safer than guessing which active reply owns it.
+        if method == "error":
+            return self.turn_active
+        if isinstance(method, str) and method.startswith("hook/"):
+            return self.turn_active
+        log.warning("unattributed codex turn notification dropped", method=method)
+        return False
+
+    async def _dispatch(self, m: dict, raw_size: Optional[int] = None) -> None:
         has_id = "id" in m
         has_method = "method" in m
         if has_id and not has_method:                       # response to our request
@@ -894,6 +1229,9 @@ class CodexHandle:
             return
         # notification
         method = m.get("method")
+        if not self._notification_is_current(m):
+            return
+        completed_spontaneous_turn_id: Optional[str] = None
         if method == "thread/started" and not self.thread_id:
             self.thread_id = _thread_id_of_notif(m)
         elif method == "turn/started":
@@ -915,6 +1253,9 @@ class CodexHandle:
                 # bounded queue and deadlock the sole stdout reader.
                 self._turn_q = None
                 self._spontaneous_turn_id = turn_id
+                self._open_spontaneous_stream(turn_id)
+                # The machine callback only claims state and schedules its raw
+                # consumer; it deliberately performs no relay I/O on this reader.
                 await self._publish_turn_lifecycle("started", turn_id)
         elif method == "thread/tokenUsage/updated":
             tu = (m.get("params") or {}).get("tokenUsage")
@@ -975,14 +1316,23 @@ class CodexHandle:
                 and (not completed_turn_id
                      or completed_turn_id == spontaneous_turn_id)
             ):
-                self._spontaneous_turn_id = None
-                await self._publish_turn_lifecycle(
-                    "completed", spontaneous_turn_id)
-        if self._turn_q is not None:
+                completed_spontaneous_turn_id = spontaneous_turn_id
+        if self._turn_q is not None and _is_turn_queue_notification(method):
             queue = self._turn_q
             await queue.put(m)
             if method == "turn/completed":
                 await queue.put(None)
+        elif (_is_turn_queue_notification(method)
+              and self._spontaneous_turn_id is not None):
+            self._queue_spontaneous_notification(m, raw_size)
+        if completed_spontaneous_turn_id is not None:
+            self._spontaneous_turn_id = None
+            await self._publish_turn_lifecycle(
+                "completed", completed_spontaneous_turn_id)
+        if method == "turn/completed":
+            completed_turn_id = _notification_turn_id(m)
+            if completed_turn_id == self.turn_id:
+                self.turn_id = None
 
     @staticmethod
     def _force_turn_sentinel(queue: asyncio.Queue) -> None:

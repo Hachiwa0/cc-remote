@@ -55,7 +55,10 @@ from claude_agent_sdk import (
     fork_session, get_session_info, get_session_messages, list_sessions,
     rename_session, tag_session,
 )
-from claude_agent_sdk.types import ResultMessage
+from claude_agent_sdk.types import (
+    HookEventMessage, ResultMessage, TaskNotificationMessage,
+    TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage,
+)
 
 from cc_remote.attachments import decode_attachment, validate_attachments
 from cc_remote.config import WrapperConfig
@@ -75,8 +78,11 @@ from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.wrapper.stream import (
     StreamTranslator, extract_session_id, extract_model,
     translate_history, last_assistant_model, transcript_timestamps, transcript_path,
+    translate_subagent_history, merge_subagent_history,
 )
-from cc_remote.wrapper.codex_handle import CodexHandle
+from cc_remote.wrapper.codex_handle import (
+    CodexHandle, CodexSpontaneousClosed, CodexSpontaneousOverflow,
+)
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator, codex_session_id, is_turn_terminal, codex_translate_history,
 )
@@ -552,6 +558,15 @@ class WrapperMachine:
                     await self._watch_task
                 except asyncio.CancelledError:
                     pass
+            spontaneous_tasks = [
+                c.codex_spontaneous_task for c in self.sessions.values()
+                if c.codex_spontaneous_task is not None
+                and not c.codex_spontaneous_task.done()
+            ]
+            for task in spontaneous_tasks:
+                task.cancel()
+            if spontaneous_tasks:
+                await asyncio.gather(*spontaneous_tasks, return_exceptions=True)
             await self.transport.stop()
             for c in list(self.sessions.values()):
                 disconnected = False
@@ -1515,6 +1530,9 @@ class WrapperMachine:
                             transcript_timestamps(sid))
                 msgs, tss = await asyncio.to_thread(_read)
                 events = translate_history(msgs, self.cfg.tool_result_max, timestamps=tss)
+                subagent_events = await asyncio.to_thread(
+                    translate_subagent_history, sid, self.cfg.tool_result_max)
+                events = merge_subagent_history(events, subagent_events)
                 mdl = last_assistant_model(msgs)
             except Exception as e:
                 log.warning("get_history failed", session_id=sid, error=str(e))
@@ -1524,16 +1542,62 @@ class WrapperMachine:
                 if restored_files and not ev.files:
                     ev.files = restored_files
             ev.sid = sid
-        # Group events into turns at each user_msg boundary (a turn = one user
-        # message + the assistant's reply); leading non-user events form group 0.
+        # Claude history has one visible turn per user_msg. Codex can additionally
+        # create goal/background continuations with no user_message after the prior
+        # turn has already completed. Preserve those as independent pages by closing
+        # a Codex history group at every authoritative TurnEnd; otherwise an
+        # arbitrarily long goal would collapse into the preceding user's page.
         turns: list[list] = []
-        for ev in events:
-            if getattr(ev, "type", None) == "user_msg" or not turns:
-                turns.append([])
-            turns[-1].append(ev)
+        if is_codex_hist:
+            current: list = []
+            for ev in events:
+                event_type = getattr(ev, "type", None)
+                if event_type == "user_msg" and current:
+                    # Retain a malformed/legacy unterminated prefix rather than
+                    # attaching it to the next real user turn.
+                    turns.append(current)
+                    current = []
+                current.append(ev)
+                if event_type == "turn_end":
+                    turns.append(current)
+                    current = []
+            if current:
+                turns.append(current)
+        else:
+            # Claude keeps the legacy grouping contract: a turn is one user
+            # message plus its reply; leading non-user events form group 0.
+            for ev in events:
+                if getattr(ev, "type", None) == "user_msg" or not turns:
+                    turns.append([])
+                turns[-1].append(ev)
 
         def _tid(grp):
-            return next((e.msg_id for e in grp if getattr(e, "type", None) == "user_msg"), None)
+            user_cursor = next(
+                (e.msg_id for e in grp
+                 if getattr(e, "type", None) == "user_msg"),
+                None,
+            )
+            if user_cursor or not is_codex_hist:
+                return user_cursor
+            # An assistant-only Codex turn has no user msg_id. Its terminal app-
+            # server turn id is authoritative and remains stable across reparses.
+            terminal_cursor = next(
+                (getattr(e, "turn_id", None) for e in reversed(grp)
+                 if getattr(e, "type", None) == "turn_end"
+                 and getattr(e, "turn_id", None)),
+                None,
+            )
+            if terminal_cursor:
+                return terminal_cursor
+            # In-progress/legacy assistant-only records may not have reached a
+            # terminal boundary yet. Translator-generated item ids are deterministic
+            # for the same rollout record, so they are a stable best-effort cursor.
+            for event in grp:
+                for field in ("message_id", "item_id", "tool_use_id"):
+                    cursor = getattr(event, field, None)
+                    if cursor:
+                        return cursor
+            return None
 
         # Select the page of turns: newest `limit` turns, ending before `before`.
         end = len(turns)
@@ -2033,10 +2097,14 @@ class WrapperMachine:
         self.sessions.pop(ctx.key, None)
         disconnected = False
         try:
-            turn_task = ctx.turn_task
-            if turn_task and not turn_task.done():
-                turn_task.cancel()
-                await asyncio.gather(turn_task, return_exceptions=True)
+            tasks = {
+                task for task in (ctx.turn_task, ctx.codex_spontaneous_task)
+                if task is not None and not task.done()
+            }
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             await ctx.sdk.disconnect()
             disconnected = True
         except Exception as e:
@@ -2156,17 +2224,59 @@ class WrapperMachine:
         """
         await self._emit(ctx, GoalState(goal=goal))
 
+    async def _on_claude_background_message(
+        self, ctx: SessionContext, message, turn_id: str | None,
+    ) -> None:
+        """Forward Claude task/hook lifecycle frames emitted after Result.
+
+        SdkHandle is the sole consumer of the SDK Query stream and calls this
+        only while no managed turn owns a response.  A fresh translator is
+        sufficient because stable item -> origin-turn/title/kind maps live on
+        the SessionContext and are shared across all translator instances.
+        """
+        thread_id = ctx.session_id or ctx.key
+        if not thread_id:
+            return
+        goal_changed, goal = ctx.sdk.observe_goal_message(
+            message, thread_id)
+        if goal_changed and ctx.goal_visible:
+            await self._emit(ctx, GoalState(goal=goal))
+        if not isinstance(message, (
+            HookEventMessage, TaskStartedMessage, TaskProgressMessage,
+            TaskUpdatedMessage, TaskNotificationMessage,
+        )):
+            return
+        translator = StreamTranslator(
+            self.cfg.tool_result_max,
+            turn_id=turn_id,
+            item_turns=ctx.claude_item_turns,
+            item_titles=ctx.claude_item_titles,
+            item_meta=ctx.claude_item_meta,
+        )
+        for event in translator.feed(message):
+            await self._emit(ctx, event)
+
     async def _on_codex_turn_lifecycle(
         self, ctx: SessionContext, phase: str, turn_id: str,
     ) -> None:
-        """Mirror a Codex turn that app-server started without query().
+        """Claim and schedule a Codex turn that started without ``query()``.
 
-        Goal loops and automatic continuations have no Machine._run_turn
-        consumer, but they still own the thread. Keep the same single-writer
-        state/interrupt contract as a normal remote turn and only unlock on the
-        matching authoritative completion notification.
+        This callback runs on the sole app-server stdout reader.  Its normal path
+        intentionally performs no relay I/O: state is claimed synchronously and a
+        separate task drains the handle's bounded raw-notification bridge.
         """
         if phase == "started":
+            if (ctx.codex_spontaneous_turn_id == turn_id
+                    and ctx.codex_spontaneous_task is not None):
+                return
+            if (ctx.codex_spontaneous_turn_id is not None
+                    and ctx.codex_spontaneous_turn_id != turn_id):
+                log.warning(
+                    "overlapping codex spontaneous turn ignored",
+                    active_turn_id=ctx.codex_spontaneous_turn_id,
+                    incoming_turn_id=turn_id,
+                )
+                return
             ctx.codex_spontaneous_turn_id = turn_id
             if ctx.turn_task is not None:
                 # A user send claimed the session but has not reached turn/start
@@ -2174,14 +2284,38 @@ class WrapperMachine:
                 # Abort that launch rather than write concurrently with the
                 # automatic turn that won the race.
                 ctx.interrupt_event.set()
-            if ctx.state == "idle":
+            announce_running = ctx.state == "idle"
+            if announce_running:
                 ctx.interrupt_event.clear()
                 ctx.interrupt_deadline = None
-                await self._set_state(ctx, "running")
+                # Claim before yielding so an incoming query cannot slip between
+                # turn/started and the bridge consumer's first scheduled step.
+                ctx.state = "running"
+            task = asyncio.create_task(self._run_codex_spontaneous_turn(
+                ctx, turn_id, announce_running=announce_running))
+            ctx.codex_spontaneous_task = task
             return
         if phase != "completed" or ctx.codex_spontaneous_turn_id != turn_id:
             return
+        # The raw consumer receives the same authoritative turn/completed frame
+        # and owns final emission/unlock. This fallback covers a direct lifecycle
+        # callback or an unexpectedly failed consumer without double-emitting.
+        task = ctx.codex_spontaneous_task
+        if task is not None and not task.done():
+            return
+        await self._finish_codex_spontaneous_turn(ctx, turn_id)
+
+    async def _finish_codex_spontaneous_turn(
+        self, ctx: SessionContext, turn_id: str,
+    ) -> None:
+        if ctx.codex_spontaneous_turn_id != turn_id:
+            return
         ctx.codex_spontaneous_turn_id = None
+        current = asyncio.current_task()
+        if (ctx.codex_spontaneous_task is current
+                or (ctx.codex_spontaneous_task is not None
+                    and ctx.codex_spontaneous_task.done())):
+            ctx.codex_spontaneous_task = None
         ctx.active_msg_id = None
         ctx.interrupt_deadline = None
         ctx.interrupt_event.clear()
@@ -2191,6 +2325,134 @@ class WrapperMachine:
         # _run_turn against the same SessionContext.
         if ctx.turn_task is None and ctx.state != "idle":
             await self._set_state(ctx, "idle")
+
+    async def _run_codex_spontaneous_turn(
+        self, ctx: SessionContext, turn_id: str, *, announce_running: bool,
+    ) -> None:
+        """Translate one goal/automatic turn from the handle's bounded bridge."""
+        translator = CodexStreamTranslator(self.cfg.tool_result_max)
+        overflowed = False
+        terminal_seen = False
+        stream_closed = False
+        try:
+            if announce_running:
+                await self._emit(ctx, StateEvent(state="running"))
+                log.info("state transition", sid=ctx.session_id, state="running")
+
+            # A continuation can win just as the preceding managed consumer is
+            # unwinding. Preserve wire order: its TurnEnd must land before this
+            # new empty-prompt turn begins.
+            managed_task = ctx.turn_task
+            if managed_task is not None and managed_task is not asyncio.current_task():
+                await asyncio.shield(managed_task)
+            if ctx.codex_spontaneous_turn_id != turn_id:
+                return
+
+            # Automatic continuations have no user prompt. A real empty anchor
+            # gives their assistant/process events a stable turn owner without
+            # rendering a fabricated user bubble.
+            await self._emit(ctx, UserMsg(msg_id=turn_id, prompt=""))
+
+            async for raw in ctx.sdk.receive_spontaneous_response(turn_id):
+                if isinstance(raw, CodexSpontaneousOverflow):
+                    overflowed = True
+                    if ctx.state == "running":
+                        await self._emit(ctx, StateEvent(
+                            state="running",
+                            phase="waiting",
+                            detail=("部分实时过程因本机积压未展示；回合结束后可刷新历史。"),
+                            msg_id=turn_id,
+                        ))
+                    continue
+                if isinstance(raw, CodexSpontaneousClosed):
+                    stream_closed = True
+                    break
+                if not isinstance(raw, dict):
+                    continue
+
+                events = translator.feed(raw)
+                terminal = is_turn_terminal(raw)
+                if overflowed and terminal:
+                    # Feed the terminal frame so open assistant blocks close, but
+                    # replace its misleading "empty upstream" failure with the
+                    # authoritative local-overflow error below.
+                    events = [event for event in events
+                              if not isinstance(event, (Error, TurnEnd))]
+                for event in events:
+                    if isinstance(event, Error) and event.msg_id is None:
+                        event.msg_id = turn_id
+                    if isinstance(event, StateEvent) and event.detail:
+                        if ctx.state != "running":
+                            continue
+                        event.state = ctx.state
+                        if event.msg_id is None:
+                            event.msg_id = turn_id
+                    await self._emit(ctx, event)
+                if terminal:
+                    terminal_seen = True
+                    break
+
+            if overflowed and terminal_seen:
+                await self._emit(ctx, Error(
+                    code=ERR_CC_CRASH,
+                    message=("Codex 实时事件积压，部分过程未能同步；"
+                             "请刷新会话以从历史恢复。"),
+                    msg_id=turn_id,
+                ))
+                await self._emit(ctx, TurnEnd(
+                    result=TurnResult(
+                        subtype="error",
+                        duration_ms=0,
+                        is_error=True,
+                    ),
+                    turn_id=turn_id,
+                ))
+            elif stream_closed and not terminal_seen:
+                synthetic = {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": turn_id,
+                        "status": "failed",
+                        "error": {"message": "Codex app-server connection closed"},
+                    }},
+                }
+                for event in translator.feed(synthetic):
+                    if isinstance(event, Error) and event.msg_id is None:
+                        event.msg_id = turn_id
+                    await self._emit(ctx, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "codex spontaneous turn consumer failed",
+                turn_id=turn_id,
+                error_type=type(exc).__name__,
+            )
+            try:
+                await self._emit(ctx, Error(
+                    code=ERR_CC_CRASH,
+                    message="Codex 自动回合实时同步失败；请刷新会话。",
+                    msg_id=turn_id,
+                ))
+                await self._emit(ctx, TurnEnd(
+                    result=TurnResult(
+                        subtype="error", duration_ms=0, is_error=True),
+                    turn_id=turn_id,
+                ))
+            except Exception:
+                log.warning(
+                    "codex spontaneous failure event could not be emitted",
+                    turn_id=turn_id,
+                )
+        finally:
+            try:
+                await self._finish_codex_spontaneous_turn(ctx, turn_id)
+            except Exception as exc:
+                log.warning(
+                    "codex spontaneous turn cleanup failed",
+                    turn_id=turn_id,
+                    error_type=type(exc).__name__,
+                )
 
     async def _set_idle_after_managed_turn(self, ctx: SessionContext) -> None:
         """Do not unlock a thread already claimed by an automatic continuation."""
@@ -4369,6 +4631,9 @@ class WrapperMachine:
                 lambda tool, tool_input, permission_context:
                 self._on_claude_tool_permission(
                     ctx, tool, tool_input, permission_context))
+            ctx.sdk.background_message_callback = (
+                lambda message, turn_id: self._on_claude_background_message(
+                    ctx, message, turn_id))
         else:
             ctx.sdk.approval_callback = (
                 lambda method, params: self._on_codex_approval(
@@ -4491,6 +4756,9 @@ class WrapperMachine:
                 lambda tool, tool_input, permission_context:
                 self._on_claude_tool_permission(
                     ctx, tool, tool_input, permission_context))
+            ctx.sdk.background_message_callback = (
+                lambda message, turn_id: self._on_claude_background_message(
+                    ctx, message, turn_id))
         else:
             ctx.sdk.approval = parent.sdk.approval
             ctx.sdk.approval_callback = (
@@ -4536,6 +4804,9 @@ class WrapperMachine:
             return
         try:
             events = translate_history(msgs, self.cfg.tool_result_max)
+            subagent_events = await asyncio.to_thread(
+                translate_subagent_history, session_id, self.cfg.tool_result_max)
+            events = merge_subagent_history(events, subagent_events)
             mdl = last_assistant_model(msgs)
         except Exception as e:
             # a single malformed history message must never break the resume — the
@@ -4695,7 +4966,13 @@ class WrapperMachine:
                         images: Optional[list] = None, files: Optional[list] = None) -> None:
         is_codex = ctx.engine == "codex"
         ctx.translator = (CodexStreamTranslator(self.cfg.tool_result_max) if is_codex
-                          else StreamTranslator(self.cfg.tool_result_max))
+                          else StreamTranslator(
+                              self.cfg.tool_result_max,
+                              turn_id=ctx.active_msg_id,
+                              item_turns=ctx.claude_item_turns,
+                              item_titles=ctx.claude_item_titles,
+                              item_meta=ctx.claude_item_meta,
+                          ))
         # Backpressure the SDK reader if downstream handling stalls. Without a
         # bound, a slow relay/client could make one verbose model turn grow this
         # process until OOM even though transport queues themselves are bounded.
@@ -4937,8 +5214,10 @@ class WrapperMachine:
                         yield {"type": "user", "message": {"role": "user", "content": content},
                                "parent_tool_use_id": None}
 
+                    ctx.sdk.next_turn_id = ctx.active_msg_id
                     await ctx.sdk.query(msg_stream())
                 else:
+                    ctx.sdk.next_turn_id = ctx.active_msg_id
                     await ctx.sdk.query(prompt)
             # Codex sessions don't emit a Model event like cc's init SystemMessage,
             # so announce the configured codex model (gpt-*) once — else the header
@@ -5007,15 +5286,25 @@ class WrapperMachine:
                 if isinstance(msg, ResultMessage):
                     break
 
-            if not is_codex and ctx.session_id:
+            if not is_codex:
                 # ResultMessage closes the SDK response iterator; wait for its
-                # reader task to release the single consumer before consulting
-                # the transcript that Claude has just flushed.
+                # reader task to release the turn queue, then allow the sole
+                # session-long SDK reader to deliver messages that followed the
+                # processed Result. This preserves raw ordering: TurnEnd reaches
+                # the UI before a delayed task/hook update from the same queue.
                 if reader_task is not None:
                     await reader_task
+
+            if not is_codex and ctx.session_id:
                 goal = await ctx.sdk.refresh_goal(ctx.session_id)
                 if ctx.goal_visible:
                     await self._emit(ctx, GoalState(goal=goal))
+
+            if not is_codex:
+                release_background = getattr(
+                    ctx.sdk, "release_background_messages", None)
+                if release_background is not None:
+                    release_background()
 
             await self._set_idle_after_managed_turn(ctx)
         except asyncio.TimeoutError:
@@ -5047,6 +5336,11 @@ class WrapperMachine:
                 msg_id=ctx.active_msg_id))
             await self._set_idle_after_managed_turn(ctx)
         finally:
+            if not is_codex:
+                release_background = getattr(
+                    ctx.sdk, "release_background_messages", None)
+                if release_background is not None:
+                    release_background()
             ctx.translator = None
             ctx.turn_task = None
             if ctx.codex_spontaneous_turn_id is None:

@@ -804,6 +804,65 @@ def test_codex_history_goal_continuation_after_completed_turn_is_own_turn(tmp_pa
         "turn-user", "turn-goal"]
 
 
+def test_codex_history_goal_continuations_page_as_independent_turns(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout-goal-pages.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-1"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-user"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "start goal"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "first answer"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-user"}},
+    ]
+    for index in range(1, 4):
+        rows.extend([
+            {"timestamp": f"2026-01-01T00:0{index}:01Z", "type": "event_msg",
+             "payload": {"type": "task_started",
+                         "turn_id": f"turn-goal-{index}"}},
+            {"timestamp": f"2026-01-01T00:0{index}:02Z", "type": "event_msg",
+             "payload": {"type": "agent_message",
+                         "message": f"goal progress {index}"}},
+            {"timestamp": f"2026-01-01T00:0{index}:03Z", "type": "event_msg",
+             "payload": {"type": "task_complete",
+                         "turn_id": f"turn-goal-{index}"}},
+        ])
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.machine.codex_rollout_path", lambda sid: str(rollout)
+    )
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "codex"
+        machine.sessions["session-1"] = ctx
+
+        newest = await machine._build_history("session-1", limit=2)
+        assert newest.oldest_id == "turn-goal-2"
+        assert newest.newest_id == "turn-goal-3"
+        assert newest.has_more is True
+        assert not any(row["type"] == "user_msg" for row in newest.events)
+        assert [row.get("turn_id") for row in newest.events
+                if row["type"] == "turn_end"] == [
+                    "turn-goal-2", "turn-goal-3"]
+
+        older = await machine._build_history(
+            "session-1", before=newest.oldest_id, limit=2)
+        assert older.oldest_id == "turn-user"
+        assert older.newest_id == "turn-goal-1"
+        assert older.has_more is False
+        assert [row.get("turn_id") for row in older.events
+                if row["type"] == "turn_end"] == [
+                    "turn-user", "turn-goal-1"]
+
+    asyncio.run(run())
+
+
 def test_codex_history_restores_final_text_after_tools_from_task_complete(tmp_path):
     rollout = tmp_path / "rollout-tool-final.jsonl"
     rows = [

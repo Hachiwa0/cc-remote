@@ -1,6 +1,11 @@
 // Mirror of cc_remote/protocol.py. Kept in sync manually (generate later).
 
 export type State = "idle" | "running" | "interrupting" | "draining";
+export type AssistantChannel = "unknown" | "thinking" | "commentary" | "final";
+export type ToolCategory = "tool" | "command" | "file" | "mcp" | "agent" | "server_tool" | "web_search";
+export type ProcessKind = "reasoning" | "plan" | "command" | "file_change" | "mcp" | "agent" | "hook" | "server_tool" | "web_search" | "task" | "terminal" | "diff" | "compaction";
+export type ProcessPhase = "start" | "update" | "end" | "snapshot";
+export type ProcessStatus = "pending" | "running" | "succeeded" | "failed" | "declined" | "cancelled" | "interrupted" | "unknown";
 
 interface Base {
   v: number;
@@ -78,11 +83,66 @@ export interface SessionForked extends Base {
   target: "same_cwd" | "worktree";
 }
 export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
-export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string }
-export interface Delta extends Base { type: "delta"; message_id: string; text: string }
-export interface ToolUse extends Base { type: "tool_use"; message_id: string; tool_use_id: string; tool: string; input: Record<string, unknown> }
-export interface ToolResult extends Base { type: "tool_result"; tool_use_id: string; content: string; is_error: boolean; truncated?: boolean | null }
-export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string }
+export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string; channel?: AssistantChannel }
+export interface Delta extends Base { type: "delta"; message_id: string; text: string; channel?: AssistantChannel }
+export interface ToolUse extends Base {
+  type: "tool_use";
+  message_id: string;
+  tool_use_id: string;
+  tool: string;
+  input: Record<string, unknown>;
+  category?: ToolCategory;
+  title?: string | null;
+  parent_id?: string | null;
+  server?: string | null;
+}
+export interface ToolDelta extends Base {
+  type: "tool_delta";
+  tool_use_id: string;
+  stream: "progress" | "output" | "diff" | "summary" | "terminal";
+  delta: string;
+}
+export interface ToolResult extends Base {
+  type: "tool_result";
+  tool_use_id: string;
+  content: string;
+  is_error: boolean;
+  truncated?: boolean | null;
+  status?: ProcessStatus | null;
+  summary?: string | null;
+  diff?: string | null;
+  exit_code?: number | null;
+  duration_ms?: number | null;
+}
+export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string; channel?: AssistantChannel }
+export interface ProcessEvent extends Base {
+  type: "process";
+  item_id: string;
+  kind: ProcessKind;
+  phase: ProcessPhase;
+  status: ProcessStatus;
+  turn_id?: string | null;
+  parent_id?: string | null;
+  title: string;
+  summary?: string | null;
+  detail?: string | null;
+  input?: Record<string, unknown> | null;
+  output?: string | null;
+  diff?: string | null;
+  progress?: string | null;
+  append_to?: "summary" | "detail" | "output" | "diff" | "progress" | null;
+  delta?: string | null;
+  server?: string | null;
+  tool?: string | null;
+  command?: string | null;
+  cwd?: string | null;
+  exit_code?: number | null;
+  duration_ms?: number | null;
+  truncated?: boolean | null;
+}
+export interface PlanEntry { step: string; status: "pending" | "inProgress" | "completed" }
+export interface TurnPlan extends Base { type: "turn_plan"; item_id: string; turn_id?: string | null; explanation?: string | null; plan: PlanEntry[] }
+export interface TurnDiff extends Base { type: "turn_diff"; item_id: string; turn_id?: string | null; diff: string; truncated?: boolean | null }
 export interface TurnResult { subtype: string; duration_ms: number; is_error: boolean; total_cost_usd?: number | null; num_turns?: number | null }
 export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null }
 export interface ErrorMsg extends Base {
@@ -235,10 +295,11 @@ export type ServerEvent =
   | AskUser | GoalState | StatusReport
   | SessionList | SessionFocus | SessionRekey | SessionForked
   | DirList
-  | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolResult | AssistantMsgEnd
+  | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
+  | ProcessEvent | TurnPlan | TurnDiff
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** Build the correlated message-level fork command for either engine.
  * `last_turn_id` is the protocol-v5 legacy wire name; for Claude its value is

@@ -49,6 +49,12 @@ class SessionContext:
     interrupt_event: asyncio.Event = field(default_factory=asyncio.Event)
     interrupt_deadline: Optional[float] = None
     translator: Optional[StreamTranslator] = None
+    # Claude's SDK response queue outlives one ResultMessage. Background task
+    # updates can therefore be consumed by the next turn's translator; preserve
+    # their original turn/title by stable item id across translator instances.
+    claude_item_turns: dict[str, str] = field(default_factory=dict)
+    claude_item_titles: dict[str, str] = field(default_factory=dict)
+    claude_item_meta: dict[str, tuple[str, str | None]] = field(default_factory=dict)
     # /btw ephemeral fork: a throwaway side-session forked from `parent_sid` that
     # inherits its context. Never persisted, excluded from the session list, and
     # discarded on close. Its turns reuse the normal _run_turn path.
@@ -69,6 +75,7 @@ class SessionContext:
     # machine calling query(). Their lifecycle is delivered separately from the
     # managed turn stream so the session remains single-writer and interruptible.
     codex_spontaneous_turn_id: Optional[str] = None
+    codex_spontaneous_task: Optional[asyncio.Task] = None
     # ---- external-write mirroring (a native `claude`/`codex` in the user's
     # terminal owns this session and is appending to its transcript) ----
     # epoch of the last append this wrapper did NOT make. Recent => the session is

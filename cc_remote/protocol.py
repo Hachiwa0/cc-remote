@@ -28,10 +28,24 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
+AssistantChannel = Literal["unknown", "thinking", "commentary", "final"]
+ToolCategory = Literal[
+    "tool", "command", "file", "mcp", "agent", "server_tool", "web_search",
+]
+ProcessKind = Literal[
+    "reasoning", "plan", "command", "file_change", "mcp", "agent", "hook",
+    "server_tool", "web_search", "task", "terminal", "diff", "compaction",
+]
+ProcessPhase = Literal["start", "update", "end", "snapshot"]
+ProcessStatus = Literal[
+    "pending", "running", "succeeded", "failed", "declined", "cancelled",
+    "interrupted", "unknown",
+]
+ProcessAppendTarget = Literal["summary", "detail", "output", "diff", "progress"]
 CodexThreadStatus = Literal["notLoaded", "idle", "systemError", "active"]
 EffortLevel = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -124,6 +138,12 @@ class AskOption(TypedDict):
     __pydantic_config__ = ConfigDict(extra="forbid")
     label: AskOptionLabel
     ds: NotRequired[AskOptionDescription]
+
+
+class PlanEntry(TypedDict):
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    step: Annotated[str, StringConstraints(min_length=1, max_length=16 * 1024)]
+    status: Literal["pending", "inProgress", "completed"]
 
 
 def _attachment_count(images, files) -> int:
@@ -397,12 +417,17 @@ class UserMsg(_Base):
 class AssistantMsgStart(_Base):
     type: Literal["assistant_msg_start"] = "assistant_msg_start"
     message_id: WireId
+    channel: AssistantChannel = "unknown"
 
 
 class Delta(_Base):
     type: Literal["delta"] = "delta"
     message_id: WireId
     text: str
+    # Some engines only reveal whether text is commentary or final on the
+    # assembled message. Repeating the channel on deltas/end lets the client
+    # promote a provisional block without duplicating it.
+    channel: AssistantChannel = "unknown"
 
 
 class ToolUse(_Base):
@@ -411,6 +436,18 @@ class ToolUse(_Base):
     tool_use_id: WireId
     tool: str
     input: dict[str, Any]
+    category: ToolCategory = "tool"
+    title: Optional[str] = Field(default=None, max_length=1024)
+    parent_id: Optional[WireId] = None
+    server: Optional[str] = Field(default=None, max_length=1024)
+
+
+class ToolDelta(_Base):
+    """Incremental progress/output for a previously-started tool call."""
+    type: Literal["tool_delta"] = "tool_delta"
+    tool_use_id: WireId
+    stream: Literal["progress", "output", "diff", "summary", "terminal"]
+    delta: str = Field(max_length=512 * 1024)
 
 
 class ToolResult(_Base):
@@ -419,11 +456,65 @@ class ToolResult(_Base):
     content: str
     is_error: bool
     truncated: Optional[bool] = None
+    status: Optional[ProcessStatus] = None
+    summary: Optional[str] = Field(default=None, max_length=64 * 1024)
+    diff: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
+    exit_code: Optional[int] = None
+    duration_ms: Optional[int] = Field(default=None, ge=0)
 
 
 class AssistantMsgEnd(_Base):
     type: Literal["assistant_msg_end"] = "assistant_msg_end"
     message_id: WireId
+    channel: AssistantChannel = "unknown"
+
+
+class ProcessEvent(_Base):
+    """Engine-neutral lifecycle event rendered inside one turn's process UI.
+
+    Tool calls retain ToolUse/ToolDelta/ToolResult for compatibility. This event
+    carries non-tool rich-client activities such as plans, hooks, collaboration,
+    compaction, and structured app-server lifecycle updates.
+    """
+    type: Literal["process"] = "process"
+    item_id: WireId
+    kind: ProcessKind
+    phase: ProcessPhase
+    status: ProcessStatus = "unknown"
+    turn_id: Optional[WireId] = None
+    parent_id: Optional[WireId] = None
+    title: str = Field(min_length=1, max_length=1024)
+    summary: Optional[str] = Field(default=None, max_length=64 * 1024)
+    detail: Optional[str] = Field(default=None, max_length=256 * 1024)
+    input: Optional[dict[str, Any]] = None
+    output: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
+    diff: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
+    progress: Optional[str] = Field(default=None, max_length=64 * 1024)
+    append_to: Optional[ProcessAppendTarget] = None
+    delta: Optional[str] = Field(default=None, max_length=512 * 1024)
+    server: Optional[str] = Field(default=None, max_length=1024)
+    tool: Optional[str] = Field(default=None, max_length=1024)
+    command: Optional[str] = Field(default=None, max_length=256 * 1024)
+    cwd: Optional[str] = Field(default=None, max_length=16 * 1024)
+    exit_code: Optional[int] = None
+    duration_ms: Optional[int] = Field(default=None, ge=0)
+    truncated: Optional[bool] = None
+
+
+class TurnPlan(_Base):
+    type: Literal["turn_plan"] = "turn_plan"
+    item_id: WireId
+    turn_id: Optional[WireId] = None
+    explanation: Optional[str] = Field(default=None, max_length=64 * 1024)
+    plan: list[PlanEntry] = Field(max_length=128)
+
+
+class TurnDiff(_Base):
+    type: Literal["turn_diff"] = "turn_diff"
+    item_id: WireId
+    turn_id: Optional[WireId] = None
+    diff: str = Field(max_length=2 * 1024 * 1024)
+    truncated: Optional[bool] = None
 
 
 class TurnResult(BaseModel):
@@ -835,7 +926,9 @@ class GetHistory(_Command):
     session_id: WireId
     client_id: Optional[WireId] = None  # requester, so the wrapper routes History back to=<client_id>
     cwd: Optional[str] = Field(default=None, max_length=4096)
-    before: Optional[WireId] = None  # oldest already-loaded turn's msg_id — page strictly older than this
+    # Stable cursor for the oldest loaded turn: a user msg_id normally, or the
+    # authoritative engine turn_id for an assistant-only automatic continuation.
+    before: Optional[WireId] = None
     limit: Optional[int] = Field(default=None, ge=1, le=200)
 
 
@@ -850,8 +943,8 @@ class History(_Base):
     session_id: WireId
     events: list[dict[str, Any]] = []
     has_more: bool = False            # older turns exist beyond what's returned (pagination)
-    oldest_id: Optional[str] = None   # first returned turn's msg_id — cursor for load-more
-    newest_id: Optional[str] = None   # last returned turn's msg_id
+    oldest_id: Optional[str] = None   # first returned stable turn cursor
+    newest_id: Optional[str] = None   # last returned stable turn cursor
     before: Optional[str] = None      # echoes the request's `before`: set => this is an OLDER page (client prepends)
     # True => this session's transcript is being appended to by an EXTERNAL process
     # (a native `claude`/`codex` in the user's terminal), not by us. The wrapper
@@ -959,7 +1052,8 @@ AnyMessage = Union[
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
-    UserMsg, AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
+    UserMsg, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
+    AssistantMsgEnd, ProcessEvent, TurnPlan, TurnDiff,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
 
@@ -968,8 +1062,9 @@ AnyMessage = Union[
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
     "user_msg", "state", "model", "effort", "perm", "fast", "btw_opened",
-    "assistant_msg_start", "delta", "tool_use", "tool_result",
-    "assistant_msg_end", "turn_end", "error", "ask_user",
+    "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
+    "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_end",
+    "error", "ask_user",
 })
 
 _TYPE_MAP: dict[str, type[BaseModel]] = {
@@ -1029,8 +1124,12 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "assistant_msg_start": AssistantMsgStart,
     "delta": Delta,
     "tool_use": ToolUse,
+    "tool_delta": ToolDelta,
     "tool_result": ToolResult,
     "assistant_msg_end": AssistantMsgEnd,
+    "process": ProcessEvent,
+    "turn_plan": TurnPlan,
+    "turn_diff": TurnDiff,
     "turn_end": TurnEnd,
     "error": Error,
     "wrapper_disconnected": WrapperDisconnected,

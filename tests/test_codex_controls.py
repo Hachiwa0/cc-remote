@@ -767,6 +767,9 @@ def test_codex_goal_auto_turn_claims_session_interrupts_and_completes():
             "method": "turn/completed",
             "params": {"turn": {"id": "auto-1", "status": "interrupted"}},
         })
+        spontaneous_task = ctx.codex_spontaneous_task
+        assert spontaneous_task is not None
+        await spontaneous_task
         assert ctx.state == "idle"
         assert ctx.codex_spontaneous_turn_id is None
         assert [event.state for event in transport.sent

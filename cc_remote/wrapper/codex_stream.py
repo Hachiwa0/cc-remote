@@ -1,38 +1,64 @@
-"""Translate codex app-server notifications into wire-protocol events.
+"""Translate Codex app-server notifications into the remote rich-event model.
 
-Codex analog of stream.py's StreamTranslator: stateful per turn, emits the SAME
-wire events (AssistantMsgStart / Delta / ToolUse / ToolResult / AssistantMsgEnd /
-TurnEnd) so the Codex engine reuses the entire client + reducer unchanged. Fed by
-CodexHandle (codex_handle.py), which yields raw JSON-RPC notification dicts.
-
-Mapping (validated against real gpt-5.5 turns):
-  item/agentMessage/delta {itemId, delta}      -> AssistantMsgStart(once) + Delta
-  item/completed  agentMessage {id, text}      -> AssistantMsgEnd
-  item/started    commandExecution {id, cmd}   -> ToolUse(shell/listFiles/…)
-  item/completed  commandExecution {out, exit} -> ToolResult(is_error = exit != 0)
-  item/*          fileChange / mcpToolCall      -> ToolUse / ToolResult
-  turn/completed  {turn:{status, durationMs}}   -> TurnEnd
-  reasoning / userMessage / hooks / mcp-status  -> skipped (parity with cc)
+Only app-server fields that are explicitly part of its public client protocol are
+forwarded.  In particular, reasoning *summary* is visible, while raw/encrypted
+reasoning and terminal stdin are deliberately ignored.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+import shlex
 from datetime import datetime
+from itertools import islice
 
 from cc_remote.protocol import (
-    AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
-    TurnEnd, TurnResult, UserMsg, Error, StateEvent, ERR_CC_CRASH,
+    AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult, AssistantMsgEnd,
+    ProcessEvent, TurnPlan, TurnDiff, TurnEnd, TurnResult, UserMsg, Error,
+    StateEvent, ERR_CC_CRASH,
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
 
-_TOOL_TYPES = {"commandExecution", "fileChange", "mcpToolCall"}
+_TOOL_TYPES = {
+    "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
+    "webSearch",
+}
+_PROCESS_ITEM_TYPES = {
+    "plan", "reasoning", "collabAgentToolCall", "subAgentActivity",
+    "contextCompaction",
+}
 _MAX_HISTORY_RECORD_CHARS = 16 * 1024 * 1024
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_CREDENTIAL_EXACT_KEYS = frozenset({"env", "environment"})
+_CREDENTIAL_KEY_FRAGMENTS = (
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "authorization",
+    "credential",
+    "cookie",
+    "accesskey",
+    "privatekey",
+    "apikey",
+)
+_REDACTED = "[REDACTED]"
+_REDACTION_BUDGET_EXCEEDED = "<redaction budget exceeded>"
+_REDACTION_REMAINDER_KEY = "<remaining omitted>"
+_MAX_REDACTION_DEPTH = 6
+_MAX_REDACTION_NODES = 2048
+_MAX_REDACTION_DICT_ITEMS = 64
+_MAX_REDACTION_SEQUENCE_ITEMS = 32
 _EMPTY_COMPLETED_MESSAGE = (
     "Codex 回合已结束，但没有返回任何内容；上游服务可能暂时不可用，请重试。"
 )
+_MAX_DELTA_STREAMS = 2048
+_MAX_DELTA_EVENTS_PER_STREAM = 1024
+_MAX_FINISHED_DELTA_ITEMS = 4096
+_MAX_LIVE_ITEMS = 4096
+_LIVE_ITEMS_OMITTED_ID = "cc-remote-live-items-omitted"
+_DELTA_TRUNCATION_NOTICE = "\n…（后续输出已截断）"
 
 
 def _bounded_jsonl_records(file):
@@ -54,60 +80,320 @@ def _bounded_jsonl_records(file):
 class CodexStreamTranslator:
     def __init__(self, tool_result_max: int):
         self.tool_result_max = tool_result_max
-        self._started: set[str] = set()       # agentMessage itemIds that emitted a start
-        self._text_seen: set[str] = set()     # ids with at least one non-empty delta
-        self._open_msg: str | None = None      # currently-open assistant message block
-        self._visible_output = False           # text or a visible tool card this turn
-        self._terminal_error = False            # a non-retrying error was already emitted
+        self._started: set[str] = set()
+        self._text_seen: set[str] = set()
+        self._message_channels: dict[str, str] = {}
+        self._tools_started: set[str] = set()
+        self._reasoning_started: set[str] = set()
+        self._file_diffs: dict[str, str] = {}
+        self._open_msg: str | None = None
+        self._open_channel = "unknown"
+        self._visible_output = False
+        self._terminal_error = False
+        self._delta_chars: dict[tuple[str, str], int] = {}
+        self._delta_events: dict[tuple[str, str], int] = {}
+        self._truncated_delta_streams: set[tuple[str, str]] = set()
+        self._finished_delta_items: set[str] = set()
+        # One translator owns one turn. Keep a fixed admission set instead of
+        # allowing every distinct provider id to grow several parallel maps.
+        # Rejected ids are not tombstoned individually: once full, *all* new ids
+        # stay rejected, so a later completed event cannot resurrect them.
+        self._live_items: set[str] = set()
+        self._live_items_truncated = False
+        self._turn_closed = False
 
     def feed(self, msg: dict) -> list:
         method = msg.get("method")
-        p = msg.get("params") or {}
+        p = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         out: list = []
 
         if method == "item/agentMessage/delta":
-            iid = p.get("itemId") or ""
-            if iid and iid not in self._started:
+            iid = _live_id(p.get("itemId"), "agent-message")
+            if not self._admit_live_item(iid, out):
+                return out
+            channel = self._message_channels.get(iid, "unknown")
+            if iid not in self._started:
+                if self._open_msg is not None and self._open_msg != iid:
+                    self._close_open(out)
                 self._started.add(iid)
                 self._open_msg = iid
-                out.append(AssistantMsgStart(message_id=iid))
-            if p.get("delta"):
+                self._open_channel = channel
+                out.append(AssistantMsgStart(message_id=iid, channel=channel))
+            delta = p.get("delta")
+            if isinstance(delta, str) and delta:
                 self._text_seen.add(iid)
                 self._visible_output = True
-                out.append(Delta(message_id=iid, text=p["delta"]))
+                out.append(Delta(message_id=iid, text=delta, channel=channel))
 
         elif method == "item/started":
-            item = p.get("item") or {}
-            if item.get("type") in _TOOL_TYPES:
+            item = p.get("item") if isinstance(p.get("item"), dict) else {}
+            item_type = item.get("type")
+            if item_type == "agentMessage":
+                iid = _live_id(item.get("id"), "agent-message")
+                if not self._admit_live_item(iid, out):
+                    return out
+                channel = _assistant_channel(item.get("phase"))
+                self._message_channels[iid] = channel
+                if iid not in self._started:
+                    if self._open_msg is not None and self._open_msg != iid:
+                        self._close_open(out)
+                    self._started.add(iid)
+                    self._open_msg = iid
+                    self._open_channel = channel
+                    out.append(AssistantMsgStart(
+                        message_id=iid, channel=channel))
+            elif item_type in _TOOL_TYPES:
                 self._visible_output = True
                 out.extend(self._tool_use(item))
+            elif item_type in _PROCESS_ITEM_TYPES:
+                iid = _live_id(item.get("id"), str(item_type or "process"))
+                if not self._admit_live_item(iid, out):
+                    return out
+                event = self._process_item(item, p, completed=False)
+                if event is not None:
+                    self._visible_output = True
+                    out.append(event)
 
         elif method == "item/completed":
-            item = p.get("item") or {}
+            item = p.get("item") if isinstance(p.get("item"), dict) else {}
             t = item.get("type")
             if t == "agentMessage":
                 text = item.get("text") if isinstance(item.get("text"), str) else ""
-                iid = item.get("id") or (
-                    hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
-                    if text else "")
+                iid = _live_id(item.get("id") or text, "agent-message")
+                if not self._admit_live_item(iid, out):
+                    return out
+                channel = _assistant_channel(item.get("phase"))
+                if channel == "unknown":
+                    channel = self._message_channels.get(iid, "unknown")
+                else:
+                    self._message_channels[iid] = channel
                 # Some providers send only item/completed with the final text and
                 # no delta notification. Preserve that answer instead of turning
                 # it into a false empty-completed error.
                 if text and iid not in self._text_seen:
                     if iid not in self._started:
+                        if self._open_msg is not None and self._open_msg != iid:
+                            self._close_open(out)
                         self._started.add(iid)
                         self._open_msg = iid
-                        out.append(AssistantMsgStart(message_id=iid))
+                        self._open_channel = channel
+                        out.append(AssistantMsgStart(
+                            message_id=iid, channel=channel))
                     self._text_seen.add(iid)
                     self._visible_output = True
-                    out.append(Delta(message_id=iid, text=text))
+                    out.append(Delta(
+                        message_id=iid, text=text, channel=channel))
                 if iid in self._started:
-                    out.append(AssistantMsgEnd(message_id=iid))
+                    out.append(AssistantMsgEnd(
+                        message_id=iid, channel=channel))
                     if self._open_msg == iid:
                         self._open_msg = None
+                        self._open_channel = "unknown"
             elif t in _TOOL_TYPES:
                 self._visible_output = True
+                iid = _live_id(item.get("id"), f"{t}-tool")
+                if not self._admit_live_item(iid, out):
+                    return out
+                if iid not in self._tools_started:
+                    out.extend(self._tool_use(item))
                 out.append(self._tool_result(item))
+            elif t in _PROCESS_ITEM_TYPES:
+                iid = _live_id(item.get("id"), str(t or "process"))
+                if not self._admit_live_item(iid, out):
+                    return out
+                event = self._process_item(item, p, completed=True)
+                if event is not None:
+                    self._visible_output = True
+                    out.append(event)
+            if t in _TOOL_TYPES | _PROCESS_ITEM_TYPES:
+                fallback = {
+                    "commandExecution": "command-tool",
+                    "fileChange": "fileChange-tool",
+                    "mcpToolCall": "mcpToolCall-tool",
+                    "dynamicToolCall": "dynamicToolCall-tool",
+                    "webSearch": "webSearch-tool",
+                }.get(t, str(t or "process"))
+                finished_id = _live_id(item.get("id"), fallback)
+                self._finish_delta_item(finished_id)
+                self._file_diffs.pop(finished_id, None)
+
+        elif method == "item/reasoning/summaryPartAdded":
+            iid = _live_id(p.get("itemId"), "reasoning")
+            if not self._admit_live_item(iid, out):
+                return out
+            event = self._ensure_reasoning(iid, p)
+            if event is not None:
+                self._visible_output = True
+                out.append(event)
+
+        elif method == "item/reasoning/summaryTextDelta":
+            iid = _live_id(p.get("itemId"), "reasoning")
+            if not self._admit_live_item(iid, out):
+                return out
+            event = self._ensure_reasoning(iid, p)
+            if event is not None:
+                out.append(event)
+            delta = self._bounded_live_delta(
+                iid, "reasoning-summary", p.get("delta"), 512 * 1024)
+            if delta:
+                self._visible_output = True
+                out.append(ProcessEvent(
+                    item_id=iid,
+                    kind="reasoning",
+                    phase="update",
+                    status="running",
+                    turn_id=_optional_wire_id(p.get("turnId"), "turn"),
+                    title="思考",
+                    append_to="summary",
+                    delta=delta,
+                ))
+
+        elif method == "item/plan/delta":
+            iid = _live_id(p.get("itemId"), "plan")
+            if not self._admit_live_item(iid, out):
+                return out
+            delta = self._bounded_live_delta(
+                iid, "plan-detail", p.get("delta"), 512 * 1024)
+            if delta:
+                self._visible_output = True
+                out.append(ProcessEvent(
+                    item_id=iid,
+                    kind="plan",
+                    phase="update",
+                    status="running",
+                    turn_id=_optional_wire_id(p.get("turnId"), "turn"),
+                    title="计划",
+                    append_to="detail",
+                    delta=delta,
+                ))
+
+        elif method == "turn/plan/updated":
+            turn_id = _optional_wire_id(p.get("turnId"), "turn")
+            iid = _live_id(
+                f"plan:{turn_id or p.get('turnId') or 'current'}", "plan")
+            if not self._admit_live_item(iid, out):
+                return out
+            plan = []
+            for entry in (p.get("plan") or [])[:128]:
+                if not isinstance(entry, dict):
+                    continue
+                step, _ = bounded_text(entry.get("step"), 16 * 1024)
+                if not step:
+                    continue
+                plan.append({
+                    "step": step,
+                    "status": _plan_status(entry.get("status")),
+                })
+            explanation, _ = bounded_text(p.get("explanation"), 64 * 1024)
+            self._visible_output = True
+            out.append(TurnPlan(
+                item_id=iid,
+                turn_id=turn_id,
+                explanation=explanation or None,
+                plan=plan,
+            ))
+
+        elif method == "item/commandExecution/outputDelta":
+            iid = _live_id(p.get("itemId"), "command-tool")
+            if not self._admit_live_item(iid, out):
+                return out
+            delta = self._bounded_live_delta(
+                iid, "output", p.get("delta"),
+                min(self.tool_result_max, 512 * 1024))
+            if delta:
+                out.append(ToolDelta(
+                    tool_use_id=iid,
+                    stream="output",
+                    delta=delta,
+                ))
+
+        elif method == "item/fileChange/outputDelta":
+            # Kept for old app-server builds; 0.144.1 marks it deprecated.
+            iid = _live_id(p.get("itemId"), "fileChange-tool")
+            if not self._admit_live_item(iid, out):
+                return out
+            delta = self._bounded_live_delta(
+                iid, "output", p.get("delta"),
+                min(self.tool_result_max, 512 * 1024))
+            if delta:
+                out.append(ToolDelta(
+                    tool_use_id=iid,
+                    stream="output",
+                    delta=delta,
+                ))
+
+        elif method == "item/fileChange/patchUpdated":
+            iid = _live_id(p.get("itemId"), "fileChange-tool")
+            if not self._admit_live_item(iid, out):
+                return out
+            latest, _ = bounded_text(_changes_diff(p.get("changes")), 2 * 1024 * 1024)
+            previous = self._file_diffs.get(iid, "")
+            self._file_diffs[iid] = latest
+            # patchUpdated is a snapshot. ToolDelta is append-only, so forward
+            # only the genuinely-new suffix; non-monotonic rewrites are still
+            # delivered authoritatively by item/completed.diff.
+            if latest and latest.startswith(previous):
+                delta = self._bounded_live_delta(
+                    iid, "diff", latest[len(previous):], 512 * 1024)
+                if delta:
+                    out.append(ToolDelta(
+                        tool_use_id=iid, stream="diff", delta=delta))
+
+        elif method == "turn/diff/updated":
+            turn_id = _optional_wire_id(p.get("turnId"), "turn")
+            iid = _live_id(
+                f"diff:{turn_id or p.get('turnId') or 'current'}", "diff")
+            if not self._admit_live_item(iid, out):
+                return out
+            diff, truncated = bounded_text(p.get("diff"), 2 * 1024 * 1024)
+            self._visible_output = True
+            out.append(TurnDiff(
+                item_id=iid,
+                turn_id=turn_id,
+                diff=diff,
+                truncated=True if truncated else None,
+            ))
+
+        elif method == "item/mcpToolCall/progress":
+            iid = _live_id(p.get("itemId"), "mcpToolCall-tool")
+            if not self._admit_live_item(iid, out):
+                return out
+            progress = self._bounded_live_delta(
+                iid, "progress", p.get("message"), 64 * 1024)
+            if progress:
+                out.append(ToolDelta(
+                    tool_use_id=iid,
+                    stream="progress",
+                    delta=progress,
+                ))
+
+        elif method in {"hook/started", "hook/completed"}:
+            event = _hook_event(p, completed=(method == "hook/completed"))
+            if event is not None and self._admit_live_item(event.item_id, out):
+                self._visible_output = True
+                out.append(event)
+
+        elif method == "thread/compacted":
+            turn_id = _optional_wire_id(p.get("turnId"), "turn")
+            iid = _live_id(
+                f"compaction:{turn_id or p.get('turnId') or 'current'}",
+                "compaction")
+            if not self._admit_live_item(iid, out):
+                return out
+            self._visible_output = True
+            out.append(ProcessEvent(
+                item_id=iid,
+                kind="compaction",
+                phase="end",
+                status="succeeded",
+                turn_id=turn_id,
+                title="压缩上下文",
+            ))
+
+        # Raw reasoning text is intentionally ignored. Only the public summary
+        # notifications above and the summary array on a completed item cross the
+        # remote boundary. terminalInteraction is likewise skipped because it
+        # contains stdin.
 
         elif method == "error":
             # Retrying provider failures are progress, not terminal errors. Emit a
@@ -132,6 +418,7 @@ class CodexStreamTranslator:
                 out.append(Error(code=ERR_CC_CRASH, message=detail))
 
         elif method == "turn/completed":
+            self._close_open(out)
             turn = p.get("turn") or {}
             st = turn.get("status") or "completed"
             # a failed turn carries its reason in turn.error — surface it (the
@@ -180,49 +467,233 @@ class CodexStreamTranslator:
                 is_error=(st != "completed"),
             ), turn_id=(completed_turn_id
                         if isinstance(completed_turn_id, str) else None)))
+            self._clear_all_delta_budgets()
+            self._turn_closed = True
 
         # everything else (reasoning, userMessage, hook/*, mcpServer/startupStatus,
         # thread/status, account/rateLimits, tokenUsage, remoteControl…) -> skip.
         return out
 
     # ---- helpers ----
+    def _admit_live_item(self, item_id: str, out: list) -> bool:
+        if self._turn_closed:
+            return False
+        if item_id in self._live_items:
+            return True
+        if len(self._live_items) < _MAX_LIVE_ITEMS:
+            self._live_items.add(item_id)
+            return True
+        if not self._live_items_truncated:
+            self._live_items_truncated = True
+            self._visible_output = True
+            out.append(ProcessEvent(
+                item_id=_LIVE_ITEMS_OMITTED_ID,
+                kind="compaction",
+                phase="snapshot",
+                status="succeeded",
+                title="较早过程已省略",
+                summary="此回合的处理项目过多，后续新增项目未实时展示。",
+            ))
+        return False
+
+    def _bounded_live_delta(
+        self, item_id: str, stream: str, value, single_event_cap: int,
+    ) -> str:
+        """Bound cumulative append-only payload and append count per UI field."""
+        key = (item_id, stream)
+        if (item_id in self._finished_delta_items
+                or key in self._truncated_delta_streams):
+            return ""
+        if key not in self._delta_chars and len(self._delta_chars) >= _MAX_DELTA_STREAMS:
+            return ""
+        budget = max(1, self.tool_result_max)
+        used = self._delta_chars.get(key, 0)
+        count = self._delta_events.get(key, 0)
+        remaining = budget - used
+        # Reserve the final allowed append for an explicit truncation marker.
+        if remaining <= 0 or count >= _MAX_DELTA_EVENTS_PER_STREAM - 1:
+            self._truncated_delta_streams.add(key)
+            if remaining <= 0:
+                return ""
+            notice = _DELTA_TRUNCATION_NOTICE[-remaining:]
+            self._delta_chars[key] = used + len(notice)
+            self._delta_events[key] = count + 1
+            return notice
+
+        text, truncated = bounded_text(
+            value, min(max(1, single_event_cap), remaining))
+        if not text and not truncated:
+            return ""
+        if truncated:
+            self._truncated_delta_streams.add(key)
+            notice = _DELTA_TRUNCATION_NOTICE
+            if len(notice) >= remaining:
+                text = notice[-remaining:]
+            else:
+                text = text[:remaining - len(notice)] + notice
+        self._delta_chars[key] = used + len(text)
+        self._delta_events[key] = count + 1
+        return text
+
+    def _finish_delta_item(self, item_id: str) -> None:
+        if len(self._finished_delta_items) < _MAX_FINISHED_DELTA_ITEMS:
+            self._finished_delta_items.add(item_id)
+        for key in [key for key in self._delta_chars if key[0] == item_id]:
+            self._delta_chars.pop(key, None)
+            self._delta_events.pop(key, None)
+            self._truncated_delta_streams.discard(key)
+
+    def _clear_all_delta_budgets(self) -> None:
+        self._delta_chars.clear()
+        self._delta_events.clear()
+        self._truncated_delta_streams.clear()
+        self._finished_delta_items.clear()
+
+    def _close_open(self, out: list) -> None:
+        if self._open_msg is None:
+            return
+        out.append(AssistantMsgEnd(
+            message_id=self._open_msg,
+            channel=self._open_channel,
+        ))
+        self._open_msg = None
+        self._open_channel = "unknown"
+
     def _ensure_block(self, mid: str, out: list) -> None:
         """A tool card needs an assistant message block to hang under (the reducer
         keys tool cards by message_id); open one lazily if none is active."""
         if self._open_msg is None:
             self._open_msg = mid
+            self._open_channel = "commentary"
             self._started.add(mid)
-            out.append(AssistantMsgStart(message_id=mid))
+            out.append(AssistantMsgStart(
+                message_id=mid, channel="commentary"))
 
     def _tool_use(self, item: dict) -> list:
         out: list = []
-        mid = self._open_msg or item.get("id") or ""
+        item_type = str(item.get("type") or "tool")
+        iid = _live_id(item.get("id"), f"{item_type}-tool")
+        if not self._admit_live_item(iid, out):
+            return out
+        if iid in self._tools_started:
+            return out
+        self._tools_started.add(iid)
+        mid = self._open_msg or iid
         self._ensure_block(mid, out)
-        inp: dict = {}
-        for k in ("command", "cwd", "changes"):
-            if item.get(k) is not None:
-                inp[k] = item[k]
+        inp = _tool_input(item)
+        tool, category, title, server = _tool_presentation(item)
         out.append(ToolUse(
             message_id=self._open_msg or "",
-            tool_use_id=item.get("id") or "",
-            tool=_tool_name(item),
+            tool_use_id=iid,
+            tool=tool,
             input=bounded_tool_input(inp, self.tool_result_max),
+            category=category,
+            title=title,
+            server=server,
         ))
         return out
 
     def _tool_result(self, item: dict) -> ToolResult:
-        text, was_truncated = bounded_text(
-            item.get("aggregatedOutput") or item.get("output") or "",
-            self.tool_result_max,
-        )
+        item_type = item.get("type")
+        status = _process_status(item.get("status"))
+        code = _nonnegative_or_signed_int(item.get("exitCode"))
+        diff = None
+        summary = None
+        raw_content = item.get("aggregatedOutput") or item.get("output") or ""
+        if item_type == "fileChange":
+            diff, diff_truncated = bounded_text(
+                _changes_diff(item.get("changes")), 2 * 1024 * 1024)
+            paths = _change_paths(item.get("changes"))
+            summary = _file_summary(paths, status)
+            raw_content = summary
+        elif item_type == "mcpToolCall":
+            raw_content = _mcp_result_content(item)
+            error = item.get("error") if isinstance(item.get("error"), dict) else {}
+            summary, _ = bounded_text(error.get("message"), 64 * 1024)
+            if summary:
+                status = "failed"
+        elif item_type == "dynamicToolCall":
+            raw_content = _redact_credentials(item.get("contentItems") or "")
+            success = item.get("success")
+            if success is False:
+                status = "failed"
+            elif success is True:
+                status = "succeeded"
+        elif item_type == "webSearch":
+            raw_content = {
+                "query": item.get("query"),
+                "action": item.get("action"),
+            }
+            status = "succeeded"
+        text, was_truncated = bounded_text(raw_content, self.tool_result_max)
         truncated = True if was_truncated else None
-        code = item.get("exitCode")
-        return ToolResult(
-            tool_use_id=item.get("id") or "",
-            content=text,
-            is_error=bool(code) if code is not None else False,
-            truncated=truncated,
+        if item_type == "fileChange" and diff_truncated:
+            truncated = True
+        is_error = (
+            status in {"failed", "declined", "cancelled", "interrupted"}
+            or (code is not None and code != 0)
         )
+        return ToolResult(
+            tool_use_id=_live_id(item.get("id"), f"{item_type}-tool"),
+            content=text,
+            is_error=is_error,
+            truncated=truncated,
+            status=status,
+            summary=summary or None,
+            diff=diff or None,
+            exit_code=code,
+            duration_ms=_duration_ms(item.get("durationMs")),
+        )
+
+    def _ensure_reasoning(self, iid: str, params: dict):
+        if iid in self._reasoning_started:
+            return None
+        self._reasoning_started.add(iid)
+        return ProcessEvent(
+            item_id=iid,
+            kind="reasoning",
+            phase="start",
+            status="running",
+            turn_id=_optional_wire_id(params.get("turnId"), "turn"),
+            title="思考",
+        )
+
+    def _process_item(self, item: dict, params: dict, *, completed: bool):
+        item_type = item.get("type")
+        iid = _live_id(item.get("id"), str(item_type or "process"))
+        turn_id = _optional_wire_id(params.get("turnId"), "turn")
+        phase = "end" if completed else "start"
+        status = "succeeded" if completed else "running"
+        if item_type == "reasoning":
+            summary = _reasoning_summary(item)
+            if not summary:
+                # Never substitute content/encryptedContent for a missing public
+                # summary.
+                return None
+            self._reasoning_started.add(iid)
+            return ProcessEvent(
+                item_id=iid,
+                kind="reasoning",
+                phase=phase,
+                status=status,
+                turn_id=turn_id,
+                title="思考",
+                summary=summary,
+            )
+        if item_type == "plan":
+            detail, _ = bounded_text(item.get("text"), 256 * 1024)
+            return ProcessEvent(
+                item_id=iid, kind="plan", phase=phase, status=status,
+                turn_id=turn_id, title="计划", detail=detail or None)
+        if item_type == "collabAgentToolCall":
+            return _collab_event(item, turn_id, completed)
+        if item_type == "subAgentActivity":
+            return _subagent_event(item, turn_id, completed)
+        if item_type == "contextCompaction":
+            return ProcessEvent(
+                item_id=iid, kind="compaction", phase=phase, status=status,
+                turn_id=turn_id, title="压缩上下文")
+        return None
 
 
 def _retry_detail(error: dict) -> str:
@@ -259,18 +730,407 @@ def _structured_http_status(error: dict) -> str | None:
     return None
 
 
-def _tool_name(item: dict) -> str:
-    t = item.get("type")
-    if t == "commandExecution":
-        acts = item.get("commandActions") or []
-        if acts and isinstance(acts[0], dict) and acts[0].get("type"):
-            return acts[0]["type"]   # listFiles / readFile / editFile / …
-        return "shell"
-    if t == "fileChange":
-        return "apply_patch"
-    if t == "mcpToolCall":
-        return item.get("toolName") or "mcp"
-    return t or "tool"
+def _live_id(value, kind: str) -> str:
+    """Return a protocol-safe, stable identity without trusting provider text."""
+    if isinstance(value, str) and _SAFE_WIRE_ID.fullmatch(value):
+        return value
+    if isinstance(value, str):
+        identity = value[:4096]
+    elif value is None:
+        identity = "missing"
+    else:
+        identity = type(value).__name__
+    return hashlib.sha256(
+        f"codex\0{kind}\0{identity}".encode("utf-8", "surrogatepass")
+    ).hexdigest()[:32]
+
+
+def _optional_wire_id(value, kind: str) -> str | None:
+    return None if value is None else _live_id(value, kind)
+
+
+def _assistant_channel(value) -> str:
+    if value in {"final", "final_answer"}:
+        return "final"
+    if value == "commentary":
+        return "commentary"
+    if value == "thinking":
+        return "thinking"
+    return "unknown"
+
+
+def _process_status(value) -> str:
+    key = str(value or "").replace("_", "").replace("-", "").lower()
+    if key in {"pending"}:
+        return "pending"
+    if key in {"inprogress", "running", "started"}:
+        return "running"
+    if key in {"completed", "complete", "succeeded", "success"}:
+        return "succeeded"
+    if key in {"failed", "failure", "error"}:
+        return "failed"
+    if key in {"declined", "denied", "blocked"}:
+        return "declined"
+    if key in {"cancelled", "canceled", "stopped"}:
+        return "cancelled"
+    if key in {"interrupted", "aborted"}:
+        return "interrupted"
+    return "unknown"
+
+
+def _plan_status(value) -> str:
+    status = _process_status(value)
+    if status == "running":
+        return "inProgress"
+    if status == "succeeded":
+        return "completed"
+    return "pending"
+
+
+def _duration_ms(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if result >= 0 else None
+
+
+def _nonnegative_or_signed_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _is_credential_key(key_text: str) -> bool:
+    """Match common credential keys across snake, kebab and camel case."""
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key_text)
+    tokens = tuple(filter(None, re.split(r"[^a-z0-9]+", separated.lower())))
+    compact = "".join(tokens)
+    return (
+        compact in _CREDENTIAL_EXACT_KEYS
+        or any(fragment in compact for fragment in _CREDENTIAL_KEY_FRAGMENTS)
+    )
+
+
+def _redact_credentials(
+    value,
+    depth: int = 0,
+    ancestors=None,
+    node_budget=None,
+):
+    """Copy bounded JSON-like tool data and replace credential-bearing values."""
+    if node_budget is None:
+        node_budget = [_MAX_REDACTION_NODES]
+    if node_budget[0] <= 0:
+        return _REDACTION_BUDGET_EXCEEDED
+    node_budget[0] -= 1
+    if depth >= _MAX_REDACTION_DEPTH:
+        return f"<{type(value).__name__} omitted>"
+    if isinstance(value, dict):
+        ancestors = ancestors if ancestors is not None else set()
+        identity = id(value)
+        if identity in ancestors:
+            return "<cycle omitted>"
+        ancestors.add(identity)
+        try:
+            out = {}
+            for key, item in islice(
+                value.items(), _MAX_REDACTION_DICT_ITEMS
+            ):
+                if node_budget[0] <= 0:
+                    out[_REDACTION_REMAINDER_KEY] = (
+                        _REDACTION_BUDGET_EXCEEDED
+                    )
+                    break
+                key_text = key if isinstance(key, str) else f"<{type(key).__name__}>"
+                if _is_credential_key(key_text):
+                    node_budget[0] -= 1
+                    safe_item = _REDACTED
+                else:
+                    safe_item = _redact_credentials(
+                        item, depth + 1, ancestors, node_budget
+                    )
+                out[key_text[:128]] = safe_item
+            return out
+        finally:
+            ancestors.discard(identity)
+    if isinstance(value, (list, tuple)):
+        ancestors = ancestors if ancestors is not None else set()
+        identity = id(value)
+        if identity in ancestors:
+            return "<cycle omitted>"
+        ancestors.add(identity)
+        try:
+            out = []
+            for item in islice(value, _MAX_REDACTION_SEQUENCE_ITEMS):
+                if node_budget[0] <= 0:
+                    out.append(_REDACTION_BUDGET_EXCEEDED)
+                    break
+                out.append(_redact_credentials(
+                    item, depth + 1, ancestors, node_budget
+                ))
+            return out
+        finally:
+            ancestors.discard(identity)
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    return f"<{type(value).__name__}>"
+
+
+def _tool_input(item: dict) -> dict:
+    item_type = item.get("type")
+    if item_type == "commandExecution":
+        out = {
+            "command": item.get("command"),
+            "cwd": item.get("cwd"),
+            "actions": item.get("commandActions"),
+            "source": item.get("source"),
+        }
+        if item.get("processId") is not None:
+            out["process_id"] = item.get("processId")
+        return {key: value for key, value in out.items() if value is not None}
+    if item_type == "fileChange":
+        return {"changes": _change_descriptors(item.get("changes"))}
+    if item_type == "mcpToolCall":
+        arguments = item.get("arguments")
+        if isinstance(arguments, dict):
+            return _redact_credentials(arguments)
+        return {"arguments": _redact_credentials(arguments)}
+    if item_type == "dynamicToolCall":
+        arguments = item.get("arguments")
+        sanitized = _redact_credentials(arguments)
+        out = sanitized if isinstance(sanitized, dict) else {"arguments": sanitized}
+        if item.get("namespace") is not None:
+            out = dict(out)
+            out["namespace"] = item.get("namespace")
+        return out
+    if item_type == "webSearch":
+        return {
+            key: item.get(key) for key in ("query", "action")
+            if item.get(key) is not None
+        }
+    return {}
+
+
+def _tool_presentation(item: dict) -> tuple[str, str, str | None, str | None]:
+    item_type = item.get("type")
+    if item_type == "commandExecution":
+        actions = item.get("commandActions") or []
+        first = actions[0] if actions and isinstance(actions[0], dict) else {}
+        action_type = first.get("type")
+        if action_type == "read":
+            path = first.get("path") or first.get("name")
+            title = f"读取 {path}" if path else "读取文件"
+            return "readFile", "command", title, None
+        if action_type == "listFiles":
+            path = first.get("path")
+            title = f"列出 {path}" if path else "列出文件"
+            return "listFiles", "command", title, None
+        if action_type == "search":
+            query = first.get("query")
+            title = f"搜索 {query}" if query else "搜索内容"
+            return "search", "command", title, None
+        return "shell", "command", "运行命令", None
+    if item_type == "fileChange":
+        paths = _change_paths(item.get("changes"))
+        return "apply_patch", "file", _file_summary(paths, "running"), None
+    if item_type == "mcpToolCall":
+        server = str(item.get("server") or "MCP")[:1024]
+        tool = str(item.get("tool") or "mcp")[:1024]
+        return tool, "mcp", f"{server} · {tool}"[:1024], server
+    if item_type == "dynamicToolCall":
+        tool = str(item.get("tool") or "dynamicTool")[:1024]
+        namespace = item.get("namespace")
+        title = f"{namespace} · {tool}" if namespace else tool
+        return tool, "server_tool", title[:1024], None
+    if item_type == "webSearch":
+        query, _ = bounded_text(item.get("query"), 900)
+        return "webSearch", "web_search", (
+            f"搜索 {query}" if query else "搜索网页"), None
+    return str(item_type or "tool")[:1024], "tool", None, None
+
+
+def _change_descriptors(changes) -> list[dict]:
+    descriptors: list[dict] = []
+    if isinstance(changes, list):
+        iterable = changes[:64]
+        for entry in iterable:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            if isinstance(kind, dict):
+                kind = kind.get("type")
+            descriptors.append({
+                "path": str(entry.get("path") or "")[:16 * 1024],
+                "kind": str(kind or "update")[:128],
+            })
+    elif isinstance(changes, dict):
+        for path, change in list(changes.items())[:64]:
+            kind = change.get("type") if isinstance(change, dict) else "update"
+            descriptors.append({
+                "path": str(path)[:16 * 1024],
+                "kind": str(kind or "update")[:128],
+            })
+    return descriptors
+
+
+def _change_paths(changes) -> list[str]:
+    return [entry["path"] for entry in _change_descriptors(changes)
+            if entry.get("path")]
+
+
+def _changes_diff(changes) -> str:
+    """Normalize v2 FileUpdateChange arrays and legacy path->change maps."""
+    parts: list[str] = []
+    if isinstance(changes, list):
+        for entry in changes[:64]:
+            if not isinstance(entry, dict):
+                continue
+            diff = entry.get("diff")
+            if isinstance(diff, str) and diff:
+                parts.append(diff)
+    elif isinstance(changes, dict):
+        for _path, entry in list(changes.items())[:64]:
+            if not isinstance(entry, dict):
+                continue
+            diff = entry.get("unified_diff") or entry.get("diff")
+            if isinstance(diff, str) and diff:
+                parts.append(diff)
+    return "\n".join(parts)
+
+
+def _file_summary(paths: list[str], status: str) -> str:
+    prefix = "修改了" if status == "succeeded" else "修改"
+    if not paths:
+        return f"{prefix}文件"
+    if len(paths) == 1:
+        return f"{prefix} {paths[0]}"[:64 * 1024]
+    return f"{prefix} {len(paths)} 个文件"
+
+
+def _reasoning_summary(item: dict) -> str:
+    values = item.get("summary")
+    parts: list[str] = []
+    if isinstance(values, list):
+        for value in values[:128]:
+            if isinstance(value, str):
+                text = value
+            elif isinstance(value, dict) and value.get("type") == "summary_text":
+                text = value.get("text")
+            else:
+                continue
+            if isinstance(text, str) and text:
+                parts.append(text)
+    text, _ = bounded_text("\n\n".join(parts), 64 * 1024)
+    return text
+
+
+def _mcp_result_content(item: dict):
+    error = item.get("error") if isinstance(item.get("error"), dict) else None
+    if error is not None:
+        return error.get("message") or "MCP tool call failed"
+    result = item.get("result")
+    if not isinstance(result, dict):
+        return result or ""
+    # `_meta` is server-private and can contain connector/session data. Never put
+    # it in a replayable client ring.
+    return _redact_credentials({
+        key: result.get(key) for key in ("content", "structuredContent")
+        if result.get(key) is not None
+    })
+
+
+def _collab_event(item: dict, turn_id: str | None, completed: bool):
+    tool = str(item.get("tool") or "agent")[:1024]
+    status = _process_status(item.get("status"))
+    if completed and status in {"unknown", "running", "pending"}:
+        status = "succeeded"
+    labels = {
+        "spawnAgent": "启动协作代理",
+        "sendInput": "向协作代理发送消息",
+        "resumeAgent": "恢复协作代理",
+        "wait": "等待协作代理",
+        "closeAgent": "关闭协作代理",
+    }
+    states = item.get("agentsStates")
+    safe_states = {}
+    if isinstance(states, dict):
+        for agent_id, state in list(states.items())[:32]:
+            if not isinstance(state, dict):
+                continue
+            safe_states[str(agent_id)[:128]] = {
+                "status": _process_status(state.get("status")),
+            }
+    input_value = bounded_tool_input({
+        "prompt": item.get("prompt"),
+        "model": item.get("model"),
+        "reasoning_effort": item.get("reasoningEffort"),
+        "receivers": item.get("receiverThreadIds"),
+        "agents": safe_states,
+    }, 64 * 1024)
+    return ProcessEvent(
+        item_id=_live_id(item.get("id"), "collab-agent"),
+        kind="agent",
+        phase="end" if completed else "start",
+        status=status,
+        turn_id=turn_id,
+        parent_id=_optional_wire_id(item.get("senderThreadId"), "thread"),
+        title=labels.get(tool, "协作代理"),
+        input=input_value,
+        tool=tool,
+    )
+
+
+def _subagent_event(item: dict, turn_id: str | None, completed: bool):
+    kind = str(item.get("kind") or "started")
+    status = (
+        "interrupted" if kind == "interrupted"
+        else "succeeded" if completed
+        else "running"
+    )
+    path, _ = bounded_text(item.get("agentPath"), 16 * 1024)
+    return ProcessEvent(
+        item_id=_live_id(item.get("id"), "sub-agent"),
+        kind="agent",
+        phase="end" if completed else "start",
+        status=status,
+        turn_id=turn_id,
+        parent_id=_optional_wire_id(item.get("agentThreadId"), "thread"),
+        title={
+            "started": "协作代理已启动",
+            "interacted": "协作代理有新进展",
+            "interrupted": "协作代理已中断",
+        }.get(kind, "协作代理"),
+        summary=path or None,
+    )
+
+
+def _hook_event(params: dict, *, completed: bool):
+    run = params.get("run") if isinstance(params.get("run"), dict) else None
+    if run is None:
+        return None
+    status = _process_status(run.get("status"))
+    if completed and status in {"unknown", "running", "pending"}:
+        status = "succeeded"
+    event_name = str(run.get("eventName") or "hook")[:256]
+    handler_type = str(run.get("handlerType") or "")[:128]
+    # Hook output/statusMessage can include command output, environment data, or
+    # credentials. Only lifecycle metadata crosses the remote boundary.
+    return ProcessEvent(
+        item_id=_live_id(run.get("id"), "hook"),
+        kind="hook",
+        phase="end" if completed else "start",
+        status=status,
+        turn_id=_optional_wire_id(params.get("turnId"), "turn"),
+        title=(f"Hook · {event_name}" + (
+            f" · {handler_type}" if handler_type else ""))[:1024],
+        duration_ms=_duration_ms(run.get("durationMs")),
+    )
 
 
 # ---- helpers the machine loop needs (codex analogs of stream.extract_*) ----
@@ -308,10 +1168,20 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
     pending_turn_id: str | None = None
     turn_visible = False
     turn_text_visible = False
+    turn_final_visible = False
     assistant_open = False
     cur_mid: str | None = None
+    cur_channel = "unknown"
     last_ts = None
     pending_images: list = []   # input_image blocks seen before the next user_message
+    seen_tool_uses: set[str] = set()
+    seen_tool_results: set[str] = set()
+    seen_authoritative_results: set[str] = set()
+    plan_tool_ids: set[str] = set()
+    seen_process_items: set[str] = set()
+    history_tools: dict[str, tuple[str, str, str | None, str | None, dict]] = {}
+    seen_agent_messages: set[tuple[str, str, str]] = set()
+    seen_reasoning: set[tuple[str, str]] = set()
 
     def _ts(iso: str):
         try:
@@ -351,19 +1221,84 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
             return _ts(value) or fallback
         return fallback
 
-    def ensure_assistant(line_no: int, raw_ts: str = "", item_id=None):
-        nonlocal assistant_open, cur_mid
+    def ensure_assistant(
+        line_no: int,
+        raw_ts: str = "",
+        item_id=None,
+        channel: str = "commentary",
+        *,
+        force_new: bool = False,
+    ):
+        nonlocal assistant_open, cur_mid, cur_channel
+        if force_new and assistant_open:
+            close_assistant()
+        if assistant_open and cur_channel != channel:
+            close_assistant()
         if not assistant_open:
             cur_mid = _history_id(item_id, "assistant", line_no, raw_ts)
             assistant_open = True
-            events.append(AssistantMsgStart(message_id=cur_mid))
+            cur_channel = channel
+            events.append(AssistantMsgStart(
+                message_id=cur_mid, channel=channel))
 
     def close_assistant():
-        nonlocal assistant_open, cur_mid
+        nonlocal assistant_open, cur_mid, cur_channel
         if assistant_open and cur_mid:
-            events.append(AssistantMsgEnd(message_id=cur_mid))
+            events.append(AssistantMsgEnd(
+                message_id=cur_mid, channel=cur_channel))
         assistant_open = False
         cur_mid = None
+        cur_channel = "unknown"
+
+    def upsert_tool_use(
+        tool_id: str,
+        tool: str,
+        category: str,
+        title: str | None,
+        server: str | None,
+        tool_input: dict,
+        line_no: int,
+        raw_ts: str,
+    ) -> None:
+        nonlocal turn_visible
+        history_tools[tool_id] = (
+            tool, category, title, server, tool_input)
+        for event in reversed(events):
+            if isinstance(event, ToolUse) and event.tool_use_id == tool_id:
+                event.tool = tool
+                event.category = category
+                event.title = title
+                event.server = server
+                event.input = tool_input
+                seen_tool_uses.add(tool_id)
+                turn_visible = True
+                return
+        ensure_assistant(line_no, raw_ts)
+        events.append(ToolUse(
+            message_id=cur_mid or "",
+            tool_use_id=tool_id,
+            tool=tool,
+            input=tool_input,
+            category=category,
+            title=title,
+            server=server,
+        ))
+        seen_tool_uses.add(tool_id)
+        turn_visible = True
+
+    def upsert_tool_result(result: ToolResult) -> None:
+        nonlocal turn_visible
+        for index in range(len(events) - 1, -1, -1):
+            event = events[index]
+            if (isinstance(event, ToolResult)
+                    and event.tool_use_id == result.tool_use_id):
+                events[index] = result
+                seen_tool_results.add(result.tool_use_id)
+                turn_visible = True
+                return
+        events.append(result)
+        seen_tool_results.add(result.tool_use_id)
+        turn_visible = True
 
     def open_assistant_only_turn():
         """Start a visible continuation that has no user_message record.
@@ -373,7 +1308,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         tool item proves this is a separate assistant-only turn.
         """
         nonlocal turn_open, active_turn_id, active_msg_id
-        nonlocal turn_visible, turn_text_visible
+        nonlocal turn_visible, turn_text_visible, turn_final_visible
         if turn_open:
             return
         turn_open = True
@@ -381,6 +1316,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         active_msg_id = None
         turn_visible = False
         turn_text_visible = False
+        turn_final_visible = False
 
     def close_turn(
         subtype: str,
@@ -392,6 +1328,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
     ):
         nonlocal turn_open, active_turn_id, active_msg_id, pending_turn_id
         nonlocal assistant_open, cur_mid, turn_visible, turn_text_visible
+        nonlocal turn_final_visible
         if not turn_open:
             return
         close_assistant()
@@ -419,6 +1356,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         active_msg_id = None
         turn_visible = False
         turn_text_visible = False
+        turn_final_visible = False
 
     try:
         f = open(path)
@@ -486,48 +1424,350 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                     events.append(um)
                     turn_open = True
                 pending_images = []   # consume (per user turn)
-            elif t == "response_item" and p.get("type") == "function_call":
+            elif (t == "response_item"
+                  and payload_type in {"function_call", "custom_tool_call"}):
                 open_assistant_only_turn()
-                ensure_assistant(line_no, raw_ts)
-                turn_visible = True
-                events.append(ToolUse(
-                    message_id=cur_mid or "",
-                    tool_use_id=_history_id(
-                        p.get("call_id") or p.get("id"),
-                        "tool-use", line_no, raw_ts),
-                    tool=_hist_tool_name(p.get("name")),
-                    input=_hist_tool_input(p.get("arguments")),
-                ))
-            elif t == "response_item" and p.get("type") == "function_call_output":
-                turn_visible = True
-                out, was_truncated = bounded_text(
-                    p.get("output"), tool_result_max)
-                truncated = True if was_truncated else None
-                events.append(ToolResult(
-                    tool_use_id=_history_id(
-                        p.get("call_id"), "tool-result", line_no, raw_ts),
-                    content=out,
-                    is_error=_exit_is_error(out),
-                    truncated=truncated,
-                ))
+                tool_id = _history_id(
+                    p.get("call_id") or p.get("id"),
+                    "tool", line_no, raw_ts)
+                arguments = (p.get("arguments") if payload_type == "function_call"
+                             else p.get("input"))
+                hist_input = _hist_tool_input(arguments, p.get("name"))
+                plan_event = _history_plan_event(
+                    p.get("name"), hist_input,
+                    _history_optional_turn_id(
+                        active_turn_id or pending_turn_id),
+                    _history_id, tool_id, line_no, raw_ts,
+                )
+                if plan_event is not None:
+                    plan_tool_ids.add(tool_id)
+                    seen_tool_uses.add(tool_id)
+                    turn_visible = True
+                    events.append(plan_event)
+                else:
+                    ensure_assistant(line_no, raw_ts)
+                    tool, category, title, server = _hist_tool_presentation(
+                        p.get("name"), hist_input)
+                    history_tools[tool_id] = (
+                        tool, category, title, server, hist_input)
+                    if tool_id not in seen_tool_uses:
+                        seen_tool_uses.add(tool_id)
+                        turn_visible = True
+                        events.append(ToolUse(
+                            message_id=cur_mid or "",
+                            tool_use_id=tool_id,
+                            tool=tool,
+                            input=hist_input,
+                            category=category,
+                            title=title,
+                            server=server,
+                        ))
+            elif (t == "response_item"
+                  and payload_type in {
+                      "function_call_output", "custom_tool_call_output"}):
+                open_assistant_only_turn()
+                tool_id = _history_id(
+                    p.get("call_id"), "tool", line_no, raw_ts)
+                tool_meta = history_tools.get(
+                    tool_id, ("tool", "tool", None, None, {}))
+                if tool_id in plan_tool_ids:
+                    seen_tool_results.add(tool_id)
+                else:
+                    if tool_id not in seen_tool_uses:
+                        ensure_assistant(line_no, raw_ts)
+                        tool, category, title, server, hist_input = tool_meta
+                        seen_tool_uses.add(tool_id)
+                        events.append(ToolUse(
+                            message_id=cur_mid or "", tool_use_id=tool_id,
+                            tool=tool, input=hist_input, category=category,
+                            title=title, server=server))
+                    if tool_id not in seen_tool_results:
+                        seen_tool_results.add(tool_id)
+                        turn_visible = True
+                        category = tool_meta[1]
+                        raw_output = p.get("output")
+                        structured_error = False
+                        if category in {"mcp", "server_tool"}:
+                            raw_output, structured_error = (
+                                _history_structured_tool_output(raw_output))
+                        output, was_truncated = bounded_text(
+                            raw_output, tool_result_max)
+                        exit_code = _history_exit_code(output)
+                        is_error = structured_error or _exit_is_error(output)
+                        events.append(ToolResult(
+                            tool_use_id=tool_id,
+                            content=output,
+                            is_error=is_error,
+                            truncated=True if was_truncated else None,
+                            status="failed" if is_error else "succeeded",
+                            exit_code=exit_code,
+                        ))
+            elif t == "event_msg" and payload_type == "exec_command_end":
+                open_assistant_only_turn()
+                tool_id = _history_id(
+                    p.get("call_id"), "tool", line_no, raw_ts)
+                if tool_id not in seen_authoritative_results:
+                    seen_authoritative_results.add(tool_id)
+                    command = _legacy_command_text(p.get("command"))
+                    command_input = bounded_tool_input({
+                        "command": command,
+                        "cwd": p.get("cwd"),
+                        "actions": p.get("parsed_cmd"),
+                        "source": p.get("source"),
+                        "process_id": p.get("process_id"),
+                    }, 64 * 1024)
+                    title = _legacy_command_title(p.get("parsed_cmd"))
+                    upsert_tool_use(
+                        tool_id, "shell", "command", title, None,
+                        command_input, line_no, raw_ts)
+                    output, truncated = bounded_text(
+                        p.get("aggregated_output")
+                        or p.get("formatted_output")
+                        or p.get("stdout")
+                        or p.get("stderr")
+                        or "",
+                        tool_result_max,
+                    )
+                    exit_code = _nonnegative_or_signed_int(p.get("exit_code"))
+                    status = _process_status(p.get("status"))
+                    if exit_code is not None and exit_code != 0:
+                        status = "failed"
+                    elif status in {"unknown", "running", "pending"}:
+                        status = "succeeded"
+                    upsert_tool_result(ToolResult(
+                        tool_use_id=tool_id,
+                        content=output,
+                        is_error=(status in {
+                            "failed", "declined", "cancelled", "interrupted"
+                        }),
+                        truncated=True if truncated else None,
+                        status=status,
+                        exit_code=exit_code,
+                        duration_ms=_legacy_duration_ms(p.get("duration")),
+                    ))
+            elif t == "event_msg" and payload_type == "mcp_tool_call_end":
+                open_assistant_only_turn()
+                tool_id = _history_id(
+                    p.get("call_id"), "tool", line_no, raw_ts)
+                if tool_id not in seen_authoritative_results:
+                    seen_authoritative_results.add(tool_id)
+                    invocation = (p.get("invocation")
+                                  if isinstance(p.get("invocation"), dict)
+                                  else {})
+                    server = str(invocation.get("server") or "MCP")[:1024]
+                    tool = str(invocation.get("tool") or "mcp")[:1024]
+                    arguments = invocation.get("arguments")
+                    tool_input = bounded_tool_input(
+                        _redact_credentials(
+                            arguments if isinstance(arguments, dict)
+                            else {"arguments": arguments}),
+                        64 * 1024,
+                    )
+                    upsert_tool_use(
+                        tool_id, tool, "mcp", f"{server} · {tool}"[:1024],
+                        server, tool_input, line_no, raw_ts)
+                    content, is_error = _legacy_mcp_result(p.get("result"))
+                    output, truncated = bounded_text(content, tool_result_max)
+                    upsert_tool_result(ToolResult(
+                        tool_use_id=tool_id,
+                        content=output,
+                        is_error=is_error,
+                        truncated=True if truncated else None,
+                        status="failed" if is_error else "succeeded",
+                        duration_ms=_legacy_duration_ms(p.get("duration")),
+                    ))
+            elif t == "event_msg" and payload_type == "item_completed":
+                item = p.get("item") if isinstance(p.get("item"), dict) else {}
+                if str(item.get("type") or "").lower() == "plan":
+                    open_assistant_only_turn()
+                    item_id = _history_id(
+                        item.get("id"), "plan-detail", line_no, raw_ts)
+                    if item_id not in seen_process_items:
+                        seen_process_items.add(item_id)
+                        detail, truncated = bounded_text(
+                            item.get("text"), 256 * 1024)
+                        events.append(ProcessEvent(
+                            item_id=item_id,
+                            kind="plan",
+                            phase="end",
+                            status="succeeded",
+                            turn_id=_history_optional_turn_id(
+                                p.get("turn_id") or active_turn_id
+                                or pending_turn_id),
+                            title="计划",
+                            detail=detail or None,
+                            truncated=True if truncated else None,
+                        ))
+                        turn_visible = True
+            elif t == "response_item" and payload_type == "reasoning":
+                summary = _reasoning_summary(p)
+                key = (str(active_turn_id or pending_turn_id or ""), summary)
+                if summary and key not in seen_reasoning:
+                    seen_reasoning.add(key)
+                    open_assistant_only_turn()
+                    events.append(ProcessEvent(
+                        item_id=_history_id(
+                            p.get("id"), "reasoning", line_no, raw_ts),
+                        kind="reasoning",
+                        phase="end",
+                        status="succeeded",
+                        turn_id=_history_optional_turn_id(
+                            active_turn_id or pending_turn_id),
+                        title="思考",
+                        summary=summary,
+                    ))
+            elif t == "event_msg" and payload_type == "agent_reasoning":
+                summary, _ = bounded_text(p.get("text"), 64 * 1024)
+                key = (str(active_turn_id or pending_turn_id or ""), summary)
+                if summary and key not in seen_reasoning:
+                    seen_reasoning.add(key)
+                    open_assistant_only_turn()
+                    events.append(ProcessEvent(
+                        item_id=_history_id(
+                            p.get("id") or p.get("event_id"),
+                            "reasoning", line_no, raw_ts),
+                        kind="reasoning",
+                        phase="end",
+                        status="succeeded",
+                        turn_id=_history_optional_turn_id(
+                            active_turn_id or pending_turn_id),
+                        title="思考",
+                        summary=summary,
+                    ))
             elif t == "event_msg" and payload_type == "agent_message":
                 open_assistant_only_turn()
-                ensure_assistant(line_no, raw_ts, p.get("id") or p.get("message_id"))
                 txt = p.get("message") or ""
-                if txt:
+                channel = _assistant_channel(p.get("phase"))
+                key = (str(active_turn_id or pending_turn_id or ""), channel, txt)
+                if txt and key not in seen_agent_messages:
+                    seen_agent_messages.add(key)
+                    close_assistant()
+                    ensure_assistant(
+                        line_no, raw_ts,
+                        p.get("id") or p.get("message_id"),
+                        channel=channel,
+                    )
                     turn_visible = True
                     turn_text_visible = True
-                    events.append(Delta(message_id=cur_mid, text=txt))
+                    if channel == "final":
+                        turn_final_visible = True
+                    events.append(Delta(
+                        message_id=cur_mid, text=txt, channel=channel))
+                    close_assistant()
+            elif t == "event_msg" and payload_type == "patch_apply_end":
+                open_assistant_only_turn()
+                ensure_assistant(line_no, raw_ts)
+                tool_id = _history_id(
+                    p.get("call_id"), "tool", line_no, raw_ts)
+                paths = _change_paths(p.get("changes"))
+                if tool_id not in seen_tool_uses:
+                    seen_tool_uses.add(tool_id)
+                    turn_visible = True
+                    events.append(ToolUse(
+                        message_id=cur_mid or "",
+                        tool_use_id=tool_id,
+                        tool="apply_patch",
+                        input=bounded_tool_input({
+                            "changes": _change_descriptors(p.get("changes")),
+                        }, 64 * 1024),
+                        category="file",
+                        title=_file_summary(paths, "running"),
+                    ))
+                if tool_id not in seen_tool_results:
+                    seen_tool_results.add(tool_id)
+                    turn_visible = True
+                    success = p.get("success") is not False
+                    diff, diff_truncated = bounded_text(
+                        _changes_diff(p.get("changes")), 2 * 1024 * 1024)
+                    output, output_truncated = bounded_text(
+                        p.get("stdout") or p.get("stderr") or "",
+                        tool_result_max)
+                    events.append(ToolResult(
+                        tool_use_id=tool_id,
+                        content=output,
+                        is_error=not success,
+                        truncated=(True if diff_truncated or output_truncated
+                                   else None),
+                        status="succeeded" if success else "failed",
+                        summary=_file_summary(
+                            paths, "succeeded" if success else "failed"),
+                        diff=diff or None,
+                    ))
+            elif t == "event_msg" and payload_type == "web_search_end":
+                open_assistant_only_turn()
+                ensure_assistant(line_no, raw_ts)
+                tool_id = _history_id(
+                    p.get("call_id"), "tool", line_no, raw_ts)
+                query, _ = bounded_text(p.get("query"), 16 * 1024)
+                if tool_id not in seen_tool_uses:
+                    seen_tool_uses.add(tool_id)
+                    turn_visible = True
+                    events.append(ToolUse(
+                        message_id=cur_mid or "",
+                        tool_use_id=tool_id,
+                        tool="webSearch",
+                        input=bounded_tool_input({
+                            "query": query, "action": p.get("action"),
+                        }, 64 * 1024),
+                        category="web_search",
+                        title=(f"搜索 {query}" if query else "搜索网页")[:1024],
+                    ))
+                if tool_id not in seen_tool_results:
+                    seen_tool_results.add(tool_id)
+                    events.append(ToolResult(
+                        tool_use_id=tool_id,
+                        content="",
+                        is_error=False,
+                        status="succeeded",
+                    ))
+            elif t == "event_msg" and payload_type == "sub_agent_activity":
+                open_assistant_only_turn()
+                item = {
+                    "id": p.get("event_id"),
+                    "kind": p.get("kind"),
+                    "agentThreadId": p.get("agent_thread_id"),
+                    "agentPath": p.get("agent_path"),
+                }
+                events.append(_subagent_event(
+                    item,
+                    _history_optional_turn_id(
+                        active_turn_id or pending_turn_id),
+                    completed=True,
+                ))
+                turn_visible = True
+            elif t == "event_msg" and payload_type == "context_compacted":
+                open_assistant_only_turn()
+                events.append(ProcessEvent(
+                    item_id=_history_id(
+                        p.get("id"), "compaction", line_no, raw_ts),
+                    kind="compaction",
+                    phase="end",
+                    status="succeeded",
+                    turn_id=_history_optional_turn_id(
+                        active_turn_id or pending_turn_id),
+                    title="压缩上下文",
+                ))
             elif t == "event_msg" and payload_type == "task_complete":
                 last = p.get("last_agent_message")
                 if (not turn_open and isinstance(last, str) and last):
                     open_assistant_only_turn()
                 if turn_open:
-                    if not turn_text_visible and isinstance(last, str) and last:
-                        ensure_assistant(line_no, raw_ts)
-                        events.append(Delta(message_id=cur_mid, text=last))
+                    turn_key = str(active_turn_id or pending_turn_id or "")
+                    last_already_visible = any(
+                        key[0] == turn_key and key[2] == last
+                        for key in seen_agent_messages)
+                    if (not turn_final_visible and isinstance(last, str) and last
+                            and not last_already_visible):
+                        close_assistant()
+                        ensure_assistant(
+                            line_no, raw_ts, channel="final", force_new=True)
+                        events.append(Delta(
+                            message_id=cur_mid, text=last, channel="final"))
+                        close_assistant()
+                        seen_agent_messages.add((turn_key, "final", last))
                         turn_visible = True
                         turn_text_visible = True
+                        turn_final_visible = True
                     if turn_visible:
                         close_turn("success", _duration(p), False,
                                    _completed_ts(p, ts), p.get("turn_id"))
@@ -551,7 +1791,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                 if turn_open:
                     close_turn("error", _duration(p), True,
                                _completed_ts(p, ts), p.get("turn_id"))
-            # session_meta / world_state / reasoning / token_count / task_* : skipped
+            # session_meta / world_state / token_count / private reasoning : skipped
             if ts is not None:
                 last_ts = ts
     # A file can be read while Codex is still appending the current turn. Close
@@ -562,20 +1802,89 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
 
 
 def _hist_tool_name(name) -> str:
-    if name in ("exec_command", "shell", "local_shell"):
+    if name in ("exec", "exec_command", "shell", "local_shell"):
         return "shell"
     if name in ("apply_patch",):
         return "apply_patch"
     return name or "tool"
 
 
-def _hist_tool_input(arguments) -> dict:
+def _history_plan_event(
+    name,
+    tool_input: dict,
+    turn_id: str | None,
+    id_builder,
+    tool_id: str,
+    line_no: int,
+    raw_ts: str,
+):
+    normalized = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if not normalized.endswith("updateplan"):
+        return None
+    raw_plan = tool_input.get("plan")
+    if not isinstance(raw_plan, list):
+        return None
+    plan = []
+    for entry in raw_plan[:128]:
+        if not isinstance(entry, dict):
+            continue
+        step, _ = bounded_text(entry.get("step"), 16 * 1024)
+        if not step:
+            continue
+        plan.append({
+            "step": step,
+            "status": _plan_status(entry.get("status")),
+        })
+    explanation, _ = bounded_text(tool_input.get("explanation"), 64 * 1024)
+    identity = f"plan:{turn_id or tool_id}"
+    return TurnPlan(
+        item_id=id_builder(identity, "plan", line_no, raw_ts),
+        turn_id=turn_id,
+        explanation=explanation or None,
+        plan=plan,
+    )
+
+
+def _hist_tool_presentation(
+    name, tool_input: dict,
+) -> tuple[str, str, str | None, str | None]:
+    raw_name = str(name or "tool")
+    tool = _hist_tool_name(raw_name)
+    if tool == "shell":
+        return tool, "command", "运行命令", None
+    if tool == "apply_patch":
+        return tool, "file", "修改文件", None
+    if raw_name in {"web_search", "webSearch", "search_web"}:
+        query = tool_input.get("query")
+        title = f"搜索 {query}" if query else "搜索网页"
+        return "webSearch", "web_search", title[:1024], None
+    if raw_name in {
+        "spawn_agent", "spawnAgent", "send_input", "sendInput",
+        "resume_agent", "resumeAgent", "wait_agent", "wait",
+        "close_agent", "closeAgent",
+    }:
+        return raw_name[:1024], "agent", "协作代理", None
+    if raw_name.startswith("mcp__"):
+        parts = raw_name.split("__", 2)
+        server = parts[1] if len(parts) > 1 and parts[1] else "MCP"
+        mcp_tool = parts[2] if len(parts) > 2 and parts[2] else raw_name
+        return mcp_tool[:1024], "mcp", f"{server} · {mcp_tool}"[:1024], server[:1024]
+    return tool[:1024], "tool", raw_name[:1024], None
+
+
+def _hist_tool_input(arguments, name=None) -> dict:
     try:
         a = json.loads(arguments) if isinstance(arguments, str) else (arguments or {})
     except Exception:
+        if isinstance(arguments, str):
+            mapped = _hist_tool_name(name)
+            key = "command" if mapped == "shell" else (
+                "patch" if mapped == "apply_patch" else "input")
+            return bounded_tool_input({key: arguments}, 64 * 1024)
         a = {}
     if not isinstance(a, dict):
-        return bounded_tool_input({"args": a}, 64 * 1024)
+        return bounded_tool_input(
+            {"args": _redact_credentials(a)}, 64 * 1024)
     out: dict = {}
     if a.get("cmd") is not None:
         out["command"] = a["cmd"]
@@ -584,12 +1893,137 @@ def _hist_tool_input(arguments) -> dict:
     for k, v in a.items():
         if k not in ("cmd", "workdir", "yield_time_ms"):
             out[k] = v
-    return bounded_tool_input(out, 64 * 1024)
+    return bounded_tool_input(_redact_credentials(out), 64 * 1024)
+
+
+def _history_structured_tool_output(output) -> tuple[object, bool]:
+    """Allow-list replayable MCP/dynamic result fields from rollout output."""
+    parsed = output
+    if isinstance(output, str):
+        try:
+            parsed = json.loads(output)
+        except (TypeError, ValueError):
+            # Opaque strings can embed serialized `_meta` or credentials without
+            # field boundaries, so never replay them as trusted MCP history.
+            return "MCP 工具调用已完成（历史结果格式不可解析）", False
+    if isinstance(parsed, list):
+        return {"content": _redact_credentials(parsed)}, False
+    if not isinstance(parsed, dict):
+        return "MCP 工具调用已完成", False
+
+    candidate = parsed.get("result")
+    if not isinstance(candidate, dict):
+        candidate = parsed
+    error = parsed.get("error")
+    if error is None and candidate is not parsed:
+        error = candidate.get("error")
+    if error:
+        if isinstance(error, dict):
+            message = error.get("message")
+        else:
+            message = str(error)
+        safe_error, _ = bounded_text(message or "MCP tool call failed", 64 * 1024)
+        return safe_error, True
+
+    safe = {}
+    aliases = (
+        ("content", "content"),
+        ("structuredContent", "structuredContent"),
+        ("structured_content", "structuredContent"),
+        ("contentItems", "content"),
+    )
+    for source, target in aliases:
+        if source in candidate and target not in safe:
+            safe[target] = _redact_credentials(candidate[source])
+    failed = parsed.get("success") is False or str(
+        parsed.get("status") or "").lower() in {"failed", "error"}
+    return (safe or "MCP 工具调用已完成"), failed
+
+
+def _legacy_command_text(command) -> str:
+    """Normalize persisted ``exec_command_end.command`` into display text."""
+    if isinstance(command, str):
+        text, _ = bounded_text(command, 256 * 1024)
+        return text
+    if isinstance(command, (list, tuple)):
+        argv = [str(part) for part in list(command)[:256]]
+        try:
+            text = shlex.join(argv)
+        except (TypeError, ValueError):
+            text = " ".join(argv)
+        text, _ = bounded_text(text, 256 * 1024)
+        return text
+    text, _ = bounded_text(command, 256 * 1024)
+    return text
+
+
+def _legacy_command_title(parsed_command) -> str:
+    """Give old rollout command records the same semantic title as live items."""
+    actions = parsed_command if isinstance(parsed_command, list) else []
+    first = actions[0] if actions and isinstance(actions[0], dict) else {}
+    action_type = re.sub(
+        r"[^a-z0-9]", "", str(first.get("type") or "").lower())
+    if action_type == "read":
+        path = first.get("path") or first.get("name")
+        return (f"读取 {path}" if path else "读取文件")[:1024]
+    if action_type in {"list", "listfiles"}:
+        path = first.get("path")
+        return (f"列出 {path}" if path else "列出文件")[:1024]
+    if action_type in {"search", "grep"}:
+        query = first.get("query") or first.get("pattern")
+        return (f"搜索 {query}" if query else "搜索内容")[:1024]
+    return "运行命令"
+
+
+def _legacy_duration_ms(duration) -> int | None:
+    """Convert persisted protobuf-style ``{secs, nanos}`` durations."""
+    if not isinstance(duration, dict):
+        return _duration_ms(duration)
+    secs = duration.get("secs")
+    nanos = duration.get("nanos")
+    if isinstance(secs, bool) or isinstance(nanos, bool):
+        return None
+    try:
+        milliseconds = int(secs or 0) * 1000 + int(nanos or 0) // 1_000_000
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return milliseconds if milliseconds >= 0 else None
+
+
+def _legacy_mcp_result(result) -> tuple[object, bool]:
+    """Decode persisted Rust ``Result`` while excluding server-private metadata."""
+    if not isinstance(result, dict):
+        return "MCP 工具调用已完成", False
+    if "Err" in result:
+        # Err is an opaque provider string and may itself contain connector
+        # credentials. Preserve failure semantics without replaying it verbatim.
+        return "MCP 工具调用失败", True
+    value = result.get("Ok")
+    if not isinstance(value, dict):
+        return "MCP 工具调用已完成", False
+    safe = _redact_credentials({
+        key: value.get(key) for key in ("content", "structuredContent")
+        if value.get(key) is not None
+    })
+    return safe or "MCP 工具调用已完成", bool(value.get("isError"))
 
 
 def _exit_is_error(output: str) -> bool:
-    m = re.search(r"exited with code (\d+)", output or "")
-    return bool(m) and m.group(1) != "0"
+    code = _history_exit_code(output)
+    return code is not None and code != 0
+
+
+def _history_exit_code(output: str) -> int | None:
+    match = re.search(
+        r"\b(?:process\s+)?(?:exited|exit)\s+(?:with\s+)?code\s*[:=]?\s*(-?\d+)",
+        output or "",
+        re.IGNORECASE,
+    )
+    return int(match.group(1)) if match else None
+
+
+def _history_optional_turn_id(value) -> str | None:
+    return _optional_wire_id(value, "turn")
 
 
 def _data_uri_to_img(url) -> dict | None:

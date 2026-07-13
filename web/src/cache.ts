@@ -13,9 +13,9 @@ const SCHEMA = 1;
 // Bump when the cached turn shape changes in a way old entries can't be
 // trusted (e.g. a past bug left tool-only turns without text). Old entries are
 // ignored -> client falls back to a full buffer replay (text + tools restored).
-// v5 invalidates promptless duplicate turns persisted by the running-History
-// race fixed in history-merge.ts.
-const CACHE_VER = 5;
+// v6 adds assistant channels and structured process blocks. Older caches would
+// otherwise render commentary as final text and lose process ordering.
+const CACHE_VER = 6;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

@@ -15,11 +15,30 @@ interface SizedFile { filename?: string; data?: string }
 interface SizedTextBlock { kind: "text"; message_id?: string; text?: string }
 interface SizedToolBlock {
   kind: "tool";
+  done?: boolean;
   message_id?: string;
   tool_use_id?: string;
   tool?: string;
   input?: unknown;
-  result?: { content?: string };
+  output?: string;
+  progress?: string;
+  diff?: string;
+  result?: { content?: string; summary?: string | null; diff?: string | null };
+}
+interface SizedProcessBlock {
+  kind: "process";
+  done?: boolean;
+  item_id?: string;
+  title?: string;
+  summary?: string | null;
+  detail?: string | null;
+  output?: string | null;
+  diff?: string | null;
+  progress?: string | null;
+  command?: string | null;
+  cwd?: string | null;
+  input?: unknown;
+  plan?: Array<{ step?: string }>;
 }
 
 export interface BoundedTurn {
@@ -30,7 +49,7 @@ export interface BoundedTurn {
   progress?: string;
   images?: SizedImage[];
   files?: SizedFile[];
-  blocks?: Array<SizedTextBlock | SizedToolBlock>;
+  blocks?: Array<SizedTextBlock | SizedToolBlock | SizedProcessBlock>;
 }
 
 function textUnits(value: string | undefined): number {
@@ -49,18 +68,36 @@ function turnUnits(turn: BoundedTurn, stopAfter: number): number {
     if (units > stopAfter) return units;
   }
   for (const block of turn.blocks ?? []) {
-    units += 128 + textUnits(block.message_id);
+    units += 128;
     if (block.kind === "text") {
-      units += textUnits(block.text);
+      units += textUnits(block.message_id) + textUnits(block.text);
+    } else if (block.kind === "tool") {
+      units += textUnits(block.message_id) + textUnits(block.tool_use_id) + textUnits(block.tool)
+        + textUnits(block.output) + textUnits(block.progress) + textUnits(block.diff)
+        + textUnits(block.result?.content) + textUnits(block.result?.summary ?? undefined)
+        + textUnits(block.result?.diff ?? undefined);
+      try { units += JSON.stringify(block.input ?? {}).length; }
+      catch { units = stopAfter + 1; }
     } else {
-      units += textUnits(block.tool_use_id) + textUnits(block.tool)
-        + textUnits(block.result?.content);
+      units += textUnits(block.item_id) + textUnits(block.title)
+        + textUnits(block.summary ?? undefined) + textUnits(block.detail ?? undefined)
+        + textUnits(block.output ?? undefined) + textUnits(block.diff ?? undefined)
+        + textUnits(block.progress ?? undefined) + textUnits(block.command ?? undefined)
+        + textUnits(block.cwd ?? undefined);
+      for (const entry of block.plan ?? []) units += textUnits(entry.step);
       try { units += JSON.stringify(block.input ?? {}).length; }
       catch { units = stopAfter + 1; }
     }
     if (units > stopAfter) return units;
   }
   return units;
+}
+
+function turnHasActiveProcess(turn: {
+  blocks?: ReadonlyArray<{ kind?: string; done?: boolean }>;
+}): boolean {
+  return (turn.blocks ?? []).some((block) =>
+    (block.kind === "tool" || block.kind === "process") && block.done === false);
 }
 
 /** Keep every in-flight turn and the newest bounded window of completed turns.
@@ -72,7 +109,8 @@ export function boundRuntimeTurns<T extends BoundedTurn>(
   maxCompletedUnits = MAX_RUNTIME_COMPLETED_UNITS,
 ): T[] {
   if (!turns.length) return turns as T[];
-  const activeCount = turns.reduce((count, turn) => count + (turn.done ? 0 : 1), 0);
+  const activeCount = turns.reduce(
+    (count, turn) => count + (!turn.done || turnHasActiveProcess(turn) ? 1 : 0), 0);
   const completedSlots = Math.max(0, maxTurns - activeCount);
   const keep = new Array<boolean>(turns.length).fill(false);
   let completedKept = 0;
@@ -80,7 +118,7 @@ export function boundRuntimeTurns<T extends BoundedTurn>(
 
   for (let index = turns.length - 1; index >= 0; index--) {
     const turn = turns[index];
-    if (!turn.done) {
+    if (!turn.done || turnHasActiveProcess(turn)) {
       keep[index] = true;
       continue;
     }
@@ -100,7 +138,10 @@ export interface RetainedRuntime {
   state: string;
   syncReady: boolean;
   replaying: boolean;
-  turns: Array<{ done: boolean }>;
+  turns: Array<{
+    done: boolean;
+    blocks?: Array<{ kind?: string; done?: boolean }>;
+  }>;
   queue: unknown[];
   pendingSend: unknown | null;
   pendingQuestion: unknown | null;
@@ -110,7 +151,7 @@ function hasLiveWork(runtime: RetainedRuntime): boolean {
   if (runtime.queue.length || runtime.pendingSend || runtime.replaying) return true;
   if (!runtime.syncReady) return false;
   return runtime.state !== "idle" || runtime.pendingQuestion !== null
-    || runtime.turns.some((turn) => !turn.done);
+    || runtime.turns.some((turn) => !turn.done || turnHasActiveProcess(turn));
 }
 
 /** Oldest-first reclamation by insertion order. The normal idle pool stays at `maxSessions`;

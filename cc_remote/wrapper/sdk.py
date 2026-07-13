@@ -38,6 +38,14 @@ log = logger("cc_remote.wrapper.sdk")
 REQUIRED_SDK = (0, 2)  # 0.2.x; the interrupt/drain contract is version-sensitive
 
 
+class _MessagePumpFailure:
+    def __init__(self, error: BaseException):
+        self.error = error
+
+
+_MESSAGE_PUMP_END = object()
+
+
 def _explicit_cli_path(value: str) -> str | None:
     """Normalize an opt-in CLI path without changing blank/PATH behavior."""
     value = value.strip()
@@ -68,6 +76,26 @@ class SdkHandle:
         self.goal: dict[str, Any] | None = None
         self.goal_session_id: str | None = None
         self._goal_message_tokens: dict[str, int] = {}
+        # Claude's Query owns one anyio MemoryObjectReceiveStream.  Keep exactly
+        # one session-long consumer of that stream, then route messages into a
+        # bounded active-turn queue or a bounded idle/background queue.  This is
+        # what lets task/hook notifications emitted after ResultMessage reach the
+        # UI immediately without racing the next receive_response() consumer.
+        self.background_message_callback: Callable[
+            [Any, str | None], Awaitable[None]] | None = None
+        # Machine sets this immediately before query(). It is copied onto every
+        # post-Result background envelope so even a parentless Stop hook or a
+        # newly-announced task remains attached to the turn that spawned it.
+        self.next_turn_id: str | None = None
+        self._turn_origin_id: str | None = None
+        self._message_pump_task: asyncio.Task | None = None
+        self._background_task: asyncio.Task | None = None
+        self._turn_messages: asyncio.Queue | None = None
+        self._background_messages: asyncio.Queue | None = None
+        self._turn_active = False
+        self._turn_consumer_active = False
+        self._turn_background_release: asyncio.Event | None = None
+        self._message_pump_error: BaseException | None = None
 
     async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any):
         callback = self.permission_callback
@@ -101,6 +129,10 @@ class SdkHandle:
                  fork: bool = False) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             include_partial_messages=True,        # StreamEvent with content_block_delta
+            # Emit hook lifecycle metadata into the SDK stream. StreamTranslator
+            # forwards only the hook name/status/exit/duration; raw callback data,
+            # output, commands, and environment values never cross the wire.
+            include_hook_events=True,
             permission_mode="bypassPermissions",  # unattended; matches settings.json
             can_use_tool=self._can_use_tool,
             cwd=cwd or self.cfg.cc_cwd,           # dynamic: must match the resumed session's cwd
@@ -155,6 +187,7 @@ class SdkHandle:
         if resume_id and not fork:
             await self.refresh_goal(resume_id)
         self.applied_effort = self.effort  # the live subprocess now reflects this effort
+        self._start_message_pump()
         log.info("sdk connected", resume=bool(resume_id), fork=fork, cwd=opts.cwd,
                  effort=self.effort, sdk_version=SDK_VERSION)
 
@@ -162,6 +195,27 @@ class SdkHandle:
         """Send a request. `prompt` is a string, or an async iterable of user-
         message dicts (used for multimodal input — text + image blocks)."""
         assert self.client is not None
+        if self._message_pump_task is not None:
+            if self._message_pump_task.done():
+                raise RuntimeError("Claude SDK message pump is not running") from self._message_pump_error
+            if self._turn_active or self._turn_consumer_active:
+                raise RuntimeError("Claude SDK already has an active response")
+            # Each turn gets its own barrier. Background messages retain the
+            # barrier belonging to the Result they followed, so a later query
+            # cannot re-block old queued notifications and deadlock the reader.
+            self._turn_background_release = asyncio.Event()
+            self._turn_origin_id = self.next_turn_id
+            self.next_turn_id = None
+            self._turn_active = True
+            try:
+                await self.client.query(prompt)
+            except BaseException:
+                self._turn_active = False
+                self._turn_background_release.set()
+                raise
+            return
+        # Compatibility for tests/custom clients that install a client without
+        # going through connect(). Real SDK connections always use the sole pump.
         await self.client.query(prompt)
 
     async def interrupt(self) -> None:
@@ -247,6 +301,12 @@ class SdkHandle:
             msg, self.goal, self._goal_message_tokens)
         return changed, current_goal(self.goal)
 
+    @staticmethod
+    def _parse_compat_message(data: Any):
+        if isinstance(data, dict) and data.get("type") == "active_goal":
+            return SystemMessage(subtype="active_goal", data=data)
+        return _parse_sdk_message(data)
+
     async def _receive_response_compat(self):
         """Preserve raw active_goal frames dropped by SDK <= 0.2.116.
 
@@ -264,23 +324,151 @@ class SdkHandle:
                 yield message
             return
         async for data in query.receive_messages():
-            if isinstance(data, dict) and data.get("type") == "active_goal":
-                message = SystemMessage(subtype="active_goal", data=data)
-            else:
-                message = _parse_sdk_message(data)
+            message = self._parse_compat_message(data)
             if message is None:
                 continue
             yield message
             if isinstance(message, ResultMessage):
                 return
 
+    def _start_message_pump(self) -> None:
+        """Start the sole consumer of the SDK Query message stream."""
+        if self._message_pump_task is not None:
+            raise RuntimeError("Claude SDK message pump already started")
+        cap = max(1, int(getattr(self.cfg, "turn_reader_queue_cap", 4)))
+        self._turn_messages = asyncio.Queue(maxsize=cap)
+        self._background_messages = asyncio.Queue(maxsize=cap)
+        self._turn_active = False
+        self._turn_consumer_active = False
+        self._message_pump_error = None
+        initial_release = asyncio.Event()
+        initial_release.set()
+        self._turn_background_release = initial_release
+        client = self.client
+        assert client is not None
+        self._message_pump_task = asyncio.create_task(
+            self._message_pump(client))
+        self._background_task = asyncio.create_task(
+            self._background_message_worker())
+
+    async def _message_pump(self, client: ClaudeSDKClient) -> None:
+        """Read the private SDK queue once for the complete client lifetime."""
+        assert self._turn_messages is not None
+        assert self._background_messages is not None
+        try:
+            query = getattr(client, "_query", None)
+            if query is not None and hasattr(query, "receive_messages"):
+                source = query.receive_messages()
+                parse_raw = True
+            else:
+                source = client.receive_messages()
+                parse_raw = False
+            async for data in source:
+                message = self._parse_compat_message(data) if parse_raw else data
+                if message is None:
+                    continue
+                if self._turn_active:
+                    await self._turn_messages.put(message)
+                    if isinstance(message, ResultMessage):
+                        self._turn_active = False
+                    continue
+                release = self._turn_background_release
+                if release is None:
+                    release = asyncio.Event()
+                    release.set()
+                await self._background_messages.put(
+                    (message, release, self._turn_origin_id))
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            self._message_pump_error = exc
+            if self._turn_active:
+                self._turn_active = False
+                await self._turn_messages.put(_MessagePumpFailure(exc))
+            else:
+                log.warning(
+                    "Claude SDK message pump stopped",
+                    error_type=type(exc).__name__)
+        else:
+            if self._turn_active:
+                self._turn_active = False
+                await self._turn_messages.put(_MESSAGE_PUMP_END)
+
+    async def _background_message_worker(self) -> None:
+        """Deliver idle notifications in order with bounded backpressure."""
+        assert self._background_messages is not None
+        while True:
+            message, release, turn_id = await self._background_messages.get()
+            await release.wait()
+            callback = self.background_message_callback
+            if callback is None:
+                continue
+            try:
+                await callback(message, turn_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # One malformed/background notification must not kill the sole
+                # SDK reader and make the next user query hang forever.
+                log.warning(
+                    "Claude background message callback failed",
+                    error_type=type(exc).__name__)
+
+    async def _receive_response_pumped(self):
+        queue = self._turn_messages
+        if queue is None:
+            raise RuntimeError("Claude SDK message pump is unavailable")
+        if self._turn_consumer_active:
+            raise RuntimeError("Claude SDK response already has a consumer")
+        self._turn_consumer_active = True
+        try:
+            while True:
+                message = await queue.get()
+                if message is _MESSAGE_PUMP_END:
+                    raise RuntimeError(
+                        "Claude SDK stream ended without a ResultMessage")
+                if isinstance(message, _MessagePumpFailure):
+                    raise message.error
+                yield message
+                if isinstance(message, ResultMessage):
+                    return
+        finally:
+            self._turn_consumer_active = False
+
+    def release_background_messages(self) -> None:
+        """Release notifications ordered after the processed ResultMessage."""
+        if self._turn_background_release is not None:
+            self._turn_background_release.set()
+
     def receive_response(self):
         assert self.client is not None
+        if self._message_pump_task is not None:
+            return self._receive_response_pumped()
         return self._receive_response_compat()
+
+    async def _stop_message_pump(self) -> None:
+        release = self._turn_background_release
+        if release is not None:
+            release.set()
+        tasks = [task for task in (
+            self._message_pump_task, self._background_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._message_pump_task = None
+        self._background_task = None
+        self._turn_messages = None
+        self._background_messages = None
+        self._turn_active = False
+        self._turn_consumer_active = False
+        self._turn_background_release = None
+        self._turn_origin_id = None
 
     async def disconnect(self) -> None:
         if self.client is not None:
             try:
+                await self._stop_message_pump()
                 await self.client.disconnect()
             finally:
                 self.client = None

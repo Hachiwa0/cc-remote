@@ -36,6 +36,7 @@
 ## 它能干什么
 
 - 📱 **手机/浏览器实时遥控**：在外面用手机就能驱动家里/公司机器上的 Claude Code 或 Codex，流式看它敲字、跑工具。
+- 🧭 **完整处理过程**：按回合折叠展示思考摘要、说明、计划、命令输出、文件 diff、MCP、协作代理和 Hook 生命周期；最终答复保持独立清晰。
 - ⏹️ **随时打断**：一键中断当前回合（正确处理 SDK/app-server 的终止语义，不会串台）。
 - 🔀 **多会话**：常驻会话池，侧栏切换；后台会话继续跑，状态点实时更新。
 - 🕘 **历史秒开**：历史按需从 transcript/rollout 分页读取（像各家 web chat 一样），刷新不卡、不重放洪流。
@@ -156,12 +157,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **从协议 v4 升级到 v5**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v6**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
-> v4 页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v5 relay 和
-> v5 wrapper；这样旧 wrapper 不会占住 relay 的单连接槽。
+> v5 页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v6 relay 和
+> v6 wrapper；这样旧 wrapper 不会占住 relay 的单连接槽。
 
 ### 3）停服维护窗口内，从 staging 发布到 VPS
 
@@ -171,7 +172,7 @@ rsync -av --delete --exclude='.git' --exclude='.venv' \
   --exclude='web/node_modules' --exclude='.env' \
   ./ <vps-user>@<vps>:~/cc-remote-upload/
 
-# VPS：协议 v5 的 Python + web/dist 在停服窗口一起发布，避免混跑
+# VPS：协议 v6 的 Python + web/dist 在停服窗口一起发布，避免混跑
 ssh <vps-user>@<vps>
 sudo systemctl stop cc-remote-relay 2>/dev/null || true
 sudo mkdir -p /opt/cc-remote
