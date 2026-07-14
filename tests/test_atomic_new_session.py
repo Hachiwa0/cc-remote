@@ -20,7 +20,7 @@ _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
 def test_protocol_v10_new_session_query_roundtrip_and_validation():
-    assert PROTOCOL_VERSION == 10
+    assert PROTOCOL_VERSION == 11
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",
@@ -118,6 +118,8 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             "collaboration_mode": None,
             "permission_mode": None,
             "service_tier": None,
+            "space": "code",
+            "work_id": None,
         }
         turn_ctx, prompt, images, files = captured["turn"]
         assert turn_ctx is ctx and prompt == "first prompt"

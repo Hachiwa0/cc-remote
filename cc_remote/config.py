@@ -125,6 +125,12 @@ class WrapperConfig:
     # from 4 so browsing many sessions doesn't thrash-respawn. Tune via env.
     max_concurrent_sessions: int = field(default_factory=lambda: _int("MAX_CONCURRENT_SESSIONS", 20))
     state_dir: Path = field(default_factory=lambda: Path(_env("CC_REMOTE_STATE_DIR", str(Path.home() / ".cc-remote"))))
+    # Work uses native engine sessions, but gives them private provider-scoped
+    # working directories and a cc-remote metadata registry.
+    claude_work_root: Path = field(default_factory=lambda: Path(_env(
+        "CLAUDE_WORK_ROOT", str(Path.home() / ".claude" / "cc-remote" / "work"))))
+    codex_work_root: Path = field(default_factory=lambda: Path(_env(
+        "CODEX_WORK_ROOT", str(Path.home() / ".codex" / "cc-remote" / "work"))))
 
 
 def relay_config() -> RelayConfig:

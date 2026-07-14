@@ -78,6 +78,8 @@ class SdkHandle:
         # only after the CLI accepts them; every later reconnect passes the same
         # value back through ClaudeAgentOptions instead of silently reverting.
         self.permission_mode = "bypassPermissions"
+        self.work_mode = False
+        self.work_settings_path: str | None = None
         # A SetPerm can arrive while a turn task is respawning Claude for effort
         # or stale history. Serialize those two control paths so a successful
         # runtime change cannot land on the old child after the new options were
@@ -142,6 +144,26 @@ class SdkHandle:
     def _options(self, resume_id: str | None, cwd: str | None = None,
                  fork: bool = False,
                  model_override: str | None = None) -> ClaudeAgentOptions:
+        prompt_append = (
+            "You are running inside cc-remote Work, a deliverable-oriented "
+            "workspace rather than a source-code project. Create documents, "
+            "analysis, tables, presentations, and other requested artifacts in "
+            "the current workspace. If WORK.md exists, read it before the first "
+            "task; it contains the selected project's sources and enabled work "
+            "plugins. Never attempt to read or modify paths outside "
+            "the explicitly granted workspace. If more local context is required, "
+            "ask the user to grant a folder instead of trying to bypass the sandbox.\n"
+            if self.work_mode else
+            "You have two MCP tools on the cc-remote-ask server:\n"
+            "- `ask_user(question, options)`: ask the user a multiple-choice clarifying "
+            "question (instead of plain text). Blocks until they answer.\n"
+            "- `set_mode(mode)`: switch cc's permission mode yourself, in the middle of a "
+            "turn. When the user expresses intent — 'plan first' / 'let's plan this' -> "
+            "set_mode('plan'); 'just do it' / 'go ahead' -> set_mode('bypassPermissions') "
+            "or 'acceptEdits'. The user has no Shift+Tab here, so calling this is how you "
+            "enter plan mode for them.\n"
+            "Modes: default, acceptEdits, plan, auto, bypassPermissions."
+        )
         return ClaudeAgentOptions(
             include_partial_messages=True,        # StreamEvent with content_block_delta
             # Emit hook lifecycle metadata into the SDK stream. StreamTranslator
@@ -163,21 +185,19 @@ class SdkHandle:
             # Claude/tool subprocesses. Never expose relay login/bearer secrets.
             env=child_env_tombstones(),
             stderr=self._on_stderr,               # surface cc subprocess errors
-            # setting_sources left None -> load ~/.claude/settings.json (model link, model id)
+            # Work keeps the user's model-link settings but adds a wrapper-owned
+            # fail-closed sandbox file that the writable workspace cannot edit.
+            settings=self.work_settings_path if self.work_mode else None,
+            setting_sources=["user"] if self.work_mode else None,
+            sandbox=({
+                "enabled": True,
+                "autoAllowBashIfSandboxed": True,
+                "allowUnsandboxedCommands": False,
+            } if self.work_mode else None),
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
-                "append": (
-                    "You have two MCP tools on the cc-remote-ask server:\n"
-                    "- `ask_user(question, options)`: ask the user a multiple-choice clarifying "
-                    "question (instead of plain text). Blocks until they answer.\n"
-                    "- `set_mode(mode)`: switch cc's permission mode yourself, in the middle of a "
-                    "turn. When the user expresses intent — 'plan first' / 'let's plan this' -> "
-                    "set_mode('plan'); 'just do it' / 'go ahead' -> set_mode('bypassPermissions') "
-                    "or 'acceptEdits'. The user has no Shift+Tab here, so calling this is how you "
-                    "enter plan mode for them.\n"
-                    "Modes: default, acceptEdits, plan, auto, bypassPermissions."
-                ),
+                "append": prompt_append,
             },
             mcp_servers=(
                 {"cc-remote-ask": {"type": "sdk", "name": "cc-remote-ask", "instance": self.ask_server}}

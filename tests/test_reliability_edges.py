@@ -80,7 +80,10 @@ def test_session_lists_echo_engine_and_are_unicast_to_each_requester(monkeypatch
         calls.append((threading.get_ident(), limit))
         return []
 
+    codex_calls = []
+
     async def list_codex_sessions(_limit):
+        codex_calls.append(_limit)
         return []
 
     monkeypatch.setattr(mm, "list_sessions", list_claude_sessions)
@@ -93,12 +96,17 @@ def test_session_lists_echo_engine_and_are_unicast_to_each_requester(monkeypatch
             engine="claude", client_id="client-claude"))
         await machine._handle_list_sessions(ListSessions(
             engine="codex", client_id="client-codex"))
+        await machine._handle_list_sessions(ListSessions(
+            engine="codex", space="work", client_id="client-codex-work"))
 
         lists = [msg for msg in transport.sent if isinstance(msg, SessionList)]
         assert [(msg.engine, msg.to) for msg in lists] == [
             ("claude", "client-claude"),
             ("codex", "client-codex"),
+            ("codex", "client-codex-work"),
         ]
+        assert lists[-1].space == "work"
+        assert codex_calls == [200]
         assert len(calls) == 1 and calls[0][1] == 200
         assert calls[0][0] != caller_thread
 

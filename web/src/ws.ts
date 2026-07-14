@@ -8,7 +8,7 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent,
+  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, Space,
 } from "./protocol.ts";
 import { makeForkSessionCommand, makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
 import { CommandOutbox, planRecoveryReplay } from "./outbox.ts";
@@ -45,12 +45,16 @@ export class RelayWs {
   private rebuildingSessions = new Set<string>();
   private replayOrder: string[] = [];
   private engineBySession: Record<string, "claude" | "codex"> = {};
+  private spaceBySession: Record<string, Space> = {};
   private focusedSid: string | null = null;
+  private activeEngine: "claude" | "codex" = "claude";
+  private activeSpace: Space = "code";
   // Correlates a create response without using SessionFocus as a trigger for the
   // first query. A later explicit switch clears it, so late create focus cannot
   // override the user's newer navigation intent.
   private newSessionFocusRequestId: string | null = null;
   private newSessionEngine: "claude" | "codex" = "claude";
+  private newSessionSpace: Space = "code";
   private readonly outbox = new CommandOutbox(
     OUTBOX_MAX_COMMANDS, OUTBOX_MAX_BYTES, OUTBOX_MAX_FRAME_BYTES);
   private readonly clientId: string;
@@ -133,6 +137,7 @@ export class RelayWs {
       delete this.lastSeqBySession[expired];
       delete this.generationBySession[expired];
       delete this.engineBySession[expired];
+      delete this.spaceBySession[expired];
       this.rebuildingSessions.delete(expired);
     }
   }
@@ -143,6 +148,7 @@ export class RelayWs {
       delete this.generationBySession[knownSid];
       delete this.lastSeqBySession[knownSid];
       delete this.engineBySession[knownSid];
+      delete this.spaceBySession[knownSid];
       this.rebuildingSessions.delete(knownSid);
       this.replayOrder = this.replayOrder.filter((item) => item !== knownSid);
     }
@@ -224,19 +230,43 @@ export class RelayWs {
     }
   }
 
-  setFocusedSid(sid: string | null, engine?: "claude" | "codex"): void {
+  setFocusedSid(sid: string | null, engine?: "claude" | "codex", space?: Space): void {
     this.focusedSid = sid;
     if (sid) {
       if (engine) this.engineBySession[sid] = engine;
+      if (space) this.spaceBySession[sid] = space;
       this.touchReplay(sid);
     }
     this.newSessionFocusRequestId = null;
   }
 
-  setSessionEngines(sessions: Array<{ session_id: string; engine?: string | null }>): void {
+  /** Set the visible product surface and drop a focus owned by another one. */
+  setSurface(engine: "claude" | "codex", space: Space): void {
+    const changed = engine !== this.activeEngine || space !== this.activeSpace;
+    this.activeEngine = engine;
+    this.activeSpace = space;
+    if (this.focusedSid && !this.sessionMatchesSurface(this.focusedSid, engine, space)) {
+      this.focusedSid = null;
+    }
+    if (changed && this.newSessionFocusRequestId
+        && (this.newSessionEngine !== engine || this.newSessionSpace !== space)) {
+      this.newSessionFocusRequestId = null;
+    }
+  }
+
+  private sessionMatchesSurface(
+    sid: string, engine = this.activeEngine, space = this.activeSpace,
+  ): boolean {
+    return this.engineBySession[sid] === engine && this.spaceBySession[sid] === space;
+  }
+
+  setSessionEngines(sessions: Array<{ session_id: string; engine?: string | null; space?: Space | null }>): void {
     for (const session of sessions) {
       if (session.engine === "codex" || session.engine === "claude") {
         this.engineBySession[session.session_id] = session.engine;
+      }
+      if (session.space === "work" || session.space === "code") {
+        this.spaceBySession[session.session_id] = session.space;
       }
     }
   }
@@ -415,16 +445,19 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...this.sidObj() });
   }
 
-  sendListSessions(engine?: "claude" | "codex"): void {
+  sendListSessions(engine?: "claude" | "codex", space: Space = "code"): void {
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
     this.send(obj);
   }
 
-  sendSwitchSession(sessionId: string, engine?: "claude" | "codex"): void {
+  sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
     if (engine) this.engineBySession[sessionId] = engine;
+    this.spaceBySession[sessionId] = space;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
     this.send(obj);
   }
 
@@ -433,15 +466,19 @@ export class RelayWs {
                  initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] },
                  collaborationMode?: "default" | "plan",
                  permissionMode?: "never" | "on-request" | "untrusted",
-                 serviceTier?: "default" | "fast"): boolean {
+                 serviceTier?: "default" | "fast",
+                 space: Space = "code", projectId?: string | null): boolean {
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
     this.newSessionEngine = engine ?? "claude";
+    this.newSessionSpace = space;
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "new_session", request_id: requestId, ts: nowTs(),
     };
     if (cwd) obj.cwd = cwd;
     if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    if (space === "work" && projectId) obj.project_id = projectId;
     if (model) obj.model = model;
     if (effort) obj.effort = effort;
     if (engine === "codex" && collaborationMode) {
@@ -464,12 +501,99 @@ export class RelayWs {
     return queued;
   }
 
-  sendRenameSession(sessionId: string, title: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() });
+  sendRenameSession(sessionId: string, title: string,
+                    engine?: "claude" | "codex", space: Space = "code"): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() };
+    if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    this.send(obj);
   }
 
-  sendArchiveSession(sessionId: string, archived: boolean): void {
-    this.send({ v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() });
+  sendArchiveSession(sessionId: string, archived: boolean,
+                     engine?: "claude" | "codex", space: Space = "code"): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() };
+    if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    this.send(obj);
+  }
+
+  sendDeleteWorkSession(sessionId: string, engine: "claude" | "codex"): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "delete_work_session", session_id: sessionId,
+      engine, space: "work", ts: nowTs(),
+    });
+  }
+
+  sendGetWorkDashboard(engine: "claude" | "codex"): void {
+    this.send({
+      v: PROTOCOL_VERSION, type: "get_work_dashboard", engine, ts: nowTs(),
+    });
+  }
+
+  sendCreateWorkProject(engine: "claude" | "codex", name: string,
+                        description: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "create_work_project", engine,
+      name, description, ts: nowTs() });
+  }
+
+  sendDeleteWorkProject(engine: "claude" | "codex", projectId: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "delete_work_project", engine,
+      project_id: projectId, ts: nowTs() });
+  }
+
+  sendAddWorkSource(engine: "claude" | "codex", projectId: string,
+                    kind: "file" | "link" | "note", title: string,
+                    uri?: string, file?: QueryFile): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "add_work_source", engine,
+      project_id: projectId, kind, title, ts: nowTs(),
+    };
+    if (uri) command.uri = uri;
+    if (file) command.file = file;
+    return this.send(command);
+  }
+
+  sendDeleteWorkSource(engine: "claude" | "codex", sourceId: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "delete_work_source", engine,
+      source_id: sourceId, ts: nowTs() });
+  }
+
+  sendCreateWorkPlugin(engine: "claude" | "codex", name: string,
+                       instructions: string, projectId?: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "create_work_plugin", engine,
+      name, instructions, ts: nowTs(),
+    };
+    if (projectId) command.project_id = projectId;
+    return this.send(command);
+  }
+
+  sendDeleteWorkPlugin(engine: "claude" | "codex", pluginId: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "delete_work_plugin", engine,
+      plugin_id: pluginId, ts: nowTs() });
+  }
+
+  sendCreateWorkSchedule(engine: "claude" | "codex", title: string,
+                         prompt: string, nextRunAt: number,
+                         repeatSeconds?: number, projectId?: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "create_work_schedule", engine,
+      title, prompt, next_run_at: nextRunAt, ts: nowTs(),
+    };
+    if (repeatSeconds) command.repeat_seconds = repeatSeconds;
+    if (projectId) command.project_id = projectId;
+    return this.send(command);
+  }
+
+  sendDeleteWorkSchedule(engine: "claude" | "codex", scheduleId: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "delete_work_schedule", engine,
+      schedule_id: scheduleId, ts: nowTs() });
+  }
+
+  sendSetWorkGrant(engine: "claude" | "codex", sessionId: string,
+                   path: string, mode: "none" | "read" | "write"): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "set_work_grant", engine,
+      session_id: sessionId, path, mode, ts: nowTs() });
   }
 
   sendListDir(path?: string | null): void {
@@ -509,6 +633,7 @@ export class RelayWs {
       v: PROTOCOL_VERSION, type: "switch_session", session_id: sid, ts: nowTs(),
     };
     if (this.engineBySession[sid] === "codex") frame.engine = "codex";
+    if (this.spaceBySession[sid] === "work") frame.space = "work";
     this.sendUntracked(frame);
   }
 
@@ -584,12 +709,20 @@ export class RelayWs {
           // or the very first focus when we have none yet.
           const isCreatedFocus = !!msg.request_id
             && msg.request_id === this.newSessionFocusRequestId;
+          const targetEngine = isCreatedFocus
+            ? this.newSessionEngine : this.engineBySession[msg.session_id];
+          const targetSpace = isCreatedFocus
+            ? this.newSessionSpace : this.spaceBySession[msg.session_id];
+          if (targetEngine !== this.activeEngine || targetSpace !== this.activeSpace) {
+            return; // delayed/foreign Code↔Work or Claude↔Codex focus
+          }
           if (this.focusedSid != null && msg.session_id !== this.focusedSid && !isCreatedFocus) {
             return; // superseded — ignore
           }
           if (isCreatedFocus) this.newSessionFocusRequestId = null;
           this.focusedSid = msg.session_id;
           if (isCreatedFocus) this.engineBySession[msg.session_id] = this.newSessionEngine;
+          if (isCreatedFocus) this.spaceBySession[msg.session_id] = this.newSessionSpace;
           this.touchReplay(msg.session_id);
           this.cb.onEvent(msg);
           return;
@@ -616,6 +749,10 @@ export class RelayWs {
               this.engineBySession[session_id] = this.engineBySession[old_key];
             }
             delete this.engineBySession[old_key];
+            if (this.spaceBySession[old_key] && !this.spaceBySession[session_id]) {
+              this.spaceBySession[session_id] = this.spaceBySession[old_key];
+            }
+            delete this.spaceBySession[old_key];
             this.outbox.rekeySession(old_key, session_id);
             this.replayOrder = this.replayOrder.filter((sid) => sid !== old_key);
             this.touchReplay(session_id);
@@ -630,7 +767,8 @@ export class RelayWs {
             this.noteGeneration(sid, msg.generation);
             this.rebuildingSessions.delete(sid);
           }
-          if (this.focusedSid == null && sid) this.focusedSid = sid;
+          // Snapshots announce background runtimes. Only an explicit switch or
+          // correlated create response may move focus across product surfaces.
         }
         if (msg.type === "replay_start" && msg.sid && msg.generation) {
           this.noteGeneration(msg.sid, msg.generation);

@@ -7,6 +7,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.protocol import (
     NewSession,
     Notice,
@@ -259,7 +260,16 @@ def test_runtime_callback_failure_logs_no_notice_or_exception_body(caplog):
             "params": {"message": "SECRET_NOTICE_BODY"},
         })
 
-    asyncio.run(run())
+    # Production JSON loggers intentionally do not propagate to a root logger.
+    # Temporarily expose this logger to caplog so the test can inspect the raw
+    # LogRecord while leaving the production logging topology unchanged.
+    raw_logger = codex_handle_module.log._raw
+    original_propagate = raw_logger.propagate
+    raw_logger.propagate = True
+    try:
+        asyncio.run(run())
+    finally:
+        raw_logger.propagate = original_propagate
     logged = "\n".join(
         record.getMessage() + repr(getattr(record, "extra_data", {}))
         for record in caplog.records

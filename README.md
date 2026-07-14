@@ -43,6 +43,9 @@ API key 烤进网页。
 | 场景 | 可以做什么 |
 |---|---|
 | **双引擎** | 在同一个 Web UI 中使用 Claude Code 和 Codex；每个会话保持自己的模型、思考强度、权限与运行状态。 |
+| **Code / Work 双空间** | Code 继续面向代码仓库；Work 是完全独立的 Cowork 工作区，用于文档、表格、演示、资料整理和临时协作，不混入代码会话列表。 |
+| **Work 项目与资料库** | 为 Claude/Codex 分别建立私有项目、文件/链接/笔记资料库和可复用指令插件；创建工作时会把选定上下文物化到专属目录。 |
+| **Work 定时任务与授权** | 支持一次、每日、每周任务；默认只能访问自己的私有工作目录，用户可按会话额外授予外部目录只读或读写权限并随时撤销。 |
 | **远程操作** | 手机、平板或桌面浏览器实时看流式回复，发送附件，排队下一条消息，随时打断当前回合。 |
 | **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
 | **文件预览与 Markdown 编辑** | 点击回复中的本机文件链接可直接打开源码并定位行号；也可从变更卡片或 `/preview 路径` 打开 Markdown，在实时预览和源码编辑间切换，通过 Ctrl/⌘+S 或保存按钮执行带冲突检测的原子保存。 |
@@ -69,6 +72,20 @@ API key 烤进网页。
 | **wrapper** | `claude` / `codex` 所在的机器 | 持有会话池、把 SDK/app-server 事件翻成线协议、管打断/排空、按需从 transcript/rollout 读历史。**只出站连中继，机器不需要开入站端口。** |
 | **relay（中继）** | 公网 VPS（或本地） | 纯 WebSocket 转发器（FastAPI）。wrapper 使用 Bearer token，浏览器使用 HttpOnly 会话 cookie；单 wrapper 槽、多客户端扇出。**从不 import `claude-agent-sdk`、从不碰模型 API**。 |
 | **web** | 浏览器 | React 客户端；中继同源托管它的静态文件（`web/dist`）。 |
+
+### Code 与 Work
+
+侧栏顶部的 **Code / Work** 开关复用同一套 Claude/Codex 引擎，但两类会话在
+存储、列表和权限上彼此隔离：
+
+- **Code** 保持原有行为，以用户选择的代码仓库为工作目录，适合开发、调试和部署。
+- **Work** 适合文档、表格、PPT、调研、资料库和临时对话。Claude 数据默认在
+  `~/.claude/cc-remote/work`，Codex 数据默认在 `~/.codex/cc-remote/work`；每项工作有
+  独立的 `workspace/`、上传文件和产物目录，删除时只删除注册表确认属于该 Work 的目录。
+- Work 默认不开放用户主目录。需要引用现有资料时，从会话菜单显式授予某个绝对目录
+  **只读**或**读写**权限；撤销后会在会话空闲时重新生成沙箱并重连。
+- “插件”当前是可复用的工作说明/流程模板，会写入该项目的 `WORK.md`，不会在后台执行
+  未审核的第三方代码。定时任务由 wrapper 持久化和领取，使用同一 Work 隔离策略运行。
 
 ## 真实界面与实用功能
 
@@ -221,12 +238,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v10**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v11**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v10 relay 和
-> v10 wrapper；这样旧 wrapper 不会占住 relay 的单连接槽。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v11 relay 和
+> v11 wrapper；这样旧 wrapper 不会占住 relay 的单连接槽。
 
 ### 3）停服维护窗口内，从 staging 发布到 VPS
 
@@ -236,7 +253,7 @@ rsync -av --delete --exclude='.git' --exclude='.venv' \
   --exclude='web/node_modules' --exclude='.env' \
   ./ <vps-user>@<vps>:~/cc-remote-upload/
 
-# VPS：协议 v10 的 Python + web/dist 在停服窗口一起发布，避免混跑
+# VPS：协议 v11 的 Python + web/dist 在停服窗口一起发布，避免混跑
 ssh <vps-user>@<vps>
 sudo systemctl stop cc-remote-relay 2>/dev/null || true
 sudo mkdir -p /opt/cc-remote
@@ -331,6 +348,8 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `CLAUDE_BIN` | 空 | 可选的 Claude CLI 绝对路径；systemd/PATH 找不到 `claude` 时设置。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |
 | `CC_RESUME_SESSION_ID` | 空 | 恢复指定会话 UUID；留空开新会话。首次启动后 id 会持久化到 `~/.cc-remote/`。 |
+| `CLAUDE_WORK_ROOT` | `~/.claude/cc-remote/work` | Claude Work 的私有注册表、资料库、会话目录和策略文件根目录。 |
+| `CODEX_WORK_ROOT` | `~/.codex/cc-remote/work` | Codex Work 的私有注册表、资料库、会话目录和策略文件根目录。 |
 | `MAX_CONCURRENT_SESSIONS` | `20` | 常驻 agent 子进程上限（内存随引擎/版本变化）。超了就驱逐 idle 的；客户端缓存仍在，可再切回。 |
 | `DRAIN_TIMEOUT` | `15` | interrupt 后等终止 ResultMessage 的秒数，超时强制重连（排空保险）。 |
 | `CODEX_TURN_IDLE_WARN_SECONDS` | `90` | Codex app-server 连续无事件时显示“仍在等待”提示；`0` 禁用。只提示，不自动打断 ultra 推理或长工具。 |
@@ -358,7 +377,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 
 > **cc-remote 会让远端的人在你机器上跑任意命令。请当成「给别人一个你机器的 shell」来对待。**
 
-- Claude 会话默认使用 `permissionMode: bypassPermissions`；Codex 默认审批策略是 `never` 并继承本机 Codex sandbox 配置，也可切到 `on-request` / `untrusted`，审批请求会转到网页。无论当前界面显示什么策略，已登录客户端都能创建/切换会话和修改可用控制项。**能连到中继且通过登录的人，应等同于拿到了这台机器的远程 agent/shell 权限。**
+- Code 会话仍是远程开发控制面：Claude 默认使用 `permissionMode: bypassPermissions`；Codex 默认审批策略是 `never` 并继承本机 Codex sandbox 配置，也可切到 `on-request` / `untrusted`。**能登录且能进入 Code 的人，仍应等同于拿到了这台机器的远程 agent/shell 权限。** Work 会话另有私有根目录和显式目录授权，但它只是缩小默认能力面，不替代操作系统级的独立用户、容器或虚拟机隔离。
 - `LOGIN_PASSWORD` / `WRAPPER_TOKEN` / `SESSION_SECRET` 是唯一的门：用强随机值、别提交 git、别贴到聊天里、定期轮换。仓库 `.env` 只适合本机开发；生产 wrapper 必须使用上述 root-only `/etc/cc-remote/wrapper.env`。systemd 模板会禁止服务及模型子进程读取这个源文件和遗留仓库 `.env`；Linux wrapper 还会关闭 dumpability，避免子进程从 `/proc/<pid>/environ` 或进程内存取回已经捕获的 token。
 - 公网必须上 TLS（`wss://`，本仓库用 Caddy 自动签证书）。别用明文 `ws://` 暴露公网。
 - 建议：给中继加 IP 白名单 / 只在需要时开、给登录加失败限速（已内置每 IP 每分钟 5 次）。

@@ -44,6 +44,9 @@ not proxy model APIs or bake API keys into the web client.
 | Scenario | What you can do |
 |---|---|
 | **Two engines** | Use Claude Code and Codex in the same web UI. Every session keeps its own model, reasoning effort, permissions, and runtime state. |
+| **Code / Work spaces** | Code remains repository-oriented. Work is an independent Cowork surface for documents, spreadsheets, presentations, research, and temporary collaboration, with a separate session list. |
+| **Work projects and knowledge** | Keep provider-scoped projects, file/link/note sources, and reusable instruction plugins. Starting a Work session materializes the selected context into its private directory. |
+| **Work schedules and grants** | Run one-shot, daily, or weekly tasks. Work can access only its private directory by default; grant a specific external directory read-only or read-write access per session, then revoke it. |
 | **Remote operation** | Watch streaming replies from a phone, tablet, or desktop browser; send attachments, queue the next message, and interrupt the current turn at any time. |
 | **Complete process** | Expand the reasoning summaries, plans, command output, file diffs, MCP calls, collaboration agents, Hooks, and terminal interaction events exposed by each engine. |
 | **File preview and Markdown editing** | Open local file links from a reply directly in a source viewer at the referenced line. Changed-file chips and `/preview path` also open Markdown with live rendered/source modes, bounded local images, and conflict-safe atomic saves via Ctrl/Cmd+S or the Save button. |
@@ -70,6 +73,25 @@ CONTROL LINK (this repo):              browser ⇄ relay(WebSocket) ⇄ wrapper 
 | **wrapper** | the machine where `claude` / `codex` runs | Holds a session pool, translates SDK/app-server events to the wire protocol, handles interrupt/drain, and reads transcript/rollout history on demand. **Outbound-only to the relay — no inbound ports needed.** |
 | **relay** | public VPS (or local) | Pure WebSocket forwarder (FastAPI). The wrapper uses a Bearer token and browsers use an HttpOnly session cookie; single wrapper slot, multi-client fan-out. **Never imports `claude-agent-sdk`, never touches the model API.** |
 | **web** | the browser | React client; the relay serves its static files (`web/dist`) from the same origin. |
+
+### Code and Work
+
+The **Code / Work** switch at the top of the sidebar reuses the same Claude and
+Codex engines while isolating storage, session lists, and permissions:
+
+- **Code** preserves the existing repository-oriented behavior for development,
+  debugging, and deployment.
+- **Work** targets documents, spreadsheets, presentations, research, knowledge
+  collections, and temporary chats. Claude stores it under
+  `~/.claude/cc-remote/work` and Codex under `~/.codex/cc-remote/work` by default.
+  Every work item has its own `workspace/`, uploads, and artifacts directories.
+  Deletion is limited to a directory that the registry proves belongs to Work.
+- Work does not expose the home directory by default. Use the session menu to
+  grant one absolute directory **read-only** or **read-write** access; revocation
+  regenerates the sandbox and reconnects the session once it is idle.
+- A Work “plugin” is currently an instruction/workflow template written into the
+  project's `WORK.md`; it does not execute unreviewed third-party code. Scheduled
+  tasks are persisted and claimed by the wrapper under the same Work isolation.
 
 ## Real interface and practical features
 
@@ -241,14 +263,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v10:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v11:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v10 relay and v10 wrapper so the old wrapper cannot occupy the
+> then start the v11 relay and v11 wrapper so the old wrapper cannot occupy the
 > relay's single wrapper slot.
 
 ### 3) Publish from staging during a maintenance stop
@@ -259,7 +281,7 @@ rsync -av --delete --exclude='.git' --exclude='.venv' \
   --exclude='web/node_modules' --exclude='.env' \
   ./ <vps-user>@<vps>:~/cc-remote-upload/
 
-# VPS: publish protocol-v10 Python + web/dist together while relay is stopped
+# VPS: publish protocol-v11 Python + web/dist together while relay is stopped
 ssh <vps-user>@<vps>
 sudo systemctl stop cc-remote-relay 2>/dev/null || true
 sudo mkdir -p /opt/cc-remote
@@ -355,6 +377,8 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `CLAUDE_BIN` | empty | Optional absolute Claude CLI path; set it when systemd/PATH cannot find `claude`. |
 | `CC_CWD` | cwd | Default working directory for new sessions. Claude `--resume` needs it to locate `~/.claude/projects/` — **it must be correct**; Codex resume first recovers the original cwd from its rollout. |
 | `CC_RESUME_SESSION_ID` | empty | Resume a specific session UUID; empty starts fresh. The id is persisted to `~/.cc-remote/` after first start. |
+| `CLAUDE_WORK_ROOT` | `~/.claude/cc-remote/work` | Private Claude Work root for the registry, knowledge sources, sessions, and generated policy files. |
+| `CODEX_WORK_ROOT` | `~/.codex/cc-remote/work` | Private Codex Work root for the registry, knowledge sources, sessions, and generated policy files. |
 | `MAX_CONCURRENT_SESSIONS` | `20` | Maximum resident agent subprocesses (memory varies by engine/version). Over the cap, an idle process is evicted; client history remains available. |
 | `DRAIN_TIMEOUT` | `15` | Seconds to wait for the terminal ResultMessage after interrupt before forcing a reconnect (drain safety net). |
 | `CODEX_TURN_IDLE_WARN_SECONDS` | `90` | Show a non-terminal waiting notice after this many seconds without a Codex app-server event; `0` disables it. It does not auto-interrupt long reasoning or tools. |
@@ -382,7 +406,7 @@ Each message accepts at most 8 attachments, at most 6 MiB each and 8 MiB decoded
 
 > **cc-remote lets a remote person run arbitrary commands on your machine. Treat it like handing someone a shell.**
 
-- Claude sessions default to `permissionMode: bypassPermissions`. Codex defaults to approval policy `never` while inheriting the machine's Codex sandbox configuration; it can also use `on-request` / `untrusted`, with approval requests bridged to the web client. Regardless of the policy currently displayed, authenticated clients can create/switch sessions and change available controls. **Treat anyone authenticated to the relay as holding remote agent/shell authority on the wrapper machine.**
+- Code sessions remain a remote development control plane: Claude defaults to `permissionMode: bypassPermissions`, and Codex defaults to approval policy `never` while inheriting the machine's Codex sandbox configuration; both can expose approval controls in the web client. **Treat anyone who can log in and enter Code as holding remote agent/shell authority on the wrapper machine.** Work has a private root and explicit directory grants, but this narrows the default capability surface; it is not a substitute for OS-user, container, or VM isolation.
 - `LOGIN_PASSWORD` / `WRAPPER_TOKEN` / `SESSION_SECRET` are the only gate: use strong random values, never commit or paste them into chats, and rotate them. A repository `.env` is for local development only; production wrappers must use the root-only `/etc/cc-remote/wrapper.env` above. The systemd template prevents the service and model descendants from reading that source file or a legacy repository `.env`; on Linux the wrapper also disables dumpability so children cannot recover the captured token through `/proc/<pid>/environ` or process memory.
 - Always use TLS (`wss://`) in production (this repo uses Caddy for automatic certs). Do not expose plain `ws://` publicly.
 - Recommended: restrict the relay by IP / only run it when needed; login is rate-limited (5/min per IP) out of the box.

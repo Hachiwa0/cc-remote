@@ -260,6 +260,8 @@ export type Action =
   | { type: "start_file_save"; requestId: string; content: string }
   | { type: "clear_artifact" }
   | { type: "clear_btw" }
+  | { type: "clear_session_list" }
+  | { type: "restore_session_list"; sessions: SessionInfo[] }
   | { type: "focus_session"; sid: string }
   | { type: "hydrate_cache"; sid: string; turns: Turn[] }
   | { type: "prune_runtimes"; protectedSids: string[] }
@@ -737,6 +739,14 @@ export function reduce(state: AppState, action: Action): AppState {
       delete runtimes[state.btwSid];   // ephemeral: drop the fork's runtime
       return { ...state, btwSid: null, btwEngine: undefined, runtimes };
     }
+    case "clear_session_list":
+      return { ...state, sessions: [], focusedSid: null };
+    case "restore_session_list":
+      // Surface switches are view changes. Paint that surface's last accepted
+      // list immediately, then let the in-flight authoritative list replace it.
+      // Clearing first exposed Codex app-server startup time as a blank/frozen
+      // sidebar even though the browser already had the exact rows in memory.
+      return { ...state, sessions: action.sessions, focusedSid: null };
     case "focus_session": {
       // optimistic view switch: focus the session locally right away (its runtime
       // is usually already in memory) instead of waiting for the round-trip
@@ -800,14 +810,14 @@ function reduceEvent(
       // real cc id (may still be null while a brand-new session's id is captured).
       const key = e.sid ?? e.cc_session_id ?? state.focusedSid;
       if (!key) return state;
-      // First snapshot on a fresh connect focuses that session so the UI shows
-      // something; a later session_focus (or the user picking one) overrides it.
-      const focusedSid = state.focusedSid ?? key;
+      // A snapshot may belong to a background engine/space. It hydrates that
+      // runtime but never moves focus; the accepted session list drives the
+      // initial explicit switch.
       return { ...patch(state, key, (rt) => {
         rt.state = e.state;
         rt.syncReady = true;
         rt.ccSessionId = e.cc_session_id ?? rt.ccSessionId;
-      }, true), focusedSid, wrapperOnline: true };
+      }, true), focusedSid: state.focusedSid, wrapperOnline: true };
     }
     case "session_focus": {
       // NON-destructive, focus-ONLY view change. Runtime key migration on
@@ -874,6 +884,10 @@ function reduceEvent(
     }
     case "session_list":
       return { ...state, sessions: e.sessions };
+    case "work_dashboard":
+      // Work dashboard state is owned by App because it is engine-scoped and
+      // intentionally independent from the focused conversation runtime.
+      return state;
     case "history": {
       // Bulk on-demand history (one frame, read from the transcript — like a web
       // chat's GET /conversation). Rebuild this session's COMPLETED turns by

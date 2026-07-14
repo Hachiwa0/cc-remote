@@ -1,5 +1,14 @@
 import type { StatusAccount } from "./protocol";
 
+/** Status is a Codex-only, session-bound sheet; two empty ids never mean open. */
+export function shouldOpenCodexStatus(
+  requestedSid: string | null,
+  focusedSid: string | null,
+  engine: "claude" | "codex",
+): boolean {
+  return engine === "codex" && requestedSid !== null && requestedSid === focusedSid;
+}
+
 /** Explain why ChatGPT subscription statistics are absent without calling it a failure. */
 export function accountStatsNote(account?: StatusAccount | null): string | null {
   if (account?.auth_type === "apiKey") {

@@ -86,10 +86,10 @@ assert.deepEqual(planRecoveryReplay([
   { type: "switch", sid: "focused" },
 ]);
 
-assert.equal(shouldAcceptSessionList("claude", {
+assert.equal(shouldAcceptSessionList("claude", "code", {
   v: 10, type: "session_list", ts: 1, engine: "claude", sessions: [],
 }), true);
-assert.equal(shouldAcceptSessionList("codex", {
+assert.equal(shouldAcceptSessionList("codex", "code", {
   v: 10, type: "session_list", ts: 1, engine: "claude", sessions: [],
 }), false);
 

@@ -513,6 +513,28 @@ try {
   const event = (body: Record<string, unknown>): ServerEvent => ({
     v: 10, ts: 10, ...body,
   } as ServerEvent);
+  // Work/Code and engine switches restore the target surface's last accepted
+  // list immediately. The authoritative refresh may take ~1s for Codex because
+  // app-server is started on demand, but it must not blank the sidebar meanwhile.
+  const cachedSessions = [{
+    session_id: "cached-work-session",
+    engine: "codex" as const,
+    space: "work" as const,
+    summary: "cached",
+  }];
+  const restored = reduce(
+    { ...initialState, focusedSid: "old-code-session" },
+    { type: "restore_session_list", sessions: cachedSessions },
+  );
+  assert.deepEqual(restored.sessions, cachedSessions);
+  assert.equal(restored.focusedSid, null);
+
+  const snapshotOnly = reduce(initialState, { type: "event", event: event({
+    type: "snapshot", sid: "background-code", cc_session_id: "background-code",
+    state: "idle", tail_text: "",
+  }) });
+  assert.equal(snapshotOnly.focusedSid, null,
+    "a background snapshot must not focus across Code/Work surfaces");
   const unannounced = createRuntime();
   assert.equal(unannounced.model, "");
   assert.equal(unannounced.effort, "");
@@ -1310,6 +1332,31 @@ relay.start();
 const socket = FakeWebSocket.instances.at(-1);
 assert.ok(socket);
 socket.onopen?.();
+
+// Code/Work is a hard focus boundary. Background snapshots and delayed focus
+// confirmations from the previous surface must not retarget later commands.
+relay.setSessionEngines([
+  { session_id: "surface-code", engine: "claude", space: "code" },
+  { session_id: "surface-work", engine: "claude", space: "work" },
+]);
+relay.setFocusedSid("surface-code", "claude", "code");
+relay.setSurface("claude", "work");
+socket.receive({
+  type: "snapshot", sid: "surface-code", cc_session_id: "surface-code",
+  state: "idle", tail_text: "",
+});
+relay.sendGetContext();
+assert.equal("sid" in JSON.parse(socket.sent.at(-1) ?? "{}"), false);
+const focusEventsBefore = observed.filter((event) => event.type === "session_focus").length;
+socket.receive({ type: "session_focus", session_id: "surface-code" });
+assert.equal(observed.filter((event) => event.type === "session_focus").length,
+  focusEventsBefore);
+relay.sendGetContext();
+assert.equal("sid" in JSON.parse(socket.sent.at(-1) ?? "{}"), false);
+socket.receive({ type: "session_focus", session_id: "surface-work" });
+relay.sendGetContext();
+assert.equal(JSON.parse(socket.sent.at(-1) ?? "{}").sid, "surface-work");
+relay.setSurface("codex", "code");
 
 const codexModels = modelsFor("codex");
 assert.equal(clientSlashesFor("codex").has("plan"), true);

@@ -2,6 +2,7 @@
 
 export type State = "idle" | "running" | "interrupting" | "draining";
 export type Engine = "claude" | "codex";
+export type Space = "code" | "work";
 export type AssistantChannel = "unknown" | "thinking" | "commentary" | "final";
 export type ToolCategory = "tool" | "command" | "file" | "mcp" | "agent" | "server_tool" | "web_search";
 export type ProcessKind = "reasoning" | "plan" | "command" | "file_change" | "mcp" | "agent" | "hook" | "server_tool" | "web_search" | "task" | "terminal" | "model" | "safety" | "diff" | "compaction";
@@ -183,14 +184,18 @@ export interface SessionInfo {
   engine?: Engine | null;
   forked_from_id?: string | null;
   codex_status?: CodexThreadStatus | null;
+  space?: Space | null;
+  work_id?: string | null;
 }
-export interface ListSessions extends Base { type: "list_sessions"; engine?: Engine }
-export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: Engine }
+export interface ListSessions extends Base { type: "list_sessions"; engine?: Engine; space?: Space }
+export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: Engine; space?: Space }
 export interface NewSession extends Base {
   type: "new_session";
   request_id?: string | null;
   cwd?: string | null;
   engine?: "claude" | "codex";
+  space?: Space;
+  project_id?: string | null;
   model?: string | null;
   effort?: string | null;
   collaboration_mode?: CollaborationModeName | null;
@@ -201,14 +206,30 @@ export interface NewSession extends Base {
   images?: QueryImg[] | null;
   files?: QueryFile[] | null;
 }
-export interface SessionList extends Base { type: "session_list"; engine: Engine; sessions: SessionInfo[] }
+export interface SessionList extends Base { type: "session_list"; engine: Engine; space?: Space; sessions: SessionInfo[] }
 export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null; request_id?: string | null }
 // NON-focusing re-key: a temp-keyed new session captured its real cc id. Rename
 // the runtime old_key -> session_id + migrate the cursor; focus only follows if
 // we were already viewing old_key. Prevents focus-steal by background sessions.
 export interface SessionRekey extends Base { type: "session_rekey"; old_key: string; session_id: string; cwd?: string | null }
-export interface RenameSession extends Base { type: "rename_session"; session_id: string; title: string }
-export interface ArchiveSession extends Base { type: "archive_session"; session_id: string; archived: boolean }
+export interface RenameSession extends Base { type: "rename_session"; session_id: string; title: string; engine?: Engine; space?: Space }
+export interface ArchiveSession extends Base { type: "archive_session"; session_id: string; archived: boolean; engine?: Engine; space?: Space }
+export interface DeleteWorkSession extends Base { type: "delete_work_session"; session_id: string; engine: Engine; space?: "work" }
+export interface GetWorkDashboard extends Base { type: "get_work_dashboard"; engine?: Engine }
+export interface CreateWorkProject extends Base { type: "create_work_project"; engine?: Engine; name: string; description?: string }
+export interface DeleteWorkProject extends Base { type: "delete_work_project"; engine?: Engine; project_id: string }
+export interface AddWorkSource extends Base { type: "add_work_source"; engine?: Engine; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; file?: QueryFile | null }
+export interface DeleteWorkSource extends Base { type: "delete_work_source"; engine?: Engine; source_id: string }
+export interface CreateWorkPlugin extends Base { type: "create_work_plugin"; engine?: Engine; project_id?: string | null; name: string; instructions: string }
+export interface DeleteWorkPlugin extends Base { type: "delete_work_plugin"; engine?: Engine; plugin_id: string }
+export interface CreateWorkSchedule extends Base { type: "create_work_schedule"; engine?: Engine; project_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null }
+export interface DeleteWorkSchedule extends Base { type: "delete_work_schedule"; engine?: Engine; schedule_id: string }
+export interface SetWorkGrant extends Base { type: "set_work_grant"; engine?: Engine; session_id: string; path: string; mode: "none" | "read" | "write" }
+export interface WorkProjectInfo { project_id: string; name: string; description: string; created_at: number; updated_at: number }
+export interface WorkSourceInfo { source_id: string; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; created_at: number }
+export interface WorkPluginInfo { plugin_id: string; project_id?: string | null; name: string; instructions: string; enabled: boolean; created_at: number; updated_at: number }
+export interface WorkScheduleInfo { schedule_id: string; project_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null; enabled: boolean; last_run_at?: number | null; last_session_id?: string | null; last_error?: string | null; created_at: number; updated_at: number }
+export interface WorkDashboard extends Base { type: "work_dashboard"; engine: Engine; projects: WorkProjectInfo[]; sources: WorkSourceInfo[]; plugins: WorkPluginInfo[]; schedules: WorkScheduleInfo[] }
 export interface DirEntry { name: string; path: string }
 export interface ListDir extends Base { type: "list_dir"; path?: string | null }
 export interface DirList extends Base { type: "dir_list"; path: string; parent?: string | null; dirs: DirEntry[] }
@@ -346,13 +367,13 @@ export interface ContextReport extends Base {
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | Models | TakeoverState
   | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate
-  | SessionList | SessionFocus | SessionRekey | SessionForked
+  | SessionList | SessionFocus | SessionRekey | SessionForked | WorkDashboard
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | TurnPlan | TurnDiff
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 
 /** Local storage is user-controlled and may contain stale values from older
  * builds. Normalize before a value reaches a strict Pydantic command frame. */

@@ -28,10 +28,11 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
+Space = Literal["code", "work"]
 AssistantChannel = Literal["unknown", "thinking", "commentary", "final"]
 ToolCategory = Literal[
     "tool", "command", "file", "mcp", "agent", "server_tool", "web_search",
@@ -640,6 +641,8 @@ class SessionInfo(BaseModel):
     engine: Optional[str] = None  # "claude" | "codex"; None = claude (legacy sidebar badge)
     forked_from_id: Optional[WireId] = None  # Codex thread/fork parent, when present
     codex_status: Optional[CodexThreadStatus] = None  # authoritative app-server status
+    space: Space = "code"
+    work_id: Optional[WireId] = None
 
 
 class ListSessions(_Command):
@@ -648,12 +651,14 @@ class ListSessions(_Command):
     optional, default claude."""
     type: Literal["list_sessions"] = "list_sessions"
     engine: Literal["claude", "codex"] = "claude"
+    space: Space = "code"
 
 
 class SessionList(_Base):
     """wrapper -> client: the sessions (downstream so a reconnect restores it)."""
     type: Literal["session_list"] = "session_list"
     engine: Literal["claude", "codex"]
+    space: Space = "code"
     sessions: list[SessionInfo]
 
 
@@ -663,6 +668,7 @@ class SwitchSession(_Command):
     type: Literal["switch_session"] = "switch_session"
     session_id: WireId
     engine: Optional[Engine] = None
+    space: Space = "code"
 
 
 class NewSession(_Command):
@@ -680,6 +686,8 @@ class NewSession(_Command):
     request_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
     engine: Engine = "claude"
+    space: Space = "code"
+    project_id: Optional[WireId] = None
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
     effort: Optional[EffortLevel] = None  # None -> engine default
     collaboration_mode: Optional[CollaborationModeName] = None  # Codex only; first turn included
@@ -709,7 +717,156 @@ class NewSession(_Command):
         if invalid:
             raise ValueError(
                 f"{', '.join(invalid)} only supported for Codex sessions")
+        if self.space == "work" and self.cwd is not None:
+            raise ValueError("Work session cwd is assigned by the wrapper")
+        if self.space == "code" and self.project_id is not None:
+            raise ValueError("project_id is only supported for Work sessions")
         return self
+
+
+class DeleteWorkSession(_Command):
+    """Permanently delete one registered Work chat and its owned files."""
+    type: Literal["delete_work_session"] = "delete_work_session"
+    session_id: WireId
+    engine: Engine
+    space: Literal["work"] = "work"
+
+
+class WorkProjectInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_id: WireId
+    name: str = Field(max_length=200)
+    description: str = Field(max_length=16 * 1024)
+    created_at: float = Field(ge=0)
+    updated_at: float = Field(ge=0)
+
+
+class WorkSourceInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: WireId
+    project_id: WireId
+    kind: Literal["file", "link", "note"]
+    title: str = Field(max_length=500)
+    uri: Optional[str] = Field(default=None, max_length=16 * 1024)
+    created_at: float = Field(ge=0)
+
+
+class WorkPluginInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    plugin_id: WireId
+    project_id: Optional[WireId] = None
+    name: str = Field(max_length=200)
+    instructions: str = Field(max_length=64 * 1024)
+    enabled: bool
+    created_at: float = Field(ge=0)
+    updated_at: float = Field(ge=0)
+
+
+class WorkScheduleInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schedule_id: WireId
+    project_id: Optional[WireId] = None
+    title: str = Field(max_length=200)
+    prompt: str = Field(max_length=64 * 1024)
+    next_run_at: float = Field(ge=0)
+    repeat_seconds: Optional[int] = Field(default=None, ge=60, le=31_536_000)
+    enabled: bool
+    last_run_at: Optional[float] = Field(default=None, ge=0)
+    last_session_id: Optional[WireId] = None
+    last_error: Optional[str] = Field(default=None, max_length=2000)
+    created_at: float = Field(ge=0)
+    updated_at: float = Field(ge=0)
+
+
+class WorkDashboard(_Base):
+    type: Literal["work_dashboard"] = "work_dashboard"
+    engine: Engine
+    projects: list[WorkProjectInfo] = Field(max_length=500)
+    sources: list[WorkSourceInfo] = Field(max_length=5000)
+    plugins: list[WorkPluginInfo] = Field(max_length=500)
+    schedules: list[WorkScheduleInfo] = Field(max_length=500)
+
+
+class GetWorkDashboard(_Command):
+    type: Literal["get_work_dashboard"] = "get_work_dashboard"
+    engine: Engine = "claude"
+
+
+class CreateWorkProject(_Command):
+    type: Literal["create_work_project"] = "create_work_project"
+    engine: Engine = "claude"
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=16 * 1024)
+
+
+class DeleteWorkProject(_Command):
+    type: Literal["delete_work_project"] = "delete_work_project"
+    engine: Engine = "claude"
+    project_id: WireId
+
+
+class AddWorkSource(_Command):
+    type: Literal["add_work_source"] = "add_work_source"
+    engine: Engine = "claude"
+    project_id: WireId
+    kind: Literal["file", "link", "note"]
+    title: str = Field(min_length=1, max_length=500)
+    uri: Optional[str] = Field(default=None, max_length=16 * 1024)
+    file: Optional[QueryFile] = None
+
+    @model_validator(mode="after")
+    def source_payload_matches_kind(self):
+        if self.kind == "file" and self.file is None:
+            raise ValueError("file Work source requires file")
+        if self.kind != "file" and self.file is not None:
+            raise ValueError("non-file Work source cannot contain file")
+        if self.kind in {"link", "note"} and not (self.uri or "").strip():
+            raise ValueError("Work source requires uri or note content")
+        return self
+
+
+class DeleteWorkSource(_Command):
+    type: Literal["delete_work_source"] = "delete_work_source"
+    engine: Engine = "claude"
+    source_id: WireId
+
+
+class CreateWorkPlugin(_Command):
+    type: Literal["create_work_plugin"] = "create_work_plugin"
+    engine: Engine = "claude"
+    project_id: Optional[WireId] = None
+    name: str = Field(min_length=1, max_length=200)
+    instructions: str = Field(min_length=1, max_length=64 * 1024)
+
+
+class DeleteWorkPlugin(_Command):
+    type: Literal["delete_work_plugin"] = "delete_work_plugin"
+    engine: Engine = "claude"
+    plugin_id: WireId
+
+
+class CreateWorkSchedule(_Command):
+    type: Literal["create_work_schedule"] = "create_work_schedule"
+    engine: Engine = "claude"
+    project_id: Optional[WireId] = None
+    title: str = Field(min_length=1, max_length=200)
+    prompt: str = Field(min_length=1, max_length=64 * 1024)
+    next_run_at: float = Field(ge=0)
+    repeat_seconds: Optional[int] = Field(default=None, ge=60, le=31_536_000)
+
+
+class DeleteWorkSchedule(_Command):
+    type: Literal["delete_work_schedule"] = "delete_work_schedule"
+    engine: Engine = "claude"
+    schedule_id: WireId
+
+
+class SetWorkGrant(_Command):
+    type: Literal["set_work_grant"] = "set_work_grant"
+    engine: Engine = "claude"
+    session_id: WireId
+    path: str = Field(min_length=1, max_length=4096)
+    mode: Literal["none", "read", "write"]
 
 
 class SessionFocus(_Base):
@@ -749,6 +906,8 @@ class RenameSession(_Command):
     type: Literal["rename_session"] = "rename_session"
     session_id: WireId
     title: str = Field(min_length=1, max_length=200)
+    engine: Optional[Engine] = None
+    space: Space = "code"
 
 
 class ArchiveSession(_Command):
@@ -756,6 +915,8 @@ class ArchiveSession(_Command):
     type: Literal["archive_session"] = "archive_session"
     session_id: WireId
     archived: bool
+    engine: Optional[Engine] = None
+    space: Space = "code"
 
 
 class ForkSession(_Command):
@@ -1244,9 +1405,9 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, DeleteWorkSession, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, SetWorkGrant, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, Models, AskUser, AnswerQuestion,
-    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession,
+    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, WorkDashboard,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
@@ -1291,6 +1452,17 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "list_sessions": ListSessions,
     "switch_session": SwitchSession,
     "new_session": NewSession,
+    "delete_work_session": DeleteWorkSession,
+    "get_work_dashboard": GetWorkDashboard,
+    "create_work_project": CreateWorkProject,
+    "delete_work_project": DeleteWorkProject,
+    "add_work_source": AddWorkSource,
+    "delete_work_source": DeleteWorkSource,
+    "create_work_plugin": CreateWorkPlugin,
+    "delete_work_plugin": DeleteWorkPlugin,
+    "create_work_schedule": CreateWorkSchedule,
+    "delete_work_schedule": DeleteWorkSchedule,
+    "set_work_grant": SetWorkGrant,
     "rename_session": RenameSession,
     "archive_session": ArchiveSession,
     "fork_session": ForkSession,
@@ -1328,6 +1500,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "session_list": SessionList,
     "session_focus": SessionFocus,
     "session_rekey": SessionRekey,
+    "work_dashboard": WorkDashboard,
     "user_msg": UserMsg,
     "assistant_msg_start": AssistantMsgStart,
     "delta": Delta,

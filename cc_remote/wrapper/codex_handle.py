@@ -315,6 +315,8 @@ def _initialize_params() -> dict[str, Any]:
 
 class CodexHandle:
     def __init__(self, cfg, cwd: Optional[str] = None,
+                 work_mode: bool = False,
+                 work_roots: Optional[list[dict[str, str]]] = None,
                  approval_callback: Optional[ApprovalCallback] = None,
                  interaction_callback: Optional[InteractionCallback] = None,
                  goal_callback: Optional[GoalCallback] = None,
@@ -331,6 +333,8 @@ class CodexHandle:
         # watcher attribute those late records to us instead of to a terminal.
         self._owned_turn_ids: OrderedDict[str, None] = OrderedDict()
         self._cwd = cwd
+        self.work_mode = work_mode
+        self.work_roots = list(work_roots or [])
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._turn_q: Optional[asyncio.Queue] = None
@@ -476,8 +480,29 @@ class CodexHandle:
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
         # version-probes subprocesses on first call; keep it off the event loop.
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
+        argv = [codex_bin, "app-server", "--stdio"]
+        if self.work_mode:
+            # One app-server process belongs to one resident session, so a
+            # per-process permission profile can enforce this Work cwd without
+            # mutating the user's global ~/.codex/config.toml.
+            filesystem_entries = [
+                '":minimal" = "read"', '"~" = "deny"',
+                f'{json.dumps(self._cwd)} = "write"',
+            ]
+            for grant in self.work_roots:
+                path = grant.get("path")
+                mode = grant.get("mode")
+                if path and mode in {"read", "write"}:
+                    filesystem_entries.append(
+                        f'{json.dumps(path)} = {json.dumps(mode)}')
+            filesystem = "{ " + ", ".join(filesystem_entries) + " }"
+            argv.extend([
+                "-c", 'default_permissions="cc_remote_work"',
+                "-c", f"permissions.cc_remote_work.filesystem={filesystem}",
+                "-c", "permissions.cc_remote_work.network.enabled=false",
+            ])
         proc = await asyncio.create_subprocess_exec(
-            codex_bin, "app-server", "--stdio",
+            *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -582,6 +607,20 @@ class CodexHandle:
             "input": _to_input(prompt, images),
             "approvalPolicy": self.approval_policy,
         }
+        if self.work_mode:
+            params["cwd"] = self._cwd
+            # Compatibility for Codex versions/configurations still using the
+            # legacy sandbox knobs instead of permission profiles.
+            params["sandboxPolicy"] = {
+                "type": "workspaceWrite",
+                "writableRoots": [
+                    grant["path"] for grant in self.work_roots
+                    if grant.get("mode") == "write" and grant.get("path")
+                ],
+                "networkAccess": False,
+                "excludeTmpdirEnvVar": True,
+                "excludeSlashTmp": True,
+            }
         if self.model:
             params["model"] = self.model
         if self.effort:
@@ -593,7 +632,16 @@ class CodexHandle:
         if collaboration_model:
             settings: dict[str, Any] = {
                 "model": collaboration_model,
-                "developer_instructions": None,
+                "developer_instructions": (
+                    "You are running inside cc-remote Work, a deliverable-oriented "
+                    "private workspace. Create requested documents, spreadsheets, "
+                    "presentations, analyses, and other artifacts in the current "
+                    "workspace. If WORK.md exists, read it first; it contains the "
+                    "selected project's sources and enabled work plugins. Do not "
+                    "access paths outside the granted workspace; ask the user for "
+                    "an explicit folder grant when more local context is required."
+                    if self.work_mode else None
+                ),
             }
             if self.effort:
                 settings["reasoning_effort"] = self.effort

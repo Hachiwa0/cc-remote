@@ -50,6 +50,7 @@ import stat
 import tempfile
 import time
 from collections import OrderedDict
+from pathlib import Path
 from uuid import uuid4
 from typing import Optional
 
@@ -66,6 +67,7 @@ from claude_agent_sdk.types import (
 from cc_remote.attachments import decode_attachment, validate_attachments
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
+from cc_remote.workspaces import WorkStores
 from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, FILE_PREVIEW_MAX_BYTES, PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast,
@@ -74,6 +76,7 @@ from cc_remote.protocol import (
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg,
     TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, SessionFocus, SessionRekey, SessionForked, DirList,
+    WorkDashboard,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
     ERR_FORK_RECONCILING,
@@ -219,7 +222,7 @@ class WrapperMachine:
     SAFE_RETRY_COMMANDS = frozenset({
         "list_sessions", "get_history", "get_models",
         "get_context", "get_status", "get_diff", "get_file_preview",
-        "get_preview_asset", "get_goal", "list_dir",
+        "get_preview_asset", "get_goal", "list_dir", "get_work_dashboard",
     })
     # Commands whose target is a runtime ``sid``.  A /btw runtime is private to
     # the client that created it, so every operation against that sid must pass
@@ -233,7 +236,7 @@ class WrapperMachine:
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
         "get_history", "switch_session", "rename_session", "archive_session",
-        "fork_session", "fork_session_worktree",
+        "delete_work_session", "fork_session", "fork_session_worktree",
     })
 
     def __init__(self, cfg: WrapperConfig, transport: WrapperTransport):
@@ -250,9 +253,15 @@ class WrapperMachine:
         # when it grows without us having written it, mirrors the append to clients.
         self._watch: dict[str, dict] = {}
         self._watch_task: Optional[asyncio.Task] = None
+        self._work_schedule_task: Optional[asyncio.Task] = None
+        self._work_schedule_runs: set[asyncio.Task] = set()
         self._codex_watch_lock = asyncio.Lock()
         self._codex_probe_warned = False
         self._claude_probe_warned = False
+        # Code and Work are two filtered views over the same native Codex
+        # catalog. The browser warms both back-to-back, so briefly reuse one
+        # authoritative read instead of starting app-server twice.
+        self._codex_session_list_cache: tuple[float, list[dict]] | None = None
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
         # resets this window (documented residual risk, not durable exactly-once).
@@ -292,6 +301,14 @@ class WrapperMachine:
         self._models_command_tasks: dict[
             tuple[str, str], asyncio.Task
         ] = {}
+        # Narrow test/embedded configs often omit the new Work roots. Keep those
+        # stores below their temporary state_dir instead of touching the real
+        # user's ~/.claude or ~/.codex during a read-only Code session listing.
+        fallback_work = Path(cfg.state_dir) / "work"
+        self._work = WorkStores(
+            getattr(cfg, "claude_work_root", fallback_work / "claude"),
+            getattr(cfg, "codex_work_root", fallback_work / "codex"),
+        )
 
     # ---- pool helpers ----
 
@@ -574,6 +591,7 @@ class WrapperMachine:
 
     async def run(self) -> None:
         self._cleanup_tmp()
+        await asyncio.to_thread(self._work.initialize)
         # A previous process may have died while a Claude /btw fork was live.
         # Remove its persisted private transcript before accepting any client
         # command or publishing SessionList.
@@ -601,6 +619,8 @@ class WrapperMachine:
                 log.warning("Claude bootstrap unavailable; continuing with empty pool")
 
             self._watch_task = asyncio.create_task(self._watch_loop())
+            self._work_schedule_task = asyncio.create_task(
+                self._work_schedule_loop())
             async for cmd in self.transport.incoming():
                 if cmd.type == "get_models":
                     self._start_models_command(cmd)
@@ -623,6 +643,16 @@ class WrapperMachine:
                 await asyncio.gather(*fork_tasks, return_exceptions=True)
             self._codex_fork_tasks.clear()
             self._claude_fork_tasks.clear()
+            if self._work_schedule_task:
+                self._work_schedule_task.cancel()
+                await asyncio.gather(
+                    self._work_schedule_task, return_exceptions=True)
+            work_runs = list(self._work_schedule_runs)
+            for task in work_runs:
+                task.cancel()
+            if work_runs:
+                await asyncio.gather(*work_runs, return_exceptions=True)
+            self._work_schedule_runs.clear()
             if self._watch_task:
                 self._watch_task.cancel()
                 try:
@@ -649,6 +679,73 @@ class WrapperMachine:
                 if c.btw and c.engine != "codex" and c.btw_real_id:
                     await self._delete_private_btw(
                         c.btw_real_id, c.cwd, forget=disconnected)
+
+    async def _work_schedule_loop(self) -> None:
+        """Claim and launch due Work tasks without stealing the UI focus."""
+        while True:
+            try:
+                now = time.time()
+                for engine in ("claude", "codex"):
+                    due = await asyncio.to_thread(
+                        self._work.for_engine(engine).claim_due_schedules, now)
+                    for schedule in due:
+                        task = asyncio.create_task(
+                            self._run_work_schedule(engine, schedule))
+                        self._work_schedule_runs.add(task)
+                        task.add_done_callback(self._work_schedule_runs.discard)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Work schedule scan failed")
+            await asyncio.sleep(15)
+
+    async def _run_work_schedule(self, engine: str,
+                                 schedule: dict[str, object]) -> None:
+        store = self._work.for_engine(engine)
+        schedule_id = str(schedule["schedule_id"])
+        record = None
+        ctx = None
+        try:
+            record = await asyncio.to_thread(
+                store.create_session, schedule.get("project_id"))
+            ctx = await self._spawn(
+                resume_id=None, cwd=record.cwd, engine=engine,
+                space="work", work_id=record.work_id,
+                permission_mode=("on-request" if engine == "codex" else None),
+            )
+            if ctx is None:
+                raise RuntimeError("engine spawn failed")
+            result = await self._handle_query(Query(
+                sid=ctx.key,
+                prompt=str(schedule["prompt"]),
+                msg_id=f"scheduled-{uuid4().hex}",
+            ))
+            if getattr(result, "type", None) == "error" or ctx.turn_task is None:
+                raise RuntimeError("scheduled turn rejected")
+            await ctx.turn_task
+            if not ctx.session_id:
+                raise RuntimeError("scheduled session id unavailable")
+            await asyncio.to_thread(
+                store.complete_schedule, schedule_id, ctx.session_id, None)
+            log.info("Work schedule completed", engine=engine,
+                     schedule_id=schedule_id, session_id=ctx.session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Work schedule failed", engine=engine,
+                        schedule_id=schedule_id,
+                        error_type=type(exc).__name__)
+            await asyncio.to_thread(
+                store.complete_schedule, schedule_id, None,
+                "执行失败，请检查引擎和权限配置")
+            if ctx is not None:
+                try:
+                    await ctx.sdk.disconnect()
+                except Exception:
+                    pass
+                self.sessions.pop(ctx.key, None)
+            if record is not None and record.session_id is None:
+                await asyncio.to_thread(store.abandon, record.work_id)
 
     async def _on_transport_connected(self) -> None:
         ctx = self._focused_ctx()
@@ -944,6 +1041,18 @@ class WrapperMachine:
             await self._handle_rename_session(cmd)
         elif t == "archive_session":
             await self._handle_archive_session(cmd)
+        elif t == "delete_work_session":
+            return await self._handle_delete_work_session(cmd)
+        elif t == "get_work_dashboard":
+            return await self._handle_get_work_dashboard(cmd)
+        elif t in {
+            "create_work_project", "delete_work_project", "add_work_source",
+            "delete_work_source", "create_work_plugin", "delete_work_plugin",
+            "create_work_schedule", "delete_work_schedule",
+        }:
+            return await self._handle_work_mutation(cmd)
+        elif t == "set_work_grant":
+            return await self._handle_set_work_grant(cmd)
         elif t == "fork_session":
             return await self._handle_fork_session(cmd)
         elif t == "fork_session_worktree":
@@ -4111,6 +4220,7 @@ class WrapperMachine:
 
     async def _handle_list_sessions(self, cmd) -> None:
         engine = getattr(cmd, "engine", "claude")
+        space = getattr(cmd, "space", "code")
         if engine == "codex":
             await self._list_codex_sessions(cmd)
             return
@@ -4138,23 +4248,36 @@ class WrapperMachine:
             private_btw_ids = set(self._private_btw_sessions)
             resident_ids = {c.session_id for c in self.sessions.values() if c.session_id}
             resident_state = {c.session_id: c.state for c in self.sessions.values() if c.session_id}
-            sessions = [
-                SessionInfo(
-                    session_id=i.session_id,
-                    summary=(i.summary or (i.custom_title if hasattr(i, "custom_title") else None) or "")[:500] or None,
-                    last_modified=str(i.last_modified) if i.last_modified else None,
-                    first_prompt=(i.first_prompt or "")[:2000] or None,
-                    git_branch=(i.git_branch or "")[:500] or None,
-                    cwd=(i.cwd or "")[:4096] or None,
-                    tag=(i.tag or "")[:128] or None,
-                    state=resident_state.get(i.session_id),
-                )
-                for i in infos
-                if i.session_id not in blocked
-                and i.session_id not in private_btw_ids
-            ]
+            work_records = await asyncio.to_thread(
+                self._work.for_engine("claude").records_by_session)
+            sessions = []
+            for info in infos:
+                record = work_records.get(info.session_id)
+                if ((record is not None) != (space == "work")
+                        or info.session_id in blocked
+                        or info.session_id in private_btw_ids):
+                    continue
+                sessions.append(SessionInfo(
+                    session_id=info.session_id,
+                    summary=(
+                        (record.title if record else None)
+                        or info.summary
+                        or (info.custom_title if hasattr(info, "custom_title") else None)
+                        or ""
+                    )[:500] or None,
+                    last_modified=str(info.last_modified) if info.last_modified else None,
+                    first_prompt=(info.first_prompt or "")[:2000] or None,
+                    git_branch=(info.git_branch or "")[:500] or None,
+                    cwd=(info.cwd or "")[:4096] or None,
+                    tag=("archived" if record and record.archived else
+                         (info.tag or "")[:128] or None),
+                    state=resident_state.get(info.session_id),
+                    engine="claude", space=space,
+                    work_id=record.work_id if record else None,
+                ))
             await self.transport.send(SessionList(
                 engine="claude",
+                space=space,
                 sessions=sessions,
                 to=getattr(cmd, "client_id", None),
             ))
@@ -4170,28 +4293,42 @@ class WrapperMachine:
             # Load the bounded app-server maximum for each archive state. Search
             # is client-side, so stopping at the old 60-row page made older
             # threads impossible to rename, restore, or fork.
-            raw = await list_codex_sessions(200)
+            cached = self._codex_session_list_cache
+            if cached is not None and time.monotonic() - cached[0] <= 1.0:
+                raw = cached[1]
+            else:
+                raw = await list_codex_sessions(200)
+                self._codex_session_list_cache = (time.monotonic(), raw)
             resident_state = {c.session_id: c.state for c in self.sessions.values()
                               if c.session_id and c.engine == "codex"}
-            sessions = [
-                SessionInfo(
-                    session_id=r["session_id"],
-                    summary=r.get("summary"),
-                    first_prompt=r.get("first_prompt"),
-                    cwd=r.get("cwd"),
-                    last_modified=r.get("last_modified"),
-                    git_branch=r.get("git_branch"),
-                    tag=r.get("tag"),
-                    engine="codex",
-                    state=(resident_state.get(r["session_id"])
-                           or _codex_list_state(r.get("status"))),
-                    forked_from_id=r.get("forked_from_id"),
-                    codex_status=r.get("status"),
-                )
-                for r in raw
-            ]
+            space = getattr(cmd, "space", "code")
+            work_records = await asyncio.to_thread(
+                self._work.for_engine("codex").records_by_session)
+            sessions = []
+            for row in raw:
+                record = work_records.get(row["session_id"])
+                if (record is not None) != (space == "work"):
+                    continue
+                sessions.append(SessionInfo(
+                    session_id=row["session_id"],
+                    summary=(record.title if record and record.title
+                             else row.get("summary")),
+                    first_prompt=row.get("first_prompt"),
+                    cwd=row.get("cwd"),
+                    last_modified=row.get("last_modified"),
+                    git_branch=row.get("git_branch"),
+                    tag=("archived" if record and record.archived
+                         else row.get("tag")),
+                    engine="codex", space=space,
+                    work_id=record.work_id if record else None,
+                    state=(resident_state.get(row["session_id"])
+                           or _codex_list_state(row.get("status"))),
+                    forked_from_id=row.get("forked_from_id"),
+                    codex_status=row.get("status"),
+                ))
             await self.transport.send(SessionList(
                 engine="codex",
+                space=space,
                 sessions=sessions,
                 to=getattr(cmd, "client_id", None),
             ))
@@ -4206,12 +4343,28 @@ class WrapperMachine:
         # focus it (its turn keeps running in the background). If not resident,
         # spawn (resume) it. The previously-focused session is NOT interrupted.
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        engine = getattr(cmd, "engine", None) or "claude"
+        requested_space = getattr(cmd, "space", "code")
+        work_record = await asyncio.to_thread(
+            self._work.for_engine(engine).get_by_session, sid)
+        actual_space = "work" if work_record is not None else "code"
+        if requested_space != actual_space:
+            error = Error(
+                code=ERR_AUTH,
+                message="会话不属于当前 Work/Code 空间",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
         ctx = self.sessions.get(sid)
         if ctx is None:
             ctx = next((c for c in self.sessions.values() if c.session_id == sid), None)
         newly_spawned = ctx is None
         if ctx is None:
-            ctx = await self._spawn(resume_id=sid, engine=getattr(cmd, "engine", None) or "claude")
+            ctx = await self._spawn(
+                resume_id=sid, engine=engine, space=actual_space,
+                work_id=work_record.work_id if work_record else None)
             if ctx is None:
                 # surface it on the session the user switched INTO (not the stale
                 # focused one), so a spawn failure never looks like silent "no
@@ -4353,6 +4506,12 @@ class WrapperMachine:
             return
         old_key = ctx.key
         ctx.session_id = sid
+        if ctx.space == "work" and ctx.work_id:
+            await asyncio.to_thread(
+                self._work.for_engine(ctx.engine).bind_session,
+                ctx.work_id, sid)
+        if ctx.engine == "codex":
+            self._codex_session_list_cache = None
         if ctx.engine != "codex":
             rekey_goal = getattr(ctx.sdk, "rekey_goal", None)
             if rekey_goal is not None:
@@ -4386,8 +4545,30 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
-        ctx = await self._spawn(resume_id=None, cwd=getattr(cmd, "cwd", None),
-                                engine=getattr(cmd, "engine", "claude"),
+        engine = getattr(cmd, "engine", "claude")
+        space = getattr(cmd, "space", "code")
+        work_record = None
+        target_cwd = getattr(cmd, "cwd", None)
+        if space == "work":
+            try:
+                work_record = await asyncio.to_thread(
+                    self._work.for_engine(engine).create_session,
+                    getattr(cmd, "project_id", None))
+            except Exception:
+                log.exception("Work session directory creation failed",
+                              engine=engine)
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="Work 私有目录创建失败",
+                    request_id=getattr(cmd, "request_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+            target_cwd = work_record.cwd
+
+        ctx = await self._spawn(resume_id=None, cwd=target_cwd,
+                                engine=engine,
                                 model=getattr(cmd, "model", None),
                                 effort=getattr(cmd, "effort", None),
                                 collaboration_mode=getattr(
@@ -4395,8 +4576,15 @@ class WrapperMachine:
                                 permission_mode=getattr(
                                     cmd, "permission_mode", None),
                                 service_tier=getattr(
-                                    cmd, "service_tier", None))
+                                    cmd, "service_tier", None),
+                                space=space,
+                                work_id=(work_record.work_id
+                                         if work_record else None))
         if ctx is None:
+            if work_record is not None:
+                await asyncio.to_thread(
+                    self._work.for_engine(engine).abandon,
+                    work_record.work_id)
             error = Error(
                 code=ERR_CC_CRASH,
                 message="新会话启动失败，请检查工作目录和引擎配置",
@@ -4482,11 +4670,31 @@ class WrapperMachine:
 
     async def _handle_rename_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
-        if await self._is_codex_session(sid):
+        is_codex = await self._is_codex_session(sid)
+        engine = "codex" if is_codex else "claude"
+        requested_engine = getattr(cmd, "engine", engine)
+        if "engine" in getattr(cmd, "model_fields_set", set()) \
+                and requested_engine != engine:
+            await self._emit_to_sid(sid, Error(
+                code=ERR_AUTH, message="会话不属于请求的引擎"))
+            return
+        work_record = await asyncio.to_thread(
+            self._work.for_engine(engine).get_by_session, sid)
+        requested_space = getattr(cmd, "space", "code")
+        if (work_record is not None) != (requested_space == "work"):
+            await self._emit_to_sid(sid, Error(
+                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间"))
+            return
+        if is_codex:
+            self._codex_session_list_cache = None
             try:
                 await codex_rpc("thread/name/set", {
                     "threadId": sid, "name": cmd.title,
                 })
+                if work_record is not None:
+                    await asyncio.to_thread(
+                        self._work.for_engine(engine).update_title,
+                        sid, cmd.title)
                 log.info("codex session renamed", session_id=sid,
                          title_length=len(cmd.title))
                 await self._list_codex_sessions(cmd)
@@ -4498,6 +4706,10 @@ class WrapperMachine:
             return
         try:
             await asyncio.to_thread(rename_session, sid, cmd.title)
+            if work_record is not None:
+                await asyncio.to_thread(
+                    self._work.for_engine(engine).update_title,
+                    sid, cmd.title)
             # our own append -> re-baseline, else the watcher calls it an external write
             self._resync_watch(sid)
             log.info("session renamed", session_id=sid,
@@ -4509,10 +4721,30 @@ class WrapperMachine:
 
     async def _handle_archive_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
-        if await self._is_codex_session(sid):
+        is_codex = await self._is_codex_session(sid)
+        engine = "codex" if is_codex else "claude"
+        requested_engine = getattr(cmd, "engine", engine)
+        if "engine" in getattr(cmd, "model_fields_set", set()) \
+                and requested_engine != engine:
+            await self._emit_to_sid(sid, Error(
+                code=ERR_AUTH, message="会话不属于请求的引擎"))
+            return
+        work_record = await asyncio.to_thread(
+            self._work.for_engine(engine).get_by_session, sid)
+        requested_space = getattr(cmd, "space", "code")
+        if (work_record is not None) != (requested_space == "work"):
+            await self._emit_to_sid(sid, Error(
+                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间"))
+            return
+        if is_codex:
+            self._codex_session_list_cache = None
             method = "thread/archive" if cmd.archived else "thread/unarchive"
             try:
                 await codex_rpc(method, {"threadId": sid})
+                if work_record is not None:
+                    await asyncio.to_thread(
+                        self._work.for_engine(engine).update_archived,
+                        sid, cmd.archived)
                 log.info("codex session archive toggled", session_id=sid,
                          archived=cmd.archived)
                 await self._list_codex_sessions(cmd)
@@ -4528,6 +4760,10 @@ class WrapperMachine:
         try:
             tag = "archived" if cmd.archived else None
             await asyncio.to_thread(tag_session, sid, tag)
+            if work_record is not None:
+                await asyncio.to_thread(
+                    self._work.for_engine(engine).update_archived,
+                    sid, cmd.archived)
             # our own append -> re-baseline (see _resync_watch)
             self._resync_watch(sid)
             log.info("session archive toggled", session_id=sid, archived=cmd.archived)
@@ -4535,6 +4771,187 @@ class WrapperMachine:
         except Exception as e:
             log.exception("archive_session failed", error=str(e))
             await self._emit_focused(Error(code=ERR_INTERNAL, message=f"archive failed: {e}"))
+
+    async def _handle_delete_work_session(self, cmd):
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        engine = getattr(cmd, "engine", "claude")
+        store = self._work.for_engine(engine)
+        record = await asyncio.to_thread(store.get_by_session, sid)
+        if record is None:
+            error = Error(
+                code=ERR_AUTH,
+                message="只能删除已注册的 Work 会话",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        ctx = self._ctx_for(sid)
+        if ctx is not None and ctx.state != "idle":
+            error = Error(
+                code=ERR_BUSY,
+                message="Work 会话仍在运行，请先中断后再删除",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if ctx is not None:
+            await ctx.sdk.disconnect()
+            self.sessions.pop(ctx.key or sid, None)
+        try:
+            if engine == "codex":
+                await codex_rpc("thread/delete", {"threadId": sid})
+            else:
+                await asyncio.to_thread(
+                    delete_session, sid, directory=record.cwd)
+            await asyncio.to_thread(store.delete, sid)
+        except Exception as exc:
+            log.exception("Work session deletion failed", engine=engine,
+                          session_id=sid)
+            error = Error(
+                code=ERR_INTERNAL,
+                message="Work 会话删除失败，原始资料未被删除",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if self.focused_sid in {sid, getattr(ctx, "key", None)}:
+            self.focused_sid = None
+        await self._handle_list_sessions(cmd)
+        log.info("Work session deleted", engine=engine, session_id=sid)
+
+    async def _work_dashboard(self, engine: str, client_id: str | None = None):
+        data = await asyncio.to_thread(
+            self._work.for_engine(engine).dashboard)
+        return WorkDashboard(engine=engine, to=client_id, **data)
+
+    async def _handle_get_work_dashboard(self, cmd):
+        engine = getattr(cmd, "engine", "claude")
+        try:
+            dashboard = await self._work_dashboard(
+                engine, getattr(cmd, "client_id", None))
+        except Exception:
+            log.exception("Work dashboard read failed", engine=engine)
+            error = Error(
+                code=ERR_INTERNAL, message="Work 工作台读取失败",
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        await self.transport.send(dashboard)
+        return dashboard
+
+    async def _handle_work_mutation(self, cmd):
+        """Apply one bounded Work metadata mutation, then return fresh state."""
+        engine = getattr(cmd, "engine", "claude")
+        store = self._work.for_engine(engine)
+        try:
+            if cmd.type == "create_work_project":
+                await asyncio.to_thread(
+                    store.create_project, cmd.name.strip(), cmd.description.strip())
+            elif cmd.type == "delete_work_project":
+                await asyncio.to_thread(store.delete_project, cmd.project_id)
+            elif cmd.type == "add_work_source":
+                file = getattr(cmd, "file", None)
+                content = None
+                filename = None
+                if file is not None:
+                    attachment_error = validate_attachments(None, [file])
+                    if attachment_error:
+                        raise ValueError(attachment_error)
+                    content = decode_attachment(file["data"])
+                    filename = file["filename"]
+                await asyncio.to_thread(
+                    store.add_source, cmd.project_id, cmd.kind,
+                    cmd.title.strip(), (cmd.uri or "").strip() or None,
+                    filename, content)
+            elif cmd.type == "delete_work_source":
+                await asyncio.to_thread(store.delete_source, cmd.source_id)
+            elif cmd.type == "create_work_plugin":
+                await asyncio.to_thread(
+                    store.create_plugin, cmd.name.strip(),
+                    cmd.instructions.strip(), cmd.project_id)
+            elif cmd.type == "delete_work_plugin":
+                await asyncio.to_thread(store.delete_plugin, cmd.plugin_id)
+            elif cmd.type == "create_work_schedule":
+                # A stale browser clock may be a few seconds behind, but never
+                # accept a task already far in the past that would run by accident.
+                if cmd.next_run_at < time.time() - 60:
+                    raise ValueError("schedule time is in the past")
+                await asyncio.to_thread(
+                    store.create_schedule, cmd.title.strip(), cmd.prompt.strip(),
+                    cmd.next_run_at, cmd.repeat_seconds, cmd.project_id)
+            elif cmd.type == "delete_work_schedule":
+                await asyncio.to_thread(store.delete_schedule, cmd.schedule_id)
+            else:
+                raise ValueError("unsupported Work mutation")
+            dashboard = await self._work_dashboard(
+                engine, getattr(cmd, "client_id", None))
+        except (LookupError, ValueError) as exc:
+            log.warning("Work mutation rejected", type=cmd.type, engine=engine,
+                        reason=type(exc).__name__)
+            error = Error(
+                code=ERR_BAD_PROMPT, message="Work 操作参数无效或目标不存在",
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        except Exception:
+            log.exception("Work mutation failed", type=cmd.type, engine=engine)
+            error = Error(
+                code=ERR_INTERNAL, message="Work 操作失败，数据未完整更新",
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        await self.transport.send(dashboard)
+        return dashboard
+
+    async def _handle_set_work_grant(self, cmd):
+        engine = getattr(cmd, "engine", "claude")
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        store = self._work.for_engine(engine)
+        ctx = self._ctx_for(sid)
+        if ctx is not None and (ctx.space != "work" or ctx.engine != engine):
+            error = Error(code=ERR_AUTH, message="只能修改当前引擎的 Work 授权",
+                          sid=sid, to=getattr(cmd, "client_id", None))
+            await self.transport.send(error)
+            return error
+        if ctx is not None and ctx.state != "idle":
+            error = Error(code=ERR_BUSY, message="请等待当前工作结束后再修改目录授权",
+                          sid=sid, to=getattr(cmd, "client_id", None))
+            await self.transport.send(error)
+            return error
+        try:
+            record = await asyncio.to_thread(
+                store.set_grant, sid, cmd.path, cmd.mode)
+            if ctx is not None:
+                grants = await asyncio.to_thread(store.grants, record.work_id)
+                if engine == "codex":
+                    ctx.sdk.work_roots = grants
+                else:
+                    ctx.sdk.work_settings_path = await asyncio.to_thread(
+                        store.ensure_claude_policy, record)
+                await ctx.sdk.force_reconnect(
+                    ctx.session_id, ctx.cwd, reason="Work directory grant changed")
+        except (LookupError, ValueError):
+            error = Error(code=ERR_BAD_PROMPT,
+                          message="授权目录不存在、为文件系统根目录或会话不是 Work",
+                          sid=sid, to=getattr(cmd, "client_id", None))
+            await self.transport.send(error)
+            return error
+        except Exception:
+            log.exception("Work grant update failed", engine=engine,
+                          session_id=sid)
+            error = Error(code=ERR_INTERNAL,
+                          message="目录授权已保存，但当前会话重新加载失败，请重新打开会话",
+                          sid=sid, to=getattr(cmd, "client_id", None))
+            await self.transport.send(error)
+            return error
+        log.info("Work grant updated", engine=engine, session_id=sid,
+                 mode=cmd.mode)
 
     async def _is_codex_session(self, session_id: str) -> bool:
         """Capability guard for commands whose wire shape predates `engine`.
@@ -4704,7 +5121,22 @@ class WrapperMachine:
     async def _handle_fork_session(self, cmd):
         """Dispatch a message-level persistent fork to the owning engine."""
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
-        if await self._is_codex_session(sid):
+        is_codex = await self._is_codex_session(sid)
+        engine = "codex" if is_codex else "claude"
+        # Resident contexts already carry the authoritative surface.  Avoid an
+        # unnecessary thread hop for Code: reliable Codex fork reconciliation
+        # deliberately relies on there being no scheduling point between its
+        # journal check and retry path.
+        ctx = self._ctx_for(sid)
+        is_work = ctx is not None and ctx.space == "work"
+        if ctx is None:
+            is_work = await asyncio.to_thread(
+                self._work.for_engine(engine).get_by_session, sid) is not None
+        if is_work:
+            return await self._send_session_fork_error(
+                cmd, ERR_AUTH,
+                "Work 会话不支持派生到 Code；请新建 Work 并选择同一项目")
+        if is_codex:
             return await self._handle_codex_fork_session(cmd)
         return await self._handle_claude_fork_session(cmd, sid)
 
@@ -5610,7 +6042,9 @@ class WrapperMachine:
                      model: Optional[str] = None, effort: Optional[str] = None,
                      collaboration_mode: Optional[str] = None,
                      permission_mode: Optional[str] = None,
-                     service_tier: Optional[str] = None) -> Optional[SessionContext]:
+                     service_tier: Optional[str] = None,
+                     space: str = "code",
+                     work_id: Optional[str] = None) -> Optional[SessionContext]:
         """Create a SessionContext, connect its SDK subprocess, load history.
         Returns the ctx (added to the pool under its real or temp key) or None
         on failure (an Error has been emitted). `bootstrap` exempts the cap and
@@ -5707,7 +6141,52 @@ class WrapperMachine:
         else:
             target_cwd = self.cfg.cc_cwd
 
-        sdk = CodexHandle(self.cfg, cwd=target_cwd) if engine == "codex" else SdkHandle(self.cfg)
+        work_record = None
+        work_grants: list[dict[str, str]] = []
+        if space == "work":
+            store = self._work.for_engine(engine)
+            work_record = (await asyncio.to_thread(store.get_by_session, resume_id)
+                           if resume_id else
+                           await asyncio.to_thread(store.get_by_work_id, work_id or ""))
+            if work_record is None:
+                await self._emit_to_sid(resume_id, Error(
+                    code=ERR_AUTH,
+                    message="Work 会话注册信息不存在，已拒绝启动",
+                ))
+                return None
+            registered_cwd = os.path.realpath(work_record.cwd)
+            if os.path.realpath(target_cwd) != registered_cwd:
+                await self._emit_to_sid(resume_id, Error(
+                    code=ERR_AUTH,
+                    message="Work 会话目录与原生 Session 不一致，已拒绝启动",
+                ))
+                return None
+            if not store.contains_cwd(registered_cwd):
+                await self._emit_to_sid(resume_id, Error(
+                    code=ERR_AUTH,
+                    message="Work 会话目录越过受控根目录，已拒绝启动",
+                ))
+                return None
+            work_id = work_record.work_id
+            work_grants = await asyncio.to_thread(store.grants, work_id)
+
+        sdk = (
+            (CodexHandle(self.cfg, cwd=target_cwd, work_mode=True,
+                         work_roots=work_grants)
+             if space == "work" else CodexHandle(self.cfg, cwd=target_cwd))
+            if engine == "codex" else SdkHandle(self.cfg)
+        )
+        if space == "work":
+            if engine == "codex":
+                # Work starts least-privileged even if Code defaults to never.
+                sdk.approval = "on-request"
+            else:
+                assert work_record is not None
+                sdk.work_mode = True
+                sdk.work_settings_path = await asyncio.to_thread(
+                    self._work.for_engine("claude").ensure_claude_policy,
+                    work_record)
+                sdk.permission_mode = "acceptEdits"
         # Pre-select effort at spawn (before connect): cc reads it via _options at
         # connect so --effort is baked into the first turn (no respawn); codex uses
         # it as a per-turn param. codex model is also a per-turn field, so set it
@@ -5718,7 +6197,7 @@ class WrapperMachine:
         if engine == "codex":
             if collaboration_mode in CODEX_COLLABORATION_MODES:
                 sdk.collaboration_mode = collaboration_mode
-            if permission_mode in CODEX_PERMISSION_MODES:
+            if (space != "work" and permission_mode in CODEX_PERMISSION_MODES):
                 sdk.approval = permission_mode
             if service_tier in {"default", "fast"}:
                 sdk.service_tier = (
@@ -5734,7 +6213,7 @@ class WrapperMachine:
                 model = model or prev.get("model")
                 effort = effort or prev.get("effort")
                 approval = prev.get("approval_policy")
-                if (permission_mode is None
+                if (space != "work" and permission_mode is None
                         and approval in CODEX_PERMISSION_MODES):
                     sdk.approval = approval
                 if service_tier is None and "service_tier" in prev:
@@ -5759,6 +6238,8 @@ class WrapperMachine:
             buffer=RingBuffer(self.cfg.ring_max_events, self.cfg.ring_max_bytes),
             cwd=target_cwd,
             engine=engine,
+            space=space,
+            work_id=work_id,
         )
         # Per-ctx MCP ask server is Claude-only (the cc-remote-ask tools). Codex
         # handles approvals through its own app-server protocol, so skip it.
@@ -5805,6 +6286,11 @@ class WrapperMachine:
                 log.exception("connect failed", error=str(e))
                 await self._emit_focused(Error(code=ERR_CC_CRASH, message=f"connect failed: {e}"))
                 return None
+
+        if space == "work" and engine == "codex":
+            # thread/resume may restore the Code-time policy recorded in the
+            # native rollout. Work always reasserts its least-privilege policy.
+            ctx.sdk.approval = "on-request"
 
         # cc model is a runtime switch on the live subprocess (set_model), so apply
         # a pre-selected model now that we're connected. codex was set pre-connect.
@@ -6064,7 +6550,9 @@ class WrapperMachine:
     def _strip_attachment_paths(prompt: str) -> tuple[str, list[dict[str, str]]]:
         """Remove expired private temp paths from transcript-facing history."""
         path_re = re.compile(
-            r"/\S*cc-remote-turn-[A-Za-z0-9_-]+/\d{2}-([^\s]+)")
+            r"(?:/\S*cc-remote-turn-[A-Za-z0-9_-]+|"
+            r"/\S*/cc-remote/work/chats/work-[0-9a-f]+/uploads/[A-Za-z0-9._:@-]+)"
+            r"/\d{2}-([^\s]+)")
         marker = "\n\n[用户附件,请用工具读取以下文件]:\n"
         if marker in prompt:
             original, block = prompt.rsplit(marker, 1)
@@ -6073,7 +6561,9 @@ class WrapperMachine:
                 return original, [{"filename": name} for name in names]
 
         matches = list(re.finditer(
-            r"@(?P<path>/\S*cc-remote-turn-[A-Za-z0-9_-]+/\d{2}-(?P<name>[^\s]+))",
+            r"@(?P<path>(?:/\S*cc-remote-turn-[A-Za-z0-9_-]+|"
+            r"/\S*/cc-remote/work/chats/work-[0-9a-f]+/uploads/[A-Za-z0-9._:@-]+)"
+            r"/\d{2}-(?P<name>[^\s]+))",
             prompt,
         ))
         if matches:
@@ -6149,6 +6639,7 @@ class WrapperMachine:
         reader_exc: list = []
         reader_task: Optional[asyncio.Task] = None
         temp_dir: Optional[str] = None
+        persistent_attachments = False
         notice_active = False
         claude_turn_completed = False
 
@@ -6304,8 +6795,16 @@ class WrapperMachine:
                     files=file_meta,
                 ))
                 if files or (is_codex and images):
-                    temp_dir = tempfile.mkdtemp(prefix="cc-remote-turn-")
-                    os.chmod(temp_dir, 0o700)
+                    if ctx.space == "work":
+                        upload_root = Path(ctx.cwd).parent / "uploads"
+                        upload_dir = upload_root / (
+                            ctx.active_msg_id or uuid4().hex)
+                        upload_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+                        temp_dir = str(upload_dir)
+                        persistent_attachments = True
+                    else:
+                        temp_dir = tempfile.mkdtemp(prefix="cc-remote-turn-")
+                        os.chmod(temp_dir, 0o700)
                 if files:
                     prompt = self._stash_files(prompt, files, temp_dir, ctx.engine)
                 if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
@@ -6619,7 +7118,7 @@ class WrapperMachine:
             ctx.claude_write_active = False
             if not is_codex and claude_turn_completed and ctx.session_id:
                 self._resync_watch(ctx.session_id)
-            if temp_dir is not None:
+            if temp_dir is not None and not persistent_attachments:
                 try:
                     shutil.rmtree(temp_dir)
                 except FileNotFoundError:

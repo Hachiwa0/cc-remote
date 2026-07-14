@@ -39,6 +39,10 @@ class SessionContext:
     seq: int = 0                       # per-session monotonic counter
     state: State = "idle"
     engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
+    # Product-space identity. Work sessions are native engine sessions whose
+    # cwd and metadata are owned by cc-remote's private Work registry.
+    space: str = "code"
+    work_id: Optional[str] = None
     turn_task: Optional[asyncio.Task] = None
     # Correlates asynchronous turn crashes/drain failures with the optimistic
     # client turn. Control-command errors must never terminate an unrelated turn.
