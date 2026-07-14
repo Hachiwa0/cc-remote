@@ -105,7 +105,7 @@ export function NewChatView({ cwd, space = "code", engine = "claude", createErro
         {space === "work" ? (
           <>
             <div className="work-private-note"><Icon name="lock" size={14} />
-              默认只访问这项工作的私有目录；需要其他资料时再由你授权。
+              默认只访问这项工作的私有目录；需要其他资料时直接上传。
             </div>
             <div className="work-project-bar">
               <select value={selectedProjectId ?? ""}

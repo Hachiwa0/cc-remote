@@ -20,7 +20,6 @@ interface Props {
   onRename: (id: string, title: string) => void;
   onArchive: (id: string, archived: boolean) => void;
   onDelete: (id: string) => void;
-  onGrant: (id: string) => void;
   onForkWorktree: (session: SessionInfo) => void;
 }
 
@@ -48,7 +47,7 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 
 export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStates,
   activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive,
-  onDelete, onGrant, onForkWorktree }: Props) {
+  onDelete, onForkWorktree }: Props) {
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
@@ -244,14 +243,9 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
               <button onClick={() => doArchive(s, true)}><Icon name="archive" size={15} />归档</button>
             ))}
             {space === "work" && (
-              <>
-                <button onClick={() => { onGrant(s.session_id); closeMenu(); }}>
-                  <Icon name="folder" size={15} />目录授权…
-                </button>
-                <button className="danger" onClick={() => doDelete(s)}>
-                  <Icon name="trash" size={15} />删除工作
-                </button>
-              </>
+              <button className="danger" onClick={() => doDelete(s)}>
+                <Icon name="trash" size={15} />删除工作
+              </button>
             )}
           </div>
         )}

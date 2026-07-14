@@ -77,6 +77,8 @@ ASK_OPTION_MAX_COUNT = 5
 FILE_PREVIEW_MAX_BYTES = 512 * 1024
 PREVIEW_ASSET_MAX_BYTES = 4 * 1024 * 1024
 MAX_ENCODED_PREVIEW_ASSET_CHARS = ((PREVIEW_ASSET_MAX_BYTES + 2) // 3) * 4
+ARTIFACT_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
+MAX_ENCODED_ARTIFACT_PREVIEW_CHARS = ((ARTIFACT_PREVIEW_MAX_BYTES + 2) // 3) * 4
 
 
 def _valid_attachment_filename(value: str) -> str:
@@ -138,6 +140,9 @@ FileMtimeNs = Annotated[
 ]
 PreviewAssetData = Annotated[
     str, StringConstraints(min_length=1, max_length=MAX_ENCODED_PREVIEW_ASSET_CHARS),
+]
+ArtifactPreviewData = Annotated[
+    str, StringConstraints(min_length=1, max_length=MAX_ENCODED_ARTIFACT_PREVIEW_CHARS),
 ]
 StatusErrorText = Annotated[
     str, StringConstraints(min_length=1, max_length=384),
@@ -861,12 +866,26 @@ class DeleteWorkSchedule(_Command):
     schedule_id: WireId
 
 
-class SetWorkGrant(_Command):
-    type: Literal["set_work_grant"] = "set_work_grant"
+class GetWorkArtifacts(_Command):
+    type: Literal["get_work_artifacts"] = "get_work_artifacts"
     engine: Engine = "claude"
     session_id: WireId
-    path: str = Field(min_length=1, max_length=4096)
-    mode: Literal["none", "read", "write"]
+
+
+class WorkArtifactInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: PreviewPath
+    size: int = Field(ge=0)
+    modified_at: float = Field(ge=0)
+    kind: Literal["document", "spreadsheet", "presentation", "image", "pdf", "file"]
+    previewable: bool = False
+
+
+class WorkArtifacts(_Base):
+    type: Literal["work_artifacts"] = "work_artifacts"
+    engine: Engine
+    session_id: WireId
+    artifacts: list[WorkArtifactInfo] = Field(max_length=200)
 
 
 class SessionFocus(_Base):
@@ -1213,12 +1232,23 @@ class GetFilePreview(_Command):
 
 
 class FilePreview(_Base):
-    """wrapper -> requesting client: bounded text source or a safe error."""
+    """wrapper -> requesting client: bounded source or locally-rendered artifact.
+
+    Binary previews are transported directly through the authenticated relay;
+    the relay never writes them to disk. Office files are converted by the
+    wrapper host and report their original extension in ``converted_from``.
+    """
     type: Literal["file_preview"] = "file_preview"
     path: PreviewPath
     request_id: WireId
-    format: Literal["markdown", "text"] = "text"
+    format: Literal["markdown", "text", "html", "image", "pdf"] = "text"
     content: PreviewContent = ""
+    media_type: Optional[Literal[
+        "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
+        "application/pdf",
+    ]] = None
+    data: Optional[ArtifactPreviewData] = None
+    converted_from: Optional[str] = Field(default=None, max_length=16)
     size: int = Field(default=0, ge=0)
     truncated: bool = False
     mtime_ns: FileMtimeNs = "0"
@@ -1405,9 +1435,9 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, DeleteWorkSession, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, SetWorkGrant, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, DeleteWorkSession, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, Models, AskUser, AnswerQuestion,
-    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, WorkDashboard,
+    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
@@ -1462,7 +1492,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "delete_work_plugin": DeleteWorkPlugin,
     "create_work_schedule": CreateWorkSchedule,
     "delete_work_schedule": DeleteWorkSchedule,
-    "set_work_grant": SetWorkGrant,
+    "get_work_artifacts": GetWorkArtifacts,
     "rename_session": RenameSession,
     "archive_session": ArchiveSession,
     "fork_session": ForkSession,
@@ -1490,6 +1520,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "file_preview": FilePreview,
     "file_save_result": FileSaveResult,
     "preview_asset": PreviewAsset,
+    "work_artifacts": WorkArtifacts,
     "history": History,
     "ask_user": AskUser,
     "answer_question": AnswerQuestion,

@@ -8,6 +8,7 @@ import {
   type WheelEvent,
 } from "react";
 import type { Turn } from "../reducer";
+import type { Space } from "../protocol";
 import { MessageBlock } from "./MessageBlock";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
 import { canForkTurn } from "../session-worktree";
@@ -46,9 +47,10 @@ function formatTime(ts: number): string {
 
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onLoadMore, onEdit, onGetDiff, onPreviewMarkdown, onOpenFile,
-  onFork, forkingPointId }: {
+  onOpenArtifacts, onFork, forkingPointId, surface = "code" }: {
   sid: string | null;
   turns: Turn[];
+  surface?: Space;
   engine?: "claude" | "codex";
   loading?: boolean;
   hasMore?: boolean;
@@ -57,6 +59,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onGetDiff: (file: string) => void;
   onPreviewMarkdown?: (file: string) => void;
   onOpenFile?: (file: string, line?: number) => void;
+  onOpenArtifacts?: () => void;
   onFork?: (forkPointId: string) => void;
   forkingPointId?: string | null;
 }) {
@@ -224,8 +227,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   };
   const aiText = (t: Turn) => finalTextBlocks(t.blocks).map((block) => block.text).join("\n\n");
 
-  // collect the file_paths this turn mutated (Edit/Write) — a summary button +
-  // a list of file chips. Click summary => all diffs; click a file => that file.
+  // Collect the file_paths this turn mutated (Edit/Write). In Work, the summary
+  // opens the deliverable while the individual file chips remain diff links.
   const fileChips = (t: Turn) => {
     const files = new Set<string>();
     t.blocks.forEach((b) => {
@@ -236,17 +239,31 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     });
     if (!files.size) return null;
     const arr = [...files];
+    const openSummary = () => {
+      if (surface !== "work") {
+        onGetDiff("");
+        return;
+      }
+      if (arr.length === 1 && onOpenFile) {
+        onOpenFile(arr[0]);
+        return;
+      }
+      onOpenArtifacts?.();
+    };
     return (
       <div className="turn-files">
-        <button className="turn-files-summary" onClick={() => onGetDiff("")}>
-          <Icon name="edit" size={13} />改动 {arr.length} 个文件
+        <button className="turn-files-summary" onClick={openSummary}
+          title={surface === "work" ? "预览交付物" : "查看全部改动"}>
+          <Icon name={surface === "work" ? "folder" : "edit"} size={13} />{
+            surface === "work" ? `交付物 · ${arr.length} 个文件` : `改动 ${arr.length} 个文件`
+          }
         </button>
         <div className="turn-files-list">
           {arr.map((f) => {
-            const markdown = isMarkdownPath(f) && !!onPreviewMarkdown;
+            const markdown = surface !== "work" && isMarkdownPath(f) && !!onPreviewMarkdown;
             return <button key={f} className={"turn-file-chip" + (markdown ? " markdown" : "")}
               onClick={() => markdown ? onPreviewMarkdown(f) : onGetDiff(f)}
-              title={markdown ? `预览 ${f}` : f}>
+              title={markdown ? `预览 ${f}` : `查看 ${f} 的 diff`}>
               <Icon name={markdown ? "read" : "edit"} size={12} />
               {f.split("/").pop()}
               {markdown && <span className="turn-file-action">预览</span>}
@@ -269,14 +286,16 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     return (
       <div className="empty">
         <div className="glyph"><ClaudeMark size={30} /></div>
-        <h2>已连接</h2>
-        <p>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</p>
+        <h2>{surface === "work" ? "工作区已就绪" : "已连接"}</h2>
+        <p>{surface === "work"
+          ? "添加资料并描述成果，我会把生成的文档和文件留在这项工作的私有目录。"
+          : <>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</>}</p>
       </div>
     );
   }
 
   return (
-    <div className="thread-shell">
+    <div className={surface === "work" ? "thread-shell work-thread-shell" : "thread-shell"}>
       <div className="thread" ref={scrollRef} onScroll={onScroll} onWheel={onWheel}
         onTouchStart={onTouchStart} onTouchMove={onTouchMove}
         onTouchEnd={clearTouch} onTouchCancel={clearTouch}>

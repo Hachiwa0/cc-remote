@@ -39,6 +39,10 @@ from cc_remote.wrapper.codex_sessions import (
     codex_model,
 )
 from cc_remote.wrapper.child_env import sanitized_child_env
+from cc_remote.wrapper.work_prompt import (
+    WORK_BASE_INSTRUCTIONS,
+    WORK_DEVELOPER_INSTRUCTIONS,
+)
 
 log = logger("cc_remote.wrapper.codex_handle")
 
@@ -305,6 +309,18 @@ def _codex_env(bin_path: str) -> dict:
     return env
 
 
+def _codex_runtime_tmp() -> str:
+    """Return the private runtime directory Codex uses for sandbox launchers.
+
+    Work leaves unspecified paths ungranted and opens only its own workspace.
+    Codex stages ``codex-linux-sandbox`` below ``$CODEX_HOME/tmp`` before every
+    tool call, so that narrow runtime path must remain readable as well.
+    """
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    codex_home = os.path.realpath(os.path.expanduser(codex_home))
+    return os.path.join(codex_home, "tmp")
+
+
 def _initialize_params() -> dict[str, Any]:
     """Declare the capability required by collaborationMode/list and turn/start."""
     return {
@@ -316,7 +332,6 @@ def _initialize_params() -> dict[str, Any]:
 class CodexHandle:
     def __init__(self, cfg, cwd: Optional[str] = None,
                  work_mode: bool = False,
-                 work_roots: Optional[list[dict[str, str]]] = None,
                  approval_callback: Optional[ApprovalCallback] = None,
                  interaction_callback: Optional[InteractionCallback] = None,
                  goal_callback: Optional[GoalCallback] = None,
@@ -334,7 +349,6 @@ class CodexHandle:
         self._owned_turn_ids: OrderedDict[str, None] = OrderedDict()
         self._cwd = cwd
         self.work_mode = work_mode
-        self.work_roots = list(work_roots or [])
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._turn_q: Optional[asyncio.Queue] = None
@@ -388,7 +402,11 @@ class CodexHandle:
         self.model: Optional[str] = codex_model()
         self.effort: Optional[str] = codex_effort()         # low | medium | high | xhigh
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
-        self.approval: str = codex_approval()                # UI/callback projection
+        # Work is governed by its per-process named permission profile. It must
+        # never fall back to interactive escalation outside that profile, even
+        # when a resumed native thread persisted a Code-time approval policy.
+        self.approval: str = (
+            "never" if self.work_mode else codex_approval())  # UI/callback projection
         self.collaboration_mode: str = "default"            # default | plan; independent of approval
         self.service_tier: Optional[str] = (
             "fast" if codex_fast_enabled() else None
@@ -485,16 +503,15 @@ class CodexHandle:
             # One app-server process belongs to one resident session, so a
             # per-process permission profile can enforce this Work cwd without
             # mutating the user's global ~/.codex/config.toml.
+            # The arg0 sandbox helper is a symlink to this exact executable. A
+            # grant for CODEX_HOME/tmp alone leaves that target invisible inside
+            # bwrap and every tool fails with ENOENT before its command starts.
             filesystem_entries = [
-                '":minimal" = "read"', '"~" = "deny"',
+                '":minimal" = "read"',
+                f'{json.dumps(_codex_runtime_tmp())} = "read"',
+                f'{json.dumps(os.path.realpath(codex_bin))} = "read"',
                 f'{json.dumps(self._cwd)} = "write"',
             ]
-            for grant in self.work_roots:
-                path = grant.get("path")
-                mode = grant.get("mode")
-                if path and mode in {"read", "write"}:
-                    filesystem_entries.append(
-                        f'{json.dumps(path)} = {json.dumps(mode)}')
             filesystem = "{ " + ", ".join(filesystem_entries) + " }"
             argv.extend([
                 "-c", 'default_permissions="cc_remote_work"',
@@ -542,17 +559,31 @@ class CodexHandle:
                 # ephemeral /btw fork: inherits resume_id's context into a throwaway
                 # thread; the parent thread is never touched (verified: fork answers
                 # from parent context, parent stays coherent).
-                res = await self._request("thread/fork", {
+                fork_params: dict[str, Any] = {
                     "threadId": resume_id, "ephemeral": True,
                     "cwd": self._cwd,
-                    "approvalPolicy": self.approval_policy})
+                    "approvalPolicy": self.approval_policy,
+                }
+                if self.work_mode:
+                    fork_params.update({
+                        "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                        "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                    })
+                res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
             elif resume_id:
                 # Do not send local/config defaults here: omitted fields tell
                 # app-server to resume the thread's persisted settings. The
                 # authoritative response is adopted below.
-                res = await self._request("thread/resume", {
-                    "threadId": resume_id, "cwd": self._cwd})
+                resume_params: dict[str, Any] = {
+                    "threadId": resume_id, "cwd": self._cwd,
+                }
+                if self.work_mode:
+                    resume_params.update({
+                        "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                        "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                    })
+                res = await self._request("thread/resume", resume_params)
                 self.thread_id = _thread_id_of(res) or resume_id
             else:
                 params: dict[str, Any] = {
@@ -562,6 +593,11 @@ class CodexHandle:
                 }
                 if self.model:
                     params["model"] = self.model
+                if self.work_mode:
+                    params.update({
+                        "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                        "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                    })
                 res = await self._request("thread/start", params)
                 self.thread_id = _thread_id_of(res)
             if not self.thread_id:
@@ -609,46 +645,21 @@ class CodexHandle:
         }
         if self.work_mode:
             params["cwd"] = self._cwd
-            # Compatibility for Codex versions/configurations still using the
-            # legacy sandbox knobs instead of permission profiles.
-            params["sandboxPolicy"] = {
-                "type": "workspaceWrite",
-                "writableRoots": [
-                    grant["path"] for grant in self.work_roots
-                    if grant.get("mode") == "write" and grant.get("path")
-                ],
-                "networkAccess": False,
-                "excludeTmpdirEnvVar": True,
-                "excludeSlashTmp": True,
-            }
+            # Do not add the legacy sandboxPolicy here. Codex gives legacy
+            # sandbox settings precedence over named permission profiles; the
+            # old workspaceWrite policy therefore re-protected this cwd merely
+            # because Work lives below ~/.codex.
         if self.model:
             params["model"] = self.model
         if self.effort:
             params["effort"] = self.effort
         # Codex Plan mode is a collaboration-mode override, not an approval
-        # policy.  The app-server schema requires settings.model; null developer
-        # instructions selects Codex's built-in instructions for the chosen mode.
+        # policy. The app-server schema requires settings.model. Code selects the
+        # built-in mode instructions with null; Work repeats its isolated policy.
         collaboration_model = self.model or codex_model()
         if collaboration_model:
-            settings: dict[str, Any] = {
-                "model": collaboration_model,
-                "developer_instructions": (
-                    "You are running inside cc-remote Work, a deliverable-oriented "
-                    "private workspace. Create requested documents, spreadsheets, "
-                    "presentations, analyses, and other artifacts in the current "
-                    "workspace. If WORK.md exists, read it first; it contains the "
-                    "selected project's sources and enabled work plugins. Do not "
-                    "access paths outside the granted workspace; ask the user for "
-                    "an explicit folder grant when more local context is required."
-                    if self.work_mode else None
-                ),
-            }
-            if self.effort:
-                settings["reasoning_effort"] = self.effort
-            params["collaborationMode"] = {
-                "mode": self.collaboration_mode,
-                "settings": settings,
-            }
+            params["collaborationMode"] = self._collaboration_setting(
+                self.collaboration_mode)
         elif self.collaboration_mode == "plan":
             raise RuntimeError("Codex Plan mode requires an active model")
         # null is intentional: in app-server 0.144.1 it clears a persisted Fast
@@ -926,6 +937,8 @@ class CodexHandle:
         # Existing machine/tests assign this projection directly. Keep the raw
         # policy in lockstep for named policies; granular snapshots set _approval
         # directly so turn/start can preserve their full official object.
+        if self.work_mode:
+            value = "never"
         self._approval = value
         self.approval_policy: Any = value
 
@@ -961,7 +974,8 @@ class CodexHandle:
             raise RuntimeError("Codex collaboration mode requires an active model")
         settings: dict[str, Any] = {
             "model": model,
-            "developer_instructions": None,
+            "developer_instructions": (
+                WORK_DEVELOPER_INSTRUCTIONS if self.work_mode else None),
         }
         if self.effort:
             settings["reasoning_effort"] = self.effort
@@ -990,7 +1004,11 @@ class CodexHandle:
                 self.applied_effort = self.effort
 
         approval = settings.get("approvalPolicy")
-        if isinstance(approval, str) and approval in {
+        if self.work_mode:
+            # A resume response may carry the thread's previous Code policy.
+            # Work's filesystem profile is non-escalating by construction.
+            self.approval = "never"
+        elif isinstance(approval, str) and approval in {
             "untrusted",
             "on-request",
             "never",
@@ -1052,6 +1070,10 @@ class CodexHandle:
         # Codex "mode" = approval policy (untrusted | on-request | never).
         if mode not in ("untrusted", "on-request", "never"):
             raise ValueError(f"unsupported codex approval policy: {mode}")
+        if self.work_mode and mode != "never":
+            raise ValueError(
+                "Codex Work approval is fixed to never; its named permission "
+                "profile controls access")
         authoritative = await self._update_thread_settings(
             approvalPolicy=mode, wait_for_notification=True)
         if not authoritative:

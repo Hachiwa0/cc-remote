@@ -189,7 +189,7 @@ const chatViewSource = readFileSync(
   new URL("../../../../src/components/ChatView.tsx", import.meta.url),
   "utf8",
 );
-assert.match(chatViewSource, /className="thread-shell"/);
+assert.match(chatViewSource, /"thread-shell work-thread-shell"/);
 const threadShellRule = css.match(/\.thread-shell\{[^}]+\}/)?.[0] ?? "";
 assert.match(threadShellRule, /position:relative/);
 const scrollBottomRule = css.match(/\.scroll-bottom-wrap\{[^}]+\}/)?.[0] ?? "";

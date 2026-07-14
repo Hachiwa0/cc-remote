@@ -47,6 +47,7 @@ import re
 import signal
 import shutil
 import stat
+import subprocess
 import tempfile
 import time
 from collections import OrderedDict
@@ -69,14 +70,15 @@ from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.workspaces import WorkStores
 from cc_remote.protocol import (
-    ASK_OPTION_MAX_COUNT, FILE_PREVIEW_MAX_BYTES, PREVIEW_ASSET_MAX_BYTES,
+    ASK_OPTION_MAX_COUNT, ARTIFACT_PREVIEW_MAX_BYTES, FILE_PREVIEW_MAX_BYTES,
+    PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast,
     CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, AskUser,
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg,
     TurnEnd, TurnResult, is_downstream, is_reliable_command,
-    SessionInfo, SessionList, SessionFocus, SessionRekey, SessionForked, DirList,
-    WorkDashboard,
+    SessionInfo, SessionList, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
+    WorkDashboard, WorkArtifacts,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
     ERR_FORK_RECONCILING,
@@ -211,6 +213,13 @@ class WrapperMachine:
     FORK_BACKGROUND_ATTEMPTS = 100
     UNCERTAIN_FORK_CAP = 4096
     MARKDOWN_PREVIEW_SUFFIXES = frozenset({".md", ".markdown"})
+    HTML_PREVIEW_SUFFIXES = frozenset({".htm", ".html", ".svg"})
+    OFFICE_PREVIEW_SUFFIXES = frozenset({
+        ".doc", ".docx", ".odt", ".rtf", ".xls", ".xlsx", ".ods",
+        ".ppt", ".pptx", ".odp",
+    })
+    OFFICE_PREVIEW_INPUT_MAX_BYTES = 32 * 1024 * 1024
+    OFFICE_PREVIEW_TIMEOUT_SECONDS = 45
     PREVIEW_ASSET_MEDIA_TYPES = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -218,6 +227,10 @@ class WrapperMachine:
         ".gif": "image/gif",
         ".webp": "image/webp",
         ".avif": "image/avif",
+    }
+    ARTIFACT_PREVIEW_MEDIA_TYPES = {
+        **PREVIEW_ASSET_MEDIA_TYPES,
+        ".pdf": "application/pdf",
     }
     SAFE_RETRY_COMMANDS = frozenset({
         "list_sessions", "get_history", "get_models",
@@ -243,6 +256,7 @@ class WrapperMachine:
         self.cfg = cfg
         self.transport = transport
         self.instance_id = uuid4().hex
+        self._preview_conversion_limit = asyncio.Semaphore(2)
         # Pool of resident sessions, keyed by real session_id (or a `tmp-<uuid>`
         # temp key for a brand-new session until its id is captured).
         self.sessions: dict[str, SessionContext] = {}
@@ -1045,14 +1059,14 @@ class WrapperMachine:
             return await self._handle_delete_work_session(cmd)
         elif t == "get_work_dashboard":
             return await self._handle_get_work_dashboard(cmd)
+        elif t == "get_work_artifacts":
+            return await self._handle_get_work_artifacts(cmd)
         elif t in {
             "create_work_project", "delete_work_project", "add_work_source",
             "delete_work_source", "create_work_plugin", "delete_work_plugin",
             "create_work_schedule", "delete_work_schedule",
         }:
             return await self._handle_work_mutation(cmd)
-        elif t == "set_work_grant":
-            return await self._handle_set_work_grant(cmd)
         elif t == "fork_session":
             return await self._handle_fork_session(cmd)
         elif t == "fork_session_worktree":
@@ -2678,7 +2692,7 @@ class WrapperMachine:
             ctx.announced_effort = effort
             await self._emit(ctx, Effort(effort=effort))
         approval = settings.get("approval_policy")
-        if (approval in CODEX_PERMISSION_MODES
+        if (ctx.space != "work" and approval in CODEX_PERMISSION_MODES
                 and ctx.sdk.approval != approval):
             ctx.sdk.approval = approval
             ctx.announced_perm = approval
@@ -2797,6 +2811,12 @@ class WrapperMachine:
     async def _handle_set_perm(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
+            return
+        if ctx.space == "work" and ctx.engine == "codex" and cmd.mode != "never":
+            await self._emit(ctx, Error(
+                code=ERR_AUTH,
+                message="Codex Work 权限由隔离工作区固定管理，不能升级为交互授权",
+            ))
             return
         allowed = (CODEX_PERMISSION_MODES if ctx.engine == "codex"
                    else CLAUDE_PERMISSION_MODES)
@@ -3368,18 +3388,27 @@ class WrapperMachine:
             return response
 
         try:
-            path, content, size, truncated, mtime_ns, file_format, revision = (
-                await asyncio.to_thread(
-                    self._read_text_preview, ctx.cwd, cmd.path))
+            suffix = os.path.splitext(cmd.path)[1].lower()
+            if suffix in self.OFFICE_PREVIEW_SUFFIXES:
+                async with self._preview_conversion_limit:
+                    preview = await asyncio.to_thread(
+                        self._read_file_preview, ctx.cwd, cmd.path)
+            else:
+                preview = await asyncio.to_thread(
+                    self._read_file_preview, ctx.cwd, cmd.path)
             response = FilePreview(
-                path=path,
+                path=preview["path"],
                 request_id=cmd.request_id,
-                format=file_format,
-                content=content,
-                size=size,
-                truncated=truncated,
-                mtime_ns=str(mtime_ns),
-                revision=revision,
+                format=preview["format"],
+                content=preview.get("content", ""),
+                media_type=preview.get("media_type"),
+                data=(base64.b64encode(preview["data"]).decode("ascii")
+                      if preview.get("data") is not None else None),
+                converted_from=preview.get("converted_from"),
+                size=preview["size"],
+                truncated=preview.get("truncated", False),
+                mtime_ns=str(preview["mtime_ns"]),
+                revision=preview.get("revision"),
                 to=client_id,
             )
         except (UnicodeDecodeError, ValueError) as exc:
@@ -3820,7 +3849,8 @@ class WrapperMachine:
             if not stat.S_ISREG(file_stat.st_mode):
                 raise ValueError("预览目标必须是普通文件")
             if not allow_truncate and file_stat.st_size > max_bytes:
-                raise ValueError("预览图片超过 4 MiB 限制")
+                raise ValueError(
+                    f"预览文件超过 {max_bytes // (1024 * 1024)} MiB 限制")
             with os.fdopen(fd, "rb", closefd=False) as handle:
                 data = handle.read(max_bytes + 1)
         finally:
@@ -3828,7 +3858,8 @@ class WrapperMachine:
 
         truncated = len(data) > max_bytes or file_stat.st_size > max_bytes
         if truncated and not allow_truncate:
-            raise ValueError("预览图片超过 4 MiB 限制")
+            raise ValueError(
+                f"预览文件超过 {max_bytes // (1024 * 1024)} MiB 限制")
         return relative.replace(os.sep, "/"), data[:max_bytes], file_stat, truncated
 
     @classmethod
@@ -3858,6 +3889,188 @@ class WrapperMachine:
             cls._preview_format(relative),
             None if truncated else hashlib.sha256(data).hexdigest(),
         )
+
+    @classmethod
+    def _read_file_preview(cls, cwd: str, path: str) -> dict[str, object]:
+        """Read or render one artifact entirely on the wrapper host.
+
+        The returned dictionary is short-lived and immediately serialized into
+        a requester-routed WebSocket response. No artifact or converted preview
+        is persisted by the relay/VPS.
+        """
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix in cls.OFFICE_PREVIEW_SUFFIXES:
+            return cls._convert_office_preview(cwd, path)
+
+        if suffix in cls.HTML_PREVIEW_SUFFIXES:
+            relative, data, file_stat, truncated = cls._read_session_file(
+                cwd,
+                path,
+                allowed_suffixes=cls.HTML_PREVIEW_SUFFIXES,
+                max_bytes=FILE_PREVIEW_MAX_BYTES,
+                allow_truncate=True,
+            )
+            if b"\0" in data:
+                raise ValueError("HTML 文件不是有效的 UTF-8 文本")
+            decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
+            try:
+                content = decoder.decode(data, final=not truncated)
+            except UnicodeDecodeError as exc:
+                raise ValueError("HTML 文件不是有效的 UTF-8 文本") from exc
+            return {
+                "path": relative,
+                "format": "html",
+                "content": content,
+                "size": file_stat.st_size,
+                "truncated": truncated,
+                "mtime_ns": file_stat.st_mtime_ns,
+                "revision": None if truncated else hashlib.sha256(data).hexdigest(),
+            }
+
+        media_type = cls.ARTIFACT_PREVIEW_MEDIA_TYPES.get(suffix)
+        if media_type is not None:
+            relative, data, file_stat, _ = cls._read_session_file(
+                cwd,
+                path,
+                allowed_suffixes=frozenset(cls.ARTIFACT_PREVIEW_MEDIA_TYPES),
+                max_bytes=ARTIFACT_PREVIEW_MAX_BYTES,
+                allow_truncate=False,
+            )
+            cls._validate_rendered_preview(media_type, data)
+            return {
+                "path": relative,
+                "format": "pdf" if media_type == "application/pdf" else "image",
+                "media_type": media_type,
+                "data": data,
+                "size": file_stat.st_size,
+                "mtime_ns": file_stat.st_mtime_ns,
+            }
+
+        relative, content, size, truncated, mtime_ns, file_format, revision = (
+            cls._read_text_preview(cwd, path))
+        return {
+            "path": relative,
+            "format": file_format,
+            "content": content,
+            "size": size,
+            "truncated": truncated,
+            "mtime_ns": mtime_ns,
+            "revision": revision,
+        }
+
+    @staticmethod
+    def _validate_rendered_preview(media_type: str, data: bytes) -> None:
+        valid = {
+            "application/pdf": data.startswith(b"%PDF-"),
+            "image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg": data.startswith(b"\xff\xd8\xff"),
+            "image/gif": data.startswith((b"GIF87a", b"GIF89a")),
+            "image/webp": (len(data) >= 12 and data[:4] == b"RIFF"
+                            and data[8:12] == b"WEBP"),
+            "image/avif": (len(data) >= 12 and data[4:8] == b"ftyp"
+                            and data[8:12] in {b"avif", b"avis"}),
+        }.get(media_type, False)
+        if not valid:
+            raise ValueError("文件内容与预览格式不匹配")
+
+    @classmethod
+    def _convert_office_preview(cls, cwd: str, path: str) -> dict[str, object]:
+        suffix = os.path.splitext(path)[1].lower()
+        relative, data, file_stat, _ = cls._read_session_file(
+            cwd,
+            path,
+            allowed_suffixes=cls.OFFICE_PREVIEW_SUFFIXES,
+            max_bytes=cls.OFFICE_PREVIEW_INPUT_MAX_BYTES,
+            allow_truncate=False,
+        )
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        bwrap = shutil.which("bwrap")
+        if not soffice:
+            raise ValueError("本机未安装 LibreOffice，无法预览 Office 文件")
+        if not bwrap:
+            raise ValueError("本机未安装 bubblewrap，已拒绝不安全的 Office 转换")
+
+        with tempfile.TemporaryDirectory(prefix="cc-remote-preview-") as temp:
+            os.chmod(temp, 0o700)
+            root = Path(temp)
+            source = root / f"input{suffix}"
+            output = root / "out"
+            home = root / "home"
+            output.mkdir(mode=0o700)
+            home.mkdir(mode=0o700)
+            source.write_bytes(data)
+            source.chmod(0o600)
+
+            command = [
+                bwrap,
+                "--die-with-parent",
+                "--unshare-net",
+                "--new-session",
+                "--ro-bind", "/usr", "/usr",
+                "--ro-bind", "/etc", "/etc",
+                "--ro-bind", "/lib", "/lib",
+                "--ro-bind", "/lib64", "/lib64",
+                "--symlink", "usr/bin", "/bin",
+                "--symlink", "usr/sbin", "/sbin",
+                "--proc", "/proc",
+                "--tmpfs", "/tmp",
+                "--tmpfs", "/run",
+                "--dev", "/dev",
+                "--dir", "/mnt",
+                "--bind", temp, "/mnt",
+                "--chdir", "/mnt",
+                "--setenv", "HOME", "/mnt/home",
+                "--setenv", "TMPDIR", "/mnt/home",
+                soffice,
+                "-env:UserInstallation=file:///mnt/profile",
+                "--headless",
+                "--convert-to", "pdf",
+                "--outdir", "/mnt/out",
+                f"/mnt/{source.name}",
+            ]
+            cls._run_office_conversion(command)
+            candidates = list(output.glob("*.pdf"))
+            if len(candidates) != 1:
+                raise ValueError("Office 文件未能生成可预览的 PDF")
+            converted = candidates[0]
+            converted_stat = converted.lstat()
+            if (not stat.S_ISREG(converted_stat.st_mode)
+                    or converted.is_symlink()):
+                raise ValueError("Office 转换结果无效")
+            if converted_stat.st_size > ARTIFACT_PREVIEW_MAX_BYTES:
+                raise ValueError("转换后的 PDF 超过 8 MiB 预览限制")
+            preview = converted.read_bytes()
+            cls._validate_rendered_preview("application/pdf", preview)
+            return {
+                "path": relative,
+                "format": "pdf",
+                "media_type": "application/pdf",
+                "data": preview,
+                "converted_from": suffix.removeprefix("."),
+                "size": file_stat.st_size,
+                "mtime_ns": file_stat.st_mtime_ns,
+            }
+
+    @classmethod
+    def _run_office_conversion(cls, command: list[str]) -> None:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+        try:
+            return_code = process.wait(timeout=cls.OFFICE_PREVIEW_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            finally:
+                process.wait()
+            raise ValueError("Office 预览转换超时") from exc
+        if return_code != 0:
+            raise ValueError("Office 文件转换失败")
 
     @classmethod
     def _write_markdown_file(
@@ -4052,11 +4265,16 @@ class WrapperMachine:
 
     @classmethod
     def _preview_format(cls, path: str) -> str:
-        return (
-            "markdown"
-            if os.path.splitext(path)[1].lower() in cls.MARKDOWN_PREVIEW_SUFFIXES
-            else "text"
-        )
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix in cls.MARKDOWN_PREVIEW_SUFFIXES:
+            return "markdown"
+        if suffix in cls.HTML_PREVIEW_SUFFIXES:
+            return "html"
+        if suffix in cls.OFFICE_PREVIEW_SUFFIXES or suffix == ".pdf":
+            return "pdf"
+        if suffix in cls.PREVIEW_ASSET_MEDIA_TYPES:
+            return "image"
+        return "text"
 
     @classmethod
     def _read_preview_asset(
@@ -4081,13 +4299,73 @@ class WrapperMachine:
         max_bytes = max(64 * 1024, min(4 * 1024 * 1024,
                                        self.cfg.ws_max_size_bytes // 2))
         if not file:
-            return await self._bounded_process_output(
+            tracked = await self._bounded_process_output(
                 ("git", "-C", cwd, "diff", "--no-ext-diff", "--no-textconv",
                  "HEAD"), max_bytes)
+            if "[diff truncated at transport safety limit]" in tracked:
+                return tracked
+
+            # `git diff HEAD` deliberately omits untracked files. Work sessions
+            # commonly create their deliverables from scratch, so append a
+            # bounded no-index diff for each regular, non-ignored new file.
+            root_text = await self._bounded_process_output(
+                ("git", "-C", cwd, "rev-parse", "--show-toplevel"), 4096)
+            root = os.path.realpath(
+                root_text.strip().splitlines()[0] if root_text.strip() else cwd)
+            untracked_text = await self._bounded_process_output(
+                ("git", "-C", root, "ls-files", "-z", "--others",
+                 "--exclude-standard"), min(max_bytes, 512 * 1024))
+            # A bounded path list can end midway through a name. Only consume
+            # NUL-terminated entries so a partial path is never opened.
+            untracked_paths = untracked_text.split("\0")
+            if not untracked_text.endswith("\0"):
+                untracked_paths = untracked_paths[:-1]
+
+            parts = [tracked]
+            used = len(tracked.encode(errors="replace"))
+            source_cap = getattr(
+                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
+            for rel_file in untracked_paths:
+                if not rel_file or used >= max_bytes:
+                    continue
+                candidate = os.path.join(root, rel_file)
+                parent = os.path.realpath(os.path.dirname(candidate))
+                contained = os.path.join(parent, os.path.basename(candidate))
+                try:
+                    if os.path.commonpath((root, contained)) != root:
+                        continue
+                    file_stat = os.lstat(contained)
+                except (OSError, ValueError):
+                    continue
+                if (not stat.S_ISREG(file_stat.st_mode)
+                        or file_stat.st_size > source_cap):
+                    continue
+                separator = "\n" if parts[-1] and not parts[-1].endswith("\n") else ""
+                remaining = max_bytes - used - len(separator.encode())
+                if remaining <= 0:
+                    break
+                addition = await self._bounded_process_output(
+                    ("git", "-C", root, "diff", "--no-ext-diff",
+                     "--no-textconv", "--no-index", "--", "/dev/null",
+                     rel_file),
+                    remaining,
+                )
+                if not addition:
+                    continue
+                if separator:
+                    parts.append(separator)
+                    used += len(separator.encode())
+                parts.append(addition)
+                used += len(addition.encode(errors="replace"))
+                if "[diff truncated at transport safety limit]" in addition:
+                    break
+            return "".join(parts)
 
         root_text = await self._bounded_process_output(
             ("git", "-C", cwd, "rev-parse", "--show-toplevel"), 4096)
-        root = os.path.realpath(root_text.strip().splitlines()[0] if root_text.strip() else cwd)
+        in_repository = bool(root_text.strip())
+        root = os.path.realpath(
+            root_text.strip().splitlines()[0] if in_repository else cwd)
         candidate = os.path.abspath(
             os.path.expanduser(file) if os.path.isabs(os.path.expanduser(file))
             else os.path.join(cwd, os.path.expanduser(file)))
@@ -4102,6 +4380,28 @@ class WrapperMachine:
         except ValueError as exc:
             raise ValueError("diff path is outside the session repository") from exc
         rel_file = os.path.relpath(contained, root)
+
+        # Work uses a private plain directory rather than a Git repository. A
+        # newly generated deliverable still has a meaningful diff: the whole
+        # regular file is an addition from /dev/null. Keep the same containment
+        # and source-size guards as the repository-backed untracked path.
+        if not in_repository:
+            try:
+                file_stat = os.lstat(contained)
+            except OSError:
+                return ""
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("diff target outside Git must be a regular file")
+            source_cap = getattr(
+                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
+            if file_stat.st_size > source_cap:
+                raise ValueError("diff target exceeds the source size limit")
+            return await self._bounded_process_output(
+                ("git", "-C", root, "diff", "--no-ext-diff",
+                 "--no-textconv", "--no-index", "--", "/dev/null",
+                 rel_file),
+                max_bytes,
+            )
 
         diff = await self._bounded_process_output(
             ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
@@ -4302,8 +4602,41 @@ class WrapperMachine:
             resident_state = {c.session_id: c.state for c in self.sessions.values()
                               if c.session_id and c.engine == "codex"}
             space = getattr(cmd, "space", "code")
-            work_records = await asyncio.to_thread(
-                self._work.for_engine("codex").records_by_session)
+            store = self._work.for_engine("codex")
+            work_records = await asyncio.to_thread(store.records_by_session)
+            # thread/start commits the native rollout before WorkRegistry can bind
+            # it. If the wrapper dies in that narrow window, recover only an
+            # unambiguous exact-cwd match inside the private Work root.
+            unbound = await asyncio.to_thread(store.unbound_records_by_cwd)
+            rows_by_cwd: dict[str, list[dict]] = {}
+            for row in raw:
+                row_cwd = row.get("cwd")
+                if isinstance(row_cwd, str) and row_cwd:
+                    rows_by_cwd.setdefault(os.path.realpath(row_cwd), []).append(row)
+            for registered_cwd, record in unbound.items():
+                matches = rows_by_cwd.get(registered_cwd, [])
+                if len(matches) != 1:
+                    if len(matches) > 1:
+                        log.warning(
+                            "ambiguous unbound Codex Work session",
+                            work_id=record.work_id, matches=len(matches))
+                    continue
+                sid = matches[0].get("session_id")
+                if not isinstance(sid, str) or not sid or sid in work_records:
+                    continue
+                try:
+                    await asyncio.to_thread(store.bind_session, record.work_id, sid)
+                except Exception:
+                    log.exception(
+                        "Codex Work session reconciliation failed",
+                        work_id=record.work_id)
+                    continue
+                recovered = await asyncio.to_thread(store.get_by_session, sid)
+                if recovered is not None:
+                    work_records[sid] = recovered
+                log.info(
+                    "reconciled Codex Work session",
+                    session_id=sid, work_id=record.work_id)
             sessions = []
             for row in raw:
                 record = work_records.get(row["session_id"])
@@ -4666,6 +4999,14 @@ class WrapperMachine:
             ))
             if getattr(query_result, "type", None):
                 cached_responses.append(query_result)
+        if space == "work" and ctx.session_id:
+            # A newly durable Work item belongs in the sidebar immediately; do
+            # not wait for a later engine/space toggle to request another list.
+            await self._handle_list_sessions(ListSessions(
+                engine=engine,
+                space="work",
+                client_id=getattr(cmd, "client_id", None),
+            ))
         return tuple(cached_responses)
 
     async def _handle_rename_session(self, cmd) -> None:
@@ -4843,6 +5184,27 @@ class WrapperMachine:
         await self.transport.send(dashboard)
         return dashboard
 
+    async def _handle_get_work_artifacts(self, cmd):
+        engine = getattr(cmd, "engine", "claude")
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        client_id = getattr(cmd, "client_id", None)
+        store = self._work.for_engine(engine)
+        try:
+            artifacts = await asyncio.to_thread(store.artifacts, sid)
+            response = WorkArtifacts(
+                engine=engine, session_id=sid, artifacts=artifacts, to=client_id)
+        except LookupError:
+            response = Error(
+                code=ERR_AUTH, message="只能读取当前引擎的 Work 产物",
+                sid=sid, to=client_id)
+        except Exception:
+            log.exception("Work artifact scan failed", engine=engine, session_id=sid)
+            response = Error(
+                code=ERR_INTERNAL, message="Work 产物读取失败",
+                sid=sid, to=client_id)
+        await self.transport.send(response)
+        return response
+
     async def _handle_work_mutation(self, cmd):
         """Apply one bounded Work metadata mutation, then return fresh state."""
         engine = getattr(cmd, "engine", "claude")
@@ -4908,50 +5270,6 @@ class WrapperMachine:
             return error
         await self.transport.send(dashboard)
         return dashboard
-
-    async def _handle_set_work_grant(self, cmd):
-        engine = getattr(cmd, "engine", "claude")
-        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
-        store = self._work.for_engine(engine)
-        ctx = self._ctx_for(sid)
-        if ctx is not None and (ctx.space != "work" or ctx.engine != engine):
-            error = Error(code=ERR_AUTH, message="只能修改当前引擎的 Work 授权",
-                          sid=sid, to=getattr(cmd, "client_id", None))
-            await self.transport.send(error)
-            return error
-        if ctx is not None and ctx.state != "idle":
-            error = Error(code=ERR_BUSY, message="请等待当前工作结束后再修改目录授权",
-                          sid=sid, to=getattr(cmd, "client_id", None))
-            await self.transport.send(error)
-            return error
-        try:
-            record = await asyncio.to_thread(
-                store.set_grant, sid, cmd.path, cmd.mode)
-            if ctx is not None:
-                grants = await asyncio.to_thread(store.grants, record.work_id)
-                if engine == "codex":
-                    ctx.sdk.work_roots = grants
-                else:
-                    ctx.sdk.work_settings_path = await asyncio.to_thread(
-                        store.ensure_claude_policy, record)
-                await ctx.sdk.force_reconnect(
-                    ctx.session_id, ctx.cwd, reason="Work directory grant changed")
-        except (LookupError, ValueError):
-            error = Error(code=ERR_BAD_PROMPT,
-                          message="授权目录不存在、为文件系统根目录或会话不是 Work",
-                          sid=sid, to=getattr(cmd, "client_id", None))
-            await self.transport.send(error)
-            return error
-        except Exception:
-            log.exception("Work grant update failed", engine=engine,
-                          session_id=sid)
-            error = Error(code=ERR_INTERNAL,
-                          message="目录授权已保存，但当前会话重新加载失败，请重新打开会话",
-                          sid=sid, to=getattr(cmd, "client_id", None))
-            await self.transport.send(error)
-            return error
-        log.info("Work grant updated", engine=engine, session_id=sid,
-                 mode=cmd.mode)
 
     async def _is_codex_session(self, session_id: str) -> bool:
         """Capability guard for commands whose wire shape predates `engine`.
@@ -6142,7 +6460,6 @@ class WrapperMachine:
             target_cwd = self.cfg.cc_cwd
 
         work_record = None
-        work_grants: list[dict[str, str]] = []
         if space == "work":
             store = self._work.for_engine(engine)
             work_record = (await asyncio.to_thread(store.get_by_session, resume_id)
@@ -6168,18 +6485,18 @@ class WrapperMachine:
                 ))
                 return None
             work_id = work_record.work_id
-            work_grants = await asyncio.to_thread(store.grants, work_id)
 
         sdk = (
-            (CodexHandle(self.cfg, cwd=target_cwd, work_mode=True,
-                         work_roots=work_grants)
+            (CodexHandle(self.cfg, cwd=target_cwd, work_mode=True)
              if space == "work" else CodexHandle(self.cfg, cwd=target_cwd))
             if engine == "codex" else SdkHandle(self.cfg)
         )
         if space == "work":
             if engine == "codex":
-                # Work starts least-privileged even if Code defaults to never.
-                sdk.approval = "on-request"
+                # The named Work permission profile grants autonomous access only
+                # inside this registered cwd. Never allow approval escalation to
+                # turn an outside-profile denial into broader host access.
+                sdk.approval = "never"
             else:
                 assert work_record is not None
                 sdk.work_mode = True
@@ -6287,10 +6604,47 @@ class WrapperMachine:
                 await self._emit_focused(Error(code=ERR_CC_CRASH, message=f"connect failed: {e}"))
                 return None
 
+        # Unlike Claude, Codex returns its durable thread id from thread/start
+        # before the first turn. Bind it now so SessionFocus, artifact reads and
+        # the sidebar never observe a temporary id.
+        if engine == "codex" and not resume_id:
+            native_sid = getattr(ctx.sdk, "thread_id", None)
+            if not isinstance(native_sid, str) or not native_sid:
+                log.error("fresh Codex session missing thread id")
+                try:
+                    await ctx.sdk.disconnect()
+                except Exception:
+                    pass
+                await self._emit_focused(Error(
+                    code=ERR_CC_CRASH,
+                    message="Codex 未返回新会话 ID，已拒绝创建",
+                ))
+                return None
+            ctx.session_id = native_sid
+            if space == "work" and work_id:
+                try:
+                    await asyncio.to_thread(
+                        self._work.for_engine("codex").bind_session,
+                        work_id, native_sid)
+                except Exception:
+                    log.exception(
+                        "fresh Codex Work session binding failed",
+                        work_id=work_id)
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception:
+                        pass
+                    await self._emit_focused(Error(
+                        code=ERR_INTERNAL,
+                        message="Codex Work 会话登记失败",
+                    ))
+                    return None
+            self._codex_session_list_cache = None
+
         if space == "work" and engine == "codex":
             # thread/resume may restore the Code-time policy recorded in the
-            # native rollout. Work always reasserts its least-privilege policy.
-            ctx.sdk.approval = "on-request"
+            # native rollout. Work always reasserts its non-escalating profile.
+            ctx.sdk.approval = "never"
 
         # cc model is a runtime switch on the live subprocess (set_model), so apply
         # a pre-selected model now that we're connected. codex was set pre-connect.
@@ -6305,8 +6659,9 @@ class WrapperMachine:
             ctx.announced_model = model
         if effort:
             ctx.announced_effort = effort
-        # Pool key: real sid if known, else a temp id until captured in _run_turn.
-        key = resume_id or f"tmp-{uuid4().hex}"
+        # Codex knows its real id at connect time. Claude still uses a temporary
+        # key until its first init/result message exposes the SDK session id.
+        key = ctx.session_id or f"tmp-{uuid4().hex}"
         self.sessions[key] = ctx
         ctx.key = key
         if resume_id:

@@ -17,6 +17,7 @@ from cc_remote.wrapper.child_env import (
 )
 from cc_remote.wrapper.codex_handle import _codex_env
 from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,29 @@ def test_claude_sdk_options_override_inherited_control_secrets(monkeypatch):
         monkeypatch.setenv(key, f"secret-{key}")
     options = SdkHandle(WrapperConfig())._options(None, "/tmp")
     assert options.env == {key: "" for key in CONTROL_PLANE_SECRET_KEYS}
+
+
+def test_claude_work_uses_explicit_settings_without_filesystem_sources():
+    handle = SdkHandle(WrapperConfig())
+    handle.work_mode = True
+    handle.work_settings_path = "/tmp/cc-remote-work-policy.json"
+
+    options = handle._options(None, "/tmp/workspace")
+
+    assert options.settings == "/tmp/cc-remote-work-policy.json"
+    assert options.setting_sources == []
+    assert options.skills == []
+    assert options.system_prompt == WORK_SYSTEM_PROMPT
+    assert isinstance(options.system_prompt, str)
+    assert "not acting as a coding agent" in options.system_prompt
+    assert "preset" not in options.system_prompt
+
+
+def test_claude_code_keeps_official_prompt_preset():
+    options = SdkHandle(WrapperConfig())._options(None, "/tmp/code")
+
+    assert options.system_prompt["preset"] == "claude_code"
+    assert "cc-remote-ask" in options.system_prompt["append"]
 
 
 def test_scrub_removes_live_environment_mapping(monkeypatch):

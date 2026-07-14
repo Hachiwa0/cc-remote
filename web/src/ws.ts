@@ -530,6 +530,13 @@ export class RelayWs {
     });
   }
 
+  sendGetWorkArtifacts(engine: "claude" | "codex", sessionId: string): void {
+    this.send({
+      v: PROTOCOL_VERSION, type: "get_work_artifacts", engine,
+      session_id: sessionId, client_id: this.clientId, ts: nowTs(),
+    });
+  }
+
   sendCreateWorkProject(engine: "claude" | "codex", name: string,
                         description: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "create_work_project", engine,
@@ -588,12 +595,6 @@ export class RelayWs {
   sendDeleteWorkSchedule(engine: "claude" | "codex", scheduleId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_schedule", engine,
       schedule_id: scheduleId, ts: nowTs() });
-  }
-
-  sendSetWorkGrant(engine: "claude" | "codex", sessionId: string,
-                   path: string, mode: "none" | "read" | "write"): boolean {
-    return this.send({ v: PROTOCOL_VERSION, type: "set_work_grant", engine,
-      session_id: sessionId, path, mode, ts: nowTs() });
   }
 
   sendListDir(path?: string | null): void {

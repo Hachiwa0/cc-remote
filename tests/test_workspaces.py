@@ -1,7 +1,10 @@
+import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cc_remote.workspaces import WorkRegistry, WorkStores
 
@@ -79,20 +82,93 @@ class WorkRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             stores.for_engine("other")
 
-    def test_explicit_folder_grants_are_persisted_and_revocable(self):
+    def test_unbound_records_are_indexed_by_canonical_private_cwd(self):
+        unbound = self.store.create_session()
+        bound = self.store.create_session()
+        self.store.bind_session(bound.work_id, "session-bound")
+
+        records = self.store.unbound_records_by_cwd()
+
+        self.assertEqual(list(records), [os.path.realpath(unbound.cwd)])
+        self.assertEqual(records[os.path.realpath(unbound.cwd)].work_id,
+                         unbound.work_id)
+
+    def test_artifacts_list_only_user_deliverables_inside_private_workspace(self):
         record = self.store.create_session()
         self.store.bind_session(record.work_id, "session-1")
-        external = Path(self.tmp.name) / "external"
-        external.mkdir()
-        self.store.set_grant("session-1", str(external), "read")
-        self.assertEqual(self.store.grants(record.work_id), [
-            {"path": str(external.resolve()), "mode": "read"},
-        ])
-        policy = Path(self.store.ensure_claude_policy(
-            self.store.get_by_session("session-1")))
-        self.assertIn(str(external.resolve()), policy.read_text(encoding="utf-8"))
-        self.store.set_grant("session-1", str(external), "none")
-        self.assertEqual(self.store.grants(record.work_id), [])
+        workspace = Path(record.cwd)
+        (workspace / "report.md").write_text("# result", encoding="utf-8")
+        slides = workspace / "output" / "deck.pptx"
+        slides.parent.mkdir()
+        slides.write_bytes(b"presentation")
+        (workspace / ".private.txt").write_text("hidden", encoding="utf-8")
+        (workspace / "资料库").mkdir(exist_ok=True)
+        (workspace / "资料库" / "source.csv").write_text("input", encoding="utf-8")
+        outside = Path(self.tmp.name) / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        (workspace / "linked.txt").symlink_to(outside)
+
+        artifacts = self.store.artifacts("session-1")
+
+        self.assertEqual({item["path"] for item in artifacts}, {
+            "report.md", "output/deck.pptx",
+        })
+        by_path = {item["path"]: item for item in artifacts}
+        self.assertTrue(by_path["report.md"]["previewable"])
+        self.assertEqual(by_path["report.md"]["kind"], "document")
+        self.assertTrue(by_path["output/deck.pptx"]["previewable"])
+        self.assertEqual(by_path["output/deck.pptx"]["kind"], "presentation")
+
+    def test_claude_policy_copies_only_runtime_provider_settings(self):
+        config_dir = Path(self.tmp.name) / "claude-config"
+        config_dir.mkdir()
+        (config_dir / "settings.json").write_text(json.dumps({
+            "model": "claude-sonnet-4-5",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://provider.example/v1",
+                "ANTHROPIC_AUTH_TOKEN": "provider-token",
+                "ANTHROPIC_MODEL": "provider-model",
+                "UNRELATED_SECRET": "must-not-cross",
+            },
+            "hooks": {"UserPromptSubmit": [{"hooks": [{"command": "inject-memory"}]}]},
+            "permissions": {"allow": ["Read(~/private/**)"]},
+            "enabledPlugins": {"global-memory": True},
+            "theme": "dark",
+        }), encoding="utf-8")
+        record = self.store.create_session()
+
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config_dir)}):
+            policy = Path(self.store.ensure_claude_policy(record))
+
+        payload = json.loads(policy.read_text(encoding="utf-8"))
+        self.assertEqual(payload["model"], "claude-sonnet-4-5")
+        self.assertEqual(payload["env"], {
+            "ANTHROPIC_BASE_URL": "https://provider.example/v1",
+            "ANTHROPIC_AUTH_TOKEN": "provider-token",
+            "ANTHROPIC_MODEL": "provider-model",
+        })
+        self.assertNotIn("hooks", payload)
+        self.assertNotIn("enabledPlugins", payload)
+        self.assertNotIn("UNRELATED_SECRET", repr(payload))
+        self.assertEqual(payload["sandbox"]["filesystem"]["allowRead"],
+                         [record.cwd])
+        self.assertEqual(payload["sandbox"]["filesystem"]["allowWrite"],
+                         [record.cwd])
+        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+
+    def test_claude_policy_ignores_invalid_or_oversized_user_settings(self):
+        config_dir = Path(self.tmp.name) / "claude-config"
+        config_dir.mkdir()
+        (config_dir / "settings.json").write_text("{" + "x" * 1_100_000,
+                                                   encoding="utf-8")
+        record = self.store.create_session()
+
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config_dir)}):
+            policy = Path(self.store.ensure_claude_policy(record))
+
+        payload = json.loads(policy.read_text(encoding="utf-8"))
+        self.assertNotIn("model", payload)
+        self.assertNotIn("env", payload)
 
 
 if __name__ == "__main__":

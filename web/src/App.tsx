@@ -2,7 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState, type TouchEvent }
 import { RelayWs } from "./ws";
 import { reduce, initialState, createRuntime, type Turn } from "./reducer";
 import { uuid } from "./util";
-import { Icon, ClaudeMark } from "./icons";
+import { Icon } from "./icons";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { ReconnectBanner } from "./components/ReconnectBanner";
@@ -18,6 +18,7 @@ import { GoalPanel } from "./components/GoalPanel";
 import { StatusSheet } from "./components/StatusSheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
+import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
@@ -33,7 +34,7 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexServiceTier, type CollaborationModeName,
   type DiffTheme, type Engine, type Space } from "./protocol";
-import type { WorkDashboard } from "./protocol";
+import type { WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { resolveSidebarSwipe } from "./responsive-layout";
 
@@ -74,8 +75,10 @@ export default function App() {
   const [forkWorktreeError, setForkWorktreeError] = useState<string | null>(null);
   const [forkingPointId, setForkingPointId] = useState<string | null>(null);
   const [workManagerOpen, setWorkManagerOpen] = useState(false);
+  const [workArtifactsOpen, setWorkArtifactsOpen] = useState(false);
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
   const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
+  const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
   const [state, dispatch] = useReducer(reduce, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -126,6 +129,7 @@ export default function App() {
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const focusedEngine = (state.sessions.find(
     (session) => session.session_id === focusedSid)?.engine ?? engine) as "claude" | "codex";
+  const currentWorkArtifacts = focusedSid ? (workArtifactsBySid[focusedSid] ?? []) : [];
   const allQueued = collectWaitingQueries(state.runtimes);
   const replaceableQueued = collectWaitingQueries(state.runtimes, focusedSid);
 
@@ -221,6 +225,7 @@ export default function App() {
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
+    setWorkArtifactsOpen(false);
     preferredSurfaceFocusRef.current = null;
     setWorkProjectId(null);
     dispatch({
@@ -240,6 +245,7 @@ export default function App() {
     setStatusOpenSid(null);
     setForkWorktreeSession(null);
     setForkWorktreeError(null);
+    setWorkArtifactsOpen(false);
     dispatch({
       type: "restore_session_list",
       sessions: sessionListsBySurfaceRef.current[`${next}:${engine}`] ?? [],
@@ -378,6 +384,18 @@ export default function App() {
             return;
           }
           if (msg.type === "session_rekey") {
+            setWorkArtifactsBySid((current) => {
+              const prior = current[msg.old_key];
+              if (!prior) return current;
+              const next = { ...current, [msg.session_id]: prior };
+              delete next[msg.old_key];
+              return next;
+            });
+            if (spaceRef.current === "work"
+                && stateRef.current.focusedSid === msg.old_key) {
+              ws.sendListSessions(engineRef.current, "work");
+              ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
+            }
             setGoalUiBySid((current) => {
               const prior = current[msg.old_key];
               if (!prior) return current;
@@ -407,6 +425,15 @@ export default function App() {
             setWorkProjectId((current) => current && msg.projects.some(
               (project) => project.project_id === current) ? current : null);
           }
+          if (msg.type === "work_artifacts") {
+            setWorkArtifactsBySid((current) => ({
+              ...current, [msg.session_id]: msg.artifacts,
+            }));
+          }
+          if (msg.type === "session_focus" && spaceRef.current === "work"
+              && !msg.session_id.startsWith("tmp-")) {
+            ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
+          }
           if (msg.type === "session_list"
               && !shouldAcceptSessionList(engineRef.current, spaceRef.current, msg)) return;
           if ((msg.type === "turn_end"
@@ -425,7 +452,16 @@ export default function App() {
             if (currentSid) ws.sendGetHistory(currentSid, undefined, HISTORY_PAGE);
           }
           // refresh the context ring after each turn (local SDK query, no model tokens)
-          if (msg.type === "turn_end" && msg.sid) ws.sendGetContextTo(msg.sid);
+          if (msg.type === "turn_end" && msg.sid) {
+            ws.sendGetContextTo(msg.sid);
+            const session = stateRef.current.sessions.find(
+              (candidate) => candidate.session_id === msg.sid);
+            if (session?.space === "work"
+                || (spaceRef.current === "work" && stateRef.current.focusedSid === msg.sid)) {
+              ws.sendGetWorkArtifacts(
+                (session?.engine as Engine | undefined) ?? engineRef.current, msg.sid);
+            }
+          }
         },
         onConnState: (s, detail) => {
           dispatch({ type: "conn", connState: s, detail });
@@ -433,6 +469,8 @@ export default function App() {
             ws.sendListSessions(engineRef.current, spaceRef.current);
             if (spaceRef.current === "work") {
               ws.sendGetWorkDashboard(engineRef.current);
+              const currentSid = stateRef.current.focusedSid;
+              if (currentSid) ws.sendGetWorkArtifacts(engineRef.current, currentSid);
             }
             // Always fetch codex's catalog, not just when codex is the active engine:
             // the engine pill switches instantly and must render real models/efforts.
@@ -457,6 +495,8 @@ export default function App() {
           setForkWorktreeError(null);
           setGoalUiBySid({});
           setStatusOpenSid(null);
+          setWorkArtifactsOpen(false);
+          setWorkArtifactsBySid({});
           dispatch({ type: "reset" });
           setAuthed(false);
           void (async () => {
@@ -905,7 +945,7 @@ export default function App() {
         sessions={state.sessions}
         liveStates={Object.fromEntries(Object.entries(state.runtimes).map(([sid, r]) => [sid, r.state]))}
         activeSessionId={focusedSid}
-        onSelect={(id) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); const selected = state.sessions.find((s) => s.session_id === id); const selectedEngine = (selected?.engine as "claude" | "codex") || engine; const selectedSpace = selected?.space === "work" ? "work" : space; dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace); wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace); if (isMobile()) setSidebarOpen(false); }}
+        onSelect={(id) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setWorkArtifactsOpen(false); const selected = state.sessions.find((s) => s.session_id === id); const selectedEngine = (selected?.engine as "claude" | "codex") || engine; const selectedSpace = selected?.space === "work" ? "work" : space; dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace); wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace); if (selectedSpace === "work") wsRef.current?.sendGetWorkArtifacts(selectedEngine, id); if (isMobile()) setSidebarOpen(false); }}
         onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~" }); if (isMobile()) setSidebarOpen(false); }}
         onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
@@ -915,23 +955,6 @@ export default function App() {
           if (space !== "work" || !window.confirm("删除后将永久移除这项工作及其私有文件，确定继续吗？")) return;
           if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~" });
           wsRef.current?.sendDeleteWorkSession(id, engine);
-        }}
-        onGrant={(id) => {
-          const path = window.prompt("输入要授权或撤销的绝对目录路径");
-          if (!path?.trim()) return;
-          const rawMode = window.prompt("输入权限：read（只读）、write（读写）或 none（撤销）", "read");
-          const mode = rawMode?.trim().toLowerCase();
-          if (mode !== "read" && mode !== "write" && mode !== "none") {
-            window.alert("权限必须是 read、write 或 none"); return;
-          }
-          const submitted = wsRef.current?.sendSetWorkGrant(engine, id, path.trim(), mode);
-          if (submitted) {
-            window.alert(mode === "none"
-              ? "目录授权撤销请求已提交；空闲会话会立即应用。"
-              : `目录${mode === "write" ? "读写" : "只读"}授权请求已提交；空闲会话会立即应用。`);
-          } else {
-            window.alert("当前未连接，目录授权没有提交，请稍后重试。");
-          }
         }}
         onForkWorktree={openForkWorktree}
       />
@@ -944,27 +967,36 @@ export default function App() {
         onConfirm={(cwd) => { if (state.newChat) dispatch({ type: "set_new_chat_cwd", cwd }); setDirPickerOpen(false); }}
         onClose={() => setDirPickerOpen(false)}
       />
-      <section className="pane">
-        <header className="c-head">
+      <section className={`pane ${space}-pane`}>
+        <header className={`c-head ${space}-head`}>
           <div className="titlewrap">
             <div className="ttl">
-              <span className="brand" onClick={() => setSidebarOpen(true)} style={{ cursor: "pointer" }}>
-                <span className="brand-mark"><ClaudeMark size={18} /></span>
-                <span className="name serif"><b>cc</b><span>·remote</span></span>
-              </span>
+              <button className="surface-head-title" onClick={() => setSidebarOpen(true)}>
+                <span className="surface-head-mark"><Icon name={space === "work" ? "work" : "code"} size={18} /></span>
+                <span>{space === "work" ? "Work" : "Code"}</span>
+              </button>
             </div>
-            <div className="sub">{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</div>
+            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</div>
           </div>
           <span className={`hstat ${rt.state}`}><span className="sd" />{rt.state}</span>
+          {space === "work" && !state.newChat && currentWorkArtifacts.length > 0 && (
+            <button className="work-artifacts-btn" onClick={() => setWorkArtifactsOpen(true)}>
+              <Icon name="read" size={15} /><span>Artifacts</span>
+              <b>{currentWorkArtifacts.length}</b>
+            </button>
+          )}
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
           <button className="iconbtn" onClick={toggleTheme} aria-label="切换主题">
             <Icon name={theme === "dark" ? "sun" : "moon"} />
           </button>
-          <button className="iconbtn" onClick={() => void logout()} aria-label="退出"><Icon name="dots" /></button>
+          <button className="iconbtn" onClick={() => void logout()}
+            aria-label="退出登录" title="退出登录"><Icon name="logout" /></button>
         </header>
 
-        <ReconnectBanner banner={state.banner} replaying={rt.replaying} truncated={rt.truncated} />
+        <ReconnectBanner banner={state.banner} replaying={rt.replaying}
+          truncated={rt.truncated}
+          busy={state.connState !== "connected" || !state.wrapperOnline || rt.replaying} />
         <NoticeStack notices={rt.notices}
           onDismiss={(noticeId) => {
             if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
@@ -983,12 +1015,19 @@ export default function App() {
         ) : (
           <>
             <ChatView sid={focusedSid} turns={rt.turns} loading={!!rt.loading}
+              surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={!!rt.hasMore}
               onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_PAGE); }}
               onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff}
               onPreviewMarkdown={previewMarkdown}
               onOpenFile={previewFile}
+              onOpenArtifacts={() => {
+                if (focusedSid) {
+                  wsRef.current?.sendGetWorkArtifacts(focusedEngine, focusedSid);
+                }
+                setWorkArtifactsOpen(true);
+              }}
               onFork={space === "code" ? forkFromTurn : undefined} />
 
             <GoalPanel engine={engine} goal={rt.goal}
@@ -1006,6 +1045,7 @@ export default function App() {
               }} />
 
             <Composer
+          surface={space}
           state={rt.state}
           catalog={state.catalog}
           connState={state.connState}
@@ -1043,6 +1083,7 @@ export default function App() {
           onPreview={previewMarkdown}
           onGoal={runGoal}
           onStatus={openStatus}
+          onManageWork={() => setWorkManagerOpen(true)}
           contextReport={rt.contextReport}
         />
           </>
@@ -1102,6 +1143,11 @@ export default function App() {
         onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
         onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
         onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />
+      <WorkArtifactsSheet open={workArtifactsOpen && space === "work"
+          && !state.newChat && currentWorkArtifacts.length > 0}
+        artifacts={currentWorkArtifacts}
+        onOpen={(path) => { setWorkArtifactsOpen(false); previewFile(path); }}
+        onClose={() => setWorkArtifactsOpen(false)} />
     </div>
   );
 }

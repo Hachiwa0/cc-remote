@@ -56,6 +56,23 @@ assert.equal(clampPanelWidth(200, 1440), 360);
 assert.equal(clampPanelWidth(2_000, 1440), 1_020);
 assert.equal(clampPanelWidth(600, 1_000), 580);
 
+const loginFormSource = readFileSync(resolve(
+  process.cwd(), "src/components/LoginForm.tsx"), "utf8");
+assert.match(loginFormSource, /type=\{passwordVisible \? "text" : "password"\}/);
+assert.match(loginFormSource, /name="password"/);
+assert.match(loginFormSource, /autoComplete="current-password"/);
+assert.match(loginFormSource, /autoCapitalize="none"/);
+assert.match(loginFormSource, /autoCorrect="off"/);
+assert.match(loginFormSource, /spellCheck=\{false\}/);
+assert.match(loginFormSource, /enterKeyHint="go"/);
+assert.match(loginFormSource, /aria-label=\{passwordVisible \? "隐藏密码" : "显示密码"\}/);
+assert.match(loginFormSource, /aria-pressed=\{passwordVisible\}/);
+
+const reconnectBannerSource = readFileSync(resolve(
+  process.cwd(), "src/components/ReconnectBanner.tsx"), "utf8");
+assert.ok(reconnectBannerSource.includes('busy && <span className="sp"'),
+  "only an active reconnect/replay may render the progress indicator");
+
 const viewportListeners = new Map<MobileViewportEvent, Set<() => void>>();
 const viewportCss = new Map<string, string>();
 const viewportFrames = new Map<number, () => void>();
@@ -229,6 +246,9 @@ assert.doesNotMatch(layoutCss, /transition\s*:\s*grid-template-columns/);
 assert.match(layoutCss, /\.shell\.sidebar-open \.pane\s*\{[^}]*margin-left\s*:\s*352px/s);
 assert.match(layoutCss, /\.pane\s*\{[^}]*transition\s*:[^}]*margin-left[^}]*width/s);
 assert.match(layoutCss, /\.sessions\s*\{[^}]*position\s*:\s*fixed[^}]*width\s*:\s*352px/s);
+assert.match(layoutCss,
+  /@media \(max-width:980px\)\{\s*\.artifact-panel\{[^}]*top:calc\(var\(--app-offset-top,0px\) \+ 10px\)[^}]*bottom:auto[^}]*height:calc\(var\(--app-height,100dvh\) - 20px\)[^}]*max-height:none/s,
+  "mobile artifact previews must fill the visual viewport instead of shrink-wrapping iframe or Markdown content");
 
 let requested = "";
 const authenticated = await probeSession(async (input, init) => {
@@ -567,6 +587,8 @@ try {
   assert.equal(state.catalogDefaultEffort.claude, "max");
   const { NewChatView } = await reducerHarness.ssrLoadModule(
     "/src/components/NewChatView.tsx");
+  const { WorkArtifactsSheet } = await reducerHarness.ssrLoadModule(
+    "/src/components/WorkArtifactsSheet.tsx");
   const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
     cwd: "~", engine: "claude",
     onPickCwd: () => {},
@@ -583,6 +605,19 @@ try {
     assert.doesNotMatch(markup, /本机默认|默认 ·|选择模型|思考强度/);
   }
   assert.doesNotMatch(codexNewChatMarkup, /不询问|Plan|标准/);
+  const artifactsMarkup = renderToStaticMarkup(createElement(WorkArtifactsSheet, {
+    open: true,
+    artifacts: [
+      { path: "report.md", size: 1024, modified_at: 1, kind: "document", previewable: true },
+      { path: "slides/deck.pptx", size: 4096, modified_at: 2, kind: "presentation", previewable: true },
+    ],
+    onOpen: () => {},
+    onClose: () => {},
+  }));
+  assert.match(artifactsMarkup, /当前工作产生的 2 个文件/);
+  assert.match(artifactsMarkup, /report\.md/);
+  assert.match(artifactsMarkup, /slides\/deck\.pptx/);
+  assert.doesNotMatch(artifactsMarkup, /暂不可预览|disabled=""/);
   state = { ...state,
     newChat: { cwd: "/other", model: null, effort: null } };
   state = reduce(state, { type: "event", event: event({
@@ -1358,6 +1393,13 @@ relay.sendGetContext();
 assert.equal(JSON.parse(socket.sent.at(-1) ?? "{}").sid, "surface-work");
 relay.setSurface("codex", "code");
 
+relay.sendGetWorkArtifacts("claude", "surface-work");
+const artifactsFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(artifactsFrame.type, "get_work_artifacts");
+assert.equal(artifactsFrame.engine, "claude");
+assert.equal(artifactsFrame.session_id, "surface-work");
+assert.equal(typeof artifactsFrame.client_id, "string");
+
 const codexModels = modelsFor("codex");
 assert.equal(clientSlashesFor("codex").has("plan"), true);
 assert.equal(clientSlashesFor("codex").has("normal"), true);
@@ -1421,6 +1463,30 @@ for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_coll
 }
 assert.match(appSource, /const \{ cwd, model, effort \} = state\.newChat/);
 assert.match(appSource, /data-lock-horizontal-swipe/);
+assert.match(appSource, /surface=\{space\}/);
+assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
+assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
+assert.match(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/);
+assert.match(appSource, /className="work-artifacts-btn"/);
+assert.match(appSource, /currentWorkArtifacts\.length > 0/);
+assert.doesNotMatch(appSource, /className="work-head-manage"/);
+assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
+const sidebarSource = readFileSync(
+  resolve(process.cwd(), "src/components/SessionsSidebar.tsx"), "utf8");
+assert.doesNotMatch(sidebarSource, /onGrant|目录授权/);
+const composerSource = readFileSync(
+  resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
+assert.match(composerSource, /workSurface \? \(/);
+assert.match(composerSource, /className="work-compose-card"/);
+assert.match(composerSource, /工作设置/);
+assert.match(composerSource, /ref=\{workSettingsRef\}/);
+assert.match(composerSource, /document\.addEventListener\("pointerdown", onPointerDown\)/);
+const chatViewSource = readFileSync(
+  resolve(process.cwd(), "src/components/ChatView.tsx"), "utf8");
+assert.match(chatViewSource, /surface !== "work"/);
+assert.match(chatViewSource, /arr\.length === 1 && onOpenFile/);
+assert.match(chatViewSource, /onOpenArtifacts\?\.\(\)/);
+assert.match(layoutCss, /\.work-thread-shell \.thread-in\s*\{/);
 
 assert.equal(relay.sendTakeover("codex-model-session"), true);
 const takeoverFrame = JSON.parse(socket.sent.at(-1) ?? "{}");

@@ -45,15 +45,15 @@ API key 烤进网页。
 | **双引擎** | 在同一个 Web UI 中使用 Claude Code 和 Codex；每个会话保持自己的模型、思考强度、权限与运行状态。 |
 | **Code / Work 双空间** | Code 继续面向代码仓库；Work 是完全独立的 Cowork 工作区，用于文档、表格、演示、资料整理和临时协作，不混入代码会话列表。 |
 | **Work 项目与资料库** | 为 Claude/Codex 分别建立私有项目、文件/链接/笔记资料库和可复用指令插件；创建工作时会把选定上下文物化到专属目录。 |
-| **Work 定时任务与授权** | 支持一次、每日、每周任务；默认只能访问自己的私有工作目录，用户可按会话额外授予外部目录只读或读写权限并随时撤销。 |
+| **Work 定时任务与隔离** | 支持一次、每日、每周任务；每个工作默认只能访问自己的私有目录，需要的资料通过会话附件或项目资料库显式加入。 |
 | **远程操作** | 手机、平板或桌面浏览器实时看流式回复，发送附件，排队下一条消息，随时打断当前回合。 |
 | **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
-| **文件预览与 Markdown 编辑** | 点击回复中的本机文件链接可直接打开源码并定位行号；也可从变更卡片或 `/preview 路径` 打开 Markdown，在实时预览和源码编辑间切换，通过 Ctrl/⌘+S 或保存按钮执行带冲突检测的原子保存。 |
+| **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。 |
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
 | **会话管理** | 搜索、切换、重命名、归档和消息级派生；Codex 还可在 Git 仓库中派生到独立 worktree。 |
 | **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；`/goal` 管理长目标，Codex `/status` 读取 app-server 状态、用量与限额。 |
 | **连续性** | 后台会话继续运行，多端实时同步；从 Claude transcript / Codex rollout 分页恢复历史，断线后按游标补流。 |
-| **自托管** | wrapper 只出站连接；VPS 不需要模型 SDK，网页认证使用 HttpOnly cookie，CLI 凭据与 API key 不进入前端。 |
+| **自托管** | wrapper 只出站连接；会话、Work 数据和预览转换都留在本机，VPS 只做无状态中继且可替换；网页认证使用 HttpOnly cookie，CLI 凭据与 API key 不进入前端。 |
 
 > 不同引擎可用的模型、服务档位和运行控制以本机 CLI 及其 SDK/app-server 能力为准。
 
@@ -69,8 +69,8 @@ API key 烤进网页。
 
 | 组件 | 跑在哪 | 干什么 |
 |---|---|---|
-| **wrapper** | `claude` / `codex` 所在的机器 | 持有会话池、把 SDK/app-server 事件翻成线协议、管打断/排空、按需从 transcript/rollout 读历史。**只出站连中继，机器不需要开入站端口。** |
-| **relay（中继）** | 公网 VPS（或本地） | 纯 WebSocket 转发器（FastAPI）。wrapper 使用 Bearer token，浏览器使用 HttpOnly 会话 cookie；单 wrapper 槽、多客户端扇出。**从不 import `claude-agent-sdk`、从不碰模型 API**。 |
+| **wrapper** | `claude` / `codex` 所在的机器 | 持有会话池、把 SDK/app-server 事件翻成线协议、管打断/排空、按需从 transcript/rollout 读历史，并在本机临时转换 Office 预览。**只出站连中继，机器不需要开入站端口。** |
+| **relay（中继）** | 公网 VPS（或本地） | 纯 WebSocket 转发器（FastAPI）。wrapper 使用 Bearer token，浏览器使用 HttpOnly 会话 cookie；单 wrapper 槽、多客户端扇出。**不持久化会话或 Artifact，从不 import `claude-agent-sdk`、从不碰模型 API**。 |
 | **web** | 浏览器 | React 客户端；中继同源托管它的静态文件（`web/dist`）。 |
 
 ### Code 与 Work
@@ -81,11 +81,24 @@ API key 烤进网页。
 - **Code** 保持原有行为，以用户选择的代码仓库为工作目录，适合开发、调试和部署。
 - **Work** 适合文档、表格、PPT、调研、资料库和临时对话。Claude 数据默认在
   `~/.claude/cc-remote/work`，Codex 数据默认在 `~/.codex/cc-remote/work`；每项工作有
-  独立的 `workspace/`、上传文件和产物目录，删除时只删除注册表确认属于该 Work 的目录。
-- Work 默认不开放用户主目录。需要引用现有资料时，从会话菜单显式授予某个绝对目录
-  **只读**或**读写**权限；撤销后会在会话空闲时重新生成沙箱并重连。
+  独立的 `workspace/` 和上传文件。Artifact 是该工作目录中产生的普通文件，删除工作时
+  只删除注册表确认属于该 Work 的目录。Work 会替换两家 CLI 面向代码开发的基础提示词；
+  闲聊不会主动检查文件或提及代码项目，需要编程时仍可按用户的明确要求执行。
+- Work 不开放用户主目录或任意外部目录。需要引用现有资料时，通过附件或项目资料库
+  显式复制到私有工作目录，避免对话意外读取其他项目和历史。
 - “插件”当前是可复用的工作说明/流程模板，会写入该项目的 `WORK.md`，不会在后台执行
   未审核的第三方代码。定时任务由 wrapper 持久化和领取，使用同一 Work 隔离策略运行。
+
+### Artifact 预览在哪里运行
+
+- HTML 内容在浏览器端经 DOMPurify 清理后进入无脚本、无外部网络的 sandbox iframe。
+- PNG/JPEG/GIF/WebP/AVIF 和 PDF 由 wrapper 做路径、类型和大小校验后，通过当前鉴权
+  WebSocket 定向返回给请求它的浏览器。
+- DOC/DOCX/ODT/RTF、XLS/XLSX/ODS、PPT/PPTX/ODP 由 **wrapper 所在机器**上的
+  LibreOffice 转成 PDF；Linux 使用 bubblewrap 隔离网络、用户目录和文件系统，只挂载本次
+  临时目录。转换完成后临时目录立即删除。
+- VPS relay 只转发有上限的预览帧，不落原文件或转换结果。换 VPS 不需要迁移会话；换
+  wrapper 设备时迁移本机 transcript/rollout、Work 根目录和 cc-remote 状态即可。
 
 ## 真实界面与实用功能
 
@@ -148,6 +161,8 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 - 一台已装好 **Claude Code CLI**（`claude`，v2.1.51+）或支持 `app-server` 的 **Codex CLI**（`codex`）并且 CLI **本身已经能正常对话**的机器；两个都装即可在网页中切换引擎。
 - **Python 3.10+**、**Node 20.19+**（用来构建网页）。
+- 可选：要预览 DOCX/XLSX/PPTX 等 Office 文件，Linux wrapper 主机需安装
+  **LibreOffice + bubblewrap**（例如 `sudo apt install libreoffice bubblewrap`）；VPS 不需要。
 
 ### 1）装依赖 + 构建网页
 
@@ -286,6 +301,12 @@ curl https://your-domain.com/healthz
 
 ### 5）你的机器：配 root-only wrapper 环境 + systemd
 
+如果需要 Office Artifact 预览，先在这台 wrapper 主机安装转换沙箱（不要装到 VPS）：
+
+```bash
+sudo apt-get update && sudo apt-get install -y libreoffice bubblewrap
+```
+
 ```bash
 cd /path/to/cc-remote
 python3 -m venv .venv
@@ -377,7 +398,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 
 > **cc-remote 会让远端的人在你机器上跑任意命令。请当成「给别人一个你机器的 shell」来对待。**
 
-- Code 会话仍是远程开发控制面：Claude 默认使用 `permissionMode: bypassPermissions`；Codex 默认审批策略是 `never` 并继承本机 Codex sandbox 配置，也可切到 `on-request` / `untrusted`。**能登录且能进入 Code 的人，仍应等同于拿到了这台机器的远程 agent/shell 权限。** Work 会话另有私有根目录和显式目录授权，但它只是缩小默认能力面，不替代操作系统级的独立用户、容器或虚拟机隔离。
+- Code 会话仍是远程开发控制面：Claude 默认使用 `permissionMode: bypassPermissions`；Codex 默认审批策略是 `never` 并继承本机 Codex sandbox 配置，也可切到 `on-request` / `untrusted`。**能登录且能进入 Code 的人，仍应等同于拿到了这台机器的远程 agent/shell 权限。** Work 会话使用独立私有根目录且不开放外部目录，但这只是缩小默认能力面，不替代操作系统级的独立用户、容器或虚拟机隔离。
 - `LOGIN_PASSWORD` / `WRAPPER_TOKEN` / `SESSION_SECRET` 是唯一的门：用强随机值、别提交 git、别贴到聊天里、定期轮换。仓库 `.env` 只适合本机开发；生产 wrapper 必须使用上述 root-only `/etc/cc-remote/wrapper.env`。systemd 模板会禁止服务及模型子进程读取这个源文件和遗留仓库 `.env`；Linux wrapper 还会关闭 dumpability，避免子进程从 `/proc/<pid>/environ` 或进程内存取回已经捕获的 token。
 - 公网必须上 TLS（`wss://`，本仓库用 Caddy 自动签证书）。别用明文 `ws://` 暴露公网。
 - 建议：给中继加 IP 白名单 / 只在需要时开、给登录加失败限速（已内置每 IP 每分钟 5 次）。
@@ -418,6 +439,7 @@ npm --prefix web run build          # 网页生产构建
 
 - **wrapper 重启会丢历史吗？** 已落盘历史不会；它来自磁盘上的 Claude transcript / Codex rollout。重启会丢尚未确认的内存命令和实时 ring，详见上面的可靠性边界。
 - **中继重启会断吗？** 会短暂断连并要求重新登录（进程内撤销注册表会重置）；对话不丢，因为会话在 wrapper 机器上。
+- **可以更换 VPS 或迁移到新设备吗？** 可以。VPS 只提供 relay + Web 静态文件，不是会话权威；更换它只需部署同版本并让 wrapper 指向新的 `RELAY_URL`。迁移 wrapper 设备时，复制 Claude transcript、Codex rollout、`CLAUDE_WORK_ROOT` / `CODEX_WORK_ROOT` 和 `~/.cc-remote`，在新设备重新登录 CLI 后再启动 wrapper。
 - **要开入站端口吗？** 不用。wrapper 只出站连中继。
 - **多贵？** cc-remote 本身零模型开销；浏览/刷新/看历史都不花 token。真正的模型花费取决于本地 agent CLI 使用的后端。
 

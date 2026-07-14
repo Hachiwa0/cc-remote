@@ -20,6 +20,110 @@ from uuid import uuid4
 
 Engine = Literal["claude", "codex"]
 
+_MAX_WORK_ARTIFACTS = 200
+_MAX_WORK_ARTIFACT_SCAN = 4096
+_WORK_ARTIFACT_PREVIEW_SUFFIXES = frozenset({
+    ".c", ".cc", ".conf", ".cpp", ".css", ".csv", ".go", ".h", ".hpp",
+    ".htm", ".html", ".ini", ".java", ".js", ".json", ".jsonl", ".log", ".md",
+    ".mdown", ".markdown", ".mjs", ".py", ".rs", ".sh", ".sql", ".svg",
+    ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+    ".avif", ".doc", ".docx", ".gif", ".jpeg", ".jpg", ".odp", ".ods",
+    ".odt", ".pdf", ".png", ".ppt", ".pptx", ".rtf", ".webp", ".xls",
+    ".xlsx",
+})
+_WORK_ARTIFACT_KIND_SUFFIXES = {
+    "document": frozenset({".doc", ".docx", ".md", ".odt", ".rtf", ".txt"}),
+    "spreadsheet": frozenset({".csv", ".ods", ".xls", ".xlsx"}),
+    "presentation": frozenset({".odp", ".ppt", ".pptx"}),
+    "image": frozenset({".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}),
+    "pdf": frozenset({".pdf"}),
+}
+
+_MAX_CLAUDE_SETTINGS_BYTES = 1024 * 1024
+_MAX_CLAUDE_SETTING_VALUE = 16 * 1024
+_CLAUDE_RUNTIME_ENV_KEYS = frozenset({
+    # Direct Anthropic and compatible endpoints.
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+    "ANTHROPIC_BETAS",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    # Claude Code's supported cloud-provider selectors and credentials.
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+})
+
+
+def _bounded_setting(value: object, *, limit: int = _MAX_CLAUDE_SETTING_VALUE) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if 0 < len(value) <= limit else None
+
+
+def _claude_runtime_settings() -> dict[str, object]:
+    """Copy provider connectivity only; never import global Work context.
+
+    The explicit Work policy is the sole Claude settings file used by the SDK.
+    User hooks, permissions, plugins, skills and CLAUDE.md discovery therefore
+    cannot cross from Code into Work, while a compatible endpoint configured in
+    the user's settings remains usable.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    root = Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
+    path = root / "settings.json"
+    try:
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_CLAUDE_SETTINGS_BYTES:
+            return {}
+        raw = path.read_bytes()
+    except OSError:
+        return {}
+    if len(raw) > _MAX_CLAUDE_SETTINGS_BYTES:
+        return {}
+    try:
+        source = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(source, dict):
+        return {}
+
+    runtime: dict[str, object] = {}
+    model = _bounded_setting(source.get("model"), limit=256)
+    if model is not None:
+        runtime["model"] = model
+    source_env = source.get("env")
+    if isinstance(source_env, dict):
+        env = {
+            key: value
+            for key in sorted(_CLAUDE_RUNTIME_ENV_KEYS)
+            if (value := _bounded_setting(source_env.get(key))) is not None
+        }
+        if env:
+            runtime["env"] = env
+    return runtime
+
 
 @dataclass(frozen=True)
 class WorkSessionRecord:
@@ -121,14 +225,6 @@ class WorkRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS work_schedules_due
                     ON work_schedules(enabled, next_run_at);
-                CREATE TABLE IF NOT EXISTS work_grants (
-                    work_id TEXT NOT NULL REFERENCES work_sessions(work_id)
-                        ON DELETE CASCADE,
-                    path TEXT NOT NULL,
-                    mode TEXT NOT NULL CHECK (mode IN ('read', 'write')),
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY (work_id, path)
-                );
                 """
             )
         self._chmod_file(self.db_path)
@@ -142,7 +238,7 @@ class WorkRegistry:
         chat_root = self.chats_root / work_id
         workspace = chat_root / "workspace"
         for directory in (
-            chat_root, workspace, chat_root / "uploads", chat_root / "artifacts",
+            chat_root, workspace, chat_root / "uploads",
         ):
             self._mkdir_private(directory)
         cwd = str(workspace)
@@ -211,6 +307,60 @@ class WorkRegistry:
             description=row["description"], created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
+
+    def artifacts(self, session_id: str) -> list[dict[str, object]]:
+        """List bounded, user-visible deliverables from one private Work cwd.
+
+        Project context and copied source material are inputs, not artifacts.
+        Symlinks and hidden paths are ignored so enumeration never escapes or
+        exposes implementation state from the wrapper-owned workspace.
+        """
+        record = self.get_by_session(session_id)
+        if record is None or not self.contains_cwd(record.cwd):
+            raise LookupError(f"unknown Work session: {session_id}")
+        root = os.path.realpath(record.cwd)
+        artifacts: list[dict[str, object]] = []
+        scanned = 0
+        for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+            relative_dir = os.path.relpath(current, root)
+            if relative_dir == ".":
+                dirs[:] = [name for name in dirs
+                           if not name.startswith(".") and name != "资料库"]
+            else:
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+            for name in files:
+                scanned += 1
+                if scanned > _MAX_WORK_ARTIFACT_SCAN:
+                    break
+                if name.startswith("."):
+                    continue
+                path = Path(current) / name
+                relative = os.path.relpath(path, root)
+                if relative == "WORK.md" or relative.startswith(f"资料库{os.sep}"):
+                    continue
+                try:
+                    info = path.lstat()
+                    resolved = os.path.realpath(path)
+                    if (not stat.S_ISREG(info.st_mode)
+                            or os.path.commonpath((root, resolved)) != root):
+                        continue
+                except (OSError, ValueError):
+                    continue
+                suffix = path.suffix.lower()
+                kind = next((candidate for candidate, suffixes
+                             in _WORK_ARTIFACT_KIND_SUFFIXES.items()
+                             if suffix in suffixes), "file")
+                artifacts.append({
+                    "path": relative.replace(os.sep, "/"),
+                    "size": info.st_size,
+                    "modified_at": info.st_mtime,
+                    "kind": kind,
+                    "previewable": suffix in _WORK_ARTIFACT_PREVIEW_SUFFIXES,
+                })
+            if scanned > _MAX_WORK_ARTIFACT_SCAN:
+                break
+        artifacts.sort(key=lambda item: (-float(item["modified_at"]), str(item["path"])))
+        return artifacts[:_MAX_WORK_ARTIFACTS]
 
     def delete_project(self, project_id: str) -> None:
         self.initialize()
@@ -465,12 +615,8 @@ class WorkRegistry:
         policy_dir = self.root / "policies"
         self._mkdir_private(policy_dir)
         path = policy_dir / f"{record.work_id}.json"
-        grants = self.grants(record.work_id)
-        read_roots = [record.cwd, *[grant["path"] for grant in grants]]
-        write_roots = [record.cwd, *[
-            grant["path"] for grant in grants if grant["mode"] == "write"
-        ]]
         payload = {
+            **_claude_runtime_settings(),
             "permissions": {"defaultMode": "acceptEdits"},
             "sandbox": {
                 "enabled": True,
@@ -479,9 +625,9 @@ class WorkRegistry:
                 "failIfUnavailable": True,
                 "filesystem": {
                     "denyRead": ["~/"],
-                    "allowRead": read_roots,
+                    "allowRead": [record.cwd],
                     "denyWrite": ["~/"],
-                    "allowWrite": write_roots,
+                    "allowWrite": [record.cwd],
                 },
             },
         }
@@ -500,41 +646,6 @@ class WorkRegistry:
             except FileNotFoundError:
                 pass
         return str(path)
-
-    def grants(self, work_id: str) -> list[dict[str, str]]:
-        self.initialize()
-        with self._connect() as db:
-            rows = db.execute(
-                "SELECT path, mode FROM work_grants WHERE work_id = ? ORDER BY path",
-                (work_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def set_grant(self, session_id: str, path: str, mode: str) -> WorkSessionRecord:
-        record = self.get_by_session(session_id)
-        if record is None:
-            raise LookupError(f"unknown Work session: {session_id}")
-        target = os.path.realpath(os.path.expanduser(path))
-        if not os.path.isdir(target) or target == os.path.sep:
-            raise ValueError("grant target must be an existing non-root directory")
-        if target == os.path.realpath(record.cwd):
-            raise ValueError("the Work workspace is already granted")
-        with self._connect() as db:
-            if mode == "none":
-                db.execute(
-                    "DELETE FROM work_grants WHERE work_id = ? AND path = ?",
-                    (record.work_id, target),
-                )
-            elif mode in {"read", "write"}:
-                db.execute(
-                    """INSERT INTO work_grants (work_id, path, mode, created_at)
-                       VALUES (?, ?, ?, ?)
-                       ON CONFLICT(work_id, path) DO UPDATE SET mode = excluded.mode""",
-                    (record.work_id, target, mode, time.time()),
-                )
-            else:
-                raise ValueError("unsupported Work grant mode")
-        return record
 
     def get_by_session(self, session_id: str) -> WorkSessionRecord | None:
         self.initialize()
@@ -567,6 +678,22 @@ class WorkRegistry:
             record.session_id: record
             for record in records
             if record is not None and record.session_id is not None
+        }
+
+    def unbound_records_by_cwd(self) -> dict[str, WorkSessionRecord]:
+        """Crash-recovery candidates created before a native session id landed."""
+        self.initialize()
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM work_sessions
+                   WHERE session_id IS NULL AND engine = ?""",
+                (self.engine,),
+            ).fetchall()
+        records = (self._record(row) for row in rows)
+        return {
+            os.path.realpath(record.cwd): record
+            for record in records
+            if record is not None
         }
 
     def contains_cwd(self, cwd: str | None) -> bool:

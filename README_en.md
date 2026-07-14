@@ -46,15 +46,15 @@ not proxy model APIs or bake API keys into the web client.
 | **Two engines** | Use Claude Code and Codex in the same web UI. Every session keeps its own model, reasoning effort, permissions, and runtime state. |
 | **Code / Work spaces** | Code remains repository-oriented. Work is an independent Cowork surface for documents, spreadsheets, presentations, research, and temporary collaboration, with a separate session list. |
 | **Work projects and knowledge** | Keep provider-scoped projects, file/link/note sources, and reusable instruction plugins. Starting a Work session materializes the selected context into its private directory. |
-| **Work schedules and grants** | Run one-shot, daily, or weekly tasks. Work can access only its private directory by default; grant a specific external directory read-only or read-write access per session, then revoke it. |
+| **Work schedules and isolation** | Run one-shot, daily, or weekly tasks. Each work item can access only its private directory; add required material explicitly through conversation attachments or the project knowledge collection. |
 | **Remote operation** | Watch streaming replies from a phone, tablet, or desktop browser; send attachments, queue the next message, and interrupt the current turn at any time. |
 | **Complete process** | Expand the reasoning summaries, plans, command output, file diffs, MCP calls, collaboration agents, Hooks, and terminal interaction events exposed by each engine. |
-| **File preview and Markdown editing** | Open local file links from a reply directly in a source viewer at the referenced line. Changed-file chips and `/preview path` also open Markdown with live rendered/source modes, bounded local images, and conflict-safe atomic saves via Ctrl/Cmd+S or the Save button. |
+| **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. |
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
 | **Session management** | Search, switch, rename, archive, and fork from individual messages. Codex sessions can also fork into an isolated Git worktree. |
 | **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Use `/goal` for long-running goals and Codex `/status` for app-server status, usage, and rate limits. |
 | **Continuity** | Let background sessions keep running and synchronize them across clients. Restore paged history from Claude transcripts or Codex rollouts and resume from a cursor after reconnecting. |
-| **Self-hosted** | The wrapper only makes outbound connections. The VPS needs no model SDK, web auth uses an HttpOnly cookie, and CLI credentials or API keys never enter the frontend. |
+| **Self-hosted** | The wrapper only makes outbound connections. Sessions, Work data, and preview conversion stay on that machine; the replaceable VPS remains a stateless relay. Web auth uses an HttpOnly cookie, and CLI credentials or API keys never enter the frontend. |
 
 > Available models, service tiers, and runtime controls depend on the local CLI and the capabilities exposed by its SDK or app-server.
 
@@ -70,8 +70,8 @@ CONTROL LINK (this repo):              browser ⇄ relay(WebSocket) ⇄ wrapper 
 
 | Component | Runs where | What it does |
 |---|---|---|
-| **wrapper** | the machine where `claude` / `codex` runs | Holds a session pool, translates SDK/app-server events to the wire protocol, handles interrupt/drain, and reads transcript/rollout history on demand. **Outbound-only to the relay — no inbound ports needed.** |
-| **relay** | public VPS (or local) | Pure WebSocket forwarder (FastAPI). The wrapper uses a Bearer token and browsers use an HttpOnly session cookie; single wrapper slot, multi-client fan-out. **Never imports `claude-agent-sdk`, never touches the model API.** |
+| **wrapper** | the machine where `claude` / `codex` runs | Holds a session pool, translates SDK/app-server events to the wire protocol, handles interrupt/drain, reads transcript/rollout history on demand, and temporarily converts Office previews locally. **Outbound-only to the relay — no inbound ports needed.** |
+| **relay** | public VPS (or local) | Pure WebSocket forwarder (FastAPI). The wrapper uses a Bearer token and browsers use an HttpOnly session cookie; single wrapper slot, multi-client fan-out. **Does not persist sessions or artifacts, never imports `claude-agent-sdk`, and never touches the model API.** |
 | **web** | the browser | React client; the relay serves its static files (`web/dist`) from the same origin. |
 
 ### Code and Work
@@ -84,14 +84,32 @@ Codex engines while isolating storage, session lists, and permissions:
 - **Work** targets documents, spreadsheets, presentations, research, knowledge
   collections, and temporary chats. Claude stores it under
   `~/.claude/cc-remote/work` and Codex under `~/.codex/cc-remote/work` by default.
-  Every work item has its own `workspace/`, uploads, and artifacts directories.
-  Deletion is limited to a directory that the registry proves belongs to Work.
-- Work does not expose the home directory by default. Use the session menu to
-  grant one absolute directory **read-only** or **read-write** access; revocation
-  regenerates the sandbox and reconnects the session once it is idle.
+  Every work item has its own `workspace/` and uploads. Artifacts are ordinary
+  files produced inside that workspace. Deletion is limited to a directory that
+  the registry proves belongs to Work. Work replaces both CLIs' coding-oriented
+  base prompts: casual chat does not inspect files or mention code projects, while
+  explicit software requests can still use the same engines and tools.
+- Work does not expose the home directory or arbitrary external directories.
+  Add existing material explicitly through attachments or the project knowledge
+  collection so a conversation cannot discover unrelated projects or history.
 - A Work “plugin” is currently an instruction/workflow template written into the
   project's `WORK.md`; it does not execute unreviewed third-party code. Scheduled
   tasks are persisted and claimed by the wrapper under the same Work isolation.
+
+### Where artifact preview runs
+
+- HTML is sanitized with DOMPurify in the browser and rendered in a scriptless,
+  network-blocked sandbox iframe.
+- PNG/JPEG/GIF/WebP/AVIF and PDF are path-, type-, and size-checked by the wrapper,
+  then returned only to the requesting browser through the authenticated WebSocket.
+- DOC/DOCX/ODT/RTF, XLS/XLSX/ODS, and PPT/PPTX/ODP are converted to PDF by
+  LibreOffice on the **wrapper host**. On Linux, bubblewrap removes network and
+  user-directory access and mounts only that request's temporary directory. The
+  directory is deleted immediately after conversion.
+- The VPS relay forwards bounded preview frames and stores neither originals nor
+  converted files. Replacing the VPS requires no session migration. Moving to a
+  new wrapper device means migrating the local transcripts/rollouts, Work roots,
+  and cc-remote state.
 
 ## Real interface and practical features
 
@@ -172,6 +190,9 @@ First get the relay + wrapper + web running on the **machine where the agent CLI
 
 - A machine with **Claude Code CLI** (`claude`, v2.1.51+) or a **Codex CLI** (`codex`) that supports `app-server`, already installed and **able to chat**. Install both to switch engines in the web UI.
 - **Python 3.10+**, **Node 20.19+** (to build the web client).
+- Optional: Office artifact preview requires **LibreOffice + bubblewrap** on the
+  Linux wrapper host (for example, `sudo apt install libreoffice bubblewrap`).
+  The VPS does not need either package.
 
 ### 1) Install deps + build the web client
 
@@ -314,6 +335,13 @@ curl https://your-domain.com/healthz
 
 ### 5) Your machine: root-only wrapper environment + systemd
 
+For Office artifact preview, install the converter sandbox on this wrapper host,
+not on the VPS:
+
+```bash
+sudo apt-get update && sudo apt-get install -y libreoffice bubblewrap
+```
+
 ```bash
 cd /path/to/cc-remote
 python3 -m venv .venv
@@ -406,7 +434,7 @@ Each message accepts at most 8 attachments, at most 6 MiB each and 8 MiB decoded
 
 > **cc-remote lets a remote person run arbitrary commands on your machine. Treat it like handing someone a shell.**
 
-- Code sessions remain a remote development control plane: Claude defaults to `permissionMode: bypassPermissions`, and Codex defaults to approval policy `never` while inheriting the machine's Codex sandbox configuration; both can expose approval controls in the web client. **Treat anyone who can log in and enter Code as holding remote agent/shell authority on the wrapper machine.** Work has a private root and explicit directory grants, but this narrows the default capability surface; it is not a substitute for OS-user, container, or VM isolation.
+- Code sessions remain a remote development control plane: Claude defaults to `permissionMode: bypassPermissions`, and Codex defaults to approval policy `never` while inheriting the machine's Codex sandbox configuration; both can expose approval controls in the web client. **Treat anyone who can log in and enter Code as holding remote agent/shell authority on the wrapper machine.** Work uses a separate private root and does not expose external directories, but this only narrows the default capability surface; it is not a substitute for OS-user, container, or VM isolation.
 - `LOGIN_PASSWORD` / `WRAPPER_TOKEN` / `SESSION_SECRET` are the only gate: use strong random values, never commit or paste them into chats, and rotate them. A repository `.env` is for local development only; production wrappers must use the root-only `/etc/cc-remote/wrapper.env` above. The systemd template prevents the service and model descendants from reading that source file or a legacy repository `.env`; on Linux the wrapper also disables dumpability so children cannot recover the captured token through `/proc/<pid>/environ` or process memory.
 - Always use TLS (`wss://`) in production (this repo uses Caddy for automatic certs). Do not expose plain `ws://` publicly.
 - Recommended: restrict the relay by IP / only run it when needed; login is rate-limited (5/min per IP) out of the box.
@@ -447,6 +475,7 @@ Architecture notes & contribution contracts are in [CLAUDE.md](CLAUDE.md).
 
 - **Does restarting the wrapper lose history?** Persisted history does not disappear; it comes from Claude transcripts / Codex rollouts. A restart does lose unacknowledged in-memory commands and the live ring; see the reliability boundary above.
 - **Does restarting the relay drop the session?** It briefly disconnects and requires login again because the process-local revocation registry resets. The conversation remains intact on the wrapper machine.
+- **Can I replace the VPS or move to a new device?** Yes. The VPS only serves the relay and static web bundle; it is not the session authority. Deploy the same version on the new VPS and point the wrapper at its new `RELAY_URL`. To move the wrapper, copy the Claude transcripts, Codex rollouts, `CLAUDE_WORK_ROOT` / `CODEX_WORK_ROOT`, and `~/.cc-remote`, re-authenticate each CLI on the new machine, then start the wrapper.
 - **Do I need inbound ports?** No. The wrapper only dials out to the relay.
 - **How expensive is it?** cc-remote itself has zero model cost; browsing / refreshing / viewing history spends no tokens. Actual model cost depends on the backend used by the local agent CLI.
 

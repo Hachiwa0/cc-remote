@@ -2,9 +2,10 @@ interface Props {
   banner?: string;
   replaying: boolean;
   truncated: boolean;
+  busy: boolean;
 }
 
-export function ReconnectBanner({ banner, replaying, truncated }: Props) {
+export function ReconnectBanner({ banner, replaying, truncated, busy }: Props) {
   const parts: string[] = [];
   if (replaying) parts.push("正在补发历史…");
   if (banner) parts.push(banner);
@@ -13,7 +14,7 @@ export function ReconnectBanner({ banner, replaying, truncated }: Props) {
   if (!text) return null;
   return (
     <div className="banner show" role="status" aria-live="polite">
-      <span className="sp" aria-hidden="true" />
+      {busy && <span className="sp" aria-hidden="true" />}
       <span>{text}</span>
     </div>
   );

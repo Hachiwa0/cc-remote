@@ -131,11 +131,14 @@ export interface PreviewAssetState {
 
 export interface Artifact {
   file: string;
-  kind: "diff" | "md" | "file" | "gitdiff";
+  kind: "diff" | "md" | "file" | "gitdiff" | "html" | "image" | "pdf";
   sid?: string | null;
   requestId?: string;
   diff?: DiffLine[];
   content?: string;
+  data?: string;
+  mediaType?: string;
+  convertedFrom?: string;
   sections?: GitDiffSection[];
   loading?: boolean;
   size?: number;
@@ -885,8 +888,10 @@ function reduceEvent(
     case "session_list":
       return { ...state, sessions: e.sessions };
     case "work_dashboard":
+    case "work_artifacts":
       // Work dashboard state is owned by App because it is engine-scoped and
-      // intentionally independent from the focused conversation runtime.
+      // artifact inventories are owned by App because both are intentionally
+      // independent from the focused conversation runtime.
       return state;
     case "history": {
       // Bulk on-demand history (one frame, read from the transcript — like a web
@@ -1024,15 +1029,18 @@ function reduceEvent(
         file: e.file, sid: state.artifact.sid, kind: "gitdiff", sections: parseGitDiff(e.diff),
       } };
     case "file_preview":
-      if (!state.artifact || !["md", "file"].includes(state.artifact.kind)
+      if (!state.artifact || !["md", "file", "html", "image", "pdf"].includes(state.artifact.kind)
           || state.artifact.requestId !== e.request_id
           || state.artifact.sid !== (e.sid ?? state.focusedSid)) return state;
       return { ...state, artifact: {
         file: e.path,
         sid: state.artifact.sid,
         requestId: e.request_id,
-        kind: e.format === "markdown" ? "md" : "file",
+        kind: e.format === "markdown" ? "md" : e.format === "text" ? "file" : e.format,
         content: e.content,
+        data: e.data ?? undefined,
+        mediaType: e.media_type ?? undefined,
+        convertedFrom: e.converted_from ?? undefined,
         size: e.size,
         truncated: e.truncated,
         mtimeNs: e.mtime_ns,

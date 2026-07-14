@@ -10,6 +10,7 @@ export function LoginForm({
   onToggleTheme: () => void;
 }) {
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -50,9 +51,15 @@ export function LoginForm({
           <Icon name="lock" size={18} />
           <input
             ref={imeSubmit.inputRef}
-            type="password"
+            type={passwordVisible ? "text" : "password"}
+            name="password"
             placeholder="访问密码"
             value={password}
+            autoComplete="current-password"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint="go"
             onChange={(e) => setPassword(e.target.value)}
             onCompositionStart={imeSubmit.startComposition}
             onCompositionEnd={(e) => {
@@ -72,6 +79,15 @@ export function LoginForm({
             disabled={loading}
             autoFocus
           />
+          <button type="button" className="login-reveal"
+            aria-label={passwordVisible ? "隐藏密码" : "显示密码"}
+            aria-pressed={passwordVisible}
+            title={passwordVisible ? "隐藏密码，恢复密码输入模式" : "显示密码"}
+            onPointerDown={(event) => event.preventDefault()}
+            onClick={() => setPasswordVisible((visible) => !visible)}
+            disabled={loading}>
+            <Icon name={passwordVisible ? "eye-off" : "eye"} size={19} />
+          </button>
         </div>
         {error && <div className="login-err">{error}</div>}
         <button className="login-btn"

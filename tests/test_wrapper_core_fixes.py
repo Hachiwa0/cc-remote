@@ -55,6 +55,17 @@ class _StalledSdk:
         self.reconnects += 1
 
 
+def test_codex_session_id_accepts_app_server_thread_id_notifications():
+    assert codex_stream_module.codex_session_id({
+        "method": "turn/started",
+        "params": {"threadId": "thread-current", "turnId": "turn-1"},
+    }) == "thread-current"
+    assert codex_stream_module.codex_session_id({
+        "method": "thread/started",
+        "params": {"thread": {"id": "thread-object"}},
+    }) == "thread-object"
+
+
 def test_interrupt_during_preflight_reconnect_never_submits_query():
     class PreflightSdk:
         effort = "max"
@@ -210,6 +221,47 @@ def test_untracked_diff_filename_cannot_inject_git_output_option(tmp_path):
 
     asyncio.run(run())
     assert not target.exists()
+
+
+def test_all_files_diff_includes_untracked_regular_files(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("before\n")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run([
+        "git", "-C", str(repo), "-c", "user.name=Test",
+        "-c", "user.email=test@example.com", "commit", "-qm", "initial",
+    ], check=True)
+    tracked.write_text("after\n")
+    (repo / "chat.html").write_text("<h1>交付物</h1>\n")
+
+    async def run():
+        machine, _ = _mk_machine()
+        diff = await machine._git_diff(str(repo), "")
+        assert "diff --git a/tracked.txt b/tracked.txt" in diff
+        assert "+after" in diff
+        assert "diff --git a/chat.html b/chat.html" in diff
+        assert "new file mode" in diff
+        assert "+<h1>交付物</h1>" in diff
+
+    asyncio.run(run())
+
+
+def test_explicit_file_diff_works_outside_git_repository(tmp_path):
+    workspace = tmp_path / "work" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "chat.html").write_text("<h1>Work artifact</h1>\n")
+
+    async def run():
+        machine, _ = _mk_machine()
+        diff = await machine._git_diff(str(workspace), "chat.html")
+        assert "diff --git a/chat.html b/chat.html" in diff
+        assert "new file mode" in diff
+        assert "+<h1>Work artifact</h1>" in diff
+
+    asyncio.run(run())
 
 
 def test_diff_rejects_paths_outside_repository(tmp_path):

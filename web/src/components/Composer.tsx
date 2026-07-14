@@ -10,6 +10,7 @@ import { canEnqueueQuery } from "../runtime-drain";
 import { ImeSubmitGuard } from "../ime-submit";
 
 interface Props {
+  surface?: "code" | "work";
   state: State;
   connState: ConnState;
   wrapperOnline: boolean;
@@ -50,6 +51,7 @@ interface Props {
   onPreview?: (path: string) => void;
   onGoal?: (args: string) => void;
   onStatus?: () => void;
+  onManageWork?: () => void;
   contextReport: ContextReport | null;
 }
 
@@ -62,6 +64,7 @@ export function Composer(p: Props) {
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
   const [ctxOpen, setCtxOpen] = useState(false);
   const ctxWrapRef = useRef<HTMLDivElement>(null);
+  const workSettingsRef = useRef<HTMLDetailsElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<number | null>(null);
   const [images, setImages] = useState<QueryImg[]>([]);
@@ -85,6 +88,30 @@ export function Composer(p: Props) {
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
   }, [ctxOpen]);
+
+  // <details> has no controlled open state here, so keep one document-level
+  // listener active for mouse and touch and close it when focus moves outside.
+  useEffect(() => {
+    const closeWorkSettings = () => {
+      if (!workSettingsRef.current?.open) return;
+      workSettingsRef.current.open = false;
+      setCtxOpen(false);
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      const details = workSettingsRef.current;
+      if (details?.open && event.target instanceof Node
+          && !details.contains(event.target)) closeWorkSettings();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeWorkSettings();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
 
   useEffect(() => () => {
     if (buttonSendTimerRef.current !== null) {
@@ -344,10 +371,55 @@ export function Composer(p: Props) {
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm?.id === "plan" ? " plan" : perm?.danger ? " danger" : "";
   const hintBusy = p.state !== "idle";
+  const workSurface = p.surface === "work";
+
+  const inputControl = (placeholder: string) => (
+    <textarea
+      ref={taRef}
+      rows={1}
+      value={input}
+      placeholder={importing ? "正在安全导入附件…"
+        : offline ? "机器离线 — 等待重连…"
+        : p.external ? "终端占用中 — 只读镜像,无法在此发送"
+        : placeholder}
+      disabled={locked}
+      onChange={(e) => onInput(e.target.value)}
+      onCompositionStart={() => imeSubmitRef.current.startComposition()}
+      onCompositionEnd={(e) => {
+        imeSubmitRef.current.endComposition();
+        onInput(e.currentTarget.value);
+      }}
+      onPaste={onPaste}
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && cmdOpen) { setInput(""); resetTaHeight(); return; }
+        if (!imeSubmitRef.current.shouldSubmitKey({
+          key: e.key,
+          shiftKey: e.shiftKey,
+          isComposing: e.nativeEvent.isComposing,
+          keyCode: e.nativeEvent.keyCode,
+        })) return;
+        e.preventDefault();
+        if (cmdOpen && cmdToken) { pickCommand(cmdMatches[0].slash); return; }
+        if (cmdToken === "") return;
+        send(e.currentTarget.value);
+      }}
+    />
+  );
+
+  const sendControl = (
+    <button className={sendClass}
+      onPointerDown={() => {
+        if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
+      }}
+      onClick={requestButtonSend}
+      disabled={disabled} aria-label={stopping ? "停止" : "发送"}>
+      <Icon name={sendIcon} size={19} />
+    </button>
+  );
 
   return (
-    <div className="composer">
-      <div className="composer-in">
+    <div className={workSurface ? "composer work-composer" : "composer"}>
+      <div className={workSurface ? "composer-in work-composer-in" : "composer-in"}>
         {cmdOpen && (
           <div className="cmd-pop" role="listbox" aria-label="命令"
             data-lock-horizontal-swipe="true">
@@ -420,50 +492,72 @@ export function Composer(p: Props) {
           </div>
         )}
 
-        <div className="inrow">
-          <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="附件" disabled={locked || importing}><Icon name="plus" size={19} /></button>
-          <input ref={fileRef} type="file" multiple hidden onChange={(e) => { void onPickFiles(e.target.files); e.target.value = ""; }} />
-          <textarea
-            ref={taRef}
-            rows={1}
-            value={input}
-            placeholder={importing ? "正在安全导入附件…"
-              : offline ? "机器离线 — 等待重连…"
-              : p.external ? "终端占用中 — 只读镜像,无法在此发送"
-              : "发消息…  输入 / 唤起命令"}
-            disabled={locked}
-            onChange={(e) => onInput(e.target.value)}
-            onCompositionStart={() => imeSubmitRef.current.startComposition()}
-            onCompositionEnd={(e) => {
-              imeSubmitRef.current.endComposition();
-              onInput(e.currentTarget.value);
-            }}
-            onPaste={onPaste}
-            onKeyDown={(e) => {
-              if (e.key === "Escape" && cmdOpen) { setInput(""); resetTaHeight(); return; }
-              if (!imeSubmitRef.current.shouldSubmitKey({
-                key: e.key,
-                shiftKey: e.shiftKey,
-                isComposing: e.nativeEvent.isComposing,
-                keyCode: e.nativeEvent.keyCode,
-              })) return;
-              e.preventDefault();
-              // typing a command name (no args) => Enter completes/executes the top match
-              if (cmdOpen && cmdToken) { pickCommand(cmdMatches[0].slash); return; }
-              if (cmdToken === "") return; // just "/" — do nothing
-              send(e.currentTarget.value);
-            }}
-          />
-          <button className={sendClass}
-            onPointerDown={() => {
-              if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
-            }}
-            onClick={requestButtonSend}
-            disabled={disabled} aria-label="发送">
-            <Icon name={sendIcon} size={19} />
-          </button>
-        </div>
-        <div className="hint">
+        <input ref={fileRef} type="file" multiple hidden
+          onChange={(e) => { void onPickFiles(e.target.files); e.target.value = ""; }} />
+
+        {workSurface ? (
+          <div className="work-compose-card">
+            <div className="work-compose-caption">
+              <span className="work-compose-icon"><Icon name="work" size={17} /></span>
+              <span><b>继续这项工作</b><small>围绕当前资料生成、整理或修改交付物</small></span>
+              <span className="work-private"><Icon name="lock" size={12} />私有工作区</span>
+            </div>
+            <div className="work-inrow">
+              {inputControl("描述接下来要完成的工作…")}
+              {sendControl}
+            </div>
+            <div className="work-compose-foot">
+              <button type="button" className="work-compose-tool"
+                onClick={() => fileRef.current?.click()} disabled={locked || importing}
+                aria-label="添加资料" title="添加资料">
+                <Icon name="plus" size={15} /><span>添加资料</span>
+              </button>
+              <button type="button" className="work-compose-tool" onClick={p.onManageWork}
+                aria-label="项目与资料" title="项目与资料">
+                <Icon name="folder" size={15} /><span>项目与资料</span>
+              </button>
+              <details className="work-settings" ref={workSettingsRef}>
+                <summary><Icon name="plan" size={15} /><span>工作设置</span></summary>
+                <div className="work-settings-pop" ref={ctxWrapRef}>
+                  <button type="button" onClick={() => setSheetKind("models")}>
+                    <span>模型</span><b>{model?.name ?? "读取中"}</b>
+                  </button>
+                  <button type="button" onClick={() => setSheetKind("efforts")}>
+                    <span>思考强度</span><b>{effort?.name ?? "读取中"}</b>
+                  </button>
+                  <button type="button" onClick={() => setSheetKind("perms")}>
+                    <span>访问权限</span><b>{perm?.short ?? "读取中"}</b>
+                  </button>
+                  <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
+                    <span>上下文</span><b>{p.contextReport ? `${p.contextReport.percentage.toFixed(0)}%` : "查看"}</b>
+                  </button>
+                  {ctxOpen && (
+                    <div className="ctx-pop work-ctx-pop" role="dialog" aria-label="上下文占用">
+                      {p.contextReport ? (
+                        <>
+                          <div className="ctx-pop-row"><span>上下文窗口</span>
+                            <span className="ctx-pop-nums">{p.contextReport.total_tokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()}</span>
+                          </div>
+                          <div className="ctx-pop-bar"><i style={{ width: `${Math.min(p.contextReport.percentage, 100)}%` }} /></div>
+                          <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
+                        </>
+                      ) : <div className="ctx-pop-loading">读取上下文占用…</div>}
+                    </div>
+                  )}
+                </div>
+              </details>
+              <span className={`work-run-state ${p.state}`}><i />{
+                p.state === "idle" ? "可以继续" : p.state === "running" ? "正在工作" : stateZh[p.state]
+              }</span>
+            </div>
+          </div>
+        ) : (<>
+          <div className="inrow">
+            <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="附件" disabled={locked || importing}><Icon name="plus" size={19} /></button>
+            {inputControl("发消息…  输入 / 唤起命令")}
+            {sendControl}
+          </div>
+          <div className="hint">
           <button
             type="button"
             className={"hint-mode" + modeCls + (hintBusy ? " busy" : "")}
@@ -539,7 +633,8 @@ export function Composer(p: Props) {
               </div>
             )}
           </div>
-        </div>
+          </div>
+        </>)}
       </div>
 
       <CommandSheet

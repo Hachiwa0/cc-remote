@@ -1,9 +1,10 @@
 """ClaudeSDKClient lifecycle: connect / query / interrupt / receive / resume.
 
 Isolates the one version-sensitive call site (`include_partial_messages` on
-ClaudeAgentOptions) so an SDK upgrade touches only this file. The wrapper does
-NOT set ANTHROPIC_BASE_URL or setting_sources — it wants ~/.claude/settings.json
-loaded so cc inherits the user's model link and model id. Permission mode is
+ClaudeAgentOptions) so an SDK upgrade touches only this file. Code sessions use
+Claude's ordinary setting sources. Work sessions use one wrapper-owned settings
+file containing only provider connectivity and the fail-closed sandbox; they
+must never inherit user/project memory, hooks or skills. Permission mode is
 explicit live session state and survives reconnects.
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ from mcp.server import Server
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.wrapper.child_env import child_env_tombstones
+from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
 from cc_remote.wrapper.claude_goal import (
     NO_GOAL_EVENT,
     active_goal_from_message,
@@ -144,16 +146,7 @@ class SdkHandle:
     def _options(self, resume_id: str | None, cwd: str | None = None,
                  fork: bool = False,
                  model_override: str | None = None) -> ClaudeAgentOptions:
-        prompt_append = (
-            "You are running inside cc-remote Work, a deliverable-oriented "
-            "workspace rather than a source-code project. Create documents, "
-            "analysis, tables, presentations, and other requested artifacts in "
-            "the current workspace. If WORK.md exists, read it before the first "
-            "task; it contains the selected project's sources and enabled work "
-            "plugins. Never attempt to read or modify paths outside "
-            "the explicitly granted workspace. If more local context is required, "
-            "ask the user to grant a folder instead of trying to bypass the sandbox.\n"
-            if self.work_mode else
+        code_prompt_append = (
             "You have two MCP tools on the cc-remote-ask server:\n"
             "- `ask_user(question, options)`: ask the user a multiple-choice clarifying "
             "question (instead of plain text). Blocks until they answer.\n"
@@ -185,20 +178,26 @@ class SdkHandle:
             # Claude/tool subprocesses. Never expose relay login/bearer secrets.
             env=child_env_tombstones(),
             stderr=self._on_stderr,               # surface cc subprocess errors
-            # Work keeps the user's model-link settings but adds a wrapper-owned
-            # fail-closed sandbox file that the writable workspace cannot edit.
+            # Work uses only a wrapper-owned policy that the writable workspace
+            # cannot edit. [] is the SDK's filesystem-settings isolation mode:
+            # no user/project/local settings, CLAUDE.md, hooks or skills leak in.
             settings=self.work_settings_path if self.work_mode else None,
-            setting_sources=["user"] if self.work_mode else None,
+            setting_sources=[] if self.work_mode else None,
+            skills=[] if self.work_mode else None,
             sandbox=({
                 "enabled": True,
                 "autoAllowBashIfSandboxed": True,
                 "allowUnsandboxedCommands": False,
             } if self.work_mode else None),
-            system_prompt={
-                "type": "preset",
-                "preset": "claude_code",
-                "append": prompt_append,
-            },
+            # Work deliberately replaces Claude Code's coding-focused preset.
+            # Code retains the official preset plus cc-remote's control tools.
+            system_prompt=(
+                WORK_SYSTEM_PROMPT if self.work_mode else {
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": code_prompt_append,
+                }
+            ),
             mcp_servers=(
                 {"cc-remote-ask": {"type": "sdk", "name": "cc-remote-ask", "instance": self.ask_server}}
                 if self.ask_server is not None else {}

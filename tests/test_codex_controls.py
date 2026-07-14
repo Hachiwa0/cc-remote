@@ -18,6 +18,10 @@ from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_handle import CodexHandle
 from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.work_prompt import (
+    WORK_BASE_INSTRUCTIONS,
+    WORK_DEVELOPER_INSTRUCTIONS,
+)
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -487,8 +491,73 @@ def test_codex_granular_approval_survives_resume_and_turn_start():
     asyncio.run(run())
 
 
-def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
+def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
         monkeypatch):
+    async def run():
+        spawned = []
+
+        async def capture(*args, **_kwargs):
+            spawned.extend(args)
+            raise RuntimeError("captured work profile")
+
+        monkeypatch.setenv("CODEX_HOME", "/home/test/.codex-custom")
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec", capture)
+        cwd = "/home/test/.codex-custom/cc-remote/work/chats/work-1/workspace"
+        with pytest.raises(RuntimeError, match="captured work profile"):
+            await CodexHandle(_Cfg(), cwd=cwd, work_mode=True).connect()
+
+        assert spawned[:3] == ["/usr/bin/codex", "app-server", "--stdio"]
+        overrides = [
+            spawned[index + 1]
+            for index, value in enumerate(spawned[:-1])
+            if value == "-c"
+        ]
+        assert 'default_permissions="cc_remote_work"' in overrides
+        filesystem = next(
+            value for value in overrides
+            if value.startswith("permissions.cc_remote_work.filesystem="))
+        assert '":minimal" = "read"' in filesystem
+        assert '"~"' not in filesystem
+        assert '"/home/test/.codex-custom/tmp" = "read"' in filesystem
+        assert '"/usr/bin/codex" = "read"' in filesystem
+        assert f'"{cwd}" = "write"' in filesystem
+        assert "permissions.cc_remote_work.network.enabled=false" in overrides
+
+    asyncio.run(run())
+
+
+def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
+    async def run():
+        cwd = "/home/test/.codex/cc-remote/work/chats/work-1/workspace"
+        handle = CodexHandle(_Cfg(), cwd=cwd, work_mode=True)
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "work-thread"
+        handle.model = "gpt-work"
+        handle.effort = None
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            return {"turn": {"id": "work-turn"}}
+
+        handle._request = request
+        await handle.query("create a file")
+
+        method, params = requests[-1]
+        assert method == "turn/start"
+        assert params["cwd"] == cwd
+        assert params["approvalPolicy"] == "never"
+        assert "sandboxPolicy" not in params
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("work_mode", [False, True])
+def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
+        monkeypatch, work_mode):
     class FakeProcess:
         pid = 424243
         returncode = None
@@ -513,7 +582,7 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
 
-        handle = CodexHandle(_Cfg())
+        handle = CodexHandle(_Cfg(), work_mode=work_mode)
         calls = []
 
         async def idle(*_args):
@@ -539,19 +608,27 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
         await handle.connect(resume_id="resume-thread", cwd="/tmp")
 
-        assert calls[1] == ("thread/resume", {
+        expected_resume = {
             "threadId": "resume-thread", "cwd": "/tmp",
-        })
+        }
+        if work_mode:
+            expected_resume.update({
+                "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+            })
+        assert calls[1] == ("thread/resume", expected_resume)
         assert (handle.model, handle.effort, handle.approval,
                 handle.service_tier) == (
-            "persisted-model", "ultra", "on-request", "fast")
+            "persisted-model", "ultra",
+            "never" if work_mode else "on-request", "fast")
         await handle.disconnect()
 
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("work_mode", [False, True])
 def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
-        monkeypatch):
+        monkeypatch, work_mode):
     class FakeProcess:
         pid = 424244
         returncode = None
@@ -576,7 +653,7 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
 
-        handle = CodexHandle(_Cfg())
+        handle = CodexHandle(_Cfg(), work_mode=work_mode)
         handle.model = "first-model"
         handle.effort = "ultra"
         handle.applied_effort = "ultra"
@@ -626,19 +703,26 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
         await handle.connect(cwd="/tmp")
 
-        assert calls[1] == ("thread/start", {
+        expected_start = {
             "cwd": "/tmp",
-            "approvalPolicy": "on-request",
+            "approvalPolicy": "never" if work_mode else "on-request",
             "serviceTier": "fast",
             "model": "first-model",
-        })
+        }
+        if work_mode:
+            expected_start.update({
+                "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+            })
+        assert calls[1] == ("thread/start", expected_start)
         assert calls[2] == ("thread/settings/update", {
             "threadId": "fresh-thread",
             "collaborationMode": {
                 "mode": "plan",
                 "settings": {
                     "model": "first-model",
-                    "developer_instructions": None,
+                    "developer_instructions": (
+                        WORK_DEVELOPER_INSTRUCTIONS if work_mode else None),
                     "reasoning_effort": "ultra",
                 },
             },
@@ -646,7 +730,73 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         })
         assert (handle.model, handle.effort, handle.approval,
                 handle.collaboration_mode, handle.service_tier) == (
-            "first-model", "ultra", "on-request", "plan", "priority")
+            "first-model", "ultra",
+            "never" if work_mode else "on-request", "plan", "priority")
+        await handle.disconnect()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("work_mode", [False, True])
+def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
+        monkeypatch, work_mode):
+    class FakeProcess:
+        pid = 424245
+        returncode = None
+        stdin = stdout = stderr = SimpleNamespace()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = 0
+
+    async def run():
+        process = FakeProcess()
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec",
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
+        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+
+        handle = CodexHandle(_Cfg(), work_mode=work_mode)
+        calls = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            if method == "initialize":
+                return {"serverInfo": {"version": "0.144.1"}}
+            if method == "thread/fork":
+                return {"thread": {"id": "forked-thread"}}
+            raise AssertionError(method)
+
+        handle._read_loop = idle
+        handle._drain_stderr = idle
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+        await handle.connect(
+            resume_id="parent-thread", cwd="/tmp", fork=True)
+
+        expected_fork = {
+            "threadId": "parent-thread",
+            "ephemeral": True,
+            "cwd": "/tmp",
+            "approvalPolicy": "never",
+        }
+        if work_mode:
+            expected_fork.update({
+                "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+            })
+        assert calls[1] == ("thread/fork", expected_fork)
         await handle.disconnect()
 
     asyncio.run(run())
@@ -1463,6 +1613,28 @@ def test_permission_modes_are_engine_strict_and_broadcast_after_apply():
     asyncio.run(run())
 
 
+def test_codex_work_permission_cannot_escalate_outside_its_profile():
+    async def run():
+        machine, transport = _mk_machine()
+        work = _control_ctx("codex-work", "codex")
+        work.space = "work"
+        machine.sessions = {"codex-work": work}
+
+        await machine._handle_set_perm(SimpleNamespace(
+            sid="codex-work", mode="on-request"))
+        assert work.sdk.permission_calls == []
+        assert transport.sent[-1].type == "error"
+        assert transport.sent[-1].code == "auth"
+
+        await machine._handle_set_perm(SimpleNamespace(
+            sid="codex-work", mode="never"))
+        assert work.sdk.permission_calls == ["never"]
+        assert transport.sent[-1].type == "perm"
+        assert transport.sent[-1].mode == "never"
+
+    asyncio.run(run())
+
+
 def test_collaboration_modes_are_codex_only_and_broadcast_after_apply():
     async def run():
         machine, transport = _mk_machine()
@@ -1811,6 +1983,7 @@ def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
     class FakeCodexHandle:
         def __init__(self, _cfg, cwd=None):
             self.cwd = cwd
+            self.thread_id = None
             self.model = "gpt-test"
             self.effort = "high"
             self.applied_effort = "high"
@@ -1819,7 +1992,7 @@ def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
             self.disconnected = False
 
         async def connect(self, **_kwargs):
-            return None
+            self.thread_id = "fresh-codex-thread"
 
         async def activate_runtime_events(self):
             return None

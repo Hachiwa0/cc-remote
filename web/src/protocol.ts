@@ -224,7 +224,9 @@ export interface CreateWorkPlugin extends Base { type: "create_work_plugin"; eng
 export interface DeleteWorkPlugin extends Base { type: "delete_work_plugin"; engine?: Engine; plugin_id: string }
 export interface CreateWorkSchedule extends Base { type: "create_work_schedule"; engine?: Engine; project_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null }
 export interface DeleteWorkSchedule extends Base { type: "delete_work_schedule"; engine?: Engine; schedule_id: string }
-export interface SetWorkGrant extends Base { type: "set_work_grant"; engine?: Engine; session_id: string; path: string; mode: "none" | "read" | "write" }
+export interface GetWorkArtifacts extends Base { type: "get_work_artifacts"; engine?: Engine; session_id: string }
+export interface WorkArtifactInfo { path: string; size: number; modified_at: number; kind: "document" | "spreadsheet" | "presentation" | "image" | "pdf" | "file"; previewable: boolean }
+export interface WorkArtifacts extends Base { type: "work_artifacts"; engine: Engine; session_id: string; artifacts: WorkArtifactInfo[] }
 export interface WorkProjectInfo { project_id: string; name: string; description: string; created_at: number; updated_at: number }
 export interface WorkSourceInfo { source_id: string; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; created_at: number }
 export interface WorkPluginInfo { plugin_id: string; project_id?: string | null; name: string; instructions: string; enabled: boolean; created_at: number; updated_at: number }
@@ -239,7 +241,7 @@ export interface GetContext extends Base { type: "get_context" }
 export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: DiffTheme }
 export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string }
 export interface GetFilePreview extends Base { type: "get_file_preview"; path: string; request_id: string }
-export interface FilePreview extends Base { type: "file_preview"; path: string; request_id: string; format: "markdown" | "text"; content: string; size: number; truncated: boolean; mtime_ns: string; revision?: string | null; error?: string | null }
+export interface FilePreview extends Base { type: "file_preview"; path: string; request_id: string; format: "markdown" | "text" | "html" | "image" | "pdf"; content: string; media_type?: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "application/pdf" | null; data?: string | null; converted_from?: string | null; size: number; truncated: boolean; mtime_ns: string; revision?: string | null; error?: string | null }
 export interface SaveMarkdown extends Base { type: "save_markdown"; path: string; request_id: string; content: string; expected_size: number; expected_mtime_ns: string; expected_revision: string }
 export interface FileSaveResult extends Base { type: "file_save_result"; path: string; request_id: string; status: "saved" | "conflict" | "error"; size: number; mtime_ns: string; revision?: string | null; error?: string | null }
 export interface GetPreviewAsset extends Base { type: "get_preview_asset"; path: string; preview_id: string; request_id: string }
@@ -367,7 +369,7 @@ export interface ContextReport extends Base {
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | Models | TakeoverState
   | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate
-  | SessionList | SessionFocus | SessionRekey | SessionForked | WorkDashboard
+  | SessionList | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | TurnPlan | TurnDiff

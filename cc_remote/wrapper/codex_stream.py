@@ -1271,8 +1271,11 @@ def _hook_event(params: dict, *, completed: bool):
 # ---- helpers the machine loop needs (codex analogs of stream.extract_*) ----
 
 def codex_session_id(msg: dict) -> str | None:
-    """Thread id from any notification that carries the thread object."""
+    """Thread id from either current app-server notification shape."""
     p = msg.get("params") or {}
+    thread_id = p.get("threadId")
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
     th = p.get("thread")
     if isinstance(th, dict):
         return th.get("id") or th.get("sessionId")

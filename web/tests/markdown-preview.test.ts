@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
@@ -48,6 +50,8 @@ try {
   const { initialState, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
   const { ArtifactPanel } = await harness.ssrLoadModule(
     "/src/components/ArtifactPanel.tsx");
+  const { buildSandboxDocument } = await harness.ssrLoadModule(
+    "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
   let state = reduce(initialState, {
@@ -260,6 +264,58 @@ try {
   assert.match(sourceMarkup, /source-line focused/);
   assert.match(sourceMarkup, />731<\/span><code>line 731<\/code>/);
   assert.match(sourceMarkup, /501–740 \/ 740 行/);
+
+  state = reduce(state, {
+    type: "open_file_loading",
+    file: "report.pdf",
+    sid: "session-1",
+    requestId: "binary-1",
+    kind: "file",
+  });
+  state = reduce(state, { type: "event", event: {
+    v: 11,
+    type: "file_preview",
+    ts: 6,
+    sid: "session-1",
+    path: "report.pptx",
+    request_id: "binary-1",
+    format: "pdf",
+    content: "",
+    media_type: "application/pdf",
+    data: "JVBERi0xLjcK",
+    converted_from: "pptx",
+    size: 8192,
+    truncated: false,
+    mtime_ns: "4",
+  } as ServerEvent });
+  assert.equal(state.artifact?.kind, "pdf");
+  assert.equal(state.artifact?.mediaType, "application/pdf");
+  assert.equal(state.artifact?.convertedFrom, "pptx");
+
+  const pdfMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: state.artifact!,
+    active: "diff",
+    hasBtw: false,
+    onTab: () => {},
+    onClose: () => {},
+  }));
+  assert.match(pdfMarkup, /rendered-artifact-body/);
+  assert.match(pdfMarkup, /PPTX → PDF/);
+  assert.match(pdfMarkup, /正在准备预览/);
+
+  const sandbox = buildSandboxDocument("<h1>safe</h1>");
+  assert.match(sandbox, /Content-Security-Policy/);
+  assert.match(sandbox, /default-src &#39;none&#39;|default-src 'none'/);
+  assert.match(sandbox, /<body><h1>safe<\/h1><\/body>/);
+
+  const artifactPanelSource = readFileSync(
+    resolve(process.cwd(), "src/components/ArtifactPanel.tsx"), "utf8");
+  assert.match(artifactPanelSource, /DOMPurify\.sanitize/);
+  assert.match(artifactPanelSource, /sandbox=""/);
+  assert.match(artifactPanelSource, /FORBID_TAGS/);
+  assert.match(artifactPanelSource, /\["md", "html"\]\.includes\(artifact\.kind\)/);
+  assert.match(artifactPanelSource, /artifact\.kind === "html" && mode === "preview"/);
+  assert.match(artifactPanelSource, /mode === "source"[\s\S]*?<SourceFile content=\{artifact\.content/);
 } finally {
   await harness.close();
 }
