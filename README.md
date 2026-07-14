@@ -1,25 +1,30 @@
 # cc-remote
 
-用手机 / 浏览器远程遥控你机器上的 **Claude Code / Codex** —— 自托管、开源。
+<p align="center"><strong>把你机器上的 Claude Code / Codex，带到手机和任意浏览器。</strong></p>
+<p align="center">自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web</p>
+<p align="center">
+  <a href="README_en.md">English</a> ·
+  <a href="#本地快速开始一台机器5-分钟">5 分钟上手</a> ·
+  <a href="#生产部署公网-vps-中继--你机器上的-wrapper">生产部署</a> ·
+  <a href="#安全须知务必读">安全须知</a>
+</p>
 
-一台机器上跑着的 `claude` 或 `codex` 会话，通过部署在 VPS 上的一个 WebSocket 中继，从手机或任意浏览器实时遥控：**流式输出、随时打断、多端同步、多会话切换、历史按需秒开**。
-
-> 灵感来自 Claude Code 官方的 Remote Control，但完全自托管。**模型后端由本地 CLI 决定**：Claude 可用官方 Anthropic API 或兼容端点，Codex 沿用本机 Codex 配置。cc-remote 本身**从不碰模型 API**，只做「控制」这条链路。
-
-**English:** [README_en.md](README_en.md)
+cc-remote 是一个开源的远程控制面：本机 `wrapper` 驱动已经安装并登录的
+`claude` / `codex`，浏览器通过你自托管的 WebSocket 中继查看和控制会话。
+模型、认证与工具执行仍由本地 CLI 决定；cc-remote 不代理模型 API，也不会把
+API key 烤进网页。
 
 <p align="center">
-  <img src="assets/01-cc-remote-UI.png" alt="cc-remote 浏览器界面" width="600">
-  &nbsp;
-  <img src="assets/02-cc-remote-iphone.png" alt="cc-remote 手机浏览器界面" width="175">
+  <img src="assets/readme-claude-multisession.jpg" alt="cc-remote 的 Claude 会话与多会话工作台" width="960">
 </p>
 
 ---
 
 ## 目录
 
-- [它能干什么](#它能干什么)
+- [核心能力](#核心能力)
 - [架构](#架构)
+- [真实界面与实用功能](#真实界面与实用功能)
 - [本地快速开始（一台机器，5 分钟）](#本地快速开始一台机器5-分钟)
 - [生产部署（公网 VPS 中继 + 你机器上的 wrapper）](#生产部署公网-vps-中继--你机器上的-wrapper)
 - [环境变量](#环境变量)
@@ -33,15 +38,20 @@
 
 ---
 
-## 它能干什么
+## 核心能力
 
-- 📱 **手机/浏览器实时遥控**：在外面用手机就能驱动家里/公司机器上的 Claude Code 或 Codex，流式看它敲字、跑工具。
-- 🧭 **完整处理过程**：按回合折叠展示思考摘要、说明、计划、命令输出、文件 diff、MCP、协作代理和 Hook 生命周期；最终答复保持独立清晰。
-- ⏹️ **随时打断**：一键中断当前回合（正确处理 SDK/app-server 的终止语义，不会串台）。
-- 🔀 **多会话**：常驻会话池，侧栏切换；后台会话继续跑，状态点实时更新。
-- 🕘 **历史秒开**：历史按需从 transcript/rollout 分页读取（像各家 web chat 一样），刷新不卡、不重放洪流。
-- 🔗 **多端同步**：多个设备连同一个中继，看到同一份对话。
-- 🔒 **自托管**：中继是纯 WebSocket 转发器，不碰模型；你的代码/密钥都在自己机器上。
+| 场景 | 可以做什么 |
+|---|---|
+| **双引擎** | 在同一个 Web UI 中使用 Claude Code 和 Codex；每个会话保持自己的模型、思考强度、权限与运行状态。 |
+| **远程操作** | 手机、平板或桌面浏览器实时看流式回复，发送附件，排队下一条消息，随时打断当前回合。 |
+| **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
+| **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
+| **会话管理** | 搜索、切换、重命名、归档和消息级派生；Codex 还可在 Git 仓库中派生到独立 worktree。 |
+| **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；`/goal` 管理长目标，Codex `/status` 读取 app-server 状态、用量与限额。 |
+| **连续性** | 后台会话继续运行，多端实时同步；从 Claude transcript / Codex rollout 分页恢复历史，断线后按游标补流。 |
+| **自托管** | wrapper 只出站连接；VPS 不需要模型 SDK，网页认证使用 HttpOnly cookie，CLI 凭据与 API key 不进入前端。 |
+
+> 不同引擎可用的模型、服务档位和运行控制以本机 CLI 及其 SDK/app-server 能力为准。
 
 ## 架构
 
@@ -58,6 +68,59 @@
 | **wrapper** | `claude` / `codex` 所在的机器 | 持有会话池、把 SDK/app-server 事件翻成线协议、管打断/排空、按需从 transcript/rollout 读历史。**只出站连中继，机器不需要开入站端口。** |
 | **relay（中继）** | 公网 VPS（或本地） | 纯 WebSocket 转发器（FastAPI）。wrapper 使用 Bearer token，浏览器使用 HttpOnly 会话 cookie；单 wrapper 槽、多客户端扇出。**从不 import `claude-agent-sdk`、从不碰模型 API**。 |
 | **web** | 浏览器 | React 客户端；中继同源托管它的静态文件（`web/dist`）。 |
+
+## 真实界面与实用功能
+
+以下截图来自实际运行中的 cc-remote，不是设计稿。
+
+### 多会话管理：后台继续跑，随时切回来
+
+左侧会话池按工作目录分组，可以搜索、切换、重命名和归档会话；一个会话在后台处理时，仍可进入另一个会话继续工作，切回来即可看到完整实时进度。Claude Code 与 Codex 会话共用同一套工作台，但各自保留独立的上下文、模型、权限和运行状态。
+
+<p align="center">
+  <img src="assets/readme-multi-session.jpg" alt="按项目分组并可搜索切换的多会话工作台" width="960">
+</p>
+
+### Claude Code：思考、工具调用和 Hook 都能看见
+
+Claude 会话不是一个只显示最终文字的简化聊天框。Remote 会接收 Claude Code SDK 暴露的思考、命令调用、工具结果和 Hook 生命周期，按发生顺序折叠展示；底部同时显示 Claude 当前模型、思考强度、权限模式和上下文占用。
+
+<p align="center">
+  <img src="assets/readme-claude-session.jpg" alt="Claude Code 的思考、命令调用和 Hook 处理过程" width="960">
+</p>
+
+### 新会话：先选引擎和工作目录
+
+一个入口创建 Claude Code 或 Codex 会话；工作目录可浏览选择，第一条消息可直接带图片或文件。会话建立后再按需要调整模型、权限和 Plan 模式，不用先填写一排默认参数。
+
+<p align="center">
+  <img src="assets/readme-new-session.jpg" alt="选择引擎和工作目录并创建新会话" width="960">
+</p>
+
+### Codex：计划与处理过程完整保留
+
+Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff、MCP、协作代理与 Hook 组织成可折叠时间线。运行中可以展开追踪细节，完成后收起为一行摘要；最终答复始终独立显示。
+
+<p align="center">
+  <img src="assets/readme-process-timeline.jpg" alt="可折叠的计划、Hook 和工具调用处理过程" width="960">
+</p>
+
+### Codex 会话级控制：模型、思考、权限与状态
+
+模型、思考强度、服务档位和权限都绑定当前会话；可以在不改本机全局配置的情况下调整下一回合。输入区同时提供附件、排队/打断、上下文占用以及 `/goal`、`/status` 等命令入口。
+
+<p align="center">
+  <img src="assets/readme-model-controls.jpg" alt="Codex 模型选择和会话控制" width="960">
+</p>
+
+### 常用操作速查
+
+- **会话**：新建、搜索、后台运行、重命名、归档、派生、Codex worktree。
+- **回合**：流式输出、排队、打断、复制、编辑重发、从指定消息派生。
+- **工具**：命令输出、文件修改与 diff、MCP、协作代理、Hook、审批和用户输入回传。
+- **终端协同**：检测原生 CLI 占用，实时镜像新消息；远端用户保留主动接管权。
+- **状态**：模型、思考强度、权限、Plan、上下文、目标、用量、rate limit 和运行告警。
+- **设备**：响应式手机界面、深浅主题、多浏览器同步与断线重连。
 
 ## 本地快速开始（一台机器，5 分钟）
 
