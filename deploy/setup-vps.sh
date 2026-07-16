@@ -211,7 +211,7 @@ if [ -n "$PREVIOUS_RELEASE" ]; then
 fi
 
 # During the one-time overlay migration, WEB_STATIC_DIR is changed to the
-# stable current path before this installer runs. Establish a complete v14
+# stable current path before this installer runs. Establish a complete v15
 # baseline link immediately so any pre-activation failure that restarts the old
 # unit still has a valid same-version web tree. This baseline is not the new
 # release switch and therefore must not set RELEASE_SWITCHED.

@@ -8,9 +8,9 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, Space,
+  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, SessionControl, Space,
 } from "./protocol.ts";
-import { makeForkSessionCommand, makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
+import { compareSessionControl, makeForkSessionCommand, makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION, sessionControlTargetsSid } from "./protocol.ts";
 import { CommandOutbox, planRecoveryReplay } from "./outbox.ts";
 import { probeSession, shouldReconnectAfterSessionProbe } from "./session-auth.ts";
 import { uuid } from "./util.ts";
@@ -42,6 +42,9 @@ export class RelayWs {
   private ws: WebSocket | null = null;
   private lastSeqBySession: Record<string, number> = {};
   private generationBySession: Record<string, string> = {};
+  // Transport-level control watermark survives runtime pruning/reconnect. The
+  // reducer repeats this guard because cached control may hydrate independently.
+  private controlBySession: Record<string, SessionControl> = {};
   private rebuildingSessions = new Set<string>();
   private replayOrder: string[] = [];
   private engineBySession: Record<string, "claude" | "codex"> = {};
@@ -140,6 +143,7 @@ export class RelayWs {
       if (!expired) break;
       delete this.lastSeqBySession[expired];
       delete this.generationBySession[expired];
+      delete this.controlBySession[expired];
       delete this.engineBySession[expired];
       delete this.spaceBySession[expired];
       this.rebuildingSessions.delete(expired);
@@ -150,6 +154,7 @@ export class RelayWs {
     for (const knownSid of Object.keys(this.generationBySession)) {
       if (!knownSid.startsWith("btw-")) continue;
       delete this.generationBySession[knownSid];
+      delete this.controlBySession[knownSid];
       delete this.lastSeqBySession[knownSid];
       delete this.engineBySession[knownSid];
       delete this.spaceBySession[knownSid];
@@ -180,9 +185,50 @@ export class RelayWs {
       // first per-session proof of a restart, so reset here as well as on an
       // explicit rebuild envelope.
       this.lastSeqBySession[sid] = 0;
+      delete this.controlBySession[sid];
     }
     this.generationBySession[sid] = generation;
     this.touchReplay(sid);
+  }
+
+  private acceptControl(sid: string, incoming: SessionControl): boolean {
+    const incomingGeneration = incoming.generation ?? null;
+    const activeGeneration = this.generationBySession[sid] ?? null;
+    if (activeGeneration !== null && incomingGeneration !== activeGeneration) {
+      return false;
+    }
+    if (activeGeneration === null && incomingGeneration !== null) {
+      this.noteGeneration(sid, incomingGeneration);
+    }
+    const disposition = compareSessionControl(
+      this.controlBySession[sid], incoming);
+    if (disposition === "newer") this.controlBySession[sid] = incoming;
+    return disposition === "newer" || disposition === "same";
+  }
+
+  /** Keep narrative/snapshot envelopes while stripping only an obsolete nested
+   * control value. A direct obsolete SessionControl frame can be dropped whole. */
+  private filterControl(msg: ServerEvent): ServerEvent | null {
+    if (msg.type === "session_control") {
+      // A live control frame without a routing key must never fall through to
+      // the reducer's focused-session fallback. Embedded controls are routed by
+      // their trusted Snapshot/History envelope instead.
+      if (!msg.sid) return null;
+      return this.acceptControl(msg.sid, msg) ? msg : null;
+    }
+    if (msg.type !== "snapshot" && msg.type !== "history") return msg;
+    const control = msg.control;
+    const sid = msg.type === "history"
+      ? msg.session_id : (msg.sid ?? msg.cc_session_id);
+    // The outer snapshot/history generation is the trusted epoch switch. Move
+    // the transport watermark before comparing its embedded control revision.
+    if (sid && msg.generation) this.noteGeneration(sid, msg.generation);
+    if (!control) return msg;
+    if (sid && !sessionControlTargetsSid(control, sid)) {
+      return { ...msg, control: undefined } as ServerEvent;
+    }
+    if (!sid || this.acceptControl(sid, control)) return msg;
+    return { ...msg, control: undefined } as ServerEvent;
   }
 
   private boundedReplayState(): {
@@ -219,6 +265,7 @@ export class RelayWs {
    *  of every resident session — that flood is what wedged reconnect into a loop. */
   seedReplayState(
     cursors: Record<string, number>, generations: Record<string, string>,
+    controls: Record<string, SessionControl> = {},
   ): void {
     for (const [sid, seq] of Object.entries(cursors)) {
       if (typeof seq === "number" && seq > (this.lastSeqBySession[sid] ?? 0)) {
@@ -227,10 +274,13 @@ export class RelayWs {
       }
     }
     for (const [sid, generation] of Object.entries(generations)) {
-      if (generation && this.lastSeqBySession[sid] != null) {
-        this.generationBySession[sid] = generation;
-        this.touchReplay(sid);
+      if (generation && (this.lastSeqBySession[sid] != null
+          || controls[sid] != null)) {
+        this.noteGeneration(sid, generation);
       }
+    }
+    for (const [sid, control] of Object.entries(controls)) {
+      if (this.acceptControl(sid, control)) this.touchReplay(sid);
     }
   }
 
@@ -739,8 +789,10 @@ export class RelayWs {
     };
     ws.onmessage = (e) => {
       try {
-        const msg = JSON.parse(e.data) as ServerEvent;
-        this.lastRecvAt = Date.now();  // any frame proves the link is alive
+        const decoded = JSON.parse(e.data) as ServerEvent;
+        this.lastRecvAt = Date.now();  // any valid JSON frame proves the link is alive
+        const msg = this.filterControl(decoded);
+        if (!msg) return;
         // Debug hook: record inbound frames so a live-sync issue is diagnosable
         // from the browser console. Inspect `window.__wsLog`; set
         // `window.__CCDEBUG = true` to also console.debug each frame.
@@ -799,13 +851,18 @@ export class RelayWs {
             const oldSeq = this.lastSeqBySession[old_key];
             const realSeq = this.lastSeqBySession[session_id];
             if (oldSeq != null && (realSeq == null || oldSeq >= realSeq)) {
+              const oldGeneration = this.generationBySession[old_key];
+              // A live temp runtime wins the alias merge together with its
+              // revision epoch. Use the normal generation transition so a
+              // cached watermark already stored under the real id is cleared.
+              if (oldGeneration) this.noteGeneration(session_id, oldGeneration);
               this.lastSeqBySession[session_id] = oldSeq;
-              if (this.generationBySession[old_key]) {
-                this.generationBySession[session_id] = this.generationBySession[old_key];
-              }
             }
             delete this.lastSeqBySession[old_key];
             delete this.generationBySession[old_key];
+            const oldControl = this.controlBySession[old_key];
+            if (oldControl) this.acceptControl(session_id, oldControl);
+            delete this.controlBySession[old_key];
             if (this.rebuildingSessions.delete(old_key)) {
               this.rebuildingSessions.add(session_id);
             }

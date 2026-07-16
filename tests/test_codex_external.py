@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from pathlib import Path
 from cc_remote.protocol import History, Query, Takeover
 from cc_remote.wrapper import machine as machine_module
@@ -21,7 +22,7 @@ def _event(kind: str, turn_id: str) -> bytes:
 
 
 def _fake_process(root: Path, pid: int, start: int, *, tty: int = 0,
-                  cmdline: tuple[str, ...] = ()) -> Path:
+                  cmdline: tuple[str, ...] = (), cwd: Path | None = None) -> Path:
     proc = root / str(pid)
     (proc / "fd").mkdir(parents=True)
     (proc / "fdinfo").mkdir()
@@ -32,6 +33,8 @@ def _fake_process(root: Path, pid: int, start: int, *, tty: int = 0,
     if cmdline:
         (proc / "cmdline").write_bytes(
             b"\0".join(arg.encode() for arg in cmdline) + b"\0")
+    if cwd is not None:
+        (proc / "cwd").symlink_to(cwd)
     return proc
 
 
@@ -131,6 +134,31 @@ def test_headless_app_server_holder_is_classified_passive(tmp_path):
     assert scan.passive_holders["sid"] == {ProcessIdentity(211, 2101)}
 
 
+def test_headless_daemon_and_stdio_proxy_are_both_passive(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    daemon = _fake_process(
+        proc_root, 213, 2103,
+        cmdline=("codex", "-c", "features.code_mode_host=true",
+                 "app-server", "--listen", "unix://"),
+    )
+    proxy = _fake_process(
+        proc_root, 214, 2104,
+        cmdline=("codex", "app-server", "--stdio"),
+    )
+    _fake_fd(daemon, 4, rollout, os.O_WRONLY | os.O_APPEND)
+    _fake_fd(proxy, 5, rollout, os.O_WRONLY | os.O_APPEND)
+
+    scan = writable_rollout_holders(
+        {"sid": str(rollout)}, proc_root=str(proc_root))
+
+    expected = {ProcessIdentity(213, 2103), ProcessIdentity(214, 2104)}
+    assert scan.complete is True
+    assert scan.holders["sid"] == expected
+    assert scan.passive_holders["sid"] == expected
+
+
 def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
     sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
     rollout = tmp_path / "rollout.jsonl"
@@ -155,6 +183,176 @@ def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
         ProcessIdentity(221, 2201), ProcessIdentity(222, 2202)}
     assert scan.passive_holders[sid] == {ProcessIdentity(221, 2201)}
     assert tui.exists()
+
+
+def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
+    target = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    sibling = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    target_rollout = tmp_path / "target.jsonl"
+    sibling_rollout = tmp_path / "sibling.jsonl"
+    target_rollout.write_bytes(b"")
+    sibling_rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    identity = ProcessIdentity(223, 2203)
+    _fake_process(
+        proc_root, identity.pid, identity.start_ticks, tty=34819,
+        # The second UUID is the optional PROMPT. It must not make a sibling
+        # session appear terminal-attached merely because its text is a SID.
+        cmdline=(
+            "codex", "resume", "--no-alt-screen", "-C", "/repo",
+            target, sibling,
+        ),
+    )
+
+    scan = writable_rollout_holders(
+        {target: str(target_rollout), sibling: str(sibling_rollout)},
+        proc_root=str(proc_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[target] == {identity}
+    assert scan.holders[sibling] == set()
+    assert scan.passive_holders[target] == set()
+    assert scan.passive_holders[sibling] == set()
+
+
+def test_codex_resume_last_does_not_treat_uuid_prompt_as_target(tmp_path):
+    prompt_sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 225, 2205, tty=34821,
+        cmdline=("codex", "resume", "--last", prompt_sid),
+    )
+
+    scan = writable_rollout_holders(
+        {prompt_sid: str(rollout)}, proc_root=str(proc_root))
+
+    assert scan.complete is True
+    assert scan.holders[prompt_sid] == set()
+    assert scan.passive_holders[prompt_sid] == set()
+
+
+def test_codex_resume_skips_repeated_image_values_before_target(tmp_path):
+    image_named_like_sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    target = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    image_rollout = tmp_path / "image-name.jsonl"
+    target_rollout = tmp_path / "target.jsonl"
+    image_rollout.write_bytes(b"")
+    target_rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    identity = ProcessIdentity(226, 2206)
+    _fake_process(
+        proc_root, identity.pid, identity.start_ticks, tty=34822,
+        cmdline=(
+            "codex", "resume",
+            "-i", image_named_like_sid,
+            "--image", "/tmp/second.png",
+            target,
+        ),
+    )
+
+    scan = writable_rollout_holders(
+        {
+            image_named_like_sid: str(image_rollout),
+            target: str(target_rollout),
+        },
+        proc_root=str(proc_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[image_named_like_sid] == set()
+    assert scan.holders[target] == {identity}
+
+
+def test_codex_resume_logical_holder_clears_when_process_exits(tmp_path):
+    sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    tui = _fake_process(
+        proc_root, 224, 2204, tty=34820,
+        cmdline=("codex", "resume", sid),
+    )
+
+    first = writable_rollout_holders(
+        {sid: str(rollout)}, proc_root=str(proc_root))
+    assert first.holders[sid] == {ProcessIdentity(224, 2204)}
+
+    shutil.rmtree(tui)
+    second = writable_rollout_holders(
+        {sid: str(rollout)}, proc_root=str(proc_root))
+    assert second.complete is True
+    assert second.holders[sid] == set()
+    assert second.passive_holders[sid] == set()
+
+
+def test_plain_codex_tui_uses_exact_startup_shell_snapshot(tmp_path):
+    target = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    sibling = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    target_rollout = tmp_path / "target.jsonl"
+    sibling_rollout = tmp_path / "sibling.jsonl"
+    def meta(sid: str) -> bytes:
+        return (json.dumps({
+            "type": "session_meta",
+            "payload": {"id": sid, "session_id": sid, "cwd": str(cwd)},
+        }) + "\n").encode()
+    target_rollout.write_bytes(meta(target))
+    sibling_rollout.write_bytes(meta(sibling))
+    proc_root = tmp_path / "proc"
+    identity = ProcessIdentity(227, 2207)
+    _fake_process(
+        proc_root, identity.pid, identity.start_ticks, tty=34823,
+        cmdline=("/opt/codex", "--no-alt-screen"), cwd=cwd,
+    )
+    snapshots = tmp_path / "shell_snapshots"
+    snapshots.mkdir()
+    (snapshots / f"{target}.123456789.sh").write_text("snapshot")
+
+    scan = writable_rollout_holders(
+        {target: str(target_rollout), sibling: str(sibling_rollout)},
+        proc_root=str(proc_root), shell_snapshot_root=str(snapshots),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[target] == {identity}
+    assert scan.holders[sibling] == set()
+    assert scan.passive_holders[target] == set()
+
+
+def test_plain_codex_tui_snapshot_binding_fails_closed_when_ambiguous(tmp_path):
+    first = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    second = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    paths = {}
+    for sid in (first, second):
+        rollout = tmp_path / f"{sid}.jsonl"
+        rollout.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {"id": sid, "session_id": sid, "cwd": str(cwd)},
+        }) + "\n")
+        paths[sid] = str(rollout)
+    proc_root = tmp_path / "proc"
+    for pid, start in ((228, 2208), (229, 2209)):
+        _fake_process(
+            proc_root, pid, start, tty=34824,
+            cmdline=("codex", "--no-alt-screen"), cwd=cwd,
+        )
+    snapshots = tmp_path / "shell_snapshots"
+    snapshots.mkdir()
+    for sid in (first, second):
+        (snapshots / f"{sid}.123456789.sh").write_text("snapshot")
+
+    scan = writable_rollout_holders(
+        paths, proc_root=str(proc_root), shell_snapshot_root=str(snapshots),
+    )
+
+    assert scan.complete is True
+    assert scan.holders == {first: set(), second: set()}
 
 
 def test_holder_scan_reports_missing_proc_as_incomplete(tmp_path):

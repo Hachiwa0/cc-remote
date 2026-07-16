@@ -191,6 +191,10 @@ class SdkHandle:
             # not use --bare here: it intentionally disables OAuth/keychain
             # auth, which would break subscription-backed Work sessions.
             extra_args["safe-mode"] = None
+        elif self.permission_mode != "bypassPermissions":
+            # A Code session restored while currently in a safer mode must still
+            # retain Claude's native ability to cycle back to bypass later.
+            extra_args["allow-dangerously-skip-permissions"] = None
         return ClaudeAgentOptions(
             tools=list(CLAUDE_WORK_TOOLS) if self.work_mode else None,
             include_partial_messages=True,        # StreamEvent with content_block_delta
@@ -507,6 +511,27 @@ class SdkHandle:
             raise classify_control_failure(exc) from None
         return parse_conversation_rewind_response(
             response, requested_target=target)
+
+    async def prepare_conversation_rewind(
+        self, *, resume_id: str, cwd: str | None,
+    ) -> None:
+        """Reload native state and prove rewind support before any file mutation.
+
+        A long-lived SDK child may retain queued private-control state after
+        terminal/broker ownership changes. Reconnect first so a combined
+        restore never rewinds files using a runtime already unable to service
+        the conversation half.
+        """
+        await self.force_reconnect(
+            resume_id=resume_id,
+            cwd=cwd,
+            reason="prepare conversation rewind",
+            preserve_model=False,
+        )
+        capability = await self.conversation_rewind_capability(refresh=True)
+        if not capability.supported:
+            raise ClaudeRewindError(
+                "capability_unavailable", operation="conversation")
 
     async def prepare_goal(self, thread_id: str, objective: str) -> dict[str, Any]:
         """Install the immediate state for a soon-to-be-submitted native /goal.

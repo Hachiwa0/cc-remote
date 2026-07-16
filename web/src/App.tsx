@@ -21,6 +21,7 @@ import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
 import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
 import { CapabilitiesSheet } from "./components/CapabilitiesSheet";
+import { TerminalControl } from "./components/TerminalControl";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
@@ -35,7 +36,8 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexServiceTier, type CollaborationModeName,
-  type DiffTheme, type Engine, type Space, type RestoreMode } from "./protocol";
+  type DiffTheme, type Engine, type Space, type RestoreMode,
+  type SessionControl, sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { resolveSidebarSwipe } from "./responsive-layout";
@@ -334,7 +336,8 @@ export default function App() {
 
     (async () => {
       let seeded = { cursors: {} as Record<string, number>,
-        generations: {} as Record<string, string> };
+        generations: {} as Record<string, string>,
+        controls: {} as Record<string, SessionControl> };
       try { seeded = await import("./cache").then((m) => m.loadAllReplayState()); } catch { /* best-effort */ }
       if (cancelled) return;
       const ws = new RelayWs({
@@ -680,7 +683,16 @@ export default function App() {
         },
       }, machineId);
       ws.setSurface(engineRef.current, spaceRef.current);
-      ws.seedReplayState(seeded.cursors, seeded.generations);
+      // Seed both transport and reducer watermarks before Hello. This prevents
+      // an older replay/snapshot from reviving a lock already superseded in the
+      // last authoritative control snapshot.
+      ws.seedReplayState(seeded.cursors, seeded.generations, seeded.controls);
+      for (const [sid, control] of Object.entries(seeded.controls)) {
+        dispatch({
+          type: "hydrate_cache", sid, turns: [], revision: null,
+          generation: seeded.generations[sid] ?? control.generation, control,
+        });
+      }
       wsRef.current = ws;
       ws.start();
     })();
@@ -766,17 +778,17 @@ export default function App() {
   useEffect(() => {
     const sid = rt.ccSessionId;
     const revision = rt.historyRevision;
-    if (!sid || rt.turns.length === 0
-        || !revision
+    if (!sid || !revision
         || historyInvalidationsRef.current.has(sid)) return;
     import("./cache").then(({ saveSession }) => {
       const live = wsRef.current?.lastSeqFor(sid) || 0;
       saveSession(
         sid, rt.turns, live, revision,
         wsRef.current?.generationFor(sid),
+        rt.control,
       );
     });
-  }, [focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision]);
+  }, [focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control]);
 
   // Hydrate the focused session's turns from IndexedDB for an INSTANT render on
   // switch — the wrapper's replay (for non-resident sessions) then reconciles.
@@ -792,10 +804,13 @@ export default function App() {
       if (!cancelled
           && cacheEpoch === (historyCacheEpochRef.current.get(sid) ?? 0)
           && !historyInvalidationsRef.current.has(sid)
-          && cached && Array.isArray(cached.turns) && cached.turns.length) {
+          && cached && Array.isArray(cached.turns)
+          && (cached.turns.length || cached.control)) {
         dispatch({
           type: "hydrate_cache", sid, turns: cached.turns as Turn[],
           revision: cached.revision,
+          generation: cached.generation ?? cached.control?.generation,
+          control: cached.control,
         });
       }
     });
@@ -846,6 +861,8 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Tab" && e.shiftKey) {
         e.preventDefault();
+        if ((rt.control && sessionControlLocksInput(rt.control))
+            || (!rt.control && rt.external)) return;
         if (focusedEngine === "codex") {
           setCollaborationMode(
             rt.collaborationMode === "plan" ? "default" : "plan");
@@ -858,7 +875,8 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [authed, focusedSid, rt.perm, rt.collaborationMode, focusedEngine]);
+  }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
+    rt.external, focusedEngine]);
 
   // ---- /btw effects ----
   // These MUST stay ABOVE the `!authed` early return below. Hooks have to run
@@ -1194,7 +1212,17 @@ export default function App() {
             </div>
             <div className="sub">{space === "work" ? "私有工作区 · " : ""}{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</div>
           </div>
-          <span className={`hstat ${rt.state}`}><span className="sd" />{rt.state}</span>
+          <span className={`hstat ${rt.state}`}><span className="sd" />
+            <span className="hstat-label">{rt.state}</span></span>
+          {space === "code" && focusedSid && !state.newChat && (
+            <TerminalControl control={rt.control} engine={focusedEngine}
+              availability={state.connState !== "connected" || !state.wrapperOnline
+                ? "offline" : rt.replaying || !rt.syncReady ? "syncing" : "online"}
+              legacyExternal={!rt.control && !!rt.external}
+              legacyTakeoverPending={rt.takeoverPending}
+              legacyMessage={rt.takeoverMessage}
+              onTakeover={() => wsRef.current?.sendTakeover(focusedSid)} />
+          )}
           {machines.length > 1 && <select className="machine-select"
             value={machineId} onChange={(event) => setMachineId(event.target.value)}
             aria-label="远程机器" title="切换远程机器">
@@ -1202,7 +1230,7 @@ export default function App() {
           </select>}
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
-          <button className="iconbtn" onClick={() => {
+          <button className="iconbtn header-secondary" onClick={() => {
             setCapabilitiesOpen(true);
             setCapabilitiesLoading(true);
             wsRef.current?.sendGetEngineCapabilities(
@@ -1211,7 +1239,7 @@ export default function App() {
             <Icon name="spark" />
           </button>
           {typeof Notification !== "undefined" && <button
-            className={`iconbtn${notificationsEnabled ? " notify-on" : ""}`}
+            className={`iconbtn header-secondary${notificationsEnabled ? " notify-on" : ""}`}
             onClick={() => { void (async () => {
               if (notificationsEnabled) {
                 localStorage.removeItem(NOTIFY_KEY);
@@ -1227,7 +1255,7 @@ export default function App() {
             title={notificationsEnabled ? "后台完成提醒已开启" : "开启后台完成提醒"}>
             <Icon name="notify" />
           </button>}
-          <button className="iconbtn" onClick={toggleTheme} aria-label="切换主题">
+          <button className="iconbtn header-secondary" onClick={toggleTheme} aria-label="切换主题">
             <Icon name={theme === "dark" ? "sun" : "moon"} />
           </button>
           <button className="iconbtn" onClick={() => void logout()}
@@ -1301,10 +1329,10 @@ export default function App() {
           perm={rt.perm}
           collaborationMode={rt.collaborationMode}
           fast={rt.fast}
+          control={rt.control}
           external={rt.external}
           takeoverPending={rt.takeoverPending}
           takeoverMessage={rt.takeoverMessage}
-          onTakeover={() => { if (focusedSid) wsRef.current?.sendTakeover(focusedSid); }}
           engine={focusedEngine}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}

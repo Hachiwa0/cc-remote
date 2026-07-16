@@ -80,6 +80,8 @@ def test_claude_control_state_survives_sdk_reconnect_and_failed_set(
         assert [client.options.permission_mode
                 for client in _FakeClaudeClient.created] == [
                     "bypassPermissions", "plan"]
+        assert "allow-dangerously-skip-permissions" in (
+            _FakeClaudeClient.created[-1].options.extra_args or {})
         assert [client.options.model for client in _FakeClaudeClient.created] == [
             None, "claude-opus-4-8"]
 
@@ -334,10 +336,10 @@ def test_switching_to_resident_claude_reseeds_its_actual_permission():
             session_id="claude-1", engine="claude"))
 
         assert [event.type for event in result] == [
-            "session_focus", "perm", "model", "effort"]
-        assert result[1].mode == "default"
-        assert result[2].model == "claude-sonnet-5"
-        assert result[3].effort == "high"
+            "session_focus", "session_control", "perm", "model", "effort"]
+        assert result[2].mode == "default"
+        assert result[3].model == "claude-sonnet-5"
+        assert result[4].effort == "high"
 
     asyncio.run(go())
 

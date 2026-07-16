@@ -30,6 +30,24 @@ _SAFE_MESSAGES = {
     "file_rewind_failed": "Claude could not restore the tracked files.",
 }
 
+_SAFE_MESSAGES_ZH = {
+    "invalid_target": "回滚点不是有效的消息标识",
+    "not_connected": "Claude 运行时未连接",
+    "capability_unavailable": "当前 Claude Code 版本或控制方式不支持对话回滚",
+    "capability_probe_failed": "无法确认当前 Claude Code 是否支持对话回滚",
+    "commands_queued": "Claude 仍有排队中的命令，请等待完成后重试",
+    "turn_running": "Claude 仍在处理当前回合，请等待空闲后重试",
+    "target_not_found": "所选回滚点已不存在，请刷新会话后重新选择",
+    "stale_target": "所选回滚点已过期，请刷新会话后重试",
+    "no_preceding_assistant": "所选位置之前没有可恢复的助手回复",
+    "persistence_failed": "Claude 无法持久化回滚锚点，可稍后重试",
+    "state_changed": "执行回滚期间会话发生了变化，请刷新后重试",
+    "timeout": "Claude 未在限定时间内确认回滚结果",
+    "rejected": "Claude 拒绝了本次对话回滚",
+    "malformed_response": "Claude 返回了无法验证的回滚结果",
+    "file_rewind_failed": "Claude 无法恢复该回滚点的代码文件",
+}
+
 
 class ClaudeRewindError(RuntimeError):
     """Stable error contract for both public and private rewind operations."""
@@ -57,6 +75,10 @@ class ClaudeRewindError(RuntimeError):
             "operation": self.operation,
             "retryable": self.retryable,
         }
+
+    @property
+    def user_message_zh(self) -> str:
+        return _SAFE_MESSAGES_ZH.get(self.code, "Claude 无法完成本次回滚")
 
 
 @dataclass(frozen=True)

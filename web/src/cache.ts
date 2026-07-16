@@ -6,6 +6,10 @@
 //
 // Writes are coalesced (turns change every frame during streaming).
 
+import {
+  isSessionControl, sessionControlTargetsSid, type SessionControl,
+} from "./protocol.ts";
+
 const DB_NAME = "cc_remote_cache";
 const STORE = "sessions";
 const SCHEMA = 1;
@@ -16,7 +20,9 @@ const SCHEMA = 1;
 // v6 adds assistant channels and structured process blocks. v7 binds cached
 // turns to the backend's authoritative history revision so a destructive
 // rewind or wrapper restart can never merge removed completed turns back in.
-const CACHE_VER = 7;
+// v8 persists the revisioned v15 SessionControl snapshot so instant hydration
+// cannot fall back to an unrevisioned terminal lock.
+const CACHE_VER = 8;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
@@ -25,6 +31,7 @@ interface ReplayRecord {
   sid: string;
   lastSeq: number;
   generation?: string;
+  control?: SessionControl;
   savedAt: number;
 }
 
@@ -111,7 +118,16 @@ export interface CachedSession {
   lastSeq: number;
   revision: string;
   generation?: string;
+  control?: SessionControl | null;
   savedAt: number;
+}
+
+/** Validate and bind a cache control snapshot to its IndexedDB row key. */
+export function controlForCachedSession(
+  sessionId: string, value: unknown,
+): SessionControl | undefined {
+  return isSessionControl(value) && sessionControlTargetsSid(value, sessionId)
+    ? value : undefined;
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -141,9 +157,16 @@ export async function loadSession(sessionId: string): Promise<CachedSession | nu
       req.onsuccess = () => {
         const r = req.result as (CachedSession & { v?: number }) | undefined;
         // Ignore stale caches from before the current shape (v must match).
-        resolve(!invalidatedSessions.has(sessionId) && r && r.v === CACHE_VER
-          && typeof r.revision === "string" && r.revision
-          ? r : null);
+        if (invalidatedSessions.has(sessionId) || !r || r.v !== CACHE_VER
+            || typeof r.revision !== "string" || !r.revision
+            || (r.control != null && !isSessionControl(r.control))) {
+          resolve(null);
+          return;
+        }
+        resolve({
+          ...r,
+          control: controlForCachedSession(sessionId, r.control),
+        });
       };
       req.onerror = () => resolve(null);
     });
@@ -158,13 +181,17 @@ export async function loadSession(sessionId: string): Promise<CachedSession | nu
 export async function loadAllReplayState(): Promise<{
   cursors: Record<string, number>;
   generations: Record<string, string>;
+  controls: Record<string, SessionControl>;
 }> {
-  if (typeof indexedDB === "undefined") return { cursors: {}, generations: {} };
+  if (typeof indexedDB === "undefined") {
+    return { cursors: {}, generations: {}, controls: {} };
+  }
   try {
     const d = await db();
     const replay = await new Promise<{
       cursors: Record<string, number>;
       generations: Record<string, string>;
+      controls: Record<string, SessionControl>;
     }>((resolve) => {
       const records: ReplayRecord[] = [];
       const req = d.transaction(STORE, "readonly").objectStore(STORE).openCursor();
@@ -173,41 +200,51 @@ export async function loadAllReplayState(): Promise<{
         if (!cur) {
           const cursors: Record<string, number> = {};
           const generations: Record<string, string> = {};
+          const controls: Record<string, SessionControl> = {};
           for (const record of records) {
-            cursors[record.sid] = record.lastSeq;
+            if (record.lastSeq > 0) {
+              cursors[record.sid] = record.lastSeq;
+            }
             if (record.generation) generations[record.sid] = record.generation;
+            if (record.control) controls[record.sid] = record.control;
           }
-          resolve({ cursors, generations });
+          resolve({ cursors, generations, controls });
           return;
         }
         const r = cur.value as (CachedSession & { v?: number }) | undefined;
         if (r && r.v === CACHE_VER
             && typeof r.revision === "string" && r.revision
-            && typeof r.lastSeq === "number" && r.lastSeq > 0) {
+            && typeof r.lastSeq === "number"
+            && (r.lastSeq > 0 || isSessionControl(r.control))) {
+          const sid = String(cur.key);
+          const control = controlForCachedSession(sid, r.control);
           retainNewest(records, {
-            sid: String(cur.key),
+            sid,
             lastSeq: r.lastSeq,
             generation: typeof r.generation === "string" && r.generation
-              ? r.generation : undefined,
+              ? r.generation
+              : (control?.generation ?? undefined),
+            control,
             savedAt: typeof r.savedAt === "number" ? r.savedAt : 0,
           });
         }
         cur.continue();
       };
-      req.onerror = () => resolve({ cursors: {}, generations: {} });
+      req.onerror = () => resolve({ cursors: {}, generations: {}, controls: {} });
     });
     // Queue a bounded cleanup after the readonly cursor transaction. This also
     // repairs databases created by older builds that never evicted sessions.
     void pruneCacheStore(d);
     return replay;
   } catch {
-    return { cursors: {}, generations: {} };
+    return { cursors: {}, generations: {}, controls: {} };
   }
 }
 
 const pending = new Map<string, {
   sid: string; turns: unknown[]; lastSeq: number; revision: string;
   generation?: string;
+  control?: SessionControl | null;
   epoch: number;
 }>();
 // A destructive history mutation must invalidate both the committed IDB row
@@ -228,7 +265,7 @@ function sessionEpoch(sessionId: string): number {
  *  debounced 400ms so streaming doesn't hammer IndexedDB. */
 export function saveSession(
   sessionId: string, turns: unknown[], lastSeq: number, revision: string,
-  generation?: string,
+  generation?: string, control?: SessionControl | null,
 ): void {
   if (typeof indexedDB === "undefined" || !sessionId || !revision) return;
   if (invalidatedSessions.has(sessionId)) return;
@@ -242,6 +279,7 @@ export function saveSession(
     lastSeq,
     revision,
     generation,
+    control: controlForCachedSession(sessionId, control),
     epoch: sessionEpoch(sessionId),
   });
   if (saveTimer) return;
@@ -265,6 +303,7 @@ async function flush(): Promise<void> {
         store.put(
           { v: CACHE_VER, turns, lastSeq: job.lastSeq,
             revision: job.revision, generation: job.generation,
+            control: job.control,
             savedAt: Date.now() }, job.sid);
       }
       tx.oncomplete = () => resolve();

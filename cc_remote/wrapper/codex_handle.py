@@ -1,14 +1,15 @@
 """Codex app-server lifecycle: connect / query / interrupt / receive / disconnect.
 
-The Codex analog of SdkHandle (sdk.py). Drives one persistent `codex app-server`
-subprocess over newline-delimited JSON-RPC 2.0 (stdio) and presents the SAME
-async surface the machine's per-turn consumer expects:
+The Codex analog of SdkHandle (sdk.py). Drives either a private ``app-server
+--stdio`` process (Work/compatibility) or one short-lived ``app-server proxy``
+connection to the official shared Code daemon. Both present the SAME async
+JSON-RPC surface the machine's per-turn consumer expects:
 
   connect(resume_id, cwd) -> initialize/initialized handshake + thread/start|resume
   query(prompt)           -> turn/start (opens a fresh per-turn queue)
   receive_response()      -> async-gen of raw notification dicts until turn/completed
   interrupt()             -> turn/interrupt {threadId, turnId}
-  disconnect()            -> terminate the subprocess
+  disconnect()            -> terminate only the owned stdio/proxy subprocess
 
 Model-agnostic: whatever backend Codex is pointed at (user's cc-switch) is Codex's
 concern. We never set a model/provider here.
@@ -16,8 +17,10 @@ concern. We never set a model/provider here.
 from __future__ import annotations
 
 import asyncio
+import base64
 import glob
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -31,6 +34,11 @@ from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote.log import logger
 from cc_remote.protocol import Notice, RateLimitUpdate, ThreadGoal
+from cc_remote.wrapper.codex_daemon import (
+    CodexDaemonManager,
+    codex_daemon_mode,
+    default_codex_daemon_manager,
+)
 from cc_remote.wrapper.codex_sessions import (
     codex_approval,
     codex_context_window,
@@ -71,6 +79,10 @@ _WORK_SKILL_LIMIT = 512
 _WORK_MCP_SERVER_LIMIT = 128
 _WORK_PATH_MAX = 4096
 _WORK_NAME_MAX = 256
+_PROXY_HANDSHAKE_MAX = 16 * 1024
+_PROXY_HANDSHAKE_TIMEOUT = 5.0
+_PROXY_MESSAGE_MAX = 16 * 1024 * 1024
+_WEBSOCKET_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _WORK_DISABLED_FEATURES = (
     "apps",
     "hooks",
@@ -89,6 +101,36 @@ GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
 RuntimeEvent = Notice | RateLimitUpdate
 RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
+
+
+class CodexProxyProtocolError(RuntimeError):
+    """The local proxy stream violated its RFC 6455 boundary."""
+
+
+def _websocket_client_frame(
+    payload: bytes, *, opcode: int = 0x1, fin: bool = True,
+) -> bytes:
+    """Build one masked client frame for the local app-server proxy."""
+    if opcode not in {0x0, 0x1, 0x2, 0x8, 0x9, 0xA}:
+        raise CodexProxyProtocolError("invalid WebSocket opcode")
+    if len(payload) > _PROXY_MESSAGE_MAX:
+        raise CodexProxyProtocolError("WebSocket payload exceeds limit")
+    if opcode >= 0x8 and (not fin or len(payload) > 125):
+        raise CodexProxyProtocolError("invalid WebSocket control frame")
+    first = (0x80 if fin else 0) | opcode
+    length = len(payload)
+    if length <= 125:
+        header = bytes((first, 0x80 | length))
+    elif length <= 0xFFFF:
+        header = bytes((first, 0x80 | 126)) + length.to_bytes(2, "big")
+    else:
+        header = bytes((first, 0x80 | 127)) + length.to_bytes(8, "big")
+    mask = os.urandom(4)
+    if len(mask) != 4:
+        raise CodexProxyProtocolError("invalid WebSocket mask")
+    masked = bytes(value ^ mask[index & 3]
+                   for index, value in enumerate(payload))
+    return header + mask + masked
 
 
 class CodexSpontaneousOverflow:
@@ -233,6 +275,14 @@ def _notification_turn_id(message: dict) -> Optional[str]:
         value = turn.get("id")
         if isinstance(value, str) and value:
             return value
+    return None
+
+
+def _server_request_key(value: Any) -> Optional[object]:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
     return None
 
 
@@ -471,7 +521,9 @@ class CodexHandle:
                  interaction_callback: Optional[InteractionCallback] = None,
                  goal_callback: Optional[GoalCallback] = None,
                  turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
-                 runtime_event_callback: Optional[RuntimeEventCallback] = None):
+                 runtime_event_callback: Optional[RuntimeEventCallback] = None,
+                 daemon_mode: Optional[str] = None,
+                 daemon_manager: Optional[CodexDaemonManager] = None):
         self.cfg = cfg
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
@@ -493,6 +545,21 @@ class CodexHandle:
         self._owned_turn_ids: OrderedDict[str, None] = OrderedDict()
         self._cwd = cwd
         self.work_mode = work_mode
+        requested_daemon_mode = (
+            daemon_mode if daemon_mode is not None
+            else getattr(daemon_manager, "mode", None)
+        )
+        self.daemon_mode = (
+            "off" if work_mode else codex_daemon_mode(requested_daemon_mode))
+        self.daemon_manager = (
+            daemon_manager
+            if daemon_manager is not None
+            else default_codex_daemon_manager(self.daemon_mode)
+        )
+        self._using_daemon_proxy = False
+        self._proxy_read_buffer = bytearray()
+        self._proxy_close_sent = False
+        self._send_lock = asyncio.Lock()
         self._work_config: Optional[dict[str, Any]] = None
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
@@ -506,8 +573,10 @@ class CodexHandle:
         # Keep detached request handlers generation-owned and cancel them on
         # disconnect so an old approval cannot reply to a new app-server process.
         self._server_request_tasks: set[asyncio.Task] = set()
-        # POSIX app-server processes get their own group so disconnecting a
-        # session also terminates any shell/tool descendants it spawned.
+        self._server_request_tasks_by_id: dict[object, asyncio.Task] = {}
+        self._pending_server_request_ids: set[object] = set()
+        # POSIX transport children get their own group. For stdio this includes
+        # tool descendants; in daemon mode it contains only this proxy chain.
         self._process_group: Optional[int] = None
         self._generation = 0
         self._dead = False
@@ -592,6 +661,16 @@ class CodexHandle:
                     error_type=type(exc).__name__,
                 )
 
+    @property
+    def using_daemon_proxy(self) -> bool:
+        """Whether this live handle is attached to the shared Codex daemon."""
+        return bool(
+            self._using_daemon_proxy
+            and self.proc is not None
+            and not self._dead
+            and getattr(self.proc, "returncode", None) is None
+        )
+
     async def _publish_runtime_event(self, event: RuntimeEvent) -> None:
         key = _runtime_event_key(event)
         async with self._runtime_event_lock:
@@ -637,33 +716,78 @@ class CodexHandle:
                 error_type=type(exc).__name__,
             )
 
-    async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
-                      fork: bool = False) -> None:
-        if self.proc is not None:
-            await self.disconnect()
-        self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
-        # version-probes subprocesses on first call; keep it off the event loop.
-        codex_bin = await asyncio.to_thread(_resolve_codex_bin)
-        argv = [codex_bin, "app-server", "--stdio"]
-        if self.work_mode:
-            # One app-server process belongs to one resident session, so a
-            # per-process permission profile can enforce this Work cwd without
-            # mutating the user's global ~/.codex/config.toml.
-            # The arg0 sandbox helper is a symlink to this exact executable. A
-            # grant for CODEX_HOME/tmp alone leaves that target invisible inside
-            # bwrap and every tool fails with ENOENT before its command starts.
-            filesystem_entries = [
-                '":minimal" = "read"',
-                f'{json.dumps(_codex_runtime_tmp())} = "read"',
-                f'{json.dumps(os.path.realpath(codex_bin))} = "read"',
-                f'{json.dumps(self._cwd)} = "write"',
-            ]
-            filesystem = "{ " + ", ".join(filesystem_entries) + " }"
-            argv.extend([
-                "-c", 'default_permissions="cc_remote_work"',
-                "-c", f"permissions.cc_remote_work.filesystem={filesystem}",
-                "-c", "permissions.cc_remote_work.network.enabled=false",
-            ])
+    async def _proxy_handshake(
+        self, proc: asyncio.subprocess.Process,
+    ) -> None:
+        """Upgrade the proxy's raw stdio stream to a local WebSocket."""
+        if proc.stdin is None or proc.stdout is None:
+            raise CodexProxyProtocolError("proxy stdio unavailable")
+        nonce_bytes = os.urandom(16)
+        if len(nonce_bytes) != 16:
+            raise CodexProxyProtocolError("invalid WebSocket nonce")
+        nonce = base64.b64encode(nonce_bytes).decode("ascii")
+        request = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {nonce}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        ).encode("ascii")
+        async with self._send_lock:
+            proc.stdin.write(request)
+            await proc.stdin.drain()
+
+        received = bytearray()
+        marker = b"\r\n\r\n"
+        while marker not in received:
+            remaining = _PROXY_HANDSHAKE_MAX - len(received)
+            if remaining <= 0:
+                raise CodexProxyProtocolError("proxy handshake exceeds limit")
+            chunk = await proc.stdout.read(min(4096, remaining))
+            if not chunk:
+                raise CodexProxyProtocolError("proxy closed during handshake")
+            received.extend(chunk)
+        boundary = received.find(marker) + len(marker)
+        if boundary > _PROXY_HANDSHAKE_MAX:
+            raise CodexProxyProtocolError("proxy handshake exceeds limit")
+        header_bytes = bytes(received[:boundary - len(marker)])
+        trailing = received[boundary:]
+        try:
+            lines = header_bytes.decode("ascii").split("\r\n")
+        except UnicodeDecodeError as exc:
+            raise CodexProxyProtocolError("non-ASCII proxy handshake") from exc
+        if not lines or re.fullmatch(r"HTTP/1\.[01] 101(?: .*)?", lines[0]) is None:
+            raise CodexProxyProtocolError("proxy handshake was not HTTP 101")
+        headers: dict[str, list[str]] = {}
+        for line in lines[1:]:
+            if not line or line[:1] in {" ", "\t"} or ":" not in line:
+                raise CodexProxyProtocolError("malformed proxy handshake header")
+            name, value = line.split(":", 1)
+            if not name or any(ord(char) <= 32 or ord(char) >= 127 for char in name):
+                raise CodexProxyProtocolError("malformed proxy handshake header")
+            headers.setdefault(name.lower(), []).append(value.strip())
+        upgrades = headers.get("upgrade", [])
+        connections = headers.get("connection", [])
+        accepts = headers.get("sec-websocket-accept", [])
+        connection_tokens = {
+            token.strip().lower()
+            for value in connections for token in value.split(",")
+        }
+        expected = base64.b64encode(hashlib.sha1(
+            nonce.encode("ascii") + _WEBSOCKET_GUID,
+        ).digest()).decode("ascii")
+        if (len(upgrades) != 1 or upgrades[0].lower() != "websocket"
+                or "upgrade" not in connection_tokens
+                or len(accepts) != 1
+                or not hmac.compare_digest(accepts[0], expected)):
+            raise CodexProxyProtocolError("proxy handshake validation failed")
+        self._proxy_read_buffer = bytearray(trailing)
+
+    async def _open_process(
+        self, argv: list[str], codex_bin: str, *, daemon_proxy: bool,
+    ) -> None:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
@@ -671,13 +795,14 @@ class CodexHandle:
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
             env=_codex_env(codex_bin),
-            # a single JSON-RPC line can exceed asyncio's default 64KB StreamReader
-            # cap (e.g. an image echo or a big tool output) and crash readline —
-            # raise it so the reader never dies mid-turn.
-            limit=16 * 1024 * 1024,
+            # JSONL and reassembled WebSocket messages share this hard ceiling.
+            limit=_PROXY_MESSAGE_MAX,
             start_new_session=(os.name == "posix"),
         )
         self.proc = proc
+        self._using_daemon_proxy = daemon_proxy
+        self._proxy_read_buffer.clear()
+        self._proxy_close_sent = False
         self._process_group = proc.pid if os.name == "posix" else None
         self._generation += 1
         generation = self._generation
@@ -692,15 +817,86 @@ class CodexHandle:
         self._spontaneous_turn_id = None
         self.last_token_usage = None
         self.context_window = None
-        self._reader = asyncio.create_task(self._read_loop(proc, generation))
-        self._stderr_task = asyncio.create_task(self._drain_stderr(proc, generation))
-
+        self._stderr_task = asyncio.create_task(
+            self._drain_stderr(proc, generation))
         try:
-            initialized = await self._request(
-                "initialize", _initialize_params())
-            self.app_server_version = _app_server_version(initialized)
-            await self._notify("initialized")
+            if daemon_proxy:
+                await asyncio.wait_for(
+                    self._proxy_handshake(proc),
+                    timeout=_PROXY_HANDSHAKE_TIMEOUT,
+                )
+        except BaseException:
+            await self.disconnect()
+            raise
+        self._reader = asyncio.create_task(self._read_loop(proc, generation))
 
+    async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
+                      fork: bool = False) -> None:
+        if self.proc is not None:
+            await self.disconnect()
+        self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
+        # version-probes subprocesses on first call; keep it off the event loop.
+        codex_bin = await asyncio.to_thread(_resolve_codex_bin)
+        child_env = _codex_env(codex_bin)
+        stdio_argv = [codex_bin, "app-server", "--stdio"]
+        if self.work_mode:
+            # One app-server process belongs to one resident session, so a
+            # per-process permission profile can enforce this Work cwd without
+            # mutating the user's global ~/.codex/config.toml.
+            # The arg0 sandbox helper is a symlink to this exact executable. A
+            # grant for CODEX_HOME/tmp alone leaves that target invisible inside
+            # bwrap and every tool fails with ENOENT before its command starts.
+            filesystem_entries = [
+                '":minimal" = "read"',
+                f'{json.dumps(_codex_runtime_tmp())} = "read"',
+                f'{json.dumps(os.path.realpath(codex_bin))} = "read"',
+                f'{json.dumps(self._cwd)} = "write"',
+            ]
+            filesystem = "{ " + ", ".join(filesystem_entries) + " }"
+            stdio_argv.extend([
+                "-c", 'default_permissions="cc_remote_work"',
+                "-c", f"permissions.cc_remote_work.filesystem={filesystem}",
+                "-c", "permissions.cc_remote_work.network.enabled=false",
+            ])
+        proxy_argv: Optional[list[str]] = None
+        if not self.work_mode and self.daemon_mode == "auto":
+            try:
+                proxy_argv = await self.daemon_manager.proxy_args(
+                    codex_bin, child_env)
+            except Exception as exc:
+                log.warning(
+                    "Codex daemon preparation failed; using stdio",
+                    error_type=type(exc).__name__,
+                )
+        attempts = (
+            [(proxy_argv, True), (stdio_argv, False)]
+            if proxy_argv is not None else [(stdio_argv, False)]
+        )
+        initialized: Any = None
+        for argv, daemon_proxy in attempts:
+            try:
+                await self._open_process(
+                    argv, codex_bin, daemon_proxy=daemon_proxy)
+                initialized = await self._request(
+                    "initialize", _initialize_params())
+                self.app_server_version = _app_server_version(initialized)
+                await self._notify("initialized")
+                break
+            except asyncio.CancelledError:
+                await self.disconnect()
+                raise
+            except Exception as exc:
+                await self.disconnect()
+                if not daemon_proxy:
+                    raise
+                self.daemon_manager.invalidate()
+                log.warning(
+                    "Codex daemon proxy unavailable; using stdio",
+                    error_type=type(exc).__name__,
+                )
+        else:  # pragma: no cover - the attempt list is never empty
+            raise RuntimeError("unable to start Codex app-server transport")
+        try:
             if self.work_mode:
                 # Inspect the effective native runtime rather than guessing at
                 # user-configured skill and MCP names.  Failure is fatal: silently
@@ -1164,6 +1360,7 @@ class CodexHandle:
     async def disconnect(self) -> None:
         proc = self.proc
         process_group = self._process_group
+        daemon_proxy = self._using_daemon_proxy
         spontaneous_turn_id = self._spontaneous_turn_id
         self._close_spontaneous_stream(spontaneous_turn_id)
         self._spontaneous_turn_id = None
@@ -1175,6 +1372,8 @@ class CodexHandle:
             if task is not asyncio.current_task()
         ]
         self._server_request_tasks.clear()
+        self._server_request_tasks_by_id.clear()
+        self._pending_server_request_ids.clear()
         self.proc = None
         self._process_group = None
         self._reader = None
@@ -1205,11 +1404,14 @@ class CodexHandle:
                 except asyncio.TimeoutError:
                     stop(getattr(signal, "SIGKILL", signal.SIGTERM), force=True)
                     await proc.wait()
-            # The app-server parent can exit before a tool subprocess that ignored
-            # SIGTERM. A final group kill guarantees no descendant survives session
-            # eviction, /btw close, or reconnect.
+            # For stdio this also cleans tool descendants.  For daemon mode the
+            # process group contains only this connection's proxy; the shared
+            # app-server was started independently by the official manager.
             if process_group is not None:
                 stop(signal.SIGKILL, force=True)
+        self._using_daemon_proxy = False
+        self._proxy_read_buffer.clear()
+        self._proxy_close_sent = False
         if self._turn_q is not None:
             self._force_turn_sentinel(self._turn_q)
             self._turn_q = None
@@ -1224,6 +1426,8 @@ class CodexHandle:
         if spontaneous_turn_id is not None:
             await self._publish_turn_lifecycle(
                 "completed", spontaneous_turn_id)
+        if daemon_proxy:
+            log.debug("codex daemon proxy disconnected")
 
     async def force_reconnect(self, resume_id: Optional[str], cwd: Optional[str] = None,
                               reason: str = "reconnect") -> None:
@@ -1788,31 +1992,36 @@ class CodexHandle:
             "error": {"code": code, "message": message},
         })
 
-    async def _approval_decision(self, method: str, params: dict) -> str:
-        """Return one current-schema approval decision, failing closed."""
+    async def _approval_decision(
+        self, method: str, params: dict,
+    ) -> Optional[str]:
+        """Return a decision, or stay silent for a shared pending request."""
         if self.approval == "never":
             return "decline"
         if self.approval not in {"on-request", "untrusted"}:
             log.warning("invalid codex approval policy; denying", approval=self.approval)
-            return "decline"
+            return None if self._using_daemon_proxy else "decline"
         callback = self.approval_callback
         if callback is None:
             log.warning("codex approval requested without a client callback", method=method)
-            return "decline"
+            return None if self._using_daemon_proxy else "decline"
         try:
             decision = await asyncio.wait_for(
                 callback(method, params), timeout=_APPROVAL_TIMEOUT)
         except asyncio.TimeoutError:
-            log.warning("codex approval timed out; denying", method=method)
-            return "decline"
+            log.warning("codex approval timed out", method=method)
+            return None if self._using_daemon_proxy else "decline"
         except Exception as exc:
-            log.warning("codex approval callback failed; denying",
-                        method=method, error=str(exc))
-            return "decline"
+            log.warning(
+                "codex approval callback failed",
+                method=method,
+                error_type=type(exc).__name__,
+            )
+            return None if self._using_daemon_proxy else "decline"
         if decision not in _APPROVAL_DECISIONS:
-            log.warning("invalid codex approval decision; denying",
+            log.warning("invalid codex approval decision",
                         method=method, decision=decision)
-            return "decline"
+            return None if self._using_daemon_proxy else "decline"
         return decision
 
     async def _handle_server_request(self, message: dict) -> None:
@@ -1833,22 +2042,34 @@ class CodexHandle:
         if method in _INTERACTION_METHODS:
             callback = self.interaction_callback
             if callback is None:
+                if self._using_daemon_proxy:
+                    return
                 await self._respond_error(rid, -32000, "remote interaction callback unavailable")
                 return
             try:
                 result = await asyncio.wait_for(
                     callback(method, params), timeout=_APPROVAL_TIMEOUT)
             except asyncio.TimeoutError:
+                if self._using_daemon_proxy:
+                    return
                 await self._respond_error(rid, -32001, "remote user input timed out")
                 return
             except Exception as exc:
-                log.warning("codex interaction callback failed", method=method, error=str(exc))
+                log.warning(
+                    "codex interaction callback failed",
+                    method=method,
+                    error_type=type(exc).__name__,
+                )
+                if self._using_daemon_proxy:
+                    return
                 await self._respond_error(rid, -32000, "remote user input failed")
                 return
             await self._respond(rid, result)
             return
 
         decision = await self._approval_decision(method, params)
+        if decision is None:
+            return
         if method in _LEGACY_APPROVAL_METHODS:
             decision = _LEGACY_DECISIONS[decision]
         await self._respond(rid, {"decision": decision})
@@ -1856,6 +2077,10 @@ class CodexHandle:
     def _server_request_done(self, task: asyncio.Task) -> None:
         """Observe a detached server-request task and keep the set bounded."""
         self._server_request_tasks.discard(task)
+        for request_id, owner in list(self._server_request_tasks_by_id.items()):
+            if owner is task:
+                self._server_request_tasks_by_id.pop(request_id, None)
+                self._pending_server_request_ids.discard(request_id)
         if task.cancelled():
             return
         try:
@@ -1868,25 +2093,170 @@ class CodexHandle:
                 error_type=type(error).__name__,
             )
 
+    async def _proxy_read_exact(
+        self, proc: asyncio.subprocess.Process, size: int,
+    ) -> bytes:
+        if proc.stdout is None:
+            raise CodexProxyProtocolError("proxy stdout unavailable")
+        while len(self._proxy_read_buffer) < size:
+            chunk = await proc.stdout.read(size - len(self._proxy_read_buffer))
+            if not chunk:
+                raise EOFError("Codex daemon proxy closed")
+            self._proxy_read_buffer.extend(chunk)
+        data = bytes(self._proxy_read_buffer[:size])
+        del self._proxy_read_buffer[:size]
+        return data
+
+    async def _proxy_read_frame(
+        self, proc: asyncio.subprocess.Process,
+    ) -> tuple[bool, int, bytes]:
+        header = await self._proxy_read_exact(proc, 2)
+        first, second = header
+        fin = bool(first & 0x80)
+        if first & 0x70:
+            raise CodexProxyProtocolError("unsupported WebSocket extension")
+        opcode = first & 0x0F
+        if opcode not in {0x0, 0x1, 0x2, 0x8, 0x9, 0xA}:
+            raise CodexProxyProtocolError("invalid WebSocket opcode")
+        # Servers never mask frames.  Accepting a masked local stream would hide
+        # a direction/protocol mixup and risks feeding arbitrary bytes to JSON.
+        if second & 0x80:
+            raise CodexProxyProtocolError("masked WebSocket server frame")
+        length_marker = second & 0x7F
+        if length_marker == 126:
+            length = int.from_bytes(
+                await self._proxy_read_exact(proc, 2), "big")
+            if length <= 125:
+                raise CodexProxyProtocolError("non-canonical WebSocket length")
+        elif length_marker == 127:
+            raw_length = await self._proxy_read_exact(proc, 8)
+            if raw_length[0] & 0x80:
+                raise CodexProxyProtocolError("invalid WebSocket length")
+            length = int.from_bytes(raw_length, "big")
+            if length <= 0xFFFF:
+                raise CodexProxyProtocolError("non-canonical WebSocket length")
+        else:
+            length = length_marker
+        if length > _PROXY_MESSAGE_MAX:
+            raise CodexProxyProtocolError("WebSocket frame exceeds limit")
+        if opcode >= 0x8 and (not fin or length > 125):
+            raise CodexProxyProtocolError("invalid WebSocket control frame")
+        return fin, opcode, await self._proxy_read_exact(proc, length)
+
+    async def _send_proxy_frame(self, payload: bytes, opcode: int) -> None:
+        if not self._using_daemon_proxy:
+            raise CodexProxyProtocolError("proxy transport is not active")
+        frame = _websocket_client_frame(payload, opcode=opcode)
+        async with self._send_lock:
+            proc = self.proc
+            if proc is None or proc.stdin is None:
+                raise RuntimeError("codex daemon proxy disconnected")
+            proc.stdin.write(frame)
+            await proc.stdin.drain()
+
+    async def _proxy_read_message(
+        self, proc: asyncio.subprocess.Process,
+    ) -> Optional[bytes]:
+        fragments: Optional[bytearray] = None
+        while True:
+            fin, opcode, payload = await self._proxy_read_frame(proc)
+            if opcode == 0x8:  # close
+                if len(payload) == 1:
+                    raise CodexProxyProtocolError("invalid WebSocket close frame")
+                if len(payload) >= 2:
+                    code = int.from_bytes(payload[:2], "big")
+                    defined = code in {
+                        1000, 1001, 1002, 1003, 1007, 1008,
+                        1009, 1010, 1011, 1012, 1013, 1014,
+                    }
+                    if not defined and not 3000 <= code < 5000:
+                        raise CodexProxyProtocolError("invalid WebSocket close code")
+                    try:
+                        payload[2:].decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise CodexProxyProtocolError(
+                            "invalid WebSocket close reason") from exc
+                if not self._proxy_close_sent:
+                    self._proxy_close_sent = True
+                    await self._send_proxy_frame(payload, 0x8)
+                return None
+            if opcode == 0x9:  # ping
+                await self._send_proxy_frame(payload, 0xA)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+            if opcode == 0x2:
+                raise CodexProxyProtocolError(
+                    "binary app-server WebSocket message")
+            if opcode == 0x1:
+                if fragments is not None:
+                    raise CodexProxyProtocolError(
+                        "interleaved WebSocket data messages")
+                if fin:
+                    try:
+                        payload.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise CodexProxyProtocolError(
+                            "invalid WebSocket text") from exc
+                    return payload
+                fragments = bytearray(payload)
+                continue
+            # continuation
+            if fragments is None:
+                raise CodexProxyProtocolError(
+                    "unexpected WebSocket continuation")
+            if len(fragments) + len(payload) > _PROXY_MESSAGE_MAX:
+                raise CodexProxyProtocolError(
+                    "WebSocket message exceeds limit")
+            fragments.extend(payload)
+            if fin:
+                complete = bytes(fragments)
+                try:
+                    complete.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise CodexProxyProtocolError(
+                        "invalid fragmented WebSocket text") from exc
+                return complete
+
     async def _send(self, obj: dict) -> None:
-        assert self.proc and self.proc.stdin
-        self.proc.stdin.write((json.dumps(obj) + "\n").encode())
-        await self.proc.stdin.drain()
+        payload = json.dumps(obj).encode("utf-8")
+        if self._using_daemon_proxy:
+            await self._send_proxy_frame(payload, 0x1)
+            return
+        async with self._send_lock:
+            proc = self.proc
+            assert proc and proc.stdin
+            proc.stdin.write(payload + b"\n")
+            await proc.stdin.drain()
 
     async def _read_loop(self, proc: asyncio.subprocess.Process,
                          generation: int) -> None:
         assert proc.stdout
+        daemon_proxy = self._using_daemon_proxy
         try:
             while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
+                if daemon_proxy:
+                    line = await self._proxy_read_message(proc)
+                    if line is None:
+                        break
+                else:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
                 try:
                     m = json.loads(line)
-                except Exception:
+                except Exception as exc:
+                    if daemon_proxy:
+                        raise CodexProxyProtocolError(
+                            "invalid app-server JSON message") from exc
+                    continue
+                if not isinstance(m, dict):
+                    if daemon_proxy:
+                        raise CodexProxyProtocolError(
+                            "non-object app-server WebSocket message")
                     continue
                 if generation != self._generation:
                     return
@@ -1902,6 +2272,9 @@ class CodexHandle:
             pass
         except Exception as e:
             log.warning("codex read loop ended", error=str(e))
+            if daemon_proxy and generation == self._generation:
+                self.daemon_manager.invalidate()
+                await self.disconnect()
         finally:
             # A stale reader belongs to an app-server generation already replaced
             # by disconnect/reconnect.  Leave the new generation alone, but do not
@@ -1909,6 +2282,10 @@ class CodexHandle:
             # exception from this reader task.
             if generation == self._generation:
                 self._dead = True
+                if daemon_proxy:
+                    self.daemon_manager.invalidate()
+                    self._using_daemon_proxy = False
+                    self._proxy_read_buffer.clear()
                 self._clear_review_tracking()
                 spontaneous_turn_id = self._spontaneous_turn_id
                 self._spontaneous_turn_id = None
@@ -2034,11 +2411,46 @@ class CodexHandle:
                     fut.set_result(m.get("result"))
             return
         if has_id and has_method:                            # server -> client request
+            method = m.get("method")
+            request_id = _server_request_key(m.get("id"))
+            missing_callback = isinstance(method, str) and ((
+                method in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS
+                and self.approval != "never"
+                and self.approval_callback is None
+            ) or (
+                method in _INTERACTION_METHODS
+                and self.interaction_callback is None
+            ))
+            if self._using_daemon_proxy and missing_callback:
+                # A shared app-server can deliver the same prompt to another
+                # subscribed client.  Silence means "still pending"; replying
+                # decline/error here would win the race and reject it globally.
+                if (request_id is not None
+                        and len(self._pending_server_request_ids)
+                        < _MAX_SERVER_REQUEST_TASKS):
+                    self._pending_server_request_ids.add(request_id)
+                log.warning(
+                    "Codex shared server request left pending without callback",
+                    method=method,
+                )
+                return
             if len(self._server_request_tasks) >= _MAX_SERVER_REQUEST_TASKS:
-                method = m.get("method")
                 rid = m.get("id")
-                log.warning("codex server request cap reached; rejecting",
-                            method=method)
+                supported = isinstance(method, str) and method in (
+                    _NEW_APPROVAL_METHODS
+                    | _LEGACY_APPROVAL_METHODS
+                    | _INTERACTION_METHODS
+                )
+                if self._using_daemon_proxy and supported:
+                    # Do not let this saturated connection reject a prompt which
+                    # another subscribed official client can still resolve.
+                    log.warning(
+                        "Codex shared server request cap reached; left pending",
+                        method=method,
+                    )
+                    return
+                log.warning(
+                    "codex server request cap reached; rejecting", method=method)
                 if method in _NEW_APPROVAL_METHODS:
                     await self._respond(rid, {"decision": "decline"})
                 elif method in _LEGACY_APPROVAL_METHODS:
@@ -2049,10 +2461,22 @@ class CodexHandle:
                 return
             task = asyncio.create_task(self._handle_server_request(m))
             self._server_request_tasks.add(task)
+            if request_id is not None:
+                self._server_request_tasks_by_id[request_id] = task
+                self._pending_server_request_ids.add(request_id)
             task.add_done_callback(self._server_request_done)
             return
         # notification
         method = m.get("method")
+        if method == "serverRequest/resolved":
+            params = m.get("params")
+            request_id = _server_request_key(
+                params.get("requestId") if isinstance(params, dict) else None)
+            if request_id is not None:
+                self._pending_server_request_ids.discard(request_id)
+                task = self._server_request_tasks_by_id.pop(request_id, None)
+                if task is not None and not task.done():
+                    task.cancel()
         if not self._notification_is_current(m):
             return
         target_turn_id = _notification_turn_id(m)

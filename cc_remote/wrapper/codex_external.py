@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+import glob
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -19,8 +20,16 @@ MAX_PROC_SCAN = 8192
 MAX_FDS_PER_PROCESS = 8192
 MAX_PARTIAL_RECORD_BYTES = 16 * 1024 * 1024
 MAX_CMDLINE_BYTES = 64 * 1024
+_TUI_SNAPSHOT_START_SLOP_NS = 2_000_000_000
+_TUI_SNAPSHOT_READY_WINDOW_NS = 20_000_000_000
 _TERMINAL_EVENTS = frozenset({
     "task_complete", "turn_aborted", "task_failed", "task_cancelled",
+})
+_RESUME_OPTIONS_WITH_VALUE = frozenset({
+    b"-c", b"--config", b"--enable", b"--disable", b"--remote",
+    b"--remote-auth-token-env", b"-m", b"--model", b"--local-provider",
+    b"-p", b"--profile", b"-s", b"--sandbox", b"-C", b"--cd",
+    b"--add-dir", b"-a", b"--ask-for-approval", b"-i", b"--image",
 })
 
 
@@ -111,8 +120,118 @@ def _codex_resume_sids(
     if not command_names.intersection({b"codex", b"codex.exe", b"codex.js"}):
         return set()
     resume_at = args.index(b"resume")
+    # `--last` resolves the target inside Codex. Its first positional is PROMPT,
+    # so /proc contains no exact session id that Remote can safely claim.
+    if b"--last" in args[resume_at + 1:]:
+        return set()
+    index = resume_at + 1
+    while index < len(args):
+        arg = args[index]
+        if arg == b"--":
+            index += 1
+            if index >= len(args):
+                return set()
+            arg = args[index]
+        elif arg in _RESUME_OPTIONS_WITH_VALUE:
+            # Missing option values are left to Codex to reject. Conservatively
+            # stop when no value is present rather than mistaking later prompt
+            # text for a session owner.
+            index += 2
+            continue
+        elif arg.startswith(b"-"):
+            index += 1
+            continue
+        sid = sid_by_arg.get(arg)
+        # SESSION_ID is the first positional after `resume`; the following
+        # positional is PROMPT and may itself happen to contain another UUID.
+        return {sid} if sid is not None else set()
+    return set()
+
+
+def _is_interactive_codex_tui(
+    args: tuple[bytes, ...] | None, tty_nr: int,
+) -> bool:
+    """Recognize a native Codex TUI without treating helper commands as one."""
+    if tty_nr == 0 or not args:
+        return False
+    command_names = {arg.rsplit(b"/", 1)[-1] for arg in args[:2]}
+    if not command_names.intersection({b"codex", b"codex.exe", b"codex.js"}):
+        return False
+    return not any(
+        helper in args for helper in (
+            b"app-server", b"mcp-server", b"exec", b"execpolicy",
+        )
+    )
+
+
+def _rollout_cwd(path: str) -> str | None:
+    """Read only the bounded session_meta cwd needed for TUI attribution."""
+    try:
+        with open(path, "rb") as stream:
+            line = stream.readline(1024 * 1024 + 1)
+        if len(line) > 1024 * 1024:
+            return None
+        record = json.loads(line)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    payload = record.get("payload") if isinstance(record, dict) else None
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
+        return None
+    return os.path.realpath(cwd)
+
+
+def _shell_snapshot_rows(
+    paths: Mapping[str, str], root: str,
+) -> tuple[tuple[str, int, str | None], ...]:
+    """Return exact watched session snapshots without scanning unrelated files."""
+    rows: list[tuple[str, int, str | None]] = []
+    for sid, rollout in paths.items():
+        latest = -1
+        try:
+            matches = glob.iglob(os.path.join(root, f"{glob.escape(sid)}.*.sh"))
+            for match in matches:
+                try:
+                    latest = max(latest, os.stat(match).st_mtime_ns)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+        if latest >= 0:
+            rows.append((sid, latest, _rollout_cwd(rollout)))
+    return tuple(rows)
+
+
+def _snapshot_tui_bindings(
+    processes: list[tuple[ProcessIdentity, int, str]],
+    snapshots: tuple[tuple[str, int, str | None], ...],
+) -> dict[ProcessIdentity, str]:
+    """Uniquely bind plain `codex` TUIs to their startup shell snapshot.
+
+    A shared app-server TUI does not keep the rollout open and a fresh `codex`
+    command has no session id in argv. Codex does, however, create one shell
+    snapshot named with the exact thread id immediately after that TUI starts.
+    Bind only a one-to-one process/snapshot match in the same cwd and short
+    startup window; ambiguous simultaneous launches deliberately stay unknown.
+    """
+    candidates: dict[ProcessIdentity, set[str]] = {}
+    for identity, started_ns, cwd in processes:
+        matches = {
+            sid for sid, snapshot_ns, session_cwd in snapshots
+            if session_cwd == cwd
+            and started_ns - _TUI_SNAPSHOT_START_SLOP_NS <= snapshot_ns
+            <= started_ns + _TUI_SNAPSHOT_READY_WINDOW_NS
+        }
+        if matches:
+            candidates[identity] = matches
+    counts: dict[str, int] = {}
+    for matches in candidates.values():
+        for sid in matches:
+            counts[sid] = counts.get(sid, 0) + 1
     return {
-        sid_by_arg[arg] for arg in args[resume_at + 1:] if arg in sid_by_arg
+        identity: next(iter(matches))
+        for identity, matches in candidates.items()
+        if len(matches) == 1 and counts.get(next(iter(matches))) == 1
     }
 
 
@@ -134,6 +253,7 @@ def writable_rollout_holders(
     own_processes: Iterable[ProcessIdentity] = (),
     *,
     proc_root: str = "/proc",
+    shell_snapshot_root: str | None = None,
 ) -> HolderScan:
     """Return writable holders of each rollout, excluding exact wrapper children.
 
@@ -156,6 +276,11 @@ def writable_rollout_holders(
 
     own = set(own_processes)
     root = Path(proc_root)
+    if shell_snapshot_root is None:
+        codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+        shell_snapshot_root = os.path.join(codex_home, "shell_snapshots")
+    snapshots = _shell_snapshot_rows(paths, shell_snapshot_root)
+    unresolved_tuis: list[tuple[ProcessIdentity, int, str]] = []
     if own:
         own_fd_visible = False
         for identity in own:
@@ -188,6 +313,7 @@ def writable_rollout_holders(
             args = _process_cmdline(proc_dir)
             logical_sids = (
                 _codex_resume_sids(args, sid_by_arg) if tty_nr != 0 else set())
+            interactive_tui = _is_interactive_codex_tui(args, tty_nr)
             matched: set[str] = set()
             try:
                 fds = proc_dir.joinpath("fd").iterdir()
@@ -219,12 +345,20 @@ def writable_rollout_holders(
                     matched.update(sids)
             except OSError:
                 pass
-            if not matched and not logical_sids:
+            if not matched and not logical_sids and not interactive_tui:
                 continue
             # The process may have exited or the PID may have been reused while
             # its descriptors/cmdline were scanned. Only accept a stable identity.
             if _process_start_ticks(proc_dir) != start:
                 continue
+            if not logical_sids and interactive_tui:
+                try:
+                    cwd = os.path.realpath(os.readlink(proc_dir / "cwd"))
+                    started_ns = proc_dir.stat().st_ctime_ns
+                except OSError:
+                    cwd = ""
+                if cwd:
+                    unresolved_tuis.append((identity, started_ns, cwd))
             for sid in logical_sids:
                 result[sid].add(identity)
             for sid in matched:
@@ -233,6 +367,10 @@ def writable_rollout_holders(
                     passive[sid].add(identity)
     except OSError:
         return HolderScan(result, False, passive)
+    for identity, sid in _snapshot_tui_bindings(
+        unresolved_tuis, snapshots,
+    ).items():
+        result[sid].add(identity)
     return HolderScan(result, complete, passive)
 
 

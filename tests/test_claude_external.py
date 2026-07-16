@@ -50,7 +50,7 @@ def _fake_process(
     return proc
 
 
-def test_claude_process_scan_tracks_exact_and_cwd_owners(tmp_path):
+def test_claude_process_scan_tracks_explicit_owner_only(tmp_path):
     sid = "11111111-1111-4111-8111-111111111111"
     sibling = "22222222-2222-4222-8222-222222222222"
     other = "33333333-3333-4333-8333-333333333333"
@@ -64,12 +64,12 @@ def test_claude_process_scan_tracks_exact_and_cwd_owners(tmp_path):
         cmdline=("claude", "--resume", sid),
     )
     _fake_process(
-        proc_root, 102, 1002, cwd=project,
-        cmdline=("/usr/local/bin/claude",),
-    )
-    _fake_process(
         proc_root, 103, 1003, parent_pid=900, cwd=project,
         cmdline=("claude", "--resume", sibling),
+    )
+    _fake_process(
+        proc_root, 104, 1004, cwd=elsewhere,
+        cmdline=("claude", f"--session-id={sibling}"),
     )
     paths = {sid: "a", sibling: "b", other: "c"}
     scan = claude_session_holders(
@@ -80,10 +80,307 @@ def test_claude_process_scan_tracks_exact_and_cwd_owners(tmp_path):
     )
 
     assert scan.complete is True
-    assert scan.holders[sid] == {
-        ProcessIdentity(101, 1001), ProcessIdentity(102, 1002)}
-    assert scan.holders[sibling] == {ProcessIdentity(102, 1002)}
+    assert scan.holders[sid] == {ProcessIdentity(101, 1001)}
+    assert scan.holders[sibling] == {ProcessIdentity(104, 1004)}
     assert scan.holders[other] == set()
+
+
+def test_claude_process_scan_assigns_unqualified_owner_for_unique_cwd(tmp_path):
+    sid = "11111111-1111-4111-8111-111111111111"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 102, 1002, cwd=project,
+        cmdline=("/usr/local/bin/claude",),
+    )
+
+    scan = claude_session_holders(
+        {sid: "transcript"}, {sid: str(project)}, wrapper_pid=900,
+        proc_root=str(proc_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[sid] == {ProcessIdentity(102, 1002)}
+
+
+def test_claude_process_scan_bare_resume_uses_unique_cwd_fallback(tmp_path):
+    sid = "11111111-1111-4111-8111-111111111111"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    commands = (
+        ("/usr/local/bin/claude", "--resume"),
+        ("/usr/local/bin/claude", "-r"),
+        ("/usr/local/bin/claude", "--resume="),
+    )
+    for offset, command in enumerate(commands):
+        _fake_process(
+            proc_root, 102 + offset, 1002 + offset,
+            cwd=project, cmdline=command,
+        )
+
+    scan = claude_session_holders(
+        {sid: "transcript"}, {sid: str(project)}, wrapper_pid=900,
+        proc_root=str(proc_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[sid] == {
+        ProcessIdentity(102, 1002),
+        ProcessIdentity(103, 1003),
+        ProcessIdentity(104, 1004),
+    }
+
+
+def test_claude_process_scan_never_reassigns_explicit_unknown_session(tmp_path):
+    sid = "11111111-1111-4111-8111-111111111111"
+    unknown = "99999999-9999-4999-8999-999999999999"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 102, 1002, cwd=project,
+        cmdline=("/usr/local/bin/claude", "--resume", unknown),
+    )
+
+    scan = claude_session_holders(
+        {sid: "transcript"}, {sid: str(project)}, wrapper_pid=900,
+        proc_root=str(proc_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[sid] == set()
+
+
+def test_claude_process_scan_does_not_fan_out_ambiguous_cwd_owner(tmp_path):
+    sid = "11111111-1111-4111-8111-111111111111"
+    sibling = "22222222-2222-4222-8222-222222222222"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 102, 1002, cwd=project,
+        cmdline=("/usr/local/bin/claude",),
+    )
+
+    scan = claude_session_holders(
+        {sid: "a", sibling: "b"},
+        {sid: str(project), sibling: str(project)},
+        wrapper_pid=900,
+        proc_root=str(proc_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders == {sid: set(), sibling: set()}
+
+
+def test_claude_continue_uses_native_latest_and_sticks_until_process_exit(
+    tmp_path,
+):
+    older = "11111111-1111-4111-8111-111111111111"
+    latest = "22222222-2222-4222-8222-222222222222"
+    project = tmp_path / "project"
+    project.mkdir()
+    older_path = tmp_path / "older.jsonl"
+    latest_path = tmp_path / "latest.jsonl"
+    older_path.write_bytes(b"older\n")
+    latest_path.write_bytes(b"latest\n")
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 150, 1500, cwd=project,
+        cmdline=("/usr/local/bin/claude", "-c"),
+    )
+    identity = ProcessIdentity(150, 1500)
+    bindings: dict[ProcessIdentity, str] = {}
+    paths = {older: str(older_path), latest: str(latest_path)}
+    cwds = {older: str(project), latest: str(project)}
+    resolved = []
+
+    def resolver(cwd):
+        resolved.append(cwd)
+        return latest
+
+    first = claude_session_holders(
+        paths, cwds, wrapper_pid=900, proc_root=str(proc_root),
+        continue_bindings=bindings,
+        continue_resolver=resolver,
+    )
+    assert first.complete is True
+    assert first.holders == {older: set(), latest: {identity}}
+    assert bindings == {identity: latest}
+    assert resolved == [str(project)]
+
+    # Native catalog changes do not move a still-running process after its
+    # startup selection has been recorded.
+    second = claude_session_holders(
+        paths, cwds, wrapper_pid=900, proc_root=str(proc_root),
+        continue_bindings=bindings,
+        continue_resolver=lambda _cwd: older,
+    )
+    assert second.holders == {older: set(), latest: {identity}}
+    assert bindings == {identity: latest}
+    assert resolved == [str(project)]
+
+    empty_proc = tmp_path / "empty-proc"
+    empty_proc.mkdir()
+    exited = claude_session_holders(
+        paths, cwds, wrapper_pid=900, proc_root=str(empty_proc),
+        continue_bindings=bindings,
+        continue_resolver=resolver,
+    )
+    assert exited.complete is True
+    assert bindings == {}
+
+
+def test_claude_continue_never_guesses_from_old_watched_subset(tmp_path):
+    older = "11111111-1111-4111-8111-111111111111"
+    newer = "22222222-2222-4222-8222-222222222222"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 151, 1501, cwd=project,
+        cmdline=("/usr/local/bin/claude", "--continue"),
+    )
+    identity = ProcessIdentity(151, 1501)
+    bindings: dict[ProcessIdentity, str] = {}
+    candidates: dict[ProcessIdentity, str] = {}
+    calls = []
+
+    def resolver(cwd):
+        calls.append(cwd)
+        return newer
+
+    old_only = claude_session_holders(
+        {older: "old.jsonl"}, {older: str(project)}, wrapper_pid=900,
+        proc_root=str(proc_root), continue_bindings=bindings,
+        continue_candidates=candidates,
+        continue_resolver=resolver,
+    )
+    assert old_only.complete is True
+    assert old_only.holders == {older: set()}
+    assert bindings == {}
+    assert candidates == {identity: newer}
+
+    both = claude_session_holders(
+        {older: "old.jsonl", newer: "new.jsonl"},
+        {older: str(project), newer: str(project)}, wrapper_pid=900,
+        proc_root=str(proc_root), continue_bindings=bindings,
+        continue_candidates=candidates,
+        continue_resolver=resolver,
+    )
+    assert both.complete is True
+    assert both.holders == {older: set(), newer: {identity}}
+    assert bindings == {identity: newer}
+    assert calls == [str(project)]
+
+
+def test_claude_continue_catalog_failure_is_incomplete_not_old_owner(tmp_path):
+    older = "11111111-1111-4111-8111-111111111111"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 152, 1502, cwd=project,
+        cmdline=("/usr/local/bin/claude", "-c"),
+    )
+    bindings: dict[ProcessIdentity, str] = {}
+    candidates: dict[ProcessIdentity, str] = {}
+
+    def failed_catalog(_cwd):
+        raise RuntimeError("catalog unavailable")
+
+    scan = claude_session_holders(
+        {older: "old.jsonl"}, {older: str(project)}, wrapper_pid=900,
+        proc_root=str(proc_root), continue_bindings=bindings,
+        continue_candidates=candidates,
+        continue_resolver=failed_catalog,
+    )
+    assert scan.complete is False
+    assert scan.holders == {older: set()}
+    assert bindings == {}
+    assert candidates == {}
+
+
+def test_claude_continue_empty_catalog_retries_without_caching(tmp_path):
+    session_id = "11111111-1111-4111-8111-111111111111"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 153, 1503, cwd=project,
+        cmdline=("/usr/local/bin/claude", "--continue"),
+    )
+    identity = ProcessIdentity(153, 1503)
+    bindings: dict[ProcessIdentity, str] = {}
+    candidates: dict[ProcessIdentity, str] = {}
+    results = iter((None, session_id))
+    calls = []
+
+    def racing_catalog(cwd):
+        calls.append(cwd)
+        return next(results)
+
+    first = claude_session_holders(
+        {session_id: "session.jsonl"}, {session_id: str(project)},
+        wrapper_pid=900, proc_root=str(proc_root),
+        continue_bindings=bindings,
+        continue_candidates=candidates,
+        continue_resolver=racing_catalog,
+    )
+    assert first.complete is False
+    assert first.holders == {session_id: set()}
+    assert bindings == {}
+    assert candidates == {}
+
+    second = claude_session_holders(
+        {session_id: "session.jsonl"}, {session_id: str(project)},
+        wrapper_pid=900, proc_root=str(proc_root),
+        continue_bindings=bindings,
+        continue_candidates=candidates,
+        continue_resolver=racing_catalog,
+    )
+    assert second.complete is True
+    assert second.holders == {session_id: {identity}}
+    assert bindings == {identity: session_id}
+    assert candidates == {identity: session_id}
+    assert calls == [str(project), str(project)]
+
+
+def test_prime_claude_ownership_resolves_against_all_watched_sessions(
+    tmp_path, monkeypatch,
+):
+    async def go():
+        machine, _ = _mk_machine()
+        project = tmp_path / "project"
+        project.mkdir()
+        first_path = tmp_path / "first.jsonl"
+        second_path = tmp_path / "second.jsonl"
+        first_path.write_bytes(b"")
+        second_path.write_bytes(b"")
+        machine._watch["first"] = {
+            **_watch(first_path), "cwd": str(project),
+        }
+        machine._watch["second"] = {
+            **_watch(second_path), "cwd": str(project),
+        }
+        observed = []
+
+        async def probe(paths, cwds):
+            observed.append((dict(paths), dict(cwds)))
+            return HolderScan(
+                {"first": set(), "second": {ProcessIdentity(160, 1600)}},
+                True,
+            )
+
+        monkeypatch.setattr(machine, "_probe_claude_holders", probe)
+
+        assert await machine._prime_claude_ownership("first") is False
+        assert set(observed[0][0]) == {"first", "second"}
+        assert set(observed[0][1]) == {"first", "second"}
+
+    asyncio.run(go())
 
 
 def test_claude_process_scan_recognizes_native_installer_and_ignores_daemon(
@@ -390,7 +687,7 @@ def test_final_preflight_closes_the_watcher_poll_window(monkeypatch):
     asyncio.run(go())
 
 
-def test_claude_takeover_waits_for_the_terminal_process_to_exit(
+def test_claude_takeover_explicitly_migrates_the_terminal_process(
     tmp_path, monkeypatch,
 ):
     async def go():
@@ -408,17 +705,66 @@ def test_claude_takeover_waits_for_the_terminal_process_to_exit(
         async def probe(_paths, _cwds):
             return HolderScan({"sid": {holder}}, True)
 
+        async def terminate(holders):
+            assert holders == {holder}
+            return set()
+
         monkeypatch.setattr(
             machine, "_probe_claude_holders", probe, raising=False)
+        monkeypatch.setattr(
+            machine, "_terminate_external_claude_holders", terminate,
+            raising=False)
         result = await machine._handle_takeover(Takeover(
             sid="sid", cmd_id="takeover-1"))
 
         assert result is None
-        assert watch["takeover_pending"] is True
-        assert machine._is_external("sid") is True
+        assert watch["takeover_pending"] is False
+        assert machine._is_external("sid") is False
+        assert ctx.needs_reload is True
         pending = [event for event in transport.sent
                    if getattr(event, "type", None) == "takeover_state"]
-        assert pending and pending[-1].pending is True
+        assert [event.pending for event in pending[-2:]] == [True, False]
+
+    asyncio.run(go())
+
+
+def test_claude_takeover_never_force_kills_a_process_that_does_not_exit(
+    tmp_path, monkeypatch,
+):
+    async def go():
+        machine, transport = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.sdk = _ClaudeRunSdk()
+        machine.sessions["sid"] = ctx
+        holder = ProcessIdentity(104, 1004)
+        watch = _watch(path)
+        watch.update({"external": True, "holders": {holder}})
+        machine._watch["sid"] = watch
+
+        async def probe(_paths, _cwds):
+            return HolderScan({"sid": {holder}}, True)
+
+        async def terminate(holders):
+            assert holders == {holder}
+            return {holder}
+
+        monkeypatch.setattr(
+            machine, "_probe_claude_holders", probe, raising=False)
+        monkeypatch.setattr(
+            machine, "_terminate_external_claude_holders", terminate,
+            raising=False)
+
+        result = await machine._handle_takeover(Takeover(
+            sid="sid", cmd_id="takeover-refused"))
+
+        assert result is not None and result.code == "busy"
+        assert watch["takeover_pending"] is False
+        assert machine._is_external("sid") is True
+        assert ctx.needs_reload is False
+        assert not any(getattr(event, "type", None) == "history"
+                       for event in transport.sent)
 
     asyncio.run(go())
 

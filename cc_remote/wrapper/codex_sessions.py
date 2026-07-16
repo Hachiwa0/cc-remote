@@ -212,7 +212,11 @@ def codex_session_settings(
     """The per-thread settings carried by the latest bounded rollout tail.
 
     Codex appends a `turn_context` record per turn carrying `model`, `effort`,
-    and the nested `collaboration_mode` selected for that turn.
+    and the nested `collaboration_mode` selected for that turn. A live
+    `thread/settings/update` is persisted immediately as a
+    `thread_settings_applied` event, before another turn necessarily exists.
+    Both records are consumed in file order so a wrapper restart cannot restore
+    the preceding turn's stale controls over that newer applied snapshot.
     The official thread/resume response is authoritative for settings it exposes;
     this bounded tail is the fallback and remains necessary for collaboration mode,
     which 0.144.1 does not include in that response. Config.toml is never a valid
@@ -231,8 +235,8 @@ def codex_session_settings(
     out: dict = {}
     try:
         # A long-running thread can easily exceed 64 MiB. Only its newest
-        # turn_context matters, so seek to a bounded tail and discard the first
-        # partial JSONL record instead of rejecting the entire rollout.
+        # settings records matter, so seek to a bounded tail and discard the
+        # first partial JSONL record instead of rejecting the entire rollout.
         tail_bytes = max(1, int(max_bytes))
         start = max(0, size - tail_bytes)
         with open(path, "rb") as f:
@@ -258,29 +262,43 @@ def codex_session_settings(
                     line = raw.decode("utf-8")
                 except UnicodeDecodeError:
                     continue
-                # cheap prefilter: most lines are messages, not turn contexts
-                if '"turn_context"' not in line:
+                # Cheap prefilter: most lines are messages, not settings.
+                if ('"turn_context"' not in line
+                        and '"thread_settings_applied"' not in line):
                     continue
                 try:
                     rec = json.loads(line)
                 except Exception:
                     continue
-                if rec.get("type") != "turn_context":
-                    continue
+                record_type = rec.get("type")
                 payload = rec.get("payload")
+                effort_key = "effort"
+                if record_type == "event_msg" and isinstance(payload, dict):
+                    if payload.get("type") != "thread_settings_applied":
+                        continue
+                    payload = payload.get("thread_settings")
+                    effort_key = "reasoning_effort"
+                elif record_type != "turn_context":
+                    continue
                 if not isinstance(payload, dict):
                     continue
-                for key in ("model", "effort"):
-                    val = payload.get(key)
-                    if isinstance(val, str) and val:
-                        out[key] = val[:256 if key == "model" else 64]
-                        # last one wins = the session's current setting
+
+                model = payload.get("model")
+                if isinstance(model, str) and model:
+                    out["model"] = model[:256]
+                if effort_key in payload:
+                    effort = payload.get(effort_key)
+                    if isinstance(effort, str) and effort:
+                        out["effort"] = effort[:64]
+                    elif effort is None:
+                        out.pop("effort", None)
+
                 approval = payload.get("approval_policy")
                 if approval in {"untrusted", "on-request", "never"}:
                     out["approval_policy"] = approval
                 if "service_tier" in payload:
                     tier = payload.get("service_tier")
-                    if tier is None:
+                    if tier is None or tier == "default":
                         out["service_tier"] = None
                     elif isinstance(tier, str) and tier:
                         out["service_tier"] = tier[:64]

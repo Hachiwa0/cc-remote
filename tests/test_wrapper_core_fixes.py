@@ -1032,6 +1032,76 @@ def test_codex_session_settings_restores_last_valid_collaboration_mode(
     }
 
 
+def test_codex_session_settings_restores_applied_update_before_next_turn(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout-session-1.jsonl"
+    rollout.write_text("\n".join(json.dumps(row) for row in [
+        {"type": "turn_context", "payload": {
+            "model": "gpt-before", "effort": "low",
+            "approval_policy": "on-request", "service_tier": "fast",
+            "collaboration_mode": {"mode": "default"},
+        }},
+        # app-server persists this immediately. There is deliberately no newer
+        # turn_context: this is the wrapper-restart window that used to restore
+        # gpt-before until the user sent another message.
+        {"type": "event_msg", "payload": {
+            "type": "thread_settings_applied",
+            "thread_settings": {
+                "model": "gpt-after",
+                "reasoning_effort": "xhigh",
+                "approval_policy": "never",
+                "service_tier": "default",
+                "collaboration_mode": {"mode": "plan", "settings": {
+                    "model": "gpt-after",
+                    "developer_instructions": "must not escape into output",
+                }},
+            },
+        }},
+    ]) + "\n")
+    monkeypatch.setattr(
+        codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
+
+    assert codex_session_settings("session-1") == {
+        "model": "gpt-after",
+        "effort": "xhigh",
+        "approval_policy": "never",
+        "service_tier": None,
+        "collaboration_mode": "plan",
+    }
+
+
+def test_codex_session_settings_last_ordered_record_wins_after_update(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout-session-1.jsonl"
+    rollout.write_text("\n".join(json.dumps(row) for row in [
+        {"type": "turn_context", "payload": {
+            "model": "gpt-first", "effort": "low",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "thread_settings_applied",
+            "thread_settings": {
+                "model": "gpt-second", "reasoning_effort": "high",
+                "service_tier": "default",
+                "collaboration_mode": {"mode": "plan"},
+            },
+        }},
+        {"type": "turn_context", "payload": {
+            "model": "gpt-third", "effort": "ultra",
+            "service_tier": "fast",
+            "collaboration_mode": {"mode": "default"},
+        }},
+    ]) + "\n")
+    monkeypatch.setattr(
+        codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
+
+    assert codex_session_settings("session-1") == {
+        "model": "gpt-third",
+        "effort": "ultra",
+        "service_tier": "fast",
+        "collaboration_mode": "default",
+    }
+
+
 def test_codex_history_skips_one_oversized_record_and_continues(
         monkeypatch, tmp_path):
     rollout = tmp_path / "rollout.jsonl"

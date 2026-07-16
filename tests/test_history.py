@@ -173,7 +173,7 @@ def test_hello_with_cursor_replays_only_missing_tail():
             generations={"s1": m.instance_id}, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
-            "replay_start", "user_msg", "replay_end", "perm"]
+            "replay_start", "user_msg", "replay_end", "session_control", "perm"]
         assert tr.sent[1].msg_id == "m3"
         assert all(msg.to == "c1" for msg in tr.sent)
 

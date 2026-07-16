@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from cc_remote.claude_broker.paths import default_socket_path
+
 try:
     from dotenv import load_dotenv
 
@@ -96,6 +98,9 @@ class WrapperConfig:
     # Optional explicit Claude Code executable. Blank preserves the existing
     # SDK/PATH discovery behavior.
     claude_bin: str = field(default_factory=lambda: _env("CLAUDE_BIN", "").strip())
+    # Optional local PTY broker used only by the explicit `claude-remote`
+    # launcher. The normal `claude` executable remains untouched.
+    claude_broker_socket: str = field(default_factory=default_socket_path)
     # cwd for the cc session. MUST match the resumed session's cwd, otherwise
     # --resume cannot locate the session jsonl under ~/.claude/projects/.
     cc_cwd: str = field(default_factory=lambda: _env("CC_CWD", os.getcwd()))
@@ -129,6 +134,12 @@ class WrapperConfig:
     # Set 0 to disable.
     codex_turn_idle_warn_seconds: float = field(
         default_factory=lambda: _float("CODEX_TURN_IDLE_WARN_SECONDS", 90.0)
+    )
+    # Code sessions prefer Codex's official shared app-server daemon so the
+    # native TUI and Remote can attach to the same thread/control plane. Work
+    # intentionally keeps its private stdio app-server for isolation.
+    codex_daemon_mode: str = field(
+        default_factory=lambda: _env("CC_REMOTE_CODEX_DAEMON", "auto").strip().lower()
     )
     # Max cc subprocesses (resident sessions) the wrapper runs concurrently. Each
     # session = one `claude --resume` child (~190MB RAM). Over the cap → evict an
@@ -360,6 +371,15 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
     elif (cfg.claude_bin
           and not os.path.isabs(os.path.expanduser(cfg.claude_bin))):
         errors.append("CLAUDE_BIN must be an absolute path")
+    if (not cfg.claude_broker_socket
+            or "\x00" in cfg.claude_broker_socket
+            or len(cfg.claude_broker_socket.encode(
+                "utf-8", errors="surrogatepass")) > 4096):
+        errors.append(
+            "CC_REMOTE_CLAUDE_BROKER_SOCKET must be a non-empty path of at "
+            "most 4096 UTF-8 bytes")
+    elif not os.path.isabs(os.path.expanduser(cfg.claude_broker_socket)):
+        errors.append("CC_REMOTE_CLAUDE_BROKER_SOCKET must be an absolute path")
 
     if not (12 * 1024 * 1024 <= cfg.ws_max_size_bytes <= 64 * 1024 * 1024):
         errors.append("WS_MAX_SIZE_BYTES must be between 12582912 and 67108864")
@@ -396,6 +416,8 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
             and not (5 <= cfg.codex_turn_idle_warn_seconds <= 3600)):
         errors.append(
             "CODEX_TURN_IDLE_WARN_SECONDS must be 0 or between 5 and 3600")
+    if cfg.codex_daemon_mode not in {"auto", "off"}:
+        errors.append("CC_REMOTE_CODEX_DAEMON must be auto or off")
 
     if errors:
         raise ValueError("invalid wrapper configuration: " + "; ".join(errors))

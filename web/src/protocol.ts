@@ -15,6 +15,8 @@ export type CodexThreadStatus = "notLoaded" | "idle" | "systemError" | "active";
 export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "never" | "on-request" | "untrusted";
 export type CollaborationModeName = "default" | "plan";
+export type ControlMode = "remote" | "codex_shared" | "claude_broker" | "external_cli" | "agent_view" | "desktop";
+export type WriteState = "writable" | "read_only" | "takeover_pending" | "input_busy";
 export type ServiceTier = "" | "default" | "fast" | "toggle";
 export type DiffTheme = "light" | "dark";
 export type CodexPermissionMode = "never" | "on-request" | "untrusted";
@@ -54,6 +56,17 @@ export interface Query extends Base { type: "query"; prompt: string; msg_id: str
 export interface Interrupt extends Base { type: "interrupt" }
 export interface Takeover extends Base { type: "takeover"; sid: string; cmd_id: string }
 export interface TakeoverState extends Base { type: "takeover_state"; pending: boolean; message?: string | null }
+export interface SessionControl extends Base {
+  type: "session_control";
+  control_mode: ControlMode;
+  write_state: WriteState;
+  terminal_attached: boolean;
+  reason?: string | null;
+  generation?: string | null;
+  revision: number;
+  /** Display capability only; it does not mean migration is pre-authorized. */
+  can_takeover?: boolean | null;
+}
 export interface SetModel extends Base { type: "set_model"; model: string }
 export interface SetEffort extends Base { type: "set_effort"; effort: EffortLevel }
 export interface SetServiceTier extends Base { type: "set_service_tier"; service_tier: ServiceTier }
@@ -63,7 +76,7 @@ export interface Pong extends Base { type: "pong"; n: number }
 export interface CommandAck extends Base { type: "command_ack"; cmd_id: string; client_id: string }
 export interface ReplayStart extends Base { type: "replay_start"; from_seq: number; to_seq: number; truncated: boolean; rebuild?: boolean; generation?: string | null }
 export interface ReplayEnd extends Base { type: "replay_end"; to_seq: number; truncated: boolean }
-export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string; cwd?: string | null; generation?: string | null }
+export interface Snapshot extends Base { type: "snapshot"; cc_session_id?: string | null; state: State; tail_text: string; cwd?: string | null; generation?: string | null; control?: SessionControl | null }
 export interface StateEvent extends Base {
   type: "state";
   state: State;
@@ -279,7 +292,7 @@ export interface GetHistory extends Base { type: "get_history"; session_id: stri
 // `external`: this session's transcript is being appended to by a native `claude`/
 // `codex` in the user's terminal. The wrapper mirrors those appends by broadcasting
 // a fresh History; we render the session read-only (a cc session has one owner).
-export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; reset?: boolean }
+export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; control?: SessionControl | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; reset?: boolean }
 // Replayable barrier for a destructive history mutation. The full History
 // replacement is one-shot and may exceed the ring byte budget; this small frame
 // guarantees that reconnecting clients never retain turns removed by rollback.
@@ -411,7 +424,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
@@ -419,7 +432,68 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 14;
+export const PROTOCOL_VERSION = 15;
+
+const CONTROL_MODES = new Set<ControlMode>([
+  "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",
+]);
+const WRITE_STATES = new Set<WriteState>([
+  "writable", "read_only", "takeover_pending", "input_busy",
+]);
+
+/** Validate the small control snapshot before accepting user-controlled IDB data. */
+export function isSessionControl(value: unknown): value is SessionControl {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const control = value as Record<string, unknown>;
+  return control.type === "session_control"
+    && CONTROL_MODES.has(control.control_mode as ControlMode)
+    && WRITE_STATES.has(control.write_state as WriteState)
+    && typeof control.terminal_attached === "boolean"
+    && Number.isSafeInteger(control.revision) && (control.revision as number) >= 0
+    && (control.reason == null || (typeof control.reason === "string"
+      && control.reason.length <= 4096))
+    && (control.generation == null || (typeof control.generation === "string"
+      && /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/.test(control.generation)))
+    && (control.can_takeover == null || typeof control.can_takeover === "boolean");
+}
+
+/** Embedded controls inherit routing from their Snapshot/History/cache row.
+ * A producer may omit the redundant sid, but an explicit sid must agree with
+ * that trusted outer route or the control belongs to another session. */
+export function sessionControlTargetsSid(
+  control: SessionControl, sid: string,
+): boolean {
+  return control.sid == null || control.sid === sid;
+}
+
+export type ControlRevisionDisposition = "newer" | "same" | "stale" | "conflict";
+
+/** Compare only authoritative control fields, not transport-envelope metadata. */
+export function compareSessionControl(
+  current: SessionControl | null | undefined,
+  incoming: SessionControl,
+): ControlRevisionDisposition {
+  if (!current) return "newer";
+  if ((incoming.generation ?? null) !== (current.generation ?? null)) {
+    return "conflict";
+  }
+  if (incoming.revision > current.revision) return "newer";
+  if (incoming.revision < current.revision) return "stale";
+  const same = incoming.control_mode === current.control_mode
+    && incoming.write_state === current.write_state
+    && incoming.terminal_attached === current.terminal_attached
+    && (incoming.reason ?? null) === (current.reason ?? null)
+    && (incoming.can_takeover ?? null) === (current.can_takeover ?? null);
+  return same ? "same" : "conflict";
+}
+
+/** Fail closed for view-only surfaces even if a malformed producer says writable. */
+export function sessionControlLocksInput(control: SessionControl): boolean {
+  return control.control_mode === "external_cli"
+    || control.control_mode === "agent_view"
+    || control.control_mode === "desktop"
+    || control.write_state !== "writable";
+}
 
 /** Local storage is user-controlled and may contain stale values from older
  * builds. Normalize before a value reaches a strict Pydantic command frame. */

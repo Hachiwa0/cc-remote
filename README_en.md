@@ -98,6 +98,33 @@ Codex engines while isolating storage, session lists, and permissions:
   project's `WORK.md`; it does not execute unreviewed third-party code. Scheduled
   tasks are persisted and claimed by the wrapper under the same Work isolation.
 
+### How native terminals and Remote cooperate
+
+Code sessions follow each CLI's real control plane without replacing official
+commands:
+
+- **Claude:** `claude` always remains the official command and official TUI;
+  cc-remote installs no alias, shim, or PATH interception. Sessions opened directly
+  by `claude`, Claude Desktop, or Agent View are read-only mirrors in Remote by
+  default, which prevents two independent input owners. For bidirectional terminal
+  and Remote control, explicitly run `claude-remote`: a same-user local broker runs
+  the real official `claude` inside a PTY, the terminal still renders the complete
+  official TUI, and Remote shares that session. Migration is always user-initiated.
+  For a direct CLI session it sends SIGTERM only to the exact same-user Claude
+  process identity; it never kills the terminal shell, escalates to SIGKILL, or
+  takes over a process silently.
+- **Codex Code:** prefers Codex's official shared app-server daemon, so native
+  Codex clients and Remote share the thread and control state. If the installed
+  version cannot provide it, cc-remote explicitly falls back to a private
+  app-server. Set `CC_REMOTE_CODEX_DAEMON=off` for troubleshooting.
+- **Work:** Claude and Codex Work keep private processes and directories and do
+  not join the Code control plane, preventing work material from leaking into code
+  sessions.
+
+The `claude-remote` broker listens only on a same-user Unix socket and opens no
+TCP port. The wrapper and terminal TUI must run as the same OS user and use the
+same socket path.
+
 ### Where artifact preview runs
 
 - HTML is sanitized with DOMPurify in the browser and rendered in a scriptless,
@@ -180,7 +207,9 @@ context usage, and command entry points such as `/goal` and `/status`.
 - **Sessions:** create, search, run in the background, rename, archive, delete, fork, use Claude Rewind, roll back Codex conversation and code, compact, Review, and create a Codex worktree.
 - **Turns:** stream, queue, interrupt, copy, edit and resend, or fork from a specific message.
 - **Tools:** inspect command output, file changes and diffs, MCP, collaboration agents, Hooks, approvals, and user-input requests.
-- **Terminal coordination:** detect a native CLI owner and mirror new messages in real time while preserving the remote user's explicit takeover control.
+- **Terminal coordination:** Codex Code shares the official daemon; Claude uses
+  explicit `claude-remote` to preserve the official TUI with bidirectional control.
+  Direct `claude` / Desktop / Agent View processes remain read-only mirrors.
 - **Status:** inspect the model, reasoning effort, permissions, Plan mode, context, goals, usage, rate limits, and runtime warnings.
 - **Extensions:** inspect live Skills, Plugins, Apps, and MCP status and install/uninstall plugins through the native engine manager.
 - **Devices:** use a responsive mobile UI, light or dark themes, multi-browser/multi-machine synchronization, PWA installation, background completion alerts, and reconnect recovery.
@@ -208,6 +237,21 @@ pip install --require-hashes --only-binary=:all: -r requirements.lock
 npm --prefix web ci
 npm --prefix web run build          # produces web/dist/
 ```
+
+Optional: install the **separately named** launcher for bidirectional control
+between the official Claude TUI and Remote (it does not modify `claude`):
+
+```bash
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$PWD/scripts/claude-remote" "$HOME/.local/bin/claude-remote"
+
+claude-remote                         # auto-start broker, create and attach official TUI
+claude-remote list                    # list broker-owned sessions
+claude-remote resume SESSION_UUID --cwd /path/to/project
+```
+
+Continue to run `claude` directly when you want the fully native process with a
+read-only Remote mirror.
 
 ### 2) Configure
 
@@ -287,14 +331,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v14:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v15:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v14 relay and v14 wrapper so the old wrapper cannot occupy the
+> then start the v15 relay and v15 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`.
 
 ### 3) Upload staging, then publish it as an atomic release
@@ -335,7 +379,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v14 wrapper after success.
+release's `/healthz` is verified. Start the v15 wrapper after success.
 
 Verify:
 
@@ -370,6 +414,20 @@ sudo cp deploy/cc-remote-wrapper.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now cc-remote-wrapper
 journalctl -u cc-remote-wrapper -f     # expect: connected to relay / wrapper running
 ```
+
+To enable bidirectional Claude terminal coordination, set
+`CC_REMOTE_CLAUDE_BROKER_SOCKET` to the same absolute path in
+`/etc/cc-remote/wrapper.env` and the terminal environment, then install the
+launcher for the same ordinary user that runs the wrapper:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+ln -sfn /path/to/cc-remote/scripts/claude-remote "$HOME/.local/bin/claude-remote"
+export CC_REMOTE_CLAUDE_BROKER_SOCKET="$HOME/.cc-remote/claude-broker.sock"
+claude-remote                         # auto-starts on first use; no broker service needed
+```
+
+Never rename `claude-remote` to `claude` and never alias the official command.
 
 Back on the VPS, `curl https://your-domain.com/healthz` should now show `wrapper_connected:true`.
 
@@ -417,6 +475,9 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `WRAPPER_TOKEN` | `change-me-wrapper` | Same as relay. |
 | `CC_REMOTE_MACHINE_ID` | `default` | Stable route id on a multi-machine relay; must match its `WRAPPER_TOKENS_JSON` key when that policy is enabled. |
 | `CLAUDE_BIN` | empty | Optional absolute Claude CLI path; set it when systemd/PATH cannot find `claude`. |
+| `CC_REMOTE_CLAUDE_BROKER_SOCKET` | `$XDG_RUNTIME_DIR/cc-remote/claude-broker.sock`, or `~/.cc-remote/claude-broker.sock` without XDG | Same-user Unix socket shared by `claude-remote` and the wrapper. For systemd, explicitly configure the same absolute path on both sides. |
+| `CLAUDE_REMOTE_CLAUDE_BIN` | `claude` | Selects the real official Claude Code executable for the `claude-remote` broker only; it never changes the official command. |
+| `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server. Work is always private and ignores this setting. |
 | `CC_CWD` | cwd | Default working directory for new sessions. Claude `--resume` needs it to locate `~/.claude/projects/` — **it must be correct**; Codex resume first recovers the original cwd from its rollout. |
 | `CC_RESUME_SESSION_ID` | empty | Resume a specific session UUID; empty starts fresh. The id is persisted to `~/.cc-remote/` after first start. |
 | `CLAUDE_WORK_ROOT` | `~/.claude/cc-remote/work` | Private Claude Work root for the registry, knowledge sources, sessions, and generated policy files. |

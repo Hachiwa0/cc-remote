@@ -307,8 +307,11 @@ def test_machine_never_broadcasts_runtime_event_without_session_route():
 def test_new_session_flushes_pending_notice_after_client_runtime_exists(
         monkeypatch):
     class FakeCodexHandle:
-        def __init__(self, _cfg, cwd=None):
+        def __init__(self, _cfg, cwd=None, daemon_mode=None,
+                     daemon_manager=None):
             self.cwd = cwd
+            self.daemon_mode = daemon_mode
+            self.daemon_manager = daemon_manager
             self.thread_id = None
             self.model = None
             self.effort = None
@@ -355,9 +358,12 @@ def test_new_codex_work_session_binds_native_id_and_refreshes_sidebar(
     created = {}
 
     class FakeCodexHandle:
-        def __init__(self, _cfg, cwd=None, work_mode=False):
+        def __init__(self, _cfg, cwd=None, work_mode=False,
+                     daemon_mode=None, daemon_manager=None):
             assert work_mode is True
+            assert daemon_mode == "off"
             self.cwd = cwd
+            self.daemon_manager = daemon_manager
             self.thread_id = None
             self.model = "gpt-test"
             self.effort = "high"

@@ -76,7 +76,8 @@ from cc_remote.protocol import (
     CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History,
     HistoryInvalidated, ArtifactInvalidated, AskUser,
-    GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg,
+    GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
+    UserMsg,
     TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
@@ -85,6 +86,13 @@ from cc_remote.protocol import (
     ERR_FORK_RECONCILING,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
+from cc_remote.wrapper.codex_daemon import CodexDaemonManager
+from cc_remote.claude_broker import BrokerClient, BrokerClientError
+from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
+from cc_remote.wrapper.claude_broker_history import (
+    claude_broker_tail_state,
+    parse_claude_broker_lifecycle,
+)
 from cc_remote.wrapper.ask import make_ask_server
 from cc_remote.wrapper.sdk import CLAUDE_DEFAULT_EFFORT, SdkHandle
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
@@ -277,12 +285,24 @@ class WrapperMachine:
         self.cfg = cfg
         self.transport = transport
         self.instance_id = uuid4().hex
+        # One lifecycle gate coordinates the official process-global Codex
+        # daemon. Each resident Code handle still owns only its short-lived
+        # proxy connection; Work remains per-session stdio and isolated.
+        self._codex_daemon = CodexDaemonManager(
+            getattr(cfg, "codex_daemon_mode", "auto"))
+        self._claude_broker = BrokerClient(
+            getattr(cfg, "claude_broker_socket", None))
         # A History token changes for every wrapper process and every local
         # destructive conversation mutation.  Browsers persist this token with
         # IndexedDB turns, so a fresh wrapper can never merge a pre-crash cache
         # over its authoritative transcript.  The per-process generation also
         # makes a crash after native rollback safe without another disk journal.
         self._history_revision_epochs: dict[str, int] = {}
+        # SessionContext objects are evicted and recreated while this wrapper
+        # generation stays alive. Keep each sid's control revision outside the
+        # resident context so a rebuilt Snapshot cannot move backwards and be
+        # rejected by a browser that still holds the previous control watermark.
+        self._control_revision_epochs: dict[str, int] = {}
         self._preview_conversion_limit = asyncio.Semaphore(2)
         # Pool of resident sessions, keyed by real session_id (or a `tmp-<uuid>`
         # temp key for a brand-new session until its id is captured).
@@ -299,6 +319,15 @@ class WrapperMachine:
         self._codex_watch_lock = asyncio.Lock()
         self._codex_probe_warned = False
         self._claude_probe_warned = False
+        # ``claude -c`` selects the cwd's latest conversation only once at
+        # process startup. Keep that exact pid+start-ticks assignment across
+        # later transcript writes so the terminal cannot appear to jump between
+        # same-cwd sessions while it remains alive.
+        self._claude_continue_bindings: dict[ProcessIdentity, str] = {}
+        # A `-c` process may select a native session that no browser has watched
+        # yet. Cache that startup result separately; it becomes an ownership
+        # binding only after the exact sid enters the watched set.
+        self._claude_continue_candidates: dict[ProcessIdentity, str] = {}
         # Newest-page History builds can race the watcher, another client, and
         # live stream events. Sequence them per session so browsers can discard
         # an older build that completes after a newer one. Pagination echoes the
@@ -379,6 +408,692 @@ class WrapperMachine:
 
     def _focused_ctx(self) -> Optional[SessionContext]:
         return self.sessions.get(self.focused_sid) if self.focused_sid else None
+
+    def _bind_control_revision(self, ctx: SessionContext) -> None:
+        """Bind one resident context to the machine-local monotonic sid epoch."""
+        key = ctx.session_id or ctx.key
+        if not key:
+            return
+        if ctx.control_revision_key != key:
+            previous = self._control_revision_epochs.get(key)
+            if previous is not None:
+                ctx.control_revision = max(ctx.control_revision, previous + 1)
+            ctx.control_revision_key = key
+        previous = self._control_revision_epochs.get(key)
+        if previous is None or ctx.control_revision > previous:
+            self._control_revision_epochs[key] = ctx.control_revision
+        elif ctx.control_revision < previous:
+            # A bound context must never emit below a revision already published
+            # for this sid, even if a caller restored stale in-memory state.
+            ctx.control_revision = previous
+
+    def _session_control(self, ctx: SessionContext) -> SessionControl:
+        """Build the small authoritative ownership projection for Web."""
+        self._bind_control_revision(ctx)
+        return SessionControl(
+            control_mode=ctx.control_mode,
+            write_state=ctx.write_state,
+            terminal_attached=ctx.terminal_attached,
+            reason=ctx.control_reason,
+            can_takeover=ctx.control_can_takeover,
+            generation=self.instance_id,
+            revision=ctx.control_revision,
+        )
+
+    async def _set_session_control(
+        self,
+        ctx: SessionContext,
+        *,
+        control_mode: str,
+        write_state: str,
+        terminal_attached: bool,
+        reason: Optional[str] = None,
+        can_takeover: bool = False,
+        emit: bool = True,
+    ) -> SessionControl:
+        """Update one control epoch and optionally publish it.
+
+        Revision changes are value-driven, not poll-driven. This keeps repeated
+        ownership scans idempotent while letting the browser reject a delayed
+        read-only frame from an older process generation.
+        """
+        values = (
+            control_mode,
+            write_state,
+            bool(terminal_attached),
+            reason,
+            bool(can_takeover),
+        )
+        current = (
+            ctx.control_mode,
+            ctx.write_state,
+            ctx.terminal_attached,
+            ctx.control_reason,
+            ctx.control_can_takeover,
+        )
+        if values != current:
+            ctx.control_mode = control_mode
+            ctx.write_state = write_state
+            ctx.terminal_attached = bool(terminal_attached)
+            ctx.control_reason = reason
+            ctx.control_can_takeover = bool(can_takeover)
+            self._bind_control_revision(ctx)
+            ctx.control_revision += 1
+            key = ctx.control_revision_key
+            if key:
+                self._control_revision_epochs[key] = ctx.control_revision
+        snapshot = self._session_control(ctx)
+        if emit and values != current:
+            await self._emit(ctx, snapshot)
+        return snapshot
+
+    async def _sync_external_control(
+        self,
+        ctx: SessionContext,
+        watch: Optional[dict],
+    ) -> SessionControl:
+        """Project legacy ownership detection into protocol-v15 control state."""
+        if getattr(ctx.sdk, "is_claude_broker", False):
+            unavailable = getattr(
+                ctx.sdk, "cc_remote_unavailable_reason", None)
+            if isinstance(unavailable, str) and unavailable:
+                return await self._set_session_control(
+                    ctx,
+                    control_mode="claude_broker",
+                    write_state="read_only",
+                    # An unreachable broker cannot prove the TUI detached. Keep
+                    # the last attachment fact while failing closed.
+                    terminal_attached=ctx.terminal_attached,
+                    reason=unavailable,
+                    can_takeover=False,
+                )
+            metadata = getattr(ctx.sdk, "metadata", {})
+            input_busy = bool(metadata.get("input_busy"))
+            attached = bool(metadata.get("attached_count", 0))
+            return await self._set_session_control(
+                ctx,
+                control_mode="claude_broker",
+                write_state="input_busy" if input_busy else "writable",
+                terminal_attached=attached,
+                reason=(
+                    "本机终端正在编辑输入，完成或取消后即可从 Remote 发送"
+                    if input_busy else None
+                ),
+                can_takeover=False,
+            )
+        if (ctx.engine == "codex"
+                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+            return await self._set_session_control(
+                ctx,
+                control_mode="codex_shared",
+                write_state="writable",
+                terminal_attached=bool((watch or {}).get("holders")),
+                reason=None,
+                can_takeover=False,
+            )
+        pending = bool((watch or {}).get("takeover_pending"))
+        external = bool(ctx.session_id and self._is_external(ctx.session_id))
+        if pending or external:
+            return await self._set_session_control(
+                ctx,
+                control_mode="external_cli",
+                write_state=("takeover_pending" if pending else "read_only"),
+                terminal_attached=True,
+                reason=(
+                    "已登记接管，等待当前本机进程安全释放会话"
+                    if pending else "会话正由本机原生 CLI 驱动"
+                ),
+                can_takeover=True,
+            )
+        if ctx.control_mode != "claude_broker":
+            return await self._set_session_control(
+                ctx,
+                control_mode="remote",
+                write_state="writable",
+                terminal_attached=False,
+                reason=None,
+                can_takeover=False,
+            )
+        return self._session_control(ctx)
+
+    def _configure_claude_sdk_callbacks(
+        self, ctx: SessionContext, sdk: SdkHandle,
+    ) -> None:
+        """Install the complete per-session Claude bridge on one SDK handle."""
+        sdk.ask_server = make_ask_server(
+            lambda q, o: self._on_ask(ctx, q, o),
+            lambda m: self._on_set_mode(ctx, m),
+        )
+        sdk.permission_callback = (
+            lambda tool, tool_input, permission_context:
+            self._on_claude_tool_permission(
+                ctx, tool, tool_input, permission_context))
+        sdk.background_message_callback = (
+            lambda message, turn_id: self._on_claude_background_message(
+                ctx, message, turn_id))
+
+    @staticmethod
+    def _copy_claude_runtime_options(
+        ctx: SessionContext, source: object, target: object,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Carry the visible Claude controls across SDK/broker ownership swaps."""
+        if getattr(target, "is_claude_broker", False):
+            # The official TUI is already a live writer. Its broker metadata is
+            # authoritative; copying stale SDK chips into it would only make
+            # Remote lie about controls that were never applied to the TUI.
+            permission = getattr(target, "permission_mode", None)
+            model = getattr(target, "model", None)
+            effort = getattr(target, "effort", None)
+            return permission, model, effort
+
+        permission = getattr(source, "permission_mode", None)
+        if not isinstance(permission, str) or not permission:
+            permission = ctx.announced_perm
+        model = getattr(source, "model", None)
+        if not isinstance(model, str) or not model:
+            model = ctx.announced_model
+        effort = getattr(source, "effort", None)
+        if not isinstance(effort, str) or not effort:
+            effort = ctx.announced_effort
+        if isinstance(permission, str) and permission:
+            setattr(target, "permission_mode", permission)
+        if isinstance(model, str) and model:
+            setattr(target, "model", model)
+        if isinstance(effort, str) and effort:
+            setattr(target, "effort", effort)
+            setattr(target, "applied_effort", effort)
+        return permission, model, effort
+
+    async def _sync_claude_broker_runtime_controls(
+        self, ctx: SessionContext,
+    ) -> tuple[object, ...]:
+        """Publish only controls durably observed from the official TUI."""
+        if not getattr(ctx.sdk, "is_claude_broker", False):
+            return ()
+        events: list[object] = []
+        model = getattr(ctx.sdk, "model", None)
+        if isinstance(model, str) and model and model != ctx.announced_model:
+            ctx.announced_model = model
+            events.append(Model(model=model))
+        effort = getattr(ctx.sdk, "effort", None)
+        if isinstance(effort, str) and effort and effort != ctx.announced_effort:
+            ctx.announced_effort = effort
+            events.append(Effort(effort=effort))
+        permission = getattr(ctx.sdk, "permission_mode", None)
+        if (isinstance(permission, str) and permission
+                and permission != ctx.announced_perm):
+            ctx.announced_perm = permission
+            events.append(Perm(mode=permission))
+        for event in events:
+            await self._emit(ctx, event)
+        return tuple(events)
+
+    async def _persist_claude_session_controls(self, ctx: SessionContext) -> None:
+        """Save SDK-owned Code controls for the next official TUI resume."""
+        if (ctx.engine != "claude" or ctx.space != "code"
+                or not ctx.session_id
+                or getattr(ctx.sdk, "is_claude_broker", False)):
+            return
+        try:
+            await self._claude_broker.set_preferences(
+                ctx.session_id,
+                model=getattr(ctx.sdk, "model", None),
+                effort=getattr(ctx.sdk, "effort", None),
+                permission_mode=getattr(ctx.sdk, "permission_mode", None),
+            )
+        except Exception as exc:
+            # The live SDK mutation already succeeded. Keep Remote usable if the
+            # optional local broker is restarting, but make the durability gap
+            # observable instead of pretending the next TUI is guaranteed.
+            log.warning(
+                "Claude session controls could not be persisted to broker",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+
+    @staticmethod
+    def _is_orphaned_claude_broker_turn(ctx: SessionContext) -> bool:
+        """A terminal-only turn has no Remote task/message writer to preserve."""
+        return (
+            ctx.state in {"running", "interrupting", "draining"}
+            and ctx.turn_task is None
+            and ctx.active_msg_id is None
+            and not ctx.claude_write_active
+        )
+
+    async def _set_claude_broker_unavailable(
+        self, ctx: SessionContext, error_code: str,
+    ) -> None:
+        """Fail closed when broker liveness is unknown, without losing state."""
+        if not getattr(ctx.sdk, "is_claude_broker", False):
+            return
+        reason = (
+            "Claude broker 连接暂不可用，正在等待本机控制通道恢复"
+            if error_code in {"broker_unavailable", "broker_disconnected"}
+            else "Claude broker 状态无法安全确认，正在等待本机控制通道恢复"
+        )
+        setattr(ctx.sdk, "cc_remote_unavailable_reason", reason)
+        await self._sync_external_control(
+            ctx, self._watch.get(ctx.session_id or ""))
+
+    async def _restore_sdk_after_claude_broker_exit(
+        self,
+        ctx: SessionContext,
+        broker: object,
+    ) -> bool:
+        """Atomically resume an exited broker session through Agent SDK.
+
+        A terminal ``session_exited``/``session_not_found`` is the only proof
+        that permits creating a new writer. Before connecting, recheck the
+        broker: a replacement generation wins; transport uncertainty remains
+        read-only. The connected SDK is published to ``ctx`` only after all
+        callbacks and live controls are restored.
+        """
+        current_turn = asyncio.current_task()
+        orphaned_terminal_turn = self._is_orphaned_claude_broker_turn(ctx)
+        if ((ctx.state != "idle" and not orphaned_terminal_turn)
+                or (ctx.turn_task is not None
+                    and ctx.turn_task is not current_turn)
+                or ctx.claude_write_active
+                or not ctx.session_id):
+            return False
+
+        replacement_broker: Optional[ClaudeBrokerHandle] = None
+        terminal_confirmed = False
+        try:
+            response = await self._claude_broker.status(ctx.session_id)
+        except BrokerClientError as exc:
+            if exc.code in {"session_exited", "session_not_found"}:
+                terminal_confirmed = True
+            else:
+                await self._set_claude_broker_unavailable(ctx, exc.code)
+                return False
+        else:
+            metadata = response.get("session")
+            if (not isinstance(metadata, dict)
+                    or metadata.get("id") != ctx.session_id):
+                await self._set_claude_broker_unavailable(
+                    ctx, "invalid_status")
+                return False
+            if metadata.get("running") is True:
+                try:
+                    replacement_broker = ClaudeBrokerHandle(
+                        self._claude_broker, ctx.session_id, metadata)
+                    await replacement_broker.connect(
+                        resume_id=ctx.session_id, cwd=ctx.cwd)
+                except BrokerClientError as exc:
+                    await self._set_claude_broker_unavailable(ctx, exc.code)
+                    return False
+            else:
+                terminal_confirmed = True
+
+        async with ctx.launch_lock:
+            if ctx.sdk is not broker:
+                return not bool(getattr(
+                    ctx.sdk, "cc_remote_unavailable_reason", None))
+            # Status revalidation awaited outside the launch gate. A Query may
+            # have claimed the broker turn in that interval; never replace its
+            # live adapter underneath submit/drain.
+            orphaned_terminal_turn = self._is_orphaned_claude_broker_turn(ctx)
+            if ((ctx.state != "idle" and not orphaned_terminal_turn)
+                    or (ctx.turn_task is not None
+                        and ctx.turn_task is not current_turn)
+                    or ctx.claude_write_active):
+                return False
+            if replacement_broker is not None:
+                # A live replacement generation proves that terminal ownership
+                # still exists, but its metadata cannot prove whether the model
+                # turn itself reached an assistant boundary. Keep an orphaned
+                # running/interruption state fail-closed instead of publishing
+                # a false idle transition merely because the generation changed.
+                self._copy_claude_runtime_options(
+                    ctx, broker, replacement_broker)
+                ctx.sdk = replacement_broker
+                ctx.claude_broker_generation = replacement_broker.generation
+                await self._sync_claude_broker_runtime_controls(ctx)
+                await self._sync_external_control(
+                    ctx, self._watch.get(ctx.session_id))
+                log.info(
+                    "adopted replacement Claude broker generation",
+                    session_id=ctx.session_id,
+                    generation=replacement_broker.generation,
+                )
+                return True
+            if not terminal_confirmed:
+                return False
+
+            sdk = SdkHandle(self.cfg)
+            permission, model, effort = self._copy_claude_runtime_options(
+                ctx, broker, sdk)
+            self._configure_claude_sdk_callbacks(ctx, sdk)
+            try:
+                await sdk.connect(
+                    resume_id=ctx.session_id,
+                    cwd=ctx.cwd,
+                    model_override=model,
+                )
+            except Exception as exc:
+                try:
+                    await sdk.disconnect()
+                except Exception:
+                    pass
+                log.warning(
+                    "Claude SDK restore after broker exit failed",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+                await self._set_claude_broker_unavailable(
+                    ctx, "sdk_restore_failed")
+                return False
+
+            # Close the connect-time race as far as the broker protocol allows.
+            # If another `claude-remote` generation claimed this sid while the
+            # SDK was starting, discard our new child before publishing it.
+            try:
+                final_response = await self._claude_broker.status(
+                    ctx.session_id)
+            except BrokerClientError as exc:
+                if exc.code not in {"session_exited", "session_not_found"}:
+                    try:
+                        await sdk.disconnect()
+                    except Exception:
+                        pass
+                    await self._set_claude_broker_unavailable(ctx, exc.code)
+                    return False
+            else:
+                final_metadata = final_response.get("session")
+                if (not isinstance(final_metadata, dict)
+                        or final_metadata.get("id") != ctx.session_id):
+                    try:
+                        await sdk.disconnect()
+                    except Exception:
+                        pass
+                    await self._set_claude_broker_unavailable(
+                        ctx, "invalid_status")
+                    return False
+                if final_metadata.get("running") is True:
+                    try:
+                        live_broker = ClaudeBrokerHandle(
+                            self._claude_broker,
+                            ctx.session_id,
+                            final_metadata,
+                        )
+                        await live_broker.connect(
+                            resume_id=ctx.session_id, cwd=ctx.cwd)
+                    except BrokerClientError as exc:
+                        try:
+                            await sdk.disconnect()
+                        except Exception:
+                            pass
+                        await self._set_claude_broker_unavailable(
+                            ctx, exc.code)
+                        return False
+                    try:
+                        await sdk.disconnect()
+                    except Exception as exc:
+                        log.warning(
+                            "discarding raced Claude SDK failed",
+                            session_id=ctx.session_id,
+                            error_type=type(exc).__name__,
+                        )
+                    self._copy_claude_runtime_options(
+                        ctx, broker, live_broker)
+                    # As above, a connect-time replacement remains the writer;
+                    # only a definitive terminal broker status may converge an
+                    # orphaned terminal-authored turn back to idle.
+                    ctx.sdk = live_broker
+                    ctx.claude_broker_generation = live_broker.generation
+                    await self._sync_claude_broker_runtime_controls(ctx)
+                    await self._sync_external_control(
+                        ctx, self._watch.get(ctx.session_id))
+                    log.info(
+                        "Claude broker reclaimed session during SDK restore",
+                        session_id=ctx.session_id,
+                        generation=live_broker.generation,
+                    )
+                    return True
+
+            if orphaned_terminal_turn:
+                # The official TUI exited without a durable assistant boundary.
+                # This was a terminal-authored turn (no managed task/msg id), so
+                # publish the same idle + authoritative History convergence used
+                # by the normal broker lifecycle path before installing the SDK.
+                # ``interrupting``/``draining`` may still carry the previous
+                # stop request. It belongs to the now-proven-dead broker turn
+                # and must not immediately interrupt the first restored SDK turn.
+                ctx.interrupt_deadline = None
+                ctx.interrupt_event.clear()
+                watch = self._watch.get(ctx.session_id)
+                if watch is not None:
+                    watch["broker_active"] = False
+                    watch["broker_partial"] = b""
+                await self._set_state(ctx, "idle")
+                try:
+                    await self._push_mirrored_history(ctx.session_id)
+                except Exception as exc:
+                    # The SDK handoff is still the ownership safety boundary;
+                    # one failed optional mirror will be recovered by the next
+                    # GetHistory/watch pass and must not leave a dead adapter.
+                    log.warning(
+                        "Claude orphaned broker history refresh failed",
+                        session_id=ctx.session_id,
+                        error_type=type(exc).__name__,
+                    )
+
+            ctx.sdk = sdk
+            ctx.claude_broker_generation = None
+            ctx.needs_reload = False
+            ctx.external_ts = 0.0
+            ctx.claude_write_active = False
+            ctx.announced_perm = (
+                permission or getattr(sdk, "permission_mode", None))
+            ctx.announced_model = getattr(sdk, "model", None) or model
+            ctx.announced_effort = getattr(sdk, "effort", None) or effort
+            watch = self._watch.get(ctx.session_id)
+            if watch is not None:
+                watch["broker_active"] = False
+                watch["broker_partial"] = b""
+                watch["external"] = False
+                watch["holders"] = set()
+                watch["takeover_pending"] = False
+                watch["scan_complete"] = True
+
+        await self._set_session_control(
+            ctx,
+            control_mode="remote",
+            write_state="writable",
+            terminal_attached=False,
+            reason=None,
+            can_takeover=False,
+        )
+        log.info(
+            "restored Claude SDK after broker session exit",
+            session_id=ctx.session_id,
+            permission_mode=ctx.announced_perm,
+            model=ctx.announced_model,
+            effort=ctx.announced_effort,
+        )
+        return True
+
+    async def _refresh_claude_broker_handle(
+        self, ctx: SessionContext,
+    ) -> bool:
+        """Refresh a broker, recover terminal exits, and fail closed on doubt."""
+        if not getattr(ctx.sdk, "is_claude_broker", False):
+            return False
+        broker = ctx.sdk
+        try:
+            await broker.refresh_status()
+        except BrokerClientError as exc:
+            if exc.code in {"session_exited", "session_not_found", "stale_generation"}:
+                return await self._restore_sdk_after_claude_broker_exit(
+                    ctx, broker)
+            await self._set_claude_broker_unavailable(ctx, exc.code)
+            return False
+        setattr(broker, "cc_remote_unavailable_reason", None)
+        await self._sync_claude_broker_runtime_controls(ctx)
+        await self._sync_external_control(
+            ctx, self._watch.get(ctx.session_id or ""))
+        return True
+
+    async def _adopt_claude_broker_handle(
+        self,
+        ctx: SessionContext,
+        replacement: Optional[ClaudeBrokerHandle] = None,
+    ) -> bool:
+        """Atomically replace an idle SDK child with its exact broker TUI.
+
+        ``claude-remote resume`` can be launched after Remote has already made
+        the same session resident through the Agent SDK.  Treating that official
+        TUI as a foreign CLI makes the browser read-only and lets Takeover kill
+        the broker child.  Discover the exact sid, stop only our idle SDK child,
+        and switch the context to the non-owning broker adapter instead.
+        """
+        if (ctx.engine != "claude" or ctx.space != "code"
+                or not ctx.session_id):
+            return False
+        if getattr(ctx.sdk, "is_claude_broker", False):
+            return await self._refresh_claude_broker_handle(ctx)
+        if (ctx.state != "idle" or ctx.turn_task is not None
+                or ctx.claude_write_active):
+            return False
+
+        original = ctx.sdk
+        if replacement is None:
+            try:
+                replacement = await ClaudeBrokerHandle.discover(
+                    self._claude_broker, ctx.session_id)
+            except BrokerClientError as exc:
+                if exc.code not in {"broker_unavailable", "session_not_found"}:
+                    log.warning(
+                        "Claude broker adoption discovery failed",
+                        session_id=ctx.session_id,
+                        error_code=exc.code,
+                    )
+                return False
+        if (replacement is None
+                or replacement.session_id != ctx.session_id
+                or os.path.realpath(replacement.cwd) != os.path.realpath(ctx.cwd)):
+            return False
+
+        async with ctx.launch_lock:
+            # A query, interrupt, another watcher pass, or a pool replacement may
+            # have changed the context while broker discovery was in flight.
+            if (ctx.sdk is not original or ctx.state != "idle"
+                    or ctx.turn_task is not None or ctx.claude_write_active):
+                return bool(getattr(ctx.sdk, "is_claude_broker", False))
+            try:
+                # Revalidate the generation and cwd immediately before removing
+                # the SDK writer.  A stale list response must never leave the
+                # session without either owner.
+                await replacement.connect(
+                    resume_id=ctx.session_id, cwd=ctx.cwd)
+            except BrokerClientError as exc:
+                log.info(
+                    "Claude broker disappeared before adoption",
+                    session_id=ctx.session_id,
+                    error_code=exc.code,
+                )
+                return False
+            try:
+                await original.disconnect()
+            except Exception as exc:
+                # SdkHandle.disconnect() clears ``client`` in a finally block.
+                # If teardown already removed the writer, complete the validated
+                # broker handoff despite a late disconnect error. If a live client
+                # remains (or the handle cannot prove otherwise), fail closed and
+                # keep the original owner rather than installing a second writer.
+                missing = object()
+                client = getattr(original, "client", missing)
+                if client is not None:
+                    log.warning(
+                        "Claude SDK disconnect blocked broker adoption",
+                        session_id=ctx.session_id,
+                        error=str(exc),
+                    )
+                    return False
+                log.warning(
+                    "Claude SDK disconnect failed after writer teardown; "
+                    "continuing broker adoption",
+                    session_id=ctx.session_id,
+                    error=str(exc),
+                )
+
+            self._copy_claude_runtime_options(ctx, original, replacement)
+            ctx.sdk = replacement
+            ctx.claude_broker_generation = replacement.generation
+            ctx.needs_reload = False
+            ctx.external_ts = 0.0
+            ctx.claude_write_active = False
+
+            watch = self._watch.get(ctx.session_id)
+            if watch is not None:
+                watch["cwd"] = ctx.cwd
+                watch["external"] = False
+                watch["holders"] = set()
+                watch["takeover_pending"] = False
+                watch["scan_complete"] = True
+                try:
+                    active, partial = claude_broker_tail_state(watch["path"])
+                except OSError:
+                    active, partial = False, b""
+                watch["broker_active"] = active
+                watch["broker_partial"] = partial
+
+        if ctx.session_id not in self._watch:
+            self._watch_session(ctx.session_id)
+        watch = self._watch.get(ctx.session_id)
+        if (watch is not None and watch.get("broker_active")
+                and ctx.turn_task is None and ctx.state == "idle"):
+            await self._set_state(ctx, "running")
+
+        await self._sync_claude_broker_runtime_controls(ctx)
+        await self._sync_external_control(ctx, watch)
+        log.info(
+            "adopted live Claude broker session",
+            session_id=ctx.session_id,
+            generation=replacement.generation,
+        )
+        return True
+
+    async def _adopt_live_claude_broker_sessions(self) -> None:
+        """Upgrade resident idle contexts from one bounded broker list read."""
+        candidates = [
+            ctx for ctx in list(self.sessions.values())
+            if (ctx.engine == "claude" and ctx.space == "code"
+                and ctx.session_id and ctx.state == "idle"
+                and not getattr(ctx.sdk, "is_claude_broker", False))
+        ]
+        if not candidates:
+            return
+        try:
+            response = await self._claude_broker.list()
+        except BrokerClientError as exc:
+            if exc.code not in {"broker_unavailable", "session_not_found"}:
+                log.warning(
+                    "Claude broker list unavailable during adoption",
+                    error_code=exc.code,
+                )
+            return
+        rows = response.get("sessions")
+        if not isinstance(rows, list):
+            return
+        by_sid: dict[str, ClaudeBrokerHandle] = {}
+        for row in rows:
+            if not isinstance(row, dict) or row.get("running") is not True:
+                continue
+            sid = row.get("id")
+            if not isinstance(sid, str) or not sid or len(sid) > 256:
+                continue
+            try:
+                by_sid[sid] = ClaudeBrokerHandle(
+                    self._claude_broker, sid, row)
+            except BrokerClientError:
+                continue
+        for ctx in candidates:
+            replacement = by_sid.get(ctx.session_id or "")
+            if replacement is not None:
+                await self._adopt_claude_broker_handle(ctx, replacement)
 
     def _resolve_session_alias(self, sid: Optional[str]) -> Optional[str]:
         if not sid:
@@ -1192,9 +1907,9 @@ class WrapperMachine:
         elif t == "takeover":
             return await self._handle_takeover(cmd)
         elif t == "set_model":
-            await self._handle_set_model(cmd)
+            return await self._handle_set_model(cmd)
         elif t == "set_effort":
-            await self._handle_set_effort(cmd)
+            return await self._handle_set_effort(cmd)
         elif t == "set_service_tier":
             await self._handle_set_service_tier(cmd)
         elif t == "set_collaboration_mode":
@@ -1204,7 +1919,7 @@ class WrapperMachine:
         elif t == "close_btw":
             await self._handle_close_btw(cmd)
         elif t == "set_perm":
-            await self._handle_set_perm(cmd)
+            return await self._handle_set_perm(cmd)
         elif t == "get_context":
             await self._handle_get_context(cmd)
         elif t == "get_status":
@@ -1338,6 +2053,7 @@ class WrapperMachine:
                         tail_text=tail,
                         cwd=ctx.cwd,
                         generation=self.instance_id,
+                        control=self._session_control(ctx),
                     )]
                     if st != "idle":
                         frames.extend(ctx.buffer.current_turn_replay(
@@ -1346,6 +2062,16 @@ class WrapperMachine:
                 for frame in frames:
                     # Never mutate a shared ring event with per-client routing.
                     await self.transport.send(frame.model_copy(
+                        deep=True, update={
+                            "to": cmd.client_id,
+                            "sid": sid,
+                            "route_id": getattr(cmd, "route_id", None),
+                        }))
+                # ReplayStart's synthetic Snapshot predates protocol-v15 and is
+                # built by RingBuffer. Always follow replay with the current
+                # revisioned control value; same-revision delivery is idempotent.
+                if sid in cursors:
+                    await self.transport.send(self._session_control(ctx).model_copy(
                         deep=True, update={
                             "to": cmd.client_id,
                             "sid": sid,
@@ -1409,6 +2135,12 @@ class WrapperMachine:
 
     def _is_external(self, sid: str) -> bool:
         """Whether a stable external owner (or incomplete scan) blocks Remote."""
+        ctx = self._ctx_by_sid(sid)
+        if ctx is not None and getattr(ctx.sdk, "is_claude_broker", False):
+            return False
+        if (ctx is not None and ctx.engine == "codex"
+                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+            return False
         w = self._watch.get(sid)
         if w and w.get("engine") == "codex":
             return bool(w.get("external"))
@@ -1424,6 +2156,57 @@ class WrapperMachine:
         if ctx is None:
             return False                       # not resident => we cannot have written it
         return bool(ctx.engine == "claude" and ctx.claude_write_active)
+
+    async def _terminate_external_claude_holders(
+        self,
+        holders: set[ProcessIdentity],
+        *,
+        timeout: float = 3.0,
+    ) -> set[ProcessIdentity]:
+        """Gracefully stop exact same-user Claude CLI identities for migration.
+
+        This is called only from the reliable, explicit Takeover command. It
+        never kills a process group (which may contain the user's shell), never
+        escalates to SIGKILL, and re-checks Linux start ticks immediately before
+        SIGTERM so PID reuse cannot target an unrelated process.
+        """
+        remaining: set[ProcessIdentity] = set()
+        for identity in holders:
+            current = process_identity(identity.pid)
+            if current != identity:
+                continue
+            try:
+                proc_info = os.stat(f"/proc/{identity.pid}")
+            except OSError:
+                continue
+            if proc_info.st_uid != os.getuid():
+                log.warning(
+                    "refusing to migrate Claude process owned by another uid",
+                    pid=identity.pid,
+                )
+                remaining.add(identity)
+                continue
+            try:
+                os.kill(identity.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                log.warning(
+                    "permission denied while migrating Claude process",
+                    pid=identity.pid,
+                )
+                remaining.add(identity)
+                continue
+            remaining.add(identity)
+
+        deadline = asyncio.get_running_loop().time() + max(0.1, timeout)
+        while remaining and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+            remaining = {
+                identity for identity in remaining
+                if process_identity(identity.pid) == identity
+            }
+        return remaining
 
     def _resync_watch(self, sid: str) -> None:
         """Re-baseline a watched transcript's size after WE appended to it outside of
@@ -1518,6 +2301,16 @@ class WrapperMachine:
             if active_turns:
                 watch["external_ts"] = time.time()
         else:
+            broker_active = False
+            broker_partial = b""
+            if ctx is not None and getattr(ctx.sdk, "is_claude_broker", False):
+                try:
+                    broker_active, broker_partial = claude_broker_tail_state(path)
+                except OSError:
+                    broker_active = False
+                    broker_partial = b""
+                if broker_active and ctx.state == "idle":
+                    ctx.state = "running"
             watch.update({
                 "cwd": ctx.cwd if ctx is not None else None,
                 "external": False,
@@ -1526,6 +2319,8 @@ class WrapperMachine:
                 "file_available": True,
                 # Fail closed until the first real process scan completes.
                 "scan_complete": False,
+                "broker_active": broker_active,
+                "broker_partial": broker_partial,
             })
         self._watch[sid] = watch
         log.info("watching transcript", session_id=sid, engine=engine, size=st.st_size)
@@ -1596,6 +2391,9 @@ class WrapperMachine:
             paths,
             cwds,
             wrapper_pid=os.getpid(),
+            continue_bindings=self._claude_continue_bindings,
+            continue_candidates=self._claude_continue_candidates,
+            continue_resolver=self._latest_claude_session_for_cwd,
         )
         if not scan.complete:
             if not self._claude_probe_warned:
@@ -1607,13 +2405,38 @@ class WrapperMachine:
             self._claude_probe_warned = False
         return scan
 
+    @staticmethod
+    def _latest_claude_session_for_cwd(cwd: str) -> Optional[str]:
+        """Return Claude's native cwd-global ``-c`` target.
+
+        This runs inside the bounded process-scan worker and is called only for
+        a new ``ProcessIdentity``; the sticky binding is the per-process cache.
+        A catalog failure deliberately propagates so the ownership scan remains
+        incomplete/fail-closed instead of guessing from the watched subset.
+        """
+        infos = list_sessions(
+            directory=cwd,
+            limit=1,
+            include_worktrees=False,
+        )
+        if not infos:
+            return None
+        sid = getattr(infos[0], "session_id", None)
+        if not isinstance(sid, str) or not sid or len(sid) > 256:
+            raise RuntimeError("Claude catalog returned an invalid session id")
+        return sid
+
     async def _prime_claude_ownership(self, sid: str) -> bool:
         """Synchronously close the watcher interval before History/Query."""
         watch = self._watch.get(sid)
         if not watch or watch.get("engine") != "claude":
             return False
         async with self._codex_watch_lock:
-            paths, cwds = self._claude_watch_inputs(sid)
+            # An unqualified ``claude -c`` means "latest in this cwd". Always
+            # resolve it against the complete watched catalog; probing only the
+            # requested sid made every same-cwd sid look uniquely eligible and
+            # caused a warning to flash only after the user attempted a send.
+            paths, cwds = self._claude_watch_inputs()
             scan = await self._probe_claude_holders(paths, cwds)
             holders = set(scan.holders.get(sid, ()))
             if not scan.complete:
@@ -1771,6 +2594,41 @@ class WrapperMachine:
         except OSError:
             return
 
+        ctx = self._ctx_by_sid(sid)
+        if (ctx is not None and ctx.engine == "codex"
+                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+            changed = False
+            file_id = (st.st_dev, st.st_ino)
+            if file_id != w.get("file_id") or st.st_size < w.get("size", 0):
+                w["file_id"] = file_id
+                w["size"] = st.st_size
+                w["partial"] = b""
+                changed = True
+            elif st.st_size > w.get("size", 0):
+                data = await asyncio.to_thread(
+                    self._read_watch_growth,
+                    w["path"],
+                    w["size"],
+                    st.st_size - w["size"],
+                )
+                w["size"] += len(data)
+                changed = bool(data)
+            # The daemon is the single session owner. Other proxy/TUI clients
+            # are collaborators, not foreign writers, so they never create a
+            # takeover lock or stale in-memory fork.
+            w["holders"] = holders
+            w["writers"] = writers
+            w["external"] = False
+            w["takeover_pending"] = None
+            w["active_external_turns"].clear()
+            w["pending_wrapper_turns"].clear()
+            ctx.needs_reload = False
+            await self._sync_external_control(ctx, w)
+            if changed:
+                await self._refresh_codex_collaboration_mode(ctx)
+                await self._push_mirrored_history(sid)
+            return
+
         pending_takeover = w.get("takeover_pending")
         if pending_takeover:
             new_writers = writers.difference(
@@ -1808,7 +2666,6 @@ class WrapperMachine:
                 self._read_watch_growth, w["path"], w["size"], st.st_size - w["size"])
             w["size"] += len(data)
 
-        ctx = self._ctx_by_sid(sid)
         sdk = ctx.sdk if ctx is not None else None
         own_turn_ids = set(getattr(sdk, "owned_turn_ids", ())) if sdk else set()
         active: dict[str, float] = w["active_external_turns"]
@@ -1951,6 +2808,9 @@ class WrapperMachine:
             # state with the transcript so Remote does not keep a stale override.
             await self._refresh_codex_collaboration_mode(ctx)
 
+        if ctx is not None:
+            await self._sync_external_control(ctx, w)
+
         if external_growth or is_external != was_external or takeover_cleared:
             log.info(
                 "codex external ownership changed" if is_external != was_external
@@ -1985,6 +2845,72 @@ class WrapperMachine:
         except OSError:
             file_stat = None
         w["file_available"] = file_stat is not None
+
+        # A broker-owned official TUI is intentionally writable from both the
+        # terminal and Remote. Its process/transcript must therefore never flow
+        # through the legacy "foreign owner => read-only" heuristic. Parse only
+        # durable lifecycle boundaries, mirror all content from normal history,
+        # and leave a managed Remote turn's state to its own drain task.
+        if ctx is not None and getattr(ctx.sdk, "is_claude_broker", False):
+            w["scan_complete"] = True
+            w["external"] = False
+            w["holders"] = set()
+            lifecycle_events: tuple[tuple[str, str], ...] = ()
+            changed = False
+            if file_stat is not None:
+                current_id = (file_stat.st_dev, file_stat.st_ino)
+                old_size = int(w.get("size", 0))
+                if current_id != w.get("file_id") or file_stat.st_size < old_size:
+                    try:
+                        active, partial = await asyncio.to_thread(
+                            claude_broker_tail_state, w["path"])
+                    except OSError:
+                        active, partial = False, b""
+                    w["file_id"] = current_id
+                    w["size"] = file_stat.st_size
+                    w["broker_active"] = active
+                    w["broker_partial"] = partial
+                    changed = True
+                elif file_stat.st_size > old_size:
+                    data = await asyncio.to_thread(
+                        self._read_watch_growth,
+                        w["path"],
+                        old_size,
+                        file_stat.st_size - old_size,
+                    )
+                    w["size"] = old_size + len(data)
+                    parsed = parse_claude_broker_lifecycle(
+                        data, w.get("broker_partial", b""))
+                    w["broker_partial"] = parsed.partial
+                    lifecycle_events = parsed.ordered
+                    active = bool(w.get("broker_active", False))
+                    for kind, _event_id in lifecycle_events:
+                        active = kind == "started"
+                    w["broker_active"] = active
+                    changed = bool(data)
+
+            try:
+                await ctx.sdk.refresh_status()
+            except BrokerClientError as exc:
+                if not await self._refresh_claude_broker_handle(ctx):
+                    log.warning(
+                        "Claude broker status unavailable",
+                        session_id=sid,
+                        error_code=exc.code,
+                    )
+            else:
+                await self._sync_claude_broker_runtime_controls(ctx)
+                await self._sync_external_control(ctx, w)
+
+            if ctx.turn_task is None:
+                active = bool(w.get("broker_active", False))
+                if active and ctx.state == "idle":
+                    await self._set_state(ctx, "running")
+                elif not active and ctx.state != "idle":
+                    await self._set_state(ctx, "idle")
+            if changed:
+                await self._push_mirrored_history(sid)
+            return
 
         takeover_cleared = False
         if ownership_scan_complete:
@@ -2039,6 +2965,8 @@ class WrapperMachine:
             ctx.needs_reload = True
 
         is_external = self._is_external(sid)
+        if ctx is not None:
+            await self._sync_external_control(ctx, w)
         if (external_growth or is_external != was_external or takeover_cleared
                 or w["file_available"] != was_file_available):
             log.info(
@@ -2106,6 +3034,19 @@ class WrapperMachine:
         while True:
             try:
                 await asyncio.sleep(1.5)
+                # A user may start ``claude-remote resume`` after this wrapper
+                # already resumed the sid through the SDK. Upgrade that exact
+                # idle context before the legacy external-process scan can
+                # misclassify the broker-owned official TUI.
+                await self._adopt_live_claude_broker_sessions()
+                # A new broker session has a UUID before Claude creates its
+                # first transcript. Retry watch registration so a turn typed
+                # only in the official TUI still appears in Remote.
+                for ctx in list(self.sessions.values()):
+                    if (getattr(ctx.sdk, "is_claude_broker", False)
+                            and ctx.session_id
+                            and ctx.session_id not in self._watch):
+                        self._watch_session(ctx.session_id)
                 await self._poll_watches_once()
             except asyncio.CancelledError:
                 raise
@@ -2128,6 +3069,7 @@ class WrapperMachine:
         else:
             build_seq = self._history_build_sequences.get(sid, 0)
         ctx = self._ctx_by_sid(sid)
+        control = self._session_control(ctx) if ctx is not None else None
         live_seq = ctx.seq if ctx is not None else None
         in_progress = bool(ctx is not None and ctx.state != "idle")
         events: list = []
@@ -2158,6 +3100,7 @@ class WrapperMachine:
                     has_more=False,
                     before=before,
                     external=self._is_external(sid),
+                    control=control,
                     takeover_pending=bool(
                         (self._watch.get(sid) or {}).get("takeover_pending")),
                     in_progress=in_progress,
@@ -2176,6 +3119,13 @@ class WrapperMachine:
             except Exception as e:
                 log.warning("codex get_history failed", session_id=sid, error=str(e))
                 history_error = "历史暂时不可用，请稍后重试"
+        elif (ctx is not None
+              and getattr(ctx.sdk, "is_claude_broker", False)
+              and source_path is None):
+            # `claude-remote new` reserves its UUID before the official TUI
+            # writes the first JSONL row. That is an authoritative empty history,
+            # not a read failure banner.
+            events = []
         else:
             directory = (ctx.cwd if ctx else None) or cwd_hint or self.cfg.cc_cwd
             try:
@@ -2204,6 +3154,7 @@ class WrapperMachine:
                 has_more=False,
                 before=before,
                 external=self._is_external(sid),
+                control=control,
                 takeover_pending=bool(
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
@@ -2309,6 +3260,7 @@ class WrapperMachine:
                 events=payload,
                 has_more=effective_start > 0,
                 before=before,
+                control=control,
                 oldest_id=(_tid(selected[0]) if selected else None),
                 newest_id=(_tid(selected[-1]) if selected else None),
                 external=self._is_external(sid),
@@ -2441,11 +3393,35 @@ class WrapperMachine:
             await self._emit(ctx, error)
             return error
 
+        # ``claude-remote`` is already a shared owner, not a foreign CLI to
+        # terminate. This also closes the short interval before the periodic
+        # watcher has upgraded a previously-resident SDK context.
+        if (ctx.engine == "claude" and ctx.space == "code"
+                and not getattr(ctx.sdk, "is_claude_broker", False)):
+            await self._adopt_claude_broker_handle(ctx)
+
         resolved_sid = ctx.session_id or sid
         if not resolved_sid:
             error = Error(code=ERR_NOT_RUNNING, message="该会话尚无可接管的会话 ID")
             await self._emit(ctx, error)
             return error
+        if (ctx.engine == "codex"
+                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+            await self._sync_external_control(
+                ctx, self._watch.get(resolved_sid))
+            await self._emit(ctx, TakeoverState(
+                pending=False,
+                message="Codex 已通过共享 daemon 双向连接，无需迁移或接管",
+            ))
+            return None
+        if getattr(ctx.sdk, "is_claude_broker", False):
+            await self._sync_external_control(
+                ctx, self._watch.get(resolved_sid))
+            await self._emit(ctx, TakeoverState(
+                pending=False,
+                message="Claude 已通过 broker 双向连接，无需结束终端或迁移会话",
+            ))
+            return None
         self._watch_session(resolved_sid)
         w = self._watch.get(resolved_sid)
         if w is None:
@@ -2474,6 +3450,7 @@ class WrapperMachine:
                         "interactive": set(holders),
                         "turn_ids": set(w["active_external_turns"]),
                     }
+                    await self._sync_external_control(ctx, w)
                     await self._emit(ctx, TakeoverState(
                         pending=True,
                         message=("已登记接管；当前回复结束后会自动交给 Remote。"
@@ -2487,7 +3464,7 @@ class WrapperMachine:
                 ctx.needs_reload = True
         else:
             async with self._codex_watch_lock:
-                paths, cwds = self._claude_watch_inputs(resolved_sid)
+                paths, cwds = self._claude_watch_inputs()
                 scan = await self._probe_claude_holders(paths, cwds)
                 holders = set(scan.holders.get(resolved_sid, ()))
                 if not scan.complete:
@@ -2509,23 +3486,63 @@ class WrapperMachine:
                 if holders:
                     w["takeover_pending"] = True
                     w["external"] = True
-                    await self._push_mirrored_history(resolved_sid)
+                    await self._sync_external_control(ctx, w)
                     await self._emit(ctx, TakeoverState(
                         pending=True,
-                        message=("已登记接管；退出当前终端 Claude 后会自动交给 "
-                                 "Remote，期间不会允许双端同时发送"),
+                        message=("正在安全结束本机 Claude CLI，并把最新历史迁移给 "
+                                 "Remote；不会终止终端 Shell"),
                     ))
+                    remaining = await self._terminate_external_claude_holders(
+                        holders)
+                    if remaining:
+                        w["takeover_pending"] = False
+                        w["external"] = True
+                        await self._sync_external_control(ctx, w)
+                        await self._emit(ctx, TakeoverState(
+                            pending=False,
+                            message="本机 Claude 未在安全等待时间内退出，未强制结束进程",
+                        ))
+                        error = Error(
+                            code=ERR_BUSY,
+                            message=("本机 Claude 未退出，迁移已取消；可在终端退出后重试，"
+                                     "Remote 仍保持只读"),
+                        )
+                        await self._emit(ctx, error)
+                        return error
+                    # Consume final JSONL flushes only after the exact CLI
+                    # identity disappeared. The resident SDK reloads from this
+                    # transcript at the next query boundary.
+                    try:
+                        final_stat = await asyncio.to_thread(os.stat, w["path"])
+                    except OSError:
+                        final_stat = None
+                    if final_stat is not None:
+                        w["size"] = final_stat.st_size
+                        w["file_id"] = (final_stat.st_dev, final_stat.st_ino)
+                        w["file_available"] = True
+                    w["holders"] = set()
+                    w["takeover_pending"] = False
+                    w["external"] = False
+                    w["scan_complete"] = True
+                    ctx.external_ts = 0.0
+                    ctx.needs_reload = True
                     log.info(
-                        "Claude takeover queued until terminal exit",
+                        "Claude external CLI migrated to Remote",
                         session_id=resolved_sid,
                         holders=len(holders),
                     )
-                    return None
-                w["takeover_pending"] = False
-                w["external"] = False
-                w["scan_complete"] = True
-                ctx.external_ts = 0.0
-                ctx.needs_reload = True
+                    await self._emit(ctx, TakeoverState(
+                        pending=False,
+                        message="本机 Claude 已退出，会话已迁移到 Remote",
+                    ))
+                else:
+                    w["takeover_pending"] = False
+                    w["external"] = False
+                    w["scan_complete"] = True
+                    ctx.external_ts = 0.0
+                    ctx.needs_reload = True
+
+        await self._sync_external_control(ctx, w)
 
         log.info("session manually taken over", session_id=resolved_sid,
                  engine=ctx.engine)
@@ -2556,12 +3573,62 @@ class WrapperMachine:
                 msg_id=getattr(cmd, "msg_id", None))
             await self._emit(ctx, error)
             return error
+        if ctx.engine == "claude" and ctx.space == "code":
+            await self._adopt_claude_broker_handle(ctx)
+            if ctx.state != "idle":
+                error = Error(
+                    code=ERR_BUSY,
+                    message="该会话正由终端中的 Claude 回合运行，先 interrupt",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
+        is_claude_broker = bool(getattr(ctx.sdk, "is_claude_broker", False))
+        is_codex_shared = bool(
+            ctx.engine == "codex"
+            and getattr(ctx.sdk, "using_daemon_proxy", False))
+        if is_claude_broker:
+            try:
+                metadata = await ctx.sdk.refresh_status()
+            except BrokerClientError as exc:
+                refreshed = await self._refresh_claude_broker_handle(ctx)
+                is_claude_broker = bool(getattr(
+                    ctx.sdk, "is_claude_broker", False))
+                if refreshed and is_claude_broker:
+                    metadata = ctx.sdk.metadata
+                elif is_claude_broker:
+                    error = Error(
+                        code=ERR_BUSY,
+                        message=f"Claude broker 不可用，本次未发送: {exc}",
+                        msg_id=getattr(cmd, "msg_id", None),
+                    )
+                    await self._emit(ctx, error)
+                    return error
+                else:
+                    # A terminal session exit was proven and the context is now
+                    # a fully connected SDK handle. Continue through the normal
+                    # final ownership checks in this same send operation.
+                    metadata = {}
+            if is_claude_broker:
+                await self._sync_claude_broker_runtime_controls(ctx)
+                await self._sync_external_control(
+                    ctx, self._watch.get(ctx.session_id or ""))
+            if is_claude_broker and metadata.get("input_busy"):
+                error = Error(
+                    code=ERR_BUSY,
+                    message="本机终端正在编辑输入；完成、发送或取消后再从 Remote 发送",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
         if ctx.session_id:
             self._watch_session(ctx.session_id)
             external = (
-                await self._prime_codex_ownership(ctx.session_id)
+                (False if is_codex_shared
+                 else await self._prime_codex_ownership(ctx.session_id))
                 if ctx.engine == "codex"
-                else await self._prime_claude_ownership(ctx.session_id)
+                else (False if is_claude_broker
+                      else await self._prime_claude_ownership(ctx.session_id))
             )
             if external:
                 engine_name = "Codex" if ctx.engine == "codex" else "Claude"
@@ -2612,8 +3679,11 @@ class WrapperMachine:
         ctx.state = "running"
         async with ctx.emit_lock:
             await self._emit_locked(ctx, StateEvent(state="running"))
+        runner = (self._run_claude_broker_turn
+                  if is_claude_broker else self._run_turn)
         ctx.turn_task = asyncio.create_task(
-            self._run_turn(ctx, cmd.prompt, getattr(cmd, "images", None), getattr(cmd, "files", None)))
+            runner(ctx, cmd.prompt, getattr(cmd, "images", None),
+                   getattr(cmd, "files", None)))
 
     async def _handle_interrupt(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -2919,16 +3989,110 @@ class WrapperMachine:
             return error
         return await self._handle_get_engine_capabilities(cmd)
 
-    async def _handle_set_model(self, cmd) -> None:
+    @staticmethod
+    def _claude_broker_control_error(action: str, exc: Exception) -> Error:
+        """Translate broker control failures without exposing internals as UI state."""
+        code = getattr(exc, "code", None)
+        if code == "input_busy":
+            return Error(
+                code=ERR_BUSY,
+                message=f"Claude TUI 输入通道正忙，{action}未生效",
+            )
+        if code == "control_rejected":
+            return Error(
+                code=ERR_INTERNAL,
+                message=f"Claude TUI 拒绝了{action}，界面状态未更改",
+            )
+        if code == "control_unconfirmed":
+            return Error(
+                code=ERR_INTERNAL,
+                message=f"未收到 Claude TUI 对{action}的持久确认，界面状态未更改",
+            )
+        if code in {"bad_control", "unsupported_control"}:
+            return Error(
+                code=ERR_INTERNAL,
+                message=f"当前 Claude TUI 不支持{action}，界面状态未更改",
+            )
+        return Error(
+            code=ERR_INTERNAL,
+            message=f"Claude TUI {action}失败，真实状态暂未确认",
+        )
+
+    async def _runtime_control_preflight(
+        self, ctx: SessionContext, *, action: str,
+    ) -> Optional[Error]:
+        """Bind a control to the session's real writer before changing state.
+
+        A normal Claude CLI and the wrapper's Agent SDK can resume the same
+        transcript at once.  Model/effort/permission controls must never mutate
+        the SDK copy and announce success while the user's terminal owns another
+        live TUI.  Prefer an exact broker session; otherwise use the same
+        fail-closed ownership scan as Query before touching any runtime option.
+        """
+        if (ctx.engine == "claude" and ctx.space == "code"
+                and not getattr(ctx.sdk, "is_claude_broker", False)):
+            await self._adopt_claude_broker_handle(ctx)
+
+        is_claude_broker = bool(
+            getattr(ctx.sdk, "is_claude_broker", False))
+        if is_claude_broker and ctx.state != "idle":
+            error = Error(
+                code=ERR_BUSY,
+                message=f"Claude TUI 正在处理回合，完成或打断后再{action}",
+            )
+            await self._emit(ctx, error)
+            return error
+
+        if not ctx.session_id or is_claude_broker:
+            return None
+        if ctx.engine == "claude" and ctx.space != "code":
+            return None
+        if (ctx.engine == "codex"
+                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+            return None
+
+        self._watch_session(ctx.session_id)
+        external = (
+            await self._prime_codex_ownership(ctx.session_id)
+            if ctx.engine == "codex"
+            else await self._prime_claude_ownership(ctx.session_id)
+        )
+        if not external:
+            return None
+
+        await self._sync_external_control(
+            ctx, self._watch.get(ctx.session_id))
+        engine_name = "Codex" if ctx.engine == "codex" else "Claude"
+        guidance = (
+            "请先点击『接管』，或使用 claude-remote 启动终端以保持双向同步"
+            if ctx.engine == "claude"
+            else "请先退出终端或点击『接管』"
+        )
+        error = Error(
+            code=ERR_BUSY,
+            message=(f"该会话正由本机原生 {engine_name} CLI 控制，{action}未生效；"
+                     f"{guidance}"),
+        )
+        await self._emit(ctx, error)
+        return error
+
+    async def _handle_set_model(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return
+        control_error = await self._runtime_control_preflight(
+            ctx, action="切换模型")
+        if control_error is not None:
+            return control_error
         try:
             await ctx.sdk.set_model(cmd.model)
             await self._refresh_pending_claude_work_baseline(ctx)
+            await self._persist_claude_session_controls(ctx)
             applied_model = getattr(ctx.sdk, "model", None) or cmd.model
             ctx.announced_model = applied_model
-            await self._emit(ctx, Model(model=applied_model))
+            model_event = Model(model=applied_model)
+            await self._emit(ctx, model_event)
+            responses = [model_event]
             if ctx.engine == "codex":
                 # thread/settings/updated is authoritative. app-server may adjust
                 # effort when the selected model cannot use the old level; never
@@ -2936,10 +4100,19 @@ class WrapperMachine:
                 applied = getattr(ctx.sdk, "effort", None)
                 if applied and applied != ctx.announced_effort:
                     ctx.announced_effort = applied
-                    await self._emit(ctx, Effort(effort=applied))
+                    effort_event = Effort(effort=applied)
+                    await self._emit(ctx, effort_event)
+                    responses.append(effort_event)
+            return tuple(responses)
         except Exception as e:
             log.exception("set_model failed", error=str(e))
-            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_model failed: {e}"))
+            error = (
+                self._claude_broker_control_error("切换模型", e)
+                if getattr(ctx.sdk, "is_claude_broker", False)
+                else Error(code=ERR_INTERNAL, message=f"set_model failed: {e}")
+            )
+            await self._emit(ctx, error)
+            return error
 
     async def _apply_codex_effort(self, ctx, effort: Optional[str]) -> Optional[str]:
         """Clamp `effort` to what ctx's codex model supports and apply it to the live
@@ -2959,26 +4132,49 @@ class WrapperMachine:
         await ctx.sdk.set_effort(applied)
         return getattr(ctx.sdk, "effort", None) or applied
 
-    async def _handle_set_effort(self, cmd) -> None:
-        # cc: effort is a spawn-time flag (--effort), so we can't flip it on the live
-        # subprocess — record it and let _run_turn respawn-with-resume lazily at the
-        # next turn (an idle tweak then costs no tokens).
+    async def _handle_set_effort(self, cmd):
+        # cc SDK: effort is a spawn-time flag (--effort), so record it and let
+        # _run_turn respawn-with-resume lazily at the next turn. A broker-owned
+        # official TUI instead applies the native /effort command immediately.
         # codex: effort is a per-turn turn/start param, so the live session honors it
         # immediately — no reconnect needed.
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return
+        control_error = await self._runtime_control_preflight(
+            ctx, action="切换思考强度")
+        if control_error is not None:
+            return control_error
         if ctx.engine == "codex":
             applied = await self._apply_codex_effort(ctx, cmd.effort) or cmd.effort
             ctx.announced_effort = applied
-            await self._emit(ctx, Effort(effort=applied))
+            event = Effort(effort=applied)
+            await self._emit(ctx, event)
             log.info("effort set", sid=ctx.session_id, effort=applied,
                      requested=cmd.effort, engine=ctx.engine)
-            return
-        ctx.sdk.effort = cmd.effort
-        ctx.announced_effort = cmd.effort
-        await self._emit(ctx, Effort(effort=cmd.effort))
-        log.info("effort set", sid=ctx.session_id, effort=cmd.effort, engine=ctx.engine)
+            return event
+        if getattr(ctx.sdk, "is_claude_broker", False):
+            try:
+                await ctx.sdk.set_effort(cmd.effort)
+            except Exception as e:
+                log.exception("set_effort failed", error=str(e))
+                error = self._claude_broker_control_error(
+                    "切换思考强度", e)
+                await self._emit(ctx, error)
+                return error
+            applied = getattr(ctx.sdk, "effort", None) or cmd.effort
+            ctx.sdk.applied_effort = applied
+        else:
+            # Agent SDK applies effort only after its next lazy reconnect.
+            # Do not mark it applied here or _run_turn will skip that reconnect.
+            ctx.sdk.effort = cmd.effort
+            applied = cmd.effort
+            await self._persist_claude_session_controls(ctx)
+        ctx.announced_effort = applied
+        event = Effort(effort=applied)
+        await self._emit(ctx, event)
+        log.info("effort set", sid=ctx.session_id, effort=applied, engine=ctx.engine)
+        return event
 
     async def _handle_set_service_tier(self, cmd) -> None:
         # Codex Fast is a thread setting in app-server 0.144.1. Never mutate the
@@ -3029,6 +4225,33 @@ class WrapperMachine:
             self, ctx: SessionContext) -> None:
         """Adopt settings persisted by a native Codex turn's rollout tail."""
         if ctx.engine != "codex" or not ctx.session_id:
+            return
+        if bool(getattr(ctx.sdk, "using_daemon_proxy", False)):
+            # The shared app-server is the live authority.  A settings/update is
+            # visible to every proxy immediately, while Codex does not append the
+            # corresponding turn_context until the next turn starts.  Reading the
+            # rollout here would therefore put an old model/effort back into the
+            # handle (and Web) just after a successful Remote or TUI switch.
+            model = getattr(ctx.sdk, "model", None)
+            if (isinstance(model, str) and model
+                    and ctx.announced_model != model):
+                ctx.announced_model = model
+                await self._emit(ctx, Model(model=model))
+            effort = getattr(ctx.sdk, "effort", None)
+            if (isinstance(effort, str) and effort
+                    and ctx.announced_effort != effort):
+                ctx.announced_effort = effort
+                await self._emit(ctx, Effort(effort=effort))
+            approval = getattr(ctx.sdk, "approval", None)
+            if (approval in CODEX_PERMISSION_MODES
+                    and ctx.announced_perm != approval):
+                ctx.announced_perm = approval
+                await self._emit(ctx, Perm(mode=approval))
+            mode = getattr(ctx.sdk, "collaboration_mode", None)
+            if (mode in CODEX_COLLABORATION_MODES
+                    and ctx.announced_collaboration_mode != mode):
+                ctx.announced_collaboration_mode = mode
+                await self._emit(ctx, CollaborationMode(mode=mode))
             return
         settings = await asyncio.to_thread(
             codex_session_settings, ctx.session_id,
@@ -3115,7 +4338,8 @@ class WrapperMachine:
         # a fresh Snapshot so the requester builds a runtime for the fork's key.
         snap = Snapshot(
             cc_session_id=None, state="idle", tail_text="", cwd=btw.cwd,
-            generation=self.instance_id)
+            generation=self.instance_id,
+            control=self._session_control(btw))
         snap.sid = btw.key
         if cid:
             snap.to = cid
@@ -3161,35 +4385,52 @@ class WrapperMachine:
                 ctx.btw_real_id, ctx.cwd, forget=disconnected)
         log.info("btw closed", btw_sid=sid)
 
-    async def _handle_set_perm(self, cmd) -> None:
+    async def _handle_set_perm(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return
+        control_error = await self._runtime_control_preflight(
+            ctx, action="切换权限模式")
+        if control_error is not None:
+            return control_error
         if ctx.space == "work" and ctx.engine == "codex" and cmd.mode != "never":
-            await self._emit(ctx, Error(
+            error = Error(
                 code=ERR_AUTH,
                 message="Codex Work 权限由隔离工作区固定管理，不能升级为交互授权",
-            ))
-            return
+            )
+            await self._emit(ctx, error)
+            return error
         allowed = (CODEX_PERMISSION_MODES if ctx.engine == "codex"
                    else CLAUDE_PERMISSION_MODES)
         if cmd.mode not in allowed:
             log.warning("invalid permission mode", sid=ctx.session_id,
                         engine=ctx.engine, mode=cmd.mode)
-            await self._emit(ctx, Error(
+            error = Error(
                 code=ERR_INTERNAL,
                 message=(f"{ctx.engine} 不支持权限模式 {cmd.mode!r}; "
                          f"可选: {', '.join(sorted(allowed))}"),
-            ))
-            return
+            )
+            await self._emit(ctx, error)
+            return error
         try:
             await ctx.sdk.set_permission_mode(cmd.mode)
-            applied = getattr(ctx.sdk, "approval", cmd.mode)
+            applied = (getattr(ctx.sdk, "approval", None)
+                       or getattr(ctx.sdk, "permission_mode", None)
+                       or cmd.mode)
+            await self._persist_claude_session_controls(ctx)
             ctx.announced_perm = applied
-            await self._emit(ctx, Perm(mode=applied))
+            event = Perm(mode=applied)
+            await self._emit(ctx, event)
+            return event
         except Exception as e:
             log.exception("set_permission_mode failed", error=str(e))
-            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_perm failed: {e}"))
+            error = (
+                self._claude_broker_control_error("切换权限模式", e)
+                if getattr(ctx.sdk, "is_claude_broker", False)
+                else Error(code=ERR_INTERNAL, message=f"set_perm failed: {e}")
+            )
+            await self._emit(ctx, error)
+            return error
 
     async def _on_set_mode(self, ctx: SessionContext, mode: str) -> None:
         """Agent-facing set_mode MCP tool (called within a turn). Same effect as
@@ -3198,6 +4439,7 @@ class WrapperMachine:
             raise ValueError(f"unsupported {ctx.engine} permission mode: {mode}")
         try:
             await ctx.sdk.set_permission_mode(mode)
+            await self._persist_claude_session_controls(ctx)
             ctx.announced_perm = mode
             await self._emit(ctx, Perm(mode=mode))
             log.info("agent set permission mode", sid=ctx.session_id, mode=mode)
@@ -5505,6 +6747,43 @@ class WrapperMachine:
                     engine="claude", space=space,
                     work_id=record.work_id if record else None,
                 ))
+            if space == "code":
+                # `claude-remote new` reserves the native session UUID before
+                # Claude writes its first transcript row. Merge live broker
+                # metadata so the TUI is immediately selectable in the sidebar;
+                # once JSONL exists the ordinary catalog row wins.
+                try:
+                    broker_response = await self._claude_broker.list()
+                except BrokerClientError as exc:
+                    if exc.code not in {"broker_unavailable", "session_not_found"}:
+                        log.warning(
+                            "Claude broker list unavailable",
+                            error_code=exc.code,
+                        )
+                else:
+                    known = {item.session_id for item in sessions}
+                    broker_sessions = broker_response.get("sessions")
+                    if isinstance(broker_sessions, list):
+                        for row in broker_sessions:
+                            if not isinstance(row, dict) or row.get("running") is not True:
+                                continue
+                            broker_sid = row.get("id")
+                            broker_cwd = row.get("cwd")
+                            if (not isinstance(broker_sid, str) or not broker_sid
+                                    or len(broker_sid) > 256
+                                    or broker_sid in known
+                                    or not isinstance(broker_cwd, str)
+                                    or not broker_cwd):
+                                continue
+                            sessions.append(SessionInfo(
+                                session_id=broker_sid,
+                                summary="Claude Remote",
+                                cwd=broker_cwd[:4096],
+                                state=resident_state.get(broker_sid, "idle"),
+                                engine="claude",
+                                space="code",
+                            ))
+                            known.add(broker_sid)
             await self.transport.send(SessionList(
                 engine="claude",
                 space=space,
@@ -5623,6 +6902,13 @@ class WrapperMachine:
         ctx = self.sessions.get(sid)
         if ctx is None:
             ctx = next((c for c in self.sessions.values() if c.session_id == sid), None)
+        if (ctx is not None
+                and getattr(ctx.sdk, "is_claude_broker", False)):
+            # Terminal exit recovery is an in-place SDK handoff. Transport
+            # uncertainty intentionally keeps this exact context read-only;
+            # evicting it here would turn a tab switch into an unsafe second
+            # writer and was why the old UI only recovered after switching.
+            await self._refresh_claude_broker_handle(ctx)
         newly_spawned = ctx is None
         if ctx is None:
             ctx = await self._spawn(
@@ -5648,12 +6934,16 @@ class WrapperMachine:
             snap = Snapshot(cc_session_id=ctx.session_id,
                             state=ctx.buffer.latest_state() or ctx.state,
                             tail_text=ctx.buffer.latest_tail_text(), cwd=ctx.cwd,
-                            generation=self.instance_id)
+                            generation=self.instance_id,
+                            control=self._session_control(ctx))
             await self._emit(ctx, snap)
         focus = SessionFocus(
             session_id=ctx.session_id or self.focused_sid or sid, cwd=ctx.cwd)
         await self._emit(ctx, focus)
         cached_responses = [snap, focus] if snap is not None else [focus]
+        control_event = self._session_control(ctx)
+        await self._emit(ctx, control_event)
+        cached_responses.append(control_event)
         permission_mode = _session_permission_mode(ctx)
         ctx.announced_perm = permission_mode
         permission_event = Perm(mode=permission_mode)
@@ -5872,6 +7162,7 @@ class WrapperMachine:
             tail_text=ctx.buffer.latest_tail_text(),
             cwd=ctx.cwd,
             generation=self.instance_id,
+            control=self._session_control(ctx),
         )
         await self._emit(ctx, snap)
         # session_id is None until captured in _run_turn; use the pool (temp) key
@@ -6261,7 +7552,8 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
-        if await self._prime_codex_ownership(sid):
+        if (not bool(getattr(ctx.sdk, "using_daemon_proxy", False))
+                and await self._prime_codex_ownership(sid)):
             error = Error(
                 code=ERR_BUSY,
                 message=f"会话正由本机终端使用，无法{action}",
@@ -6666,8 +7958,39 @@ class WrapperMachine:
         codex_checkpoint_retired = False
         conversation_may_have_changed = False
         files_may_have_changed = False
+        conversation_blocked = False
 
-        if wants_files:
+        if ctx.engine == "claude" and wants_conversation:
+            try:
+                if getattr(ctx.sdk, "is_claude_broker", False):
+                    raise ClaudeRewindError(
+                        "capability_unavailable", operation="conversation")
+                prepare = getattr(ctx.sdk, "prepare_conversation_rewind", None)
+                if callable(prepare):
+                    await prepare(resume_id=sid, cwd=ctx.cwd)
+            except ClaudeRewindError as exc:
+                conversation = "failed"
+                conversation_blocked = True
+                detail_parts.append(
+                    f"对话历史恢复失败：{exc.user_message_zh}（{exc.code}）")
+                log.warning(
+                    "Claude conversation rollback preflight failed",
+                    session_id=sid,
+                    rewind_code=exc.code,
+                    retryable=exc.retryable,
+                )
+            except Exception as exc:
+                conversation = "failed"
+                conversation_blocked = True
+                detail_parts.append(
+                    "对话回滚运行时准备失败，未修改对话或代码")
+                log.warning(
+                    "Claude conversation rollback runtime refresh failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+
+        if wants_files and not conversation_blocked:
             try:
                 files_may_have_changed = True
                 if ctx.engine == "claude":
@@ -6695,7 +8018,18 @@ class WrapperMachine:
                 files = "failed"
                 conflicts = list(dict.fromkeys((*exc.paths, *exc.index_paths)))
                 detail_parts.append("检测到回滚点之后的文件或暂存区改动，未覆盖")
-            except (CheckpointError, ClaudeRewindError) as exc:
+            except ClaudeRewindError as exc:
+                files = "failed"
+                detail_parts.append(
+                    f"代码恢复失败：{exc.user_message_zh}（{exc.code}）")
+                log.warning(
+                    "session file rollback failed",
+                    engine=ctx.engine,
+                    session_id=sid,
+                    rewind_code=exc.code,
+                    retryable=exc.retryable,
+                )
+            except CheckpointError as exc:
                 files = "failed"
                 detail_parts.append("当前回滚点没有可安全恢复的代码 checkpoint")
                 log.warning(
@@ -6718,7 +8052,8 @@ class WrapperMachine:
         # conversation untouched. This avoids hiding history while code remains
         # at the newer state. Once files succeed the two engine operations are
         # still non-atomic, so a later conversation failure is reported openly.
-        if wants_conversation and not (restore == "both" and files == "failed"):
+        if (wants_conversation and not conversation_blocked
+                and not (restore == "both" and files == "failed")):
             try:
                 if ctx.engine == "codex":
                     # Retire the count-aligned file journal *before* submitting
@@ -6761,7 +8096,18 @@ class WrapperMachine:
                             session_id=sid,
                             error_type=type(exc).__name__,
                         )
-            except (ClaudeRewindError, CheckpointError) as exc:
+            except ClaudeRewindError as exc:
+                conversation = "failed"
+                detail_parts.append(
+                    f"对话历史恢复失败：{exc.user_message_zh}（{exc.code}）")
+                log.warning(
+                    "session conversation rollback failed",
+                    engine=ctx.engine,
+                    session_id=sid,
+                    rewind_code=exc.code,
+                    retryable=exc.retryable,
+                )
+            except CheckpointError as exc:
                 conversation = "failed"
                 detail_parts.append("对话历史恢复失败")
                 log.warning(
@@ -8200,10 +9546,28 @@ class WrapperMachine:
                 message="临时 btw 会话不可恢复",
             ))
             return None
+        broker_handle: Optional[ClaudeBrokerHandle] = None
+        if (engine == "claude" and space == "code" and resume_id):
+            try:
+                broker_handle = await ClaudeBrokerHandle.discover(
+                    self._claude_broker, resume_id)
+            except BrokerClientError as exc:
+                # An unsafe/malformed live endpoint is not equivalent to an
+                # absent broker. Fail before starting a second Claude writer.
+                log.warning(
+                    "Claude broker discovery failed closed",
+                    session_id=resume_id,
+                    error_code=exc.code,
+                )
+                await self._emit_to_sid(resume_id, Error(
+                    code=ERR_BUSY,
+                    message="本机 Claude broker 状态无法安全确认，未启动第二个会话进程",
+                ))
+                return None
         # Claude's CLI/version preflight belongs to Claude spawn, not wrapper
         # process startup.  Keep it before cap eviction: an unavailable optional
         # engine must not evict a healthy resident Codex session and then fail.
-        if engine != "codex":
+        if engine == "claude" and broker_handle is None:
             try:
                 SdkHandle.preflight(self.cfg.claude_bin)
             except Exception as exc:
@@ -8241,6 +9605,19 @@ class WrapperMachine:
             target_cwd = cwd_hint or self.cfg.cc_cwd
             if not os.path.isdir(target_cwd):
                 target_cwd = self.cfg.cc_cwd
+        elif resume_id and broker_handle is not None:
+            # A freshly launched broker session has a durable, preassigned
+            # Claude session id before Claude writes its first JSONL row.  Its
+            # broker metadata is authoritative in that window; requiring
+            # get_session_info() here would make the new TUI impossible to open
+            # from Remote until somebody had already typed in the terminal.
+            target_cwd = broker_handle.cwd
+            if not os.path.isdir(target_cwd):
+                await self._emit_to_sid(resume_id, Error(
+                    code=ERR_BUSY,
+                    message="Claude broker 的工作目录已不存在，未连接该会话",
+                ))
+                return None
         elif resume_id:
             try:
                 info = await asyncio.to_thread(get_session_info, resume_id)
@@ -8308,9 +9685,19 @@ class WrapperMachine:
             work_id = work_record.work_id
 
         sdk = (
-            (CodexHandle(self.cfg, cwd=target_cwd, work_mode=True)
-             if space == "work" else CodexHandle(self.cfg, cwd=target_cwd))
-            if engine == "codex" else SdkHandle(self.cfg)
+            (CodexHandle(
+                self.cfg,
+                cwd=target_cwd,
+                work_mode=True,
+                daemon_mode="off",
+                daemon_manager=self._codex_daemon,
+            ) if space == "work" else CodexHandle(
+                self.cfg,
+                cwd=target_cwd,
+                daemon_mode=getattr(self.cfg, "codex_daemon_mode", "auto"),
+                daemon_manager=self._codex_daemon,
+            ))
+            if engine == "codex" else (broker_handle or SdkHandle(self.cfg))
         )
         if space == "work":
             if engine == "codex":
@@ -8409,19 +9796,9 @@ class WrapperMachine:
         )
         # Per-ctx MCP ask server is Claude-only (the cc-remote-ask tools). Codex
         # handles approvals through its own app-server protocol, so skip it.
-        if engine != "codex":
-            ctx.sdk.ask_server = make_ask_server(
-                lambda q, o: self._on_ask(ctx, q, o),
-                lambda m: self._on_set_mode(ctx, m),
-            )
-            ctx.sdk.permission_callback = (
-                lambda tool, tool_input, permission_context:
-                self._on_claude_tool_permission(
-                    ctx, tool, tool_input, permission_context))
-            ctx.sdk.background_message_callback = (
-                lambda message, turn_id: self._on_claude_background_message(
-                    ctx, message, turn_id))
-        else:
+        if engine != "codex" and broker_handle is None:
+            self._configure_claude_sdk_callbacks(ctx, ctx.sdk)
+        elif engine == "codex":
             ctx.sdk.approval_callback = (
                 lambda method, params: self._on_codex_approval(
                     ctx, method, params))
@@ -8458,6 +9835,24 @@ class WrapperMachine:
             sampled = getattr(ctx.sdk, "work_context_baseline_tokens", None)
             if isinstance(sampled, int) and not isinstance(sampled, bool) and sampled >= 0:
                 ctx.work_context_baseline_tokens = sampled
+
+        if broker_handle is not None:
+            ctx.claude_broker_generation = broker_handle.generation
+            metadata = broker_handle.metadata
+            await self._set_session_control(
+                ctx,
+                control_mode="claude_broker",
+                write_state=(
+                    "input_busy" if metadata.get("input_busy") else "writable"
+                ),
+                terminal_attached=bool(metadata.get("attached_count", 0)),
+                reason=(
+                    "本机终端正在编辑输入，完成或取消后即可从 Remote 发送"
+                    if metadata.get("input_busy") else None
+                ),
+                can_takeover=False,
+                emit=False,
+            )
 
         # Unlike Claude, Codex returns its durable thread id from thread/start
         # before the first turn. Bind it now so SessionFocus, artifact reads and
@@ -8501,6 +9896,21 @@ class WrapperMachine:
             # native rollout. Work always reasserts its non-escalating profile.
             ctx.sdk.approval = "never"
 
+        if engine == "codex" and space == "code":
+            await self._set_session_control(
+                ctx,
+                control_mode=(
+                    "codex_shared"
+                    if getattr(ctx.sdk, "using_daemon_proxy", False)
+                    else "remote"
+                ),
+                write_state="writable",
+                terminal_attached=False,
+                reason=None,
+                can_takeover=False,
+                emit=False,
+            )
+
         # cc model is a runtime switch on the live subprocess (set_model), so apply
         # a pre-selected model now that we're connected. codex was set pre-connect.
         if model and engine != "codex":
@@ -8510,6 +9920,12 @@ class WrapperMachine:
                 log.warning("spawn set_model failed", model=model, error=str(e))
             else:
                 await self._refresh_pending_claude_work_baseline(ctx)
+        if (engine == "claude" and space == "code" and resume_id
+                and broker_handle is None):
+            # Seed a migrated/existing SDK-owned session as soon as its native
+            # controls are known; the next claude-remote resume must not depend
+            # on the user changing every chip once after an upgrade.
+            await self._persist_claude_session_controls(ctx)
         # Record the pre-selected values so _run_turn doesn't redundantly re-announce
         # them (the client already reflects its own pick optimistically).
         if model:
@@ -8523,10 +9939,14 @@ class WrapperMachine:
         ctx.key = key
         if resume_id:
             self._watch_session(resume_id)
-            if engine == "codex":
+            if (engine == "codex"
+                    and not bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
                 await self._prime_codex_ownership(resume_id)
-            else:
+            elif engine == "claude" and broker_handle is None:
                 await self._prime_claude_ownership(resume_id)
+            else:
+                await self._sync_external_control(
+                    ctx, self._watch.get(resume_id))
         if resume_id and engine != "codex":
             save_session_id(self.cfg.state_dir, target_cwd, resume_id)
         await self._load_history(ctx, resume_id)
@@ -8587,7 +10007,12 @@ class WrapperMachine:
             except Exception:
                 pass
             log.info("evicted idle session for btw", key=victim)
-        sdk = CodexHandle(self.cfg, cwd=parent.cwd) if engine == "codex" else SdkHandle(self.cfg)
+        sdk = (CodexHandle(
+            self.cfg,
+            cwd=parent.cwd,
+            daemon_mode=getattr(self.cfg, "codex_daemon_mode", "auto"),
+            daemon_manager=self._codex_daemon,
+        ) if engine == "codex" else SdkHandle(self.cfg))
         if engine != "codex":
             sdk.permission_mode = getattr(
                 parent.sdk, "permission_mode", "bypassPermissions")
@@ -8601,17 +10026,7 @@ class WrapperMachine:
             cwd=parent.cwd, engine=engine, btw=True, parent_sid=parent_id,
             owner_client_id=owner_client_id)
         if engine != "codex":
-            ctx.sdk.ask_server = make_ask_server(
-                lambda q, o: self._on_ask(ctx, q, o),
-                lambda m: self._on_set_mode(ctx, m),
-            )
-            ctx.sdk.permission_callback = (
-                lambda tool, tool_input, permission_context:
-                self._on_claude_tool_permission(
-                    ctx, tool, tool_input, permission_context))
-            ctx.sdk.background_message_callback = (
-                lambda message, turn_id: self._on_claude_background_message(
-                    ctx, message, turn_id))
+            self._configure_claude_sdk_callbacks(ctx, ctx.sdk)
         else:
             ctx.sdk.approval = parent.sdk.approval
             ctx.sdk.approval_policy = parent.sdk.approval_policy
@@ -8832,9 +10247,230 @@ class WrapperMachine:
         except Exception as e:
             log.warning("tmp cleanup failed", error=str(e))
 
+    async def _run_claude_broker_turn(
+        self,
+        ctx: SessionContext,
+        prompt: str,
+        images: Optional[list] = None,
+        files: Optional[list] = None,
+    ) -> None:
+        """Submit one atomic prompt to the broker-owned official Claude TUI.
+
+        The PTY stream is intentionally not parsed: ANSI output is a terminal
+        presentation protocol, not a durable conversation API.  Claude remains
+        the sole JSONL writer, so the transcript supplies both the mirrored
+        history and the authoritative user/end-turn boundaries used here.
+        """
+        started_at = time.monotonic()
+        temp_dir: Optional[str] = None
+        path: Optional[str] = None
+        offset = 0
+        file_id: Optional[tuple[int, int]] = None
+        partial = b""
+        saw_user_boundary = False
+        terminal_id: Optional[str] = None
+        last_status_at = 0.0
+        last_mirror_at = 0.0
+        file_meta = ([{"filename": item.get("filename", "attachment")}
+                      for item in (files or [])] or None)
+
+        async def close_turn(*, error: bool, subtype: str) -> None:
+            duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
+            await self._emit(ctx, TurnEnd(
+                result=TurnResult(
+                    subtype=subtype,
+                    duration_ms=duration_ms,
+                    is_error=error,
+                ),
+                turn_id=terminal_id,
+            ))
+            await self._set_idle_after_managed_turn(ctx)
+
+        try:
+            if not ctx.session_id:
+                raise BrokerClientError(
+                    "invalid_status", "broker session id is unavailable")
+
+            # Establish the append boundary before the broker accepts input. A
+            # very fast Claude response can otherwise finish before send()
+            # returns and be mistaken for old history.
+            path = transcript_path(ctx.session_id)
+            if path:
+                try:
+                    before = os.stat(path)
+                except OSError:
+                    path = None
+                else:
+                    offset = before.st_size
+                    file_id = (before.st_dev, before.st_ino)
+
+            async with ctx.launch_lock:
+                if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
+                    await self._emit(ctx, Error(
+                        code=ERR_BUSY,
+                        message="消息在写入 Claude TUI 前已打断",
+                        msg_id=ctx.active_msg_id,
+                    ))
+                    await close_turn(error=True, subtype="error_during_execution")
+                    return
+
+                if files or images:
+                    temp_dir = tempfile.mkdtemp(prefix="cc-remote-turn-")
+                    os.chmod(temp_dir, 0o700)
+                if files:
+                    assert temp_dir is not None
+                    prompt = self._stash_files(
+                        prompt, files, temp_dir, engine="claude")
+                if images:
+                    assert temp_dir is not None
+                    image_paths = self._stash_images(images, temp_dir)
+                    image_block = " ".join(f"@{image_path}" for image_path in image_paths)
+                    prompt = (prompt + "\n\n" if prompt else "") + image_block
+
+                if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
+                    await self._emit(ctx, Error(
+                        code=ERR_BUSY,
+                        message="消息在写入 Claude TUI 前已打断",
+                        msg_id=ctx.active_msg_id,
+                    ))
+                    await close_turn(error=True, subtype="error_during_execution")
+                    return
+                await ctx.sdk.submit(prompt)
+                # The broker accepted one atomic prompt+Enter. Only now publish
+                # the authoritative echo: a terminal half-line can race the
+                # earlier status probe and make submit fail with input_busy.
+                await self._emit(ctx, UserMsg(
+                    msg_id=ctx.active_msg_id or uuid4().hex,
+                    prompt=prompt,
+                    images=images,
+                    files=file_meta,
+                ))
+
+            # Keep polling indefinitely for a normal turn.  Long reasoning and
+            # tools are valid; only an explicit interrupt gets the existing
+            # bounded drain deadline.
+            while True:
+                now = time.monotonic()
+                if now - last_status_at >= 0.5:
+                    metadata = await ctx.sdk.refresh_status()
+                    last_status_at = now
+                    await self._sync_external_control(
+                        ctx, self._watch.get(ctx.session_id))
+                    if metadata.get("running") is not True:
+                        raise BrokerClientError(
+                            "session_exited",
+                            "official Claude TUI exited before the turn completed",
+                        )
+
+                current_path = transcript_path(ctx.session_id)
+                if current_path:
+                    path = current_path
+                    try:
+                        current = os.stat(path)
+                    except OSError:
+                        current = None
+                    if current is not None:
+                        current_id = (current.st_dev, current.st_ino)
+                        if file_id is None:
+                            # A new broker session creates its transcript only
+                            # after input. Read from byte zero in that case.
+                            file_id = current_id
+                            offset = 0
+                        elif current_id != file_id or current.st_size < offset:
+                            file_id = current_id
+                            offset = 0
+                            partial = b""
+                        if current.st_size > offset:
+                            data = await asyncio.to_thread(
+                                self._read_watch_growth,
+                                path,
+                                offset,
+                                current.st_size - offset,
+                            )
+                            if data:
+                                offset += len(data)
+                                lifecycle = parse_claude_broker_lifecycle(
+                                    data, partial)
+                                partial = lifecycle.partial
+                                for kind, event_id in lifecycle.ordered:
+                                    if kind == "started":
+                                        saw_user_boundary = True
+                                    elif saw_user_boundary:
+                                        terminal_id = event_id
+                                # History is the public content stream for the
+                                # official TUI. Bound live refreshes while still
+                                # guaranteeing a final authoritative mirror.
+                                if now - last_mirror_at >= 0.1:
+                                    self._watch_session(ctx.session_id)
+                                    await self._push_mirrored_history(ctx.session_id)
+                                    last_mirror_at = now
+                                if terminal_id is not None:
+                                    await self._push_mirrored_history(ctx.session_id)
+                                    interrupted = ctx.state == "interrupting"
+                                    await close_turn(
+                                        error=interrupted,
+                                        subtype=("error_during_execution"
+                                                 if interrupted else "success"),
+                                    )
+                                    return
+
+                if ctx.state == "interrupting":
+                    deadline = ctx.interrupt_deadline
+                    if deadline is not None and now >= deadline:
+                        if path:
+                            await self._push_mirrored_history(ctx.session_id)
+                        await close_turn(
+                            error=True, subtype="error_during_execution")
+                        return
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            raise
+        except BrokerClientError as exc:
+            log.warning(
+                "Claude broker turn failed",
+                session_id=ctx.session_id,
+                error_code=exc.code,
+            )
+            await self._emit(ctx, Error(
+                code=(ERR_BUSY if exc.code in {
+                    "input_busy", "input_read_only", "stale_generation"
+                } else ERR_CC_CRASH),
+                message=f"Claude broker 回合失败: {exc}",
+                msg_id=ctx.active_msg_id,
+            ))
+            await close_turn(error=True, subtype="error_during_execution")
+            # A proven terminal exit should restore Remote write access now,
+            # not on a later SwitchSession. Transient socket loss is handled by
+            # the same refresh path but remains fail-closed on the broker handle.
+            await self._refresh_claude_broker_handle(ctx)
+        except Exception as exc:
+            log.exception("Claude broker turn failed", error=str(exc))
+            await self._emit(ctx, Error(
+                code=ERR_CC_CRASH,
+                message="Claude broker 回合失败，请查看 wrapper 日志",
+                msg_id=ctx.active_msg_id,
+            ))
+            await close_turn(error=True, subtype="error_during_execution")
+        finally:
+            if ctx.turn_task is asyncio.current_task():
+                ctx.turn_task = None
+            ctx.active_msg_id = None
+            ctx.interrupt_deadline = None
+            ctx.interrupt_event.clear()
+            if temp_dir is not None:
+                try:
+                    shutil.rmtree(temp_dir)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:
+                    log.warning(
+                        "broker turn attachment cleanup failed", error=str(exc))
+
     async def _run_turn(self, ctx: SessionContext, prompt: str,
                         images: Optional[list] = None, files: Optional[list] = None) -> None:
         is_codex = ctx.engine == "codex"
+        is_codex_shared = bool(
+            is_codex and getattr(ctx.sdk, "using_daemon_proxy", False))
         ctx.translator = (CodexStreamTranslator(self.cfg.tool_result_max) if is_codex
                           else StreamTranslator(
                               self.cfg.tool_result_max,
@@ -8949,7 +10585,13 @@ class WrapperMachine:
             # appended to this session's transcript since we resumed it, so our child's
             # in-memory context is STALE — continuing from it would fork the
             # conversation. Reload by resuming afresh before issuing the turn.
-            if ctx.needs_reload and ctx.session_id:
+            if ctx.needs_reload and ctx.session_id and is_codex_shared:
+                # Rollout growth from another official proxy is already in the
+                # shared daemon's authoritative thread state. Reconnecting here
+                # only risks falling back to a private stdio process and creating
+                # the split-brain this mode exists to avoid.
+                ctx.needs_reload = False
+            elif ctx.needs_reload and ctx.session_id:
                 log.info("reloading session after external transcript change",
                          sid=ctx.session_id)
                 if is_codex:
@@ -9103,7 +10745,9 @@ class WrapperMachine:
                     # short native turn can finish between the earlier reload and
                     # this probe: no holder remains, but consuming its markers sets
                     # needs_reload. Reconnect once, then probe again before sending.
-                    if ctx.session_id:
+                    if (ctx.session_id
+                            and not bool(getattr(
+                                ctx.sdk, "using_daemon_proxy", False))):
                         external = await self._prime_codex_ownership(ctx.session_id)
                         if (ctx.interrupt_event.is_set()
                                 or ctx.state == "interrupting"):

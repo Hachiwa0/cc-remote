@@ -2,14 +2,14 @@
 
 An idle Claude TUI does not keep its transcript open, so transcript growth is
 not a stable ownership signal.  Prefer an explicit session id from the process
-command line and conservatively associate an otherwise-unqualified Claude Code
-process with every watched session in the same working directory.
+command line.  Fall back to the working directory only when it identifies one
+watched session unambiguously.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from cc_remote.wrapper.codex_external import (
     MAX_PROC_SCAN,
@@ -23,6 +23,7 @@ from cc_remote.wrapper.codex_external import (
 
 _CLAUDE_COMMANDS = frozenset({"claude", "claude.exe"})
 _SESSION_FLAGS = frozenset({b"--resume", b"-r", b"--session-id"})
+_CONTINUE_FLAGS = frozenset({b"--continue", b"-c"})
 _BACKGROUND_ROLES = frozenset({
     b"daemon", b"bg-pty-host", b"bg-spare", b"--bg-pty-host", b"--bg-spare",
 })
@@ -53,20 +54,37 @@ def _is_claude_cli(args: tuple[bytes, ...] | None) -> bool:
 
 def _explicit_session_ids(
     args: tuple[bytes, ...], sid_by_arg: Mapping[bytes, str],
-) -> set[str]:
+) -> tuple[set[str], bool]:
     result: set[str] = set()
+    has_explicit_target = False
     for index, arg in enumerate(args):
-        if arg in _SESSION_FLAGS and index + 1 < len(args):
-            sid = sid_by_arg.get(args[index + 1])
-            if sid is not None:
-                result.add(sid)
+        if arg in _SESSION_FLAGS:
+            if index + 1 < len(args):
+                target = args[index + 1]
+                if target and not target.startswith(b"-"):
+                    has_explicit_target = True
+                    sid = sid_by_arg.get(target)
+                    if sid is not None:
+                        result.add(sid)
             continue
         for prefix in (b"--resume=", b"--session-id="):
             if arg.startswith(prefix):
-                sid = sid_by_arg.get(arg[len(prefix):])
+                target = arg[len(prefix):]
+                if not target:
+                    continue
+                has_explicit_target = True
+                sid = sid_by_arg.get(target)
                 if sid is not None:
                     result.add(sid)
-    return result
+    return result, has_explicit_target
+
+
+def _is_continue(args: tuple[bytes, ...]) -> bool:
+    """Return whether this CLI asks Claude to continue the cwd's latest chat."""
+    return any(
+        arg in _CONTINUE_FLAGS or arg.startswith(b"--continue=")
+        for arg in args
+    )
 
 
 def claude_session_holders(
@@ -75,14 +93,17 @@ def claude_session_holders(
     *,
     wrapper_pid: int,
     proc_root: str = "/proc",
+    continue_bindings: dict[ProcessIdentity, str] | None = None,
+    continue_candidates: dict[ProcessIdentity, str] | None = None,
+    continue_resolver: Callable[[str], str | None] | None = None,
 ) -> HolderScan:
     """Return stable external Claude process identities for watched sessions.
 
     Direct children of ``wrapper_pid`` are the SDK processes owned by this
     wrapper and are excluded.  A foreign process with an explicit session flag
-    owns only that session.  A foreign Claude process without a session id owns
-    every watched session sharing its cwd; this deliberate false-positive is
-    safer than allowing two Claude processes to append to one transcript.
+    owns only that session.  A foreign Claude process without a session id is
+    associated by cwd only when exactly one watched session uses that cwd.
+    Ambiguous same-cwd processes must not make every sibling session read-only.
     """
     holders = {sid: set() for sid in paths}
     root = Path(proc_root)
@@ -95,6 +116,10 @@ def claude_session_holders(
         cwd_sids.setdefault(os.path.realpath(cwd), set()).add(sid)
     missing_cwds = set(paths).difference(
         sid for sids in cwd_sids.values() for sid in sids)
+    bindings = continue_bindings if continue_bindings is not None else {}
+    candidates = (
+        continue_candidates if continue_candidates is not None else {})
+    seen_continue: set[ProcessIdentity] = set()
 
     complete = True
     try:
@@ -119,24 +144,80 @@ def claude_session_holders(
             if parent_pid == wrapper_pid:
                 continue
 
-            matched = _explicit_session_ids(args, sid_by_arg)
-            if not matched:
+            matched, has_explicit_session = _explicit_session_ids(
+                args, sid_by_arg)
+            identity = ProcessIdentity(int(proc_dir.name), start_ticks)
+            continue_command = (
+                not matched
+                and not has_explicit_session
+                and _is_continue(args)
+            )
+            if continue_command:
+                seen_continue.add(identity)
+                if identity in bindings:
+                    bound_sid = bindings[identity]
+                else:
+                    if identity in candidates:
+                        bound_sid = candidates[identity]
+                    else:
+                        try:
+                            process_cwd = os.path.realpath(
+                                os.readlink(proc_dir / "cwd"))
+                        except OSError:
+                            if _process_start_ticks(proc_dir) == start_ticks:
+                                complete = False
+                            continue
+                        if continue_resolver is None:
+                            # The watched subset cannot prove Claude's cwd-global
+                            # "latest" target. Treat missing catalog authority as
+                            # incomplete, never as the sole watched sid.
+                            complete = False
+                            continue
+                        try:
+                            bound_sid = continue_resolver(process_cwd)
+                        except Exception:
+                            complete = False
+                            continue
+                        if bound_sid is None:
+                            # A live `-c` process should have selected a native
+                            # session. An empty/racing catalog is not proof that
+                            # it owns none of the watched sessions; retry on the
+                            # next scan while remaining fail-closed now.
+                            complete = False
+                            continue
+                        # Cache the native startup selection even before Remote
+                        # watches it, but do not call that an ownership binding.
+                        # When the exact sid enters `paths`, promote it below.
+                        candidates[identity] = bound_sid
+                if bound_sid in paths:
+                    bindings[identity] = bound_sid
+                    matched.add(bound_sid)
+            if (not matched and not has_explicit_session
+                    and not continue_command):
                 try:
                     process_cwd = os.path.realpath(os.readlink(proc_dir / "cwd"))
                 except OSError:
                     if _process_start_ticks(proc_dir) == start_ticks:
                         complete = False
                     continue
-                matched.update(cwd_sids.get(process_cwd, ()))
+                cwd_matches = cwd_sids.get(process_cwd, ())
+                if len(cwd_matches) == 1:
+                    matched.update(cwd_matches)
             if not matched:
                 if missing_cwds:
                     complete = False
                 continue
             if _process_start_ticks(proc_dir) != start_ticks:
+                bindings.pop(identity, None)
+                candidates.pop(identity, None)
                 continue
-            identity = ProcessIdentity(int(proc_dir.name), start_ticks)
             for sid in matched:
                 holders[sid].add(identity)
     except OSError:
         return HolderScan(holders, False)
+    if complete:
+        for identity in set(bindings).difference(seen_continue):
+            bindings.pop(identity, None)
+        for identity in set(candidates).difference(seen_continue):
+            candidates.pop(identity, None)
     return HolderScan(holders, complete)

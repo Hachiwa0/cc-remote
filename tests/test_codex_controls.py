@@ -2504,8 +2504,11 @@ def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
 def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
         monkeypatch, tmp_path):
     class FakeCodexHandle:
-        def __init__(self, _cfg, cwd=None):
+        def __init__(self, _cfg, cwd=None, daemon_mode=None,
+                     daemon_manager=None):
             self.cwd = cwd
+            self.daemon_mode = daemon_mode
+            self.daemon_manager = daemon_manager
             self.thread_id = None
             self.model = "gpt-test"
             self.effort = "high"

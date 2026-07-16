@@ -273,7 +273,7 @@ try {
     kind: "file",
   });
   state = reduce(state, { type: "event", event: {
-    v: 14,
+    v: 15,
     type: "file_preview",
     ts: 6,
     sid: "session-1",

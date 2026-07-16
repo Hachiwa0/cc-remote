@@ -14,7 +14,10 @@ import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ToolCategory, ProcessKind,
   ProcessStatus, PlanEntry, CollaborationModeName, Notice, RateLimitUpdate,
-  StatusRateLimit, StatusRateWindow,
+  StatusRateLimit, StatusRateWindow, SessionControl,
+} from "./protocol";
+import {
+  compareSessionControl, sessionControlLocksInput, sessionControlTargetsSid,
 } from "./protocol";
 import type { Catalog } from "./data";
 import type { DiffLine, GitDiffSection } from "./diff";
@@ -196,8 +199,18 @@ export interface SessionRuntime {
   // turn id — the cursor the "load more" button pages back from.
   hasMore?: boolean;
   oldestId?: string | null;
-  // true => an external process (native `claude`/`codex` in the terminal) owns this
-  // session and is writing its transcript; we mirror it read-only.
+  // v15 authoritative control. Once populated, legacy external/takeover frames
+  // are ignored; revision ordering owns every subsequent write-state decision.
+  control: SessionControl | null;
+  // Wrapper generation that owns control.revision. Kept even when an epoch
+  // switch clears control so a delayed old-generation direct event is rejected.
+  controlGeneration: string | null;
+  // Sticky within this browser runtime: once revisioned control has been
+  // accepted, unrevisioned compatibility frames can never regain authority,
+  // including during the short gap between a generation switch and its seed.
+  hasRevisionedControl: boolean;
+  // Legacy compatibility/derived lock consumed by queue draining. When v15
+  // control exists this is derived from it, never independently authoritative.
   external?: boolean;
   takeoverPending: boolean;
   takeoverMessage: string | null;
@@ -252,6 +265,7 @@ export function createRuntime(): SessionRuntime {
     turns: [], state: "idle", model: "", effort: "", perm: "",
     collaborationMode: "default",
     fast: null,
+    control: null, controlGeneration: null, hasRevisionedControl: false,
     takeoverPending: false, takeoverMessage: null,
     replaying: false, syncReady: false, truncated: false,
     historyInvalidated: false,
@@ -292,7 +306,7 @@ export type Action =
   | { type: "clear_session_list" }
   | { type: "restore_session_list"; sessions: SessionInfo[] }
   | { type: "focus_session"; sid: string }
-  | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null }
+  | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null }
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question" }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
@@ -653,6 +667,55 @@ function patch(state: AppState, sid: string | null | undefined,
   return { ...state, runtimes: { ...state.runtimes, [key]: rt } };
 }
 
+/** Install one authoritative control value without allowing an older or
+ * same-revision conflicting snapshot to resurrect a lock. */
+function clearSessionControl(runtime: SessionRuntime): void {
+  runtime.control = null;
+  runtime.external = false;
+  runtime.takeoverPending = false;
+  runtime.takeoverMessage = null;
+}
+
+function switchControlGeneration(
+  runtime: SessionRuntime, generation: string | null | undefined,
+): void {
+  if (!generation || generation === runtime.controlGeneration) return;
+  clearSessionControl(runtime);
+  runtime.controlGeneration = generation;
+}
+
+function applySessionControl(
+  runtime: SessionRuntime, incoming: SessionControl,
+): boolean {
+  const incomingGeneration = incoming.generation ?? null;
+  if (runtime.controlGeneration !== null) {
+    // Generation-less migration frames are accepted only by a runtime which is
+    // itself still generation-less. A delayed event from another wrapper epoch
+    // cannot compete on numeric revision.
+    if (incomingGeneration !== runtime.controlGeneration) return false;
+  } else if (incomingGeneration !== null) {
+    clearSessionControl(runtime);
+    runtime.controlGeneration = incomingGeneration;
+  }
+  const disposition = compareSessionControl(runtime.control, incoming);
+  if (disposition !== "newer") return false;
+  runtime.control = incoming;
+  runtime.hasRevisionedControl = true;
+  runtime.external = sessionControlLocksInput(incoming);
+  runtime.takeoverPending = incoming.write_state === "takeover_pending";
+  runtime.takeoverMessage = runtime.takeoverPending
+    ? (incoming.reason ?? null) : null;
+  return true;
+}
+
+function newestSessionControl(
+  current: SessionControl | null, candidate: SessionControl | null,
+): SessionControl | null {
+  if (!candidate) return current;
+  return compareSessionControl(current, candidate) === "newer"
+    ? candidate : current;
+}
+
 function mergeNotices(...groups: Notice[][]): Notice[] {
   const merged: Notice[] = [];
   for (const notice of groups.flat()) {
@@ -842,6 +905,12 @@ export function reduce(state: AppState, action: Action): AppState {
       // only if still empty (never clobber live/streaming or already-replayed turns).
       return patch(state, action.sid, (rt) => {
         if (rt.historyInvalidated) return;
+        const control = action.control
+          && sessionControlTargetsSid(action.control, action.sid)
+          ? action.control : null;
+        switchControlGeneration(
+          rt, action.generation ?? control?.generation);
+        if (control) applySessionControl(rt, control);
         if (rt.turns.length === 0 && action.turns.length) {
           replaceWithBoundedTurns(rt, action.turns.map((turn) => (
             !turn.forkPointId && turn.codexTurnId
@@ -907,9 +976,13 @@ function reduceEvent(
       // runtime but never moves focus; the accepted session list drives the
       // initial explicit switch.
       return { ...patch(state, key, (rt) => {
+        switchControlGeneration(rt, e.generation);
         rt.state = e.state;
         rt.syncReady = true;
         rt.ccSessionId = e.cc_session_id ?? rt.ccSessionId;
+        if (e.control && sessionControlTargetsSid(e.control, key)) {
+          applySessionControl(rt, e.control);
+        }
       }, true), focusedSid: state.focusedSid, wrapperOnline: true };
     }
     case "session_focus": {
@@ -951,9 +1024,19 @@ function reduceEvent(
             ...target.turns,
             ...source.turns.filter((turn) => !seen.has(turn.id)),
           ];
+          const mergedControlGeneration =
+            source.controlGeneration ?? target.controlGeneration;
+          const mergedControl = source.controlGeneration
+              && source.controlGeneration !== target.controlGeneration
+            ? source.control
+            : newestSessionControl(target.control, source.control);
           const mergedRuntime: SessionRuntime = {
             ...target,
             ...source,
+            control: null,
+            controlGeneration: null,
+            hasRevisionedControl:
+              target.hasRevisionedControl || source.hasRevisionedControl,
             state: target.state,
             syncReady: target.syncReady || source.syncReady,
             historyInvalidated:
@@ -980,6 +1063,8 @@ function reduceEvent(
             pendingSend: source.pendingSend ?? target.pendingSend,
             notices: mergeNotices(target.notices, source.notices),
           };
+          switchControlGeneration(mergedRuntime, mergedControlGeneration);
+          if (mergedControl) applySessionControl(mergedRuntime, mergedControl);
           replaceWithBoundedTurns(mergedRuntime, mergedTurns);
           runtimes[session_id] = mergedRuntime;
         } else {
@@ -1041,6 +1126,19 @@ function reduceEvent(
       // already in the runtime (an in-flight turn still streaming live, not yet in
       // the transcript) is preserved and appended after the rebuilt history.
       const sid = e.session_id;
+      // Control has its own monotonic revision and remains authoritative even
+      // when this History page later loses a transcript build/live race. Apply
+      // it before any narrative early-return.
+      if (e.control && sessionControlTargetsSid(e.control, sid)) {
+        state = patch(state, sid, (rt) => {
+          switchControlGeneration(rt, e.generation);
+          applySessionControl(rt, e.control!);
+        }, true);
+      } else if (e.generation) {
+        state = patch(state, sid, (rt) => {
+          switchControlGeneration(rt, e.generation);
+        }, true);
+      }
       const base = state.runtimes[sid] ?? createRuntime();
       const sameBuildGeneration = e.generation != null
         ? base.historyGeneration === e.generation
@@ -1125,7 +1223,8 @@ function reduceEvent(
       const historyTrimmed = boundedTurns.length < turns.length;
       turns = boundedTurns;
       const acceptsControlState = !e.before;
-      const acceptsOwnershipState = acceptsControlState && !racedLiveEvent;
+      const acceptsOwnershipState = acceptsControlState && !racedLiveEvent
+        && !base.hasRevisionedControl;
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
       return {
@@ -1156,8 +1255,15 @@ function reduceEvent(
               : base.historyBuildSeq,
             hydratedCacheTurnIds: acceptsControlState
               ? [] : base.hydratedCacheTurnIds,
-            model: acceptsControlState && hadModel ? built.model : base.model,
-            effort: acceptsControlState && hadEffort ? built.effort : base.effort,
+            // A first-page History can finish after a live thread-settings
+            // notification.  Its transcript snapshot then contains the old
+            // model/effort even though its narrative rows are still useful.
+            // Keep the live app-server/TUI setting whenever the sequence
+            // watermark proves that the History build lost that race.
+            model: acceptsControlState && !racedLiveEvent && hadModel
+              ? built.model : base.model,
+            effort: acceptsControlState && !racedLiveEvent && hadEffort
+              ? built.effort : base.effort,
             hasMore: historyTrimmed ? false : e.has_more,
             oldestId: historyTrimmed
               ? (turns[0]?.id ?? null)
@@ -1327,8 +1433,19 @@ function reduceEvent(
         }
         rt.turns = turns;
       });
+    case "session_control":
+      // Direct control events require an explicit runtime key. Snapshot and
+      // History controls are routed by their outer envelope above.
+      if (!e.sid) return state;
+      return patch(state, e.sid, (rt) => {
+        applySessionControl(rt, e);
+      }, true);
     case "takeover_state":
       return patch(state, e.sid, (rt) => {
+        // Temporary compatibility while v15 producers migrate. Once a real
+        // revisioned control value exists, an unrevisioned frame can never
+        // overwrite it or revive a completed takeover lock.
+        if (rt.hasRevisionedControl) return;
         rt.takeoverPending = e.pending;
         rt.takeoverMessage = e.message ?? null;
       });
@@ -1400,6 +1517,7 @@ function reduceEvent(
     case "replay_start": {
       const needsAuthoritativeHistory = e.truncated || !!e.rebuild;
       const next = patch(state, e.sid, (rt) => {
+        switchControlGeneration(rt, e.generation);
         rt.replaying = true;
         rt.syncReady = false;
         rt.truncated = e.truncated;

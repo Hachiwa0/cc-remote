@@ -45,6 +45,12 @@ def test_wrapper_startup_config_fails_closed():
     with pytest.raises(ValueError, match="CODEX_TURN_IDLE_WARN_SECONDS"):
         validate_wrapper_config(_wrapper_cfg(codex_turn_idle_warn_seconds=1))
     validate_wrapper_config(_wrapper_cfg(codex_turn_idle_warn_seconds=0))
+    with pytest.raises(ValueError, match="CC_REMOTE_CODEX_DAEMON"):
+        validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="always"))
+    validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="auto"))
+    validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="off"))
+    with pytest.raises(ValueError, match="CC_REMOTE_CLAUDE_BROKER_SOCKET"):
+        validate_wrapper_config(_wrapper_cfg(claude_broker_socket="relative.sock"))
 
 
 def test_wrapper_transport_queues_and_frame_size_are_bounded():

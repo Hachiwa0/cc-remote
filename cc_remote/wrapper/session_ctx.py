@@ -27,7 +27,7 @@ class SessionContext:
     # None until the first ResultMessage/init SystemMessage captures the real id
     # (a brand-new session). A resumed session knows its id at spawn time.
     session_id: Optional[str]
-    sdk: SdkHandle                     # one ClaudeSDKClient → one `claude` subprocess
+    sdk: SdkHandle                     # engine control adapter (SDK/app-server/broker)
     buffer: RingBuffer                 # per-session ring (own seq namespace)
     cwd: str                           # resume requires cwd to match the jsonl path
     # Pool key = the client-facing routing identity: the real sid once known,
@@ -113,6 +113,25 @@ class SessionContext:
     # the transcript. ``state=running`` starts earlier, during reconnect and
     # final ownership checks, so it is not sufficient write attribution.
     claude_write_active: bool = False
+    # Authoritative v15 ownership/control projection.  These fields belong to
+    # the resident session rather than to any browser so reconnects and history
+    # refreshes cannot resurrect a stale read-only banner.  `control_revision`
+    # advances whenever one of the public values changes.
+    control_mode: str = "remote"
+    write_state: str = "writable"
+    terminal_attached: bool = False
+    control_reason: Optional[str] = None
+    control_can_takeover: bool = False
+    control_revision: int = 0
+    # Machine-local sid whose monotonic control epoch has been bound to this
+    # resident context.  A newly-created context starts unbound so reopening an
+    # evicted sid advances beyond the browser's last same-generation revision.
+    control_revision_key: Optional[str] = None
+    # A Claude session launched through the explicit local `claude-remote`
+    # broker keeps the official TUI as its sole process owner.  The wrapper
+    # stores only the broker generation needed to reject a stale PID/socket
+    # record; it never owns or kills that process on an ordinary disconnect.
+    claude_broker_generation: Optional[str] = None
     pending_asks: dict = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Serialize the tiny "final preflight check -> query accepted by engine"

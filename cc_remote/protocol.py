@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 15
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -59,6 +59,13 @@ PermissionMode = Literal[
     "never", "on-request", "untrusted",
 ]
 CollaborationModeName = Literal["default", "plan"]
+ControlMode = Literal[
+    "remote", "codex_shared", "claude_broker", "external_cli",
+    "agent_view", "desktop",
+]
+WriteState = Literal[
+    "writable", "read_only", "takeover_pending", "input_busy",
+]
 ModelName = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 WireId = Annotated[
     str,
@@ -318,6 +325,32 @@ class TakeoverState(_Base):
     message: Optional[str] = Field(default=None, max_length=4096)
 
 
+class SessionControl(_Base):
+    """Authoritative, revisioned control state for one session.
+
+    ``control_mode`` says which surface currently coordinates the session;
+    ``write_state`` independently says whether the Web composer may write.
+    Consumers must accept only increasing revisions. An equal revision is
+    idempotent only when every control field is unchanged.
+
+    ``can_takeover`` advertises that a migration action can be shown. It is a
+    capability hint, not proof that a takeover command has already been
+    authorized or completed.
+    """
+
+    type: Literal["session_control"] = "session_control"
+    control_mode: ControlMode
+    write_state: WriteState
+    terminal_attached: bool
+    reason: Optional[str] = Field(default=None, max_length=4096)
+    # Wrapper lifetime that owns the numeric revision. A new generation starts
+    # a fresh revision epoch; generation-less values exist only for the short
+    # v15 migration window and never overwrite generation-bound control.
+    generation: Optional[WireId] = None
+    revision: int = Field(ge=0, le=9_007_199_254_740_991)
+    can_takeover: Optional[bool] = None
+
+
 class SetModel(_Command):
     type: Literal["set_model"] = "set_model"
     model: ModelName
@@ -421,6 +454,10 @@ class Snapshot(_Base):
     tail_text: str = ""
     cwd: Optional[str] = None  # active cc cwd, so the client knows the current project
     generation: Optional[WireId] = None
+    # Latest authoritative control value. It is intentionally also available as
+    # a live SessionControl event; embedding it here closes reconnect races when
+    # the corresponding control event has already fallen out of the ring.
+    control: Optional[SessionControl] = None
 
 
 class StateEvent(_Base):
@@ -1494,6 +1531,10 @@ class History(_Base):
     oldest_id: Optional[str] = None   # first returned stable turn cursor
     newest_id: Optional[str] = None   # last returned stable turn cursor
     before: Optional[str] = None      # echoes the request's `before`: set => this is an OLDER page (client prepends)
+    # Control is revisioned independently from transcript history/build_seq.
+    # Browsers may accept a newer control snapshot even when this History's
+    # narrative page is stale or non-authoritative.
+    control: Optional[SessionControl] = None
     # True => this session's transcript is being appended to by an EXTERNAL process
     # (a native `claude`/`codex` in the user's terminal), not by us. The wrapper
     # mirrors those appends by broadcasting a fresh History; the client renders the
@@ -1621,7 +1662,7 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, GetEngineCapabilities, ManageEnginePlugin, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, GetEngineCapabilities, ManageEnginePlugin, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
@@ -1636,7 +1677,7 @@ AnyMessage = Union[
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
     "user_msg", "state", "model", "effort", "perm", "fast",
-    "collaboration_mode", "btw_opened",
+    "collaboration_mode", "session_control", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_end",
     "error", "ask_user", "history_invalidated", "artifact_invalidated",
@@ -1648,6 +1689,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "interrupt": Interrupt,
     "takeover": Takeover,
     "takeover_state": TakeoverState,
+    "session_control": SessionControl,
     "set_model": SetModel,
     "set_effort": SetEffort,
     "set_service_tier": SetServiceTier,

@@ -206,6 +206,118 @@ def test_claude_conversation_rewind_rejects_malformed_success():
     asyncio.run(go())
 
 
+def test_claude_rewind_error_exposes_safe_chinese_reason():
+    error = ClaudeRewindError(
+        "state_changed", operation="conversation", retryable=True)
+    assert "会话发生了变化" in error.user_message_zh
+    assert "state changed" not in error.user_message_zh
+
+
+def test_broker_owned_combined_rewind_fails_before_mutating_files():
+    class BrokerSdk:
+        is_claude_broker = True
+        rewind_files_calls = 0
+
+        async def rewind_files(self, _target):
+            self.rewind_files_calls += 1
+
+    async def go():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.cwd = "/tmp/broker-rewind"
+        ctx.sdk = BrokerSdk()
+        machine.sessions[SESSION_ID] = ctx
+
+        async def code_context(_cmd, _action):
+            return ctx
+
+        machine._claude_code_context = code_context
+        outcome = await machine._handle_rollback_session(RollbackSession(
+            session_id=SESSION_ID,
+            engine="claude",
+            restore="both",
+            checkpoint_id=TARGET_ID,
+            cmd_id="broker-both-rewind",
+            client_id="client-1",
+        ))
+        result = (
+            outcome if isinstance(outcome, RollbackResult)
+            else next(item for item in outcome if isinstance(item, RollbackResult))
+        )
+        assert result.conversation == "failed"
+        assert result.files == "skipped"
+        assert "capability_unavailable" in (result.detail or "")
+        assert ctx.sdk.rewind_files_calls == 0
+
+    asyncio.run(go())
+
+
+def test_conversation_rewind_surfaces_structured_native_failure():
+    class RejectedSdk:
+        async def rewind_conversation(self, *_args, **_kwargs):
+            raise ClaudeRewindError(
+                "state_changed", operation="conversation", retryable=True)
+
+    async def go():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.cwd = "/tmp/rejected-rewind"
+        ctx.sdk = RejectedSdk()
+        machine.sessions[SESSION_ID] = ctx
+
+        async def code_context(_cmd, _action):
+            return ctx
+
+        machine._claude_code_context = code_context
+        outcome = await machine._handle_rollback_session(RollbackSession(
+            session_id=SESSION_ID,
+            engine="claude",
+            restore="conversation",
+            checkpoint_id=TARGET_ID,
+            cmd_id="rejected-conversation-rewind",
+            client_id="client-1",
+        ))
+        result = next(
+            item for item in outcome if isinstance(item, RollbackResult)
+        )
+        assert result.conversation == "failed"
+        assert result.files == "skipped"
+        assert "state_changed" in (result.detail or "")
+        assert "会话发生了变化" in (result.detail or "")
+
+    asyncio.run(go())
+
+
+def test_claude_rewind_preparation_reconnects_and_reprobes_capability():
+    async def go():
+        handle = SdkHandle(WrapperConfig())
+        calls = []
+
+        async def reconnect(**kwargs):
+            calls.append(("reconnect", kwargs))
+
+        async def capability(*, refresh=False):
+            calls.append(("capability", refresh))
+            return SimpleNamespace(supported=True)
+
+        handle.force_reconnect = reconnect
+        handle.conversation_rewind_capability = capability
+        await handle.prepare_conversation_rewind(
+            resume_id=SESSION_ID, cwd="/tmp/project")
+
+        assert calls == [
+            ("reconnect", {
+                "resume_id": SESSION_ID,
+                "cwd": "/tmp/project",
+                "reason": "prepare conversation rewind",
+                "preserve_model": False,
+            }),
+            ("capability", True),
+        ]
+
+    asyncio.run(go())
+
+
 def test_claude_rewind_remains_successful_when_only_reconnect_fails():
     class RewoundSdk:
         async def rewind_conversation(self, target, *, interrupt_if_running):

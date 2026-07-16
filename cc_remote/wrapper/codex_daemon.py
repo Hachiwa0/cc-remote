@@ -1,0 +1,329 @@
+"""Shared Codex app-server daemon discovery and lifecycle helpers.
+
+The official daemon is process-global while each client connection is a short
+``codex app-server proxy`` process.  This module owns only the former.  A
+``CodexHandle`` continues to own (and terminate) its proxy or legacy stdio
+process, so disconnecting one remote session cannot stop other Codex clients.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional
+
+from cc_remote.log import logger
+
+log = logger("cc_remote.wrapper.codex_daemon")
+
+_DAEMON_ENV = "CC_REMOTE_CODEX_DAEMON"
+_DAEMON_MODES = frozenset({"auto", "off"})
+_COMMAND_TIMEOUT = 30.0
+_OUTPUT_MAX = 64 * 1024
+
+
+def codex_daemon_mode(value: Optional[str] = None) -> str:
+    """Return ``auto`` or ``off``; invalid configuration preserves stdio.
+
+    Falling back to ``off`` for an invalid value is intentional.  A typo must
+    not make the wrapper claim that it is attached to the shared daemon.
+    """
+    raw = value if value is not None else os.environ.get(_DAEMON_ENV, "auto")
+    mode = raw.strip().lower() if isinstance(raw, str) else ""
+    if mode in _DAEMON_MODES:
+        return mode
+    log.warning("invalid Codex daemon mode; using stdio", value=str(raw)[:64])
+    return "off"
+
+
+@dataclass(frozen=True)
+class CodexDaemonInfo:
+    socket_path: Optional[str]
+
+
+@dataclass(frozen=True)
+class _CommandResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+def _run_command(
+    argv: tuple[str, ...], env: Mapping[str, str], timeout: float,
+) -> _CommandResult:
+    """Blocking subprocess boundary, kept separate for deterministic tests."""
+    try:
+        result = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env),
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Exception text can contain paths or command details.  The manager's
+        # caller needs only a bounded failure class to select stdio fallback.
+        return _CommandResult(127, b"", type(exc).__name__.encode("ascii"))
+    return _CommandResult(
+        result.returncode,
+        bytes(result.stdout or b"")[:_OUTPUT_MAX],
+        bytes(result.stderr or b"")[:_OUTPUT_MAX],
+    )
+
+
+def _json_object(data: bytes) -> Optional[dict[str, Any]]:
+    """Parse the daemon's single JSON object without accepting log prose."""
+    if not data or len(data) > _OUTPUT_MAX:
+        return None
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _text(value: Any, limit: int = 4096) -> Optional[str]:
+    return value[:limit] if isinstance(value, str) and value else None
+
+
+def _daemon_info(
+    lifecycle: dict[str, Any], remote_control: dict[str, Any],
+) -> Optional[CodexDaemonInfo]:
+    socket_path = _text(
+        remote_control.get("socketPath") or lifecycle.get("socketPath"))
+    remote_enabled = remote_control.get("remoteControlEnabled") is True
+    # The official enable command returns this field.  Requiring it prevents a
+    # zero-exit shim or incompatible older CLI from being advertised as a
+    # remotely writable shared daemon.
+    if not remote_enabled:
+        return None
+    return CodexDaemonInfo(socket_path=socket_path)
+
+
+def _existing_proxy_candidate(
+    lifecycle: dict[str, Any],
+) -> Optional[CodexDaemonInfo]:
+    """Return an official existing app-server candidate for proxy validation.
+
+    Codex Desktop and other official clients can start the standalone
+    app-server before ``codex app-server daemon`` owns its lifecycle.  Current
+    CLIs then report the complete managed package/socket identity from
+    ``daemon version`` but reject ``enable-remote-control`` with "not managed".
+    The official proxy can still attach to that socket.  Keep this path narrow:
+    require the full standalone identity and let CodexHandle's WebSocket
+    handshake + initialize request be the authoritative liveness check.  A
+    rejected proxy still falls back to private stdio without claiming shared
+    ownership.
+    """
+    if lifecycle.get("status") != "running":
+        return None
+    socket_path = _text(lifecycle.get("socketPath"))
+    managed_path = _text(lifecycle.get("managedCodexPath"))
+    managed_version = _text(lifecycle.get("managedCodexVersion"), 128)
+    cli_version = _text(lifecycle.get("cliVersion"), 128)
+    app_server_version = _text(lifecycle.get("appServerVersion"), 128)
+    if not all((socket_path, managed_path, managed_version,
+                cli_version, app_server_version)):
+        return None
+    if (not os.path.isabs(socket_path) or "\x00" in socket_path
+            or len(os.fsencode(socket_path)) > 4096):
+        return None
+    return CodexDaemonInfo(socket_path=socket_path)
+
+
+def _binary_identity(path: str) -> tuple[object, ...]:
+    """Fingerprint the executable so an in-place CLI upgrade re-probes help."""
+    resolved = path
+    if os.sep not in path:
+        resolved = shutil.which(path) or path
+    real = os.path.realpath(resolved)
+    try:
+        stat = os.stat(resolved)
+    except OSError:
+        return (path, real, None, None, None, None)
+    return (
+        path,
+        real,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+
+
+def _daemon_identity(
+    path: str, env: Mapping[str, str], socket_path: Optional[str],
+) -> tuple[object, ...]:
+    return (
+        *_binary_identity(path),
+        env.get("CODEX_HOME"),
+        socket_path,
+    )
+
+
+class CodexDaemonManager:
+    """Serialize idempotent daemon setup across resident Code sessions."""
+
+    def __init__(
+        self,
+        mode: Optional[str] = None,
+        *,
+        socket_path: Optional[str] = None,
+        command_timeout: float = _COMMAND_TIMEOUT,
+    ):
+        self.mode = codex_daemon_mode(mode)
+        self.socket_path = socket_path
+        self.command_timeout = max(1.0, float(command_timeout))
+        self._lock = asyncio.Lock()
+        self._capability_identity: Optional[tuple[object, ...]] = None
+        self._capable = False
+        self._ready_identity: Optional[tuple[object, ...]] = None
+        self._ready: Optional[CodexDaemonInfo] = None
+
+    @property
+    def info(self) -> Optional[CodexDaemonInfo]:
+        return self._ready
+
+    def invalidate(self) -> None:
+        """Forget liveness after unexpected proxy EOF; keep help capability."""
+        self._ready_identity = None
+        self._ready = None
+
+    async def _run(
+        self, codex_bin: str, env: Mapping[str, str], *args: str,
+    ) -> _CommandResult:
+        argv = (codex_bin, *args)
+        return await asyncio.to_thread(
+            _run_command, argv, env, self.command_timeout)
+
+    async def capability(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> bool:
+        """Check both official commands, caching by executable identity."""
+        if self.mode == "off" or os.name != "posix":
+            return False
+        identity = _daemon_identity(codex_bin, env, self.socket_path)
+        if identity == self._capability_identity:
+            return self._capable
+        daemon_help = await self._run(
+            codex_bin, env, "app-server", "daemon", "--help")
+        proxy_help = await self._run(
+            codex_bin, env, "app-server", "proxy", "--help")
+        capable = daemon_help.returncode == 0 and proxy_help.returncode == 0
+        self._capability_identity = identity
+        self._capable = capable
+        if not capable:
+            self.invalidate()
+        return capable
+
+    async def version(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> Optional[dict[str, Any]]:
+        result = await self._run(
+            codex_bin, env, "app-server", "daemon", "version")
+        return _json_object(result.stdout) if result.returncode == 0 else None
+
+    async def start(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> Optional[dict[str, Any]]:
+        result = await self._run(
+            codex_bin, env, "app-server", "daemon", "start")
+        return _json_object(result.stdout) if result.returncode == 0 else None
+
+    async def enable_remote_control(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> Optional[dict[str, Any]]:
+        result = await self._run(
+            codex_bin, env,
+            "app-server", "daemon", "enable-remote-control",
+        )
+        return _json_object(result.stdout) if result.returncode == 0 else None
+
+    async def ensure_started(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> Optional[CodexDaemonInfo]:
+        """Start and remotely enable the daemon, or return ``None`` for stdio."""
+        if self.mode == "off":
+            return None
+        identity = _daemon_identity(codex_bin, env, self.socket_path)
+        if identity == self._ready_identity and self._ready is not None:
+            return self._ready
+        async with self._lock:
+            identity = _daemon_identity(codex_bin, env, self.socket_path)
+            if identity == self._ready_identity and self._ready is not None:
+                return self._ready
+            if not await self.capability(codex_bin, env):
+                return None
+
+            lifecycle = await self.version(codex_bin, env)
+            if lifecycle is None:
+                lifecycle = await self.start(codex_bin, env)
+            if lifecycle is None:
+                log.warning("Codex daemon start unavailable; using stdio")
+                self.invalidate()
+                return None
+
+            remote = await self.enable_remote_control(codex_bin, env)
+            if remote is None:
+                existing = _existing_proxy_candidate(lifecycle)
+                if existing is None:
+                    log.warning(
+                        "Codex daemon remote control unavailable; using stdio")
+                    self.invalidate()
+                    return None
+                # An official client already owns this app-server generation.
+                # proxy_args() exposes it tentatively; CodexHandle validates the
+                # actual WebSocket and initialize exchange before advertising a
+                # shared writable session.
+                log.info("using existing official Codex app-server candidate")
+                self._ready_identity = identity
+                self._ready = existing
+                return existing
+
+            # Enabling can restart a managed daemon.  Re-probe after that restart
+            # so proxy clients never race a stale socket generation.
+            verified = await self.version(codex_bin, env)
+            if verified is None:
+                log.warning("Codex daemon version probe failed; using stdio")
+                self.invalidate()
+                return None
+            info = _daemon_info(verified, remote)
+            if info is None:
+                log.warning(
+                    "Codex daemon did not confirm remote control; using stdio")
+                self.invalidate()
+                return None
+            self._ready_identity = identity
+            self._ready = info
+            return info
+
+    async def proxy_args(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> Optional[list[str]]:
+        info = await self.ensure_started(codex_bin, env)
+        if info is None:
+            return None
+        argv = [codex_bin, "app-server", "proxy"]
+        socket_path = self.socket_path or info.socket_path
+        if socket_path:
+            argv.extend(["--sock", socket_path])
+        return argv
+
+_DEFAULT_MANAGERS: dict[tuple[str, Optional[str]], CodexDaemonManager] = {}
+
+
+def default_codex_daemon_manager(
+    mode: Optional[str] = None, *, socket_path: Optional[str] = None,
+) -> CodexDaemonManager:
+    normalized = codex_daemon_mode(mode)
+    key = (normalized, socket_path)
+    manager = _DEFAULT_MANAGERS.get(key)
+    if manager is None:
+        manager = CodexDaemonManager(normalized, socket_path=socket_path)
+        _DEFAULT_MANAGERS[key] = manager
+    return manager

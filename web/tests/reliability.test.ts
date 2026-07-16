@@ -19,7 +19,7 @@ import {
 } from "../src/runtime-drain.ts";
 import { mergeInitialHistory } from "../src/history-merge.ts";
 import { imageDimensions } from "../src/img.ts";
-import { boundCachedTurns } from "../src/cache.ts";
+import { boundCachedTurns, controlForCachedSession } from "../src/cache.ts";
 import { boundRuntimeTurns, pruneRuntimeMap } from "../src/runtime-bounds.ts";
 import { ImeSubmitGuard, shouldSubmitTextKey } from "../src/ime-submit.ts";
 import {
@@ -43,7 +43,7 @@ import {
   type MobileViewportEvent,
   type ViewportReading,
 } from "../src/use-mobile-viewport.ts";
-import type { ServerEvent } from "../src/protocol.ts";
+import type { ServerEvent, SessionControl } from "../src/protocol.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
 import {
   classifyBusySubmit,
@@ -54,7 +54,7 @@ import {
 import { workContextMetrics } from "../src/work-context.ts";
 
 const legacyWorkContext = workContextMetrics({
-  v: 14, ts: 0, type: "context_report",
+  v: 15, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, categories: [],
 });
@@ -64,7 +64,7 @@ assert.equal(legacyWorkContext.sessionTokens, 25_572,
 assert.equal(legacyWorkContext.sessionPercentage, 2.5572);
 
 const freshWorkContext = workContextMetrics({
-  v: 14, ts: 0, type: "context_report",
+  v: 15, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, session_tokens: 72, fixed_tokens: 25_500,
   session_percentage: 0.0072, categories: [],
@@ -76,7 +76,7 @@ assert.equal(freshWorkContext.sessionPercentage, 0.0072);
 assert.equal(freshWorkContext.totalPercentage, 2.5572);
 
 const derivedWorkContext = workContextMetrics({
-  v: 14, ts: 0, type: "context_report",
+  v: 15, ts: 0, type: "context_report",
   total_tokens: 11_194, max_tokens: 353_400,
   percentage: 3.1675, fixed_tokens: 11_000, categories: [],
 });
@@ -147,7 +147,7 @@ assert.match(historyAppSource, /replay_start[\s\S]*sendGetHistory/,
   "a replay gap must request authoritative history instead of ending on an empty view");
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
   "a replay gap must discard a possibly stale Work artifact inventory");
-assert.match(cacheSource, /const CACHE_VER = 7/,
+assert.match(cacheSource, /const CACHE_VER = 8/,
   "history revision support must invalidate pre-revision IndexedDB rows");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
@@ -611,7 +611,7 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 14, ts: 10, ...body,
+    v: 15, ts: 10, ...body,
   } as ServerEvent);
   // Work/Code and engine switches restore the target surface's last accepted
   // list immediately. The authoritative refresh may take ~1s for Codex because
@@ -924,6 +924,31 @@ try {
   assert.deepEqual(completedRace.runtimes[completedRaceSid].turns.map(
     (turn: { id: string }) => turn.id), ["live-completed"]);
   assert.equal(completedRace.runtimes[completedRaceSid].turns[0].done, true);
+
+  // A thread/settings notification can arrive while a transcript History read
+  // is already in flight.  Keep the newer live model/effort even though the
+  // older History page remains useful for narrative turns.
+  const settingsRaceSid = "history-cannot-revert-live-settings";
+  let settingsRace = {
+    ...initialState, focusedSid: settingsRaceSid,
+    runtimes: { [settingsRaceSid]: createRuntime() },
+  };
+  settingsRace = reduce(settingsRace, { type: "event", event: event({
+    type: "model", sid: settingsRaceSid, seq: 34, model: "gpt-live",
+  }) });
+  settingsRace = reduce(settingsRace, { type: "event", event: event({
+    type: "effort", sid: settingsRaceSid, seq: 35, effort: "high",
+  }) });
+  settingsRace = reduce(settingsRace, { type: "event", event: event({
+    type: "history", sid: settingsRaceSid, session_id: settingsRaceSid,
+    revision: "settings-race-rev", build_seq: 1, live_seq: 33,
+    has_more: false, events: [
+      event({ type: "model", sid: settingsRaceSid, model: "gpt-stale" }),
+      event({ type: "effort", sid: settingsRaceSid, effort: "low" }),
+    ],
+  }) });
+  assert.equal(settingsRace.runtimes[settingsRaceSid].model, "gpt-live");
+  assert.equal(settingsRace.runtimes[settingsRaceSid].effort, "high");
 
   // A current authoritative head page can repair a lost terminal event. This is
   // the exact /review interrupt failure mode: the browser saw interrupting and a
@@ -1796,6 +1821,348 @@ try {
   assert.equal(state.runtimes[sid].takeoverPending, false);
   assert.equal(state.runtimes[sid].takeoverMessage, null);
 
+  // v15 control is authoritative and independently revisioned. Older and
+  // equal-revision conflicting frames must never revive a completed lock.
+  const controlSid = "revisioned-session-control";
+  const control = (
+    revision: number,
+    control_mode: "remote" | "codex_shared" | "claude_broker" | "external_cli" | "agent_view" | "desktop",
+    write_state: "writable" | "read_only" | "takeover_pending" | "input_busy",
+    extra: Record<string, unknown> = {},
+  ): SessionControl => event({
+    type: "session_control", sid: controlSid, revision, control_mode,
+    write_state, terminal_attached: false,
+    generation: "control-generation", ...extra,
+  }) as SessionControl;
+  let controlState = reduce({
+    ...initialState, focusedSid: controlSid,
+    runtimes: { [controlSid]: createRuntime() },
+  }, { type: "event", event: control(
+    5, "external_cli", "read_only", { can_takeover: true }) });
+  assert.equal(controlState.runtimes[controlSid].control?.revision, 5);
+  assert.equal(controlState.runtimes[controlSid].external, true);
+
+  controlState = reduce(controlState, { type: "event", event: control(
+    4, "remote", "writable") });
+  controlState = reduce(controlState, { type: "event", event: control(
+    5, "desktop", "read_only") });
+  assert.equal(controlState.runtimes[controlSid].control?.control_mode,
+    "external_cli", "older/conflicting revisions must be rejected");
+  controlState = reduce(controlState, { type: "event", event: event({
+    type: "takeover_state", sid: controlSid, pending: true,
+    message: "legacy frame arrived late",
+  }) });
+  assert.equal(controlState.runtimes[controlSid].takeoverPending, false,
+    "legacy TakeoverState must be ignored after v15 control exists");
+
+  controlState = reduce(controlState, { type: "event", event: event({
+    type: "history", sid: controlSid, session_id: controlSid,
+    revision: "control-history", generation: "control-generation",
+    build_seq: 2, has_more: false, events: [],
+    control: control(6, "remote", "writable"),
+  }) });
+  assert.equal(controlState.runtimes[controlSid].external, false);
+  // This narrative page is stale (build 1 < build 2), but its separately
+  // revisioned control value is newer and must still be installed.
+  controlState = reduce(controlState, { type: "event", event: event({
+    type: "history", sid: controlSid, session_id: controlSid,
+    revision: "control-history", generation: "control-generation",
+    build_seq: 1, has_more: false, events: [],
+    control: control(7, "desktop", "read_only"),
+  }) });
+  assert.equal(controlState.runtimes[controlSid].control?.revision, 7);
+  assert.equal(controlState.runtimes[controlSid].external, true);
+
+  controlState = reduce(controlState, { type: "event", event: control(
+    8, "remote", "writable") });
+  controlState = reduce(controlState, { type: "event", event: event({
+    type: "session_control", revision: 999,
+    control_mode: "desktop", write_state: "read_only",
+    terminal_attached: true, generation: "control-generation",
+  }) });
+  assert.equal(controlState.runtimes[controlSid].control?.revision, 8,
+    "an unrouted direct control frame cannot target the focused runtime");
+  controlState = reduce(controlState, { type: "event", event: event({
+    type: "history", sid: controlSid, session_id: controlSid,
+    revision: "control-history", generation: "control-generation",
+    build_seq: 3, live_seq: 0, has_more: false, events: [],
+    external: true, takeover_pending: true,
+    control: control(7, "external_cli", "takeover_pending"),
+  }) });
+  assert.equal(controlState.runtimes[controlSid].control?.revision, 8);
+  assert.equal(controlState.runtimes[controlSid].external, false,
+    "stale modern plus legacy ownership fields cannot resurrect the lock");
+  assert.equal(controlState.runtimes[controlSid].takeoverPending, false);
+
+  controlState = reduce(controlState, { type: "event", event: event({
+    type: "snapshot", sid: controlSid, cc_session_id: controlSid,
+    state: "idle", tail_text: "",
+    control: control(9, "codex_shared", "writable", {
+      terminal_attached: true,
+    }),
+  }) });
+  assert.equal(controlState.runtimes[controlSid].control?.control_mode,
+    "codex_shared");
+  assert.equal(controlState.runtimes[controlSid].external, false,
+    "a terminal-attached shared Codex session remains writable");
+
+  const crossSessionControl = control(
+    100, "external_cli", "read_only", { sid: "another-session" });
+  assert.equal(controlForCachedSession(controlSid, crossSessionControl), undefined,
+    "a cache row must drop a control explicitly routed to another session");
+  controlState = reduce(controlState, { type: "event", event: event({
+    type: "snapshot", sid: controlSid, cc_session_id: controlSid,
+    state: "idle", tail_text: "", generation: "control-generation",
+    control: crossSessionControl,
+  }) });
+  assert.equal(controlState.runtimes[controlSid].control?.revision, 9,
+    "a Snapshot must not install another session's nested control");
+  controlState = reduce(controlState, { type: "event", event: event({
+    type: "history", sid: controlSid, session_id: controlSid,
+    revision: "cross-session-control-history",
+    generation: "control-generation", build_seq: 4,
+    has_more: false, events: [], control: crossSessionControl,
+  }) });
+  assert.equal(controlState.runtimes[controlSid].control?.revision, 9,
+    "History must not install another session's nested control");
+
+  let cachedControlState = reduce({
+    ...initialState, focusedSid: "cached-control",
+  }, {
+    type: "hydrate_cache", sid: "cached-control", turns: [], revision: null,
+    control: event({
+      type: "session_control", sid: "cached-control", revision: 20,
+      control_mode: "remote", write_state: "writable",
+      terminal_attached: false, generation: "cached-generation-old",
+    }) as SessionControl,
+    generation: "cached-generation-old",
+  });
+  cachedControlState = reduce(cachedControlState, {
+    type: "event", event: event({
+      type: "snapshot", sid: "cached-control", cc_session_id: "cached-control",
+      state: "idle", tail_text: "", generation: "cached-generation-old",
+      control: event({
+        type: "session_control", sid: "cached-control", revision: 19,
+        control_mode: "desktop", write_state: "read_only",
+        terminal_attached: true, generation: "cached-generation-old",
+      }),
+    }),
+  });
+  assert.equal(cachedControlState.runtimes["cached-control"].control?.revision, 20);
+  assert.equal(cachedControlState.runtimes["cached-control"].external, false,
+    "an older reconnect snapshot cannot revive a cache-superseded lock");
+  const mismatchedCachedControl = reduce(initialState, {
+    type: "hydrate_cache", sid: "mismatched-cache", turns: [], revision: null,
+    generation: "trusted-cache-generation",
+    control: event({
+      type: "session_control", sid: "mismatched-cache", revision: 99,
+      control_mode: "desktop", write_state: "read_only",
+      terminal_attached: true, generation: "stale-cache-generation",
+    }) as SessionControl,
+  });
+  assert.equal(mismatchedCachedControl.runtimes["mismatched-cache"].control, null,
+    "a control snapshot cannot override its cache row's trusted generation");
+  const crossSidCachedControl = reduce(initialState, {
+    type: "hydrate_cache", sid: "cache-row-a", turns: [], revision: null,
+    control: event({
+      type: "session_control", sid: "cache-row-b", revision: 100,
+      control_mode: "external_cli", write_state: "read_only",
+      terminal_attached: true, generation: "cross-cache-generation",
+    }) as SessionControl,
+  });
+  assert.equal(crossSidCachedControl.runtimes["cache-row-a"].control, null);
+  assert.equal(crossSidCachedControl.runtimes["cache-row-a"].controlGeneration, null,
+    "a mismatched cache control must not bind its generation to another row");
+  cachedControlState = reduce(cachedControlState, {
+    type: "event", event: event({
+      type: "snapshot", sid: "cached-control", cc_session_id: "cached-control",
+      state: "idle", tail_text: "", generation: "cached-generation-new",
+      control: event({
+        type: "session_control", sid: "cached-control", revision: 0,
+        control_mode: "remote", write_state: "writable",
+        terminal_attached: false, generation: "cached-generation-new",
+      }),
+    }),
+  });
+  assert.equal(cachedControlState.runtimes["cached-control"].control?.revision, 0,
+    "a trusted outer generation switch starts a fresh revision epoch");
+  cachedControlState = reduce(cachedControlState, {
+    type: "event", event: event({
+      type: "session_control", sid: "cached-control", revision: 999,
+      control_mode: "desktop", write_state: "read_only",
+      terminal_attached: true, generation: "cached-generation-old",
+    }),
+  });
+  assert.equal(cachedControlState.runtimes["cached-control"].control?.control_mode,
+    "remote", "a high revision from the previous generation must be rejected");
+
+  const generationlessSid = "generationless-control-migration";
+  let generationlessState = reduce({
+    ...initialState, focusedSid: generationlessSid,
+    runtimes: { [generationlessSid]: createRuntime() },
+  }, { type: "event", event: event({
+    type: "session_control", sid: generationlessSid, revision: 1,
+    control_mode: "external_cli", write_state: "read_only",
+    terminal_attached: true,
+  }) });
+  assert.equal(generationlessState.runtimes[generationlessSid].control?.revision, 1,
+    "a generation-less control remains compatible with a generation-less runtime");
+  generationlessState = reduce(generationlessState, {
+    type: "event", event: event({
+      type: "snapshot", sid: generationlessSid, cc_session_id: generationlessSid,
+      state: "idle", tail_text: "", generation: "migration-generation",
+      control: event({
+        type: "session_control", sid: generationlessSid, revision: 0,
+        control_mode: "remote", write_state: "writable",
+        terminal_attached: false, generation: "migration-generation",
+      }),
+    }),
+  });
+  generationlessState = reduce(generationlessState, {
+    type: "event", event: event({
+      type: "session_control", sid: generationlessSid, revision: 999,
+      control_mode: "desktop", write_state: "read_only",
+      terminal_attached: true,
+    }),
+  });
+  assert.equal(generationlessState.runtimes[generationlessSid].control?.control_mode,
+    "remote", "generation-less control cannot overwrite a bound runtime epoch");
+
+  const compatibilityGapSid = "revisioned-control-generation-gap";
+  let compatibilityGapState = reduce({
+    ...initialState, focusedSid: compatibilityGapSid,
+    runtimes: { [compatibilityGapSid]: createRuntime() },
+  }, { type: "event", event: event({
+    type: "session_control", sid: compatibilityGapSid, revision: 8,
+    control_mode: "remote", write_state: "writable",
+    terminal_attached: false, generation: "gap-generation-old",
+  }) });
+  compatibilityGapState = reduce(compatibilityGapState, {
+    type: "event", event: event({
+      type: "replay_start", sid: compatibilityGapSid,
+      from_seq: 0, to_seq: 0, truncated: false,
+      generation: "gap-generation-new",
+    }),
+  });
+  assert.equal(compatibilityGapState.runtimes[compatibilityGapSid].control, null);
+  compatibilityGapState = reduce(compatibilityGapState, {
+    type: "event", event: event({
+      type: "takeover_state", sid: compatibilityGapSid, pending: true,
+      message: "late legacy lock",
+    }),
+  });
+  assert.equal(
+    compatibilityGapState.runtimes[compatibilityGapSid].takeoverPending, false,
+    "legacy takeover cannot revive a lock while a new revision epoch is seeding",
+  );
+  compatibilityGapState = reduce(compatibilityGapState, {
+    type: "event", event: event({
+      type: "history", sid: compatibilityGapSid,
+      session_id: compatibilityGapSid, revision: "gap-history",
+      generation: "gap-generation-new", build_seq: 1,
+      has_more: false, events: [], external: true, takeover_pending: true,
+    }),
+  });
+  assert.equal(compatibilityGapState.runtimes[compatibilityGapSid].external, false,
+    "legacy History ownership cannot regain authority after revisioned control");
+
+  let legacyControlState = reduce({
+    ...initialState, focusedSid: "legacy-control",
+    runtimes: { "legacy-control": createRuntime() },
+  }, { type: "event", event: event({
+    type: "takeover_state", sid: "legacy-control", pending: true,
+    message: "等待旧式接管",
+  }) });
+  assert.equal(legacyControlState.runtimes["legacy-control"].takeoverPending, true);
+  legacyControlState = reduce(legacyControlState, { type: "event", event: event({
+    type: "takeover_state", sid: "legacy-control", pending: false,
+  }) });
+  assert.equal(legacyControlState.runtimes["legacy-control"].takeoverPending, false);
+
+  const { presentLegacyExternalControl, presentSessionControl } = await reducerHarness.ssrLoadModule(
+    "/src/session-control-ui.ts");
+  const sharedControl = presentSessionControl(control(
+    30, "codex_shared", "writable", { terminal_attached: true }));
+  assert.equal(sharedControl.locked, false);
+  assert.equal(sharedControl.title, "终端双向连接");
+  assert.equal(sharedControl.tone, "attached");
+  assert.match(sharedControl.detail, /浏览器与终端共享同一会话/);
+  assert.doesNotMatch(sharedControl.detail, /占用/);
+  const passiveSharedControl = presentSessionControl(control(
+    31, "codex_shared", "writable", { terminal_attached: false }));
+  assert.equal(passiveSharedControl.tone, "shared");
+  assert.equal(passiveSharedControl.title, "Codex 后台通道可用");
+  assert.equal(passiveSharedControl.backend, "可用");
+  assert.equal(passiveSharedControl.terminal, "未检测到本机终端",
+    "a passive Codex daemon is shown as backend topology, not terminal ownership");
+  assert.doesNotMatch(passiveSharedControl.title, /已连接/,
+    "a live shared daemon must not be presented as a live terminal connection");
+  const passiveBrokerControl = presentSessionControl(control(
+    32, "claude_broker", "writable", { terminal_attached: false }));
+  assert.equal(passiveBrokerControl.tone, "shared");
+  assert.equal(passiveBrokerControl.title, "Claude Broker 通道可用");
+  assert.equal(passiveBrokerControl.terminal, "未检测到本机终端");
+  const attachedBrokerControl = presentSessionControl(control(
+    33, "claude_broker", "writable", { terminal_attached: true }));
+  assert.equal(attachedBrokerControl.tone, "attached");
+  assert.match(attachedBrokerControl.detail, /浏览器与终端共享同一会话/);
+  const externalControl = presentSessionControl(control(
+    34, "external_cli", "read_only", { can_takeover: true }));
+  assert.equal(externalControl.locked, true);
+  assert.equal(externalControl.action, "迁移");
+  assert.equal(externalControl.tone, "attention");
+  assert.match(externalControl.detail, /只读.*接管/);
+  const desktopControl = presentSessionControl(control(
+    35, "desktop", "writable", { can_takeover: true }));
+  assert.equal(desktopControl.locked, true,
+    "desktop remains fail-closed even if a producer says writable");
+  assert.equal(desktopControl.action, undefined);
+  assert.equal(desktopControl.remote, "只读");
+  assert.match(desktopControl.title, /只读/);
+  const exitedBrokerControl = presentSessionControl(control(
+    36, "claude_broker", "input_busy", {
+      terminal_attached: false,
+      reason: "session_exited: Claude broker 已断开",
+    }));
+  assert.equal(exitedBrokerControl.tone, "disconnected");
+  assert.equal(exitedBrokerControl.title, "终端连接已断开");
+  assert.equal(exitedBrokerControl.remote, "等待恢复");
+  assert.doesNotMatch(exitedBrokerControl.placeholder ?? "", /输入.*忙碌/,
+    "a dead broker must not be presented as a merely busy input channel");
+  const legacyExternalControl = presentLegacyExternalControl(
+    "claude", false, "旧版外部终端");
+  assert.equal(legacyExternalControl.locked, true);
+  assert.equal(legacyExternalControl.action, "迁移");
+  assert.match(legacyExternalControl.detail, /旧版外部终端/);
+
+  const { TerminalControl } = await reducerHarness.ssrLoadModule(
+    "/src/components/TerminalControl.tsx");
+  const terminalControlMarkup = renderToStaticMarkup(createElement(TerminalControl, {
+    control: control(37, "codex_shared", "writable", { terminal_attached: false }),
+    engine: "codex",
+    availability: "online",
+  }));
+  assert.match(terminalControlMarkup, /终端状态：Codex 后台通道可用/);
+  assert.match(terminalControlMarkup, /tone-shared/);
+  assert.doesNotMatch(terminalControlMarkup, /terminal-control-card/,
+    "the status card stays closed until the terminal icon is clicked");
+  const staleTerminalControlMarkup = renderToStaticMarkup(createElement(TerminalControl, {
+    control: control(38, "claude_broker", "writable", { terminal_attached: true }),
+    engine: "claude",
+    availability: "offline",
+  }));
+  assert.match(staleTerminalControlMarkup, /终端状态：连接中断/);
+  assert.match(staleTerminalControlMarkup, /tone-disconnected/);
+  assert.doesNotMatch(staleTerminalControlMarkup, /tone-attached/,
+    "a cached attached state must never render green while transport is offline");
+  const legacyTerminalControlMarkup = renderToStaticMarkup(createElement(TerminalControl, {
+    engine: "claude",
+    availability: "online",
+    legacyExternal: true,
+  }));
+  assert.match(legacyTerminalControlMarkup, /终端状态：外部 CLI 只读镜像/,
+    "pre-v15 external state retains a visible terminal entry point");
+
   const progressSid = "progress";
   state = {
     ...state,
@@ -2011,7 +2378,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 10, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 15, ts: 1, ...frame }) });
   }
 }
 
@@ -2133,6 +2500,12 @@ assert.match(appSource, /surface=\{space\}/);
 assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
 assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
 assert.match(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/);
+assert.match(appSource, /rt\.replaying \|\| !rt\.syncReady \? "syncing" : "online"/,
+  "cached terminal state must be downgraded until the focused session is authoritative");
+assert.match(appSource, /legacyExternal=\{!rt\.control && !!rt\.external\}/,
+  "rolling-deploy compatibility keeps legacy external ownership actionable");
+assert.match(appSource, /sessionControlLocksInput\(rt\.control\)/,
+  "Shift+Tab must not mutate controls while the authoritative session is read-only");
 assert.doesNotMatch(appSource, /className="work-artifacts-btn"/);
 assert.doesNotMatch(appSource, /className="work-head-manage"/);
 assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
@@ -2152,6 +2525,36 @@ assert.match(composerSource, /p\.contextReport\.percentage\.toFixed\(0\)/,
   "Code must retain the engine-total context reading");
 assert.match(composerSource, /ref=\{workSettingsRef\}/);
 assert.match(composerSource, /document\.addEventListener\("pointerdown", onPointerDown\)/);
+assert.match(composerSource, /disabled=\{locked\} title="选择模型"/,
+  "external read-only sessions must disable model changes");
+assert.match(composerSource, /disabled=\{locked\} title="思考强度"/,
+  "external read-only sessions must disable effort changes");
+assert.doesNotMatch(composerSource, /终端占用/,
+  "shared control must never be presented as exclusive terminal occupancy");
+assert.match(composerSource, /presentLegacyExternalControl/);
+assert.doesNotMatch(composerSource, /control-bar/,
+  "terminal state no longer consumes a permanent row above the composer");
+const sessionControlUiSource = readFileSync(
+  resolve(process.cwd(), "src/session-control-ui.ts"), "utf8");
+assert.match(sessionControlUiSource, /桌面端控制 · 只读/);
+assert.match(sessionControlUiSource, /外部 CLI 控制中/);
+assert.match(sessionControlUiSource, /未检测到本机终端/,
+  "backend connectivity must not be presented as confirmed terminal ownership");
+const terminalControlSource = readFileSync(
+  resolve(process.cwd(), "src/components/TerminalControl.tsx"), "utf8");
+assert.match(terminalControlSource, /control\?\.control_mode === "external_cli"/);
+assert.match(terminalControlSource, /onTakeover\?\.\(\)/,
+  "can_takeover remains a displayed request action, not client-side authorization");
+assert.match(terminalControlSource, /aria-label="终端连接状态"/);
+assert.match(terminalControlSource, /event\.key !== "Tab"/);
+assert.match(terminalControlSource, /document\.contains\(trigger\).*trigger\.focus\(\)/,
+  "dialog close restores focus to its terminal-status trigger");
+assert.match(layoutCss, /\.header-secondary\{ display:none!important; \}/);
+assert.match(layoutCss, /\.hstat-label\{ display:none; \}/);
+assert.match(layoutCss, /@media\(max-width:380px\)\{ \.c-head \.hstat\{ display:none; \} \}/,
+  "tiny multi-machine headers retain title, terminal and engine before run-state chrome");
+assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\)/,
+  "the mobile sheet height accounts for the virtual keyboard inset");
 const chatViewSource = readFileSync(
   resolve(process.cwd(), "src/components/ChatView.tsx"), "utf8");
 assert.match(chatViewSource, /surface !== "work"/);
@@ -2266,5 +2669,154 @@ socket.receive({
 });
 assert.equal(wrapperGenerationChanges, 1); // one notice per wrapper generation
 relay.stop();
+
+// A separate socket exercises the v15 control watermark without perturbing
+// the narrative generation assertions above.
+const controlObserved: ServerEvent[] = [];
+const controlRelay = new RelayWs({
+  onEvent: (event) => { controlObserved.push(event); },
+  onConnState: () => {},
+});
+controlRelay.start();
+const controlSocket = FakeWebSocket.instances.at(-1);
+assert.ok(controlSocket);
+controlSocket.onopen?.();
+const wireControlSid = "wire-control-revision";
+controlRelay.seedReplayState({}, {}, {
+  [wireControlSid]: {
+    v: 15, ts: 1, type: "session_control", sid: wireControlSid,
+    control_mode: "remote", write_state: "writable",
+    terminal_attached: false, generation: "wire-generation", revision: 10,
+  },
+});
+controlSocket.receive({
+  type: "session_control", sid: wireControlSid,
+  control_mode: "desktop", write_state: "read_only",
+  terminal_attached: true, generation: "wire-generation", revision: 9,
+});
+assert.equal(controlObserved.filter(
+  (event) => event.type === "session_control").length, 0,
+"the WS watermark must drop an older direct control frame");
+controlSocket.receive({
+  type: "history", sid: wireControlSid, session_id: wireControlSid,
+  revision: "wire-history", generation: "wire-generation",
+  has_more: false, events: [],
+  control: {
+    v: 15, ts: 1, type: "session_control", sid: wireControlSid,
+    control_mode: "external_cli", write_state: "read_only",
+    terminal_attached: true, generation: "wire-generation", revision: 9,
+  },
+});
+const strippedHistory = controlObserved.at(-1);
+assert.equal(strippedHistory?.type, "history");
+assert.equal(strippedHistory?.type === "history" && strippedHistory.control,
+  undefined, "WS must retain History while stripping only stale control");
+controlSocket.receive({
+  type: "history", sid: wireControlSid, session_id: wireControlSid,
+  revision: "wire-cross-session-history", generation: "wire-generation",
+  has_more: false, events: [],
+  control: {
+    v: 15, ts: 1, type: "session_control", sid: "wire-other-session",
+    control_mode: "external_cli", write_state: "read_only",
+    terminal_attached: true, generation: "wire-generation", revision: 100,
+  },
+});
+const crossSessionHistory = controlObserved.at(-1);
+assert.equal(crossSessionHistory?.type, "history");
+assert.equal(crossSessionHistory?.type === "history"
+  && crossSessionHistory.control, undefined,
+"WS must strip a History control routed to another session");
+controlSocket.receive({
+  type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
+  state: "idle", tail_text: "", generation: "wire-generation",
+  control: {
+    v: 15, ts: 1, type: "session_control", sid: "wire-other-session",
+    control_mode: "external_cli", write_state: "read_only",
+    terminal_attached: true, generation: "wire-generation", revision: 100,
+  },
+});
+const crossSessionSnapshot = controlObserved.at(-1);
+assert.equal(crossSessionSnapshot?.type, "snapshot");
+assert.equal(crossSessionSnapshot?.type === "snapshot"
+  && crossSessionSnapshot.control, undefined,
+"WS must strip a Snapshot control routed to another session");
+controlSocket.receive({
+  type: "session_control", sid: wireControlSid,
+  control_mode: "external_cli", write_state: "read_only",
+  terminal_attached: true, generation: "wire-generation",
+  revision: 11, can_takeover: true,
+});
+assert.equal(controlObserved.at(-1)?.type, "session_control");
+controlSocket.receive({
+  type: "session_control", sid: wireControlSid,
+  control_mode: "remote", write_state: "writable",
+  terminal_attached: false, generation: "wire-generation", revision: 11,
+});
+assert.equal(controlObserved.filter(
+  (event) => event.type === "session_control").length, 1,
+"an equal-revision conflicting control frame must be dropped");
+controlSocket.receive({
+  type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
+  state: "idle", tail_text: "", generation: "wire-generation-next",
+  control: {
+    v: 15, ts: 2, type: "session_control", sid: wireControlSid,
+    control_mode: "remote", write_state: "writable",
+    terminal_attached: false, generation: "wire-generation-next", revision: 0,
+  },
+});
+const nextGenerationSnapshot = controlObserved.at(-1);
+assert.equal(nextGenerationSnapshot?.type, "snapshot");
+assert.equal(nextGenerationSnapshot?.type === "snapshot"
+  && nextGenerationSnapshot.control?.revision, 0);
+controlSocket.receive({
+  type: "session_control", sid: wireControlSid,
+  control_mode: "desktop", write_state: "read_only",
+  terminal_attached: true, generation: "wire-generation", revision: 999,
+});
+assert.equal(controlObserved.at(-1), nextGenerationSnapshot,
+  "old-generation direct control must be rejected regardless of revision");
+
+const beforeUnroutedControl = controlObserved.length;
+controlSocket.receive({
+  type: "session_control", control_mode: "desktop", write_state: "read_only",
+  terminal_attached: true, generation: "wire-generation-next", revision: 1000,
+});
+assert.equal(controlObserved.length, beforeUnroutedControl,
+  "an unrouted direct control frame must be dropped at the transport boundary");
+
+// A temp runtime can capture a real id which still has a stale cache watermark.
+// The live temp cursor wins together with its generation and control revision.
+const aliasOld = "wire-control-temp";
+const aliasReal = "wire-control-real";
+controlRelay.seedReplayState(
+  { [aliasOld]: 3, [aliasReal]: 2 },
+  { [aliasOld]: "wire-alias-live", [aliasReal]: "wire-alias-cache" },
+  {
+    [aliasOld]: {
+      v: 15, ts: 3, type: "session_control", sid: aliasOld,
+      control_mode: "remote", write_state: "writable",
+      terminal_attached: false, generation: "wire-alias-live", revision: 2,
+    },
+    [aliasReal]: {
+      v: 15, ts: 2, type: "session_control", sid: aliasReal,
+      control_mode: "desktop", write_state: "read_only",
+      terminal_attached: true, generation: "wire-alias-cache", revision: 50,
+    },
+  },
+);
+controlSocket.receive({
+  type: "session_rekey", old_key: aliasOld, session_id: aliasReal,
+});
+assert.equal(controlRelay.generationFor(aliasReal), "wire-alias-live");
+assert.equal(controlRelay.lastSeqFor(aliasReal), 3);
+const afterAliasRekey = controlObserved.length;
+controlSocket.receive({
+  type: "session_control", sid: aliasReal,
+  control_mode: "desktop", write_state: "read_only", terminal_attached: true,
+  generation: "wire-alias-cache", revision: 999,
+});
+assert.equal(controlObserved.length, afterAliasRekey,
+  "rekey must not retain the stale real-id generation watermark");
+controlRelay.stop();
 
 console.log("web reliability tests passed");

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ClipboardEvent } from "react";
-import type { State, QueryImg, QueryFile, ContextReport, CollaborationModeName } from "../protocol";
+import type { State, QueryImg, QueryFile, ContextReport, CollaborationModeName, SessionControl } from "../protocol";
+import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
 import { clientSlashesFor, CODEX_PROMPTS, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor, type Catalog } from "../data";
@@ -31,13 +32,13 @@ interface Props {
   perm: string;
   collaborationMode: CollaborationModeName;
   fast?: boolean | null;   // null until the wrapper reports the real service tier
+  control?: SessionControl | null;
   // A native `claude`/`codex` in the terminal owns this session and is appending to
   // its transcript. We mirror it live but must NOT write: a cc session has a single
   // owner, so sending from here would fork the conversation.
   external?: boolean;
   takeoverPending?: boolean;
   takeoverMessage?: string | null;
-  onTakeover?: () => void;   // drop the read-only lock now (wrapper reloads before our turn)
   engine?: "claude" | "codex";
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   editPrompt: string | null;
@@ -136,11 +137,24 @@ export function Composer(p: Props) {
 
   const busy = isComposerBusy(p.state);
   const offline = !p.wrapperOnline || p.connState !== "connected";
-  // `locked` = we must not write to this session: the machine is offline, OR a native
-  // `claude` in the terminal owns it (we mirror it read-only).
-  const locked = offline || !!p.external;
+  const legacyControl = !p.control && p.external
+    ? presentLegacyExternalControl(
+        p.engine === "codex" ? "codex" : "claude",
+        !!p.takeoverPending,
+        p.takeoverMessage,
+      ) : null;
+  const controlUi = p.control ? presentSessionControl(p.control) : legacyControl;
+  // The connection and authoritative write state independently gate input.
+  const locked = offline || !!controlUi?.locked;
   const hasText = input.trim().length > 0;
   const hasAttachments = images.length > 0 || files.length > 0;
+
+  useEffect(() => {
+    if (!locked) return;
+    setSheetKind(null);
+    setCtxOpen(false);
+    if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
+  }, [locked]);
 
   // edit: refill the input box with a past prompt (user-bubble edit button)
   useEffect(() => {
@@ -449,8 +463,7 @@ export function Composer(p: Props) {
       value={input}
       placeholder={importing ? "正在安全导入附件…"
         : offline ? "机器离线 — 等待重连…"
-        : p.external ? "终端占用中 — 只读镜像,无法在此发送"
-        : placeholder}
+        : (controlUi?.placeholder ?? placeholder)}
       disabled={locked}
       onChange={(e) => onInput(e.target.value)}
       onCompositionStart={() => imeSubmitRef.current.startComposition()}
@@ -506,19 +519,6 @@ export function Composer(p: Props) {
           </div>
         )}
         {notice && <div className="composer-notice">{notice}</div>}
-        {p.external && (
-          <div className="external-bar" role="status">
-            <Icon name="read" size={14} />
-            <span><b>{p.takeoverPending ? "等待接管" : "终端占用中"}</b> · 只读镜像 —— {
-              p.takeoverMessage || (p.engine === "codex"
-                ? "这个会话正由终端里的原生 Codex 驱动，新消息会实时同步到这里；退出终端后会自动解锁。"
-                : "这个会话正由终端里的原生 Claude Code 驱动，新消息会实时同步到这里。")}</span>
-            <button className="external-take" onClick={() => p.onTakeover?.()}
-              disabled={!!p.takeoverPending}
-              title="点击接管；终端正在回复时会在本轮结束后自动交权">
-              {p.takeoverPending ? "已登记" : "接管"}</button>
-          </div>
-        )}
         {p.queue.length > 0 && (
           <div className="queued show">
             {p.queue.map((m, i) => (
@@ -594,13 +594,16 @@ export function Composer(p: Props) {
               <details className="work-settings" ref={workSettingsRef}>
                 <summary><Icon name="plan" size={15} /><span>工作设置</span></summary>
                 <div className="work-settings-pop" ref={ctxWrapRef}>
-                  <button type="button" onClick={() => setSheetKind("models")}>
+                  <button type="button" onClick={() => setSheetKind("models")}
+                    disabled={locked}>
                     <span>模型</span><b>{model?.name ?? "读取中"}</b>
                   </button>
-                  <button type="button" onClick={() => setSheetKind("efforts")}>
+                  <button type="button" onClick={() => setSheetKind("efforts")}
+                    disabled={locked}>
                     <span>思考强度</span><b>{effort?.name ?? "读取中"}</b>
                   </button>
-                  <button type="button" onClick={() => setSheetKind("perms")}>
+                  <button type="button" onClick={() => setSheetKind("perms")}
+                    disabled={locked}>
                     <span>访问权限</span><b>{perm?.short ?? "读取中"}</b>
                   </button>
                   <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
@@ -647,18 +650,22 @@ export function Composer(p: Props) {
             type="button"
             className={"hint-mode" + modeCls + (hintBusy ? " busy" : "")}
             onClick={() => setSheetKind("perms")}
+            disabled={locked}
             title="点击切换权限模式"
           >
             {perm ? `${perm.short}模式` : "权限读取中"} · {stateZh[p.state]} <span className="hint-mode-ch">▾</span>
           </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令</span>
           <div className="hint-right" ref={ctxWrapRef}>
-            <button className="hint-ctl" onClick={() => setSheetKind("models")} title="选择模型">{model?.name ?? "模型读取中"}</button>
-            <button className="hint-ctl" onClick={() => setSheetKind("efforts")} title="思考强度">{effort?.name ?? "强度读取中"}</button>
+            <button className="hint-ctl" onClick={() => setSheetKind("models")}
+              disabled={locked} title="选择模型">{model?.name ?? "模型读取中"}</button>
+            <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
+              disabled={locked} title="思考强度">{effort?.name ?? "强度读取中"}</button>
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"
                 onClick={() => p.onSetCollaborationMode("default")}
+                disabled={locked}
                 title="Plan 模式已开启；点击恢复默认模式（下条消息生效）"
                 aria-pressed="true"
               >Plan</button>
@@ -667,6 +674,7 @@ export function Composer(p: Props) {
               <button
                 className={"hint-ctl fast-chip" + (p.fast ? " on" : "")}
                 onClick={() => p.onSetServiceTier?.("toggle")}
+                disabled={locked}
                 title="Fast 服务档位:快 / 标准(下条消息生效)"
               >{p.fast == null ? "档位读取中" : p.fast ? "⚡ 快" : "标准"}</button>
             )}

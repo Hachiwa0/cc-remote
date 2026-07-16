@@ -12,24 +12,33 @@ from cc_remote.protocol import (
     BtwOpened,
     CloseBtw,
     CommandAck,
+    Effort,
     Error,
     GetHistory,
+    History,
     Hello,
     ListSessions,
+    Model,
     OpenBtw,
     Perm,
     Ping,
     Query,
     Snapshot,
+    SetEffort,
+    SetModel,
+    SetPerm,
+    SessionControl,
     SessionList,
     SwitchSession,
     Takeover,
     TakeoverState,
     UserMsg,
     deserialize,
+    is_downstream,
     serialize,
 )
 from cc_remote.wrapper import machine as machine_module
+from cc_remote.claude_broker.client import BrokerClientError
 from cc_remote.relay.pairing import RelayHub
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -62,6 +71,48 @@ def test_command_envelope_and_routed_ack_roundtrip():
         Hello(role="client", client_id="client-1", cmd_id="not-reliable")
     with pytest.raises(ValidationError):
         Ping(n=1, cmd_id="not-reliable")
+
+
+def test_v15_session_control_roundtrip_and_snapshot_carriers():
+    control = SessionControl(
+        sid="session-1",
+        control_mode="external_cli",
+        write_state="read_only",
+        terminal_attached=True,
+        reason="外部 CLI 正在控制",
+        generation="wrapper-generation-1",
+        revision=7,
+        can_takeover=True,
+    )
+    assert deserialize(serialize(control)) == control
+    assert is_downstream(control) is True
+
+    snapshot = Snapshot(
+        sid="session-1", cc_session_id="session-1", state="idle",
+        control=control,
+    )
+    assert deserialize(serialize(snapshot)).control == control
+    history = History(
+        session_id="session-1", revision="history-revision",
+        events=[], control=control,
+    )
+    assert deserialize(serialize(history)).control == control
+
+    with pytest.raises(ValidationError):
+        SessionControl(
+            control_mode="terminal", write_state="read_only",
+            terminal_attached=True, revision=8,
+        )
+    with pytest.raises(ValidationError):
+        SessionControl(
+            control_mode="remote", write_state="writable",
+            terminal_attached=False, revision=-1,
+        )
+    with pytest.raises(ValidationError):
+        SessionControl(
+            control_mode="remote", write_state="writable",
+            terminal_attached=False, generation="bad generation", revision=0,
+        )
 
 
 def test_open_btw_request_id_roundtrip_is_required_on_both_frames():
@@ -209,6 +260,134 @@ def test_wrapper_dedupe_cache_is_bounded_per_client():
         # itself remains at the configured hard bound.
         assert handled == ["one", "two", "three", "one"]
         assert len(machine._processed_commands["client-1"]) == 2
+
+    asyncio.run(run())
+
+
+def test_duplicate_claude_broker_model_and_permission_controls_replay_without_reexecution():
+    class BrokerControls:
+        is_claude_broker = True
+        model = "old-model"
+        effort = "high"
+        permission_mode = "bypassPermissions"
+
+        def __init__(self):
+            self.model_calls = 0
+            self.effort_calls = 0
+            self.permission_calls = 0
+
+        async def set_model(self, model):
+            self.model_calls += 1
+            self.model = model
+
+        async def set_permission_mode(self, mode):
+            self.permission_calls += 1
+            self.permission_mode = mode
+
+        async def set_effort(self, effort):
+            self.effort_calls += 1
+            self.effort = effort
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "claude"
+        ctx.space = "code"
+        ctx.sdk = BrokerControls()
+        ctx.announced_model = "old-model"
+        ctx.announced_perm = "bypassPermissions"
+        machine.sessions["session-1"] = ctx
+
+        model = SetModel(
+            sid="session-1", model="claude-opus-4-1",
+            cmd_id="model-1", client_id="client-1",
+        )
+        permission = SetPerm(
+            sid="session-1", mode="default",
+            cmd_id="perm-1", client_id="client-1",
+        )
+        effort = SetEffort(
+            sid="session-1", effort="max",
+            cmd_id="effort-1", client_id="client-1",
+        )
+        await machine._process_command(model)
+        await machine._process_command(model)
+        await machine._process_command(effort)
+        await machine._process_command(effort)
+        await machine._process_command(permission)
+        await machine._process_command(permission)
+
+        assert ctx.sdk.model_calls == 1
+        assert ctx.sdk.effort_calls == 1
+        assert ctx.sdk.permission_calls == 1
+        models = [event for event in transport.sent if isinstance(event, Model)]
+        efforts = [event for event in transport.sent if isinstance(event, Effort)]
+        perms = [event for event in transport.sent if isinstance(event, Perm)]
+        assert [event.model for event in models] == [
+            "claude-opus-4-1", "claude-opus-4-1"]
+        assert [event.mode for event in perms] == ["default", "default"]
+        assert [event.effort for event in efforts] == ["max", "max"]
+        assert models[-1].to == "client-1"
+        assert efforts[-1].to == "client-1"
+        assert perms[-1].to == "client-1"
+        assert len([event for event in transport.sent
+                    if isinstance(event, CommandAck)]) == 6
+
+    asyncio.run(run())
+
+
+def test_duplicate_failed_claude_broker_controls_replay_error_without_retrying_tui():
+    class RejectingBroker:
+        is_claude_broker = True
+        model = "claude-sonnet-4-5"
+        effort = "high"
+        permission_mode = "bypassPermissions"
+
+        def __init__(self):
+            self.calls = 0
+            self.effort_calls = 0
+
+        async def set_permission_mode(self, _mode):
+            self.calls += 1
+            raise BrokerClientError(
+                "control_unconfirmed", "no durable permission record")
+
+        async def set_effort(self, _effort):
+            self.effort_calls += 1
+            raise BrokerClientError(
+                "control_unconfirmed", "no durable effort record")
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "claude"
+        ctx.space = "code"
+        ctx.sdk = RejectingBroker()
+        ctx.announced_perm = "bypassPermissions"
+        machine.sessions["session-1"] = ctx
+        command = SetPerm(
+            sid="session-1", mode="default",
+            cmd_id="perm-failed", client_id="client-1",
+        )
+        effort = SetEffort(
+            sid="session-1", effort="max",
+            cmd_id="effort-failed", client_id="client-1",
+        )
+
+        await machine._process_command(command)
+        await machine._process_command(command)
+        await machine._process_command(effort)
+        await machine._process_command(effort)
+
+        assert ctx.sdk.calls == 1
+        assert ctx.sdk.effort_calls == 1
+        errors = [event for event in transport.sent if isinstance(event, Error)]
+        assert len(errors) == 4
+        assert all("持久确认" in event.message for event in errors)
+        assert errors[-1].to == "client-1"
+        assert ctx.announced_perm == "bypassPermissions"
+        assert not [event for event in transport.sent if isinstance(event, Perm)]
+        assert not [event for event in transport.sent if isinstance(event, Effort)]
 
     asyncio.run(run())
 
