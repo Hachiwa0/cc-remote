@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Icon, ClaudeMark } from "../icons";
 import { useImeSubmit } from "../use-ime-submit";
 
@@ -10,9 +10,22 @@ export function LoginForm({
   onToggleTheme: () => void;
 }) {
   const [password, setPassword] = useState("");
+  const [username, setUsername] = useState("");
+  const [multiUser, setMultiUser] = useState(false);
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/auth-config", {
+      credentials: "same-origin", cache: "no-store",
+    }).then(async (response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (!cancelled) setMultiUser(payload?.multi_user === true);
+      }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
 
   const submit = async (value = password) => {
     if (!value) return;
@@ -23,10 +36,10 @@ export function LoginForm({
         method: "POST",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: value }),
+        body: JSON.stringify({ username, password: value }),
       });
       if (r.status === 429) { setError("尝试太频繁，等一分钟再试"); return; }
-      if (!r.ok) { setError("密码错误"); return; }
+      if (!r.ok) { setError(multiUser ? "账号或密码错误" : "密码错误"); return; }
       onLogin();
     } catch {
       setError("网络错误");
@@ -47,6 +60,23 @@ export function LoginForm({
           <span className="name"><b>cc</b><span>·remote</span></span>
         </div>
         <p className="login-tag serif" style={{ fontSize: 15 }}>你的 Claude Code，随身遥控</p>
+        {multiUser && <div className="login-field">
+          <Icon name="user" size={18} />
+          <input
+            type="text"
+            name="username"
+            placeholder="账号"
+            value={username}
+            autoComplete="username"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint="next"
+            onChange={(event) => setUsername(event.target.value)}
+            disabled={loading}
+            autoFocus
+          />
+        </div>}
         <div className="login-field">
           <Icon name="lock" size={18} />
           <input
@@ -77,7 +107,7 @@ export function LoginForm({
               imeSubmit.requestSubmit();
             }}
             disabled={loading}
-            autoFocus
+            autoFocus={!multiUser}
           />
           <button type="button" className="login-reveal"
             aria-label={passwordVisible ? "隐藏密码" : "显示密码"}
@@ -92,7 +122,8 @@ export function LoginForm({
         {error && <div className="login-err">{error}</div>}
         <button className="login-btn"
           onPointerDown={imeSubmit.commitCompositionBeforePointerSubmit}
-          onClick={imeSubmit.requestSubmit} disabled={loading || !password}>
+          onClick={imeSubmit.requestSubmit}
+          disabled={loading || !password || (multiUser && !username)}>
           {loading ? "登录中…" : "进入"}
         </button>
       </div>

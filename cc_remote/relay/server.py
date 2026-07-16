@@ -14,6 +14,7 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -26,8 +27,8 @@ from fastapi.responses import JSONResponse
 from cc_remote.config import RelayConfig, relay_config, validate_relay_config
 from cc_remote.log import logger
 from cc_remote.relay.auth import (
-    SESSION_COOKIE_NAME, SessionClaims, authenticate, make_session_token,
-    session_token_claims, verify_password,
+    SESSION_COOKIE_NAME, SessionClaims, authenticate, authenticate_login,
+    make_session_token, session_token_claims, wrapper_machine_scope,
 )
 from cc_remote.relay.pairing import RelayHub
 
@@ -244,6 +245,7 @@ async def _serve_client_until_expiry(
     hub: RelayHub,
     expires_at: int,
     revoked: asyncio.Event,
+    machine_id: str = "default",
 ) -> None:
     """Serve until disconnect, signed expiry, or server-side revocation."""
     remaining = max(0.0, expires_at - time.time())
@@ -267,7 +269,10 @@ async def _serve_client_until_expiry(
 
     guard_task = asyncio.create_task(guard())
     try:
-        await hub.serve_client(websocket)
+        if machine_id == "default":
+            await hub.serve_client(websocket)
+        else:
+            await hub.serve_client(websocket, machine_id)
     except asyncio.CancelledError:
         if not close_signal.done():
             raise
@@ -291,6 +296,13 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
     app.state.hub = hub
     app.state.sessions = sessions
     app.state.login_slots = login_slots
+
+    @app.get("/api/auth-config")
+    async def auth_config() -> JSONResponse:
+        return JSONResponse(
+            {"multi_user": bool(cfg.login_users_json)},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/api/login")
     async def login(req: Request) -> JSONResponse:
@@ -345,10 +357,19 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
             login_slots.release()
         candidate = body.get("password", "") if isinstance(body, dict) else ""
         password = candidate if isinstance(candidate, str) else ""
-        if not verify_password(password, cfg.login_password):
+        username_value = body.get("username", "") if isinstance(body, dict) else ""
+        username = username_value if isinstance(username_value, str) else ""
+        access = authenticate_login(username, password, cfg)
+        if access is None:
             log.warning("login failed", ip=ip)
             return JSONResponse({"error": "invalid"}, status_code=401)
-        token, exp = make_session_token(cfg.session_secret, cfg.session_ttl_seconds)
+        subject, machines = access
+        token, exp = make_session_token(
+            cfg.session_secret,
+            cfg.session_ttl_seconds,
+            subject=subject,
+            machines=machines,
+        )
         claims = session_token_claims(token, cfg.session_secret)
         assert claims is not None
         if not await sessions.register(claims):
@@ -382,7 +403,8 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
                 {"ok": False}, status_code=401, headers={"Cache-Control": "no-store"}
             )
         return JSONResponse(
-            {"ok": True, "exp": claims.expires_at},
+            {"ok": True, "exp": claims.expires_at,
+             "username": claims.subject},
             headers={"Cache-Control": "no-store"},
         )
 
@@ -408,9 +430,34 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
         )
         return response
 
+    @app.get("/api/machines")
+    async def machine_list(req: Request) -> JSONResponse:
+        token = req.cookies.get(SESSION_COOKIE_NAME, "")
+        claims = session_token_claims(token, cfg.session_secret)
+        if (
+            claims is None
+            or claims.expires_at <= time.time()
+            or not await sessions.active(claims)
+        ):
+            return JSONResponse(
+                {"ok": False}, status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        machines = [machine_id for machine_id in hub.machine_ids
+                    if claims.allows_machine(machine_id)]
+        return JSONResponse(
+            {"ok": True, "machines": machines},
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
-        role = authenticate(websocket.headers.get("authorization", ""), cfg)  # wrapper Bearer
+        authorization = websocket.headers.get("authorization", "")
+        role = authenticate(authorization, cfg)  # wrapper Bearer
+        wrapper_scope: str | None = None
+        if role == "wrapper":
+            wrapper_scope = wrapper_machine_scope(
+                authorization[7:].strip(), cfg)
         claims: Optional[SessionClaims] = None
         if role is None:
             token = websocket.cookies.get(SESSION_COOKIE_NAME, "")
@@ -433,7 +480,10 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
         await websocket.accept()
         log.info("ws accepted", role=role)
         if role == "wrapper":
-            await hub.serve_wrapper(websocket)
+            await hub.serve_wrapper(
+                websocket,
+                None if wrapper_scope == "*" else wrapper_scope,
+            )
         else:
             assert claims is not None
             revoked = await sessions.subscribe(claims)
@@ -443,14 +493,40 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
                     reason=SESSION_REVOKED_CLOSE_REASON,
                 )
                 return
-            await _serve_client_until_expiry(
-                websocket, hub, claims.expires_at, revoked
-            )
+            requested_machine = websocket.query_params.get("machine", "").strip()
+            if requested_machine and not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}", requested_machine
+            ):
+                await websocket.close(code=1008, reason="invalid machine")
+                return
+            if requested_machine and not claims.allows_machine(requested_machine):
+                await websocket.close(code=1008, reason="machine not authorized")
+                return
+            if requested_machine:
+                machine_id = requested_machine
+            else:
+                connected = [candidate for candidate in hub.machine_ids
+                             if claims.allows_machine(candidate)]
+                if connected:
+                    machine_id = connected[0]
+                elif "*" not in claims.machines:
+                    machine_id = claims.machines[0]
+                else:
+                    machine_id = hub.default_machine_id()
+            if machine_id == "default":
+                # Keep the legacy call shape for embedded relays and tests that
+                # replace the expiry guard. Named machines use the extended
+                # route-aware form below.
+                await _serve_client_until_expiry(
+                    websocket, hub, claims.expires_at, revoked)
+            else:
+                await _serve_client_until_expiry(
+                    websocket, hub, claims.expires_at, revoked, machine_id)
 
     @app.get("/healthz")
     async def healthz() -> dict:
         return {"ok": True, "wrapper_connected": hub.wrapper_connected,
-                "clients": hub.client_count}
+                "machines": hub.machine_ids, "clients": hub.client_count}
 
     # Static web client. Mounted last so /api/login and /ws and /healthz win.
     if cfg.static_dir and os.path.isdir(cfg.static_dir):

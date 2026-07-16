@@ -20,6 +20,10 @@ from deploy.caddy_managed_block import (
     CaddyMergeError,
     render_managed_caddyfile,
 )
+from deploy.validate_protocol_bundle import (
+    ProtocolBundleError,
+    validate_protocol_bundle,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,37 +89,85 @@ def test_setup_script_is_valid_shell_and_keeps_safe_install_order():
 
     validate = source.index('caddy validate --config "$CADDY_CANDIDATE"')
     backup = source.index('cp -a "$CADDYFILE" "$CADDY_BACKUP"')
+    changed = source.index("CADDY_CHANGED=1", backup)
     install = source.index(
-        'install -o root -g root -m 0644 "$CADDY_CANDIDATE" "$CADDYFILE"'
+        'atomic_install_file "$CADDY_CANDIDATE" "$CADDYFILE" root root 0644'
     )
-    assert validate < backup < install
+    assert validate < backup < changed < install
+    unit_backup = source.index('cp -a "$RELAY_UNIT_FILE" "$UNIT_BACKUP"')
+    unit_changed = source.index("UNIT_CHANGED=1", unit_backup)
+    unit_install = source.index("atomic_install_file", unit_changed)
+    assert unit_backup < unit_changed < unit_install
     assert "require_secret LOGIN_PASSWORD 16" in source
     assert "require_secret SESSION_SECRET 32" in source
     assert "require_secret WRAPPER_TOKEN 32" in source
     assert 'DOMAIN="${DOMAIN_INPUT,,}"' in source
     assert '[[ "$CONFIGURED_RELAY_HOST" == "127.0.0.1" ]]' in source
     assert '[[ "$CONFIGURED_RELAY_PORT" == "8765" ]]' in source
-    assert '[[ "$CONFIGURED_STATIC_DIR" == "$APPDIR/web/dist" ]]' in source
+    assert '[[ "$CONFIGURED_STATIC_DIR" == "$CURRENT_LINK/web/dist" ]]' in source
     assert 'chmod 0600 "$ENV_FILE"' in source
     assert "systemctl restart cc-remote-relay" in source
-    assert 'python3 "$APPDIR/deploy/caddy_managed_block.py"' in source
-    assert 'source "$APPDIR/deploy/setup_transaction.sh"' in source
+    assert 'python3 "$NEW_RELEASE_DIR/deploy/caddy_managed_block.py"' in source
+    assert 'source "$SOURCE_DIR/deploy/setup_transaction.sh"' in source
     assert "UNIT_BACKUP=" in source
     assert 'cp -a "$RELAY_UNIT_FILE" "$UNIT_BACKUP"' in source
     assert "RELAY_SERVICE_TOUCHED=1" in source
+    assert "flock -n 9" in source
+    assert 'RELEASES_DIR="$APPDIR/releases"' in source
+    assert 'CURRENT_LINK="$APPDIR/current"' in source
+    assert 'NEW_RELEASE_DIR="$(mktemp -d "$RELEASES_DIR/release-' in source
+    assert 'atomic_release_link "$NEW_RELEASE_DIR" "$CURRENT_LINK"' in source
+    assert 'atomic_release_link "$PREVIOUS_RELEASE" "$CURRENT_LINK"' in source
+    previous_owner = source.index('chown -R root:ccremote "$PREVIOUS_RELEASE"')
+    previous_harden = source.index(
+        'harden_release_permissions "$PREVIOUS_RELEASE"'
+    )
+    new_owner = source.index('chown -R root:ccremote "$NEW_RELEASE_DIR"')
+    new_harden = source.index('harden_release_permissions "$NEW_RELEASE_DIR"')
+    assert previous_owner < previous_harden
+    assert new_owner < new_harden
+    assert "rsync" not in source
+
+    staged_validate = source.index(
+        'python3 "$NEW_RELEASE_DIR/deploy/validate_protocol_bundle.py"'
+    )
+    staged_import = source.index("validate_relay_config(relay_config())")
+    activate = source.index(
+        'atomic_release_link "$NEW_RELEASE_DIR" "$CURRENT_LINK"'
+    )
+    unit_verify = source.index(
+        'systemd-analyze verify "$UNIT_VERIFY_DIR/cc-remote-relay.service"'
+    )
+    relay_stop = source.index("systemctl stop cc-remote-relay")
+    relay_restart = source.index("systemctl restart cc-remote-relay")
+    legacy_baseline = source.index(
+        'atomic_release_link "$PREVIOUS_RELEASE" "$CURRENT_LINK"'
+    )
+    release_stage = source.index('echo "==> staging immutable release"')
+    assert (
+        staged_validate
+        < staged_import
+        < unit_verify
+        < relay_stop
+        < activate
+        < relay_restart
+    )
+    assert legacy_baseline < release_stage
 
 
 def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     source = (ROOT / "deploy" / "setup-vps.sh").read_text()
-    assert 'chown -R root:ccremote "$APPDIR"' in source
+    assert 'chown -R root:ccremote "$PREVIOUS_RELEASE"' in source
+    assert 'chown -R root:ccremote "$NEW_RELEASE_DIR"' in source
     assert 'chown root:ccremote "$ENV_FILE"' in source
     assert 'chmod 0640 "$ENV_FILE"' in source
     assert 'chown -R ccremote:ccremote "$APPDIR"' not in source
     assert "sudo -u ccremote" not in source
-    assert 'VENV_STAGE="$(mktemp -d "$APPDIR/.venv.new.XXXXXX")"' in source
-    assert 'mv "$VENV_STAGE" "$APPDIR/.venv"' in source
+    assert 'python3 -m venv "$NEW_RELEASE_DIR/.venv"' in source
+    assert "VENV_STAGE" not in source
+    assert "VENV_BACKUP" not in source
     transaction_source = (ROOT / "deploy" / "setup_transaction.sh").read_text()
-    assert "rollback_venv" in transaction_source
+    assert "rollback_release" in transaction_source
     assert "rollback_deployment" in transaction_source
     assert 'cp -a "$CADDY_BACKUP" "$CADDYFILE"' in transaction_source
     assert 'cp -a "$UNIT_BACKUP" "$RELAY_UNIT_FILE"' in transaction_source
@@ -132,14 +184,119 @@ def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     assert "Python 3.10 or newer is required" in source
 
 
-def test_injected_post_swap_failure_restores_venv_caddy_and_relay_unit(tmp_path):
+@pytest.mark.parametrize("destination_exists", [False, True])
+def test_atomic_install_failure_never_mutates_destination(
+    tmp_path, destination_exists,
+):
+    source = tmp_path / "candidate"
+    destination = tmp_path / "installed"
+    source.write_text("complete new config")
+    if destination_exists:
+        destination.write_text("original config")
+
+    harness = r'''
+set -euo pipefail
+source "$1"
+install() {
+  local destination="${@: -1}"
+  printf '%s' 'partial config' > "$destination"
+  return 1
+}
+atomic_install_file "$2" "$3" root root 0644
+'''
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            harness,
+            "atomic-install-test",
+            str(ROOT / "deploy" / "setup_transaction.sh"),
+            str(source),
+            str(destination),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    if destination_exists:
+        assert destination.read_text() == "original config"
+    else:
+        assert not destination.exists()
+    assert not list(tmp_path.glob(".installed.cc-remote.*"))
+
+
+def test_atomic_install_replaces_destination_with_requested_mode(tmp_path):
+    source = tmp_path / "candidate"
+    destination = tmp_path / "installed"
+    source.write_text("complete new config")
+    destination.write_text("original config")
+
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; atomic_install_file "$2" "$3" "$(id -un)" "$(id -gn)" 0640',
+            "atomic-install-test",
+            str(ROOT / "deploy" / "setup_transaction.sh"),
+            str(source),
+            str(destination),
+        ],
+        check=True,
+    )
+
+    assert destination.read_text() == "complete new config"
+    assert destination.stat().st_mode & 0o777 == 0o640
+    assert not list(tmp_path.glob(".installed.cc-remote.*"))
+
+
+def test_release_permissions_remove_inherited_group_write_and_other_access(
+    tmp_path,
+):
+    release = tmp_path / "release"
+    directory = release / "package"
+    directory.mkdir(parents=True)
+    regular = directory / "module.py"
+    executable = directory / "tool"
+    regular.write_text("value = 1\n")
+    executable.write_text("#!/bin/sh\n")
+    release.chmod(0o775)
+    directory.chmod(0o775)
+    regular.chmod(0o664)
+    executable.chmod(0o775)
+
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; harden_release_permissions "$2"',
+            "permission-test",
+            str(ROOT / "deploy" / "setup_transaction.sh"),
+            str(release),
+        ],
+        check=True,
+    )
+
+    assert release.stat().st_mode & 0o777 == 0o750
+    assert directory.stat().st_mode & 0o777 == 0o750
+    assert regular.stat().st_mode & 0o777 == 0o640
+    assert executable.stat().st_mode & 0o777 == 0o750
+
+
+def test_injected_post_switch_failure_restores_full_release_caddy_and_unit(
+    tmp_path,
+):
     appdir = tmp_path / "app"
-    current_venv = appdir / ".venv"
-    previous_venv = appdir / ".venv.previous"
-    current_venv.mkdir(parents=True)
-    previous_venv.mkdir()
-    (current_venv / "marker").write_text("new")
-    (previous_venv / "marker").write_text("old")
+    releases = appdir / "releases"
+    old_release = releases / "release-old"
+    new_release = releases / "release-new"
+    for release, marker in ((old_release, "old"), (new_release, "new")):
+        for relative in ("cc_remote", "web/dist", ".venv"):
+            directory = release / relative
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "marker").write_text(marker)
+    current = appdir / "current"
+    current.symlink_to(old_release, target_is_directory=True)
 
     caddyfile = tmp_path / "Caddyfile"
     caddy_backup = tmp_path / "Caddyfile.backup"
@@ -156,24 +313,26 @@ def test_injected_post_swap_failure_restores_venv_caddy_and_relay_unit(tmp_path)
 set -euo pipefail
 source "$1"
 APPDIR="$2"
-VENV_BACKUP="$APPDIR/.venv.previous"
-VENV_STAGE=""
-VENV_SWAPPED=1
+RELEASES_DIR="$APPDIR/releases"
+CURRENT_LINK="$APPDIR/current"
+PREVIOUS_RELEASE="$3"
+NEW_RELEASE_DIR="$4"
+RELEASE_SWITCHED=0
 DEPLOY_READY=0
-CADDYFILE="$3"
-CADDY_BACKUP="$4"
+CADDYFILE="$5"
+CADDY_BACKUP="$6"
 CADDY_SITE=""
 CADDY_CANDIDATE=""
 CADDY_CHANGED=1
 CADDY_HAD_CONFIG=1
 CADDY_SERVICE_TOUCHED=1
-RELAY_UNIT_FILE="$5"
-UNIT_BACKUP="$6"
+RELAY_UNIT_FILE="$7"
+UNIT_BACKUP="$8"
 UNIT_CHANGED=1
 UNIT_HAD_FILE=1
 RELAY_SERVICE_TOUCHED=1
 ROLLBACK_DONE=0
-SYSTEMCTL_LOG="$7"
+SYSTEMCTL_LOG="$9"
 systemctl() {
   printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
   return 0
@@ -183,14 +342,17 @@ curl() {
   return 0
 }
 trap cleanup EXIT
-false  # injected relay readiness failure after every staged swap
+RELEASE_SWITCHED=1
+atomic_release_link "$NEW_RELEASE_DIR" "$CURRENT_LINK"
+false  # injected relay readiness failure after the complete release switch
 '''
     result = subprocess.run(
         [
             "bash", "-c", harness, "rollback-test",
             str(ROOT / "deploy" / "setup_transaction.sh"),
-            str(appdir), str(caddyfile), str(caddy_backup),
-            str(unit), str(unit_backup), str(systemctl_log),
+            str(appdir), str(old_release), str(new_release),
+            str(caddyfile), str(caddy_backup), str(unit), str(unit_backup),
+            str(systemctl_log),
         ],
         env={**os.environ, "CURL_LOG": str(tmp_path / "curl.log")},
         text=True,
@@ -198,8 +360,10 @@ false  # injected relay readiness failure after every staged swap
     )
 
     assert result.returncode != 0
-    assert (appdir / ".venv" / "marker").read_text() == "old"
-    assert not previous_venv.exists()
+    assert current.resolve() == old_release.resolve()
+    for relative in ("cc_remote", "web/dist", ".venv"):
+        assert (old_release / relative / "marker").read_text() == "old"
+    assert not new_release.exists()
     assert caddyfile.read_text() == "old caddy"
     assert unit.read_text() == "old unit"
     calls = systemctl_log.read_text().splitlines()
@@ -216,6 +380,67 @@ false  # injected relay readiness failure after every staged swap
     assert not unit_backup.exists()
 
 
+def test_failed_release_rollback_never_deletes_the_still_active_release(tmp_path):
+    appdir = tmp_path / "app"
+    releases = appdir / "releases"
+    old_release = releases / "release-old"
+    new_release = releases / "release-new"
+    old_release.mkdir(parents=True)
+    new_release.mkdir()
+    current = appdir / "current"
+    current.symlink_to(new_release, target_is_directory=True)
+
+    harness = r'''
+set -euo pipefail
+source "$1"
+APPDIR="$2"
+RELEASES_DIR="$APPDIR/releases"
+CURRENT_LINK="$APPDIR/current"
+PREVIOUS_RELEASE="$3"
+NEW_RELEASE_DIR="$4"
+RELEASE_SWITCHED=1
+DEPLOY_READY=0
+CADDYFILE="$APPDIR/Caddyfile"
+CADDY_BACKUP=""
+CADDY_SITE=""
+CADDY_CANDIDATE=""
+CADDY_CHANGED=0
+CADDY_HAD_CONFIG=0
+CADDY_SERVICE_TOUCHED=0
+RELAY_UNIT_FILE="$APPDIR/cc-remote-relay.service"
+UNIT_BACKUP=""
+UNIT_CHANGED=0
+UNIT_HAD_FILE=0
+RELAY_SERVICE_TOUCHED=0
+ROLLBACK_DONE=0
+systemctl() { return 0; }
+curl() { return 0; }
+# Simulate an I/O failure while trying to replace current with the old link.
+atomic_release_link() { return 1; }
+trap cleanup EXIT
+false
+'''
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            harness,
+            "rollback-test",
+            str(ROOT / "deploy" / "setup_transaction.sh"),
+            str(appdir),
+            str(old_release),
+            str(new_release),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert current.resolve() == new_release.resolve()
+    assert new_release.is_dir()
+    assert "retaining staged release because release rollback failed" in result.stderr
+
+
 def test_web_build_manifest_matches_both_protocol_implementations():
     manifest = json.loads(
         (ROOT / "web" / "public" / "cc-remote-build.json").read_text())
@@ -225,6 +450,51 @@ def test_web_build_manifest_matches_both_protocol_implementations():
     match = re.search(r"PROTOCOL_VERSION\s*=\s*(\d+)", ts)
     assert match
     assert manifest["protocol"] == PROTOCOL_VERSION == int(match.group(1))
+
+
+def test_deploy_protocol_validation_reads_backend_and_manifest(tmp_path):
+    backend = tmp_path / "protocol.py"
+    manifest = tmp_path / "cc-remote-build.json"
+    backend.write_text("PROTOCOL_VERSION = 37\n")
+    manifest.write_text('{"protocol":37}\n')
+    assert validate_protocol_bundle(backend, manifest) == 37
+
+    manifest.write_text('{"protocol":36}\n')
+    with pytest.raises(ProtocolBundleError, match="backend v37, web v36"):
+        validate_protocol_bundle(backend, manifest)
+
+
+def test_setup_protocol_gate_has_no_release_specific_literal():
+    source = (ROOT / "deploy" / "setup-vps.sh").read_text()
+    assert "validate_protocol_bundle.py" in source
+    assert "web build protocol is not v" not in source
+    assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
+
+
+def test_release_docs_and_examples_describe_one_atomic_v14_layout():
+    deploy_readme = (ROOT / "deploy" / "README.md").read_text()
+    readme = (ROOT / "README.md").read_text()
+    readme_en = (ROOT / "README_en.md").read_text()
+    claude = (ROOT / "CLAUDE.md").read_text()
+    wrapper_env = (ROOT / "deploy" / "env.wrapper.example").read_text()
+    relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
+    unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
+
+    assert "Protocol v14" in deploy_readme
+    assert "v13" not in deploy_readme
+    for document in (deploy_readme, readme, readme_en):
+        assert "sudo rsync -a --delete" not in document
+        assert "/opt/cc-remote/current" in document
+        assert "/opt/cc-remote/releases" in document
+    assert "CLAUDE_BIN=\n" in wrapper_env
+    assert "CLAUDE_BIN=/" not in wrapper_env
+    assert "WEB_STATIC_DIR=/opt/cc-remote/current/web/dist" in relay_env
+    assert "WorkingDirectory=/opt/cc-remote/current" in unit
+    assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
+    assert "claude-agent-sdk==0.2.119" in claude
+    assert "protocol v14" in claude
+    assert "0.2.110" not in claude
+    assert "protocol v10" not in claude
 
 
 def test_example_wrapper_buffer_can_hold_one_maximum_websocket_frame():

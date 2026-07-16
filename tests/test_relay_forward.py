@@ -81,7 +81,8 @@ def test_replacing_client_closes_old_generation():
         old_ws, new_ws = FakeWs(), FakeWs()
         old = ClientConn(old_ws, 4, "same", 4096)
         new = ClientConn(new_ws, 4, "same", 4096)
-        old.start(); new.start()
+        old.start()
+        new.start()
         hub._clients["same"] = old
         async with hub._lock:
             previous = hub._clients.get("same")
@@ -290,5 +291,138 @@ def test_replacement_is_linearized_after_old_inflight_wrapper_send():
         for task in (old_task, new_task):
             task.cancel()
         await asyncio.gather(old_task, new_task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_named_wrappers_route_events_only_to_their_machine_clients():
+    async def run():
+        cfg = SimpleNamespace(client_queue_cap=4, client_queue_bytes=4096)
+        hub = RelayHub(cfg)
+        wrapper_a, wrapper_b = ScriptedWs(), ScriptedWs()
+        await wrapper_a.incoming.put(serialize(Hello(
+            role="wrapper", machine_id="mac", cc_session_id="mac-session")))
+        await wrapper_b.incoming.put(serialize(Hello(
+            role="wrapper", machine_id="nono", cc_session_id="nono-session")))
+        task_a = asyncio.create_task(hub.serve_wrapper(wrapper_a))
+        task_b = asyncio.create_task(hub.serve_wrapper(wrapper_b))
+        for _ in range(20):
+            if hub.machine_ids == ["mac", "nono"]:
+                break
+            await asyncio.sleep(0)
+        assert hub.machine_ids == ["mac", "nono"]
+
+        client_a_ws, client_b_ws = ScriptedWs(), ScriptedWs()
+        client_a = ClientConn(client_a_ws, 4, "phone-a", 4096)
+        client_b = ClientConn(client_b_ws, 4, "phone-b", 4096)
+        client_a.start()
+        client_b.start()
+        hub._ensure_clients_for("mac")["phone-a"] = client_a
+        hub._ensure_clients_for("nono")["phone-b"] = client_b
+
+        await hub._on_wrapper_msg(
+            Delta(message_id="mac-only", text="a"), "mac")
+        await asyncio.sleep(0)
+        assert json.loads(client_a_ws.sent[-1])["message_id"] == "mac-only"
+        assert client_b_ws.sent == []
+
+        await hub._on_wrapper_msg(
+            Delta(message_id="nono-only", text="b"), "nono")
+        await asyncio.sleep(0)
+        assert json.loads(client_b_ws.sent[-1])["message_id"] == "nono-only"
+        assert all(json.loads(raw).get("message_id") != "nono-only"
+                   for raw in client_a_ws.sent)
+
+        for task in (task_a, task_b):
+            task.cancel()
+        await asyncio.gather(task_a, task_b, return_exceptions=True)
+        await client_a.stop()
+        await client_b.stop()
+
+    asyncio.run(run())
+
+
+def test_machine_bound_wrapper_credential_rejects_other_machine_hello():
+    async def run():
+        hub = RelayHub(SimpleNamespace())
+        ws = ScriptedWs()
+        await ws.incoming.put(serialize(Hello(
+            role="wrapper", machine_id="mac", cc_session_id="session")))
+        await hub.serve_wrapper(ws, expected_machine_id="nono")
+        assert ws.closed == [(1008, "machine not authorized")]
+        assert hub.machine_ids == []
+        assert json.loads(ws.sent[-1])["code"] == "protocol"
+
+    asyncio.run(run())
+
+
+def test_wildcard_wrapper_cannot_exceed_named_wrapper_limit():
+    async def run():
+        hub = RelayHub(SimpleNamespace())
+        hub._wrappers.update({
+            f"machine-{index}": object()
+            for index in range(pairing.MAX_NAMED_WRAPPERS)
+        })
+        ws = ScriptedWs()
+        await ws.incoming.put(serialize(Hello(
+            role="wrapper",
+            machine_id="overflow",
+            cc_session_id="session",
+        )))
+
+        await hub.serve_wrapper(ws)
+
+        assert len(hub._wrappers) == pairing.MAX_NAMED_WRAPPERS
+        assert "overflow" not in hub._wrappers
+        assert ws.closed == [(
+            pairing.WRAPPER_LIMIT_CLOSE_CODE,
+            pairing.WRAPPER_LIMIT_CLOSE_REASON,
+        )]
+        assert json.loads(ws.sent[-1])["code"] == "busy"
+
+    asyncio.run(run())
+
+
+def test_named_machine_read_paths_do_not_create_empty_client_buckets():
+    async def run():
+        hub = RelayHub(SimpleNamespace())
+
+        await hub._on_wrapper_msg(
+            Delta(message_id="missing", text="ignored", to="phone"),
+            "unused-machine",
+        )
+        await hub._broadcast(
+            Delta(message_id="broadcast", text="ignored"),
+            "unused-machine",
+        )
+        await hub._wrapper_gone("unused-machine")
+
+        assert hub._machine_clients == {}
+
+    asyncio.run(run())
+
+
+def test_last_named_client_disconnect_prunes_machine_bucket():
+    async def run():
+        cfg = SimpleNamespace(
+            client_queue_cap=4,
+            client_queue_bytes=4096,
+            max_clients=2,
+            client_hello_timeout=1,
+        )
+        hub = RelayHub(cfg)
+        ws = ScriptedWs()
+        await ws.incoming.put(serialize(Hello(
+            role="client", client_id="phone")))
+        task = asyncio.create_task(hub.serve_client(ws, "ephemeral-machine"))
+        for _ in range(20):
+            if "ephemeral-machine" in hub._machine_clients:
+                break
+            await asyncio.sleep(0)
+
+        assert list(hub._machine_clients["ephemeral-machine"]) == ["phone"]
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert "ephemeral-machine" not in hub._machine_clients
 
     asyncio.run(run())

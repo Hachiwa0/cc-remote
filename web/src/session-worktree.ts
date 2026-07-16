@@ -6,6 +6,8 @@ export interface SessionMenuCapabilities {
   rename: boolean;
   archive: boolean;
   forkWorktree: boolean;
+  rollback: boolean;
+  delete: boolean;
 }
 
 export interface PendingWorktreeFork {
@@ -23,6 +25,9 @@ export function sessionMenuCapabilities(session: SessionInfo): SessionMenuCapabi
     rename: true,
     archive: true,
     forkWorktree: session.engine === "codex" && session.tag !== "archived",
+    rollback: session.space !== "work" && session.engine === "codex"
+      && session.tag !== "archived",
+    delete: true,
   };
 }
 

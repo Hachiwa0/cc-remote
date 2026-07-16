@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,8 @@ Engine = Literal["claude", "codex"]
 
 _MAX_WORK_ARTIFACTS = 200
 _MAX_WORK_ARTIFACT_SCAN = 4096
+_WORK_CONTEXT_MANIFEST = ".cc-remote-context.json"
+_WORK_SCHEDULE_MAX_ATTEMPTS = 3
 _WORK_ARTIFACT_PREVIEW_SUFFIXES = frozenset({
     ".c", ".cc", ".conf", ".cpp", ".css", ".csv", ".go", ".h", ".hpp",
     ".htm", ".html", ".ini", ".java", ".js", ".json", ".jsonl", ".log", ".md",
@@ -38,6 +41,19 @@ _WORK_ARTIFACT_KIND_SUFFIXES = {
     "image": frozenset({".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}),
     "pdf": frozenset({".pdf"}),
 }
+
+_REGISTRY_INIT_LOCKS_GUARD = threading.Lock()
+_REGISTRY_INIT_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _registry_init_lock(path: Path) -> threading.Lock:
+    key = os.path.realpath(path)
+    with _REGISTRY_INIT_LOCKS_GUARD:
+        lock = _REGISTRY_INIT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _REGISTRY_INIT_LOCKS[key] = lock
+        return lock
 
 _MAX_CLAUDE_SETTINGS_BYTES = 1024 * 1024
 _MAX_CLAUDE_SETTING_VALUE = 16 * 1024
@@ -134,6 +150,7 @@ class WorkSessionRecord:
     title: str | None
     project_id: str | None
     archived: bool
+    context_baseline_tokens: int | None
     created_at: float
     updated_at: float
 
@@ -157,6 +174,13 @@ class WorkRegistry:
         self.db_path = self.root / "registry.sqlite3"
 
     def initialize(self) -> None:
+        # CREATE/PRAGMA/ALTER are individually safe, but concurrent first-use of
+        # the same legacy database can still race before SQLite's busy timeout is
+        # established.  Serialize the complete one-time schema path per DB.
+        with _registry_init_lock(self.db_path):
+            self._initialize_locked()
+
+    def _initialize_locked(self) -> None:
         self._mkdir_private(self.root)
         self._mkdir_private(self.chats_root)
         with self._connect() as db:
@@ -172,6 +196,7 @@ class WorkRegistry:
                     title TEXT,
                     project_id TEXT,
                     archived INTEGER NOT NULL DEFAULT 0,
+                    context_baseline_tokens INTEGER,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -225,8 +250,41 @@ class WorkRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS work_schedules_due
                     ON work_schedules(enabled, next_run_at);
+                CREATE TABLE IF NOT EXISTS work_schedule_runs (
+                    run_id TEXT PRIMARY KEY,
+                    schedule_id TEXT NOT NULL REFERENCES work_schedules(schedule_id)
+                        ON DELETE CASCADE,
+                    scheduled_for REAL NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('queued', 'claimed', 'running', 'succeeded', 'failed')),
+                    available_at REAL NOT NULL,
+                    lease_until REAL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    session_id TEXT,
+                    last_error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE(schedule_id, scheduled_for)
+                );
+                CREATE INDEX IF NOT EXISTS work_schedule_runs_ready
+                    ON work_schedule_runs(status, available_at, scheduled_for);
                 """
             )
+            # Existing self-hosted registries predate Work's split between
+            # fixed engine overhead and user conversation context. initialize()
+            # is called from several request paths and may race during the first
+            # process after an upgrade; serialize the inspect-and-alter pair so
+            # two threads cannot both decide the column is absent.
+            db.execute("BEGIN IMMEDIATE")
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(work_sessions)")
+            }
+            if "context_baseline_tokens" not in columns:
+                db.execute(
+                    "ALTER TABLE work_sessions "
+                    "ADD COLUMN context_baseline_tokens INTEGER"
+                )
         self._chmod_file(self.db_path)
 
     def create_session(self, project_id: str | None = None) -> WorkSessionRecord:
@@ -252,6 +310,7 @@ class WorkRegistry:
         record = WorkSessionRecord(
             work_id=work_id, engine=self.engine, cwd=cwd, session_id=None,
             title=None, project_id=project_id, archived=False,
+            context_baseline_tokens=None,
             created_at=now, updated_at=now,
         )
         try:
@@ -273,10 +332,25 @@ class WorkRegistry:
                 "SELECT * FROM work_plugins ORDER BY updated_at DESC").fetchall()]
             schedules = [dict(row) for row in db.execute(
                 "SELECT * FROM work_schedules ORDER BY next_run_at ASC").fetchall()]
+            latest_runs = {
+                row["schedule_id"]: dict(row)
+                for row in db.execute(
+                    """SELECT r.* FROM work_schedule_runs r
+                       JOIN (
+                         SELECT schedule_id, MAX(created_at) AS created_at
+                         FROM work_schedule_runs GROUP BY schedule_id
+                       ) latest ON latest.schedule_id = r.schedule_id
+                         AND latest.created_at = r.created_at"""
+                ).fetchall()
+            }
         for plugin in plugins:
             plugin["enabled"] = bool(plugin["enabled"])
         for schedule in schedules:
             schedule["enabled"] = bool(schedule["enabled"])
+            latest = latest_runs.get(schedule["schedule_id"])
+            schedule["last_run_id"] = latest["run_id"] if latest else None
+            schedule["last_run_status"] = latest["status"] if latest else None
+            schedule["last_run_attempt"] = latest["attempt"] if latest else None
         return {
             "projects": projects, "sources": sources,
             "plugins": plugins, "schedules": schedules,
@@ -365,6 +439,10 @@ class WorkRegistry:
     def delete_project(self, project_id: str) -> None:
         self.initialize()
         with self._connect() as db:
+            work_ids = [row["work_id"] for row in db.execute(
+                "SELECT work_id FROM work_sessions WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()]
             paths = [row["stored_path"] for row in db.execute(
                 "SELECT stored_path FROM work_sources WHERE project_id = ? "
                 "AND stored_path IS NOT NULL", (project_id,)).fetchall()]
@@ -377,6 +455,10 @@ class WorkRegistry:
             ).rowcount
         if changed != 1:
             raise LookupError(f"unknown Work project: {project_id}")
+        for work_id in work_ids:
+            record = self.get_by_work_id(work_id)
+            if record is not None:
+                self._materialize_project(record)
         for stored_path in paths:
             self._remove_owned_library_file(stored_path)
 
@@ -390,9 +472,9 @@ class WorkRegistry:
             raise ValueError("unsupported Work source kind")
         source_id = f"source-{uuid4().hex}"
         stored_path = None
-        if kind == "file":
+        if kind == "file" or (kind == "link" and content is not None):
             if content is None or not filename:
-                raise ValueError("file source requires content and filename")
+                raise ValueError("stored source requires content and filename")
             safe_name = Path(filename).name.strip()
             if not safe_name or safe_name in {".", ".."}:
                 raise ValueError("invalid source filename")
@@ -422,13 +504,14 @@ class WorkRegistry:
             if stored_path:
                 self._remove_owned_library_file(stored_path)
             raise
+        self.sync_project_sessions(project_id)
         return source_id
 
     def delete_source(self, source_id: str) -> None:
         self.initialize()
         with self._connect() as db:
             row = db.execute(
-                "SELECT stored_path FROM work_sources WHERE source_id = ?",
+                "SELECT project_id, stored_path FROM work_sources WHERE source_id = ?",
                 (source_id,),
             ).fetchone()
             changed = db.execute(
@@ -436,6 +519,8 @@ class WorkRegistry:
             ).rowcount
         if changed != 1:
             raise LookupError(f"unknown Work source: {source_id}")
+        assert row is not None
+        self.sync_project_sessions(row["project_id"])
         if row and row["stored_path"]:
             self._remove_owned_library_file(row["stored_path"])
 
@@ -451,10 +536,28 @@ class WorkRegistry:
                 "INSERT INTO work_plugins VALUES (?, ?, ?, ?, 1, ?, ?)",
                 (plugin_id, project_id, name, instructions, now, now),
             )
+        if project_id is None:
+            self.sync_all_sessions()
+        else:
+            self.sync_project_sessions(project_id)
         return plugin_id
 
     def delete_plugin(self, plugin_id: str) -> None:
-        self._delete_row("work_plugins", "plugin_id", plugin_id)
+        self.initialize()
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT project_id FROM work_plugins WHERE plugin_id = ?",
+                (plugin_id,),
+            ).fetchone()
+            changed = db.execute(
+                "DELETE FROM work_plugins WHERE plugin_id = ?", (plugin_id,),
+            ).rowcount
+        if changed != 1 or row is None:
+            raise LookupError(f"unknown Work item: {plugin_id}")
+        if row["project_id"] is None:
+            self.sync_all_sessions()
+        else:
+            self.sync_project_sessions(row["project_id"])
 
     def create_schedule(self, title: str, prompt: str, next_run_at: float,
                         repeat_seconds: int | None = None,
@@ -478,39 +581,158 @@ class WorkRegistry:
     def delete_schedule(self, schedule_id: str) -> None:
         self._delete_row("work_schedules", "schedule_id", schedule_id)
 
-    def claim_due_schedules(self, now: float, limit: int = 8) -> list[dict[str, object]]:
-        """Atomically advance due rows before execution to avoid duplicate runs."""
+    def claim_due_schedules(
+        self, now: float, limit: int = 8, lease_seconds: float = 90.0,
+    ) -> list[dict[str, object]]:
+        """Persist due occurrences, recover expired leases, then claim work.
+
+        Advancing ``next_run_at`` is safe only after a unique run row exists.
+        Crashes therefore leave a recoverable queued/leased occurrence instead
+        of silently losing a one-shot task.
+        """
         self.initialize()
         claimed: list[dict[str, object]] = []
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE work_schedule_runs
+                   SET status = 'failed', lease_until = NULL,
+                       last_error = COALESCE(last_error, '执行进程多次中断'),
+                       updated_at = ?
+                   WHERE status IN ('claimed', 'running')
+                     AND lease_until <= ? AND attempt >= ?""",
+                (now, now, _WORK_SCHEDULE_MAX_ATTEMPTS),
+            )
+            db.execute(
+                """UPDATE work_schedule_runs
+                   SET status = 'queued', lease_until = NULL,
+                       available_at = ?, updated_at = ?
+                   WHERE status IN ('claimed', 'running')
+                     AND lease_until <= ? AND attempt < ?""",
+                (now, now, now, _WORK_SCHEDULE_MAX_ATTEMPTS),
+            )
             rows = db.execute(
                 """SELECT * FROM work_schedules
                    WHERE enabled = 1 AND next_run_at <= ?
                    ORDER BY next_run_at ASC LIMIT ?""", (now, limit),
             ).fetchall()
             for row in rows:
+                active = db.execute(
+                    """SELECT 1 FROM work_schedule_runs
+                       WHERE schedule_id = ?
+                         AND status IN ('queued', 'claimed', 'running') LIMIT 1""",
+                    (row["schedule_id"],),
+                ).fetchone()
+                if active is not None:
+                    continue
+                scheduled_for = float(row["next_run_at"])
+                run_id = f"run-{uuid4().hex}"
+                db.execute(
+                    """INSERT OR IGNORE INTO work_schedule_runs
+                       (run_id, schedule_id, scheduled_for, status, available_at,
+                        attempt, created_at, updated_at)
+                       VALUES (?, ?, ?, 'queued', ?, 0, ?, ?)""",
+                    (run_id, row["schedule_id"], scheduled_for, now, now, now),
+                )
                 repeat = row["repeat_seconds"]
                 enabled = 1 if repeat else 0
-                next_run = now + int(repeat) if repeat else row["next_run_at"]
+                if repeat:
+                    repeat_value = int(repeat)
+                    skipped = max(1, int((now - scheduled_for) // repeat_value) + 1)
+                    next_run = scheduled_for + skipped * repeat_value
+                else:
+                    next_run = scheduled_for
                 db.execute(
                     """UPDATE work_schedules SET enabled = ?, next_run_at = ?,
-                       last_run_at = ?, last_error = NULL, updated_at = ?
+                       last_error = NULL, updated_at = ?
                        WHERE schedule_id = ?""",
-                    (enabled, next_run, now, now, row["schedule_id"]),
+                    (enabled, next_run, now, row["schedule_id"]),
                 )
-                claimed.append(dict(row))
+            ready = db.execute(
+                """SELECT r.*, s.project_id, s.title, s.prompt, s.repeat_seconds
+                   FROM work_schedule_runs r
+                   JOIN work_schedules s ON s.schedule_id = r.schedule_id
+                   WHERE r.status = 'queued' AND r.available_at <= ?
+                   ORDER BY r.scheduled_for ASC LIMIT ?""",
+                (now, limit),
+            ).fetchall()
+            for row in ready:
+                changed = db.execute(
+                    """UPDATE work_schedule_runs
+                       SET status = 'claimed', lease_until = ?, attempt = attempt + 1,
+                           updated_at = ?
+                       WHERE run_id = ? AND status = 'queued'""",
+                    (now + lease_seconds, now, row["run_id"]),
+                ).rowcount
+                if changed == 1:
+                    item = dict(row)
+                    item["attempt"] = int(item["attempt"]) + 1
+                    item["lease_until"] = now + lease_seconds
+                    claimed.append(item)
         return claimed
 
-    def complete_schedule(self, schedule_id: str,
-                          session_id: str | None, error: str | None) -> None:
+    def mark_schedule_running(
+        self, run_id: str, now: float, lease_seconds: float = 90.0,
+    ) -> bool:
         self.initialize()
         with self._connect() as db:
+            changed = db.execute(
+                """UPDATE work_schedule_runs SET status = 'running',
+                   lease_until = ?, updated_at = ?
+                   WHERE run_id = ? AND status = 'claimed'""",
+                (now + lease_seconds, now, run_id),
+            ).rowcount
+        return changed == 1
+
+    def renew_schedule_run(
+        self, run_id: str, now: float, lease_seconds: float = 90.0,
+    ) -> bool:
+        self.initialize()
+        with self._connect() as db:
+            changed = db.execute(
+                """UPDATE work_schedule_runs SET lease_until = ?, updated_at = ?
+                   WHERE run_id = ? AND status IN ('claimed', 'running')""",
+                (now + lease_seconds, now, run_id),
+            ).rowcount
+        return changed == 1
+
+    def complete_schedule(
+        self, run_id: str, session_id: str | None, error: str | None,
+        now: float | None = None,
+    ) -> str:
+        """Finish a run or place it back on the durable retry queue."""
+        self.initialize()
+        completed_at = time.time() if now is None else now
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT schedule_id, attempt FROM work_schedule_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"unknown Work schedule run: {run_id}")
+            if error is None:
+                status = "succeeded"
+                available_at = completed_at
+            elif int(row["attempt"]) < _WORK_SCHEDULE_MAX_ATTEMPTS:
+                status = "queued"
+                available_at = completed_at + min(
+                    300, 15 * (2 ** max(0, int(row["attempt"]) - 1)))
+            else:
+                status = "failed"
+                available_at = completed_at
             db.execute(
-                """UPDATE work_schedules SET last_session_id = ?, last_error = ?,
-                   updated_at = ? WHERE schedule_id = ?""",
-                (session_id, error, time.time(), schedule_id),
+                """UPDATE work_schedule_runs SET status = ?, available_at = ?,
+                   lease_until = NULL, session_id = ?, last_error = ?, updated_at = ?
+                   WHERE run_id = ?""",
+                (status, available_at, session_id, error, completed_at, run_id),
             )
+            db.execute(
+                """UPDATE work_schedules SET last_run_at = ?, last_session_id = ?,
+                   last_error = ?, updated_at = ? WHERE schedule_id = ?""",
+                (completed_at, session_id, error, completed_at, row["schedule_id"]),
+            )
+        return status
 
     def _delete_row(self, table: str, key: str, value: str) -> None:
         if (table, key) not in {
@@ -525,6 +747,43 @@ class WorkRegistry:
             ).rowcount
         if changed != 1:
             raise LookupError(f"unknown Work item: {value}")
+
+    def sync_session(self, session_id: str) -> None:
+        record = self.get_by_session(session_id)
+        if record is None:
+            raise LookupError(f"unknown Work session: {session_id}")
+        self._materialize_project(record)
+
+    def sync_work_id(self, work_id: str) -> None:
+        record = self.get_by_work_id(work_id)
+        if record is None:
+            raise LookupError(f"unknown Work session: {work_id}")
+        self._materialize_project(record)
+
+    def sync_project_sessions(self, project_id: str) -> None:
+        """Refresh wrapper-owned context for every live chat in one project."""
+        self.initialize()
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM work_sessions WHERE engine = ? AND project_id = ?",
+                (self.engine, project_id),
+            ).fetchall()
+        for row in rows:
+            record = self._record(row)
+            if record is not None:
+                self._materialize_project(record)
+
+    def sync_all_sessions(self) -> None:
+        """Refresh global templates without crossing the provider namespace."""
+        self.initialize()
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM work_sessions WHERE engine = ?", (self.engine,),
+            ).fetchall()
+        for row in rows:
+            record = self._record(row)
+            if record is not None:
+                self._materialize_project(record)
 
     def _materialize_project(self, record: WorkSessionRecord) -> None:
         project = (self.get_project(record.project_id)
@@ -544,40 +803,158 @@ class WorkRegistry:
                 """SELECT * FROM work_plugins
                    WHERE enabled = 1 AND project_id IS NULL ORDER BY created_at"""
             ).fetchall())
-        if project is None and not plugins:
-            return
         workspace = Path(record.cwd)
         library = workspace / "资料库"
+        manifest_path = workspace / _WORK_CONTEXT_MANIFEST
+        previous_files = self._read_context_manifest(manifest_path, workspace)
+        managed_paths = set(previous_files.values())
         lines = ([f"# {project.name}", "", project.description.strip(), ""]
                  if project else ["# Work 工作上下文", ""])
         if sources:
             lines.extend(["## 资料库", ""])
         used_names: set[str] = set()
+        current_files: dict[str, str] = {}
         for source in sources:
-            if source["kind"] == "file" and source["stored_path"]:
+            if source["stored_path"] and source["kind"] in {"file", "link"}:
                 self._mkdir_private(library)
                 base = Path(source["stored_path"]).name
-                candidate = base
+                previous = previous_files.get(source["source_id"])
+                candidate = (Path(previous).name if previous else base)
                 index = 2
-                while candidate in used_names:
+                while candidate in used_names or self._context_name_conflicts(
+                    library / candidate, workspace, managed_paths,
+                    Path(source["stored_path"]),
+                ):
                     candidate = f"{Path(base).stem}-{index}{Path(base).suffix}"
                     index += 1
                 used_names.add(candidate)
                 target = library / candidate
-                shutil.copyfile(source["stored_path"], target)
-                target.chmod(0o600)
-                lines.append(f"- {source['title']}: `资料库/{candidate}`")
+                self._replace_private_file(Path(source["stored_path"]), target)
+                relative = str(target.relative_to(workspace)).replace(os.sep, "/")
+                current_files[source["source_id"]] = relative
+                if source["kind"] == "link":
+                    lines.append(
+                        f"- {source['title']}: `资料库/{candidate}`（原链接：{source['uri'] or ''}）")
+                else:
+                    lines.append(f"- {source['title']}: `资料库/{candidate}`")
             elif source["kind"] == "link":
                 lines.append(f"- {source['title']}: {source['uri'] or ''}")
             else:
                 lines.append(f"- {source['title']}: {source['uri'] or ''}")
         if plugins:
-            lines.extend(["", "## 已启用工作插件", ""])
+            lines.extend(["", "## 已启用工作模板", ""])
             for plugin in plugins:
                 lines.extend([f"### {plugin['name']}", plugin["instructions"], ""])
         context = workspace / "WORK.md"
-        context.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-        context.chmod(0o600)
+        if project is not None or plugins:
+            self._atomic_write_private(
+                context, ("\n".join(lines).strip() + "\n").encode("utf-8"))
+        else:
+            try:
+                context.unlink()
+            except FileNotFoundError:
+                pass
+
+        for relative in managed_paths - set(current_files.values()):
+            stale = self._managed_context_path(workspace, relative)
+            if stale is not None:
+                try:
+                    stale.unlink()
+                except FileNotFoundError:
+                    pass
+        if current_files:
+            self._atomic_write_private(
+                manifest_path,
+                json.dumps({"version": 1, "files": current_files},
+                           ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            )
+        else:
+            try:
+                manifest_path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            library.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+
+    @staticmethod
+    def _managed_context_path(workspace: Path, relative: str) -> Path | None:
+        path = workspace / relative
+        try:
+            resolved_workspace = os.path.realpath(workspace)
+            resolved = os.path.realpath(path)
+            if (os.path.commonpath((resolved_workspace, resolved)) != resolved_workspace
+                    or not relative.replace("\\", "/").startswith("资料库/")):
+                return None
+        except (OSError, ValueError):
+            return None
+        return path
+
+    def _read_context_manifest(
+        self, path: Path, workspace: Path,
+    ) -> dict[str, str]:
+        try:
+            raw = path.read_bytes()
+            if len(raw) > 256 * 1024:
+                return {}
+            value = json.loads(raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        files = value.get("files") if isinstance(value, dict) else None
+        if not isinstance(files, dict):
+            return {}
+        valid: dict[str, str] = {}
+        for source_id, relative in files.items():
+            if (isinstance(source_id, str) and isinstance(relative, str)
+                    and self._managed_context_path(workspace, relative) is not None):
+                valid[source_id] = relative
+        return valid
+
+    @staticmethod
+    def _context_name_conflicts(
+        target: Path, workspace: Path, managed_paths: set[str], source: Path,
+    ) -> bool:
+        if not target.exists():
+            return False
+        relative = str(target.relative_to(workspace)).replace(os.sep, "/")
+        if relative in managed_paths:
+            return False
+        try:
+            return target.read_bytes() != source.read_bytes()
+        except OSError:
+            return True
+
+    @staticmethod
+    def _replace_private_file(source: Path, target: Path) -> None:
+        tmp = target.with_name(f".{target.name}.sync-{uuid4().hex}")
+        try:
+            shutil.copyfile(source, tmp)
+            tmp.chmod(0o600)
+            os.replace(tmp, target)
+            target.chmod(0o600)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _atomic_write_private(path: Path, payload: bytes) -> None:
+        tmp = path.with_name(f".{path.name}.sync-{uuid4().hex}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+            path.chmod(0o600)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
     def _remove_owned_library_file(self, stored_path: str) -> None:
         library = self.root / "library"
@@ -607,6 +984,30 @@ class WorkRegistry:
             ).rowcount
         if changed != 1:
             raise LookupError(f"unknown Work session: {work_id}")
+
+    def set_context_baseline(self, work_id: str, tokens: int) -> int:
+        """Persist the fresh session's startup context measurement once."""
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError("invalid Work context baseline")
+        self.initialize()
+        with self._connect() as db:
+            changed = db.execute(
+                """UPDATE work_sessions
+                   SET context_baseline_tokens = COALESCE(context_baseline_tokens, ?)
+                   WHERE work_id = ? AND engine = ?""",
+                (tokens, work_id, self.engine),
+            ).rowcount
+            if changed != 1:
+                raise LookupError(f"unknown Work session: {work_id}")
+            row = db.execute(
+                """SELECT context_baseline_tokens FROM work_sessions
+                   WHERE work_id = ? AND engine = ?""",
+                (work_id, self.engine),
+            ).fetchone()
+        value = row["context_baseline_tokens"] if row is not None else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("invalid persisted Work context baseline")
+        return value
 
     def ensure_claude_policy(self, record: WorkSessionRecord) -> str:
         """Write the wrapper-owned fail-closed Claude sandbox configuration."""
@@ -776,6 +1177,10 @@ class WorkRegistry:
             work_id=row["work_id"], engine=row["engine"], cwd=row["cwd"],
             session_id=row["session_id"], title=row["title"],
             project_id=row["project_id"], archived=bool(row["archived"]),
+            context_baseline_tokens=(
+                int(row["context_baseline_tokens"])
+                if row["context_baseline_tokens"] is not None else None
+            ),
             created_at=float(row["created_at"]), updated_at=float(row["updated_at"]),
         )
 

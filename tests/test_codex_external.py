@@ -5,8 +5,6 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
-
 from cc_remote.protocol import History, Query, Takeover
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_external import (
@@ -59,12 +57,17 @@ class _CodexSdk:
     def __init__(self, owned=()):
         self._owned = set(owned)
         self.turn_start_pending = False
+        self.review_attribution_pending = False
         self.turn_active = False
         self.proc = None
 
     @property
     def owned_turn_ids(self):
         return frozenset(self._owned)
+
+    @property
+    def turn_attribution_pending(self):
+        return self.turn_start_pending or self.review_attribution_pending
 
     def remember_owned_turn_id(self, turn_id):
         self._owned.add(turn_id)
@@ -275,7 +278,8 @@ def test_passive_app_server_locks_only_for_active_external_turn(tmp_path):
         async def push(sid):
             pushed.append(machine._is_external(sid))
             return History(
-                session_id=sid, sid=sid, events=[], has_more=False,
+                session_id=sid, revision=machine._history_revision(sid),
+                sid=sid, events=[], has_more=False,
                 external=machine._is_external(sid))
 
         machine._push_mirrored_history = push
@@ -416,6 +420,51 @@ def test_turn_start_race_is_attributed_to_wrapper(tmp_path):
         assert sdk.owned_turn_ids == {"racing-own"}
         assert watch["pending_wrapper_turns"] == {}
         assert pushed == [] and ctx.needs_reload is False
+
+    asyncio.run(go())
+
+
+def test_review_nested_rollout_waits_for_execution_id_attribution(tmp_path):
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("review-sid", "review-sid")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        sdk = _CodexSdk({"review-outer"})
+        sdk.turn_active = True
+        sdk.review_attribution_pending = True
+        ctx.sdk = sdk
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[ctx.session_id] = watch
+
+        # The rollout writer can flush task_started after review/start returned
+        # the outer id but before stdout announces the nested execution id.
+        path.write_bytes(_event("task_started", "review-inner"))
+        await machine._poll_codex_watch(
+            ctx.session_id, watch, set(), 1000.0)
+        assert "review-inner" in watch["pending_wrapper_turns"]
+        assert watch["active_external_turns"] == {}
+        assert machine._is_external(ctx.session_id) is False
+
+        # Even beyond the ordinary continuation grace, Review's explicit nested
+        # attribution window prevents a fake terminal owner/read-only mirror.
+        await machine._poll_codex_watch(
+            ctx.session_id, watch, set(),
+            1000.0 + machine.CODEX_TURN_ATTRIBUTION_GRACE + 0.01,
+        )
+        assert "review-inner" in watch["pending_wrapper_turns"]
+        assert machine._is_external(ctx.session_id) is False
+
+        sdk.remember_owned_turn_id("review-inner")
+        sdk.review_attribution_pending = False
+        await machine._poll_codex_watch(
+            ctx.session_id, watch, set(), 1004.0)
+        assert watch["pending_wrapper_turns"] == {}
+        assert watch["active_external_turns"] == {}
+        assert machine._is_external(ctx.session_id) is False
 
     asyncio.run(go())
 
@@ -675,7 +724,8 @@ def test_codex_takeover_ignores_exact_current_holder_and_unlocks(tmp_path, monke
         async def push(sid):
             pushed.append(machine._is_external(sid))
             return History(
-                session_id=sid, sid=sid, events=[], has_more=False,
+                session_id=sid, revision=machine._history_revision(sid),
+                sid=sid, events=[], has_more=False,
                 external=machine._is_external(sid))
 
         machine._push_mirrored_history = push
@@ -1077,6 +1127,14 @@ def test_prime_publishes_holder_edges_and_marks_context_stale(tmp_path, monkeypa
 
 
 def test_prime_consumes_short_lived_external_growth_before_query(tmp_path, monkeypatch):
+    class Journal:
+        def __init__(self):
+            self.cleaned = False
+
+        def cleanup(self, *, force=False):
+            assert force is True
+            self.cleaned = True
+
     async def go():
         machine, _ = _mk_machine()
         path = tmp_path / "rollout.jsonl"
@@ -1084,6 +1142,8 @@ def test_prime_consumes_short_lived_external_growth_before_query(tmp_path, monke
         ctx = _mk_ctx("sid", "sid")
         ctx.engine = "codex"
         ctx.sdk = _CodexSdk()
+        journal = Journal()
+        ctx.codex_checkpoint = journal
         machine.sessions["sid"] = ctx
         watch = _watch(path)
         machine._watch["sid"] = watch
@@ -1098,6 +1158,8 @@ def test_prime_consumes_short_lived_external_growth_before_query(tmp_path, monke
         machine._push_mirrored_history = lambda sid: _record_async(pushed, sid)
         assert await machine._prime_codex_ownership("sid") is False
         assert ctx.needs_reload is True and pushed == ["sid"]
+        assert journal.cleaned is True
+        assert ctx.codex_checkpoint is None
         assert watch["size"] == path.stat().st_size
 
     asyncio.run(go())

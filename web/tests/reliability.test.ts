@@ -45,6 +45,43 @@ import {
 } from "../src/use-mobile-viewport.ts";
 import type { ServerEvent } from "../src/protocol.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
+import {
+  classifyBusySubmit,
+  isComposerBusy,
+  isInterruptSettling,
+  isSettlingStopDisabled,
+} from "../src/composer-submit.ts";
+import { workContextMetrics } from "../src/work-context.ts";
+
+const legacyWorkContext = workContextMetrics({
+  v: 14, ts: 0, type: "context_report",
+  total_tokens: 25_572, max_tokens: 1_000_000,
+  percentage: 2.5572, categories: [],
+});
+assert.equal(legacyWorkContext.hasBreakdown, false);
+assert.equal(legacyWorkContext.sessionTokens, 25_572,
+  "an old wrapper must retain the honest legacy total");
+assert.equal(legacyWorkContext.sessionPercentage, 2.5572);
+
+const freshWorkContext = workContextMetrics({
+  v: 14, ts: 0, type: "context_report",
+  total_tokens: 25_572, max_tokens: 1_000_000,
+  percentage: 2.5572, session_tokens: 72, fixed_tokens: 25_500,
+  session_percentage: 0.0072, categories: [],
+});
+assert.equal(freshWorkContext.hasBreakdown, true);
+assert.equal(freshWorkContext.sessionTokens, 72);
+assert.equal(freshWorkContext.fixedTokens, 25_500);
+assert.equal(freshWorkContext.sessionPercentage, 0.0072);
+assert.equal(freshWorkContext.totalPercentage, 2.5572);
+
+const derivedWorkContext = workContextMetrics({
+  v: 14, ts: 0, type: "context_report",
+  total_tokens: 11_194, max_tokens: 353_400,
+  percentage: 3.1675, fixed_tokens: 11_000, categories: [],
+});
+assert.equal(derivedWorkContext.sessionTokens, 194);
+assert.ok(Math.abs(derivedWorkContext.sessionPercentage - 194 / 353_400 * 100) < 1e-9);
 
 assert.equal(resolveSidebarSwipe(12, 200, 84, 205, 390, false), "open");
 assert.equal(resolveSidebarSwipe(300, 200, 230, 205, 390, false), "close");
@@ -55,6 +92,26 @@ assert.equal(resolveSidebarSwipe(12, 200, 84, 205, 390, true), null,
 assert.equal(clampPanelWidth(200, 1440), 360);
 assert.equal(clampPanelWidth(2_000, 1440), 1_020);
 assert.equal(clampPanelWidth(600, 1_000), 580);
+
+assert.equal(isComposerBusy("idle"), false);
+assert.equal(isComposerBusy("running"), true);
+assert.equal(isComposerBusy("interrupting"), true);
+assert.equal(isComposerBusy("draining"), true);
+assert.equal(isInterruptSettling("running"), false);
+assert.equal(isInterruptSettling("interrupting"), true);
+assert.equal(isInterruptSettling("draining"), true);
+assert.equal(isSettlingStopDisabled("running", false), false);
+assert.equal(isSettlingStopDisabled("interrupting", false), true);
+assert.equal(isSettlingStopDisabled("draining", false), true);
+assert.equal(isSettlingStopDisabled("interrupting", true), false);
+assert.equal(classifyBusySubmit("running", "interrupt", false), "interrupt");
+assert.equal(classifyBusySubmit("interrupting", "interrupt", false), "noop");
+assert.equal(classifyBusySubmit("draining", "interrupt", false), "noop");
+assert.equal(classifyBusySubmit(
+  "running", "interrupt", true), "interrupt-and-replace");
+assert.equal(classifyBusySubmit("interrupting", "interrupt", true), "replace");
+assert.equal(classifyBusySubmit("draining", "interrupt", true), "replace");
+assert.equal(classifyBusySubmit("interrupting", "queue", true), "enqueue");
 
 const loginFormSource = readFileSync(resolve(
   process.cwd(), "src/components/LoginForm.tsx"), "utf8");
@@ -72,6 +129,29 @@ const reconnectBannerSource = readFileSync(resolve(
   process.cwd(), "src/components/ReconnectBanner.tsx"), "utf8");
 assert.ok(reconnectBannerSource.includes('busy && <span className="sp"'),
   "only an active reconnect/replay may render the progress indicator");
+
+const historyAppSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
+const cacheSource = readFileSync(resolve(process.cwd(), "src/cache.ts"), "utf8");
+assert.match(historyAppSource, /history_invalidated[\s\S]*invalidateSessionCache/,
+  "history invalidation must evict the matching IndexedDB row");
+assert.match(historyAppSource, /historyCacheEpochRef[\s\S]*loadSession/,
+  "an IndexedDB read started before the marker must be rejected");
+assert.match(historyAppSource, /history_invalidated[\s\S]*sendGetHistory/,
+  "a visible invalidated session must request authoritative history");
+assert.match(historyAppSource,
+  /msg\.type === "history" && msg\.authoritative !== false[\s\S]*allowSessionCache/,
+  "a failed non-authoritative History must not reopen the IndexedDB cache barrier");
+assert.match(historyAppSource, /artifact_invalidated[\s\S]*sendGetWorkArtifacts/,
+  "file rollback must refresh the Work artifact inventory");
+assert.match(historyAppSource, /replay_start[\s\S]*sendGetHistory/,
+  "a replay gap must request authoritative history instead of ending on an empty view");
+assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
+  "a replay gap must discard a possibly stale Work artifact inventory");
+assert.match(cacheSource, /const CACHE_VER = 7/,
+  "history revision support must invalidate pre-revision IndexedDB rows");
+assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
+assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
+  "a debounced pre-marker write must not recreate the deleted cache row");
 
 const viewportListeners = new Map<MobileViewportEvent, Set<() => void>>();
 const viewportCss = new Map<string, string>();
@@ -531,7 +611,7 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 10, ts: 10, ...body,
+    v: 14, ts: 10, ...body,
   } as ServerEvent);
   // Work/Code and engine switches restore the target surface's last accepted
   // list immediately. The authoritative refresh may take ~1s for Codex because
@@ -576,6 +656,589 @@ try {
       [otherSid]: { ...createRuntime(), turns: [untouched], syncReady: true },
     },
   };
+  const historySid = "background-history-invalidated";
+  const staleTurns = [
+    { id: "kept-before-rewind", prompt: "保留", blocks: [], done: true },
+    { id: "removed-by-rewind", prompt: "应删除", blocks: [], done: true },
+  ];
+  state = {
+    ...state,
+    artifact: { file: "changed.ts", kind: "file", sid: historySid },
+    runtimes: {
+      ...state.runtimes,
+      [historySid]: {
+        ...createRuntime(),
+        turns: staleTurns,
+        pendingQuestion: {
+          ask_id: "old-question", question: "旧问题", options: [],
+        },
+      },
+    },
+  };
+  state = reduce(state, { type: "event", event: event({
+    type: "history_invalidated", sid: historySid,
+    session_id: historySid, revision: "history-rev-2", reason: "rollback",
+  }) });
+  assert.deepEqual(state.runtimes[historySid].turns, []);
+  assert.equal(state.runtimes[historySid].pendingQuestion, null);
+  assert.equal(state.runtimes[historySid].historyInvalidated, true);
+  assert.equal(state.runtimes[historySid].loading, true);
+  assert.equal(state.artifact, null);
+
+  state = {
+    ...state,
+    artifact: { file: "stale-after-file-rollback.ts", kind: "file", sid: historySid },
+  };
+  state = reduce(state, { type: "event", event: event({
+    type: "artifact_invalidated", sid: historySid,
+    session_id: historySid, reason: "rollback",
+  }) });
+  assert.equal(state.artifact, null,
+    "a replayed file rollback marker must close stale previews");
+
+  state = {
+    ...state,
+    artifact: { file: "stale-files-only-diff.ts", kind: "gitdiff", sid: historySid,
+      sections: [] },
+  };
+  state = reduce(state, { type: "event", event: event({
+    type: "rollback_result", sid: historySid, session_id: historySid,
+    engine: "codex", restore: "files", conversation: "skipped",
+    files: "succeeded", restored_turns: 1, conflicts: [],
+  }) });
+  assert.equal(state.artifact, null,
+    "a files-only rollback result must close stale diff and preview state");
+
+  state = {
+    ...state,
+    artifact: { file: "other-session.ts", kind: "file", sid: otherSid },
+  };
+  state = reduce(state, { type: "event", event: event({
+    type: "rollback_result", sid: historySid, session_id: historySid,
+    engine: "codex", restore: "files", conversation: "skipped",
+    files: "succeeded", restored_turns: 1, conflicts: [],
+  }) });
+  assert.equal(state.artifact?.sid, otherSid,
+    "a background file rollback must not close another session's preview");
+
+  state = reduce(state, {
+    type: "hydrate_cache", sid: historySid, turns: staleTurns,
+    revision: "history-rev-1",
+  });
+  assert.deepEqual(state.runtimes[historySid].turns, [],
+    "a marker must reject a late IndexedDB hydrate");
+  assert.equal(state.runtimes[historySid].loading, true);
+
+  state = reduce(state, { type: "event", event: event({
+    type: "history", sid: historySid, session_id: historySid,
+    revision: "history-rev-1", before: "old-page", has_more: false,
+    events: [event({
+      type: "user_msg", sid: historySid, msg_id: "removed-by-rewind",
+      prompt: "应删除",
+    })],
+  }) });
+  assert.deepEqual(state.runtimes[historySid].turns, [],
+    "a late pagination page cannot satisfy a destructive marker");
+  assert.equal(state.runtimes[historySid].historyInvalidated, true);
+
+  state = reduce(state, { type: "event", event: event({
+    type: "history", sid: historySid, session_id: historySid,
+    revision: "history-rev-1", has_more: false,
+    events: [event({
+      type: "user_msg", sid: historySid, msg_id: "removed-by-rewind",
+      prompt: "应删除",
+    })],
+  }) });
+  assert.deepEqual(state.runtimes[historySid].turns, [],
+    "a late first page from the old revision cannot satisfy the marker");
+  assert.equal(state.runtimes[historySid].pendingHistoryRevision, "history-rev-2");
+
+  state = reduce(state, { type: "event", event: event({
+    type: "history", sid: historySid, session_id: historySid,
+    revision: "history-rev-2", has_more: false,
+    events: [
+      event({ type: "user_msg", sid: historySid,
+        msg_id: "kept-before-rewind", prompt: "保留" }),
+      event({ type: "assistant_msg_start", sid: historySid,
+        message_id: "kept-answer" }),
+      event({ type: "delta", sid: historySid,
+        message_id: "kept-answer", text: "已保留" }),
+      event({ type: "assistant_msg_end", sid: historySid,
+        message_id: "kept-answer" }),
+      event({ type: "turn_end", sid: historySid,
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  }) });
+  assert.deepEqual(state.runtimes[historySid].turns.map(
+    (turn: { id: string }) => turn.id), ["kept-before-rewind"]);
+  assert.equal(state.runtimes[historySid].historyInvalidated, false);
+  assert.equal(state.runtimes[historySid].loading, false);
+  assert.ok(!state.runtimes[historySid].turns.some(
+    (turn: { id: string }) => turn.id === "removed-by-rewind"));
+
+  const prunedHistorySid = "pruned-background-invalidated";
+  state = reduce(state, { type: "event", event: event({
+    type: "history_invalidated", sid: prunedHistorySid,
+    session_id: prunedHistorySid, revision: "pruned-rev-2", reason: "rollback",
+  }) });
+  assert.equal(state.runtimes[prunedHistorySid].historyInvalidated, true,
+    "a background marker must survive until that session is focused");
+  state = reduce(state, { type: "focus_session", sid: prunedHistorySid });
+  state = reduce(state, { type: "event", event: event({
+    type: "session_focus", sid: prunedHistorySid,
+    session_id: prunedHistorySid, cwd: "/tmp/project",
+  }) });
+  assert.equal(state.runtimes[prunedHistorySid].loading, true,
+    "session_focus must keep loading until authoritative history arrives");
+
+  // A wrapper restart/non-resident resume has no in-memory rollback marker.
+  // The History revision must still replace stale IndexedDB-completed turns,
+  // while retaining only this connection's unfinished optimistic tail.
+  const restartSid = "restart-stale-idb";
+  let restartState = reduce({
+    ...initialState, focusedSid: restartSid,
+  }, {
+    type: "hydrate_cache", sid: restartSid, turns: [
+      ...staleTurns,
+      { id: "stale-half-turn", prompt: "旧的半截输出", blocks: [], done: false },
+    ],
+    revision: "boot-old:1",
+  });
+  restartState = reduce(restartState, {
+    type: "query_sent", sid: restartSid, prompt: "正在发送",
+    msg_id: "optimistic-live", ts: 20_000,
+  });
+  restartState = reduce(restartState, { type: "event", event: event({
+    type: "history", sid: restartSid, session_id: restartSid,
+    revision: "boot-new:1", has_more: false,
+    events: [
+      event({ type: "user_msg", sid: restartSid,
+        msg_id: "kept-before-rewind", prompt: "保留" }),
+      event({ type: "turn_end", sid: restartSid,
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  }) });
+  assert.deepEqual(restartState.runtimes[restartSid].turns.map(
+    (turn: { id: string }) => turn.id),
+  ["kept-before-rewind", "optimistic-live"]);
+  assert.equal(restartState.runtimes[restartSid].historyRevision, "boot-new:1");
+  assert.ok(!restartState.runtimes[restartSid].turns.some(
+    (turn: { id: string }) => turn.id === "removed-by-rewind"));
+  assert.ok(!restartState.runtimes[restartSid].turns.some(
+    (turn: { id: string }) => turn.id === "stale-half-turn"),
+  "an unfinished IndexedDB row is not a genuine current-connection tail");
+  assert.equal(restartState.runtimes[restartSid].turns.at(-1)?.done, false,
+    "revision replacement must preserve a genuine live optimistic tail");
+
+  const resumedLiveSid = "restart-resumed-live-tail";
+  let resumedLiveState = reduce({
+    ...initialState, focusedSid: resumedLiveSid,
+  }, {
+    type: "hydrate_cache", sid: resumedLiveSid, turns: [{
+      id: "resumed-live", prompt: "仍在执行", blocks: [], done: false,
+    }], revision: "boot-old:2",
+  });
+  resumedLiveState = reduce(resumedLiveState, { type: "event", event: event({
+    type: "delta", sid: resumedLiveSid,
+    message_id: "assistant-current", text: "新的实时输出",
+  }) });
+  resumedLiveState = reduce(resumedLiveState, { type: "event", event: event({
+    type: "history", sid: resumedLiveSid, session_id: resumedLiveSid,
+    revision: "boot-new:2", has_more: false, in_progress: true, events: [],
+  }) });
+  assert.deepEqual(resumedLiveState.runtimes[resumedLiveSid].turns.map(
+    (turn: { id: string }) => turn.id), ["resumed-live"],
+  "a live continuation validates the matching unfinished cached turn");
+
+  // A reconnect may resume at any lifecycle frame, not only a text delta.
+  // Every frame that proves the cached turn is live must remove its hydrated
+  // marker and advance the live watermark used by History race protection.
+  const assertLiveValidation = (
+    name: string, blocks: Record<string, unknown>[], liveEvent: ServerEvent,
+  ) => {
+    const liveSid = `cached-${name}`;
+    let liveState = reduce({ ...initialState, focusedSid: liveSid }, {
+      type: "hydrate_cache", sid: liveSid, turns: [{
+        id: "cached-live", prompt: "继续执行", blocks, done: false,
+      }], revision: "live-rev",
+    });
+    liveState = reduce(liveState, { type: "event", event: liveEvent });
+    assert.deepEqual(liveState.runtimes[liveSid].hydratedCacheTurnIds, [],
+      `${name} must validate the hydrated turn`);
+    assert.equal(liveState.runtimes[liveSid].lastLiveSeq, liveEvent.seq,
+      `${name} must advance the live History watermark`);
+  };
+  assertLiveValidation("tool-delta", [{
+    kind: "tool", message_id: "m", tool_use_id: "tool-1",
+    tool: "Bash", input: {}, done: false,
+  }], event({
+    type: "tool_delta", sid: "cached-tool-delta", seq: 21,
+    tool_use_id: "tool-1", stream: "output", delta: "running",
+  }));
+  assertLiveValidation("tool-result", [{
+    kind: "tool", message_id: "m", tool_use_id: "tool-1",
+    tool: "Bash", input: {}, done: false,
+  }], event({
+    type: "tool_result", sid: "cached-tool-result", seq: 22,
+    tool_use_id: "tool-1", content: "done", is_error: false,
+  }));
+  assertLiveValidation("assistant-end", [{
+    kind: "text", message_id: "assistant-1", text: "done", done: false,
+    channel: "final",
+  }], event({
+    type: "assistant_msg_end", sid: "cached-assistant-end", seq: 23,
+    message_id: "assistant-1", channel: "final",
+  }));
+  assertLiveValidation("turn-end", [], event({
+    type: "turn_end", sid: "cached-turn-end", seq: 24,
+    result: { subtype: "success", duration_ms: 1, is_error: false },
+  }));
+  assertLiveValidation("error", [], event({
+    type: "error", sid: "cached-error", seq: 25, msg_id: "cached-live",
+    code: "internal", message: "failed",
+  }));
+
+  // The History read began before assistant completion. Even with the same
+  // revision, its empty snapshot must not delete the now-completed live turn.
+  const completedRaceSid = "same-revision-completed-live-race";
+  let completedRace = reduce({
+    ...initialState, focusedSid: completedRaceSid,
+    runtimes: { [completedRaceSid]: createRuntime() },
+  }, {
+    type: "query_sent", sid: completedRaceSid, prompt: "race",
+    msg_id: "live-completed", ts: 30_000,
+  });
+  completedRace = reduce(completedRace, { type: "event", event: event({
+    type: "user_msg", sid: completedRaceSid, seq: 31,
+    msg_id: "live-completed", prompt: "race",
+  }) });
+  completedRace = reduce(completedRace, { type: "event", event: event({
+    type: "turn_end", sid: completedRaceSid, seq: 32,
+    result: { subtype: "success", duration_ms: 1, is_error: false },
+  }) });
+  completedRace = reduce(completedRace, { type: "event", event: event({
+    type: "history", sid: completedRaceSid, session_id: completedRaceSid,
+    revision: "race-rev", build_seq: 1, live_seq: 30,
+    has_more: false, events: [],
+  }) });
+  assert.deepEqual(completedRace.runtimes[completedRaceSid].turns.map(
+    (turn: { id: string }) => turn.id), ["live-completed"]);
+  assert.equal(completedRace.runtimes[completedRaceSid].turns[0].done, true);
+
+  // A current authoritative head page can repair a lost terminal event. This is
+  // the exact /review interrupt failure mode: the browser saw interrupting and a
+  // running process, but missed TurnEnd. Explicit in_progress=false closes the
+  // retained live tail and its child activity instead of spinning forever.
+  const idleRepairSid = "authoritative-idle-repairs-interrupt";
+  let idleRepair = {
+    ...initialState, focusedSid: idleRepairSid,
+    runtimes: { [idleRepairSid]: createRuntime() },
+  };
+  idleRepair = reduce(idleRepair, { type: "event", event: event({
+    type: "user_msg", sid: idleRepairSid, seq: 41,
+    msg_id: "review-turn", prompt: "",
+  }) });
+  idleRepair = reduce(idleRepair, { type: "event", event: event({
+    type: "process", sid: idleRepairSid, seq: 42,
+    item_id: "review-hook", kind: "hook", phase: "start",
+    status: "running", title: "Hook",
+  }) });
+  idleRepair = reduce(idleRepair, { type: "event", event: event({
+    type: "state", sid: idleRepairSid, state: "interrupting",
+  }) });
+  const duplicateInterruptError = reduce(idleRepair, {
+    type: "event", event: event({
+      type: "error", sid: idleRepairSid, code: "not_running",
+      message: "该会话没有正在运行的回合",
+    }),
+  });
+  assert.equal(duplicateInterruptError.runtimes[idleRepairSid].state,
+    "interrupting", "not_running alone must not guess that an interrupt is terminal");
+  assert.equal(duplicateInterruptError.runtimes[idleRepairSid].turns[0].done, false);
+  idleRepair = reduce(idleRepair, { type: "event", event: event({
+    type: "history", sid: idleRepairSid, session_id: idleRepairSid,
+    revision: "idle-repair-rev", generation: "wrapper-one",
+    build_seq: 1, live_seq: 42, authoritative: true,
+    in_progress: false, has_more: false, events: [],
+  }) });
+  const repairedRuntime = idleRepair.runtimes[idleRepairSid];
+  assert.equal(repairedRuntime.state, "idle");
+  assert.equal(repairedRuntime.turns[0].done, true);
+  assert.equal(repairedRuntime.turns[0].interrupted, true);
+  const repairedProcess = repairedRuntime.turns[0].blocks[0] as {
+    done: boolean; status: string;
+  };
+  assert.equal(repairedProcess.done, true);
+  assert.equal(repairedProcess.status, "interrupted");
+
+  // Explicit in_progress=true remains open even when transcript EOF synthesizes
+  // TurnEnd. Undefined keeps the older-wrapper fallback to local runtime state.
+  const liveHistorySid = "authoritative-running-keeps-tail";
+  let liveHistory = {
+    ...initialState, focusedSid: liveHistorySid,
+    runtimes: { [liveHistorySid]: createRuntime() },
+  };
+  liveHistory = reduce(liveHistory, { type: "event", event: event({
+    type: "user_msg", sid: liveHistorySid, seq: 51,
+    msg_id: "live-review", prompt: "",
+  }) });
+  liveHistory = reduce(liveHistory, { type: "event", event: event({
+    type: "state", sid: liveHistorySid, state: "running",
+  }) });
+  const liveHistoryFrame = {
+    type: "history", sid: liveHistorySid, session_id: liveHistorySid,
+    revision: "live-history-rev", generation: "wrapper-one",
+    build_seq: 1, live_seq: 51, authoritative: true,
+    in_progress: true, has_more: false,
+    events: [
+      event({ type: "user_msg", sid: liveHistorySid,
+        msg_id: "live-review", prompt: "" }),
+      event({ type: "turn_end", sid: liveHistorySid,
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  };
+  liveHistory = reduce(liveHistory, { type: "event", event: event(liveHistoryFrame) });
+  assert.equal(liveHistory.runtimes[liveHistorySid].state, "running");
+  assert.equal(liveHistory.runtimes[liveHistorySid].turns[0].done, false);
+
+  const fallbackHistory = reduce({
+    ...liveHistory,
+    runtimes: { [liveHistorySid]: {
+      ...liveHistory.runtimes[liveHistorySid], state: "interrupting" as const,
+    } },
+  }, { type: "event", event: event({
+    ...liveHistoryFrame, build_seq: 2, in_progress: undefined,
+  }) });
+  assert.equal(fallbackHistory.runtimes[liveHistorySid].state, "interrupting");
+  assert.equal(fallbackHistory.runtimes[liveHistorySid].turns[0].done, false);
+
+  // A History read started before a newer live frame is not current control
+  // state, even when it carries in_progress=false.
+  const racedIdle = reduce(liveHistory, { type: "event", event: event({
+    ...liveHistoryFrame, build_seq: 2, live_seq: 50, in_progress: false,
+  }) });
+  assert.equal(racedIdle.runtimes[liveHistorySid].state, "running");
+  assert.equal(racedIdle.runtimes[liveHistorySid].turns[0].done, false);
+
+  // Ownership is control state too. A History build which started before a
+  // newer live state frame must never resurrect a stale terminal lock (the
+  // /review false-positive), nor clear a newer takeover/ownership decision.
+  const ownershipSid = "history-ownership-race";
+  let ownershipRace = {
+    ...initialState, focusedSid: ownershipSid,
+    runtimes: { [ownershipSid]: createRuntime() },
+  };
+  ownershipRace = reduce(ownershipRace, { type: "event", event: event({
+    type: "state", sid: ownershipSid, seq: 80, state: "running",
+  }) });
+  assert.equal(ownershipRace.runtimes[ownershipSid].lastLiveSeq, 80,
+    "non-narrative live state must advance the History race watermark");
+  ownershipRace = reduce(ownershipRace, { type: "event", event: event({
+    type: "history", sid: ownershipSid, session_id: ownershipSid,
+    revision: "ownership-rev", build_seq: 1, live_seq: 79,
+    external: true, takeover_pending: true,
+    in_progress: true, has_more: false, events: [],
+  }) });
+  assert.equal(Boolean(ownershipRace.runtimes[ownershipSid].external), false);
+  assert.equal(ownershipRace.runtimes[ownershipSid].takeoverPending, false);
+
+  ownershipRace = reduce(ownershipRace, { type: "event", event: event({
+    type: "history", sid: ownershipSid, session_id: ownershipSid,
+    revision: "ownership-rev", build_seq: 2, live_seq: 80,
+    external: true, takeover_pending: true,
+    in_progress: true, has_more: true, oldest_id: "cursor", events: [],
+  }) });
+  assert.equal(ownershipRace.runtimes[ownershipSid].external, true);
+  assert.equal(ownershipRace.runtimes[ownershipSid].takeoverPending, true);
+  ownershipRace = reduce(ownershipRace, { type: "event", event: event({
+    type: "state", sid: ownershipSid, seq: 81, state: "running",
+  }) });
+  ownershipRace = reduce(ownershipRace, { type: "event", event: event({
+    type: "history", sid: ownershipSid, session_id: ownershipSid,
+    revision: "ownership-rev", build_seq: 3, live_seq: 80,
+    external: false, takeover_pending: false,
+    in_progress: false, has_more: true, oldest_id: "cursor", events: [],
+  }) });
+  assert.equal(ownershipRace.runtimes[ownershipSid].external, true);
+  assert.equal(ownershipRace.runtimes[ownershipSid].takeoverPending, true);
+  ownershipRace = reduce(ownershipRace, { type: "event", event: event({
+    type: "history", sid: ownershipSid, session_id: ownershipSid,
+    revision: "ownership-rev", build_seq: 3, before: "cursor",
+    external: false, takeover_pending: false,
+    has_more: false, events: [],
+  }) });
+  assert.equal(ownershipRace.runtimes[ownershipSid].external, true,
+    "pagination cannot overwrite current ownership state");
+  assert.equal(ownershipRace.runtimes[ownershipSid].takeoverPending, true);
+
+  // Newest-page build ordering is independent from pagination. A late older
+  // first page cannot replace build 2. Pagination remains revision/cursor based
+  // because another client's targeted head build may advance the server counter
+  // without ever being routed to this browser.
+  const orderedHistorySid = "ordered-history";
+  let orderedHistory = reduce({ ...initialState, focusedSid: orderedHistorySid }, {
+    type: "event", event: event({
+      type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
+      revision: "ordered-rev-new", generation: "wrapper-one",
+      build_seq: 2, has_more: true,
+      oldest_id: "new", events: [
+        event({ type: "user_msg", sid: orderedHistorySid,
+          msg_id: "new", prompt: "new" }),
+        event({ type: "turn_end", sid: orderedHistorySid,
+          result: { subtype: "success", duration_ms: 1, is_error: false } }),
+      ],
+    }),
+  });
+  orderedHistory = reduce(orderedHistory, { type: "event", event: event({
+    type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
+    revision: "ordered-rev-old", generation: "wrapper-one",
+    build_seq: 1, has_more: false,
+    events: [event({ type: "user_msg", sid: orderedHistorySid,
+      msg_id: "late-old-head", prompt: "old" })],
+  }) });
+  assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
+    (turn: { id: string }) => turn.id), ["new"]);
+  orderedHistory = reduce(orderedHistory, { type: "event", event: event({
+    type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
+    revision: "ordered-rev-new", generation: "wrapper-one",
+    build_seq: 2, before: "new", has_more: false,
+    events: [
+      event({ type: "user_msg", sid: orderedHistorySid,
+        msg_id: "older-page", prompt: "older" }),
+      event({ type: "turn_end", sid: orderedHistorySid,
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  }) });
+  assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
+    (turn: { id: string }) => turn.id), ["older-page", "new"]);
+  orderedHistory = reduce(orderedHistory, { type: "event", event: event({
+    type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
+    revision: "ordered-rev-new", generation: "wrapper-one",
+    build_seq: 1, before: "older-page",
+    has_more: false, events: [
+      event({ type: "user_msg", sid: orderedHistorySid,
+        msg_id: "stale-page", prompt: "stale" }),
+      event({ type: "turn_end", sid: orderedHistorySid,
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  }) });
+  assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
+    (turn: { id: string }) => turn.id), ["stale-page", "older-page", "new"]);
+
+  // A real wrapper restart owns a new generation, so its build counter may
+  // legitimately start from one even when the previous generation reached two.
+  orderedHistory = reduce(orderedHistory, { type: "event", event: event({
+    type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
+    revision: "restart-rev", generation: "wrapper-two",
+    build_seq: 1, has_more: false, events: [
+      event({ type: "user_msg", sid: orderedHistorySid,
+        msg_id: "after-restart", prompt: "restart" }),
+      event({ type: "turn_end", sid: orderedHistorySid,
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  }) });
+  assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
+    (turn: { id: string }) => turn.id), ["after-restart"]);
+
+  const failedHistorySid = "non-authoritative-history";
+  const preservedTurn = {
+    id: "preserved", prompt: "keep", blocks: [], done: true,
+  };
+  let failedHistory = {
+    ...initialState, focusedSid: failedHistorySid,
+    runtimes: { [failedHistorySid]: {
+      ...createRuntime(), turns: [preservedTurn], loading: true,
+      historyRevision: "known-good", historyBuildSeq: 9,
+    } },
+  };
+  failedHistory = reduce(failedHistory, { type: "event", event: event({
+    type: "history", sid: failedHistorySid, session_id: failedHistorySid,
+    revision: "known-good", build_seq: 10, authoritative: false,
+    error: "历史暂时不可用，请稍后重试", has_more: false, events: [],
+  }) });
+  assert.deepEqual(failedHistory.runtimes[failedHistorySid].turns,
+    [preservedTurn]);
+  assert.equal(failedHistory.runtimes[failedHistorySid].historyRevision,
+    "known-good");
+  assert.equal(failedHistory.runtimes[failedHistorySid].historyBuildSeq, 9);
+  assert.equal(failedHistory.runtimes[failedHistorySid].loading, false);
+  assert.equal(failedHistory.banner, "历史暂时不可用，请稍后重试");
+
+  // Even when the revision is unchanged, a first page is authoritative for
+  // completed rows. This prevents generic stale-cache resurrection, not only
+  // the explicit rollback-marker path.
+  const sameRevisionSid = "same-revision-stale-idb";
+  let sameRevisionState = reduce({
+    ...initialState, focusedSid: sameRevisionSid,
+  }, {
+    type: "hydrate_cache", sid: sameRevisionSid, turns: staleTurns,
+    revision: "boot-current:7",
+  });
+  sameRevisionState = reduce(sameRevisionState, {
+    type: "event", event: event({
+      type: "history", sid: sameRevisionSid, session_id: sameRevisionSid,
+      revision: "boot-current:7", has_more: false,
+      events: [
+        event({ type: "user_msg", sid: sameRevisionSid,
+          msg_id: "kept-before-rewind", prompt: "保留" }),
+        event({ type: "turn_end", sid: sameRevisionSid,
+          result: { subtype: "success", duration_ms: 1, is_error: false } }),
+      ],
+    }),
+  });
+  assert.deepEqual(sameRevisionState.runtimes[sameRevisionSid].turns.map(
+    (turn: { id: string }) => turn.id), ["kept-before-rewind"]);
+
+  // When the tiny invalidation marker itself fell out of the ring, the replay
+  // gap is still a conservative invalidation boundary. Never leave a stale
+  // preview open or finish loading before authoritative History arrives.
+  const gapSid = "replay-gap";
+  let gapState = {
+    ...initialState,
+    focusedSid: gapSid,
+    artifact: { file: "stale.ts", kind: "file" as const, sid: gapSid },
+    runtimes: {
+      [gapSid]: {
+        ...createRuntime(), turns: staleTurns,
+        historyRevision: "boot-old:9", syncReady: true,
+      },
+    },
+  };
+  gapState = reduce(gapState, { type: "event", event: event({
+    type: "replay_start", sid: gapSid, from_seq: 20, to_seq: 30,
+    truncated: true, rebuild: false,
+  }) });
+  assert.equal(gapState.artifact, null);
+  assert.deepEqual(gapState.runtimes[gapSid].turns, []);
+  assert.equal(gapState.runtimes[gapSid].historyInvalidated, true);
+  assert.equal(gapState.runtimes[gapSid].loading, true);
+  gapState = reduce(gapState, { type: "event", event: event({
+    type: "replay_end", sid: gapSid, to_seq: 30, truncated: true,
+  }) });
+  assert.equal(gapState.runtimes[gapSid].loading, true,
+    "ReplayEnd cannot satisfy a transcript gap");
+  gapState = reduce(gapState, { type: "event", event: event({
+    type: "history", sid: gapSid, session_id: gapSid,
+    revision: "boot-new:9", has_more: false, events: [],
+  }) });
+  assert.equal(gapState.runtimes[gapSid].historyInvalidated, false);
+  assert.equal(gapState.runtimes[gapSid].loading, false);
+
+  const rebuildSeqSid = "wrapper-generation-rebuild";
+  let rebuildSeqState = {
+    ...initialState, focusedSid: rebuildSeqSid,
+    runtimes: { [rebuildSeqSid]: {
+      ...createRuntime(), historyBuildSeq: 8, lastLiveSeq: 200,
+    } },
+  };
+  rebuildSeqState = reduce(rebuildSeqState, { type: "event", event: event({
+    type: "replay_start", sid: rebuildSeqSid, from_seq: 1, to_seq: 2,
+    truncated: false, rebuild: true,
+  }) });
+  assert.equal(rebuildSeqState.runtimes[rebuildSeqSid].historyBuildSeq, 0);
+  assert.equal(rebuildSeqState.runtimes[rebuildSeqSid].lastLiveSeq, 0);
+
+  state = { ...state, focusedSid: sid };
   // Claude has a static presentation catalog, but its explicit defaults come
   // from cwd-aware settings. An empty models array must still update them.
   state = reduce(state, { type: "event", event: event({
@@ -642,7 +1305,7 @@ try {
   // pagination page cannot roll either one back, even if a stale server includes
   // control rows that should only appear on the newest page.
   state = reduce(state, { type: "event", event: event({
-    type: "history", sid, session_id: sid, has_more: true,
+    type: "history", sid, session_id: sid, revision: "main-rev", has_more: true,
     events: [
       event({ type: "model", sid, model: "claude-mythos-5" }),
       event({ type: "effort", sid, effort: "max" }),
@@ -652,7 +1315,7 @@ try {
   assert.equal(state.runtimes[sid].effort, "max");
   state = reduce(state, { type: "event", event: event({
     type: "history", sid, session_id: sid, before: "older-turn",
-    has_more: false,
+    revision: "main-rev", has_more: false,
     events: [
       event({ type: "model", sid, model: "claude-sonnet-5" }),
       event({ type: "effort", sid, effort: "low" }),
@@ -674,7 +1337,7 @@ try {
   state = reduce(state, { type: "hydrate_cache", sid: cachedSid, turns: [{
     id: "cached-turn", codexTurnId: "legacy-turn-id", prompt: "旧缓存",
     done: true, blocks: [],
-  }] });
+  }], revision: "cached-rev" });
   assert.equal(state.runtimes[cachedSid].turns[0].forkPointId, "legacy-turn-id");
   state = reduce(state, {
     type: "query_sent", sid, prompt: "在？", msg_id: "client-a", ts: 10_000,
@@ -685,7 +1348,8 @@ try {
   ]) state = reduce(state, { type: "event", event: live });
 
   state = reduce(state, { type: "event", event: event({
-    type: "history", sid, session_id: sid, in_progress: true, has_more: false,
+    type: "history", sid, session_id: sid, revision: "main-rev",
+    in_progress: true, has_more: false,
     events: [
       event({ type: "user_msg", sid, msg_id: "engine-a", prompt: "在？", ts: 10 }),
       event({ type: "turn_end", sid, ts: 11, turn_id: "codex-turn-a",
@@ -704,7 +1368,8 @@ try {
   ]) state = reduce(state, { type: "event", event: live });
 
   state = reduce(state, { type: "event", event: event({
-    type: "history", sid, session_id: sid, in_progress: false, has_more: false,
+    type: "history", sid, session_id: sid, revision: "main-rev",
+    in_progress: false, has_more: false,
     events: [
       event({ type: "user_msg", sid, msg_id: "engine-a", prompt: "在？", ts: 10 }),
       event({ type: "assistant_msg_start", sid, message_id: "engine-answer" }),
@@ -1003,7 +1668,8 @@ try {
   }));
   state = reduce(state, { type: "event", event: event({
     type: "history", sid: boundedHistorySid, session_id: boundedHistorySid,
-    in_progress: false, has_more: false, events: boundedHistoryEvents,
+    revision: "bounded-rev", in_progress: false, has_more: false,
+    events: boundedHistoryEvents,
   }) });
   const boundedHistoryTurn = state.runtimes[boundedHistorySid].turns[0];
   assert.equal(boundedHistoryTurn.blocks.length, MAX_TURN_BLOCKS);
@@ -1467,8 +2133,7 @@ assert.match(appSource, /surface=\{space\}/);
 assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
 assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
 assert.match(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/);
-assert.match(appSource, /className="work-artifacts-btn"/);
-assert.match(appSource, /currentWorkArtifacts\.length > 0/);
+assert.doesNotMatch(appSource, /className="work-artifacts-btn"/);
 assert.doesNotMatch(appSource, /className="work-head-manage"/);
 assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
 const sidebarSource = readFileSync(
@@ -1478,7 +2143,13 @@ const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
 assert.match(composerSource, /workSurface \? \(/);
 assert.match(composerSource, /className="work-compose-card"/);
+assert.match(composerSource, /交付物 · \{p\.workArtifactCount\}/);
+assert.doesNotMatch(composerSource, /项目与资料/);
 assert.match(composerSource, /工作设置/);
+assert.match(composerSource, /会话新增上下文/);
+assert.match(composerSource, /workContext\.sessionPercentage\.toFixed\(0\)/);
+assert.match(composerSource, /p\.contextReport\.percentage\.toFixed\(0\)/,
+  "Code must retain the engine-total context reading");
 assert.match(composerSource, /ref=\{workSettingsRef\}/);
 assert.match(composerSource, /document\.addEventListener\("pointerdown", onPointerDown\)/);
 const chatViewSource = readFileSync(

@@ -8,6 +8,13 @@ import { attachmentBytes, pickFiles } from "../img";
 import type { PendingQuery } from "../reducer";
 import { canEnqueueQuery } from "../runtime-drain";
 import { ImeSubmitGuard } from "../ime-submit";
+import {
+  classifyBusySubmit,
+  isComposerBusy,
+  isInterruptSettling,
+  isSettlingStopDisabled,
+} from "../composer-submit";
+import { workContextMetrics } from "../work-context";
 
 interface Props {
   surface?: "code" | "work";
@@ -50,8 +57,16 @@ interface Props {
   onOpenBtw?: () => void;
   onPreview?: (path: string) => void;
   onGoal?: (args: string) => void;
+  onRewind?: () => void;
   onStatus?: () => void;
-  onManageWork?: () => void;
+  onReview?: (
+    target: "uncommittedChanges" | "baseBranch" | "commit" | "custom",
+    value?: string,
+  ) => void;
+  onCompact?: () => void;
+  onRollback?: (numTurns: number) => void;
+  workArtifactCount?: number;
+  onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
 }
 
@@ -119,7 +134,7 @@ export function Composer(p: Props) {
     }
   }, []);
 
-  const busy = p.state === "running" || p.state === "interrupting";
+  const busy = isComposerBusy(p.state);
   const offline = !p.wrapperOnline || p.connState !== "connected";
   // `locked` = we must not write to this session: the machine is offline, OR a native
   // `claude` in the terminal owns it (we mirror it read-only).
@@ -232,19 +247,22 @@ export function Composer(p: Props) {
       files: files.length ? files : undefined,
     };
     if (busy) {
-      // empty input while busy => stop (interrupt); non-empty => interrupt+send or enqueue
-      if (!prompt && !hasAttachments) { p.onInterrupt(); return; }
+      const action = classifyBusySubmit(
+        p.state, p.sendMode, !!prompt || hasAttachments);
+      if (action === "noop") return;
+      if (action === "interrupt") { p.onInterrupt(); return; }
       const existing = p.sendMode === "queue" ? p.allQueued : p.replaceableQueued;
       if (!canEnqueueQuery(existing, query)) {
         flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
         return;
       }
-      if (p.sendMode === "queue") {
+      if (action === "enqueue") {
         p.onEnqueue(query);
         setInput(""); setImages([]); setFiles([]); resetTaHeight();
         return;
       }
-      p.onInterrupt(); p.onSetPending(query);
+      if (action === "interrupt-and-replace") p.onInterrupt();
+      p.onSetPending(query);
       setInput(""); setImages([]); setFiles([]); resetTaHeight();
       return;
     }
@@ -269,6 +287,52 @@ export function Composer(p: Props) {
       case "context": p.onContext(); setCtxOpen(true); break;
       case "status": p.onStatus?.(); break;
       case "goal": p.onGoal?.(args); break;
+      case "rewind":
+        if (args.trim()) { flash("/rewind 不接受参数；请在消息下方选择具体回滚点"); return; }
+        p.onRewind?.();
+        break;
+      case "review": {
+        const trimmed = args.trim();
+        if (!trimmed) {
+          p.onReview?.("uncommittedChanges");
+        } else {
+          const [kind, ...rest] = trimmed.split(/\s+/);
+          const value = rest.join(" ").trim();
+          if (kind === "base" || kind === "branch") {
+            if (!value) { flash("用法：/review base <分支>"); return; }
+            p.onReview?.("baseBranch", value);
+          } else if (kind === "commit") {
+            if (!value) { flash("用法：/review commit <SHA>"); return; }
+            p.onReview?.("commit", value);
+          } else if (kind === "custom") {
+            if (!value) { flash("用法：/review custom <审查要求>"); return; }
+            p.onReview?.("custom", value);
+          } else {
+            p.onReview?.("custom", trimmed);
+          }
+        }
+        flash("正在启动 Codex 原生 Review…");
+        break;
+      }
+      case "compact":
+        if (args.trim()) { flash("/compact 不接受参数"); return; }
+        p.onCompact?.();
+        flash("正在启动 Codex 原生上下文压缩…");
+        break;
+      case "rollback": {
+        const rawTurns = args.trim();
+        if (rawTurns && !/^\d+$/.test(rawTurns)) {
+          flash("用法：/rollback [正整数轮数]");
+          return;
+        }
+        const turns = rawTurns ? Number(rawTurns) : 1;
+        if (!Number.isSafeInteger(turns) || turns < 1 || turns > 1000) {
+          flash("回滚轮数必须在 1 到 1000 之间");
+          return;
+        }
+        p.onRollback?.(turns);
+        break;
+      }
       // /btw: open an ephemeral side-fork panel (both engines).
       case "btw": p.onOpenBtw?.(); break;
       case "preview":
@@ -322,8 +386,8 @@ export function Composer(p: Props) {
     if (raw === "/") return;
     const parsed = parseSlash(raw);
     if (parsed && clientSlashesFor(p.engine).has(parsed.slash)) { runClientSlash(parsed.slash, parsed.args); return; }
-    // Codex has no TUI slash layer over the app-server, so a codex command
-    // (/review, /init) is sent as the natural-language prompt codex handles.
+    // Codex has no TUI slash layer over the app-server. /init is the one
+    // compatibility prompt left; lifecycle operations above use native RPCs.
     if (p.engine === "codex" && parsed && CODEX_PROMPTS[parsed.slash]) {
       submitPrompt(CODEX_PROMPTS[parsed.slash] + (parsed.args ? "\n\n" + parsed.args : ""));
       return;
@@ -346,12 +410,18 @@ export function Composer(p: Props) {
   };
 
   const stopping = busy && !hasText && !hasAttachments;
+  const interruptSettling = isInterruptSettling(p.state);
   const sendIcon = !busy ? "send" : stopping ? "stop" : p.sendMode === "interrupt" ? "bolt" : "queue";
   const sendClass = "sendbtn" + ((stopping || (busy && p.sendMode === "interrupt" && (hasText || hasAttachments))) ? " interrupt" : "");
-  const disabled = locked || importing || (!busy && !hasText && !hasAttachments);
+  const disabled = locked || importing || (!busy && !hasText && !hasAttachments)
+    || isSettlingStopDisabled(p.state, hasText || hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
   const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
+  const workSurface = p.surface === "work";
+  const workContext = workSurface && p.contextReport
+    ? workContextMetrics(p.contextReport)
+    : null;
   // Do not substitute catalog defaults for an existing session.  Until the
   // wrapper reports its authoritative settings, the controls explicitly show
   // that they are still being read.  Unknown/hidden ids remain visible verbatim.
@@ -371,7 +441,6 @@ export function Composer(p: Props) {
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm?.id === "plan" ? " plan" : perm?.danger ? " danger" : "";
   const hintBusy = p.state !== "idle";
-  const workSurface = p.surface === "work";
 
   const inputControl = (placeholder: string) => (
     <textarea
@@ -412,7 +481,8 @@ export function Composer(p: Props) {
         if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
       }}
       onClick={requestButtonSend}
-      disabled={disabled} aria-label={stopping ? "停止" : "发送"}>
+      disabled={disabled}
+      aria-label={interruptSettling && stopping ? "正在停止" : stopping ? "停止" : "发送"}>
       <Icon name={sendIcon} size={19} />
     </button>
   );
@@ -512,10 +582,15 @@ export function Composer(p: Props) {
                 aria-label="添加资料" title="添加资料">
                 <Icon name="plus" size={15} /><span>添加资料</span>
               </button>
-              <button type="button" className="work-compose-tool" onClick={p.onManageWork}
-                aria-label="项目与资料" title="项目与资料">
-                <Icon name="folder" size={15} /><span>项目与资料</span>
-              </button>
+              {!!p.workArtifactCount && (
+                <button type="button" className="work-compose-tool"
+                  onClick={p.onOpenArtifacts}
+                  aria-label={`交付物 · ${p.workArtifactCount} 个文件`}
+                  title="查看交付物">
+                  <Icon name="read" size={15} />
+                  <span>交付物 · {p.workArtifactCount}</span>
+                </button>
+              )}
               <details className="work-settings" ref={workSettingsRef}>
                 <summary><Icon name="plan" size={15} /><span>工作设置</span></summary>
                 <div className="work-settings-pop" ref={ctxWrapRef}>
@@ -529,16 +604,26 @@ export function Composer(p: Props) {
                     <span>访问权限</span><b>{perm?.short ?? "读取中"}</b>
                   </button>
                   <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
-                    <span>上下文</span><b>{p.contextReport ? `${p.contextReport.percentage.toFixed(0)}%` : "查看"}</b>
+                    <span>会话上下文</span><b>{workContext ? `${workContext.sessionPercentage.toFixed(0)}%` : "查看"}</b>
                   </button>
                   {ctxOpen && (
-                    <div className="ctx-pop work-ctx-pop" role="dialog" aria-label="上下文占用">
-                      {p.contextReport ? (
+                    <div className="ctx-pop work-ctx-pop" role="dialog" aria-label="Work 上下文占用">
+                      {p.contextReport && workContext ? (
                         <>
-                          <div className="ctx-pop-row"><span>上下文窗口</span>
-                            <span className="ctx-pop-nums">{p.contextReport.total_tokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()}</span>
+                          <div className="ctx-pop-row"><span>{workContext.hasBreakdown ? "会话新增上下文" : "上下文窗口"}</span>
+                            <span className="ctx-pop-nums">{workContext.sessionTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.sessionPercentage.toFixed(0)}%)</span>
                           </div>
-                          <div className="ctx-pop-bar"><i style={{ width: `${Math.min(p.contextReport.percentage, 100)}%` }} /></div>
+                          <div className="ctx-pop-bar"><i style={{ width: `${Math.min(workContext.sessionPercentage, 100)}%` }} /></div>
+                          {workContext.hasBreakdown && (
+                            <div className="work-ctx-details">
+                              <div className="ctx-pop-row"><span>真实总占用</span>
+                                <span className="ctx-pop-nums">{workContext.totalTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.totalPercentage.toFixed(0)}%)</span>
+                              </div>
+                              <div className="ctx-pop-row"><span>Work 启动基线</span>
+                                <span className="ctx-pop-nums">{workContext.fixedTokens.toLocaleString()}</span>
+                              </div>
+                            </div>
+                          )}
                           <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
                         </>
                       ) : <div className="ctx-pop-loading">读取上下文占用…</div>}

@@ -9,7 +9,9 @@ from collections.abc import Mapping
 
 CONTROL_PLANE_SECRET_KEYS = (
     "WRAPPER_TOKEN",
+    "WRAPPER_TOKENS_JSON",
     "LOGIN_PASSWORD",
+    "LOGIN_USERS_JSON",
     "SESSION_SECRET",
 )
 

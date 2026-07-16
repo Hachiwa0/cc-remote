@@ -72,13 +72,14 @@ from cc_remote.workspaces import WorkStores
 from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, ARTIFACT_PREVIEW_MAX_BYTES, FILE_PREVIEW_MAX_BYTES,
     PREVIEW_ASSET_MAX_BYTES,
-    Error, Hello, Query, Interrupt, CommandAck, Model, Models, Effort, Fast,
+    Error, Hello, Query, Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort, Fast,
     CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice,
-    RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, AskUser,
+    RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History,
+    HistoryInvalidated, ArtifactInvalidated, AskUser,
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, UserMsg,
     TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
-    WorkDashboard, WorkArtifacts,
+    WorkDashboard, WorkArtifacts, RollbackResult,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
     ERR_FORK_RECONCILING,
@@ -86,6 +87,11 @@ from cc_remote.protocol import (
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.ask import make_ask_server
 from cc_remote.wrapper.sdk import CLAUDE_DEFAULT_EFFORT, SdkHandle
+from cc_remote.wrapper.claude_rewind import ClaudeRewindError
+from cc_remote.wrapper.rollback_commands import (
+    RollbackCommandJournal,
+    RollbackJournalError,
+)
 from cc_remote.wrapper.session import load_session_id, save_session_id
 from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.wrapper.stream import (
@@ -94,7 +100,8 @@ from cc_remote.wrapper.stream import (
     translate_subagent_history, merge_subagent_history,
 )
 from cc_remote.wrapper.codex_handle import (
-    CodexHandle, CodexSpontaneousClosed, CodexSpontaneousOverflow,
+    CodexHandle, CodexManagedOverflow,
+    CodexSpontaneousClosed, CodexSpontaneousOverflow,
 )
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator, codex_session_id, is_turn_terminal, codex_translate_history,
@@ -107,8 +114,20 @@ from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
 from cc_remote.wrapper.codex_rpc import (
     CodexRpcOutcomeUnknown, CodexRpcRejected, codex_rpc,
 )
+from cc_remote.wrapper.engine_capabilities import (
+    engine_capabilities, manage_engine_plugin,
+)
+from cc_remote.wrapper.source_fetch import capture_public_source
+from cc_remote.wrapper.work_context import (
+    recover_work_context_baseline,
+    work_context_metrics,
+)
 from cc_remote.wrapper.codex_worktrees import (
     WorktreeError, prepare_worktree, rollback_worktree,
+)
+from cc_remote.wrapper.codex_checkpoints import (
+    CheckpointConflict, CheckpointError, CodexCheckpointJournal,
+    NotGitWorkspaceError,
 )
 from cc_remote.wrapper.codex_forks import (
     CodexForkJournal, ForkJournalError, find_rollout_fork,
@@ -233,7 +252,7 @@ class WrapperMachine:
         ".pdf": "application/pdf",
     }
     SAFE_RETRY_COMMANDS = frozenset({
-        "list_sessions", "get_history", "get_models",
+        "list_sessions", "get_history", "get_models", "get_engine_capabilities",
         "get_context", "get_status", "get_diff", "get_file_preview",
         "get_preview_asset", "get_goal", "list_dir", "get_work_dashboard",
     })
@@ -249,13 +268,21 @@ class WrapperMachine:
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
         "get_history", "switch_session", "rename_session", "archive_session",
-        "delete_work_session", "fork_session", "fork_session_worktree",
+        "delete_work_session", "delete_session", "rollback_session",
+        "compact_session", "start_review",
+        "fork_session", "fork_session_worktree",
     })
 
     def __init__(self, cfg: WrapperConfig, transport: WrapperTransport):
         self.cfg = cfg
         self.transport = transport
         self.instance_id = uuid4().hex
+        # A History token changes for every wrapper process and every local
+        # destructive conversation mutation.  Browsers persist this token with
+        # IndexedDB turns, so a fresh wrapper can never merge a pre-crash cache
+        # over its authoritative transcript.  The per-process generation also
+        # makes a crash after native rollback safe without another disk journal.
+        self._history_revision_epochs: dict[str, int] = {}
         self._preview_conversion_limit = asyncio.Semaphore(2)
         # Pool of resident sessions, keyed by real session_id (or a `tmp-<uuid>`
         # temp key for a brand-new session until its id is captured).
@@ -272,6 +299,11 @@ class WrapperMachine:
         self._codex_watch_lock = asyncio.Lock()
         self._codex_probe_warned = False
         self._claude_probe_warned = False
+        # Newest-page History builds can race the watcher, another client, and
+        # live stream events. Sequence them per session so browsers can discard
+        # an older build that completes after a newer one. Pagination echoes the
+        # current sequence instead of advancing it.
+        self._history_build_sequences: dict[str, int] = {}
         # Code and Work are two filtered views over the same native Codex
         # catalog. The browser warms both back-to-back, so briefly reuse one
         # authoritative read instead of starting app-server twice.
@@ -304,6 +336,15 @@ class WrapperMachine:
         self._uncertain_claude_forks: OrderedDict[str, Optional[str]] = OrderedDict()
         self._claude_fork_tasks: dict[str, asyncio.Task] = {}
         self._claude_fork_locks: dict[str, asyncio.Lock] = {}
+        try:
+            self._rollback_commands: RollbackCommandJournal | None = (
+                RollbackCommandJournal(self.cfg.state_dir)
+            )
+        except RollbackJournalError:
+            # Corrupt/missing idempotency evidence must disable destructive
+            # rollback, not the rest of Remote.
+            self._rollback_commands = None
+            log.exception("rollback command journal unavailable")
         # Claude fork_session writes a real transcript even though /btw is an
         # ephemeral, owner-only UI. Persist tombstones until that transcript is
         # deleted so a crash or failed cleanup cannot expose it in SessionList or
@@ -315,6 +356,7 @@ class WrapperMachine:
         self._models_command_tasks: dict[
             tuple[str, str], asyncio.Task
         ] = {}
+        self._capabilities_command_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Narrow test/embedded configs often omit the new Work roots. Keep those
         # stores below their temporary state_dir instead of touching the real
         # user's ~/.claude or ~/.codex during a read-only Code session listing.
@@ -325,6 +367,15 @@ class WrapperMachine:
         )
 
     # ---- pool helpers ----
+
+    def _history_revision(self, sid: str) -> str:
+        return f"{self.instance_id}-{self._history_revision_epochs.get(sid, 0)}"
+
+    def _bump_history_revision(self, sid: str) -> str:
+        self._history_revision_epochs[sid] = (
+            self._history_revision_epochs.get(sid, 0) + 1
+        )
+        return self._history_revision(sid)
 
     def _focused_ctx(self) -> Optional[SessionContext]:
         return self.sessions.get(self.focused_sid) if self.focused_sid else None
@@ -639,6 +690,9 @@ class WrapperMachine:
                 if cmd.type == "get_models":
                     self._start_models_command(cmd)
                     continue
+                if cmd.type in {"get_engine_capabilities", "manage_engine_plugin"}:
+                    self._start_capabilities_command(cmd)
+                    continue
                 await self._process_command_safely(cmd)
         finally:
             models_tasks = list(self._models_command_tasks.values())
@@ -647,6 +701,12 @@ class WrapperMachine:
             if models_tasks:
                 await asyncio.gather(*models_tasks, return_exceptions=True)
             self._models_command_tasks.clear()
+            capabilities_tasks = list(self._capabilities_command_tasks.values())
+            for task in capabilities_tasks:
+                task.cancel()
+            if capabilities_tasks:
+                await asyncio.gather(*capabilities_tasks, return_exceptions=True)
+            self._capabilities_command_tasks.clear()
             fork_tasks = [
                 *self._codex_fork_tasks.values(),
                 *self._claude_fork_tasks.values(),
@@ -713,46 +773,88 @@ class WrapperMachine:
                 log.exception("Work schedule scan failed")
             await asyncio.sleep(15)
 
-    async def _run_work_schedule(self, engine: str,
-                                 schedule: dict[str, object]) -> None:
+    async def _run_work_schedule(
+        self, engine: str, schedule: dict[str, object]
+    ) -> None:
         store = self._work.for_engine(engine)
         schedule_id = str(schedule["schedule_id"])
+        run_id = str(schedule["run_id"])
         record = None
         ctx = None
+        lease_task: asyncio.Task | None = None
         try:
+            started = await asyncio.to_thread(
+                store.mark_schedule_running, run_id, time.time()
+            )
+            if not started:
+                log.warning(
+                    "Work schedule lease was no longer claimable",
+                    engine=engine,
+                    schedule_id=schedule_id,
+                    run_id=run_id,
+                )
+                return
+            lease_task = asyncio.create_task(
+                self._renew_work_schedule_lease(store, run_id)
+            )
             record = await asyncio.to_thread(
-                store.create_session, schedule.get("project_id"))
+                store.create_session, schedule.get("project_id")
+            )
             ctx = await self._spawn(
-                resume_id=None, cwd=record.cwd, engine=engine,
-                space="work", work_id=record.work_id,
+                resume_id=None,
+                cwd=record.cwd,
+                engine=engine,
+                space="work",
+                work_id=record.work_id,
                 permission_mode=("on-request" if engine == "codex" else None),
             )
             if ctx is None:
                 raise RuntimeError("engine spawn failed")
-            result = await self._handle_query(Query(
-                sid=ctx.key,
-                prompt=str(schedule["prompt"]),
-                msg_id=f"scheduled-{uuid4().hex}",
-            ))
+            result = await self._handle_query(
+                Query(
+                    sid=ctx.key,
+                    prompt=str(schedule["prompt"]),
+                    msg_id=f"scheduled-{uuid4().hex}",
+                )
+            )
             if getattr(result, "type", None) == "error" or ctx.turn_task is None:
                 raise RuntimeError("scheduled turn rejected")
             await ctx.turn_task
             if not ctx.session_id:
                 raise RuntimeError("scheduled session id unavailable")
-            await asyncio.to_thread(
-                store.complete_schedule, schedule_id, ctx.session_id, None)
-            log.info("Work schedule completed", engine=engine,
-                     schedule_id=schedule_id, session_id=ctx.session_id)
+            status = await asyncio.to_thread(
+                store.complete_schedule, run_id, ctx.session_id, None
+            )
+            log.info(
+                "Work schedule completed",
+                engine=engine,
+                schedule_id=schedule_id,
+                run_id=run_id,
+                session_id=ctx.session_id,
+                status=status,
+            )
+            await self._broadcast_work_schedule_state(
+                engine, ctx.session_id, str(schedule["title"]), status, None
+            )
         except asyncio.CancelledError:
+            # Do not mark a cancelled wrapper-owned task failed. Its lease will
+            # expire and the next process will recover the durable run row.
             raise
         except Exception as exc:
-            log.warning("Work schedule failed", engine=engine,
-                        schedule_id=schedule_id,
-                        error_type=type(exc).__name__)
-            await asyncio.to_thread(
-                store.complete_schedule, schedule_id, None,
-                "执行失败，请检查引擎和权限配置")
-            if ctx is not None:
+            log.warning(
+                "Work schedule failed",
+                engine=engine,
+                schedule_id=schedule_id,
+                error_type=type(exc).__name__,
+            )
+            message = "执行失败，请检查引擎和权限配置"
+            status = await asyncio.to_thread(
+                store.complete_schedule,
+                run_id,
+                ctx.session_id if ctx is not None else None,
+                message,
+            )
+            if ctx is not None and not ctx.session_id:
                 try:
                     await ctx.sdk.disconnect()
                 except Exception:
@@ -760,11 +862,78 @@ class WrapperMachine:
                 self.sessions.pop(ctx.key, None)
             if record is not None and record.session_id is None:
                 await asyncio.to_thread(store.abandon, record.work_id)
+            await self._broadcast_work_schedule_state(
+                engine,
+                ctx.session_id if ctx is not None else None,
+                str(schedule["title"]),
+                status,
+                message,
+            )
+        finally:
+            if lease_task is not None:
+                lease_task.cancel()
+                await asyncio.gather(lease_task, return_exceptions=True)
+
+    async def _renew_work_schedule_lease(self, store, run_id: str) -> None:
+        while True:
+            await asyncio.sleep(30)
+            renewed = await asyncio.to_thread(
+                store.renew_schedule_run, run_id, time.time()
+            )
+            if not renewed:
+                return
+
+    async def _broadcast_work_schedule_state(
+        self,
+        engine: str,
+        session_id: str | None,
+        title: str,
+        status: str,
+        error: str | None,
+    ) -> None:
+        try:
+            await self.transport.send(await self._work_dashboard(engine))
+            await self._handle_list_sessions(ListSessions(engine=engine, space="work"))
+            if session_id:
+                store = self._work.for_engine(engine)
+                artifacts = await asyncio.to_thread(store.artifacts, session_id)
+                await self.transport.send(
+                    WorkArtifacts(
+                        engine=engine, session_id=session_id, artifacts=artifacts
+                    )
+                )
+                await self.transport.send(
+                    Notice(
+                        notice_id=f"schedule-{uuid4().hex}",
+                        severity="warning" if error else "info",
+                        category="runtime",
+                        title=(
+                            "定时任务等待重试"
+                            if status == "queued"
+                            else "定时任务失败"
+                            if error
+                            else "定时任务已完成"
+                        ),
+                        message=f"{title}：{error or '交付物已更新'}",
+                        thread_id=session_id,
+                        sid=session_id,
+                    )
+                )
+        except Exception:
+            # The durable run is already committed. A browser reconnect will
+            # reload dashboard/session/artifact state even if this live fan-out
+            # failed with the transport.
+            log.exception(
+                "Work schedule result broadcast failed",
+                engine=engine,
+                session_id=session_id,
+            )
 
     async def _on_transport_connected(self) -> None:
         ctx = self._focused_ctx()
         await self.transport.send(Hello(
             role="wrapper",
+            machine_id=self.cfg.machine_id,
             wrapper_generation=self.instance_id,
             cc_session_id=ctx.session_id if ctx else None,
             state=(ctx.state if ctx else "idle"),
@@ -921,6 +1090,23 @@ class WrapperMachine:
 
         task.add_done_callback(forget)
 
+    def _start_capabilities_command(self, cmd) -> None:
+        """Keep extension discovery off the serial query/mutation lane."""
+        client_id = getattr(cmd, "client_id", None) or ""
+        cmd_id = getattr(cmd, "cmd_id", None) or f"untracked-{id(cmd)}"
+        key = (client_id, cmd_id)
+        current = self._capabilities_command_tasks.get(key)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(self._process_command_safely(cmd))
+        self._capabilities_command_tasks[key] = task
+
+        def forget(done: asyncio.Task) -> None:
+            if self._capabilities_command_tasks.get(key) is done:
+                self._capabilities_command_tasks.pop(key, None)
+
+        task.add_done_callback(forget)
+
     def _refresh_cached_response(self, response):
         """Copy a cached one-shot response, refreshing volatile snapshots.
 
@@ -1035,6 +1221,10 @@ class WrapperMachine:
             await self._handle_get_history(cmd)
         elif t == "get_models":
             await self._handle_get_models(cmd)
+        elif t == "get_engine_capabilities":
+            return await self._handle_get_engine_capabilities(cmd)
+        elif t == "manage_engine_plugin":
+            return await self._handle_manage_engine_plugin(cmd)
         elif t == "answer_question":
             await self._handle_answer_question(cmd)
         elif t == "get_goal":
@@ -1057,6 +1247,14 @@ class WrapperMachine:
             await self._handle_archive_session(cmd)
         elif t == "delete_work_session":
             return await self._handle_delete_work_session(cmd)
+        elif t == "delete_session":
+            return await self._handle_delete_session(cmd)
+        elif t == "rollback_session":
+            return await self._handle_rollback_session(cmd)
+        elif t == "compact_session":
+            return await self._handle_compact_session(cmd)
+        elif t == "start_review":
+            return await self._handle_start_review(cmd)
         elif t == "get_work_dashboard":
             return await self._handle_get_work_dashboard(cmd)
         elif t == "get_work_artifacts":
@@ -1615,9 +1813,15 @@ class WrapperMachine:
         own_turn_ids = set(getattr(sdk, "owned_turn_ids", ())) if sdk else set()
         active: dict[str, float] = w["active_external_turns"]
         pending: dict[str, dict[str, object]] = w["pending_wrapper_turns"]
+        attribution_pending = bool(
+            sdk is not None and getattr(
+                sdk, "turn_attribution_pending",
+                getattr(sdk, "turn_start_pending", False),
+            )
+        )
         wrapper_may_own_turn = bool(
             sdk is not None and (
-                getattr(sdk, "turn_start_pending", False)
+                attribution_pending
                 or getattr(sdk, "turn_active", False)))
 
         # app-server stdout and rollout writes are independent channels.  An own
@@ -1637,7 +1841,7 @@ class WrapperMachine:
                 continue
             awaiting_rpc = bool(record.get("awaiting_rpc"))
             rpc_finished_without_match = (
-                awaiting_rpc and not getattr(sdk, "turn_start_pending", False))
+                awaiting_rpc and not attribution_pending)
             automatic_grace_expired = (
                 not awaiting_rpc
                 and now - seen_at >= self.CODEX_TURN_ATTRIBUTION_GRACE)
@@ -1668,8 +1872,7 @@ class WrapperMachine:
                     pending.setdefault(turn_id, {
                         "seen_at": now,
                         "finished": False,
-                        "awaiting_rpc": bool(
-                            getattr(sdk, "turn_start_pending", False)),
+                        "awaiting_rpc": attribution_pending,
                     })
                     while len(pending) > self.CODEX_TURN_TRACK_MAX:
                         pending.pop(next(iter(pending)))
@@ -1733,6 +1936,17 @@ class WrapperMachine:
         w["external"] = is_external
         if (external_growth or (is_external and not was_external)) and ctx is not None:
             ctx.needs_reload = True
+            if ctx.codex_checkpoint not in (None, False):
+                # Native terminal turns/rollback/compact are outside Remote's
+                # pre-image boundary. Retire the old journal immediately so its
+                # newest file checkpoint can never be paired with a different
+                # newest app-server turn. A later Remote turn starts a fresh,
+                # tail-aligned journal.
+                await self._retire_codex_checkpoint(
+                    ctx,
+                    reason="external Codex transcript mutation",
+                    allow_restart=True,
+                )
             # A native Codex turn may itself switch `/plan`. Mirror that control
             # state with the transcript so Remote does not keep a stale override.
             await self._refresh_codex_collaboration_mode(ctx)
@@ -1904,7 +2118,17 @@ class WrapperMachine:
         append). No spawn, no ring buffer; the parse runs in a thread."""
         # Reading requires the session's own cwd (transcript lives under it).
         # Prefer a resident ctx's cwd, else the client-provided cwd, else default.
+        # Capture before transcript I/O. If a rollback crosses its mutation
+        # boundary while this read is in flight, its marker carries a newer
+        # token and the browser rejects this stale response.
+        revision = self._history_revision(sid)
+        if before is None:
+            build_seq = self._history_build_sequences.get(sid, 0) + 1
+            self._history_build_sequences[sid] = build_seq
+        else:
+            build_seq = self._history_build_sequences.get(sid, 0)
         ctx = self._ctx_by_sid(sid)
+        live_seq = ctx.seq if ctx is not None else None
         in_progress = bool(ctx is not None and ctx.state != "idle")
         events: list = []
         mdl = None
@@ -1926,6 +2150,10 @@ class WrapperMachine:
                 )
                 return History(
                     session_id=sid,
+                    revision=revision,
+                    generation=self.instance_id,
+                    build_seq=build_seq,
+                    live_seq=live_seq,
                     events=[notice.model_dump(mode="json")],
                     has_more=False,
                     before=before,
@@ -1936,6 +2164,7 @@ class WrapperMachine:
                 )
         except OSError:
             source_path = None
+        history_error = None
         if is_codex_hist:
             # Codex history lives in ~/.codex/sessions rollout files, not the
             # Claude transcript store.
@@ -1946,6 +2175,7 @@ class WrapperMachine:
                         codex_translate_history, path, self.cfg.tool_result_max)
             except Exception as e:
                 log.warning("codex get_history failed", session_id=sid, error=str(e))
+                history_error = "历史暂时不可用，请稍后重试"
         else:
             directory = (ctx.cwd if ctx else None) or cwd_hint or self.cfg.cc_cwd
             try:
@@ -1960,6 +2190,24 @@ class WrapperMachine:
                 mdl = last_assistant_model(msgs)
             except Exception as e:
                 log.warning("get_history failed", session_id=sid, error=str(e))
+                history_error = "历史暂时不可用，请稍后重试"
+        if history_error is not None:
+            return History(
+                session_id=sid,
+                revision=revision,
+                generation=self.instance_id,
+                build_seq=build_seq,
+                live_seq=live_seq,
+                authoritative=False,
+                error=history_error,
+                events=[],
+                has_more=False,
+                before=before,
+                external=self._is_external(sid),
+                takeover_pending=bool(
+                    (self._watch.get(sid) or {}).get("takeover_pending")),
+                in_progress=in_progress,
+            )
         for ev in events:
             if isinstance(ev, UserMsg):
                 ev.prompt, restored_files = self._strip_attachment_paths(ev.prompt)
@@ -2054,6 +2302,10 @@ class WrapperMachine:
                 payload.extend(ev.model_dump(mode="json") for ev in group)
             return History(
                 session_id=sid,
+                revision=revision,
+                generation=self.instance_id,
+                build_seq=build_seq,
+                live_seq=live_seq,
                 events=payload,
                 has_more=effective_start > 0,
                 before=before,
@@ -2337,6 +2589,22 @@ class WrapperMachine:
             )
             await self._emit(ctx, error)
             return error
+        if ctx.space == "work" and ctx.work_id:
+            try:
+                await asyncio.to_thread(
+                    self._work.for_engine(ctx.engine).sync_work_id, ctx.work_id
+                )
+            except Exception:
+                log.exception(
+                    "Work context sync failed", engine=ctx.engine, work_id=ctx.work_id
+                )
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="工作资料同步失败，本轮尚未发送；请重试",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
         # claim synchronously so a concurrent query on THIS ctx can't race in
         ctx.interrupt_event.clear()
         ctx.interrupt_deadline = None
@@ -2351,6 +2619,12 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             await self._emit_focused(Error(code=ERR_NOT_RUNNING, message="no active session"))
+            return
+        # Reliable command retries and impatient second clicks are expected.
+        # Once the first interrupt has been accepted, another stop must be an
+        # idempotent no-op rather than a misleading `not_running` error that also
+        # leaves the browser's state machine stuck in interrupting.
+        if ctx.state in {"interrupting", "draining"}:
             return
         if ctx.state != "running":
             await self._emit(ctx, Error(code=ERR_NOT_RUNNING, message="该会话没有正在运行的回合"))
@@ -2375,9 +2649,13 @@ class WrapperMachine:
                 await ctx.sdk.interrupt()
             except Exception as e:
                 log.exception("interrupt call failed", error=str(e))
-                await self._emit(ctx, Error(
-                    code=ERR_INTERNAL, message=f"interrupt failed: {e}"))
-                # leave interrupting; the drain timeout will recover
+                # The stream is still authoritative: a very fast turn may have
+                # completed just before this RPC, with its terminal frame already
+                # queued. Do not surface raw app-server text or force idle here.
+                # The managed/spontaneous consumer drains that frame; if it never
+                # arrives, the absolute interrupt deadline reconnects and unlocks.
+                if ctx.turn_task is None and ctx.codex_spontaneous_task is None:
+                    await self._set_state(ctx, "idle")
 
     @classmethod
     def _read_claude_settings(cls, path: str) -> Optional[dict]:
@@ -2567,12 +2845,87 @@ class WrapperMachine:
                  default_model=default_model, default_effort=default_effort,
                  client_id=client_id)
 
+    async def _handle_get_engine_capabilities(self, cmd):
+        engine = cmd.engine
+        space = getattr(cmd, "space", "code")
+        target_cwd = getattr(cmd, "cwd", None)
+        focused = self._focused_ctx()
+        if focused is not None and focused.engine == engine and focused.space == space:
+            target_cwd = focused.cwd
+        if not target_cwd:
+            target_cwd = self.cfg.cc_cwd
+        client_id = getattr(cmd, "client_id", None)
+        try:
+            items, errors, notes = await engine_capabilities(
+                engine, target_cwd, space, self.cfg.claude_bin
+            )
+        except Exception:
+            log.exception(
+                "engine capability discovery failed", engine=engine, space=space
+            )
+            items, errors, notes = [], ["capability discovery failed"], []
+        result = EngineCapabilities(
+            engine=engine,
+            space=space,
+            items=items,
+            errors=errors,
+            notes=notes,
+            to=client_id,
+        )
+        await self.transport.send(result)
+        return result
+
+    async def _handle_manage_engine_plugin(self, cmd):
+        target_cwd = getattr(cmd, "cwd", None)
+        focused = self._focused_ctx()
+        if (
+            focused is not None
+            and focused.engine == cmd.engine
+            and focused.space == getattr(cmd, "space", "code")
+        ):
+            target_cwd = focused.cwd
+        if not target_cwd:
+            target_cwd = self.cfg.cc_cwd
+        try:
+            await manage_engine_plugin(
+                cmd.engine,
+                cmd.plugin_id,
+                cmd.action,
+                target_cwd,
+                space=getattr(cmd, "space", "code"),
+                claude_bin=self.cfg.claude_bin,
+            )
+        except ValueError as exc:
+            error = Error(
+                code=ERR_BAD_PROMPT,
+                message=str(exc)[:500],
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        except Exception:
+            log.exception(
+                "engine plugin mutation failed",
+                engine=cmd.engine,
+                action=cmd.action,
+                plugin_id=cmd.plugin_id,
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="插件操作失败，状态未确认",
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        return await self._handle_get_engine_capabilities(cmd)
+
     async def _handle_set_model(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return
         try:
             await ctx.sdk.set_model(cmd.model)
+            await self._refresh_pending_claude_work_baseline(ctx)
             applied_model = getattr(ctx.sdk, "model", None) or cmd.model
             ctx.announced_model = applied_model
             await self._emit(ctx, Model(model=applied_model))
@@ -2852,19 +3205,99 @@ class WrapperMachine:
             log.exception("agent set_mode failed", error=str(e))
             raise
 
+    async def _persist_fresh_work_context_baseline(
+        self, ctx: SessionContext, usage: dict,
+    ) -> int | None:
+        """Persist one baseline only for a newly-created Work conversation."""
+        if (ctx.space != "work" or not ctx.work_id
+                or not ctx.work_context_baseline_pending):
+            return ctx.work_context_baseline_tokens
+        candidate = ctx.work_context_baseline_tokens
+        if candidate is None:
+            raw_key = "used_tokens" if ctx.engine == "codex" else "totalTokens"
+            raw_total = usage.get(raw_key)
+            if (not isinstance(raw_total, int) or isinstance(raw_total, bool)
+                    or raw_total <= 0):
+                return None
+            _, _, _, candidate = work_context_metrics(ctx.engine, usage, None)
+        if candidate <= 0:
+            return None
+        try:
+            persisted = await asyncio.to_thread(
+                self._work.for_engine(ctx.engine).set_context_baseline,
+                ctx.work_id, candidate,
+            )
+        except Exception:
+            # Context accounting is display metadata. Keep the authoritative raw
+            # total and retry later instead of failing an otherwise valid turn.
+            log.exception(
+                "fresh Work context baseline persistence failed",
+                engine=ctx.engine,
+                work_id=ctx.work_id,
+            )
+            return None
+        ctx.work_context_baseline_tokens = persisted
+        ctx.work_context_baseline_pending = False
+        return persisted
+
+    async def _refresh_pending_claude_work_baseline(
+        self, ctx: SessionContext,
+    ) -> None:
+        """Refresh a still-uncommitted Claude baseline after a model change."""
+        if (ctx.engine != "claude" or ctx.space != "work"
+                or not ctx.work_context_baseline_pending):
+            return
+        try:
+            usage = await ctx.sdk.get_context_usage()
+        except Exception:
+            log.warning(
+                "fresh Claude Work baseline refresh unavailable",
+                work_id=ctx.work_id,
+            )
+            return
+        refreshed = usage.get("totalTokens")
+        if (isinstance(refreshed, int) and not isinstance(refreshed, bool)
+                and refreshed >= 0):
+            ctx.sdk.work_context_baseline_tokens = refreshed
+            ctx.work_context_baseline_tokens = refreshed
+
     async def _handle_get_context(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return
         try:
             usage = await ctx.sdk.get_context_usage()
+            work_fields: dict[str, int | float] = {}
+            if ctx.space == "work" and ctx.work_id:
+                raw_key = "used_tokens" if ctx.engine == "codex" else "totalTokens"
+                raw_total = usage.get(raw_key)
+                # Codex exposes no usage before the first turn. Establish its
+                # baseline from the first authoritative tokenUsage notification;
+                # Claude's pre-turn baseline is persisted when its native id is
+                # captured. Never manufacture a baseline for migrated sessions.
+                if ctx.engine == "codex":
+                    await self._persist_fresh_work_context_baseline(ctx, usage)
+                baseline = ctx.work_context_baseline_tokens
+                if (isinstance(baseline, int) and not isinstance(baseline, bool)
+                        and isinstance(raw_total, int)
+                        and not isinstance(raw_total, bool)
+                        and raw_total >= baseline):
+                    session_tokens, fixed_tokens, session_percentage, _ = (
+                        work_context_metrics(ctx.engine, usage, baseline)
+                    )
+                    work_fields = {
+                        "session_tokens": session_tokens,
+                        "fixed_tokens": fixed_tokens,
+                        "session_percentage": session_percentage,
+                    }
             if ctx.engine == "codex":
                 used = usage.get("used_tokens") or 0
                 win = usage.get("context_window") or 0
                 await self._emit(ctx, ContextReport(
                     total_tokens=used, max_tokens=win,
                     percentage=(used / win * 100.0) if win else 0.0,
-                    model=ctx.sdk.model, is_auto_compact_enabled=None, categories=[]))
+                    model=ctx.sdk.model, is_auto_compact_enabled=None,
+                    categories=[], **work_fields))
                 return
             await self._emit(ctx, ContextReport(
                 total_tokens=usage.get("totalTokens", 0),
@@ -2873,6 +3306,7 @@ class WrapperMachine:
                 model=usage.get("model"),
                 is_auto_compact_enabled=usage.get("isAutoCompactEnabled"),
                 categories=usage.get("categories", []) or [],
+                **work_fields,
             ))
         except Exception as e:
             log.exception("get_context_usage failed", error=str(e))
@@ -3025,6 +3459,11 @@ class WrapperMachine:
     ) -> None:
         if ctx.codex_spontaneous_turn_id != turn_id:
             return
+        await self._record_codex_unavailable_turn(
+            ctx,
+            turn_id,
+            reason="automatic turn began before Remote could capture a pre-image",
+        )
         ctx.codex_spontaneous_turn_id = None
         current = asyncio.current_task()
         if (ctx.codex_spontaneous_task is current
@@ -3062,6 +3501,17 @@ class WrapperMachine:
                 await asyncio.shield(managed_task)
             if ctx.codex_spontaneous_turn_id != turn_id:
                 return
+
+            ctx.active_msg_id = turn_id
+            # turn/started is delivered only after app-server has already begun
+            # executing the automatic continuation. A filesystem pre-image taken
+            # here could be a half-turn snapshot, so preserve count alignment with
+            # an explicit unavailable slot instead of claiming code rollback.
+            await self._record_codex_unavailable_turn(
+                ctx,
+                turn_id,
+                reason="automatic turn has no safe pre-tool checkpoint boundary",
+            )
 
             # Automatic continuations have no user prompt. A real empty anchor
             # gives their assistant/process events a stable turn owner without
@@ -3169,11 +3619,491 @@ class WrapperMachine:
                     error_type=type(exc).__name__,
                 )
 
+    async def _run_codex_review_turn(
+        self, ctx: SessionContext, turn_id: str,
+    ) -> None:
+        """Drain one inline review through the normal managed-turn contract.
+
+        ``review/start`` returns a real turn but has no user query payload.  It
+        still needs the same bounded reader, interrupt deadline and authoritative
+        terminal handling as ``turn/start``; treating it as a spontaneous turn
+        loses early review frames and can leave the session permanently busy.
+        """
+        translator = CodexStreamTranslator(self.cfg.tool_result_max)
+        ctx.translator = translator
+        queue: asyncio.Queue = asyncio.Queue(
+            maxsize=max(1, self.cfg.turn_reader_queue_cap))
+        reader_exc: list[BaseException] = []
+        reader_task: Optional[asyncio.Task] = None
+        overflowed = False
+
+        async def reader() -> None:
+            cancelled = False
+            try:
+                async for message in ctx.sdk.receive_response():
+                    await queue.put(message)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            except BaseException as exc:
+                reader_exc.append(exc)
+            finally:
+                if not cancelled:
+                    await queue.put(None)
+
+        async def emit_failure(code: str, message: str, *, interrupted: bool) -> None:
+            await self._emit(ctx, Error(
+                code=code, message=message, msg_id=turn_id))
+            await self._emit(ctx, TurnEnd(
+                result=TurnResult(
+                    subtype=("error_during_execution" if interrupted else "error"),
+                    duration_ms=0,
+                    is_error=True,
+                ),
+                turn_id=turn_id,
+            ))
+
+        try:
+            # Start draining immediately: review/start may have filled the
+            # handle's small queue before its response reached this coroutine.
+            reader_task = asyncio.create_task(reader())
+            await self._record_codex_unavailable_turn(
+                ctx,
+                turn_id,
+                reason="inline review has no safe pre-tool checkpoint boundary",
+            )
+            # Review has no user prompt. The empty anchor owns reasoning/tools in
+            # the reducer without rendering a fabricated user bubble.
+            await self._emit(ctx, UserMsg(msg_id=turn_id, prompt=""))
+
+            while True:
+                raw = await self._next_from_queue(ctx, queue)
+                if raw is None:
+                    if reader_exc:
+                        raise reader_exc[0]
+                    raise RuntimeError(
+                        "codex review stream ended without turn/completed")
+                if isinstance(raw, CodexManagedOverflow):
+                    overflowed = True
+                    if ctx.state == "running":
+                        await self._emit(ctx, StateEvent(
+                            state="running",
+                            phase="waiting",
+                            detail=("部分 Review 实时过程因本机积压未展示；"
+                                    "回合结束后可刷新历史。"),
+                            msg_id=turn_id,
+                        ))
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                terminal = is_turn_terminal(raw)
+                events = translator.feed(raw)
+                if overflowed and terminal:
+                    events = [event for event in events
+                              if not isinstance(event, (Error, TurnEnd))]
+                for event in events:
+                    if isinstance(event, Error) and event.msg_id is None:
+                        event.msg_id = turn_id
+                    if isinstance(event, StateEvent) and event.detail:
+                        if ctx.state != "running":
+                            continue
+                        event.state = ctx.state
+                        if event.msg_id is None:
+                            event.msg_id = turn_id
+                    await self._emit(ctx, event)
+                if terminal:
+                    if overflowed:
+                        await emit_failure(
+                            ERR_CC_CRASH,
+                            ("Codex Review 实时事件积压，部分过程未能同步；"
+                             "请刷新会话以从历史恢复。"),
+                            interrupted=(ctx.state == "interrupting"),
+                        )
+                    break
+
+            await self._set_idle_after_managed_turn(ctx)
+        except asyncio.TimeoutError:
+            log.error(
+                "codex review interrupt drain timed out", turn_id=turn_id)
+            await emit_failure(
+                ERR_DRAIN_TIMEOUT,
+                "Codex Review 打断后未返回终态，已重连恢复会话。",
+                interrupted=True,
+            )
+            try:
+                await ctx.sdk.force_reconnect(ctx.session_id, ctx.cwd)
+            except Exception as exc:
+                log.exception(
+                    "codex review reconnect failed", error=str(exc))
+                await self._emit(ctx, Error(
+                    code=ERR_CC_CRASH,
+                    message="Codex 会话重连失败，请刷新后重试。",
+                    msg_id=turn_id,
+                ))
+            await self._set_idle_after_managed_turn(ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception(
+                "codex review turn failed", turn_id=turn_id, error=str(exc))
+            await emit_failure(
+                ERR_CC_CRASH,
+                "Codex Review 实时同步失败，请刷新会话。",
+                interrupted=(ctx.state == "interrupting"),
+            )
+            await self._set_idle_after_managed_turn(ctx)
+        finally:
+            ctx.translator = None
+            if ctx.turn_task is asyncio.current_task():
+                ctx.turn_task = None
+            if ctx.codex_spontaneous_turn_id is None:
+                ctx.active_msg_id = None
+                ctx.interrupt_deadline = None
+                ctx.interrupt_event.clear()
+            if reader_task is not None and not reader_task.done():
+                reader_task.cancel()
+                await asyncio.gather(reader_task, return_exceptions=True)
+
     async def _set_idle_after_managed_turn(self, ctx: SessionContext) -> None:
         """Do not unlock a thread already claimed by an automatic continuation."""
+        await self._finish_codex_checkpoint(ctx)
         if ctx.engine == "codex" and ctx.codex_spontaneous_turn_id is not None:
             return
         await self._set_state(ctx, "idle")
+
+    @staticmethod
+    def _clear_codex_checkpoint_tracking(ctx: SessionContext) -> None:
+        ctx.codex_checkpoint_turn_id = None
+        ctx.codex_checkpoint_ready = False
+        ctx.codex_checkpoint_accepted = False
+        ctx.codex_checkpoint_unavailable_reason = None
+
+    async def _record_codex_unavailable_turn(
+        self, ctx: SessionContext, turn_id: str, *, reason: str,
+    ) -> None:
+        """Append one idempotent count slot when no safe pre-image exists."""
+        if ctx.engine != "codex" or ctx.space != "code" or not turn_id:
+            return
+        journal = ctx.codex_checkpoint
+        if journal is False:
+            return
+        try:
+            if journal is None:
+                journal = await asyncio.to_thread(
+                    CodexCheckpointJournal,
+                    ctx.cwd,
+                    Path(self.cfg.state_dir),
+                    ctx.session_id or ctx.key,
+                )
+                ctx.codex_checkpoint = journal
+            await asyncio.to_thread(journal.record_unavailable, turn_id, reason)
+        except NotGitWorkspaceError:
+            ctx.codex_checkpoint = False
+        except CheckpointError as exc:
+            log.warning(
+                "Codex unavailable turn could not be aligned",
+                session_id=ctx.session_id,
+                turn_id=turn_id,
+                error_type=type(exc).__name__,
+            )
+            await self._retire_codex_checkpoint(
+                ctx, reason="unavailable automatic turn could not be persisted"
+            )
+
+    async def _retire_codex_checkpoint(
+        self,
+        ctx: SessionContext,
+        *,
+        reason: str,
+        allow_restart: bool = False,
+    ) -> None:
+        """Fail closed after journal alignment can no longer be guaranteed.
+
+        A fresh journal may be created after the resident context is restarted,
+        but this context must never append newer turns behind a missing barrier.
+        Force cleanup also quarantines a corrupt manifest by renaming the whole
+        private directory before deletion; it never touches the user's repo.
+        """
+        journal = ctx.codex_checkpoint
+        self._clear_codex_checkpoint_tracking(ctx)
+        ctx.codex_checkpoint = False
+        if journal is None or journal is False:
+            return
+        try:
+            await asyncio.to_thread(journal.cleanup, force=True)
+            if allow_restart:
+                # The next Remote-managed turn may start a new tail-aligned
+                # journal. Requests that cross this external boundary still fail
+                # safely because the fresh journal contains too few records.
+                ctx.codex_checkpoint = None
+        except Exception as exc:
+            log.warning(
+                "Codex checkpoint journal quarantine failed",
+                session_id=ctx.session_id,
+                reason=reason,
+                error_type=type(exc).__name__,
+            )
+
+    async def _prepare_codex_conversation_rollback(
+        self, ctx: SessionContext,
+    ) -> bool:
+        """Retire every file checkpoint before native history rollback.
+
+        ``thread/rollback`` has no transaction id that can be reconciled after a
+        lost app-server response.  Keeping count-based file records until after
+        that RPC therefore leaves a fatal crash window: history may already be
+        shorter while the checkpoint tail still names the removed turns.  Remove
+        the private journal first.  A later Remote turn can start a fresh journal
+        aligned to the then-authoritative thread tail.
+
+        This path is intentionally strict.  If an existing journal cannot be
+        quarantined, do not submit the native conversation mutation.
+        """
+        journal = ctx.codex_checkpoint
+        self._clear_codex_checkpoint_tracking(ctx)
+        if journal is False:
+            return True
+        if journal is None:
+            try:
+                journal = await asyncio.to_thread(
+                    CodexCheckpointJournal,
+                    ctx.cwd,
+                    Path(self.cfg.state_dir),
+                    ctx.session_id or ctx.key,
+                )
+            except NotGitWorkspaceError:
+                ctx.codex_checkpoint = False
+                return True
+            except CheckpointError:
+                ctx.codex_checkpoint = False
+                raise
+            ctx.codex_checkpoint = journal
+        # Disable file rollback before yielding to cleanup.  Even if quarantine
+        # fails, this resident context must never reuse possibly stale records.
+        ctx.codex_checkpoint = False
+        try:
+            await asyncio.to_thread(journal.cleanup, force=True)
+        except Exception as exc:
+            raise CheckpointError(
+                "Codex checkpoint journal could not be retired before rollback"
+            ) from exc
+        # Successful quarantine removes the old count boundary.  New managed
+        # turns may establish a fresh tail-aligned journal.
+        ctx.codex_checkpoint = None
+        return True
+
+    async def _begin_codex_checkpoint(
+        self, ctx: SessionContext, *, already_accepted: bool = False,
+    ) -> None:
+        """Best-effort capture for one managed Codex Code turn.
+
+        Checkpoint availability must never prevent Codex from doing the user's
+        work. Unsupported/non-Git workspaces remain usable and report the
+        limitation only if the user later requests code restoration.
+        """
+        if (
+            ctx.engine != "codex"
+            or ctx.space != "code"
+            or not ctx.session_id
+            or not ctx.active_msg_id
+        ):
+            return
+        turn_id = ctx.active_msg_id
+        ctx.codex_checkpoint_turn_id = turn_id
+        ctx.codex_checkpoint_ready = False
+        ctx.codex_checkpoint_accepted = already_accepted
+        ctx.codex_checkpoint_unavailable_reason = None
+        journal = ctx.codex_checkpoint
+        try:
+            if journal is False:
+                self._clear_codex_checkpoint_tracking(ctx)
+                return
+            if journal is None:
+                journal = await asyncio.to_thread(
+                    CodexCheckpointJournal,
+                    ctx.cwd,
+                    Path(self.cfg.state_dir),
+                    ctx.session_id,
+                )
+                ctx.codex_checkpoint = journal
+            try:
+                await asyncio.to_thread(journal.begin_turn, turn_id)
+            except CheckpointError:
+                # A process crash can leave the previous accepted native turn's
+                # pre-image active. Preserve its count slot as unavailable,
+                # then retry the current pre-turn capture exactly once.
+                recovered = await asyncio.to_thread(
+                    journal.recover_active_as_unavailable,
+                    "wrapper stopped before checkpoint finalization",
+                )
+                if recovered is None:
+                    raise
+                recovered_turn, recovered_accepted = recovered
+                log.warning(
+                    (
+                        "recovered accepted Codex checkpoint as unavailable"
+                        if recovered_accepted
+                        else "discarded unaccepted Codex checkpoint after restart"
+                    ),
+                    session_id=ctx.session_id,
+                    turn_id=recovered_turn,
+                )
+                await asyncio.to_thread(journal.begin_turn, turn_id)
+            ctx.codex_checkpoint_ready = True
+        except NotGitWorkspaceError:
+            ctx.codex_checkpoint = False
+            self._clear_codex_checkpoint_tracking(ctx)
+        except CheckpointError as exc:
+            log.warning(
+                "Codex pre-turn checkpoint unavailable",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            # Do not append a tombstone yet: turn/start may still fail. It is
+            # committed only by _accept_codex_checkpoint after app-server has
+            # accepted the corresponding native turn.
+            if journal is None:
+                # An unreadable existing journal cannot receive a tombstone.
+                # Disable file rollback for this resident context rather than
+                # appending later checkpoints behind an unknown gap.
+                ctx.codex_checkpoint = False
+                self._clear_codex_checkpoint_tracking(ctx)
+            else:
+                ctx.codex_checkpoint_ready = False
+                ctx.codex_checkpoint_unavailable_reason = type(exc).__name__
+        if already_accepted:
+            await self._accept_codex_checkpoint(ctx)
+
+    async def _accept_codex_checkpoint(self, ctx: SessionContext) -> None:
+        turn_id = ctx.codex_checkpoint_turn_id
+        journal = ctx.codex_checkpoint
+        if not turn_id or journal is None or journal is False:
+            return
+        if ctx.codex_checkpoint_ready:
+            try:
+                await asyncio.to_thread(journal.accept_turn, turn_id)
+            except CheckpointError as exc:
+                log.warning(
+                    "Codex checkpoint acceptance marker failed",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+                await self._retire_codex_checkpoint(
+                    ctx, reason="turn acceptance could not be persisted"
+                )
+                return
+        ctx.codex_checkpoint_accepted = True
+        reason = ctx.codex_checkpoint_unavailable_reason
+        if reason is None:
+            return
+        try:
+            await asyncio.to_thread(journal.record_unavailable, turn_id, reason)
+        except Exception as exc:
+            log.warning(
+                "Codex unavailable checkpoint marker failed; retrying at turn finish",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            # The native turn has already been accepted, so dropping tracking
+            # here would also drop its count slot.  Keep the pending reason until
+            # the authoritative finish boundary and retry exactly once there.
+            return
+        ctx.codex_checkpoint_unavailable_reason = None
+
+    async def _abort_codex_checkpoint(self, ctx: SessionContext) -> None:
+        turn_id = ctx.codex_checkpoint_turn_id
+        journal = ctx.codex_checkpoint
+        ready = ctx.codex_checkpoint_ready
+        self._clear_codex_checkpoint_tracking(ctx)
+        if not ready or not turn_id or journal is None or journal is False:
+            return
+        try:
+            await asyncio.to_thread(journal.abort_turn, turn_id)
+        except CheckpointError as exc:
+            log.warning(
+                "Codex checkpoint abort failed",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            await self._retire_codex_checkpoint(
+                ctx, reason="unaccepted checkpoint could not be aborted"
+            )
+
+    async def _finish_codex_checkpoint(self, ctx: SessionContext) -> None:
+        turn_id = ctx.codex_checkpoint_turn_id
+        journal = ctx.codex_checkpoint
+        ready = ctx.codex_checkpoint_ready
+        accepted = ctx.codex_checkpoint_accepted
+        unavailable_reason = ctx.codex_checkpoint_unavailable_reason
+        if not turn_id or journal is None or journal is False:
+            self._clear_codex_checkpoint_tracking(ctx)
+            return
+        if not accepted:
+            await self._abort_codex_checkpoint(ctx)
+            return
+        if not ready:
+            # Capture failed before turn/start.  Acceptance normally commits the
+            # unavailable tombstone; if that first write failed, retry once at
+            # the finish boundary before either clearing state or accepting a
+            # newer turn behind a missing count slot.
+            if unavailable_reason is not None:
+                try:
+                    await asyncio.to_thread(
+                        journal.record_unavailable,
+                        turn_id,
+                        unavailable_reason,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Codex unavailable checkpoint marker retry failed",
+                        session_id=ctx.session_id,
+                        error_type=type(exc).__name__,
+                    )
+                    await self._retire_codex_checkpoint(
+                        ctx, reason="unavailable marker retry could not be persisted"
+                    )
+                    return
+            self._clear_codex_checkpoint_tracking(ctx)
+            return
+        self._clear_codex_checkpoint_tracking(ctx)
+        try:
+            await asyncio.to_thread(journal.finish_turn, turn_id)
+        except CheckpointError as exc:
+            try:
+                await asyncio.to_thread(journal.abort_turn, turn_id)
+            except CheckpointError:
+                pass
+            try:
+                await asyncio.to_thread(
+                    journal.record_unavailable, turn_id, type(exc).__name__
+                )
+            except CheckpointError:
+                log.warning(
+                    "Codex unavailable checkpoint marker failed",
+                    session_id=ctx.session_id,
+                )
+                await self._retire_codex_checkpoint(
+                    ctx, reason="post-turn marker could not be persisted"
+                )
+            log.warning(
+                "Codex post-turn checkpoint unavailable",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            await self._emit(
+                ctx,
+                Notice(
+                    notice_id=f"checkpoint-{uuid4().hex}",
+                    severity="warning",
+                    category="runtime",
+                    title="本轮代码回滚不可用",
+                    message=(
+                        "本轮修改了 Git 暂存区或包含当前无法安全记录的文件；"
+                        "对话仍可正常回滚。"
+                    ),
+                    thread_id=ctx.session_id,
+                ),
+            )
 
     async def _emit_goal_error(self, ctx: SessionContext, cmd,
                                message: str) -> Error:
@@ -4840,9 +5770,15 @@ class WrapperMachine:
         old_key = ctx.key
         ctx.session_id = sid
         if ctx.space == "work" and ctx.work_id:
-            await asyncio.to_thread(
-                self._work.for_engine(ctx.engine).bind_session,
-                ctx.work_id, sid)
+            store = self._work.for_engine(ctx.engine)
+            await asyncio.to_thread(store.bind_session, ctx.work_id, sid)
+            if (ctx.work_context_baseline_pending
+                    and ctx.work_context_baseline_tokens is not None):
+                ctx.work_context_baseline_tokens = await asyncio.to_thread(
+                    store.set_context_baseline,
+                    ctx.work_id, ctx.work_context_baseline_tokens,
+                )
+                ctx.work_context_baseline_pending = False
         if ctx.engine == "codex":
             self._codex_session_list_cache = None
         if ctx.engine != "codex":
@@ -5147,7 +6083,7 @@ class WrapperMachine:
                 await asyncio.to_thread(
                     delete_session, sid, directory=record.cwd)
             await asyncio.to_thread(store.delete, sid)
-        except Exception as exc:
+        except Exception:
             log.exception("Work session deletion failed", engine=engine,
                           session_id=sid)
             error = Error(
@@ -5162,6 +6098,886 @@ class WrapperMachine:
             self.focused_sid = None
         await self._handle_list_sessions(cmd)
         log.info("Work session deleted", engine=engine, session_id=sid)
+
+    async def _handle_delete_session(self, cmd):
+        """Delete one native session without confusing Code and Work roots."""
+        if getattr(cmd, "space", "code") == "work":
+            return await self._handle_delete_work_session(cmd)
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        requested_engine = getattr(cmd, "engine", "claude")
+        is_codex = await self._is_codex_session(sid)
+        engine = "codex" if is_codex else "claude"
+        if engine != requested_engine:
+            error = Error(
+                code=ERR_AUTH,
+                message="会话不属于请求的引擎",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        work_record = await asyncio.to_thread(
+            self._work.for_engine(engine).get_by_session, sid
+        )
+        if work_record is not None:
+            error = Error(
+                code=ERR_AUTH,
+                message="Work 会话必须从 Work 空间删除",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        ctx = self._ctx_for(sid)
+        if ctx is not None and ctx.state != "idle":
+            error = Error(
+                code=ERR_BUSY,
+                message="会话仍在运行，请先中断后再删除",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        cwd = ctx.cwd if ctx is not None else None
+        checkpoint_cleanup_journal = None
+        if engine == "codex" and cwd is None:
+            cwd = await asyncio.to_thread(codex_session_cwd, sid)
+        if engine == "claude" and cwd is None:
+            info = await asyncio.to_thread(get_session_info, sid)
+            cwd = info.cwd if info is not None else None
+            if not cwd:
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message="Claude 会话不存在",
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+        if engine == "codex" and cwd:
+            existing_journal = ctx.codex_checkpoint if ctx is not None else None
+            if existing_journal is not False:
+                try:
+                    checkpoint_cleanup_journal = existing_journal or (
+                        await asyncio.to_thread(
+                            CodexCheckpointJournal,
+                            cwd,
+                            Path(self.cfg.state_dir),
+                            sid,
+                        )
+                    )
+                except (CheckpointError, NotGitWorkspaceError) as exc:
+                    log.warning(
+                        "Codex checkpoint journal could not be opened for delete cleanup",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+        if ctx is not None:
+            try:
+                await ctx.sdk.disconnect()
+            except Exception:
+                log.exception(
+                    "session disconnect before delete failed",
+                    engine=engine,
+                    session_id=sid,
+                )
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="无法安全停止会话，未执行删除",
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+            self.sessions.pop(ctx.key or sid, None)
+        try:
+            if engine == "codex":
+                try:
+                    await codex_rpc("thread/delete", {"threadId": sid})
+                except CodexRpcOutcomeUnknown:
+                    remaining = await list_codex_sessions(200)
+                    if any(row.get("session_id") == sid for row in remaining):
+                        raise
+                self._codex_session_list_cache = None
+            else:
+                await asyncio.to_thread(delete_session, sid, directory=cwd)
+        except Exception:
+            log.exception("Code session deletion failed", engine=engine, session_id=sid)
+            error = Error(
+                code=ERR_INTERNAL,
+                message="会话删除失败，请刷新后重试",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if engine == "codex" and checkpoint_cleanup_journal is not None:
+            try:
+                await asyncio.to_thread(
+                    checkpoint_cleanup_journal.cleanup, force=True
+                )
+            except CheckpointError:
+                log.warning(
+                    "Codex checkpoint cleanup after delete failed", session_id=sid
+                )
+        self._watch.pop(sid, None)
+        if self.focused_sid in {sid, getattr(ctx, "key", None)}:
+            self.focused_sid = None
+        await self._handle_list_sessions(cmd)
+        log.info("Code session deleted", engine=engine, session_id=sid)
+
+    async def _codex_code_context(self, cmd, action: str) -> SessionContext | Error:
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        work_record = await asyncio.to_thread(
+            self._work.for_engine("codex").get_by_session, sid
+        )
+        if work_record is not None or getattr(cmd, "space", "code") != "code":
+            error = Error(
+                code=ERR_AUTH,
+                message=f"{action}仅支持 Codex Code 会话",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        ctx = self._ctx_for(sid)
+        if ctx is None:
+            ctx = await self._spawn(resume_id=sid, engine="codex", space="code")
+        if ctx is None or ctx.engine != "codex":
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message="Codex 会话启动失败",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if ctx.state != "idle":
+            error = Error(
+                code=ERR_BUSY,
+                message=f"会话运行中，无法{action}",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if await self._prime_codex_ownership(sid):
+            error = Error(
+                code=ERR_BUSY,
+                message=f"会话正由本机终端使用，无法{action}",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if ctx.needs_reload:
+            if ctx.codex_checkpoint not in (None, False):
+                await self._retire_codex_checkpoint(
+                    ctx,
+                    reason=f"external transcript change before {action}",
+                    allow_restart=True,
+                )
+            try:
+                await self._refresh_codex_collaboration_mode(ctx)
+                await ctx.sdk.force_reconnect(
+                    resume_id=sid,
+                    cwd=ctx.cwd,
+                    reason=f"external transcript change before {action}",
+                )
+                ctx.needs_reload = False
+            except Exception as exc:
+                log.warning(
+                    "Codex reload before control mutation failed",
+                    session_id=sid,
+                    action=action,
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message=f"Codex 会话重载失败，无法{action}；请稍后重试",
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+        return ctx
+
+    async def _claude_code_context(self, cmd, action: str) -> SessionContext | Error:
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        work_record = await asyncio.to_thread(
+            self._work.for_engine("claude").get_by_session, sid
+        )
+        if work_record is not None or getattr(cmd, "space", "code") != "code":
+            error = Error(
+                code=ERR_AUTH,
+                message=f"{action}仅支持 Claude Code 会话",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        ctx = self._ctx_for(sid)
+        if ctx is None:
+            ctx = await self._spawn(resume_id=sid, engine="claude", space="code")
+        if ctx is None or ctx.engine != "claude":
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message="Claude 会话启动失败",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if ctx.state != "idle":
+            error = Error(
+                code=ERR_BUSY,
+                message=f"会话运行中，无法{action}",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if await self._prime_claude_ownership(sid):
+            error = Error(
+                code=ERR_BUSY,
+                message=f"会话正由本机终端使用，无法{action}",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if ctx.needs_reload:
+            # The terminal may have appended and exited before this control
+            # request arrived.  Rewind must never run against the resident
+            # Claude child's stale in-memory conversation/checkpoint map.
+            ctx.needs_reload = False
+            try:
+                await ctx.sdk.force_reconnect(
+                    resume_id=sid,
+                    cwd=ctx.cwd,
+                    reason=f"external transcript change before {action}",
+                    preserve_model=False,
+                )
+            except Exception as exc:
+                ctx.needs_reload = True
+                log.warning(
+                    "Claude reload before control mutation failed",
+                    session_id=sid,
+                    action=action,
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message=f"Claude 会话重载失败，无法{action}；请稍后重试",
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+            # Consume a terminal append that raced the reconnect.  A fresh
+            # external owner or another observed append invalidates this reload;
+            # leave needs_reload set so the next attempt starts over.
+            external = await self._prime_claude_ownership(sid)
+            if external or ctx.needs_reload:
+                error = Error(
+                    code=ERR_BUSY,
+                    message=(f"Claude 会话在重载期间又被本机终端更新，无法{action}；"
+                             "请退出终端后重试"),
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+        return ctx
+
+    async def _publish_rollback_outcome(
+        self,
+        ctx: SessionContext,
+        result: RollbackResult,
+        *,
+        invalidate_conversation: bool,
+        invalidate_files: bool,
+    ):
+        """Best-effort UI refresh after the durable mutation boundary."""
+        sid = result.session_id
+        artifact_invalidated = None
+        history_invalidated = None
+        reset_history = None
+
+        if invalidate_files:
+            artifact_invalidated = ArtifactInvalidated(
+                session_id=sid,
+                reason="rollback",
+            )
+            try:
+                await self._emit(ctx, artifact_invalidated)
+            except Exception as exc:
+                log.warning(
+                    "artifact invalidation broadcast failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+
+        if invalidate_conversation:
+            ctx.active_msg_id = None
+            try:
+                self._resync_watch(sid)
+            except Exception as exc:
+                log.warning(
+                    "rollback watch resync failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+            history_invalidated = HistoryInvalidated(
+                session_id=sid,
+                reason="rollback",
+                revision=self._history_revision(sid),
+            )
+            try:
+                await self._emit(ctx, history_invalidated)
+            except Exception as exc:
+                log.warning(
+                    "history invalidation broadcast failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+            try:
+                history = await self._build_history(
+                    sid, limit=self.MIRROR_LIMIT, cwd_hint=ctx.cwd
+                )
+                history.reset = True
+                history.to = None
+                try:
+                    await self.transport.send(history)
+                except Exception as exc:
+                    log.warning(
+                        "rollback history replacement broadcast failed",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+                reset_history = history
+            except Exception as exc:
+                log.warning(
+                    "rollback history replacement build failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+            if ctx.engine == "codex":
+                self._codex_session_list_cache = None
+                try:
+                    await self._handle_list_sessions(
+                        ListSessions(engine="codex", space="code")
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "rollback session list refresh failed",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+
+        try:
+            await self._emit(ctx, result)
+        except Exception as exc:
+            # Return the result anyway so the in-memory reliable-command cache
+            # suppresses another mutation in this process.
+            log.warning(
+                "rollback result delivery failed",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+        responses = [
+            response
+            for response in (
+                artifact_invalidated,
+                history_invalidated,
+                reset_history,
+                result,
+            )
+            if response is not None
+        ]
+        return tuple(responses) if len(responses) > 1 else result
+
+    async def _handle_rollback_session(self, cmd):
+        ctx = (
+            await self._codex_code_context(cmd, "回滚")
+            if cmd.engine == "codex"
+            else await self._claude_code_context(cmd, "回滚")
+        )
+        if isinstance(ctx, Error):
+            return ctx
+        sid = ctx.session_id or cmd.session_id
+        restore = getattr(cmd, "restore", "conversation")
+        wants_files = restore in {"files", "both"}
+        wants_conversation = restore in {"conversation", "both"}
+        client_id = getattr(cmd, "client_id", None)
+        cmd_id = getattr(cmd, "cmd_id", None)
+        if not client_id or not cmd_id:
+            error = Error(
+                code=ERR_AUTH,
+                message="回滚需要可靠命令标识，请刷新页面后重试",
+                sid=sid,
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+        rollback_journal = self._rollback_commands
+        if rollback_journal is None:
+            error = Error(
+                code=ERR_INTERNAL,
+                message="回滚安全日志不可用，已阻止本次操作",
+                sid=sid,
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+        try:
+            durable = await asyncio.to_thread(
+                rollback_journal.begin,
+                client_id,
+                cmd_id,
+                sid,
+                ctx.engine,
+                restore,
+                cmd.num_turns,
+                getattr(cmd, "checkpoint_id", None),
+            )
+        except RollbackJournalError as exc:
+            log.warning(
+                "rollback intent could not be persisted",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="无法安全记录回滚操作，未修改会话或文件",
+                sid=sid,
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+
+        if durable["status"] == "complete":
+            result = RollbackResult(**durable["result"], to=client_id)
+            return await self._publish_rollback_outcome(
+                ctx,
+                result,
+                invalidate_conversation=result.conversation == "succeeded",
+                invalidate_files=result.files == "succeeded",
+            )
+        if durable["status"] in {"submitted", "uncertain"}:
+            # A previous wrapper crossed the native mutation boundary but did
+            # not durably record its response. Never replay a count-based
+            # rollback. Refresh both possibly-mutated surfaces and report the
+            # uncertainty explicitly; a new user action gets a new command id.
+            if wants_conversation:
+                self._bump_history_revision(sid)
+            if ctx.engine == "codex" and wants_conversation:
+                try:
+                    await self._prepare_codex_conversation_rollback(ctx)
+                except CheckpointError as exc:
+                    log.warning(
+                        "uncertain Codex rollback checkpoint quarantine failed",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+            result = RollbackResult(
+                session_id=sid,
+                engine=ctx.engine,
+                restore=restore,
+                conversation="failed" if wants_conversation else "skipped",
+                files="failed" if wants_files else "skipped",
+                restored_turns=0,
+                detail=("上次回滚结果无法确认；已阻止重复执行，请核对刷新后的"
+                        "会话与文件后再操作"),
+                to=client_id,
+            )
+            try:
+                await asyncio.to_thread(
+                    rollback_journal.mark_uncertain, client_id, cmd_id
+                )
+                await asyncio.to_thread(
+                    rollback_journal.complete, client_id, cmd_id, result
+                )
+            except RollbackJournalError:
+                log.exception(
+                    "uncertain rollback result could not be finalized",
+                    session_id=sid,
+                )
+            return await self._publish_rollback_outcome(
+                ctx,
+                result,
+                invalidate_conversation=wants_conversation,
+                invalidate_files=wants_files,
+            )
+        try:
+            claimed = await asyncio.to_thread(
+                rollback_journal.mark_submitted, client_id, cmd_id
+            )
+        except RollbackJournalError as exc:
+            log.warning(
+                "rollback submission boundary could not be persisted",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="无法安全提交回滚操作，未修改会话或文件",
+                sid=sid,
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+        if not claimed:
+            # Another wrapper/process won the durable claim after begin().
+            # Re-enter once through the now non-intent state without mutation.
+            durable = await asyncio.to_thread(
+                rollback_journal.get, client_id, cmd_id
+            )
+            if durable is None:
+                raise RollbackJournalError("claimed rollback intent disappeared")
+            if wants_conversation:
+                self._bump_history_revision(sid)
+            result = RollbackResult(
+                session_id=sid,
+                engine=ctx.engine,
+                restore=restore,
+                conversation="failed" if wants_conversation else "skipped",
+                files="failed" if wants_files else "skipped",
+                detail="回滚已由另一进程接管，已阻止重复执行；请刷新后核对结果",
+                to=client_id,
+            )
+            return await self._publish_rollback_outcome(
+                ctx,
+                result,
+                invalidate_conversation=wants_conversation,
+                invalidate_files=wants_files,
+            )
+        if wants_conversation:
+            # False-positive invalidation is safe if the later file preflight or
+            # native call rejects. It must happen before either engine can
+            # mutate history so an older concurrent GetHistory is distinguishable.
+            self._bump_history_revision(sid)
+        conversation = "skipped"
+        files = "skipped"
+        conflicts: list[str] = []
+        prefill_text = None
+        detail_parts: list[str] = []
+        codex_journal = None
+        codex_checkpoint_retired = False
+        conversation_may_have_changed = False
+        files_may_have_changed = False
+
+        if wants_files:
+            try:
+                files_may_have_changed = True
+                if ctx.engine == "claude":
+                    await ctx.sdk.rewind_files(cmd.checkpoint_id)
+                else:
+                    journal = ctx.codex_checkpoint
+                    if journal is False:
+                        raise NotGitWorkspaceError(
+                            "Code rollback requires a Git repository"
+                        )
+                    if journal is None:
+                        journal = await asyncio.to_thread(
+                            CodexCheckpointJournal,
+                            ctx.cwd,
+                            Path(self.cfg.state_dir),
+                            sid,
+                        )
+                        ctx.codex_checkpoint = journal
+                    codex_journal = journal
+                    await asyncio.to_thread(
+                        journal.rollback, cmd.num_turns, consume=False
+                    )
+                files = "succeeded"
+            except CheckpointConflict as exc:
+                files = "failed"
+                conflicts = list(dict.fromkeys((*exc.paths, *exc.index_paths)))
+                detail_parts.append("检测到回滚点之后的文件或暂存区改动，未覆盖")
+            except (CheckpointError, ClaudeRewindError) as exc:
+                files = "failed"
+                detail_parts.append("当前回滚点没有可安全恢复的代码 checkpoint")
+                log.warning(
+                    "session file rollback failed",
+                    engine=ctx.engine,
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+            except Exception as exc:
+                files = "failed"
+                detail_parts.append("代码恢复失败，未继续修改对话")
+                log.warning(
+                    "session file rollback failed",
+                    engine=ctx.engine,
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+
+        # For the combined operation, a failed file preflight leaves the
+        # conversation untouched. This avoids hiding history while code remains
+        # at the newer state. Once files succeed the two engine operations are
+        # still non-atomic, so a later conversation failure is reported openly.
+        if wants_conversation and not (restore == "both" and files == "failed"):
+            try:
+                if ctx.engine == "codex":
+                    # Retire the count-aligned file journal *before* submitting
+                    # native history rollback.  There is no app-server mutation
+                    # id with which to reconcile a lost response after restart;
+                    # pre-retirement makes every success/error/crash path safe.
+                    codex_checkpoint_retired = (
+                        await self._prepare_codex_conversation_rollback(ctx)
+                    )
+                    codex_journal = None
+                    conversation_may_have_changed = True
+                    await ctx.sdk.rollback_thread(cmd.num_turns)
+                else:
+                    conversation_may_have_changed = True
+                    result = await ctx.sdk.rewind_conversation(
+                        cmd.checkpoint_id, interrupt_if_running=False
+                    )
+                    prefill_text = result.prefill_text
+                conversation = "succeeded"
+                if ctx.engine == "claude":
+                    try:
+                        await ctx.sdk.force_reconnect(
+                            resume_id=sid,
+                            cwd=ctx.cwd,
+                            reason="conversation rewind",
+                        )
+                        ctx.needs_reload = False
+                    except Exception as exc:
+                        # rewind_conversation already persisted the destructive
+                        # transcript mutation. A failed respawn must not report
+                        # that mutation as failed or leave the browser showing
+                        # the removed turns. Retry the runtime reload before the
+                        # next query instead.
+                        ctx.needs_reload = True
+                        detail_parts.append(
+                            "对话已恢复；运行时重连失败，将在下次发送前重试"
+                        )
+                        log.warning(
+                            "Claude reconnect after conversation rewind failed",
+                            session_id=sid,
+                            error_type=type(exc).__name__,
+                        )
+            except (ClaudeRewindError, CheckpointError) as exc:
+                conversation = "failed"
+                detail_parts.append("对话历史恢复失败")
+                log.warning(
+                    "session conversation rollback failed",
+                    engine=ctx.engine,
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+            except Exception as exc:
+                conversation = "failed"
+                detail_parts.append("对话历史恢复结果无法确认，已刷新核对")
+                log.warning(
+                    "session conversation rollback failed",
+                    engine=ctx.engine,
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+
+        if conversation == "succeeded":
+            if ctx.engine == "codex" and not codex_checkpoint_retired:
+                try:
+                    journal = codex_journal or ctx.codex_checkpoint
+                    if journal is None:
+                        journal = await asyncio.to_thread(
+                            CodexCheckpointJournal,
+                            ctx.cwd,
+                            Path(self.cfg.state_dir),
+                            sid,
+                        )
+                        ctx.codex_checkpoint = journal
+                    if journal is not False:
+                        # Keep the exact failing journal attached so retirement
+                        # always quarantines it, even if this compatibility path
+                        # was reached with a separately opened instance.
+                        ctx.codex_checkpoint = journal
+                        await asyncio.to_thread(
+                            journal.discard, cmd.num_turns, allow_partial=True
+                        )
+                except NotGitWorkspaceError:
+                    ctx.codex_checkpoint = False
+                    log.debug(
+                        "Codex checkpoint journal absent after conversation rollback",
+                        session_id=sid,
+                    )
+                except Exception as exc:
+                    # The native history is already shorter. Keeping records
+                    # that still refer to removed turns would make a later
+                    # count-based file rollback target the wrong checkpoint.
+                    # Drop the private journal and fail closed for this resident
+                    # context instead of preserving a silently misaligned tail.
+                    await self._retire_codex_checkpoint(
+                        ctx, reason="conversation rollback discard failed"
+                    )
+                    detail_parts.append(
+                        "对话已恢复；代码回滚记录同步失败，已安全重置"
+                    )
+                    log.warning(
+                        "Codex checkpoint discard after conversation rollback failed",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+        result = RollbackResult(
+            session_id=sid,
+            engine=ctx.engine,
+            restore=restore,
+            conversation=conversation,
+            files=files,
+            restored_turns=(
+                cmd.num_turns
+                if (conversation == "succeeded" or files == "succeeded")
+                else 0
+            ),
+            conflicts=conflicts,
+            prefill_text=prefill_text,
+            detail="；".join(detail_parts) or None,
+            to=client_id,
+        )
+        try:
+            await asyncio.to_thread(
+                rollback_journal.complete, client_id, cmd_id, result
+            )
+        except RollbackJournalError as exc:
+            # mark_submitted was durable before any mutation, so even if the
+            # structured result cannot be committed a restart still refuses to
+            # repeat this command. Surface the exact live result now and let a
+            # later retry reconcile as uncertain.
+            try:
+                await asyncio.to_thread(
+                    rollback_journal.mark_uncertain, client_id, cmd_id
+                )
+            except RollbackJournalError:
+                pass
+            result.detail = "；".join(filter(None, (
+                result.detail,
+                "回滚结果安全日志写入失败；重复请求将只核对状态，不会再次执行",
+            )))
+            log.warning(
+                "rollback result could not be persisted",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+        log.info(
+            "session rollback finished",
+            engine=ctx.engine,
+            session_id=sid,
+            restore=restore,
+            conversation=conversation,
+            files=files,
+            turns=cmd.num_turns,
+        )
+        return await self._publish_rollback_outcome(
+            ctx,
+            result,
+            invalidate_conversation=(
+                conversation == "succeeded"
+                or (conversation == "failed" and conversation_may_have_changed)
+            ),
+            invalidate_files=(
+                files == "succeeded"
+                or (files == "failed" and files_may_have_changed)
+            ),
+        )
+
+    async def _handle_compact_session(self, cmd):
+        ctx = await self._codex_code_context(cmd, "压缩上下文")
+        if isinstance(ctx, Error):
+            return ctx
+        sid = ctx.session_id or cmd.session_id
+        try:
+            await ctx.sdk.compact_thread()
+            notice = Notice(
+                notice_id=f"compact-{uuid4().hex}",
+                severity="info",
+                category="runtime",
+                title="上下文压缩已启动",
+                message="Codex 正在使用原生 compact 重写当前线程上下文。",
+                thread_id=sid,
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(notice)
+            return notice
+        except Exception:
+            log.exception("Codex compact failed", session_id=sid)
+            error = Error(
+                code=ERR_INTERNAL,
+                message="Codex 原生上下文压缩失败",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+
+    async def _handle_start_review(self, cmd):
+        ctx = await self._codex_code_context(cmd, "启动 Review")
+        if isinstance(ctx, Error):
+            return ctx
+        value = getattr(cmd, "value", None)
+        target: dict[str, object] = {"type": cmd.target}
+        if cmd.target == "baseBranch":
+            target["branch"] = value
+        elif cmd.target == "commit":
+            target["sha"] = value
+        elif cmd.target == "custom":
+            target["instructions"] = value
+        sid = ctx.session_id or cmd.session_id
+        # Claim before the first await so Query and Interrupt observe the Review
+        # as a real turn even while review/start is still waiting for its RPC
+        # response. The final launch window is serialized with Interrupt exactly
+        # like a normal query.
+        ctx.interrupt_event.clear()
+        ctx.interrupt_deadline = None
+        ctx.active_msg_id = f"review-{uuid4().hex}"
+        ctx.state = "running"
+        await self._emit(ctx, StateEvent(state="running"))
+        try:
+            async with ctx.launch_lock:
+                # An interrupt can win while the running State frame is being
+                # relayed. In that case do not start a turn after the user has
+                # already stopped it.
+                if (ctx.interrupt_event.is_set()
+                        or ctx.state != "running"):
+                    ctx.active_msg_id = None
+                    ctx.interrupt_deadline = None
+                    ctx.interrupt_event.clear()
+                    if ctx.state != "idle":
+                        await self._set_state(ctx, "idle")
+                    return
+                result = await ctx.sdk.start_review(target)
+                turn_id = result["turn_id"]
+                ctx.active_msg_id = turn_id
+                ctx.turn_task = asyncio.create_task(
+                    self._run_codex_review_turn(ctx, turn_id))
+            log.info(
+                "Codex review started",
+                session_id=sid,
+                turn_id=turn_id,
+                target=cmd.target,
+            )
+        except Exception:
+            log.exception(
+                "Codex review start failed", session_id=sid, target=cmd.target
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="Codex 原生 Review 启动失败",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            ctx.active_msg_id = None
+            ctx.interrupt_deadline = None
+            ctx.interrupt_event.clear()
+            if ctx.state != "idle":
+                await self._set_state(ctx, "idle")
+            return error
 
     async def _work_dashboard(self, engine: str, client_id: str | None = None):
         data = await asyncio.to_thread(
@@ -5225,6 +7041,10 @@ class WrapperMachine:
                         raise ValueError(attachment_error)
                     content = decode_attachment(file["data"])
                     filename = file["filename"]
+                elif cmd.kind == "link":
+                    filename, content = await capture_public_source(
+                        (cmd.uri or "").strip()
+                    )
                 await asyncio.to_thread(
                     store.add_source, cmd.project_id, cmd.kind,
                     cmd.title.strip(), (cmd.uri or "").strip() or None,
@@ -5255,7 +7075,8 @@ class WrapperMachine:
             log.warning("Work mutation rejected", type=cmd.type, engine=engine,
                         reason=type(exc).__name__)
             error = Error(
-                code=ERR_BAD_PROMPT, message="Work 操作参数无效或目标不存在",
+                code=ERR_BAD_PROMPT,
+                message=f"Work 操作失败：{str(exc)[:500]}",
                 to=getattr(cmd, "client_id", None),
             )
             await self.transport.send(error)
@@ -6549,6 +8370,27 @@ class WrapperMachine:
         if effort:
             sdk.effort = effort
             sdk.applied_effort = effort
+        work_context_baseline = (
+            work_record.context_baseline_tokens if work_record else None
+        )
+        if (work_record is not None and work_context_baseline is None
+                and resume_id):
+            recovered = await asyncio.to_thread(
+                recover_work_context_baseline, engine, resume_id)
+            if recovered is not None:
+                try:
+                    work_context_baseline = await asyncio.to_thread(
+                        self._work.for_engine(engine).set_context_baseline,
+                        work_record.work_id, recovered,
+                    )
+                except Exception:
+                    # History recovery is optional migration metadata. Resume
+                    # the native session and keep its honest raw context gauge.
+                    log.exception(
+                        "migrated Work context baseline persistence failed",
+                        engine=engine,
+                        work_id=work_record.work_id,
+                    )
         ctx = SessionContext(
             session_id=resume_id,
             sdk=sdk,
@@ -6557,6 +8399,13 @@ class WrapperMachine:
             engine=engine,
             space=space,
             work_id=work_id,
+            work_context_baseline_tokens=work_context_baseline,
+            work_context_baseline_pending=bool(
+                work_record is not None
+                and work_record.context_baseline_tokens is None
+                and work_record.session_id is None
+                and resume_id is None
+            ),
         )
         # Per-ctx MCP ask server is Claude-only (the cc-remote-ask tools). Codex
         # handles approvals through its own app-server protocol, so skip it.
@@ -6603,6 +8452,12 @@ class WrapperMachine:
                 log.exception("connect failed", error=str(e))
                 await self._emit_focused(Error(code=ERR_CC_CRASH, message=f"connect failed: {e}"))
                 return None
+
+        if (ctx.space == "work" and ctx.work_context_baseline_pending
+                and ctx.work_context_baseline_tokens is None):
+            sampled = getattr(ctx.sdk, "work_context_baseline_tokens", None)
+            if isinstance(sampled, int) and not isinstance(sampled, bool) and sampled >= 0:
+                ctx.work_context_baseline_tokens = sampled
 
         # Unlike Claude, Codex returns its durable thread id from thread/start
         # before the first turn. Bind it now so SessionFocus, artifact reads and
@@ -6653,6 +8508,8 @@ class WrapperMachine:
                 await ctx.sdk.set_model(model)
             except Exception as e:
                 log.warning("spawn set_model failed", model=model, error=str(e))
+            else:
+                await self._refresh_pending_claude_work_baseline(ctx)
         # Record the pre-selected values so _run_turn doesn't redundantly re-announce
         # them (the client already reflects its own pick optimistically).
         if model:
@@ -6997,6 +8854,7 @@ class WrapperMachine:
         persistent_attachments = False
         notice_active = False
         claude_turn_completed = False
+        codex_overflowed = False
 
         async def reader() -> None:
             cancelled = False
@@ -7095,6 +8953,12 @@ class WrapperMachine:
                 log.info("reloading session after external transcript change",
                          sid=ctx.session_id)
                 if is_codex:
+                    if ctx.codex_checkpoint not in (None, False):
+                        await self._retire_codex_checkpoint(
+                            ctx,
+                            reason="external transcript change before query",
+                            allow_restart=True,
+                        )
                     await self._refresh_codex_collaboration_mode(ctx)
                     await ctx.sdk.force_reconnect(
                         resume_id=ctx.session_id, cwd=ctx.cwd,
@@ -7265,6 +9129,13 @@ class WrapperMachine:
                                 "found at final preflight",
                                 sid=ctx.session_id,
                             )
+                            if ctx.codex_checkpoint not in (None, False):
+                                await self._retire_codex_checkpoint(
+                                    ctx,
+                                    reason=("external transcript change at final "
+                                            "query preflight"),
+                                    allow_restart=True,
+                                )
                             await self._refresh_codex_collaboration_mode(ctx)
                             await ctx.sdk.force_reconnect(
                                 resume_id=ctx.session_id, cwd=ctx.cwd,
@@ -7299,7 +9170,22 @@ class WrapperMachine:
                                 ))
                                 await self._set_idle_after_managed_turn(ctx)
                                 return
+                    await self._begin_codex_checkpoint(ctx)
+                    if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
+                        await self._abort_codex_checkpoint(ctx)
+                        await self._emit(ctx, TurnEnd(result=TurnResult(
+                            subtype="error_during_execution",
+                            duration_ms=0,
+                            is_error=True,
+                        )))
+                        await self._set_idle_after_managed_turn(ctx)
+                        return
                     await ctx.sdk.query(prompt, images=img_paths)
+                    # CodexHandle marks turn/start failure by raising with
+                    # turn_active=False. Reaching here is the authoritative
+                    # acceptance boundary, including an ultra-fast turn that
+                    # already completed before the RPC coroutine resumed.
+                    await self._accept_codex_checkpoint(ctx)
                 elif images:
                     content: list = []
                     if prompt:
@@ -7361,12 +9247,49 @@ class WrapperMachine:
                     raise RuntimeError("cc stream ended without a ResultMessage")
 
                 if is_codex:
+                    if isinstance(msg, CodexManagedOverflow):
+                        codex_overflowed = True
+                        if ctx.state == "running":
+                            await self._emit(ctx, StateEvent(
+                                state="running",
+                                phase="waiting",
+                                detail=("部分实时过程因本机积压未展示；"
+                                        "回合结束后可刷新历史。"),
+                                msg_id=ctx.active_msg_id,
+                            ))
+                        continue
                     sid = codex_session_id(msg)
                     if sid and not ctx.session_id:
                         await self._capture_session_id(ctx, sid)
-                    for ev in ctx.translator.feed(msg):
+                    terminal = is_turn_terminal(msg)
+                    events = ctx.translator.feed(msg)
+                    if codex_overflowed and terminal:
+                        events = [event for event in events
+                                  if not isinstance(event, (Error, TurnEnd))]
+                    for ev in events:
                         await emit_codex_event(ev)
-                    if is_turn_terminal(msg):
+                    if terminal:
+                        if ctx.work_context_baseline_pending:
+                            await self._persist_fresh_work_context_baseline(
+                                ctx, await ctx.sdk.get_context_usage())
+                        if codex_overflowed:
+                            await self._emit(ctx, Error(
+                                code=ERR_CC_CRASH,
+                                message=("Codex 实时事件积压，部分过程未能同步；"
+                                         "请刷新会话以从历史恢复。"),
+                                msg_id=ctx.active_msg_id,
+                            ))
+                            await self._emit(ctx, TurnEnd(
+                                result=TurnResult(
+                                    subtype=("error_during_execution"
+                                             if ctx.state == "interrupting"
+                                             else "error"),
+                                    duration_ms=0,
+                                    is_error=True,
+                                ),
+                                turn_id=((msg.get("params") or {}).get("turn")
+                                         or {}).get("id"),
+                            ))
                         break
                     continue
 

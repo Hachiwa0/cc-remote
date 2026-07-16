@@ -13,6 +13,7 @@ const PATHS: Record<string, string> = {
   queue: '<path d="M4 7h16M4 12h16M4 17h10"/>',
   term: '<path d="M5 8l4 4-4 4M12 16h7"/>',
   logout: '<path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/>',
+  notify: '<path d="M18 8a6 6 0 00-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/>',
   close: '<path d="M18 6L6 18M6 6l12 12"/>',
   sun: '<circle cx="12" cy="12" r="4.2"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   moon: '<path d="M20 14.5A8 8 0 019.5 4 8 8 0 1020 14.5z"/>',
@@ -33,6 +34,7 @@ const PATHS: Record<string, string> = {
   simplify: '<path d="M4 7h16M7 12h10M10 17h4"/>',
   init: '<path d="M12 3v18M3 12h18" opacity=".25"/><circle cx="12" cy="12" r="8.5"/><path d="M12 8v4l2.5 2.5"/>',
   folder: '<path d="M3.5 7.5A1.5 1.5 0 015 6h4l2 2.5h8A1.5 1.5 0 0120.5 10v8A1.5 1.5 0 0119 19.5H5A1.5 1.5 0 013.5 18z"/>',
+  'folder-open': '<path d="M3.5 10V7.5A1.5 1.5 0 015 6h4l2 2.5h7.5A1.5 1.5 0 0120 10"/><path d="M4.5 10.5h16l-2 8.5h-16z"/>',
   work: '<rect x="3.5" y="7" width="17" height="12.5" rx="2.5"/><path d="M8.5 7V5.5A1.5 1.5 0 0110 4h4a1.5 1.5 0 011.5 1.5V7M3.5 12h17M10 12v2h4v-2"/>',
   code: '<path d="M8.5 7L3.5 12l5 5M15.5 7l5 5-5 5M14 4l-4 16"/>',
   chev: '<path d="M6 9l6 6 6-6"/>',
@@ -45,6 +47,7 @@ const PATHS: Record<string, string> = {
   branch: '<circle cx="6" cy="5" r="2"/><circle cx="18" cy="7" r="2"/><circle cx="6" cy="19" r="2"/><path d="M6 7v10M8 8.5c4.5 0 5.5-1.5 8-1.5"/>',
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/>',
   refresh: '<path d="M20 7v5h-5"/><path d="M19 12a7.5 7.5 0 10.4 4.7"/>',
+  history: '<path d="M4 8V3m0 0h5M4 3l3.2 3.2"/><path d="M5.2 17.5A8.5 8.5 0 1012 3.5"/><path d="M12 7.5V12l3 2"/>',
   // model-tier glyphs (one per model, so the picker rows are distinct)
   // reasoning-effort gauges: same dial, needle sweeps left(低)->right(最大)
   gauge1: '<path d="M4 16a8 8 0 0116 0"/><path d="M12 16L7.5 12.6"/><circle cx="12" cy="16" r="1.3"/>',

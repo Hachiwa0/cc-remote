@@ -27,7 +27,8 @@ _TOOL_TYPES = {
 }
 _PROCESS_ITEM_TYPES = {
     "plan", "reasoning", "collabAgentToolCall", "subAgentActivity",
-    "contextCompaction",
+    "contextCompaction", "imageView", "sleep", "imageGeneration",
+    "enteredReviewMode", "exitedReviewMode",
 }
 _MAX_HISTORY_RECORD_CHARS = 16 * 1024 * 1024
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -484,6 +485,36 @@ class CodexStreamTranslator:
                     summary=summary,
                 ))
 
+        elif method in {
+            "item/autoApprovalReview/started",
+            "item/autoApprovalReview/completed",
+        }:
+            event = _auto_approval_review_event(
+                p, completed=method.endswith("/completed"))
+            if event is not None and self._admit_live_item(event.item_id, out):
+                self._visible_output = True
+                out.append(event)
+
+        elif method == "turn/moderationMetadata":
+            # ``metadata`` is deliberately untyped in the public schema and may
+            # contain provider-internal data. Preserve the lifecycle marker but
+            # never forward the opaque payload across the remote boundary.
+            turn_id = _optional_wire_id(p.get("turnId"), "turn")
+            if turn_id and p.get("metadata") is not None:
+                iid = _live_id(f"moderation:{turn_id}", "moderation")
+                if not self._admit_live_item(iid, out):
+                    return out
+                self._visible_output = True
+                out.append(ProcessEvent(
+                    item_id=iid,
+                    kind="safety",
+                    phase="snapshot",
+                    status="succeeded",
+                    turn_id=turn_id,
+                    title="内容安全检查",
+                    summary="已完成（详细元数据未在远程端展示）",
+                ))
+
         elif method in {"hook/started", "hook/completed"}:
             event = _hook_event(p, completed=(method == "hook/completed"))
             if event is not None and self._admit_live_item(event.item_id, out):
@@ -809,7 +840,110 @@ class CodexStreamTranslator:
             return ProcessEvent(
                 item_id=iid, kind="compaction", phase=phase, status=status,
                 turn_id=turn_id, title="压缩上下文")
+        if item_type == "imageView":
+            path, _ = bounded_text(item.get("path"), 16 * 1024)
+            return ProcessEvent(
+                item_id=iid, kind="server_tool", phase=phase, status=status,
+                turn_id=turn_id, title="查看图片",
+                summary=path or None,
+                input={"file_path": path} if path else None,
+            )
+        if item_type == "sleep":
+            duration = _duration_ms(item.get("durationMs"))
+            return ProcessEvent(
+                item_id=iid, kind="task", phase=phase, status=status,
+                turn_id=turn_id, title="等待",
+                summary=_human_duration(duration) if duration is not None else None,
+                duration_ms=duration,
+            )
+        if item_type == "imageGeneration":
+            generated_status = _process_status(item.get("status"))
+            if completed and generated_status in {"unknown", "running", "pending"}:
+                generated_status = "succeeded"
+            prompt, prompt_truncated = bounded_text(
+                item.get("revisedPrompt"), 64 * 1024)
+            path, _ = bounded_text(item.get("savedPath"), 16 * 1024)
+            # `result` may be a full base64 image. The saved file is previewable
+            # through the existing authenticated artifact route; never duplicate
+            # the binary payload into replay history or relay buffers.
+            return ProcessEvent(
+                item_id=iid, kind="server_tool", phase=phase,
+                status=generated_status, turn_id=turn_id, title="生成图片",
+                summary=prompt or (path if path else None),
+                input={"file_path": path} if path else None,
+                truncated=True if prompt_truncated else None,
+            )
+        if item_type in {"enteredReviewMode", "exitedReviewMode"}:
+            review, review_truncated = bounded_text(
+                item.get("review"), 256 * 1024)
+            return ProcessEvent(
+                item_id=iid, kind="safety", phase=phase, status=status,
+                turn_id=turn_id,
+                title=("进入 Review" if item_type == "enteredReviewMode"
+                       else "退出 Review"),
+                detail=review or None,
+                truncated=True if review_truncated else None,
+            )
         return None
+
+
+def _human_duration(duration_ms: int) -> str:
+    seconds = duration_ms / 1000
+    if seconds < 60:
+        return f"{seconds:g} 秒"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:g} 分钟"
+    return f"{minutes / 60:g} 小时"
+
+
+def _auto_approval_review_event(params: dict, *, completed: bool):
+    review_id = params.get("reviewId")
+    if not isinstance(review_id, str) or not review_id:
+        return None
+    review = params.get("review") if isinstance(params.get("review"), dict) else {}
+    action = params.get("action") if isinstance(params.get("action"), dict) else {}
+    action_type = str(action.get("type") or "")
+    action_labels = {
+        "command": "命令",
+        "execve": "程序执行",
+        "applyPatch": "文件修改",
+        "networkAccess": "网络访问",
+        "mcpToolCall": "MCP 工具",
+        "requestPermissions": "权限请求",
+    }
+    review_status = _process_status(review.get("status"))
+    if not completed:
+        review_status = "running"
+    elif review_status in {"unknown", "running", "pending"}:
+        review_status = "succeeded"
+    risk = str(review.get("riskLevel") or "")
+    authorization = str(review.get("userAuthorization") or "")
+    summary_parts = [action_labels.get(action_type, "工具操作")]
+    if risk in {"low", "medium", "high", "critical"}:
+        summary_parts.append(f"风险 {risk}")
+    if authorization in {"unknown", "low", "medium", "high"}:
+        summary_parts.append(f"用户授权 {authorization}")
+    rationale, rationale_truncated = bounded_text(
+        review.get("rationale"), 64 * 1024)
+    started_at = _nonnegative_or_signed_int(params.get("startedAtMs"))
+    completed_at = _nonnegative_or_signed_int(params.get("completedAtMs"))
+    duration = None
+    if started_at is not None and completed_at is not None and completed_at >= started_at:
+        duration = completed_at - started_at
+    return ProcessEvent(
+        item_id=_live_id(review_id, "auto-approval-review"),
+        kind="safety",
+        phase="end" if completed else "start",
+        status=review_status,
+        turn_id=_optional_wire_id(params.get("turnId"), "turn"),
+        parent_id=_optional_wire_id(params.get("targetItemId"), "item"),
+        title="自动审批审查",
+        summary=" · ".join(summary_parts),
+        detail=rationale or None,
+        duration_ms=duration,
+        truncated=True if rationale_truncated else None,
+    )
 
 
 def _retry_detail(error: dict) -> str:
@@ -900,9 +1034,9 @@ def _process_status(value) -> str:
         return "pending"
     if key in {"inprogress", "running", "started"}:
         return "running"
-    if key in {"completed", "complete", "succeeded", "success"}:
+    if key in {"completed", "complete", "succeeded", "success", "approved"}:
         return "succeeded"
-    if key in {"failed", "failure", "error"}:
+    if key in {"failed", "failure", "error", "timedout", "timeout"}:
         return "failed"
     if key in {"declined", "denied", "blocked"}:
         return "declined"

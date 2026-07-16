@@ -47,7 +47,7 @@ function formatTime(ts: number): string {
 
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onLoadMore, onEdit, onGetDiff, onPreviewMarkdown, onOpenFile,
-  onOpenArtifacts, onFork, forkingPointId, surface = "code" }: {
+  onOpenArtifacts, onFork, onRewind, forkingPointId, surface = "code" }: {
   sid: string | null;
   turns: Turn[];
   surface?: Space;
@@ -61,6 +61,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onOpenFile?: (file: string, line?: number) => void;
   onOpenArtifacts?: () => void;
   onFork?: (forkPointId: string) => void;
+  onRewind?: (checkpointId: string, prompt: string) => void;
   forkingPointId?: string | null;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -358,6 +359,13 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                           disabled={!!forkingPointId}
                           onClick={() => onFork(t.forkPointId)}>
                           <Icon name="branch" size={13} />
+                        </button>
+                      )}
+                      {engine === "claude" && onRewind && t.checkpointId && (
+                        <button className="ubub-act" aria-label="回到这里"
+                          data-tooltip="从这里回滚对话、代码或两者"
+                          onClick={() => onRewind(t.checkpointId!, t.prompt)}>
+                          <Icon name="history" size={13} />
                         </button>
                       )}
                     </div>

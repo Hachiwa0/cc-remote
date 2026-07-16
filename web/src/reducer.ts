@@ -102,6 +102,9 @@ export interface Turn {
   // a Claude transcript assistant UUID. The wire keeps the legacy `turn_id`
   // name so already-deployed protocol-v5 peers remain compatible.
   forkPointId?: string;
+  // Claude's authoritative top-level user transcript UUID. File rewind and
+  // conversation rewind target this id, never the optimistic browser turn id.
+  checkpointId?: string;
   /** @deprecated Read only while migrating CACHE_VER=5 entries. */
   codexTurnId?: string;
   prompt: string; // empty when we joined mid-turn (no user bubble rendered)
@@ -168,6 +171,24 @@ export interface SessionRuntime {
   // ReplayEnd. Prevents stale local "idle" state from draining work early.
   syncReady: boolean;
   truncated: boolean;
+  // A replayable marker announced a destructive transcript rewrite. Until a
+  // fresh non-pagination History arrives, never hydrate/merge an older tail.
+  historyInvalidated: boolean;
+  // Revision attached to the last authoritative non-pagination History and,
+  // while a rollback barrier is pending, the exact revision allowed to clear it.
+  historyRevision: string | null;
+  pendingHistoryRevision: string | null;
+  // Ordering watermark for newest-page History builds within one wrapper
+  // generation. Pagination never advances it.
+  historyGeneration: string | null;
+  historyBuildSeq: number;
+  // Greatest downstream sequence that confirmed a turn on this connection.
+  // A History captured before it may merge rows but cannot delete the live tail.
+  lastLiveSeq: number;
+  // IDs painted from IndexedDB before authoritative History arrives. They are
+  // not a genuine live tail, even when an old cache row happens to be marked
+  // unfinished (for example a tab closed halfway through streaming).
+  hydratedCacheTurnIds: string[];
   // true while we've switched to a session but its history hasn't arrived yet
   // (no cache hit + waiting on the wrapper's cold spawn/replay) — drives a spinner.
   loading?: boolean;
@@ -233,7 +254,12 @@ export function createRuntime(): SessionRuntime {
     fast: null,
     takeoverPending: false, takeoverMessage: null,
     replaying: false, syncReady: false, truncated: false,
-    pendingQuestion: null, contextReport: null, goal: null, statusReport: null,
+    historyInvalidated: false,
+    historyRevision: null, pendingHistoryRevision: null,
+    historyGeneration: null, historyBuildSeq: 0, lastLiveSeq: 0,
+    hydratedCacheTurnIds: [],
+    pendingQuestion: null, contextReport: null, goal: null,
+    statusReport: null,
     notices: [],
     queue: [], pendingSend: null,
   };
@@ -266,7 +292,7 @@ export type Action =
   | { type: "clear_session_list" }
   | { type: "restore_session_list"; sessions: SessionInfo[] }
   | { type: "focus_session"; sid: string }
-  | { type: "hydrate_cache"; sid: string; turns: Turn[] }
+  | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null }
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question" }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
@@ -532,6 +558,26 @@ function finishOpenBlocks(
   }
 }
 
+/** Reconcile an unfinished browser tail against a current authoritative History
+ * snapshot which explicitly says the session is idle. This is a lost-terminal
+ * recovery path: keep already-rendered text/process detail, but never leave its
+ * timer and child blocks running forever. */
+function finishOpenTurnsFromIdleHistory(
+  turns: Turn[], interrupted: boolean, doneTs: number,
+): Turn[] {
+  return turns.map((turn) => {
+    if (turn.done) return turn;
+    const next = { ...turn, blocks: turn.blocks.map((block) => ({ ...block })) };
+    next.done = true;
+    next.doneTs ??= doneTs;
+    next.progress = undefined;
+    if (interrupted) next.interrupted = true;
+    finishOpenBlocks(
+      next, interrupted ? "interrupted" : "succeeded", interrupted);
+    return next;
+  });
+}
+
 const MAX_LIVE_TEXT_CHARS = 4 * 1024 * 1024;
 const MAX_LIVE_TOOL_OUTPUT_CHARS = 2 * 1024 * 1024;
 const MAX_LIVE_DIFF_CHARS = 2 * 1024 * 1024;
@@ -557,6 +603,35 @@ function replaceWithBoundedTurns(runtime: SessionRuntime, turns: Turn[]): void {
     runtime.oldestId = bounded[0]?.id ?? null;
   }
   runtime.turns = bounded;
+}
+
+function turnHasUnfinishedWork(turn: Turn): boolean {
+  return !turn.done || turn.blocks.some((block) => !block.done);
+}
+
+/** Keep only work that still belongs to the live connection.
+ *
+ * Completed cache rows are never evidence that a turn still exists after an
+ * authoritative History response: retaining them is what resurrected messages
+ * removed by rollback.  An unfinished optimistic/streaming tail is different;
+ * merge it by id/prompt so a history read racing the active turn stays smooth. */
+function unfinishedLiveTail(turns: Turn[], hydratedCacheTurnIds: string[]): Turn[] {
+  const cached = new Set(hydratedCacheTurnIds);
+  return turns.filter((turn) => !cached.has(turn.id) && turnHasUnfinishedWork(turn));
+}
+
+function markTurnAsLive(
+  runtime: SessionRuntime, turnId: string, liveEvent: boolean,
+  eventSeq?: number | null,
+): void {
+  if (!liveEvent) return;
+  if (typeof eventSeq === "number") {
+    runtime.lastLiveSeq = Math.max(runtime.lastLiveSeq, eventSeq);
+  }
+  if (runtime.hydratedCacheTurnIds.length > 0) {
+    runtime.hydratedCacheTurnIds = runtime.hydratedCacheTurnIds.filter(
+      (cachedId) => cachedId !== turnId);
+  }
 }
 
 // Patch a runtime by sid (explicit sid wins; null/undefined → focused). `create`
@@ -669,7 +744,8 @@ export function reduce(state: AppState, action: Action): AppState {
       };
       const runtimes = reduceTargetedRuntime(
         state.runtimes, action.sid, { type: "query_sent", turn });
-      return runtimes === state.runtimes ? state : { ...state, runtimes };
+      if (runtimes === state.runtimes) return state;
+      return { ...state, runtimes };
     }
     case "enqueue": {
       const allQueued = collectWaitingQueries(state.runtimes);
@@ -765,12 +841,15 @@ export function reduce(state: AppState, action: Action): AppState {
       // fill a session's turns from the IndexedDB cache for an INSTANT render;
       // only if still empty (never clobber live/streaming or already-replayed turns).
       return patch(state, action.sid, (rt) => {
+        if (rt.historyInvalidated) return;
         if (rt.turns.length === 0 && action.turns.length) {
           replaceWithBoundedTurns(rt, action.turns.map((turn) => (
             !turn.forkPointId && turn.codexTurnId
               ? { ...turn, forkPointId: turn.codexTurnId }
               : turn
           )));
+          rt.historyRevision = action.revision;
+          rt.hydratedCacheTurnIds = action.turns.map((turn) => turn.id);
         }
         rt.loading = false;
       }, true);
@@ -807,6 +886,17 @@ export function reduce(state: AppState, action: Action): AppState {
 function reduceEvent(
   state: AppState, e: ServerEvent, boundCompletedTurns = true,
 ): AppState {
+  // History is built asynchronously. Any newer replayable frame — including a
+  // state/ownership update with no message block — makes an older History
+  // envelope stale for control state. Narrative event reducers also advance
+  // this watermark via markTurnAsLive; doing it once here covers the non-turn
+  // frames which previously let stale `external=true` resurrect read-only mode.
+  if (boundCompletedTurns && e.type !== "history"
+      && typeof e.seq === "number") {
+    state = patch(state, e.sid, (rt) => {
+      rt.lastLiveSeq = Math.max(rt.lastLiveSeq, e.seq!);
+    });
+  }
   switch (e.type) {
     case "snapshot": {
       // Per-session: the frame's sid is the runtime key; cc_session_id is the
@@ -833,7 +923,11 @@ function reduceEvent(
       const base = state.runtimes[newF] ?? createRuntime();
       const runtimes = {
         ...state.runtimes,
-        [newF]: { ...base, loading: false, syncReady: true },
+        [newF]: {
+          ...base,
+          loading: base.historyInvalidated ? true : false,
+          syncReady: true,
+        },
       };
       return {
         ...state, focusedSid: newF, runtimes,
@@ -862,6 +956,24 @@ function reduceEvent(
             ...source,
             state: target.state,
             syncReady: target.syncReady || source.syncReady,
+            historyInvalidated:
+              target.historyInvalidated || source.historyInvalidated,
+            historyRevision:
+              source.historyRevision ?? target.historyRevision,
+            pendingHistoryRevision:
+              source.pendingHistoryRevision ?? target.pendingHistoryRevision,
+            historyBuildSeq: source.historyRevision == null
+              ? target.historyBuildSeq
+              : source.historyRevision === target.historyRevision
+                ? Math.max(source.historyBuildSeq, target.historyBuildSeq)
+                : source.historyBuildSeq,
+            historyGeneration: source.historyRevision == null
+              ? target.historyGeneration : source.historyGeneration,
+            lastLiveSeq: Math.max(source.lastLiveSeq, target.lastLiveSeq),
+            hydratedCacheTurnIds: Array.from(new Set([
+              ...target.hydratedCacheTurnIds,
+              ...source.hydratedCacheTurnIds,
+            ])),
             ccSessionId: session_id,
             turns: mergedTurns,
             queue: [...source.queue, ...target.queue],
@@ -893,6 +1005,33 @@ function reduceEvent(
       // artifact inventories are owned by App because both are intentionally
       // independent from the focused conversation runtime.
       return state;
+    case "history_invalidated": {
+      const next = patch(state, e.session_id, (rt) => {
+        // This small frame is replayable even when the authoritative History
+        // replacement is too large for the bounded ring. Empty stale turns
+        // immediately; the following live/history refresh rebuilds from the
+        // engine transcript without resurrecting removed messages.
+        rt.turns = [];
+        rt.pendingQuestion = null;
+        rt.hasMore = false;
+        rt.oldestId = null;
+        rt.truncated = false;
+        rt.historyInvalidated = true;
+        rt.pendingHistoryRevision = e.revision;
+        // Keep the accepted generation until replacement arrives: a slow
+        // pre-rollback build from that same generation must remain rejectable.
+        rt.historyBuildSeq = 0;
+        rt.hydratedCacheTurnIds = [];
+        rt.loading = true;
+      }, true);
+      return next.artifact?.sid === e.session_id
+        ? { ...next, artifact: null }
+        : next;
+    }
+    case "artifact_invalidated":
+      return state.artifact?.sid === e.session_id
+        ? { ...state, artifact: null }
+        : state;
     case "history": {
       // Bulk on-demand history (one frame, read from the transcript — like a web
       // chat's GET /conversation). Rebuild this session's COMPLETED turns by
@@ -902,6 +1041,28 @@ function reduceEvent(
       // already in the runtime (an in-flight turn still streaming live, not yet in
       // the transcript) is preserved and appended after the rebuilt history.
       const sid = e.session_id;
+      const base = state.runtimes[sid] ?? createRuntime();
+      const sameBuildGeneration = e.generation != null
+        ? base.historyGeneration === e.generation
+        : base.historyGeneration == null && base.historyRevision === e.revision;
+      if (!e.before && e.build_seq != null && sameBuildGeneration
+          && e.build_seq < base.historyBuildSeq) return state;
+      // A failed read/parse is explicitly non-authoritative. It satisfies the
+      // current loading attempt but must not turn "could not read" into "the
+      // conversation is empty" or clear a pending rollback barrier.
+      if (e.authoritative === false) {
+        const next = patch(state, sid, (rt) => {
+          rt.loading = false;
+        }, true);
+        return e.error && state.focusedSid === sid
+          ? { ...next, banner: e.error }
+          : next;
+      }
+      // build_seq orders newest-page reads only within the same boot-scoped
+      // revision. A restart legitimately resets the sequence while changing
+      // revision. Pagination remains revision/cursor based: another client's
+      // targeted newest-page read can advance the wrapper's build sequence
+      // without ever being routed to this browser.
       let scratch: AppState = {
         ...state, banner: undefined, runtimes: { [sid]: createRuntime() },
       };
@@ -909,7 +1070,18 @@ function reduceEvent(
         scratch = reduceEvent(scratch, ev as ServerEvent, false);
       }
       const built = scratch.runtimes[sid] ?? createRuntime();
-      const base = state.runtimes[sid] ?? createRuntime();
+      // A pre-rollback first page and an older pagination response can arrive
+      // after the replayable marker. Only the marker's exact revision may cross
+      // the destructive boundary; pagination is valid only for the revision
+      // whose first page is already installed.
+      if (!e.before && base.pendingHistoryRevision
+          && e.revision !== base.pendingHistoryRevision) return state;
+      if (e.before && (base.historyInvalidated
+          || !base.historyRevision || e.revision !== base.historyRevision)) {
+        return state;
+      }
+      const racedLiveEvent = !e.before && e.live_seq != null
+        && base.lastLiveSeq > e.live_seq;
       let turns: Turn[];
       if (e.before) {
         // pagination (load older): PREPEND the older turns ahead of what we have,
@@ -917,21 +1089,43 @@ function reduceEvent(
         const haveIds = new Set(base.turns.map((t) => t.id));
         turns = [...built.turns.filter((t) => !haveIds.has(t.id)), ...base.turns];
       } else {
-        // Initial load has no atomic transcript/live boundary. Merge instead of
-        // replacing: preserve just-finished turns not flushed to disk, correlate
-        // optimistic client ids by prompt/time, and combine an in-flight tail.
-        turns = mergeInitialHistory(built.turns, base.turns, {
+        // Every first page is authoritative for completed turns. Merge only the
+        // genuinely unfinished local tail; arbitrary completed cache rows may
+        // have been removed by rollback while this browser was offline.
+        const cached = new Set(base.hydratedCacheTurnIds);
+        const liveTail = racedLiveEvent
+          // This History started before a live event already painted by the
+          // browser. Keep every non-cache local row (including a just-completed
+          // TurnEnd); the stale frame may add history but cannot delete it.
+          ? base.turns.filter((turn) => !cached.has(turn.id))
+          : unfinishedLiveTail(base.turns, base.hydratedCacheTurnIds);
+        turns = mergeInitialHistory(
+          built.turns,
+          liveTail, {
           // History's final TurnEnd is synthetic: Claude transcripts do not
-          // contain ResultMessage.  A focus switch can read that EOF while the
-          // resident turn is still running, so never let it close the live tail.
-          preserveLiveTailOpen: !!e.in_progress || base.state !== "idle",
+          // contain ResultMessage. A newer live event always wins; otherwise an
+          // explicit in_progress value is authoritative, and only an older
+          // wrapper without that field falls back to the local runtime state.
+          preserveLiveTailOpen: racedLiveEvent || e.in_progress === true
+            || (e.in_progress == null && base.state !== "idle"),
         });
+        // A current first page which explicitly reports idle is the recovery
+        // boundary for a lost TurnEnd. Do not close a merely optimistic local
+        // query (base is still idle), or a tail advanced after this History read.
+        if (e.in_progress === false && !racedLiveEvent && base.state !== "idle") {
+          const wasInterrupting = base.state === "interrupting"
+            || base.state === "draining";
+          turns = finishOpenTurnsFromIdleHistory(
+            turns, wasInterrupting,
+            e.ts ? Math.round(e.ts * 1000) : Date.now());
+        }
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
       const historyTrimmed = boundedTurns.length < turns.length;
       turns = boundedTurns;
       const acceptsControlState = !e.before;
+      const acceptsOwnershipState = acceptsControlState && !racedLiveEvent;
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
       return {
@@ -941,6 +1135,27 @@ function reduceEvent(
           ...state.runtimes,
           [sid]: {
             ...base, turns, loading: false,
+            state: acceptsControlState && !racedLiveEvent
+              && e.in_progress != null
+              ? (e.in_progress
+                  ? (base.state === "interrupting" || base.state === "draining"
+                      ? base.state : "running")
+                  : "idle")
+              : base.state,
+            historyInvalidated: acceptsControlState
+              ? false : base.historyInvalidated,
+            historyRevision: acceptsControlState
+              ? e.revision : base.historyRevision,
+            pendingHistoryRevision: acceptsControlState
+              ? null : base.pendingHistoryRevision,
+            historyGeneration: acceptsControlState
+              ? (e.generation ?? base.historyGeneration)
+              : base.historyGeneration,
+            historyBuildSeq: acceptsControlState
+              ? (e.build_seq ?? base.historyBuildSeq)
+              : base.historyBuildSeq,
+            hydratedCacheTurnIds: acceptsControlState
+              ? [] : base.hydratedCacheTurnIds,
             model: acceptsControlState && hadModel ? built.model : base.model,
             effort: acceptsControlState && hadEffort ? built.effort : base.effort,
             hasMore: historyTrimmed ? false : e.has_more,
@@ -951,9 +1166,12 @@ function reduceEvent(
             // A native `claude`/`codex` in the terminal owns this session and is
             // appending to its transcript; the wrapper mirrors those appends here.
             // Render read-only — a cc session has ONE owner, and typing would fork it.
-            external: !!e.external,
-            takeoverPending: !!e.takeover_pending,
-            takeoverMessage: e.takeover_pending ? base.takeoverMessage : null,
+            external: acceptsOwnershipState ? !!e.external : base.external,
+            takeoverPending: acceptsOwnershipState
+              ? !!e.takeover_pending : base.takeoverPending,
+            takeoverMessage: acceptsOwnershipState
+              ? (e.takeover_pending ? base.takeoverMessage : null)
+              : base.takeoverMessage,
           },
         },
       };
@@ -1008,6 +1226,10 @@ function reduceEvent(
         catalogDefaultCwd,
       };
     }
+    // App owns this on-demand, surface-keyed sheet state. Keep the event in the
+    // exhaustive reducer switch so protocol drift cannot silently bypass it.
+    case "engine_capabilities":
+      return state;
     case "wrapper_disconnected":
       return {
         ...state,
@@ -1134,6 +1356,37 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret }; });
     case "goal_state":
       return patch(state, e.sid, (rt) => { rt.goal = e.goal ?? null; });
+    case "rollback_result": {
+      const next = patch(state, e.sid, (rt) => {
+        const succeeded = [e.conversation, e.files].filter(
+          (outcome) => outcome === "succeeded").length;
+        const failed = [e.conversation, e.files].filter(
+          (outcome) => outcome === "failed").length;
+        const title = failed === 0 ? "回滚完成"
+          : succeeded > 0 ? "回滚部分完成" : "回滚失败";
+        const parts = [
+          e.conversation !== "skipped" ? `对话：${e.conversation === "succeeded" ? "已恢复" : "失败"}` : "",
+          e.files !== "skipped" ? `代码：${e.files === "succeeded" ? "已恢复" : "失败"}` : "",
+        ].filter(Boolean);
+        const notice: Notice = {
+          v: e.v, type: "notice", ts: e.ts, sid: e.sid,
+          notice_id: `rollback-${e.ts}-${e.session_id}`,
+          severity: failed > 0 ? "warning" : "info",
+          category: "runtime", title,
+          message: e.detail || parts.join(" · ") || title,
+          detail: e.conflicts.length > 0
+            ? `冲突文件：${e.conflicts.slice(0, 12).join("、")}` : undefined,
+          thread_id: e.session_id,
+        };
+        rt.notices = mergeNotices(rt.notices, [notice]);
+      });
+      // A files-only rollback has no HistoryInvalidated frame to close the
+      // current file/diff preview.  Treat the successful result itself as the
+      // authoritative byte boundary so a stale snapshot never remains visible.
+      return e.files === "succeeded" && next.artifact?.sid === e.session_id
+        ? { ...next, artifact: null }
+        : next;
+    }
     case "status_report":
       return patch(state, e.sid, (rt) => { rt.statusReport = e; });
     case "notice":
@@ -1144,22 +1397,47 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         rt.statusReport = mergeRateLimitUpdate(rt.statusReport, e);
       });
-    case "replay_start":
-      return { ...patch(state, e.sid, (rt) => {
+    case "replay_start": {
+      const needsAuthoritativeHistory = e.truncated || !!e.rebuild;
+      const next = patch(state, e.sid, (rt) => {
         rt.replaying = true;
         rt.syncReady = false;
         rt.truncated = e.truncated;
         // rebuild clears turns then refills — keep loading=true so the gap shows a
         // spinner rather than briefly flashing the empty "send a message" prompt.
-        if (e.truncated || !!e.rebuild) { rt.turns = []; rt.loading = true; }
-        if (e.rebuild) rt.pendingQuestion = null;
-      }, true) };
+        if (needsAuthoritativeHistory) {
+          rt.turns = [];
+          rt.pendingQuestion = null;
+          rt.hasMore = false;
+          rt.oldestId = null;
+          rt.historyInvalidated = true;
+          // A replay gap does not reveal which revision was missed. Accept the
+          // next authoritative first page; an actual rollback marker replayed
+          // inside this envelope will immediately replace this with its token.
+          rt.pendingHistoryRevision = null;
+          rt.hydratedCacheTurnIds = [];
+          if (e.rebuild) {
+            // The wrapper generation (and every SessionContext seq) restarted.
+            // Never compare the new generation against old live/build watermarks.
+            rt.historyBuildSeq = 0;
+            rt.historyGeneration = null;
+            rt.lastLiveSeq = 0;
+          }
+          rt.loading = true;
+        }
+      }, true);
+      return needsAuthoritativeHistory && next.artifact?.sid === e.sid
+        ? { ...next, artifact: null }
+        : next;
+    }
     case "replay_end":
       return { ...patch(state, e.sid, (rt) => {
         rt.replaying = false;
         rt.syncReady = true;
         rt.truncated = rt.truncated || e.truncated;
-        rt.loading = false;
+        // A truncated/rebuild replay is not authoritative history. Keep the
+        // loading barrier until the first History page replaces the gap.
+        rt.loading = rt.historyInvalidated;
       }, true), wrapperOnline: true };
     case "error": {
       // The relay has not accepted/rejected the command yet: reliable commands
@@ -1181,6 +1459,7 @@ function reduceEvent(
       }
       return patch(state, e.sid, (rt) => {
         rt.loading = false; // never leave a spinner spinning behind an error
+        markTurnAsLive(rt, e.msg_id!, boundCompletedTurns, e.seq);
         const turns = cloneTurns(rt.turns);
         const t = turns.find((turn) => turn.id === e.msg_id);
         if (t) {
@@ -1199,6 +1478,7 @@ function reduceEvent(
     }
     case "user_msg":
       return patch(state, e.sid, (rt) => {
+        markTurnAsLive(rt, e.msg_id, boundCompletedTurns, e.seq);
         const turns = cloneTurns(rt.turns);
         const existing = turns.find((t) => t.id === e.msg_id);
         const imgs = (e.images && e.images.length) ? e.images : undefined;
@@ -1225,6 +1505,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         const t = openTurn(turns, e.message_id);
+        markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const block = t.blocks.find((b) => b.kind === "text"
           && b.message_id === e.message_id) as TextBlock | undefined;
@@ -1240,6 +1521,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         const t = openTurn(turns, e.message_id);
+        markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         let block = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
         if (!block) {
@@ -1257,6 +1539,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         const t = openTurn(turns, e.message_id);
+        markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const existing = t.blocks.find((b) => b.kind === "tool"
           && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
@@ -1283,6 +1566,7 @@ function reduceEvent(
           const block = t.blocks.find((b) => b.kind === "tool"
             && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (!block) continue;
+          markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
           if (e.stream === "progress" || e.stream === "summary") {
             block.progress = appendField(
               block.progress, e.delta, MAX_LIVE_PROGRESS_CHARS);
@@ -1304,6 +1588,7 @@ function reduceEvent(
         for (const t of turns) {
           const b = t.blocks.find((b) => b.kind === "tool" && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (b) {
+            markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
             b.result = { content: e.content, is_error: e.is_error,
               truncated: e.truncated ?? undefined, status: e.status,
               summary: e.summary, diff: e.diff, exit_code: e.exit_code,
@@ -1323,6 +1608,7 @@ function reduceEvent(
         for (const t of turns) {
           const b = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
           if (b) {
+            markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
             b.channel = resolvedChannel(b.channel, e.channel ?? "unknown");
             b.done = true;
             break;
@@ -1348,6 +1634,7 @@ function reduceEvent(
         if (!owner) owner = findTurnOwningItem(turns, e.parent_id);
         if (!owner) owner = findTurnByEngineId(turns, e.turn_id);
         if (!owner) owner = openTurn(turns, e.turn_id || e.item_id);
+        markTurnAsLive(rt, owner.id, boundCompletedTurns, e.seq);
         if (!block) {
           block = { kind: "process", item_id: e.item_id, processKind: e.kind,
             phase: e.phase, status: e.status, turn_id: e.turn_id,
@@ -1401,6 +1688,7 @@ function reduceEvent(
         let t = findTurnOwningItem(turns, e.item_id)
           ?? findTurnByEngineId(turns, e.turn_id);
         if (!t) t = openTurn(turns, e.turn_id || e.item_id);
+        markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         let block = t.blocks.find((b) => b.kind === "process"
           && b.item_id === e.item_id) as ProcessBlock | undefined;
         if (!block) {
@@ -1424,6 +1712,7 @@ function reduceEvent(
         let t = findTurnOwningItem(turns, e.item_id)
           ?? findTurnByEngineId(turns, e.turn_id);
         if (!t) t = openTurn(turns, e.turn_id || e.item_id);
+        markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         let block = t.blocks.find((b) => b.kind === "process"
           && b.item_id === e.item_id) as ProcessBlock | undefined;
         if (!block) {
@@ -1443,9 +1732,11 @@ function reduceEvent(
         const turns = cloneTurns(rt.turns);
         const t = turns[turns.length - 1];
         if (t) {
+          markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
           t.done = true;
           t.durationMs = e.result.duration_ms;
           if (e.turn_id) t.forkPointId = e.turn_id;
+          if (e.checkpoint_id) t.checkpointId = e.checkpoint_id;
           t.progress = undefined;
           if (e.result.subtype === "error_during_execution") t.interrupted = true;
           // Stamp completion time from the event's own server ts (seconds -> ms).

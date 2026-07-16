@@ -44,15 +44,17 @@ API key 烤进网页。
 |---|---|
 | **双引擎** | 在同一个 Web UI 中使用 Claude Code 和 Codex；每个会话保持自己的模型、思考强度、权限与运行状态。 |
 | **Code / Work 双空间** | Code 继续面向代码仓库；Work 是完全独立的 Cowork 工作区，用于文档、表格、演示、资料整理和临时协作，不混入代码会话列表。 |
-| **Work 项目与资料库** | 为 Claude/Codex 分别建立私有项目、文件/链接/笔记资料库和可复用指令插件；创建工作时会把选定上下文物化到专属目录。 |
-| **Work 定时任务与隔离** | 支持一次、每日、每周任务；每个工作默认只能访问自己的私有目录，需要的资料通过会话附件或项目资料库显式加入。 |
+| **Work 项目与资料库** | 为 Claude/Codex 分别建立私有项目、文件/链接/笔记资料库和可复用工作模板；创建工作时会把选定上下文物化到专属目录。 |
+| **Work 定时任务与隔离** | 支持一次、每日、每周任务；执行记录、租约、失败重试和防重叠状态均持久化。每个工作默认只能访问自己的私有目录，需要的资料通过会话附件或项目资料库显式加入。 |
 | **远程操作** | 手机、平板或桌面浏览器实时看流式回复，发送附件，排队下一条消息，随时打断当前回合。 |
 | **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
 | **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。 |
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
-| **会话管理** | 搜索、切换、重命名、归档和消息级派生；Codex 还可在 Git 仓库中派生到独立 worktree。 |
-| **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；`/goal` 管理长目标，Codex `/status` 读取 app-server 状态、用量与限额。 |
+| **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Claude 支持按消息 Rewind（只回滚对话、官方文件 checkpoint 或两者）；Codex 支持对话与冲突安全的代码回滚、主动 compact、原生 Review，以及在 Git 仓库中派生到独立 worktree。 |
+| **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 通过 `/permissions` 控制审批并继承本机 Sandbox 配置；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
+| **真实扩展目录** | 按需读取 Claude/Codex 当前可见的 Skills、Plugins、Apps 与 MCP 状态；插件安装/卸载调用两家原生管理器，不用静态假列表。 |
 | **连续性** | 后台会话继续运行，多端实时同步；从 Claude transcript / Codex rollout 分页恢复历史，断线后按游标补流。 |
+| **多机器与 PWA** | 一个 relay 可连接多个具名 wrapper；可选账号策略把用户限制到指定机器。网页可安装为 PWA，并在后台回合完成/失败时发送不含对话正文的系统通知。 |
 | **自托管** | wrapper 只出站连接；会话、Work 数据和预览转换都留在本机，VPS 只做无状态中继且可替换；网页认证使用 HttpOnly cookie，CLI 凭据与 API key 不进入前端。 |
 
 > 不同引擎可用的模型、服务档位和运行控制以本机 CLI 及其 SDK/app-server 能力为准。
@@ -70,7 +72,7 @@ API key 烤进网页。
 | 组件 | 跑在哪 | 干什么 |
 |---|---|---|
 | **wrapper** | `claude` / `codex` 所在的机器 | 持有会话池、把 SDK/app-server 事件翻成线协议、管打断/排空、按需从 transcript/rollout 读历史，并在本机临时转换 Office 预览。**只出站连中继，机器不需要开入站端口。** |
-| **relay（中继）** | 公网 VPS（或本地） | 纯 WebSocket 转发器（FastAPI）。wrapper 使用 Bearer token，浏览器使用 HttpOnly 会话 cookie；单 wrapper 槽、多客户端扇出。**不持久化会话或 Artifact，从不 import `claude-agent-sdk`、从不碰模型 API**。 |
+| **relay（中继）** | 公网 VPS（或本地） | 纯 WebSocket 转发器（FastAPI）。每个 `machine_id` 一个 wrapper 槽，浏览器使用 HttpOnly 会话 cookie，并只接收所选机器的事件。**不持久化会话或 Artifact，从不 import `claude-agent-sdk`、从不碰模型 API**。 |
 | **web** | 浏览器 | React 客户端；中继同源托管它的静态文件（`web/dist`）。 |
 
 ### Code 与 Work
@@ -86,7 +88,7 @@ API key 烤进网页。
   闲聊不会主动检查文件或提及代码项目，需要编程时仍可按用户的明确要求执行。
 - Work 不开放用户主目录或任意外部目录。需要引用现有资料时，通过附件或项目资料库
   显式复制到私有工作目录，避免对话意外读取其他项目和历史。
-- “插件”当前是可复用的工作说明/流程模板，会写入该项目的 `WORK.md`，不会在后台执行
+- 工作模板是可复用的工作说明/流程模板，会写入该项目的 `WORK.md`，不会在后台执行
   未审核的第三方代码。定时任务由 wrapper 持久化和领取，使用同一 Work 隔离策略运行。
 
 ### Artifact 预览在哪里运行
@@ -146,12 +148,13 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### 常用操作速查
 
-- **会话**：新建、搜索、后台运行、重命名、归档、派生、Codex worktree。
+- **会话**：新建、搜索、后台运行、重命名、归档、删除、派生、Claude Rewind、Codex 对话与代码回滚、compact、Review、Codex worktree。
 - **回合**：流式输出、排队、打断、复制、编辑重发、从指定消息派生。
 - **工具**：命令输出、文件修改与 diff、MCP、协作代理、Hook、审批和用户输入回传。
 - **终端协同**：检测原生 CLI 占用，实时镜像新消息；远端用户保留主动接管权。
 - **状态**：模型、思考强度、权限、Plan、上下文、目标、用量、rate limit 和运行告警。
-- **设备**：响应式手机界面、深浅主题、多浏览器同步与断线重连。
+- **扩展**：实时查看 Skills、Plugins、Apps 和 MCP；通过引擎原生管理器安装/卸载插件。
+- **设备**：响应式手机界面、深浅主题、多浏览器/多机器同步、PWA、后台完成提醒与断线重连。
 
 ## 本地快速开始（一台机器，5 分钟）
 
@@ -159,7 +162,7 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### 前置
 
-- 一台已装好 **Claude Code CLI**（`claude`，v2.1.51+）或支持 `app-server` 的 **Codex CLI**（`codex`）并且 CLI **本身已经能正常对话**的机器；两个都装即可在网页中切换引擎。
+- 一台已完成 **Claude Code** 或支持 `app-server` 的 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器；Claude 默认使用锁定 SDK 自带并经过回归的官方 CLI，Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个都可用即可在网页中切换引擎。
 - **Python 3.10+**、**Node 20.19+**（用来构建网页）。
 - 可选：要预览 DOCX/XLSX/PPTX 等 Office 文件，Linux wrapper 主机需安装
   **LibreOffice + bubblewrap**（例如 `sudo apt install libreoffice bubblewrap`）；VPS 不需要。
@@ -253,14 +256,14 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v11**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v14**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v11 relay 和
-> v11 wrapper；这样旧 wrapper 不会占住 relay 的单连接槽。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v14 relay 和
+> v14 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
 
-### 3）停服维护窗口内，从 staging 发布到 VPS
+### 3）上传 staging，由原子 release 安装器发布
 
 ```bash
 # dev 机器：普通账号只写自己的 staging，不直接写 root-owned /opt
@@ -268,29 +271,35 @@ rsync -av --delete --exclude='.git' --exclude='.venv' \
   --exclude='web/node_modules' --exclude='.env' \
   ./ <vps-user>@<vps>:~/cc-remote-upload/
 
-# VPS：协议 v11 的 Python + web/dist 在停服窗口一起发布，避免混跑
+# VPS：不要把 staging 覆盖到正在运行的 /opt 正式目录
 ssh <vps-user>@<vps>
-sudo systemctl stop cc-remote-relay 2>/dev/null || true
 sudo mkdir -p /opt/cc-remote
-sudo rsync -a --delete --exclude='.env' --exclude='.venv' \
-  ~/cc-remote-upload/ /opt/cc-remote/
 ```
 
-确保 VPS 上有：`/opt/cc-remote/cc_remote/`、`web/dist/cc-remote-build.json`、`requirements.lock`、`deploy/`。升级也重复同一套 staging + 停服发布，不能直接 rsync 正在运行的目录。
+安装器会把 staging 复制到新的
+`/opt/cc-remote/releases/release-*`，在其中构建独立 venv，全部校验通过后再原子切换
+`/opt/cc-remote/current`。旧 release 的代码、`web/dist` 和 venv 会完整保留用于失败回滚；
+不会再对脏的正式目录执行 `rsync --delete`。
 
 ### 4）VPS：配 `.env` + 一键 setup
 
 ```bash
-# 在 VPS 上（/opt/cc-remote 安装后由 root 持有）
+# 在 VPS 上：.env 是 releases 之外唯一共享的运行配置
 sudo test -f /opt/cc-remote/.env || sudo install -m 600 \
-  /opt/cc-remote/deploy/env.relay.example /opt/cc-remote/.env
-sudoedit /opt/cc-remote/.env     # 填 LOGIN_PASSWORD / SESSION_SECRET / WRAPPER_TOKEN
+  ~/cc-remote-upload/deploy/env.relay.example /opt/cc-remote/.env
+sudoedit /opt/cc-remote/.env
+# 填 LOGIN_PASSWORD / SESSION_SECRET / WRAPPER_TOKEN；保持：
+# WEB_STATIC_DIR=/opt/cc-remote/current/web/dist
 
-# 装依赖 + Caddy + systemd（把域名换成你的）
-sudo bash /opt/cc-remote/deploy/setup-vps.sh your-domain.com
+# 升级时先停本机 wrapper，随后让安装器一次切换 relay + web
+sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
+  your-domain.com ~/cc-remote-upload
 ```
 
-脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、建 venv + `pip install`、把带标记的 cc-remote 站点块和全局 HTTP 超时/头大小上限合并进 Caddyfile（保留其他全局项和站点），再启动 `cc-remote-relay` + `caddy`。若新 relay 重启或健康检查失败，venv、Caddyfile、systemd unit 会作为一个事务全部恢复，并验证旧 relay 的 `/healthz`。
+脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
+和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
+relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v14 wrapper。
 
 验证：
 
@@ -348,13 +357,15 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `RELAY_HOST` / `RELAY_PORT` | `127.0.0.1` / `8765` | 监听地址（公网部署交给 Caddy，保持 127.0.0.1）。 |
-| `LOGIN_PASSWORD` | 空 | 网页登录口令。**必须设**，否则没法登录。 |
+| `LOGIN_PASSWORD` | 空 | 单用户网页登录口令。未设置 `LOGIN_USERS_JSON` 时**必须设**。 |
+| `LOGIN_USERS_JSON` | 空 | 可选多用户策略：`{"alice":{"password":"…","machines":["mac","nono"]}}`；设置后替代 `LOGIN_PASSWORD`。 |
 | `SESSION_SECRET` | 空 | 给会话 token 签名的 HMAC 密钥。**必须设**（`openssl rand -hex 32`）。 |
 | `SESSION_TTL_SECONDS` | `604800` | 会话 token 有效期（默认 7 天）。 |
 | `LOGIN_BODY_MAX_BYTES` / `LOGIN_READ_TIMEOUT` / `LOGIN_INFLIGHT_CAP` | `4096` / `10` / `32` | 登录请求体字节数、总读取秒数和并发读取数的硬上限。 |
 | `SESSION_REGISTRY_CAP` | `1024` | 进程内可撤销浏览器会话注册表的硬上限。 |
 | `PUBLIC_ORIGIN` | 空 | 浏览器允许连接 WS 的精确来源，如 `https://remote.example.com`；**必须设**，非 loopback 必须 HTTPS。 |
-| `WRAPPER_TOKEN` | 占位值 | wrapper 连中继时的 Bearer token，两边必须一致；启动会拒绝占位值和短值。 |
+| `WRAPPER_TOKEN` | 占位值 | 单机器/兼容模式下的 wrapper Bearer token；未设置 `WRAPPER_TOKENS_JSON` 时必须配置。 |
+| `WRAPPER_TOKENS_JSON` | 空 | 可选机器绑定 token：`{"mac":"…","nono":"…"}`；设置后替代 relay 的通配 `WRAPPER_TOKEN`。 |
 | `WEB_STATIC_DIR` | 空 | 指向 `web/dist` 则同源托管网页；留空则只做 API/WS。 |
 | `CLIENT_QUEUE_CAP` / `CLIENT_QUEUE_BYTES` | `4096` / `16777216` | 单客户端待发帧数/字节硬上限；超限断开慢客户端，不静默丢帧。 |
 | `MAX_CLIENTS` / `CLIENT_HELLO_TIMEOUT` | `8` / `10` | 已接受客户端总数和首个 Hello 帧等待秒数的硬上限。 |
@@ -366,6 +377,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 |---|---|---|
 | `RELAY_URL` | `ws://127.0.0.1:8765/ws` | 中继的 WebSocket 地址（公网用 `wss://域名/ws`）。 |
 | `WRAPPER_TOKEN` | `change-me-wrapper` | 同中继。 |
+| `CC_REMOTE_MACHINE_ID` | `default` | 多机器 relay 中的稳定路由 id；使用 `WRAPPER_TOKENS_JSON` 时必须匹配对应键。 |
 | `CLAUDE_BIN` | 空 | 可选的 Claude CLI 绝对路径；systemd/PATH 找不到 `claude` 时设置。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |
 | `CC_RESUME_SESSION_ID` | 空 | 恢复指定会话 UUID；留空开新会话。首次启动后 id 会持久化到 `~/.cc-remote/`。 |
@@ -384,8 +396,8 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 
 ## 鉴权模型
 
-- **网页客户端**：向中继 `POST /api/login`（带 `LOGIN_PASSWORD`）换一个短期 HMAC 会话，放在 **HttpOnly + SameSite=Strict** cookie 中；JavaScript 读不到，URL 中也没有 token。WebSocket 还必须通过精确 `Origin` 校验。
-- **wrapper ⇄ 中继**：WS 握手时带 `Authorization: Bearer <WRAPPER_TOKEN>`。
+- **网页客户端**：向中继 `POST /api/login` 换一个短期 HMAC 会话，放在 **HttpOnly + SameSite=Strict** cookie 中；JavaScript 读不到，URL 中也没有 token。配置 `LOGIN_USERS_JSON` 后，签名会话还携带允许的机器集合，机器列表和 WebSocket 路由都会再次校验。WebSocket 同时必须通过精确 `Origin` 校验。
+- **wrapper ⇄ 中继**：WS 握手时带 `Authorization: Bearer <WRAPPER_TOKEN>`；配置 `WRAPPER_TOKENS_JSON` 后，该 token 只能声明绑定的 `machine_id`。
 - token 只走 cookie/请求头，从不进 URL 或线协议消息体；日志会自动打码 token/password 字段。
 
 ## 可靠性边界
@@ -393,13 +405,14 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 - Web 与 TUI 会给可重试命令附加稳定的 `cmd_id`，断线重连或 wrapper 恢复后重发；wrapper 在同一进程生命周期内去重并返回 ACK。每个实时会话还用 wrapper generation 配对 cursor，避免 wrapper 重启后把旧序号误当成新序号。
 - 未确认命令队列和通用命令去重表是**有界内存状态**：浏览器硬刷新、TUI 退出或 wrapper 进程崩溃，不承诺跨进程的 exactly-once。cc-remote 是交互控制面，不是持久任务队列；这类故障后应先核对 transcript/rollout 和会话状态，再决定是否重发。
 - 已落盘的 Claude transcript / Codex rollout 是历史事实来源；实时 ring 只负责有界的断线补流，不替代历史文件。
+- Work 定时任务是例外：计划、运行记录、租约、心跳、重试次数和下次运行时间写入 SQLite；wrapper 重启后会恢复过期租约，但仍不会把不确定结果伪装成成功。
 
 ## 安全须知（务必读）
 
 > **cc-remote 会让远端的人在你机器上跑任意命令。请当成「给别人一个你机器的 shell」来对待。**
 
 - Code 会话仍是远程开发控制面：Claude 默认使用 `permissionMode: bypassPermissions`；Codex 默认审批策略是 `never` 并继承本机 Codex sandbox 配置，也可切到 `on-request` / `untrusted`。**能登录且能进入 Code 的人，仍应等同于拿到了这台机器的远程 agent/shell 权限。** Work 会话使用独立私有根目录且不开放外部目录，但这只是缩小默认能力面，不替代操作系统级的独立用户、容器或虚拟机隔离。
-- `LOGIN_PASSWORD` / `WRAPPER_TOKEN` / `SESSION_SECRET` 是唯一的门：用强随机值、别提交 git、别贴到聊天里、定期轮换。仓库 `.env` 只适合本机开发；生产 wrapper 必须使用上述 root-only `/etc/cc-remote/wrapper.env`。systemd 模板会禁止服务及模型子进程读取这个源文件和遗留仓库 `.env`；Linux wrapper 还会关闭 dumpability，避免子进程从 `/proc/<pid>/environ` 或进程内存取回已经捕获的 token。
+- `LOGIN_PASSWORD` / `LOGIN_USERS_JSON`、`WRAPPER_TOKEN` / `WRAPPER_TOKENS_JSON` 和 `SESSION_SECRET` 是认证边界：用强随机值、别提交 git、别贴到聊天里、定期轮换。仓库 `.env` 只适合本机开发；生产 wrapper 必须使用上述 root-only `/etc/cc-remote/wrapper.env`。systemd 模板会禁止服务及模型子进程读取这个源文件和遗留仓库 `.env`；Linux wrapper 还会关闭 dumpability，避免子进程从 `/proc/<pid>/environ` 或进程内存取回已经捕获的 token。
 - 公网必须上 TLS（`wss://`，本仓库用 Caddy 自动签证书）。别用明文 `ws://` 暴露公网。
 - 建议：给中继加 IP 白名单 / 只在需要时开、给登录加失败限速（已内置每 IP 每分钟 5 次）。
 

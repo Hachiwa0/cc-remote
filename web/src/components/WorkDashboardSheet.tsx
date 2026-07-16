@@ -76,7 +76,7 @@ export function WorkDashboardSheet(props: Props) {
         </header>
         <nav>
           {([ ["projects", "项目"], ["library", "资料库"],
-            ["schedules", "定时任务"], ["plugins", "插件"] ] as [Tab, string][]).map(([id, label]) => (
+            ["schedules", "定时任务"], ["plugins", "工作模板"] ] as [Tab, string][]).map(([id, label]) => (
             <button key={id} className={tab === id ? "active" : ""}
               onClick={() => { setTab(id); setError(null); }}>{label}</button>
           ))}
@@ -167,21 +167,21 @@ export function WorkDashboardSheet(props: Props) {
 
           {dashboard && tab === "plugins" && <>
             <section className="work-form">
-              <h3>新建工作插件</h3>
+              <h3>新建工作模板</h3>
               <ProjectPicker projects={projects} value={selectedProjectId} onChange={onSelectProject} allowNone />
-              <input value={pluginName} onChange={(e) => setPluginName(e.target.value)} placeholder="插件名称" />
-              <textarea value={pluginInstructions} onChange={(e) => setPluginInstructions(e.target.value)} placeholder="告诉 Agent 这个插件提供的工作规范、模板或处理方法" />
+              <input value={pluginName} onChange={(e) => setPluginName(e.target.value)} placeholder="模板名称" />
+              <textarea value={pluginInstructions} onChange={(e) => setPluginInstructions(e.target.value)} placeholder="告诉 Agent 这套模板的工作规范、格式或处理方法" />
               <button className="primary" disabled={!pluginName.trim() || !pluginInstructions.trim()} onClick={() => {
                 if (props.onCreatePlugin(pluginName.trim(), pluginInstructions.trim(), selectedProjectId ?? undefined)) {
                   setPluginName(""); setPluginInstructions("");
                 }
-              }}>添加插件</button>
-              <small>当前版本的 Work 插件是可复用工作说明，会进入 WORK.md；不执行第三方代码。</small>
+              }}>添加模板</button>
+              <small>工作模板是会进入 WORK.md 的可复用说明，不冒充或执行引擎插件。真实技能、插件与连接请在顶栏的 Agent 能力中查看。</small>
             </section>
             <section className="work-items">
               {dashboard.plugins.map((item) => <article key={item.plugin_id}>
                 <div><b>{item.name}</b><p>{projectName(item.project_id)} · {item.instructions}</p></div>
-                <button className="danger" onClick={() => remove(`插件「${item.name}」`, () => props.onDeletePlugin(item.plugin_id))}><Icon name="trash" size={15} /></button>
+                <button className="danger" onClick={() => remove(`模板「${item.name}」`, () => props.onDeletePlugin(item.plugin_id))}><Icon name="trash" size={15} /></button>
               </article>)}
             </section>
           </>}

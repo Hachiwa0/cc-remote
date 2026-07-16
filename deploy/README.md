@@ -4,20 +4,19 @@ Reference files for the production deploy (public VPS relay + wrapper on your
 machine). The **full step-by-step guide is in the main [README](../README.md#生产部署公网-vps-中继--你机器上的-wrapper)**
 ([English](../README_en.md#production-deploy-public-vps-relay--wrapper-on-your-machine)).
 
-- `setup-vps.sh` — idempotent VPS setup: validates required secrets, installs
-  Caddy + a hardened `ccremote` systemd service, keeps the app/venv root-owned
-  and read-only to that service account, updates a marked cc-remote
-  site block without overwriting unrelated Caddy sites, manages bounded global
-  HTTP read/write/header limits, validates the merged config, and explicitly
-  restarts both services. If the new relay fails to restart or become ready,
-  the venv, Caddyfile, and relay unit are restored as one transaction and the
-  previous relay is health-checked.
-  Run as `sudo bash deploy/setup-vps.sh your-domain.com` after following the
-  main README's maintenance-window publish flow: upload to a user-owned staging
-  directory, stop the relay, then `sudo rsync --delete` into the root-owned
-  `/opt/cc-remote`. Keep the existing `.env` and `.venv` excluded from that
-  promotion. The script builds and import-checks a new venv before switching,
-  then restores the previous venv if restart/readiness fails.
+- `setup-vps.sh` — atomic VPS release installer. It validates a user-owned
+  upload, copies it to a new root-owned
+  `/opt/cc-remote/releases/release-*` directory, builds that release's own
+  venv, validates the Python/web protocol pair, then switches the
+  `/opt/cc-remote/current` symlink in one rename. The running tree is never
+  overlaid with `rsync --delete`. If relay restart/readiness fails, `current`,
+  Caddyfile, and the relay unit roll back together and the previous release is
+  health-checked. The previous full code + web + venv directory is retained.
+  Run `sudo bash ~/cc-remote-upload/deploy/setup-vps.sh your-domain.com \
+  ~/cc-remote-upload`; the optional second argument defaults to the repository
+  containing the invoked script. Shared secrets stay only in
+  `/opt/cc-remote/.env`, whose `WEB_STATIC_DIR` must point to
+  `/opt/cc-remote/current/web/dist`.
 - `Caddyfile` — reverse proxy + auto Let's Encrypt TLS (`wss://domain/ws` →
   `127.0.0.1:8765`) plus an early 4 KiB login-body limit. Replace
   `cc-remote.example.com` with your domain.
@@ -29,17 +28,17 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
 - `env.relay.example` / `env.wrapper.example` — environment templates for each
   side. Install the wrapper template as root:root mode 0600 at the path above.
 
-Protocol v11 is a coordinated upgrade: publish the Python package and freshly
-built `web/dist` together in the documented stop window, then restart relay and
-wrapper. The strict protocol gate is intentional and mixed protocol versions will
-not communicate. `setup-vps.sh` also rejects a missing/old web build manifest.
-For a manual upgrade, stop the wrapper before stopping the relay; start the v11
-relay first and the v11 wrapper last.
+Protocol v14 is a coordinated upgrade: publish the Python package and freshly
+built `web/dist` as one release, then restart relay and wrapper. The strict
+protocol gate is intentional and mixed protocol versions will not communicate.
+`setup-vps.sh` rejects a missing or mismatched web build manifest. Stop the
+wrapper first; activate the v14 relay/web release; then start the v14 wrapper.
 
 ## Security (short version)
 
-The relay is exposed publicly; `LOGIN_PASSWORD`, `SESSION_SECRET`, and
-`WRAPPER_TOKEN` are the authentication secrets. Claude defaults to
+The relay is exposed publicly; `LOGIN_PASSWORD` or `LOGIN_USERS_JSON`,
+`SESSION_SECRET`, and `WRAPPER_TOKEN` or `WRAPPER_TOKENS_JSON` are the
+authentication secrets. Claude defaults to
 `bypassPermissions`; Codex inherits its local sandbox and defaults to approval
 policy `never`. Treat every logged-in client as holding remote agent/shell
 authority on the wrapper machine. Use strong secrets, keep relay `.env` out of

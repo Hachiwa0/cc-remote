@@ -63,6 +63,7 @@ export class RelayWs {
   private stopped = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly cb: WsCallbacks;
+  private readonly machineId: string;
   // Heartbeat: detect a HALF-OPEN link (dead TCP with no close event) and recover.
   private lastRecvAt = 0;
   private hbTimer: ReturnType<typeof setInterval> | null = null;
@@ -70,11 +71,14 @@ export class RelayWs {
   private wrapperGeneration: string | null = null;
   private lastGenerationChangeNotice: string | null = null;
 
-  constructor(cb: WsCallbacks) {
+  constructor(cb: WsCallbacks, machineId = "default") {
     this.cb = cb;
+    this.machineId = machineId;
     this.clientId = uuid();
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    this.url = new URL(`${proto}//${window.location.host}/ws`).toString();
+    const url = new URL(`${proto}//${window.location.host}/ws`);
+    if (machineId !== "default") url.searchParams.set("machine", machineId);
+    this.url = url.toString();
   }
 
   start(): void {
@@ -421,6 +425,27 @@ export class RelayWs {
     this.send(frame);
   }
 
+  sendGetEngineCapabilities(engine: "claude" | "codex", space: Space,
+                            cwd?: string | null): void {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_engine_capabilities", engine, space,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (cwd) frame.cwd = cwd;
+    this.send(frame);
+  }
+
+  sendManageEnginePlugin(engine: "claude" | "codex", space: Space,
+                         action: "install" | "uninstall", pluginId: string,
+                         cwd?: string | null): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "manage_engine_plugin", engine, space,
+      action, plugin_id: pluginId, client_id: this.clientId, ts: nowTs(),
+    };
+    if (cwd) frame.cwd = cwd;
+    return this.send(frame);
+  }
+
   sendAnswerQuestion(askId: string, answer: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
   }
@@ -524,6 +549,43 @@ export class RelayWs {
     });
   }
 
+  sendDeleteSession(sessionId: string, engine: "claude" | "codex",
+                    space: Space = "code"): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "delete_session", session_id: sessionId,
+      engine, space, ts: nowTs(),
+    });
+  }
+
+  sendRollbackSession(sessionId: string, engine: "claude" | "codex",
+                      restore: "conversation" | "files" | "both",
+                      numTurns = 1, checkpointId?: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "rollback_session", session_id: sessionId,
+      engine, space: "code", restore, num_turns: numTurns, ts: nowTs(),
+    };
+    if (engine === "claude" && checkpointId) command.checkpoint_id = checkpointId;
+    return this.send(command);
+  }
+
+  sendCompactSession(sessionId: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "compact_session", session_id: sessionId,
+      engine: "codex", space: "code", ts: nowTs(),
+    });
+  }
+
+  sendStartReview(sessionId: string,
+                  target: "uncommittedChanges" | "baseBranch" | "commit" | "custom",
+                  value?: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "start_review", session_id: sessionId,
+      engine: "codex", space: "code", target, ts: nowTs(),
+    };
+    if (value) command.value = value;
+    return this.send(command);
+  }
+
   sendGetWorkDashboard(engine: "claude" | "codex"): void {
     this.send({
       v: PROTOCOL_VERSION, type: "get_work_dashboard", engine, ts: nowTs(),
@@ -610,7 +672,8 @@ export class RelayWs {
     const replay = this.boundedReplayState();
     this.sendUntracked({
       v: PROTOCOL_VERSION, type: "hello", role: "client", client_id: this.clientId,
-      cursors: replay.cursors, ts: nowTs(), generations: replay.generations,
+      machine_id: this.machineId, cursors: replay.cursors, ts: nowTs(),
+      generations: replay.generations,
     });
     if (flush) this.flushOutbox();
   }

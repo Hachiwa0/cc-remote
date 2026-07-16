@@ -1,8 +1,8 @@
-"""Relay hub: pairs one wrapper with N clients, routes per-client replay, fans
+"""Relay hub: pairs one or more named wrappers with their clients, routes replay, fans
 out live events.
 
-- Single wrapper slot. The first wrapper to authenticate occupies it; a second
-  is rejected with `wrapper_already_connected`.
+- Each ``machine_id`` has one wrapper slot. A duplicate wrapper for the same id
+  is rejected while different self-hosted machines may share the relay.
 - Clients register by `client_id` (from their hello). A reconnecting phone
   reuses its client_id, replacing any stale connection.
 - Wrapper frames with `to=<client_id>` are routed to that client only (per-
@@ -23,7 +23,7 @@ from cc_remote.log import logger
 from cc_remote.protocol import (
     Error, ProtocolError, WrapperDisconnected, WrapperReconnected,
     deserialize, is_client_message, serialize,
-    ERR_WRAPPER_OFFLINE, ERR_WRAPPER_ALREADY_CONNECTED, ERR_PROTOCOL,
+    ERR_BUSY, ERR_WRAPPER_OFFLINE, ERR_WRAPPER_ALREADY_CONNECTED, ERR_PROTOCOL,
 )
 from cc_remote.relay.forward import ClientConn, SlowClientError
 
@@ -37,13 +37,20 @@ PROTOCOL_MISMATCH_CLOSE_CODE = 4406
 PROTOCOL_MISMATCH_CLOSE_REASON = "protocol upgrade required"
 PROTOCOL_ERROR_CLOSE_CODE = 4400
 PROTOCOL_ERROR_CLOSE_REASON = "invalid protocol frame"
+MAX_NAMED_WRAPPERS = 256
+WRAPPER_LIMIT_CLOSE_CODE = 1013
+WRAPPER_LIMIT_CLOSE_REASON = "wrapper capacity reached"
 
 
 class RelayHub:
     def __init__(self, cfg: RelayConfig):
         self.cfg = cfg
+        # Preserve the original attributes as the default-machine fast path and
+        # test/integration compatibility surface.
         self._wrapper_ws: Optional[WebSocket] = None
         self._clients: dict[str, ClientConn] = {}
+        self._wrappers: dict[str, WebSocket] = {}
+        self._machine_clients: dict[str, dict[str, ClientConn]] = {}
         self._client_slots: set[int] = set()
         self._lock = asyncio.Lock()
         # Linearizes client generation replacement with client -> wrapper sends.
@@ -53,28 +60,60 @@ class RelayHub:
 
     @property
     def wrapper_connected(self) -> bool:
-        return self._wrapper_ws is not None
+        return self._wrapper_ws is not None or bool(self._wrappers)
+
+    @property
+    def machine_ids(self) -> list[str]:
+        ids = set(self._wrappers)
+        if self._wrapper_ws is not None:
+            ids.add("default")
+        return sorted(ids)
 
     @property
     def client_count(self) -> int:
         return len(self._client_slots)
 
+    def default_machine_id(self, requested: str | None = None) -> str:
+        if requested:
+            return requested
+        ids = self.machine_ids
+        return ids[0] if ids else "default"
+
+    def _wrapper_for(self, machine_id: str):
+        return (self._wrapper_ws if machine_id == "default"
+                else self._wrappers.get(machine_id))
+
+    def _clients_for(self, machine_id: str) -> dict[str, ClientConn]:
+        if machine_id == "default":
+            return self._clients
+        return self._machine_clients.get(machine_id, {})
+
+    def _ensure_clients_for(self, machine_id: str) -> dict[str, ClientConn]:
+        if machine_id == "default":
+            return self._clients
+        return self._machine_clients.setdefault(machine_id, {})
+
+    def _prune_clients_for(
+        self,
+        machine_id: str,
+        clients: dict[str, ClientConn],
+    ) -> None:
+        if (
+            machine_id != "default"
+            and not clients
+            and self._machine_clients.get(machine_id) is clients
+        ):
+            del self._machine_clients[machine_id]
+
     # ---- wrapper side ----
 
-    async def serve_wrapper(self, ws: WebSocket) -> None:
-        async with self._lock:
-            if self._wrapper_ws is not None:
-                try:
-                    await ws.send_text(serialize(Error(
-                        code=ERR_WRAPPER_ALREADY_CONNECTED,
-                        message="a wrapper is already connected",
-                    )))
-                    await ws.close(code=1008)
-                except Exception:
-                    pass
-                return
-            self._wrapper_ws = ws
+    async def serve_wrapper(
+        self,
+        ws: WebSocket,
+        expected_machine_id: str | None = None,
+    ) -> None:
         announced = False
+        machine_id: str | None = None
         try:
             while True:
                 raw = await ws.receive_text()
@@ -112,17 +151,66 @@ class RelayHub:
                         except Exception:
                             pass
                         break
+                    machine_id = getattr(msg, "machine_id", None) or "default"
+                    if (expected_machine_id is not None
+                            and machine_id != expected_machine_id):
+                        try:
+                            await ws.send_text(serialize(Error(
+                                code=ERR_PROTOCOL,
+                                message="wrapper credential is not valid for this machine",
+                            )))
+                            await ws.close(code=1008, reason="machine not authorized")
+                        except Exception:
+                            pass
+                        return
+                    async with self._lock:
+                        current = self._wrapper_for(machine_id)
+                        over_capacity = (
+                            current is None
+                            and machine_id != "default"
+                            and len(self._wrappers) >= MAX_NAMED_WRAPPERS
+                        )
+                        if current is None and not over_capacity:
+                            if machine_id == "default":
+                                self._wrapper_ws = ws
+                            else:
+                                self._wrappers[machine_id] = ws
+                    if over_capacity:
+                        try:
+                            await ws.send_text(serialize(Error(
+                                code=ERR_BUSY,
+                                message=WRAPPER_LIMIT_CLOSE_REASON,
+                            )))
+                            await ws.close(
+                                code=WRAPPER_LIMIT_CLOSE_CODE,
+                                reason=WRAPPER_LIMIT_CLOSE_REASON,
+                            )
+                        except Exception:
+                            pass
+                        return
+                    if current is not None:
+                        try:
+                            await ws.send_text(serialize(Error(
+                                code=ERR_WRAPPER_ALREADY_CONNECTED,
+                                message=f"wrapper {machine_id!r} is already connected",
+                            )))
+                            await ws.close(code=1008)
+                        except Exception:
+                            pass
+                        return
                     announced = True
-                    log.info("wrapper connected")
-                await self._on_wrapper_msg(msg)
+                    log.info("wrapper connected", machine_id=machine_id)
+                assert machine_id is not None
+                await self._on_wrapper_msg(msg, machine_id)
         except WebSocketDisconnect:
             pass
         except Exception:
             log.exception("wrapper loop error")
         finally:
-            await self._wrapper_gone()
+            if announced and machine_id is not None:
+                await self._wrapper_gone(machine_id, ws)
 
-    async def _on_wrapper_msg(self, msg) -> None:
+    async def _on_wrapper_msg(self, msg, machine_id: str = "default") -> None:
         if msg.type == "hello" and getattr(msg, "role", None) == "wrapper":
             log.info("wrapper announced", cc_session_id=msg.cc_session_id,
                      state=msg.state, head=msg.buffer_head_seq, tail=msg.buffer_tail_seq)
@@ -130,12 +218,12 @@ class RelayHub:
                 cc_session_id=msg.cc_session_id,
                 state=msg.state or "idle",
                 generation=getattr(msg, "wrapper_generation", None),
-            ))
+            ), machine_id)
             return
         to = getattr(msg, "to", None)
         if to:
             async with self._lock:
-                conn = self._clients.get(to)
+                conn = self._clients_for(machine_id).get(to)
             route_id = getattr(msg, "route_id", None)
             if (conn is not None and route_id is not None
                     and conn.route_id != route_id):
@@ -149,23 +237,31 @@ class RelayHub:
                 try:
                     await conn.send(msg)
                 except SlowClientError:
-                    await self._drop_client(conn, code=4008, reason="slow client")
+                    await self._drop_client(conn, code=4008, reason="slow client",
+                                            machine_id=machine_id)
                 except ConnectionError:
-                    await self._drop_client(conn)
+                    await self._drop_client(conn, machine_id=machine_id)
             else:
                 log.debug("routed frame for unknown client, dropping", to=to, type=msg.type)
         else:
-            await self._broadcast(msg)
+            await self._broadcast(msg, machine_id)
 
-    async def _wrapper_gone(self) -> None:
+    async def _wrapper_gone(self, machine_id: str = "default", ws=None) -> None:
         async with self._lock:
-            self._wrapper_ws = None
-        log.warning("wrapper disconnected")
-        await self._broadcast(WrapperDisconnected())
+            current = self._wrapper_for(machine_id)
+            if ws is not None and current is not ws:
+                return
+            if machine_id == "default":
+                self._wrapper_ws = None
+            else:
+                self._wrappers.pop(machine_id, None)
+        log.warning("wrapper disconnected", machine_id=machine_id)
+        await self._broadcast(WrapperDisconnected(), machine_id)
 
     # ---- client side ----
 
-    async def serve_client(self, ws: WebSocket) -> None:
+    async def serve_client(self, ws: WebSocket,
+                           machine_id: str = "default") -> None:
         conn: Optional[ClientConn] = None
         client_id: Optional[str] = None
         slot = id(ws)
@@ -235,11 +331,14 @@ class RelayHub:
             over_capacity = False
             async with self._wrapper_send_lock:
                 async with self._lock:
-                    old = self._clients.get(client_id)
-                    if old is None and len(self._clients) >= max_clients:
+                    clients = self._clients_for(machine_id)
+                    old = clients.get(client_id)
+                    if old is None and sum(
+                        len(group) for group in [self._clients, *self._machine_clients.values()]
+                    ) >= max_clients:
                         over_capacity = True
                     else:
-                        self._clients[client_id] = conn
+                        self._ensure_clients_for(machine_id)[client_id] = conn
             if over_capacity:
                 await conn.stop(
                     code=CLIENT_LIMIT_CLOSE_CODE,
@@ -248,9 +347,11 @@ class RelayHub:
                 return
             if old is not None and old is not conn:
                 await old.stop(code=4009, reason="replaced by reconnect")
-            log.info("client registered", client_id=client_id, total=len(self._clients))
+            log.info("client registered", client_id=client_id,
+                     machine_id=machine_id, total=self.client_count)
 
-            if not await self._forward_client_msg(conn, client_id, msg):
+            if not await self._forward_client_msg(
+                    conn, client_id, msg, machine_id):
                 return
 
             while True:
@@ -276,7 +377,8 @@ class RelayHub:
                     msg.client_id = client_id
                 # route_id is reserved for the first Hello catch-up response.
                 msg.route_id = None
-                if not await self._forward_client_msg(conn, client_id, msg):
+                if not await self._forward_client_msg(
+                        conn, client_id, msg, machine_id):
                     break
         except WebSocketDisconnect:
             pass
@@ -285,19 +387,25 @@ class RelayHub:
         finally:
             if client_id is not None and conn is not None:
                 async with self._lock:
-                    if self._clients.get(client_id) is conn:
-                        del self._clients[client_id]
+                    clients = self._clients_for(machine_id)
+                    if clients.get(client_id) is conn:
+                        del clients[client_id]
+                        self._prune_clients_for(machine_id, clients)
                 await conn.stop()
             async with self._lock:
                 self._client_slots.discard(slot)
-            log.info("client removed", client_id=client_id, remaining=len(self._clients))
+            log.info("client removed", client_id=client_id,
+                     machine_id=machine_id, remaining=self.client_count)
 
-    async def _forward_client_msg(self, conn: ClientConn, client_id: str, msg) -> bool:
+    async def _forward_client_msg(
+        self, conn: ClientConn, client_id: str, msg,
+        machine_id: str = "default",
+    ) -> bool:
         """Forward iff ``conn`` still owns client_id at the send linearization point."""
         async with self._wrapper_send_lock:
             async with self._lock:
-                current = self._clients.get(client_id) is conn
-                wrapper = self._wrapper_ws
+                current = self._clients_for(machine_id).get(client_id) is conn
+                wrapper = self._wrapper_for(machine_id)
             if not current:
                 return False
             if wrapper is None:
@@ -328,9 +436,9 @@ class RelayHub:
 
     # ---- broadcast ----
 
-    async def _broadcast(self, msg) -> None:
+    async def _broadcast(self, msg, machine_id: str = "default") -> None:
         async with self._lock:
-            conns = list(self._clients.values())
+            conns = list(self._clients_for(machine_id).values())
         dead: list[ClientConn] = []
         for c in conns:
             try:
@@ -338,11 +446,14 @@ class RelayHub:
             except (SlowClientError, ConnectionError):
                 dead.append(c)
         for c in dead:
-            await self._drop_client(c, code=4008, reason="slow client")
+            await self._drop_client(
+                c, code=4008, reason="slow client", machine_id=machine_id)
 
     async def _drop_client(self, conn: ClientConn, *, code: int | None = None,
-                           reason: str = "") -> None:
+                           reason: str = "", machine_id: str = "default") -> None:
         async with self._lock:
-            if self._clients.get(conn.client_id) is conn:
-                del self._clients[conn.client_id]
+            clients = self._clients_for(machine_id)
+            if clients.get(conn.client_id) is conn:
+                del clients[conn.client_id]
+                self._prune_clients_for(machine_id, clients)
         await conn.stop(code=code, reason=reason)

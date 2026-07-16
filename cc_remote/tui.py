@@ -12,6 +12,7 @@ terminal. That's the trade for true two-way sync (see the design discussion).
 
 Env:
   RELAY_URL       default ws://127.0.0.1:8765/ws
+  LOGIN_USERNAME  required only when relay multi-user login is enabled
   LOGIN_PASSWORD  optional; if omitted the TUI prompts without echo
   PUBLIC_ORIGIN   optional WebSocket Origin override (normally derived from URL)
   ENGINE          claude | codex   (which store to list / which backend for /new)
@@ -64,6 +65,7 @@ log = logger("cc_remote.tui")
 
 RELAY_URL = os.environ.get("RELAY_URL", "ws://127.0.0.1:8765/ws")
 LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "")
+LOGIN_USERNAME = os.environ.get("LOGIN_USERNAME", "")
 PUBLIC_ORIGIN = os.environ.get("PUBLIC_ORIGIN", "")
 ENGINE = os.environ.get("ENGINE", "claude")
 TUI_OUTBOX_CAP = 256
@@ -168,9 +170,9 @@ def _validate_relay_url(ws_url: str) -> str:
     return ws_url
 
 
-def _login_cookie(ws_url: str, password: str) -> str:
+def _login_cookie(ws_url: str, password: str, username: str = "") -> str:
     """Log in with the stdlib HTTP client and return a Cookie header value."""
-    body = json.dumps({"password": password}).encode("utf-8")
+    body = json.dumps({"username": username, "password": password}).encode("utf-8")
     request = Request(
         _http_endpoint(ws_url, "/api/login"),
         data=body,
@@ -189,8 +191,9 @@ def _login_cookie(ws_url: str, password: str) -> str:
 
 class Tui:
     def __init__(self, url: str, password: str, origin: str, engine: str,
-                 want_sid: Optional[str]):
+                 want_sid: Optional[str], username: str = ""):
         self.url = _validate_relay_url(url)
+        self.username = username
         self.password = password
         self.origin = _ws_origin(url, origin)
         self.cookie = ""
@@ -277,7 +280,8 @@ class Tui:
                 self._stdin_task.cancel()
 
     async def _authenticate(self) -> None:
-        self.cookie = await asyncio.to_thread(_login_cookie, self.url, self.password)
+        self.cookie = await asyncio.to_thread(
+            _login_cookie, self.url, self.password, self.username)
 
     async def _stdin_reader(self) -> None:
         loop = asyncio.get_event_loop()
@@ -982,7 +986,8 @@ class Tui:
         if t == "user_msg":
             self._line(GREEN("» ") + _safe_remote_text(ev.get("prompt", "")))
         elif t == "assistant_msg_start":
-            self._nl(); self._write(DIM("🤖 "))
+            self._nl()
+            self._write(DIM("🤖 "))
         elif t == "delta":
             self._write(_safe_remote_text(ev.get("text", "")))
         elif t == "assistant_msg_end":
@@ -1035,6 +1040,7 @@ def main() -> None:
             PUBLIC_ORIGIN,
             ENGINE if ENGINE in ("claude", "codex") else "claude",
             want_sid,
+            username=LOGIN_USERNAME,
         )
         asyncio.run(tui.run())
     except ValueError as exc:

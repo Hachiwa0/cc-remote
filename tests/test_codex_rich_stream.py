@@ -716,6 +716,86 @@ def test_codex_model_safety_events_are_bounded_and_never_change_model_chip():
         assert secret not in wire
 
 
+def test_codex_new_runtime_items_are_visible_without_forwarding_binary_results():
+    translator = CodexStreamTranslator(8_000)
+    events = _feed(translator, [
+        {"method": "item/started", "params": {"turnId": "turn-new", "item": {
+            "type": "imageView", "id": "view-1", "path": "/tmp/chart.png",
+        }}},
+        {"method": "item/completed", "params": {"turnId": "turn-new", "item": {
+            "type": "imageView", "id": "view-1", "path": "/tmp/chart.png",
+        }}},
+        {"method": "item/started", "params": {"turnId": "turn-new", "item": {
+            "type": "sleep", "id": "sleep-1", "durationMs": 1500,
+        }}},
+        {"method": "item/completed", "params": {"turnId": "turn-new", "item": {
+            "type": "sleep", "id": "sleep-1", "durationMs": 1500,
+        }}},
+        {"method": "item/completed", "params": {"turnId": "turn-new", "item": {
+            "type": "imageGeneration", "id": "image-1", "status": "completed",
+            "result": "data:image/png;base64,BINARY_IMAGE_SECRET",
+            "revisedPrompt": "一张架构图", "savedPath": "/tmp/generated.png",
+        }}},
+        {"method": "item/completed", "params": {"turnId": "turn-new", "item": {
+            "type": "enteredReviewMode", "id": "review-enter", "review": "检查变更",
+        }}},
+        {"method": "item/completed", "params": {"turnId": "turn-new", "item": {
+            "type": "exitedReviewMode", "id": "review-exit", "review": "未发现问题",
+        }}},
+    ])
+
+    assert [(event.title, event.phase) for event in events] == [
+        ("查看图片", "start"), ("查看图片", "end"),
+        ("等待", "start"), ("等待", "end"),
+        ("生成图片", "end"), ("进入 Review", "end"),
+        ("退出 Review", "end"),
+    ]
+    image = next(event for event in events if event.title == "生成图片")
+    assert image.input == {"file_path": "/tmp/generated.png"}
+    assert image.summary == "一张架构图"
+    sleep = next(event for event in events
+                 if event.title == "等待" and event.phase == "end")
+    assert sleep.duration_ms == 1500 and sleep.summary == "1.5 秒"
+    wire = "\n".join(event.model_dump_json() for event in events)
+    assert "BINARY_IMAGE_SECRET" not in wire
+
+
+def test_codex_auto_approval_and_moderation_events_are_bounded_and_sanitized():
+    translator = CodexStreamTranslator(8_000)
+    started = {
+        "action": {"type": "command", "command": "SECRET_COMMAND", "cwd": "/tmp"},
+        "review": {"status": "inProgress", "riskLevel": "high",
+                   "userAuthorization": "medium", "rationale": None},
+        "reviewId": "guardian-1", "startedAtMs": 1000,
+        "targetItemId": "tool-1", "threadId": "thread-1", "turnId": "turn-1",
+    }
+    completed = {
+        **started,
+        "review": {"status": "approved", "riskLevel": "high",
+                   "userAuthorization": "medium", "rationale": "已由策略批准"},
+        "completedAtMs": 2250, "decisionSource": "agent",
+    }
+    events = _feed(translator, [
+        {"method": "item/autoApprovalReview/started", "params": started},
+        {"method": "item/autoApprovalReview/completed", "params": completed},
+        {"method": "turn/moderationMetadata", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "metadata": {"providerSecret": "MODERATION_SECRET"},
+        }},
+    ])
+
+    assert len(events) == 3
+    assert events[0].item_id == events[1].item_id == "guardian-1"
+    assert (events[0].phase, events[0].status) == ("start", "running")
+    assert (events[1].phase, events[1].status) == ("end", "succeeded")
+    assert events[1].duration_ms == 1250
+    assert events[1].parent_id == "tool-1"
+    assert events[2].title == "内容安全检查"
+    wire = "\n".join(event.model_dump_json() for event in events)
+    assert "SECRET_COMMAND" not in wire
+    assert "MODERATION_SECRET" not in wire
+
+
 def test_codex_history_preserves_phase_tools_and_public_reasoning_once(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rows = [

@@ -15,10 +15,12 @@ import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { GoalPanel } from "./components/GoalPanel";
+import { RollbackSheet, type RollbackTarget } from "./components/RollbackSheet";
 import { StatusSheet } from "./components/StatusSheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
 import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
+import { CapabilitiesSheet } from "./components/CapabilitiesSheet";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
@@ -33,14 +35,16 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexServiceTier, type CollaborationModeName,
-  type DiffTheme, type Engine, type Space } from "./protocol";
-import type { WorkArtifactInfo, WorkDashboard } from "./protocol";
+  type DiffTheme, type Engine, type Space, type RestoreMode } from "./protocol";
+import type { EngineCapabilities, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { resolveSidebarSwipe } from "./responsive-layout";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const SPACE_KEY = "cc_remote_space";
+const NOTIFY_KEY = "cc_remote_notifications";
+const MACHINE_KEY = "cc_remote_machine";
 const HISTORY_PAGE = 60;  // turns fetched per GetHistory (initial load + each "load more")
 
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
@@ -74,8 +78,18 @@ export default function App() {
   const [forkWorktreeCreating, setForkWorktreeCreating] = useState(false);
   const [forkWorktreeError, setForkWorktreeError] = useState<string | null>(null);
   const [forkingPointId, setForkingPointId] = useState<string | null>(null);
+  const [rollbackTarget, setRollbackTarget] = useState<RollbackTarget | null>(null);
   const [workManagerOpen, setWorkManagerOpen] = useState(false);
   const [workArtifactsOpen, setWorkArtifactsOpen] = useState(false);
+  const [capabilitiesOpen, setCapabilitiesOpen] = useState(false);
+  const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
+  const [capabilitiesBySurface, setCapabilitiesBySurface] = useState<Record<string, EngineCapabilities>>({});
+  const [notificationsEnabled, setNotificationsEnabled] = useState(
+    () => localStorage.getItem(NOTIFY_KEY) === "1"
+      && typeof Notification !== "undefined" && Notification.permission === "granted");
+  const [machineId, setMachineId] = useState(
+    () => localStorage.getItem(MACHINE_KEY) || "default");
+  const [machines, setMachines] = useState<string[]>([]);
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
   const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
@@ -98,6 +112,14 @@ export default function App() {
   // newer opening spinner. Bounded because a peer may disappear permanently.
   const btwRequestIdsRef = useRef<Set<string>>(new Set());
   const discardedBtwSidsRef = useRef<Set<string>>(new Set());
+  // A marker may arrive while its session is in the background and while an
+  // IndexedDB read is already in flight. The set blocks new cache use; the
+  // epoch rejects reads that started before the destructive mutation.
+  // sid -> exact revision required by a rollback marker. null means a replay
+  // gap hid the revision, so the next authoritative first page may satisfy it.
+  const historyInvalidationsRef = useRef<Map<string, string | null>>(new Map());
+  const historyCacheEpochRef = useRef<Map<string, number>>(new Map());
+  const previousMachineRef = useRef(machineId);
   const touchStartX = useRef(0);
   const touchStartY = useRef(0);
   const touchSwipeLocked = useRef(false);
@@ -122,6 +144,22 @@ export default function App() {
     closeBtw: () => void;
   }>({ artifact: null, btwSid: null, rightView: "diff",
     getDiff: () => {}, openBtw: () => {}, closeBtw: () => {} });
+
+  useEffect(() => {
+    const previous = previousMachineRef.current;
+    if (previous === machineId) return;
+    previousMachineRef.current = machineId;
+    localStorage.setItem(MACHINE_KEY, machineId);
+    pendingCreateRef.current = null;
+    pendingBtwRef.current = null;
+    activeBtwRef.current = null;
+    sessionListsBySurfaceRef.current = {};
+    prefetchedSurfacesRef.current.clear();
+    historyInvalidationsRef.current.clear();
+    historyCacheEpochRef.current.clear();
+    dispatch({ type: "reset" });
+    void import("./cache").then((module) => module.clearCache());
+  }, [machineId]);
 
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
@@ -170,6 +208,24 @@ export default function App() {
       if (timer !== null) window.clearTimeout(timer);
     };
   }, []);
+
+  useEffect(() => {
+    if (!authed) { setMachines([]); return; }
+    let cancelled = false;
+    void fetch("/api/machines", {
+      credentials: "same-origin", cache: "no-store",
+    }).then(async (response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (cancelled || !payload || !Array.isArray(payload.machines)) return;
+        const available = payload.machines.filter((value: unknown): value is string =>
+          typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/.test(value));
+        setMachines(available);
+        if (available.length && !available.includes(machineId)) {
+          setMachineId(available[0]);
+        }
+      }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [authed, machineId]);
 
   // Swipe right -> open sidebar, swipe left -> close (mobile). Interactive
   // vertical scrollers opt out so a diagonal scroll never becomes navigation.
@@ -283,6 +339,82 @@ export default function App() {
       if (cancelled) return;
       const ws = new RelayWs({
         onEvent: (msg) => {
+          if (msg.type === "history_invalidated") {
+            const sid = msg.session_id;
+            if (historyInvalidationsRef.current.get(sid) !== msg.revision) {
+              historyInvalidationsRef.current.set(sid, msg.revision);
+              historyCacheEpochRef.current.set(
+                sid, (historyCacheEpochRef.current.get(sid) ?? 0) + 1);
+              void import("./cache").then((module) =>
+                module.invalidateSessionCache(sid));
+            }
+            // The marker is deliberately tiny/replayable; the full replacement
+            // is one-shot and may have been dropped by a disconnect or frame
+            // size bound. Fetch immediately when visible; a background session
+            // gets the same authoritative request when it is later focused.
+            if (stateRef.current.focusedSid === sid) {
+              ws.sendGetHistory(sid, undefined, HISTORY_PAGE);
+            }
+          } else if (msg.type === "artifact_invalidated") {
+            const sid = msg.session_id;
+            setWorkArtifactsBySid((current) => {
+              if (!(sid in current)) return current;
+              const next = { ...current };
+              delete next[sid];
+              return next;
+            });
+            const session = stateRef.current.sessions.find(
+              (candidate) => candidate.session_id === sid);
+            if (session?.space === "work"
+                || (spaceRef.current === "work"
+                  && stateRef.current.focusedSid === sid)) {
+              ws.sendGetWorkArtifacts(
+                (session?.engine as Engine | undefined) ?? engineRef.current,
+                sid,
+              );
+            }
+          } else if (msg.type === "replay_start" && msg.sid
+              && (msg.truncated || msg.rebuild)) {
+            const sid = msg.sid;
+            // If a marker is still retained inside this replay it will follow
+            // ReplayStart and replace null with its exact revision.
+            if (!historyInvalidationsRef.current.has(sid)) {
+              historyInvalidationsRef.current.set(sid, null);
+              historyCacheEpochRef.current.set(
+                sid, (historyCacheEpochRef.current.get(sid) ?? 0) + 1);
+              void import("./cache").then((module) =>
+                module.invalidateSessionCache(sid));
+            }
+            setWorkArtifactsBySid((current) => {
+              if (!(sid in current)) return current;
+              const next = { ...current };
+              delete next[sid];
+              return next;
+            });
+            if (stateRef.current.focusedSid === sid) {
+              ws.sendGetHistory(sid, undefined, HISTORY_PAGE);
+            }
+          } else if (msg.type === "history" && msg.authoritative !== false && !msg.before
+              && historyInvalidationsRef.current.has(msg.session_id)) {
+            const expected = historyInvalidationsRef.current.get(msg.session_id);
+            if (expected === null || expected === msg.revision) {
+              // A late first page from an older revision must not re-enable the
+              // cache behind a newer destructive marker.
+              historyInvalidationsRef.current.delete(msg.session_id);
+              void import("./cache").then((module) =>
+                module.allowSessionCache(msg.session_id));
+            }
+          }
+          if (msg.type === "rollback_result" && msg.files === "succeeded"
+              && stateRef.current.artifact?.sid === msg.session_id) {
+            // Diff/file previews are snapshots of bytes that have just changed.
+            // Close them instead of leaving a convincing but stale panel open.
+            dispatch({ type: "clear_artifact" });
+          }
+          if (msg.type === "rollback_result" && msg.prefill_text
+              && stateRef.current.focusedSid === msg.session_id) {
+            setEditPrompt(msg.prefill_text);
+          }
           if (msg.type === "btw_opened") {
             const disposition = classifyBtwOpened(
               pendingBtwRef.current, activeBtwRef.current, msg);
@@ -430,6 +562,28 @@ export default function App() {
               ...current, [msg.session_id]: msg.artifacts,
             }));
           }
+          if (msg.type === "engine_capabilities") {
+            setCapabilitiesBySurface((current) => ({
+              ...current, [`${msg.space}:${msg.engine}`]: msg,
+            }));
+            if (msg.space === spaceRef.current && msg.engine === engineRef.current) {
+              setCapabilitiesLoading(false);
+            }
+          }
+          if (msg.type === "turn_end" && msg.sid && document.hidden
+              && localStorage.getItem(NOTIFY_KEY) === "1"
+              && typeof Notification !== "undefined"
+              && Notification.permission === "granted") {
+            const session = stateRef.current.sessions.find(
+              (candidate) => candidate.session_id === msg.sid);
+            const label = session?.engine === "codex" ? "Codex" : "Claude";
+            const body = msg.result.is_error ? `${label} 会话执行失败` : `${label} 会话已经完成`;
+            void navigator.serviceWorker?.ready.then((registration) =>
+              registration.showNotification("cc-remote", {
+                body, icon: "/favicon.svg", badge: "/favicon.svg",
+                tag: `turn-${msg.sid}`, data: { url: "/" },
+              })).catch(() => undefined);
+          }
           if (msg.type === "session_focus" && spaceRef.current === "work"
               && !msg.session_id.startsWith("tmp-")) {
             ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
@@ -488,8 +642,11 @@ export default function App() {
           activeBtwRef.current = null;
           btwRequestIdsRef.current.clear();
           discardedBtwSidsRef.current.clear();
+          historyInvalidationsRef.current.clear();
+          historyCacheEpochRef.current.clear();
           setBtwOpening(false);
           setForkingPointId(null);
+          setRollbackTarget(null);
           setForkWorktreeSession(null);
           setForkWorktreeCreating(false);
           setForkWorktreeError(null);
@@ -521,7 +678,7 @@ export default function App() {
               detail: "wrapper 已重启，临时 /btw 会话已关闭，请重新打开。" });
           }
         },
-      });
+      }, machineId);
       ws.setSurface(engineRef.current, spaceRef.current);
       ws.seedReplayState(seeded.cursors, seeded.generations);
       wsRef.current = ws;
@@ -534,7 +691,7 @@ export default function App() {
       wsRef.current = null;
       draining.clear();
     };
-  }, [authed]);
+  }, [authed, machineId]);
 
   // Land on the preferred/recent session only after an accepted list for the
   // active engine+space arrives. Background snapshots never pick focus.
@@ -608,12 +765,18 @@ export default function App() {
   // background sessions too). Coalesced in cache.ts.
   useEffect(() => {
     const sid = rt.ccSessionId;
-    if (!sid || rt.turns.length === 0) return;
+    const revision = rt.historyRevision;
+    if (!sid || rt.turns.length === 0
+        || !revision
+        || historyInvalidationsRef.current.has(sid)) return;
     import("./cache").then(({ saveSession }) => {
       const live = wsRef.current?.lastSeqFor(sid) || 0;
-      saveSession(sid, rt.turns, live, wsRef.current?.generationFor(sid));
+      saveSession(
+        sid, rt.turns, live, revision,
+        wsRef.current?.generationFor(sid),
+      );
     });
-  }, [focusedSid, rt.turns, rt.ccSessionId]);
+  }, [focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision]);
 
   // Hydrate the focused session's turns from IndexedDB for an INSTANT render on
   // switch — the wrapper's replay (for non-resident sessions) then reconciles.
@@ -624,12 +787,21 @@ export default function App() {
     const sid = focusedSid;
     if (!sid) return;
     let cancelled = false;
+    const cacheEpoch = historyCacheEpochRef.current.get(sid) ?? 0;
     import("./cache").then(({ loadSession }) => loadSession(sid)).then((cached) => {
-      if (!cancelled && cached && Array.isArray(cached.turns) && cached.turns.length) {
-        dispatch({ type: "hydrate_cache", sid, turns: cached.turns as Turn[] });
+      if (!cancelled
+          && cacheEpoch === (historyCacheEpochRef.current.get(sid) ?? 0)
+          && !historyInvalidationsRef.current.has(sid)
+          && cached && Array.isArray(cached.turns) && cached.turns.length) {
+        dispatch({
+          type: "hydrate_cache", sid, turns: cached.turns as Turn[],
+          revision: cached.revision,
+        });
       }
     });
-    const t = window.setTimeout(() => dispatch({ type: "hydrate_cache", sid, turns: [] }), 6000);
+    const t = window.setTimeout(() => dispatch({
+      type: "hydrate_cache", sid, turns: [], revision: null,
+    }), 6000);
     return () => { cancelled = true; window.clearTimeout(t); };
   }, [focusedSid]);
 
@@ -791,6 +963,39 @@ export default function App() {
     if (command.kind === "show") wsRef.current?.sendGetGoal();
     else wsRef.current?.sendSetGoal(command.objective, "active", null);
   };
+  const openClaudeRewind = (checkpointId: string, prompt: string) => {
+    if (!focusedSid || focusedEngine !== "claude" || space !== "code") return;
+    const label = prompt.trim()
+      ? `回到“${prompt.trim().slice(0, 48)}${prompt.trim().length > 48 ? "…" : ""}”`
+      : "回到所选消息";
+    setRollbackTarget({
+      sessionId: focusedSid, engine: "claude", checkpointId,
+      numTurns: 1, label,
+    });
+  };
+  const openLatestClaudeRewind = () => {
+    const turn = [...rt.turns].reverse().find((item) => item.done && item.checkpointId);
+    if (!turn?.checkpointId) {
+      dispatch({ type: "command_error", detail: "当前历史没有可用的 Claude checkpoint；请在新回合完成后重试" });
+      return;
+    }
+    openClaudeRewind(turn.checkpointId, turn.prompt);
+  };
+  const openCodexRollback = (numTurns: number, sessionId = focusedSid) => {
+    if (!sessionId) return;
+    setRollbackTarget({
+      sessionId, engine: "codex", numTurns,
+      label: `最近 ${numTurns} 轮`,
+    });
+  };
+  const confirmRollback = (mode: RestoreMode) => {
+    const target = rollbackTarget;
+    if (!target) return;
+    wsRef.current?.sendRollbackSession(
+      target.sessionId, target.engine, mode, target.numTurns,
+      target.checkpointId);
+    setRollbackTarget(null);
+  };
   const openStatus = () => {
     if (!focusedSid) return;
     setStatusOpenSid(focusedSid);
@@ -924,8 +1129,11 @@ export default function App() {
       activeBtwRef.current = null;
       btwRequestIdsRef.current.clear();
       discardedBtwSidsRef.current.clear();
+      historyInvalidationsRef.current.clear();
+      historyCacheEpochRef.current.clear();
       setCreateError(null);
       setForkingPointId(null);
+      setRollbackTarget(null);
       setForkWorktreeSession(null);
       setForkWorktreeCreating(false);
       setForkWorktreeError(null);
@@ -952,9 +1160,15 @@ export default function App() {
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
         onDelete={(id) => {
-          if (space !== "work" || !window.confirm("删除后将永久移除这项工作及其私有文件，确定继续吗？")) return;
+          const warning = space === "work"
+            ? "删除后将永久移除这项工作及其私有文件，确定继续吗？"
+            : "删除后将永久移除这条会话历史；代码文件不会被删除，确定继续吗？";
+          if (!window.confirm(warning)) return;
           if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~" });
-          wsRef.current?.sendDeleteWorkSession(id, engine);
+          wsRef.current?.sendDeleteSession(id, engine, space);
+        }}
+        onRollback={(id) => {
+          openCodexRollback(1, id);
         }}
         onForkWorktree={openForkWorktree}
       />
@@ -967,6 +1181,8 @@ export default function App() {
         onConfirm={(cwd) => { if (state.newChat) dispatch({ type: "set_new_chat_cwd", cwd }); setDirPickerOpen(false); }}
         onClose={() => setDirPickerOpen(false)}
       />
+      <RollbackSheet target={rollbackTarget}
+        onClose={() => setRollbackTarget(null)} onConfirm={confirmRollback} />
       <section className={`pane ${space}-pane`}>
         <header className={`c-head ${space}-head`}>
           <div className="titlewrap">
@@ -979,14 +1195,38 @@ export default function App() {
             <div className="sub">{space === "work" ? "私有工作区 · " : ""}{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</div>
           </div>
           <span className={`hstat ${rt.state}`}><span className="sd" />{rt.state}</span>
-          {space === "work" && !state.newChat && currentWorkArtifacts.length > 0 && (
-            <button className="work-artifacts-btn" onClick={() => setWorkArtifactsOpen(true)}>
-              <Icon name="read" size={15} /><span>Artifacts</span>
-              <b>{currentWorkArtifacts.length}</b>
-            </button>
-          )}
+          {machines.length > 1 && <select className="machine-select"
+            value={machineId} onChange={(event) => setMachineId(event.target.value)}
+            aria-label="远程机器" title="切换远程机器">
+            {machines.map((machine) => <option key={machine} value={machine}>{machine}</option>)}
+          </select>}
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
+          <button className="iconbtn" onClick={() => {
+            setCapabilitiesOpen(true);
+            setCapabilitiesLoading(true);
+            wsRef.current?.sendGetEngineCapabilities(
+              engine, space, state.newChat?.cwd ?? state.currentCwd);
+          }} aria-label="Agent 能力" title="技能、插件、应用与 MCP">
+            <Icon name="spark" />
+          </button>
+          {typeof Notification !== "undefined" && <button
+            className={`iconbtn${notificationsEnabled ? " notify-on" : ""}`}
+            onClick={() => { void (async () => {
+              if (notificationsEnabled) {
+                localStorage.removeItem(NOTIFY_KEY);
+                setNotificationsEnabled(false);
+                return;
+              }
+              const permission = await Notification.requestPermission();
+              const enabled = permission === "granted";
+              if (enabled) localStorage.setItem(NOTIFY_KEY, "1");
+              else localStorage.removeItem(NOTIFY_KEY);
+              setNotificationsEnabled(enabled);
+            })(); }} aria-label="完成提醒"
+            title={notificationsEnabled ? "后台完成提醒已开启" : "开启后台完成提醒"}>
+            <Icon name="notify" />
+          </button>}
           <button className="iconbtn" onClick={toggleTheme} aria-label="切换主题">
             <Icon name={theme === "dark" ? "sun" : "moon"} />
           </button>
@@ -1028,7 +1268,8 @@ export default function App() {
                 }
                 setWorkArtifactsOpen(true);
               }}
-              onFork={space === "code" ? forkFromTurn : undefined} />
+              onFork={space === "code" ? forkFromTurn : undefined}
+              onRewind={space === "code" ? openClaudeRewind : undefined} />
 
             <GoalPanel engine={engine} goal={rt.goal}
               revealed={!!goalUi?.revealed} open={!!goalUi?.open}
@@ -1082,8 +1323,25 @@ export default function App() {
           onOpenBtw={openBtw}
           onPreview={previewMarkdown}
           onGoal={runGoal}
+          onRewind={openLatestClaudeRewind}
           onStatus={openStatus}
-          onManageWork={() => setWorkManagerOpen(true)}
+          onReview={(target, value) => {
+            if (focusedSid) wsRef.current?.sendStartReview(focusedSid, target, value);
+          }}
+          onCompact={() => {
+            if (focusedSid) wsRef.current?.sendCompactSession(focusedSid);
+          }}
+          onRollback={(numTurns) => {
+            if (!focusedSid) return;
+            openCodexRollback(numTurns);
+          }}
+          workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
+          onOpenArtifacts={() => {
+            if (focusedSid) {
+              wsRef.current?.sendGetWorkArtifacts(focusedEngine, focusedSid);
+            }
+            setWorkArtifactsOpen(true);
+          }}
           contextReport={rt.contextReport}
         />
           </>
@@ -1148,6 +1406,23 @@ export default function App() {
         artifacts={currentWorkArtifacts}
         onOpen={(path) => { setWorkArtifactsOpen(false); previewFile(path); }}
         onClose={() => setWorkArtifactsOpen(false)} />
+      <CapabilitiesSheet open={capabilitiesOpen}
+        report={capabilitiesBySurface[`${space}:${engine}`] ?? null}
+        loading={capabilitiesLoading}
+        onRefresh={() => {
+          setCapabilitiesLoading(true);
+          wsRef.current?.sendGetEngineCapabilities(
+            engine, space, state.newChat?.cwd ?? state.currentCwd);
+        }}
+        onManagePlugin={(item, action) => {
+          const verb = action === "install" ? "安装" : "卸载";
+          if (!window.confirm(`${verb}插件「${item.name}」将修改本机 ${engine === "codex" ? "Codex" : "Claude"} 配置，确定继续吗？`)) return;
+          setCapabilitiesLoading(true);
+          wsRef.current?.sendManageEnginePlugin(
+            engine, space, action, item.id,
+            state.newChat?.cwd ?? state.currentCwd);
+        }}
+        onClose={() => setCapabilitiesOpen(false)} />
     </div>
   );
 }

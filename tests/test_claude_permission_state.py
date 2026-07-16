@@ -115,6 +115,54 @@ def test_claude_model_probe_failure_does_not_fail_connect(monkeypatch):
     asyncio.run(go())
 
 
+def test_claude_work_captures_pre_turn_context_baseline_only_once(
+    monkeypatch,
+):
+    class ContextClient(_FakeClaudeClient):
+        totals = iter((1_234, 9_999, 8_888, 777))
+
+        async def get_context_usage(self):
+            return {
+                "model": self.options.model or "claude-mythos-5",
+                "totalTokens": next(self.totals),
+            }
+
+    async def go():
+        ContextClient.created = []
+        ContextClient.totals = iter((1_234, 9_999, 8_888, 777))
+        monkeypatch.setattr(sdk_module, "ClaudeSDKClient", ContextClient)
+        handle = SdkHandle(WrapperConfig())
+        handle.work_mode = True
+        handle.work_settings_path = "/tmp/cc-remote-work-policy.json"
+
+        await handle.connect(cwd="/tmp")
+        assert handle.work_context_baseline_tokens == 1_234
+
+        # Runtime reconnects must not redefine the fixed engine baseline from a
+        # later conversation state.
+        await handle.force_reconnect(None, "/tmp", reason="baseline regression")
+        assert handle.work_context_baseline_tokens == 1_234
+        assert len(ContextClient.created) == 2
+        await handle.disconnect()
+
+        # A migrated Work session has no trustworthy pre-history baseline.
+        # Resume must not relabel its entire existing conversation as fixed
+        # engine overhead.
+        resumed = SdkHandle(WrapperConfig())
+        resumed.work_mode = True
+        resumed.work_settings_path = "/tmp/cc-remote-work-policy.json"
+        await resumed.connect(resume_id="existing-session", cwd="/tmp")
+        assert resumed.work_context_baseline_tokens is None
+        await resumed.disconnect()
+
+        code = SdkHandle(WrapperConfig())
+        await code.connect(cwd="/tmp")
+        assert code.work_context_baseline_tokens is None
+        await code.disconnect()
+
+    asyncio.run(go())
+
+
 def test_claude_new_session_defaults_use_settings_without_sdk_probe(
     monkeypatch, tmp_path,
 ):

@@ -27,6 +27,7 @@ export const COMMANDS: Command[] = [
   { slash: "init", name: "初始化 CLAUDE.md", ds: "生成代码库说明", ic: "init" },
   { g: "会话" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
+  { slash: "rewind", name: "回到上一轮", ds: "选择只回滚对话、代码或两者", ic: "history" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "clear", name: "清空会话", ds: "开新会话，清空上下文", ic: "close" },
@@ -178,20 +179,19 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // Slashes handled locally by the web client (never forwarded to cc as a prompt).
 // Everything else (code-review, verify, run, deep-research, …) is a cc skill and
 // is forwarded verbatim so cc's own slash-command layer runs it.
-export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "btw", "preview"]);
+export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "preview"]);
 
-// Codex engine command palette — its REAL slash commands (verified against the
-// codex binary's own "get started" hint: /init /status /permissions /model /review).
-// Client-handled: model/clear/context/status/permissions. /context is the focused
+// Codex engine command palette. Native app-server controls are handled locally
+// and never expanded into natural-language lookalikes. /context is the focused
 // thread's token window; /status is a separate app-server snapshot (thread,
-// config, account and rate limits). Forwarded
-// ones (review/init) expand to a prompt codex handles agentically — the app-server
-// has no TUI slash layer. /fast maps to app-server's per-thread service tier,
+// config, account and rate limits). /review maps to review/start, /compact maps
+// to thread/compact/start, and /rollback maps to thread/rollback. /init remains
+// an explicit compatibility prompt because app-server has no init RPC. /fast maps to app-server's per-thread service tier,
 // and /hook is Claude-only. /plan and /normal are handled locally by the web
 // client and mapped to app-server collaborationMode, not sent as prompt text.
 export const CODEX_COMMANDS: Command[] = [
   { g: "审查" },
-  { slash: "review", name: "代码审查", ds: "审当前 git 改动的 bug 与改进", ic: "review" },
+  { slash: "review", name: "代码审查", ds: "/review [base 分支 | commit SHA | custom 要求]", ic: "review" },
   { g: "项目" },
   { slash: "init", name: "初始化 AGENTS.md", ds: "生成/更新代码库说明", ic: "init" },
   { g: "模式" },
@@ -206,15 +206,16 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "status", name: "完整状态", ds: "线程 · 配置 · 账户 · 限额 · token", ic: "cpu" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用与容量", ic: "cpu" },
+  { slash: "compact", name: "压缩上下文", ds: "调用 Codex 原生 compact", ic: "simplify" },
+  { slash: "rollback", name: "回滚", ds: "/rollback [轮数] · 可选择对话、代码或两者", ic: "history" },
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
-export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview"]);
+export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview", "review", "compact", "rollback"]);
 export const commandsFor = (engine?: string): Command[] => (engine === "codex" ? CODEX_COMMANDS : COMMANDS);
 export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
 // codex slash -> the prompt actually sent to codex (agentic; no TUI slash layer).
 export const CODEX_PROMPTS: Record<string, string> = {
-  review: "Review the current git changes (the diff) for correctness bugs, risks, and simplifications. Be concise.",
   init: "Create or update AGENTS.md at the repo root: a concise overview of this codebase, how to build/test/run it, and key conventions.",
 };
 

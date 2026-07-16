@@ -28,11 +28,13 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 14
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
 Space = Literal["code", "work"]
+RestoreMode = Literal["conversation", "files", "both"]
+RestoreOutcome = Literal["succeeded", "failed", "skipped"]
 AssistantChannel = Literal["unknown", "thinking", "commentary", "final"]
 ToolCategory = Literal[
     "tool", "command", "file", "mcp", "agent", "server_tool", "web_search",
@@ -254,6 +256,7 @@ class Hello(_Base):
     type: Literal["hello"] = "hello"
     role: Literal["client", "wrapper"]
     client_id: Optional[WireId] = None  # client
+    machine_id: Optional[WireId] = None  # relay route; wrapper identity
     last_seq: Optional[int] = None  # client (legacy: focused session only)
     cursors: Optional[dict[WireId, int]] = None  # client: per-session last_seq for multi-session catch-up
     generations: Optional[dict[WireId, WireId]] = None  # client: wrapper generation paired with each cursor
@@ -604,6 +607,9 @@ class TurnEnd(_Base):
     # Synthetic/legacy boundaries without a real engine id leave it unset.
     # The legacy wire name stays stable for protocol-v5 browser compatibility.
     turn_id: Optional[WireId] = None
+    # Claude's file-checkpoint API targets the top-level user transcript UUID,
+    # not the assistant UUID above or the browser's optimistic message id.
+    checkpoint_id: Optional[WireId] = None
 
 
 class Error(_Base):
@@ -737,6 +743,82 @@ class DeleteWorkSession(_Command):
     space: Literal["work"] = "work"
 
 
+class DeleteSession(_Command):
+    """Permanently delete a native Code session or a registered Work session."""
+    type: Literal["delete_session"] = "delete_session"
+    session_id: WireId
+    engine: Engine
+    space: Space = "code"
+
+
+class RollbackSession(_Command):
+    """Restore conversation state, files, or both for one Code session.
+
+    Claude targets an authoritative user-message checkpoint. Codex targets the
+    latest ``num_turns`` because app-server's rollback RPC is count-based.
+    Conversation and file restore deliberately report separate outcomes: the
+    two engines do not expose an atomic transaction spanning both operations.
+    """
+    type: Literal["rollback_session"] = "rollback_session"
+    session_id: WireId
+    engine: Engine
+    space: Literal["code"] = "code"
+    restore: RestoreMode = "conversation"
+    num_turns: int = Field(default=1, ge=1, le=1000)
+    checkpoint_id: Optional[WireId] = None
+
+    @model_validator(mode="after")
+    def target_matches_engine(self):
+        if self.engine == "claude" and self.checkpoint_id is None:
+            raise ValueError("Claude rewind requires checkpoint_id")
+        if self.engine == "codex" and self.checkpoint_id is not None:
+            raise ValueError("Codex rollback is count-based")
+        return self
+
+
+class RollbackResult(_Base):
+    """Structured, non-atomic restore result for the confirmation UI."""
+    type: Literal["rollback_result"] = "rollback_result"
+    session_id: WireId
+    engine: Engine
+    restore: RestoreMode
+    conversation: RestoreOutcome
+    files: RestoreOutcome
+    restored_turns: int = Field(default=0, ge=0, le=1000)
+    conflicts: list[str] = Field(default_factory=list, max_length=128)
+    prefill_text: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
+    detail: Optional[str] = Field(default=None, max_length=4 * 1024)
+
+
+class CompactSession(_Command):
+    type: Literal["compact_session"] = "compact_session"
+    session_id: WireId
+    engine: Literal["codex"] = "codex"
+    space: Literal["code"] = "code"
+
+
+class StartReview(_Command):
+    type: Literal["start_review"] = "start_review"
+    session_id: WireId
+    engine: Literal["codex"] = "codex"
+    space: Literal["code"] = "code"
+    target: Literal["uncommittedChanges", "baseBranch", "commit", "custom"]
+    value: Optional[str] = Field(default=None, max_length=16 * 1024)
+
+    @model_validator(mode="after")
+    def target_value_matches(self):
+        value = (self.value or "").strip()
+        if self.target == "uncommittedChanges":
+            if value:
+                raise ValueError("uncommittedChanges does not accept a value")
+            self.value = None
+        elif not value:
+            raise ValueError(f"{self.target} requires a value")
+        else:
+            self.value = value
+        return self
+
+
 class WorkProjectInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project_id: WireId
@@ -779,6 +861,11 @@ class WorkScheduleInfo(BaseModel):
     last_run_at: Optional[float] = Field(default=None, ge=0)
     last_session_id: Optional[WireId] = None
     last_error: Optional[str] = Field(default=None, max_length=2000)
+    last_run_id: Optional[WireId] = None
+    last_run_status: Optional[
+        Literal["queued", "claimed", "running", "succeeded", "failed"]
+    ] = None
+    last_run_attempt: Optional[int] = Field(default=None, ge=0, le=100)
     created_at: float = Field(ge=0)
     updated_at: float = Field(ge=0)
 
@@ -1037,6 +1124,51 @@ class Models(_Base):
     cwd: Optional[str] = Field(default=None, max_length=4096)
 
 
+class GetEngineCapabilities(_Command):
+    """Read the engine's real skill/plugin/app/MCP inventory on demand."""
+    type: Literal["get_engine_capabilities"] = "get_engine_capabilities"
+    engine: Engine
+    space: Space = "code"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class ManageEnginePlugin(_Command):
+    """Install or uninstall one plugin through the engine's native manager."""
+    type: Literal["manage_engine_plugin"] = "manage_engine_plugin"
+    engine: Engine
+    action: Literal["install", "uninstall"]
+    plugin_id: str = Field(min_length=1, max_length=512)
+    space: Space = "code"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class EngineCapabilityItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["skill", "plugin", "app", "mcp"]
+    id: str = Field(max_length=512)
+    name: str = Field(max_length=512)
+    description: Optional[str] = Field(default=None, max_length=16 * 1024)
+    enabled: Optional[bool] = None
+    installed: Optional[bool] = None
+    status: Optional[str] = Field(default=None, max_length=256)
+    scope: Optional[str] = Field(default=None, max_length=256)
+    source: Optional[str] = Field(default=None, max_length=256)
+    tool_count: Optional[int] = Field(default=None, ge=0, le=100_000)
+    resource_count: Optional[int] = Field(default=None, ge=0, le=100_000)
+    install_url: Optional[str] = Field(default=None, max_length=4096)
+
+
+class EngineCapabilities(_Base):
+    type: Literal["engine_capabilities"] = "engine_capabilities"
+    engine: Engine
+    space: Space
+    items: list[EngineCapabilityItem] = Field(max_length=2000)
+    errors: list[str] = Field(default_factory=list, max_length=32)
+    notes: list[str] = Field(default_factory=list, max_length=32)
+
+
 class SetPerm(_Command):
     """client -> wrapper: switch the cc session's permission mode (runtime, no reconnect)."""
     type: Literal["set_perm"] = "set_perm"
@@ -1062,6 +1194,13 @@ class ContextReport(_Base):
     total_tokens: int
     max_tokens: int
     percentage: float
+    # Work reports keep the engine's real context usage above for honest
+    # remaining-capacity calculations, while exposing the fresh-session startup
+    # zero point separately so Work shows later conversation growth.
+    # Code omits these fields and retains the historical wire contract.
+    session_tokens: Optional[int] = None
+    fixed_tokens: Optional[int] = None
+    session_percentage: Optional[float] = None
     model: Optional[str] = None
     is_auto_compact_enabled: Optional[bool] = None
     categories: list[dict[str, Any]] = []
@@ -1329,6 +1468,27 @@ class History(_Base):
     mirror push below, which is broadcast."""
     type: Literal["history"] = "history"
     session_id: WireId
+    # Boot-scoped authoritative transcript revision.  Browsers persist this
+    # beside cached turns and must replace completed cache state whenever it
+    # changes, including after a wrapper restart or destructive rewind.
+    revision: WireId
+    # Wrapper lifetime that owns build_seq. It lets clients reject a pre-
+    # rollback response across revision epochs while still accepting build_seq
+    # restarting from one after a real wrapper restart.
+    generation: Optional[WireId] = None
+    # Monotonic per-session sequence for newest-page builds. Pagination echoes
+    # the sequence of the newest page it belongs to, so a browser can reject an
+    # older first page without rejecting a valid older page from the same view.
+    build_seq: int = Field(default=0, ge=0)
+    # Resident-session downstream sequence captured before transcript I/O.
+    # When the browser has already consumed a newer live event, this History is
+    # still useful for merging older rows but cannot delete the newer live tail.
+    live_seq: Optional[int] = Field(default=None, ge=0)
+    # A parse/read failure is not an authoritative empty transcript. Keeping the
+    # failure on the History envelope lets clients stop loading without erasing
+    # their last known good conversation.
+    authoritative: bool = True
+    error: Optional[str] = Field(default=None, max_length=4096)
     events: list[dict[str, Any]] = []
     has_more: bool = False            # older turns exist beyond what's returned (pagination)
     oldest_id: Optional[str] = None   # first returned stable turn cursor
@@ -1347,6 +1507,32 @@ class History(_Base):
     # transcript has no ResultMessage, so the final History TurnEnd is synthetic;
     # clients must not let it close their matching live tail while this is true.
     in_progress: bool = False
+    # Authoritative replacement after a destructive history mutation such as
+    # Codex rollback. Ordinary loads merge with a live tail; reset loads must
+    # discard turns that the engine has just removed.
+    reset: bool = False
+
+
+class HistoryInvalidated(_Base):
+    """Small replayable barrier emitted before destructive history replacement.
+
+    A complete History frame can exceed the bounded ring and is intentionally
+    one-shot. This marker remains replayable, so an offline client always drops
+    turns removed by rollback before its next transcript refresh is merged.
+    """
+
+    type: Literal["history_invalidated"] = "history_invalidated"
+    session_id: WireId
+    revision: WireId
+    reason: Literal["rollback"] = "rollback"
+
+
+class ArtifactInvalidated(_Base):
+    """Replayable barrier for previews made stale by file rollback."""
+
+    type: Literal["artifact_invalidated"] = "artifact_invalidated"
+    session_id: WireId
+    reason: Literal["rollback"] = "rollback"
 
 
 class AskUser(_Base):
@@ -1435,8 +1621,8 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, DeleteWorkSession, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, Models, AskUser, AnswerQuestion,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, GetEngineCapabilities, ManageEnginePlugin, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
@@ -1453,7 +1639,7 @@ DOWNSTREAM_TYPES = frozenset({
     "collaboration_mode", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_end",
-    "error", "ask_user",
+    "error", "ask_user", "history_invalidated", "artifact_invalidated",
 })
 
 _TYPE_MAP: dict[str, type[BaseModel]] = {
@@ -1479,10 +1665,18 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_history": GetHistory,
     "get_models": GetModels,
     "models": Models,
+    "get_engine_capabilities": GetEngineCapabilities,
+    "engine_capabilities": EngineCapabilities,
+    "manage_engine_plugin": ManageEnginePlugin,
     "list_sessions": ListSessions,
     "switch_session": SwitchSession,
     "new_session": NewSession,
     "delete_work_session": DeleteWorkSession,
+    "delete_session": DeleteSession,
+    "rollback_session": RollbackSession,
+    "rollback_result": RollbackResult,
+    "compact_session": CompactSession,
+    "start_review": StartReview,
     "get_work_dashboard": GetWorkDashboard,
     "create_work_project": CreateWorkProject,
     "delete_work_project": DeleteWorkProject,
@@ -1522,6 +1716,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "preview_asset": PreviewAsset,
     "work_artifacts": WorkArtifacts,
     "history": History,
+    "history_invalidated": HistoryInvalidated,
+    "artifact_invalidated": ArtifactInvalidated,
     "ask_user": AskUser,
     "answer_question": AnswerQuestion,
     "get_goal": GetGoal,
@@ -1582,6 +1778,17 @@ def deserialize(raw: str | bytes) -> AnyMessage:
 
 
 def serialize(msg: BaseModel) -> str:
+    if isinstance(msg, ContextReport) and all(
+        value is None for value in (
+            msg.session_tokens, msg.fixed_tokens, msg.session_percentage,
+        )
+    ):
+        # Keep the existing Code wire shape byte-for-field compatible. The
+        # optional breakdown exists only on Work reports that actually have a
+        # trustworthy new-session baseline.
+        return msg.model_dump_json(exclude={
+            "session_tokens", "fixed_tokens", "session_percentage",
+        })
     return msg.model_dump_json()
 
 

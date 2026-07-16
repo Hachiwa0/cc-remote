@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
@@ -25,6 +24,17 @@ from mcp.server import Server
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.wrapper.child_env import child_env_tombstones
+from cc_remote.wrapper.claude_rewind import (
+    ClaudeConversationRewindCapability,
+    ClaudeConversationRewindResult,
+    ClaudeRewindError,
+    classify_control_failure,
+    is_unsupported_control_error,
+    parse_conversation_rewind_response,
+    response_proves_conversation_rewind,
+    validate_rewind_target,
+)
+from cc_remote.wrapper.claude_runtime import inspect_claude_runtime
 from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
 from cc_remote.wrapper.claude_goal import (
     NO_GOAL_EVENT,
@@ -37,8 +47,24 @@ from cc_remote.wrapper.claude_goal import (
 
 log = logger("cc_remote.wrapper.sdk")
 
-REQUIRED_SDK = (0, 2)  # 0.2.x; the interrupt/drain contract is version-sensitive
 CLAUDE_DEFAULT_EFFORT = "max"
+_CONVERSATION_REWIND_PROBE_UUID = "00000000-0000-0000-0000-000000000000"
+
+# Work keeps the file primitives needed for documents and other deliverables,
+# plus first-party web research.  Deliberately omit Agent/Task, Skill,
+# NotebookEdit and the coding-only planning tools: the private Work workspace
+# can still generate DOCX/XLSX/PPTX/PDF through Bash without loading their
+# schemas or any subagent definitions into every conversation.
+CLAUDE_WORK_TOOLS = [
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "Bash",
+    "WebSearch",
+    "WebFetch",
+]
 
 
 class _MessagePumpFailure:
@@ -82,11 +108,19 @@ class SdkHandle:
         self.permission_mode = "bypassPermissions"
         self.work_mode = False
         self.work_settings_path: str | None = None
+        # Captured once, before the first Work turn.  The UI can subtract this
+        # fixed engine/tool overhead without pretending those real tokens do not
+        # exist.  Code sessions intentionally leave it unset.
+        self.work_context_baseline_tokens: int | None = None
         # A SetPerm can arrive while a turn task is respawning Claude for effort
         # or stale history. Serialize those two control paths so a successful
         # runtime change cannot land on the old child after the new options were
         # already captured.
         self._permission_reconnect_lock = asyncio.Lock()
+        self._conversation_rewind_probe_lock = asyncio.Lock()
+        self._conversation_rewind_capability: (
+            ClaudeConversationRewindCapability | None
+        ) = None
         self.permission_callback: Callable[[str, dict[str, Any], Any], Awaitable[Any]] | None = None
         # Claude has no goal RPC.  This cache is reconstructed from native
         # goal_status transcript attachments on resume and updated by the live
@@ -124,24 +158,17 @@ class SdkHandle:
 
     @staticmethod
     def preflight(cli_path: str = "") -> None:
-        explicit = _explicit_cli_path(cli_path)
-        if explicit:
-            if not os.path.isfile(explicit) or not os.access(explicit, os.X_OK):
-                raise RuntimeError(
-                    f"CLAUDE_BIN is not an executable file: {explicit}"
-                )
-        elif not shutil.which("claude"):
-            raise RuntimeError("'claude' CLI not found on PATH; install Claude Code v2.1.51+")
-        try:
-            parts = SDK_VERSION.split(".")
-            major, minor = int(parts[0]), int(parts[1])
-        except Exception:
-            raise RuntimeError(f"unparsable claude-agent-sdk version: {SDK_VERSION!r}")
-        if (major, minor) != REQUIRED_SDK:
-            raise RuntimeError(
-                f"claude-agent-sdk {SDK_VERSION} != expected {REQUIRED_SDK[0]}.{REQUIRED_SDK[1]}.x; "
-                f"the interrupt/drain contract may have changed — pin 0.2.110 or re-verify."
-            )
+        # ClaudeAgentOptions prefers the SDK-bundled executable when cli_path is
+        # blank. Inspect that effective runtime instead of requiring an unrelated
+        # PATH entry, and reject any unverified SDK patch release exactly.
+        runtime = inspect_claude_runtime(cli_path)
+        log.info(
+            "Claude runtime verified",
+            sdk_version=runtime.sdk_version,
+            cli_version=runtime.cli_version,
+            cli_source=runtime.cli_source,
+            cli_path=runtime.cli_path,
+        )
 
     def _options(self, resume_id: str | None, cwd: str | None = None,
                  fork: bool = False,
@@ -157,8 +184,21 @@ class SdkHandle:
             "enter plan mode for them.\n"
             "Modes: default, acceptEdits, plan, auto, bypassPermissions."
         )
+        extra_args = {"replay-user-messages": None}
+        if self.work_mode:
+            # Safe mode suppresses user-installed agents/plugins/MCP and other
+            # customizations while retaining ordinary OAuth/provider auth.  Do
+            # not use --bare here: it intentionally disables OAuth/keychain
+            # auth, which would break subscription-backed Work sessions.
+            extra_args["safe-mode"] = None
         return ClaudeAgentOptions(
+            tools=list(CLAUDE_WORK_TOOLS) if self.work_mode else None,
             include_partial_messages=True,        # StreamEvent with content_block_delta
+            # Claude's public rewind_files() needs both checkpoint creation and
+            # replayed UserMessage UUIDs.  The latter are also the stable UI
+            # anchors used to choose a code-only rewind point.
+            enable_file_checkpointing=True,
+            extra_args=extra_args,
             # Emit hook lifecycle metadata into the SDK stream. StreamTranslator
             # forwards only the hook name/status/exit/duration; raw callback data,
             # output, commands, and environment values never cross the wire.
@@ -184,11 +224,12 @@ class SdkHandle:
             settings=self.work_settings_path if self.work_mode else None,
             setting_sources=[] if self.work_mode else None,
             skills=[] if self.work_mode else None,
-            sandbox=({
-                "enabled": True,
-                "autoAllowBashIfSandboxed": True,
-                "allowUnsandboxedCommands": False,
-            } if self.work_mode else None),
+            # The wrapper-owned Work settings file already contains the complete
+            # fail-closed sandbox including its filesystem allowlist. SDK 0.2.119
+            # replaces (rather than deep-merges) that object when `sandbox=` is
+            # also supplied, silently dropping filesystem policy and inlining
+            # provider credentials in argv. Pass only the policy path instead.
+            sandbox=None,
             # Work deliberately replaces Claude Code's coding-focused preset.
             # Code retains the official preset plus cc-remote's control tools.
             system_prompt=(
@@ -198,10 +239,18 @@ class SdkHandle:
                     "append": code_prompt_append,
                 }
             ),
+            # Work asks ordinary clarifying questions in chat; it does not need
+            # Code's ask/set-mode MCP schemas. Strict mode also prevents MCP
+            # configured outside this explicit SDK invocation from leaking in.
             mcp_servers=(
-                {"cc-remote-ask": {"type": "sdk", "name": "cc-remote-ask", "instance": self.ask_server}}
-                if self.ask_server is not None else {}
+                {} if self.work_mode else
+                ({"cc-remote-ask": {"type": "sdk", "name": "cc-remote-ask", "instance": self.ask_server}}
+                 if self.ask_server is not None else {})
             ),
+            strict_mcp_config=self.work_mode,
+            # Empty custom agents plus safe mode keeps installed/global agent
+            # definitions out; the explicit tool allowlist also omits Agent.
+            agents={} if self.work_mode else None,
         )
 
     @staticmethod
@@ -217,10 +266,11 @@ class SdkHandle:
         opts = self._options(
             resume_id, cwd, fork=fork, model_override=model_override)
         self.client = ClaudeSDKClient(options=opts)
+        self._conversation_rewind_capability = None
         await self.client.connect()
         try:
-            # claude-agent-sdk 0.2.110's public helper hardcodes a 60s timeout.
-            # This project pins and preflights that SDK, so use the same control
+            # The verified SDK's public helper hardcodes a 60s timeout. This
+            # project pins and preflights it, so use the same control
             # request with a bounded timeout; its implementation also cleans both
             # pending maps on timeout instead of leaking a cancelled request.
             query = getattr(self.client, "_query", None)
@@ -232,6 +282,16 @@ class SdkHandle:
             model = usage.get("model") if isinstance(usage, dict) else None
             if isinstance(model, str) and 0 < len(model.strip()) <= 256:
                 self.model = model.strip()
+            if (self.work_mode and not resume_id
+                    and self.work_context_baseline_tokens is None):
+                total_tokens = (
+                    usage.get("totalTokens")
+                    if isinstance(usage, dict) else None
+                )
+                if (isinstance(total_tokens, int)
+                        and not isinstance(total_tokens, bool)
+                        and total_tokens >= 0):
+                    self.work_context_baseline_tokens = total_tokens
         except Exception as exc:
             # Model readout is useful control state, but failure to obtain it
             # must not make an otherwise healthy Claude session unusable.
@@ -299,6 +359,154 @@ class SdkHandle:
         """Return the cc session's context window usage (matches CLI /context)."""
         assert self.client is not None
         return await self.client.get_context_usage()
+
+    async def rewind_files(self, user_message_id: str) -> None:
+        """Restore SDK-checkpointed files to a UserMessage UUID."""
+        target = validate_rewind_target(
+            user_message_id, operation="files")
+        client = self.client
+        if client is None:
+            raise ClaudeRewindError("not_connected", operation="files")
+        rewind = getattr(client, "rewind_files", None)
+        if not callable(rewind):
+            raise ClaudeRewindError(
+                "capability_unavailable", operation="files")
+        try:
+            await rewind(target)
+        except ClaudeRewindError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Claude file rewind failed", error_type=type(exc).__name__)
+            classified = classify_control_failure(exc, operation="files")
+            if classified.code in {"timeout", "capability_unavailable"}:
+                raise classified from None
+            raise ClaudeRewindError(
+                "file_rewind_failed", operation="files") from None
+
+    def _conversation_rewind_sender(self):
+        client = self.client
+        if client is None:
+            return None
+        query = getattr(client, "_query", None)
+        sender = getattr(query, "_send_control_request", None)
+        return sender if callable(sender) else None
+
+    async def conversation_rewind_capability(
+        self,
+        *,
+        refresh: bool = False,
+    ) -> ClaudeConversationRewindCapability:
+        """Probe the private subtype with an impossible UUID and cache support.
+
+        There is no public SDK/server-info feature bit for conversation rewind.
+        A semantic rejection (for example ``target not found``) proves that the
+        CLI understands the subtype without changing conversation state.
+        """
+        if self.client is None:
+            raise ClaudeRewindError(
+                "not_connected", operation="conversation")
+        if not refresh and self._conversation_rewind_capability is not None:
+            return self._conversation_rewind_capability
+        async with self._conversation_rewind_probe_lock:
+            if not refresh and self._conversation_rewind_capability is not None:
+                return self._conversation_rewind_capability
+            sender = self._conversation_rewind_sender()
+            if sender is None:
+                capability = ClaudeConversationRewindCapability(
+                    supported=False,
+                    reason="sdk_control_unavailable",
+                )
+                self._conversation_rewind_capability = capability
+                return capability
+            try:
+                response = await sender(
+                    {
+                        "subtype": "rewind_conversation",
+                        "target_message_uuid": _CONVERSATION_REWIND_PROBE_UUID,
+                        "interrupt_if_running": False,
+                    },
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                if is_unsupported_control_error(exc):
+                    capability = ClaudeConversationRewindCapability(
+                        supported=False,
+                        reason="unsupported_control_subtype",
+                    )
+                    self._conversation_rewind_capability = capability
+                    return capability
+                # Busy/state errors are semantic proof that the handler exists.
+                classified = classify_control_failure(exc)
+                if classified.code in {
+                    "commands_queued",
+                    "turn_running",
+                    "target_not_found",
+                    "stale_target",
+                    "no_preceding_assistant",
+                    "state_changed",
+                }:
+                    capability = ClaudeConversationRewindCapability(
+                        supported=True)
+                    self._conversation_rewind_capability = capability
+                    return capability
+                raise ClaudeRewindError(
+                    "capability_probe_failed",
+                    operation="conversation",
+                    retryable=True,
+                ) from None
+            if not response_proves_conversation_rewind(response):
+                raise ClaudeRewindError(
+                    "capability_probe_failed",
+                    operation="conversation",
+                    retryable=True,
+                )
+            capability = ClaudeConversationRewindCapability(supported=True)
+            self._conversation_rewind_capability = capability
+            return capability
+
+    async def supports_rewind_conversation(self) -> bool:
+        return (await self.conversation_rewind_capability()).supported
+
+    async def rewind_conversation(
+        self,
+        target_message_uuid: str,
+        *,
+        interrupt_if_running: bool = False,
+    ) -> ClaudeConversationRewindResult:
+        """Apply Claude Code's guarded native conversation-only rewind."""
+        target = validate_rewind_target(
+            target_message_uuid, operation="conversation")
+        capability = await self.conversation_rewind_capability()
+        if not capability.supported:
+            raise ClaudeRewindError(
+                "capability_unavailable", operation="conversation")
+        sender = self._conversation_rewind_sender()
+        if sender is None:
+            # The client may have disconnected after the cached probe.
+            self._conversation_rewind_capability = None
+            raise ClaudeRewindError(
+                "not_connected", operation="conversation")
+        try:
+            response = await sender(
+                {
+                    "subtype": "rewind_conversation",
+                    "target_message_uuid": target,
+                    "interrupt_if_running": bool(interrupt_if_running),
+                },
+                timeout=30.0,
+            )
+        except Exception as exc:
+            if is_unsupported_control_error(exc):
+                self._conversation_rewind_capability = (
+                    ClaudeConversationRewindCapability(
+                        supported=False,
+                        reason="unsupported_control_subtype",
+                    )
+                )
+            raise classify_control_failure(exc) from None
+        return parse_conversation_rewind_response(
+            response, requested_target=target)
 
     async def prepare_goal(self, thread_id: str, objective: str) -> dict[str, Any]:
         """Install the immediate state for a soon-to-be-submitted native /goal.
@@ -532,6 +740,7 @@ class SdkHandle:
                 await self.client.disconnect()
             finally:
                 self.client = None
+                self._conversation_rewind_capability = None
 
     async def force_reconnect(self, resume_id: str | None, cwd: str | None = None,
                               reason: str = "drain timeout",

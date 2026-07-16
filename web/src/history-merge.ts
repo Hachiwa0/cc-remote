@@ -135,6 +135,7 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     ...history,
     id: live.id,
     forkPointId: history.forkPointId ?? live.forkPointId,
+    checkpointId: history.checkpointId ?? live.checkpointId,
     prompt: history.prompt || live.prompt,
     blocks: mergeBlocks(history.blocks, live.blocks, preserveLiveOpen),
     // A transcript has no ResultMessage, so its EOF is represented by a

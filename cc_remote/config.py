@@ -8,6 +8,7 @@ only env changes.
 from __future__ import annotations
 
 import math
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -58,6 +59,13 @@ class RelayConfig:
     # Login gate: web clients POST /api/login with this password and receive a
     # short-lived HMAC session in an HttpOnly cookie.
     login_password: str = field(default_factory=lambda: _env("LOGIN_PASSWORD", ""))
+    # Optional multi-user policy. When configured it replaces LOGIN_PASSWORD:
+    # {"alice":{"password":"...","machines":["mac","nono"]}}
+    login_users_json: str = field(default_factory=lambda: _env("LOGIN_USERS_JSON", "").strip())
+    # Optional per-machine wrapper credentials. When configured it replaces
+    # the wildcard WRAPPER_TOKEN:
+    # {"mac":"long-secret", "nono":"another-long-secret"}
+    wrapper_tokens_json: str = field(default_factory=lambda: _env("WRAPPER_TOKENS_JSON", "").strip())
     session_secret: str = field(default_factory=lambda: _env("SESSION_SECRET", ""))
     session_ttl_seconds: int = field(default_factory=lambda: _int("SESSION_TTL_SECONDS", 7 * 24 * 3600))
     login_body_max_bytes: int = field(default_factory=lambda: _int("LOGIN_BODY_MAX_BYTES", 4096))
@@ -82,6 +90,9 @@ class WrapperConfig:
     # Token the wrapper presents to the relay at WS upgrade (must match the
     # relay's WRAPPER_TOKEN). Same env name as the relay for convenience.
     wrapper_token: str = field(default_factory=lambda: _env("WRAPPER_TOKEN", "change-me-wrapper"))
+    # Stable relay routing key. Multiple wrapper hosts may share one relay when
+    # each uses a distinct id; "default" preserves the single-machine setup.
+    machine_id: str = field(default_factory=lambda: _env("CC_REMOTE_MACHINE_ID", "default").strip() or "default")
     # Optional explicit Claude Code executable. Blank preserves the existing
     # SDK/PATH discovery behavior.
     claude_bin: str = field(default_factory=lambda: _env("CLAUDE_BIN", "").strip())
@@ -138,11 +149,80 @@ def relay_config() -> RelayConfig:
 
 
 _PLACEHOLDER_PREFIXES = ("change-me", "changeme", "replace_with", "replace-with")
+_MACHINE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
 
 
 def _placeholder(value: str) -> bool:
     normalized = value.strip().lower()
     return not normalized or normalized.startswith(_PLACEHOLDER_PREFIXES)
+
+
+def valid_machine_id(value: str) -> bool:
+    return bool(_MACHINE_ID_RE.fullmatch(value))
+
+
+def parse_login_users(raw: str) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Parse the optional username/password/machine policy without logging secrets."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise ValueError("LOGIN_USERS_JSON must be valid JSON") from exc
+    if not isinstance(data, dict) or not data:
+        raise ValueError("LOGIN_USERS_JSON must be a non-empty object")
+    if len(data) > 256:
+        raise ValueError("LOGIN_USERS_JSON supports at most 256 users")
+    users: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for username, entry in data.items():
+        if (not isinstance(username, str) or not username.strip()
+                or username != username.strip() or len(username) > 128
+                or any(ord(char) < 32 for char in username)):
+            raise ValueError("LOGIN_USERS_JSON contains an invalid username")
+        if not isinstance(entry, dict):
+            raise ValueError("LOGIN_USERS_JSON user entries must be objects")
+        password = entry.get("password")
+        machines = entry.get("machines")
+        if (not isinstance(password, str) or _placeholder(password)
+                or len(password) < 12):
+            raise ValueError("LOGIN_USERS_JSON passwords must be non-placeholder and at least 12 characters")
+        if (not isinstance(machines, list) or not machines
+                or len(machines) > 64):
+            raise ValueError("LOGIN_USERS_JSON machines must be a non-empty list of at most 64 ids")
+        normalized: list[str] = []
+        for machine in machines:
+            if not isinstance(machine, str) or (
+                    machine != "*" and not valid_machine_id(machine)):
+                raise ValueError("LOGIN_USERS_JSON contains an invalid machine id")
+            if machine not in normalized:
+                normalized.append(machine)
+        if "*" in normalized and len(normalized) != 1:
+            raise ValueError("LOGIN_USERS_JSON wildcard machine must be used alone")
+        users[username] = (password, tuple(normalized))
+    return users
+
+
+def parse_wrapper_tokens(raw: str) -> dict[str, str]:
+    """Parse optional machine-bound wrapper credentials."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise ValueError("WRAPPER_TOKENS_JSON must be valid JSON") from exc
+    if not isinstance(data, dict) or not data:
+        raise ValueError("WRAPPER_TOKENS_JSON must be a non-empty object")
+    if len(data) > 256:
+        raise ValueError("WRAPPER_TOKENS_JSON supports at most 256 machines")
+    tokens: dict[str, str] = {}
+    for machine, token in data.items():
+        if not isinstance(machine, str) or not valid_machine_id(machine):
+            raise ValueError("WRAPPER_TOKENS_JSON contains an invalid machine id")
+        if (not isinstance(token, str) or _placeholder(token)
+                or len(token) < 32):
+            raise ValueError("WRAPPER_TOKENS_JSON tokens must be non-placeholder and at least 32 characters")
+        tokens[machine] = token
+    return tokens
 
 
 def validate_relay_config(cfg: RelayConfig) -> None:
@@ -153,11 +233,21 @@ def validate_relay_config(cfg: RelayConfig) -> None:
     relay entry point and the no-argument app factory call this before serving.
     """
     errors: list[str] = []
-    if _placeholder(cfg.login_password) or len(cfg.login_password) < 12:
+    try:
+        parse_login_users(cfg.login_users_json)
+    except ValueError as exc:
+        errors.append(str(exc))
+    if not cfg.login_users_json and (
+            _placeholder(cfg.login_password) or len(cfg.login_password) < 12):
         errors.append("LOGIN_PASSWORD must be non-placeholder and at least 12 characters")
     if _placeholder(cfg.session_secret) or len(cfg.session_secret) < 32:
         errors.append("SESSION_SECRET must be non-placeholder and at least 32 characters")
-    if _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32:
+    try:
+        parse_wrapper_tokens(cfg.wrapper_tokens_json)
+    except ValueError as exc:
+        errors.append(str(exc))
+    if not cfg.wrapper_tokens_json and (
+            _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32):
         errors.append("WRAPPER_TOKEN must be non-placeholder and at least 32 characters")
     if cfg.session_ttl_seconds <= 0:
         errors.append("SESSION_TTL_SECONDS must be positive")
@@ -238,6 +328,8 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
     errors: list[str] = []
     if _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32:
         errors.append("WRAPPER_TOKEN must be non-placeholder and at least 32 characters")
+    if not valid_machine_id(cfg.machine_id):
+        errors.append("CC_REMOTE_MACHINE_ID has an invalid format")
 
     parsed = urlsplit(cfg.relay_url)
     if (

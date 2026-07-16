@@ -23,14 +23,14 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **cwd must match resume**: a session's jsonl lives at
   `~/.claude/projects/<cwd-with-/-as->/<uuid>.jsonl`. `ClaudeAgentOptions.cwd`
   MUST equal the original session's cwd or `resume` can't find it.
-- **SDK pinned to `claude-agent-sdk==0.2.110`**: message-type shapes and the
+- **SDK pinned to `claude-agent-sdk==0.2.119`**: message-type shapes and the
   interrupt/drain contract can shift between minor versions. Re-run the
   interrupt+drain verification after any upgrade (`SdkHandle.preflight()` guards
   the major/minor at startup).
 - **`include_partial_messages`** is a `ClaudeAgentOptions` field (set at
   construction, not on `query()`). Streaming events arrive as `StreamEvent`
   (`.event` = raw Anthropic API stream-event dict) — NOT
-  `SDKPartialAssistantMessage` (doesn't exist in 0.2.110). Extract
+  `SDKPartialAssistantMessage` (doesn't exist in 0.2.119). Extract
   `content_block_delta` → `delta.text` from `StreamEvent.event`.
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.
@@ -64,7 +64,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   the temp key. Emitting SessionFocus on id-capture = focus-steal by background
   sessions.
 - **History = on-demand bulk read; reconnect recovery = bounded ring replay**
-  (protocol v10; aligns
+  (protocol v14; aligns
   with cc-on-web / web chats): the client fetches a session's history via
   `GetHistory` → the wrapper reads the transcript (`get_session_messages` +
   `translate_history`, in a thread) and returns it as ONE `History` frame

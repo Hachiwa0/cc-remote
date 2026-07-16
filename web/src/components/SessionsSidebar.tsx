@@ -20,6 +20,7 @@ interface Props {
   onRename: (id: string, title: string) => void;
   onArchive: (id: string, archived: boolean) => void;
   onDelete: (id: string) => void;
+  onRollback: (id: string) => void;
   onForkWorktree: (session: SessionInfo) => void;
 }
 
@@ -47,7 +48,7 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 
 export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStates,
   activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive,
-  onDelete, onForkWorktree }: Props) {
+  onDelete, onRollback, onForkWorktree }: Props) {
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
@@ -107,6 +108,10 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
   };
   const doDelete = (s: SessionInfo) => {
     onDelete(s.session_id);
+    setMenuCardId(null); setLifting(false);
+  };
+  const doRollback = (s: SessionInfo) => {
+    onRollback(s.session_id);
     setMenuCardId(null); setLifting(false);
   };
   const closeMenu = () => { setMenuCardId(null); setLifting(false); };
@@ -217,7 +222,6 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
             <span className={"pill " + st}><span className="sd" />{st === "running" ? "运行" : "中断"}</span>
           )}
         </div>
-        {space === "code" && s.cwd && <div className="scard-path" title={s.cwd}>{s.cwd}</div>}
         {s.first_prompt && !s.summary && <div className="scard-prev">{s.first_prompt}</div>}
         <div className="scard-actions">
           <button className="scard-act" aria-label="更多操作"
@@ -236,15 +240,20 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
                 <Icon name="branch" size={15} />派生到新工作树…
               </button>
             )}
+            {capabilities.rollback && (
+              <button onClick={() => doRollback(s)}>
+                <Icon name="history" size={15} />回滚最近一轮
+              </button>
+            )}
             <button onClick={() => doCopyId(s)}><Icon name={copiedId === s.session_id ? "check" : "copy"} size={15} />{copiedId === s.session_id ? "已复制" : "复制 session ID"}</button>
             {capabilities.archive && (isArchived ? (
               <button onClick={() => doArchive(s, false)}><Icon name="archive" size={15} />取消归档</button>
             ) : (
               <button onClick={() => doArchive(s, true)}><Icon name="archive" size={15} />归档</button>
             ))}
-            {space === "work" && (
+            {capabilities.delete && (
               <button className="danger" onClick={() => doDelete(s)}>
-                <Icon name="trash" size={15} />删除工作
+                <Icon name="trash" size={15} />{space === "work" ? "删除工作" : "删除会话"}
               </button>
             )}
           </div>
@@ -259,13 +268,20 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
     const title = label || (space === "work"
       ? ({ today: "今天", yesterday: "昨天", week: "最近 7 天", older: "更早" }[key] ?? "更早")
       : basename(key));
-    const canAdd = space === "code" && !!key && !label;
+    const isCodeDirectoryGroup = space === "code" && !label;
+    const canAdd = isCodeDirectoryGroup && !!key;
+    const showDirectoryPath = isCodeDirectoryGroup && !!key;
     return (
       <div key={key || "other"} className="sgroup-wrap">
         <div className="sgroup-head">
-          <button className={"sgroup-toggle" + (isCollapsed ? " collapsed" : "")} onClick={() => toggleGroup(key)}>
-            <span className="chev"><Icon name="chev" size={13} /></span>
-            <span className="label" title={key || undefined}>{title}</span>
+          <button className={"sgroup-toggle" + (isCollapsed ? " collapsed" : "")}
+            aria-label={showDirectoryPath ? `${title}，${key}` : undefined}
+            onClick={() => toggleGroup(key)}>
+            <span className={"sgroup-icon " + (isCodeDirectoryGroup ? "folder-icon" : "chev")}>
+              <Icon name={isCodeDirectoryGroup ? (isCollapsed ? "folder" : "folder-open") : "chev"}
+                size={isCodeDirectoryGroup ? 15 : 13} />
+            </span>
+            <span className="label">{title}</span>
             <span className="count">{items.length}</span>
           </button>
           {canAdd && (
@@ -274,8 +290,9 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
               <Icon name="plus" size={14} />
             </button>
           )}
+          {showDirectoryPath && <span className="sgroup-path-tip" role="tooltip">{key}</span>}
         </div>
-        {!isCollapsed && items.map(renderCard)}
+        {!isCollapsed && <div className="sgroup-items">{items.map(renderCard)}</div>}
       </div>
     );
   };

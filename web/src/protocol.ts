@@ -3,6 +3,8 @@
 export type State = "idle" | "running" | "interrupting" | "draining";
 export type Engine = "claude" | "codex";
 export type Space = "code" | "work";
+export type RestoreMode = "conversation" | "files" | "both";
+export type RestoreOutcome = "succeeded" | "failed" | "skipped";
 export type AssistantChannel = "unknown" | "thinking" | "commentary" | "final";
 export type ToolCategory = "tool" | "command" | "file" | "mcp" | "agent" | "server_tool" | "web_search";
 export type ProcessKind = "reasoning" | "plan" | "command" | "file_change" | "mcp" | "agent" | "hook" | "server_tool" | "web_search" | "task" | "terminal" | "model" | "safety" | "diff" | "compaction";
@@ -36,6 +38,7 @@ export interface Hello extends Base {
   type: "hello";
   role: "client" | "wrapper";
   client_id?: string | null;
+  machine_id?: string | null;
   last_seq?: number | null;
   cursors?: Record<string, number> | null;
   generations?: Record<string, string> | null;
@@ -160,7 +163,7 @@ export interface PlanEntry { step: string; status: "pending" | "inProgress" | "c
 export interface TurnPlan extends Base { type: "turn_plan"; item_id: string; turn_id?: string | null; explanation?: string | null; plan: PlanEntry[] }
 export interface TurnDiff extends Base { type: "turn_diff"; item_id: string; turn_id?: string | null; diff: string; truncated?: boolean | null }
 export interface TurnResult { subtype: string; duration_ms: number; is_error: boolean; total_cost_usd?: number | null; num_turns?: number | null }
-export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null }
+export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null; checkpoint_id?: string | null }
 export interface ErrorMsg extends Base {
   type: "error";
   code: string;
@@ -215,6 +218,30 @@ export interface SessionRekey extends Base { type: "session_rekey"; old_key: str
 export interface RenameSession extends Base { type: "rename_session"; session_id: string; title: string; engine?: Engine; space?: Space }
 export interface ArchiveSession extends Base { type: "archive_session"; session_id: string; archived: boolean; engine?: Engine; space?: Space }
 export interface DeleteWorkSession extends Base { type: "delete_work_session"; session_id: string; engine: Engine; space?: "work" }
+export interface DeleteSession extends Base { type: "delete_session"; session_id: string; engine: Engine; space?: Space }
+export interface RollbackSession extends Base {
+  type: "rollback_session";
+  session_id: string;
+  engine: Engine;
+  space?: "code";
+  restore?: RestoreMode;
+  num_turns?: number;
+  checkpoint_id?: string | null;
+}
+export interface RollbackResult extends Base {
+  type: "rollback_result";
+  session_id: string;
+  engine: Engine;
+  restore: RestoreMode;
+  conversation: RestoreOutcome;
+  files: RestoreOutcome;
+  restored_turns: number;
+  conflicts: string[];
+  prefill_text?: string | null;
+  detail?: string | null;
+}
+export interface CompactSession extends Base { type: "compact_session"; session_id: string; engine?: "codex"; space?: "code" }
+export interface StartReview extends Base { type: "start_review"; session_id: string; engine?: "codex"; space?: "code"; target: "uncommittedChanges" | "baseBranch" | "commit" | "custom"; value?: string | null }
 export interface GetWorkDashboard extends Base { type: "get_work_dashboard"; engine?: Engine }
 export interface CreateWorkProject extends Base { type: "create_work_project"; engine?: Engine; name: string; description?: string }
 export interface DeleteWorkProject extends Base { type: "delete_work_project"; engine?: Engine; project_id: string }
@@ -230,7 +257,7 @@ export interface WorkArtifacts extends Base { type: "work_artifacts"; engine: En
 export interface WorkProjectInfo { project_id: string; name: string; description: string; created_at: number; updated_at: number }
 export interface WorkSourceInfo { source_id: string; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; created_at: number }
 export interface WorkPluginInfo { plugin_id: string; project_id?: string | null; name: string; instructions: string; enabled: boolean; created_at: number; updated_at: number }
-export interface WorkScheduleInfo { schedule_id: string; project_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null; enabled: boolean; last_run_at?: number | null; last_session_id?: string | null; last_error?: string | null; created_at: number; updated_at: number }
+export interface WorkScheduleInfo { schedule_id: string; project_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null; enabled: boolean; last_run_at?: number | null; last_session_id?: string | null; last_error?: string | null; last_run_id?: string | null; last_run_status?: "queued" | "claimed" | "running" | "succeeded" | "failed" | null; last_run_attempt?: number | null; created_at: number; updated_at: number }
 export interface WorkDashboard extends Base { type: "work_dashboard"; engine: Engine; projects: WorkProjectInfo[]; sources: WorkSourceInfo[]; plugins: WorkPluginInfo[]; schedules: WorkScheduleInfo[] }
 export interface DirEntry { name: string; path: string }
 export interface ListDir extends Base { type: "list_dir"; path?: string | null }
@@ -252,7 +279,14 @@ export interface GetHistory extends Base { type: "get_history"; session_id: stri
 // `external`: this session's transcript is being appended to by a native `claude`/
 // `codex` in the user's terminal. The wrapper mirrors those appends by broadcasting
 // a fresh History; we render the session read-only (a cc session has one owner).
-export interface History extends Base { type: "history"; session_id: string; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean }
+export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; reset?: boolean }
+// Replayable barrier for a destructive history mutation. The full History
+// replacement is one-shot and may exceed the ring byte budget; this small frame
+// guarantees that reconnecting clients never retain turns removed by rollback.
+export interface HistoryInvalidated extends Base { type: "history_invalidated"; session_id: string; revision: string; reason: "rollback" }
+// File/diff previews contain bytes that rollback may have replaced. This small
+// replayable marker closes them on every client, including after reconnect.
+export interface ArtifactInvalidated extends Base { type: "artifact_invalidated"; session_id: string; reason: "rollback" }
 // The engine's own model catalog. codex's app-server reports, per model, exactly
 // which reasoning levels it accepts — and `turn/start` does NOT validate the level
 // (it accepts `bogus-zzz`), so one we invent client-side only fails later inside the
@@ -269,6 +303,10 @@ export interface CatalogModel {
 // Effective controls for a NEW no-override session. These are display metadata,
 // not the focused session's controls and not implicit overrides on NewSession.
 export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[]; default_model?: string | null; default_effort?: string | null; cwd?: string | null }
+export interface GetEngineCapabilities extends Base { type: "get_engine_capabilities"; engine: Engine; space?: Space; client_id?: string | null; cwd?: string | null }
+export interface ManageEnginePlugin extends Base { type: "manage_engine_plugin"; engine: Engine; action: "install" | "uninstall"; plugin_id: string; space?: Space; client_id?: string | null; cwd?: string | null }
+export interface EngineCapabilityItem { kind: "skill" | "plugin" | "app" | "mcp"; id: string; name: string; description?: string | null; enabled?: boolean | null; installed?: boolean | null; status?: string | null; scope?: string | null; source?: string | null; tool_count?: number | null; resource_count?: number | null; install_url?: string | null }
+export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[] }
 export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }
@@ -361,21 +399,27 @@ export interface ContextReport extends Base {
   total_tokens: number;
   max_tokens: number;
   percentage: number;
+  /** Work-only conversation growth after the fresh-session startup baseline. */
+  session_tokens?: number | null;
+  /** Work-only startup zero point; raw total_tokens remains authoritative. */
+  fixed_tokens?: number | null;
+  /** session_tokens as a percentage of max_tokens. */
+  session_percentage?: number | null;
   model?: string | null;
   is_auto_compact_enabled?: boolean | null;
   categories: ContextCategory[];
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | Models | TakeoverState
-  | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState
+  | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | TurnPlan | TurnDiff
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 14;
 
 /** Local storage is user-controlled and may contain stale values from older
  * builds. Normalize before a value reaches a strict Pydantic command frame. */

@@ -54,6 +54,7 @@ _MAX_CODEX_CANDIDATES = 16
 _MAX_STANDALONE_CANDIDATES = 6
 _MAX_NVM_CANDIDATES = 3
 _CODEX_VERSION_TIMEOUT = 5
+_BIN_CACHE_INVENTORY: Optional[tuple[tuple[object, ...], ...]] = None
 _THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
@@ -66,6 +67,21 @@ _NOTICE_PATH_SAMPLE_MAX = 3
 _SPONTANEOUS_QUEUE_MIN_ITEMS = 64
 _SPONTANEOUS_QUEUE_MAX_ITEMS = 256
 _SPONTANEOUS_QUEUE_MIN_BYTES = 4 * 1024 * 1024
+_WORK_SKILL_LIMIT = 512
+_WORK_MCP_SERVER_LIMIT = 128
+_WORK_PATH_MAX = 4096
+_WORK_NAME_MAX = 256
+_WORK_DISABLED_FEATURES = (
+    "apps",
+    "hooks",
+    "memories",
+    "multi_agent",
+    "personality",
+    "plugin_sharing",
+    "plugins",
+    "remote_plugin",
+    "tool_suggest",
+)
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
@@ -81,6 +97,15 @@ class CodexSpontaneousOverflow:
     __slots__ = ("turn_id",)
 
     def __init__(self, turn_id: str):
+        self.turn_id = turn_id
+
+
+class CodexManagedOverflow:
+    """Internal signal: managed live detail was shed before its consumer ran."""
+
+    __slots__ = ("turn_id",)
+
+    def __init__(self, turn_id: Optional[str]):
         self.turn_id = turn_id
 
 
@@ -115,6 +140,12 @@ class _SpontaneousNotificationQueue:
 
     def qsize(self) -> int:
         return len(self._items)
+
+    def has_turn_completed(self) -> bool:
+        return any(
+            isinstance(item, dict) and item.get("method") == "turn/completed"
+            for item, _size in self._items
+        )
 
     def put_nowait(self, item: object, size: int = 0) -> bool:
         size = max(0, size)
@@ -264,6 +295,30 @@ def _codex_version(path: str) -> tuple[int, ...]:
     return tuple(int(g) for g in m.groups()) if m else (-1,)
 
 
+def _codex_inventory(candidates: list[str]) -> tuple[tuple[object, ...], ...]:
+    """Fingerprint candidate identities so CLI upgrades invalidate the cache.
+
+    ``codex upgrade`` can add a standalone release or retarget a stable symlink
+    while the wrapper remains alive.  Existing app-server processes keep their
+    executable; only the next process spawn re-resolves against this inventory.
+    """
+    inventory: list[tuple[object, ...]] = []
+    for path in candidates:
+        real = os.path.realpath(path)
+        try:
+            stat = os.stat(path)
+            identity: tuple[object, ...] = (
+                path, real, stat.st_dev, stat.st_ino,
+                stat.st_size, stat.st_mtime_ns,
+            )
+        except OSError:
+            # A concurrent upgrade may replace a symlink between discovery and
+            # stat.  The missing marker forces a fresh probe on the next call.
+            identity = (path, real, None, None, None, None)
+        inventory.append(identity)
+    return tuple(inventory)
+
+
 def _resolve_codex_bin() -> str:
     """Locate the codex CLI, preferring the NEWEST install.
 
@@ -274,14 +329,17 @@ def _resolve_codex_bin() -> str:
     The app-server IS our model catalog, so serving a stale one silently corrupts
     every model/effort decision downstream. Blocking (subprocess); cached for the
     process — call via asyncio.to_thread from async code."""
-    global _BIN_CACHE
+    global _BIN_CACHE, _BIN_CACHE_INVENTORY
     override = os.environ.get("CODEX_BIN")
     if override:
         return override
-    if _BIN_CACHE:
-        return _BIN_CACHE
     cands = _codex_candidates()
+    inventory = _codex_inventory(cands)
+    if _BIN_CACHE and inventory == _BIN_CACHE_INVENTORY:
+        return _BIN_CACHE
     if not cands:
+        _BIN_CACHE = None
+        _BIN_CACHE_INVENTORY = inventory
         return "codex"  # last resort — errors clearly if truly absent
     # A broken candidate must not stall startup serially.  Keep both the list and
     # the worker pool small; each individual probe also has a hard timeout.
@@ -292,6 +350,7 @@ def _resolve_codex_bin() -> str:
     if best_v == (-1,):
         best = cands[0]
     _BIN_CACHE = best
+    _BIN_CACHE_INVENTORY = inventory
     log.info("codex bin resolved", path=best, version=".".join(map(str, best_v)),
              considered=[{"path": c, "version": ".".join(map(str, v))} for v, c in versions])
     return best
@@ -317,7 +376,7 @@ def _codex_runtime_tmp() -> str:
     tool call, so that narrow runtime path must remain readable as well.
     """
     codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    codex_home = os.path.realpath(os.path.expanduser(codex_home))
+    codex_home = os.path.abspath(os.path.expanduser(codex_home))
     return os.path.join(codex_home, "tmp")
 
 
@@ -326,6 +385,82 @@ def _initialize_params() -> dict[str, Any]:
     return {
         "clientInfo": {"name": "cc-remote", "version": "0.1.0"},
         "capabilities": {"experimentalApi": True},
+    }
+
+
+def _work_thread_config(
+    skills_response: Any,
+    config_response: Any,
+) -> dict[str, Any]:
+    """Build a fail-closed Work-only app-server config overlay.
+
+    Work intentionally keeps the user's account, provider, model catalog and
+    thread store in the normal ``CODEX_HOME``.  Passing this overlay on the
+    thread RPC is therefore narrower than creating a second home, while still
+    preventing personal Skills, plugins, MCP servers and collaboration agents
+    from being inserted into the model context.  Code threads never call this
+    helper and continue to inherit the native Codex configuration unchanged.
+    """
+    if not isinstance(skills_response, dict):
+        raise RuntimeError("codex skills/list returned an invalid response")
+    entries = skills_response.get("data")
+    if not isinstance(entries, list):
+        raise RuntimeError("codex skills/list returned an invalid response")
+
+    skill_paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("codex skills/list returned an invalid entry")
+        skills = entry.get("skills")
+        if not isinstance(skills, list):
+            raise RuntimeError("codex skills/list returned an invalid entry")
+        for skill in skills:
+            if not isinstance(skill, dict):
+                raise RuntimeError("codex skills/list returned an invalid skill")
+            # Missing ``enabled`` meant enabled in older app-server responses.
+            if skill.get("enabled") is False:
+                continue
+            path = skill.get("path")
+            if (not isinstance(path, str) or not path
+                    or len(path) > _WORK_PATH_MAX):
+                raise RuntimeError("codex skills/list returned an invalid path")
+            skill_paths.add(path)
+            if len(skill_paths) > _WORK_SKILL_LIMIT:
+                raise RuntimeError("codex Work skill inventory exceeds limit")
+
+    if not isinstance(config_response, dict):
+        raise RuntimeError("codex config/read returned an invalid response")
+    effective = config_response.get("config")
+    if not isinstance(effective, dict):
+        raise RuntimeError("codex config/read returned an invalid response")
+    raw_mcp = effective.get("mcp_servers", {})
+    if not isinstance(raw_mcp, dict):
+        raise RuntimeError("codex config/read returned invalid MCP settings")
+    if len(raw_mcp) > _WORK_MCP_SERVER_LIMIT:
+        raise RuntimeError("codex Work MCP inventory exceeds limit")
+    mcp_servers: dict[str, dict[str, bool]] = {}
+    for name in raw_mcp:
+        if (not isinstance(name, str) or not name
+                or len(name) > _WORK_NAME_MAX):
+            raise RuntimeError("codex config/read returned an invalid MCP name")
+        mcp_servers[name] = {"enabled": False}
+
+    return {
+        "features": {name: False for name in _WORK_DISABLED_FEATURES},
+        # Work artifacts may legitimately be called AGENTS.md.  They are data,
+        # not a route for re-introducing Code/project instructions.
+        "project_doc_max_bytes": 0,
+        "project_doc_fallback_filenames": [],
+        # Keep the native indexed research tool needed by general Work tasks,
+        # without inheriting a user's Code-time live-search preference.
+        "web_search": "cached",
+        "skills": {
+            "config": [
+                {"path": path, "enabled": False}
+                for path in sorted(skill_paths)
+            ],
+        },
+        "mcp_servers": mcp_servers,
     }
 
 
@@ -343,15 +478,26 @@ class CodexHandle:
         self.turn_id: Optional[str] = None
         self.turn_start_pending = False
         self.turn_active = False
+        # Inline Review has two different app-server turn ids.  The response and
+        # visible lifecycle use the outer id, while a nested reviewer turn is the
+        # thread's actual interrupt target.  Keep them separate: collapsing both
+        # into ``turn_id`` makes cancel target the outer id and makes the rollout
+        # watcher mistake the nested task for a native terminal turn.
+        self._review_active = False
+        self._review_outer_turn_id: Optional[str] = None
+        self._review_execution_turn_id: Optional[str] = None
+        self._review_execution_ready = asyncio.Event()
         # turn/start ids produced by this wrapper. Codex can flush a rollout for
         # tens of seconds after turn/completed; retaining ids lets the transcript
         # watcher attribute those late records to us instead of to a terminal.
         self._owned_turn_ids: OrderedDict[str, None] = OrderedDict()
         self._cwd = cwd
         self.work_mode = work_mode
+        self._work_config: Optional[dict[str, Any]] = None
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
-        self._turn_q: Optional[asyncio.Queue] = None
+        self._turn_q: Optional[Any] = None
+        self._managed_overflow = False
         self._reader: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._thread_settings_updated = asyncio.Event()
@@ -555,6 +701,26 @@ class CodexHandle:
             self.app_server_version = _app_server_version(initialized)
             await self._notify("initialized")
 
+            if self.work_mode:
+                # Inspect the effective native runtime rather than guessing at
+                # user-configured skill and MCP names.  Failure is fatal: silently
+                # falling back would leak Code's global context into Work again.
+                skills_response, config_response = await asyncio.gather(
+                    self._request("skills/list", {
+                        "cwds": [self._cwd],
+                        # Work must not miss a skill installed since the last
+                        # native cache snapshot; a partial inventory would make
+                        # the supposedly isolated context depend on timing.
+                        "forceReload": True,
+                    }),
+                    self._request("config/read", {
+                        "cwd": self._cwd,
+                        "includeLayers": False,
+                    }),
+                )
+                self._work_config = _work_thread_config(
+                    skills_response, config_response)
+
             if fork and resume_id:
                 # ephemeral /btw fork: inherits resume_id's context into a throwaway
                 # thread; the parent thread is never touched (verified: fork answers
@@ -568,6 +734,8 @@ class CodexHandle:
                     fork_params.update({
                         "baseInstructions": WORK_BASE_INSTRUCTIONS,
                         "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                        "personality": "none",
+                        "config": self._work_config,
                     })
                 res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
@@ -582,6 +750,8 @@ class CodexHandle:
                     resume_params.update({
                         "baseInstructions": WORK_BASE_INSTRUCTIONS,
                         "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                        "personality": "none",
+                        "config": self._work_config,
                     })
                 res = await self._request("thread/resume", resume_params)
                 self.thread_id = _thread_id_of(res) or resume_id
@@ -597,6 +767,8 @@ class CodexHandle:
                     params.update({
                         "baseInstructions": WORK_BASE_INSTRUCTIONS,
                         "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                        "personality": "none",
+                        "config": self._work_config,
                     })
                 res = await self._request("thread/start", params)
                 self.thread_id = _thread_id_of(res)
@@ -636,8 +808,8 @@ class CodexHandle:
         ):
             await self.force_reconnect(self.thread_id, self._cwd, reason="app-server unavailable")
         assert self.proc is not None and self.thread_id, "connect() first"
-        self._turn_q = asyncio.Queue(
-            maxsize=max(1, getattr(self.cfg, "turn_reader_queue_cap", 4)))
+        self._open_managed_stream()
+        queue = self._turn_q
         params = {
             "threadId": self.thread_id,
             "input": _to_input(prompt, images),
@@ -680,6 +852,10 @@ class CodexHandle:
             res = await self._request("turn/start", params)
         except BaseException:
             self.turn_active = False
+            self.turn_id = None
+            if self._turn_q is queue:
+                self._turn_q = None
+            self._managed_overflow = False
             raise
         finally:
             self.turn_start_pending = False
@@ -703,6 +879,36 @@ class CodexHandle:
     def owned_turn_ids(self) -> frozenset[str]:
         return frozenset(self._owned_turn_ids)
 
+    @property
+    def turn_attribution_pending(self) -> bool:
+        """Whether a rollout task may still belong to the current local launch.
+
+        Ordinary turns learn their id from ``turn/start``. Inline Review is
+        different: ``review/start`` returns the visible outer id first, then
+        app-server announces a second nested id which is the rollout writer and
+        interrupt target. Keep the ownership watcher in its attribution grace
+        until that second notification has arrived.
+        """
+        return bool(
+            self.turn_start_pending
+            or (self._review_active
+                and self._review_execution_turn_id is None)
+        )
+
+    def _begin_review_tracking(self) -> None:
+        self._review_active = True
+        self._review_outer_turn_id = None
+        self._review_execution_turn_id = None
+        self._review_execution_ready = asyncio.Event()
+
+    def _clear_review_tracking(self) -> None:
+        # Wake an interrupt which is waiting for the nested reviewer id.  It will
+        # re-check the ids/active flag and avoid issuing a stale RPC.
+        self._review_execution_ready.set()
+        self._review_active = False
+        self._review_outer_turn_id = None
+        self._review_execution_turn_id = None
+
     async def receive_response(self):
         """Async-gen of this turn's raw notification dicts, ending at turn/completed."""
         q = self._turn_q
@@ -714,9 +920,15 @@ class CodexHandle:
                 if msg is None:      # sentinel pushed by the reader on turn/completed
                     break
                 yield msg
+                # The fail-fast managed bridge preserves terminal frames without
+                # spending a third queue slot on a sentinel. Legacy asyncio.Queue
+                # tests may still append one; it is harmlessly abandoned below.
+                if isinstance(msg, dict) and msg.get("method") == "turn/completed":
+                    break
         finally:
             if self._turn_q is q:
                 self._turn_q = None
+            self._managed_overflow = False
             # An automatic continuation may have started after this managed
             # queue received its terminal sentinel but before its consumer
             # unwound. Do not let the old generator clear the new turn's active
@@ -724,14 +936,17 @@ class CodexHandle:
             if self._spontaneous_turn_id is None:
                 self.turn_active = False
 
-    def _open_spontaneous_stream(self, turn_id: str) -> None:
-        """Create the bounded raw-notification bridge before announcing a turn."""
-        if self._spontaneous_q is not None:
-            self._close_spontaneous_stream(self._spontaneous_queue_turn_id)
+    def _notification_queue_limits(
+        self, *, managed: bool,
+    ) -> tuple[int, int]:
         reader_cap = max(1, int(getattr(self.cfg, "turn_reader_queue_cap", 4)))
-        item_cap = min(
-            _SPONTANEOUS_QUEUE_MAX_ITEMS,
-            max(_SPONTANEOUS_QUEUE_MIN_ITEMS, reader_cap * 16),
+        item_cap = (
+            max(2, reader_cap)
+            if managed
+            else min(
+                _SPONTANEOUS_QUEUE_MAX_ITEMS,
+                max(_SPONTANEOUS_QUEUE_MIN_ITEMS, reader_cap * 16),
+            )
         )
         ws_cap = max(1024, int(getattr(
             self.cfg, "ws_max_size_bytes", 16 * 1024 * 1024)))
@@ -740,6 +955,19 @@ class CodexHandle:
             ws_cap,
             max(_SPONTANEOUS_QUEUE_MIN_BYTES, tool_cap * 16),
         )
+        return item_cap, byte_cap
+
+    def _open_managed_stream(self) -> None:
+        """Create a bounded producer that can never block JSON-RPC stdout."""
+        item_cap, byte_cap = self._notification_queue_limits(managed=True)
+        self._turn_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
+        self._managed_overflow = False
+
+    def _open_spontaneous_stream(self, turn_id: str) -> None:
+        """Create the bounded raw-notification bridge before announcing a turn."""
+        if self._spontaneous_q is not None:
+            self._close_spontaneous_stream(self._spontaneous_queue_turn_id)
+        item_cap, byte_cap = self._notification_queue_limits(managed=False)
         self._spontaneous_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
         self._spontaneous_queue_turn_id = turn_id
         self._spontaneous_overflow = False
@@ -818,6 +1046,56 @@ class CodexHandle:
             q.put_nowait(terminal_message, terminal_size)
         return True
 
+    def _queue_managed_notification(
+        self, message: dict, raw_size: Optional[int] = None,
+    ) -> bool:
+        """Offer a managed-turn frame without blocking the sole stdout reader.
+
+        review/start can emit multiple item notifications before its RPC response.
+        A regular bounded ``asyncio.Queue.put`` deadlocks once full because the
+        response which starts the consumer is waiting behind those notifications.
+        On overflow retain one signal plus the authoritative terminal frame.
+        """
+        q = self._turn_q
+        if not isinstance(q, _SpontaneousNotificationQueue):
+            return False
+        method = message.get("method")
+        terminal = method == "turn/completed"
+        if self._managed_overflow and not terminal:
+            return True
+        size = (
+            raw_size if isinstance(raw_size, int) and raw_size >= 0
+            else self._notification_wire_size(message)
+        )
+        if not self._managed_overflow and q.put_nowait(message, size):
+            return True
+
+        turn_id = self.turn_id or _notification_turn_id(message)
+        if not self._managed_overflow:
+            log.warning(
+                "codex managed notification bridge overflow",
+                turn_id=turn_id,
+                queued=q.qsize(),
+                queued_bytes=q.byte_size,
+            )
+            self._managed_overflow = True
+            q.clear()
+            q.put_nowait(CodexManagedOverflow(turn_id))
+        if terminal:
+            terminal_message = message
+            terminal_size = size
+            if terminal_size > q.max_bytes:
+                terminal_message = self._minimal_turn_completed(message)
+                terminal_size = self._notification_wire_size(terminal_message)
+            if not q.put_nowait(terminal_message, terminal_size):
+                # The queue reserves two slots (overflow + terminal). This final
+                # fallback only covers an unexpectedly tiny byte budget.
+                q.clear()
+                q.put_nowait(CodexManagedOverflow(turn_id))
+                minimal = self._minimal_turn_completed(message)
+                q.put_nowait(minimal, self._notification_wire_size(minimal))
+        return True
+
     def _close_spontaneous_stream(self, turn_id: Optional[str]) -> None:
         """Wake the bridge consumer after disconnect/EOF, without blocking stdout."""
         q = self._spontaneous_q
@@ -852,11 +1130,36 @@ class CodexHandle:
                 self._spontaneous_overflow = False
 
     async def interrupt(self) -> None:
-        if self.proc and self.thread_id and self.turn_id:
-            try:
-                await self._request("turn/interrupt", {"threadId": self.thread_id, "turnId": self.turn_id})
-            except Exception as e:
-                log.warning("codex interrupt failed", error=str(e))
+        if not (self.proc and self.thread_id and self.turn_id):
+            raise RuntimeError("codex turn is not running")
+        target_turn_id = self._review_execution_turn_id or self.turn_id
+        try:
+            await self._request(
+                "turn/interrupt",
+                {"threadId": self.thread_id, "turnId": target_turn_id},
+            )
+            return
+        except Exception:
+            # A click can race review/start's outer response and the nested
+            # turn/started notification.  app-server serializes both on stdout,
+            # so a rejected outer interrupt is normally followed immediately by
+            # the authoritative nested id.  Wait briefly and retry only when the
+            # target actually changed; unrelated interrupt failures still surface.
+            if self._review_active and self._review_execution_turn_id is None:
+                ready = self._review_execution_ready
+                try:
+                    await asyncio.wait_for(ready.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+            retry_turn_id = self._review_execution_turn_id
+            if (self._review_active and retry_turn_id
+                    and retry_turn_id != target_turn_id):
+                await self._request(
+                    "turn/interrupt",
+                    {"threadId": self.thread_id, "turnId": retry_turn_id},
+                )
+                return
+            raise
 
     async def disconnect(self) -> None:
         proc = self.proc
@@ -864,6 +1167,7 @@ class CodexHandle:
         spontaneous_turn_id = self._spontaneous_turn_id
         self._close_spontaneous_stream(spontaneous_turn_id)
         self._spontaneous_turn_id = None
+        self._clear_review_tracking()
         tasks = [t for t in (self._reader, self._stderr_task)
                  if t is not None and t is not asyncio.current_task()]
         server_tasks = [
@@ -909,6 +1213,7 @@ class CodexHandle:
         if self._turn_q is not None:
             self._force_turn_sentinel(self._turn_q)
             self._turn_q = None
+        self._managed_overflow = False
         for fut in list(self._pending.values()):
             if not fut.done():
                 fut.set_exception(RuntimeError("codex app-server disconnected"))
@@ -1128,6 +1433,100 @@ class CodexHandle:
         if cleared:
             self.last_goal = None
         return cleared
+
+    async def start_review(self, target: dict[str, Any]) -> dict[str, str]:
+        """Start an official inline review on this resident app-server.
+
+        The resident process is required: review/start creates a real turn and
+        its reasoning/tool notifications must flow through the same stdout
+        reader as ordinary turns instead of disappearing in a one-shot RPC.
+        """
+        assert self.thread_id, "connect() first"
+        if self.turn_active:
+            raise RuntimeError("codex thread is busy")
+        self._open_managed_stream()
+        queue = self._turn_q
+        assert queue is not None
+        # review/start creates a normal inline turn. Claim it before awaiting the
+        # RPC exactly like turn/start: app-server can emit enteredReviewMode and
+        # even turn/completed before the response coroutine is scheduled again.
+        # Without this queue those frames are classified as orphan/spontaneous,
+        # and the UI can never observe the review's terminal event.
+        self.turn_id = None
+        self.turn_active = True
+        self.turn_start_pending = True
+        self._begin_review_tracking()
+        try:
+            result = await self._request("review/start", {
+                "threadId": self.thread_id,
+                "target": target,
+                "delivery": "inline",
+            })
+            review_thread_id = (result or {}).get("reviewThreadId")
+            turn = (result or {}).get("turn")
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if not isinstance(review_thread_id, str) or not review_thread_id:
+                raise RuntimeError(
+                    "codex app-server did not return a review thread")
+            if not isinstance(turn_id, str) or not turn_id:
+                raise RuntimeError(
+                    "codex app-server did not return a review turn")
+            self.remember_owned_turn_id(turn_id)
+            if self._review_active:
+                if (self._review_outer_turn_id is not None
+                        and self._review_outer_turn_id != turn_id):
+                    raise RuntimeError(
+                        "codex app-server returned mismatched review turns")
+                self._review_outer_turn_id = turn_id
+                # A revision which reports turn/started for the outer lifecycle
+                # before answering review/start can provisionally look like the
+                # nested executor. The RPC response is authoritative; reopen the
+                # nested-id attribution window for the actual reviewer turn.
+                if self._review_execution_turn_id == turn_id:
+                    self._review_execution_turn_id = None
+                    self._review_execution_ready = asyncio.Event()
+            # A fast review may already have queued its terminal event. Do not
+            # resurrect it as interruptible after turn/completed cleared the flag.
+            if self.turn_active:
+                self.turn_id = turn_id
+            else:
+                # turn/completed can precede the RPC response, when the outer id
+                # is not known yet and _dispatch therefore cannot clear Review
+                # tracking. The completed state is authoritative here.
+                self._clear_review_tracking()
+            return {"thread_id": review_thread_id, "turn_id": turn_id}
+        except BaseException:
+            self.turn_active = False
+            self.turn_id = None
+            self._clear_review_tracking()
+            if self._turn_q is queue:
+                self._turn_q = None
+            raise
+        finally:
+            self.turn_start_pending = False
+
+    async def compact_thread(self) -> None:
+        assert self.thread_id, "connect() first"
+        if self.turn_active:
+            raise RuntimeError("codex thread is busy")
+        await self._request(
+            "thread/compact/start", {"threadId": self.thread_id})
+
+    async def rollback_thread(self, num_turns: int) -> dict[str, Any]:
+        assert self.thread_id, "connect() first"
+        if self.turn_active:
+            raise RuntimeError("codex thread is busy")
+        if not isinstance(num_turns, int) or isinstance(num_turns, bool) \
+                or not 1 <= num_turns <= 1000:
+            raise ValueError("num_turns must be between 1 and 1000")
+        result = await self._request("thread/rollback", {
+            "threadId": self.thread_id,
+            "numTurns": num_turns,
+        })
+        thread = (result or {}).get("thread")
+        if not isinstance(thread, dict):
+            raise RuntimeError("codex app-server did not return the rolled back thread")
+        return thread
 
     async def _publish_goal(self, goal: Optional[dict[str, Any]]) -> None:
         """Forward one sanitized goal notification without killing the reader."""
@@ -1492,11 +1891,12 @@ class CodexHandle:
                 if generation != self._generation:
                     return
                 await self._dispatch(m, raw_size=len(line))
-                if self._spontaneous_q is not None:
+                if self._turn_q is not None or self._spontaneous_q is not None:
                     # StreamReader can satisfy many buffered readline() calls
                     # without yielding. Give the independent bridge consumer one
                     # scheduling opportunity per frame; never wait for its relay
-                    # I/O or for queue capacity.
+                    # I/O or for queue capacity. Managed bridges are fail-fast too,
+                    # so they need the same fairness once their consumer exists.
                     await asyncio.sleep(0)
         except asyncio.CancelledError:
             pass
@@ -1509,6 +1909,7 @@ class CodexHandle:
             # exception from this reader task.
             if generation == self._generation:
                 self._dead = True
+                self._clear_review_tracking()
                 spontaneous_turn_id = self._spontaneous_turn_id
                 self._spontaneous_turn_id = None
                 self._close_spontaneous_stream(spontaneous_turn_id)
@@ -1520,6 +1921,7 @@ class CodexHandle:
                 # unblock any waiting turn/request
                 if self._turn_q is not None:
                     self._force_turn_sentinel(self._turn_q)
+                self._managed_overflow = False
                 for fut in self._pending.values():
                     if not fut.done():
                         fut.set_exception(RuntimeError("codex app-server closed"))
@@ -1553,6 +1955,32 @@ class CodexHandle:
         if (not _is_turn_notification(method)
                 and method not in {"error", "thread/compacted"}):
             return True
+
+        if self._review_active and target_turn_id is not None:
+            # ``review/start`` owns an outer visible turn plus one nested reviewer
+            # execution turn.  The nested turn is authoritative for interrupt and
+            # rollout attribution, while outer items/completion remain the public
+            # managed stream. There is exactly one nested executor; a third id is
+            # foreign and must not be allowed to hijack cancellation.
+            if method == "turn/started":
+                if target_turn_id != self._review_outer_turn_id:
+                    if (self._review_execution_turn_id is not None
+                            and self._review_execution_turn_id != target_turn_id):
+                        log.warning(
+                            "foreign codex review execution notification dropped",
+                            method=method,
+                        )
+                        return False
+                    self._review_execution_turn_id = target_turn_id
+                    self.remember_owned_turn_id(target_turn_id)
+                    self._review_execution_ready.set()
+                return True
+            if target_turn_id in {
+                self._review_outer_turn_id,
+                self._review_execution_turn_id,
+                self.turn_id,
+            }:
+                return True
 
         if method == "turn/started":
             if target_turn_id is None:
@@ -1627,6 +2055,19 @@ class CodexHandle:
         method = m.get("method")
         if not self._notification_is_current(m):
             return
+        target_turn_id = _notification_turn_id(m)
+        review_execution_frame = bool(
+            self._review_active
+            and target_turn_id is not None
+            and target_turn_id == self._review_execution_turn_id
+            and target_turn_id != self._review_outer_turn_id
+        )
+        # Some app-server revisions may report a nested terminal before the
+        # outer Review finishes its exitedReviewMode/agentMessage lifecycle.  It
+        # is not the managed turn's terminal and must not close the queue.
+        if method == "turn/completed" and review_execution_frame:
+            self._review_execution_turn_id = None
+            return
         completed_spontaneous_turn_id: Optional[str] = None
         if method == "thread/started" and not self.thread_id:
             self.thread_id = _thread_id_of_notif(m)
@@ -1642,11 +2083,13 @@ class CodexHandle:
             was_active = self.turn_active
             turn = (m.get("params") or {}).get("turn") or {}
             turn_id = turn.get("id")
-            if isinstance(turn_id, str) and turn_id:
+            if (isinstance(turn_id, str) and turn_id
+                    and not review_execution_frame):
                 self.turn_id = turn_id
                 self.remember_owned_turn_id(turn_id)
             self.turn_active = True
-            if not was_active and isinstance(turn_id, str) and turn_id:
+            if (not was_active and isinstance(turn_id, str) and turn_id
+                    and not review_execution_frame):
                 # A goal loop/automatic continuation is not backed by query().
                 # The previous managed turn's receive_response() may still hold
                 # its local queue after consuming completed+sentinel. Detach the
@@ -1735,9 +2178,12 @@ class CodexHandle:
                 completed_spontaneous_turn_id = spontaneous_turn_id
         if self._turn_q is not None and _is_turn_queue_notification(method):
             queue = self._turn_q
-            await queue.put(m)
-            if method == "turn/completed":
-                await queue.put(None)
+            if not self._queue_managed_notification(m, raw_size):
+                # Compatibility for narrow unit tests which inject an
+                # asyncio.Queue directly instead of opening the live bridge.
+                await queue.put(m)
+                if method == "turn/completed":
+                    await queue.put(None)
         elif (_is_turn_queue_notification(method)
               and self._spontaneous_turn_id is not None):
             self._queue_spontaneous_notification(m, raw_size)
@@ -1749,12 +2195,26 @@ class CodexHandle:
             completed_turn_id = _notification_turn_id(m)
             if completed_turn_id == self.turn_id:
                 self.turn_id = None
+            if (self._review_active
+                    and completed_turn_id == self._review_outer_turn_id):
+                self._clear_review_tracking()
 
     @staticmethod
-    def _force_turn_sentinel(queue: asyncio.Queue) -> None:
+    def _force_turn_sentinel(queue: Any) -> None:
         """Wake a consumer during disconnect even when the bounded queue is full."""
+        if (isinstance(queue, _SpontaneousNotificationQueue)
+                and queue.has_turn_completed()):
+            # receive_response terminates on this authoritative frame. Replacing
+            # a full [Overflow, turn/completed] bridge with None would erase the
+            # only terminal evidence during an EOF/disconnect race.
+            return
         try:
-            queue.put_nowait(None)
+            offered = queue.put_nowait(None)
+            if offered is False:
+                clear = getattr(queue, "clear", None)
+                if clear is not None:
+                    clear()
+                    queue.put_nowait(None)
         except asyncio.QueueFull:
             try:
                 queue.get_nowait()

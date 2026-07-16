@@ -383,6 +383,10 @@ class StreamTranslator:
         # fork_session(up_to_message_id=...) accepts the transcript UUID, not the
         # API message_id, so retain the last valid one until ResultMessage.
         self._last_assistant_uuid: str | None = None
+        # rewind_files() and rewind_conversation target the top-level user
+        # transcript UUID. Keep it separate from the browser's optimistic turn
+        # id and from tool-result user envelopes.
+        self._last_user_uuid: str | None = None
 
     def _remember_turn(self, item_id: str, parent_id: str | None = None) -> str | None:
         turn = (self.item_turns.get(item_id)
@@ -684,6 +688,12 @@ class StreamTranslator:
     def _feed_user(self, msg: UserMessage) -> list:
         events: list = []
         content = msg.content if isinstance(msg.content, list) else []
+        has_tool_result = any(isinstance(block, (
+            ToolResultBlock, ServerToolResultBlock)) for block in content)
+        if (not msg.parent_tool_use_id and not has_tool_result
+                and isinstance(msg.uuid, str)
+                and _CLAUDE_MESSAGE_UUID.fullmatch(msg.uuid)):
+            self._last_user_uuid = msg.uuid
         result_meta = msg.tool_use_result if isinstance(msg.tool_use_result, dict) else {}
         summary_bits = []
         for key, label in (("agentType", "代理"), ("status", "状态"),
@@ -695,8 +705,7 @@ class StreamTranslator:
         if isinstance(duration, (int, float)) and duration >= 0:
             summary_bits.append(f"耗时：{duration / 1000:g}s")
         summary = _short_text(" · ".join(summary_bits), 64 * 1024) if summary_bits else None
-        if any(isinstance(block, (
-                ToolResultBlock, ServerToolResultBlock)) for block in content):
+        if has_tool_result:
             self._ambiguous_final_mid = None
         for block in content:
             if isinstance(block, ToolResultBlock):
@@ -906,8 +915,10 @@ class StreamTranslator:
                 is_error=msg.is_error,
                 total_cost_usd=msg.total_cost_usd,
                 num_turns=msg.num_turns,
-            ), turn_id=self._last_assistant_uuid))
+            ), turn_id=self._last_assistant_uuid,
+                checkpoint_id=self._last_user_uuid))
             self._last_assistant_uuid = None
+            self._last_user_uuid = None
             self._ambiguous_final_mid = None
             self._has_final_text = False
             return events
@@ -1088,6 +1099,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                 result=TurnResult(
                     subtype="success", duration_ms=0, is_error=False),
                 turn_id=last_assistant_uuid,
+                checkpoint_id=current_turn_id,
             )
             if last_ts is not None:
                 te.ts = last_ts   # answer-done time = last message of the turn

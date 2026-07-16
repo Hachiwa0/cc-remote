@@ -20,7 +20,7 @@ _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
 def test_protocol_v10_new_session_query_roundtrip_and_validation():
-    assert PROTOCOL_VERSION == 11
+    assert PROTOCOL_VERSION == 14
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",

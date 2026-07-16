@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from cc_remote.protocol import State
 from cc_remote.wrapper.ringbuffer import RingBuffer
@@ -43,6 +43,14 @@ class SessionContext:
     # cwd and metadata are owned by cc-remote's private Work registry.
     space: str = "code"
     work_id: Optional[str] = None
+    # Work's new-session startup zero point. It is persisted by WorkRegistry and
+    # subtracted only for the Work UI's growth gauge; the raw engine total stays
+    # authoritative for capacity and compaction.
+    work_context_baseline_tokens: Optional[int] = None
+    # Only a brand-new Work record may establish a baseline. Migrated/resumed
+    # rows with no baseline must keep showing the authoritative raw total rather
+    # than silently reclassifying their existing conversation as engine cost.
+    work_context_baseline_pending: bool = False
     turn_task: Optional[asyncio.Task] = None
     # Correlates asynchronous turn crashes/drain failures with the optimistic
     # client turn. Control-command errors must never terminate an unrelated turn.
@@ -81,6 +89,17 @@ class SessionContext:
     # managed turn stream so the session remains single-writer and interruptible.
     codex_spontaneous_turn_id: Optional[str] = None
     codex_spontaneous_task: Optional[asyncio.Task] = None
+    # Remote-owned Git checkpoint journal for Codex Code turns. It is created
+    # lazily only in Git workspaces; Work and Claude use their own restore paths.
+    codex_checkpoint: Any = None
+    codex_checkpoint_turn_id: Optional[str] = None
+    # ``turn/start`` acceptance is separate from the pre-turn filesystem
+    # capture. A failed RPC must abort the active snapshot without consuming a
+    # native-turn slot, while an accepted turn whose capture failed needs an
+    # unavailable tombstone to keep count-based rollback aligned.
+    codex_checkpoint_ready: bool = False
+    codex_checkpoint_accepted: bool = False
+    codex_checkpoint_unavailable_reason: Optional[str] = None
     # ---- external-write mirroring (a native `claude`/`codex` in the user's
     # terminal owns this session and is appending to its transcript) ----
     # epoch of the last append this wrapper did NOT make. Recent => the session is

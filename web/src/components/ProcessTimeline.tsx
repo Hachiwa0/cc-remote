@@ -44,7 +44,12 @@ const PROCESS_IC: Record<ProcessBlock["processKind"], string> = {
   compaction: "simplify",
 };
 
-function ProcessActivity({ block }: { block: ProcessBlock }) {
+function ProcessActivity({ block, onOpenFile }: {
+  block: ProcessBlock;
+  onOpenFile?: (path: string, line?: number) => void;
+}) {
+  const filePath = typeof block.input?.file_path === "string"
+    ? block.input.file_path : null;
   const hasBody = !!(block.summary || block.detail || block.output || block.diff
     || block.progress || block.command || block.cwd || block.plan?.length
     || (block.input && Object.keys(block.input).length));
@@ -66,7 +71,13 @@ function ProcessActivity({ block }: { block: ProcessBlock }) {
       {block.cwd && <div className="process-meta">{block.cwd}</div>}
       {block.summary && <div className="process-copy">{block.summary}</div>}
       {block.detail && <pre className="tool-pre">{block.detail}</pre>}
-      {block.input && Object.keys(block.input).length > 0 && (
+      {filePath && onOpenFile && (
+        <button type="button" className="process-file-link"
+          onClick={() => onOpenFile(filePath)}>
+          <Icon name="file" size={14} /><span>{filePath}</span>
+        </button>
+      )}
+      {block.input && Object.keys(block.input).length > 0 && !filePath && (
         <pre className="tool-pre">{JSON.stringify(block.input, null, 2)}</pre>
       )}
       {block.output && <pre className="tool-pre">{block.output}{block.truncated ? "\n…(truncated)" : ""}</pre>}
@@ -106,7 +117,8 @@ function TimelineItem({ block, onOpenFile }: {
   block: Block;
   onOpenFile?: (path: string, line?: number) => void;
 }) {
-  if (block.kind === "process") return <ProcessActivity block={block as ProcessBlock} />;
+  if (block.kind === "process") return <ProcessActivity
+    block={block as ProcessBlock} onOpenFile={onOpenFile} />;
   const text = block as TextBlock;
   if (text.channel === "thinking") {
     return (

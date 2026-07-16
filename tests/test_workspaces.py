@@ -1,8 +1,11 @@
 import json
 import os
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +20,39 @@ class WorkRegistryTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_legacy_schema_migration_is_safe_under_concurrent_initialize(self):
+        self.root.mkdir(parents=True)
+        with sqlite3.connect(self.store.db_path) as db:
+            db.execute(
+                """CREATE TABLE work_sessions (
+                    work_id TEXT PRIMARY KEY,
+                    engine TEXT NOT NULL,
+                    session_id TEXT UNIQUE,
+                    cwd TEXT NOT NULL UNIQUE,
+                    title TEXT,
+                    project_id TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )"""
+            )
+
+        workers = 8
+        barrier = threading.Barrier(workers)
+
+        def initialize() -> None:
+            barrier.wait(timeout=5)
+            self.store.initialize()
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda _index: initialize(), range(workers)))
+
+        with sqlite3.connect(self.store.db_path) as db:
+            columns = [row[1] for row in db.execute(
+                "PRAGMA table_info(work_sessions)"
+            )]
+        self.assertEqual(columns.count("context_baseline_tokens"), 1)
 
     def test_project_sources_plugins_are_materialized_into_private_session(self):
         project_id = self.store.create_project("季度复盘", "整理业务结果")
@@ -41,6 +77,66 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
         self.assertEqual((workspace / "WORK.md").stat().st_mode & 0o777, 0o600)
 
+    def test_existing_work_session_tracks_later_project_context_changes(self):
+        project_id = self.store.create_project("持续项目", "初始说明")
+        record = self.store.create_session(project_id)
+        self.store.bind_session(record.work_id, "session-1")
+        workspace = Path(record.cwd)
+
+        source_id = self.store.add_source(
+            project_id, "file", "第一版", filename="brief.txt",
+            content=b"version one",
+        )
+        self.store.create_plugin("交付格式", "必须带结论", project_id)
+
+        self.assertEqual(
+            (workspace / "资料库" / "brief.txt").read_bytes(), b"version one")
+        context = (workspace / "WORK.md").read_text(encoding="utf-8")
+        self.assertIn("第一版", context)
+        self.assertIn("已启用工作模板", context)
+        self.assertIn("必须带结论", context)
+
+        self.store.delete_source(source_id)
+        self.assertFalse((workspace / "资料库" / "brief.txt").exists())
+        self.assertNotIn(
+            "第一版", (workspace / "WORK.md").read_text(encoding="utf-8"))
+
+    def test_context_sync_never_overwrites_user_created_library_file(self):
+        project_id = self.store.create_project("资料冲突")
+        record = self.store.create_session(project_id)
+        workspace = Path(record.cwd)
+        library = workspace / "资料库"
+        library.mkdir()
+        user_file = library / "brief.txt"
+        user_file.write_bytes(b"user owned")
+
+        self.store.add_source(
+            project_id, "file", "资料", filename="brief.txt",
+            content=b"managed copy",
+        )
+
+        self.assertEqual(user_file.read_bytes(), b"user owned")
+        self.assertEqual((library / "brief-2.txt").read_bytes(), b"managed copy")
+        self.assertIn(
+            "资料库/brief-2.txt",
+            (workspace / "WORK.md").read_text(encoding="utf-8"),
+        )
+
+    def test_deleting_project_removes_only_managed_context(self):
+        project_id = self.store.create_project("可删除项目")
+        self.store.add_source(
+            project_id, "file", "资料", filename="source.txt", content=b"source")
+        record = self.store.create_session(project_id)
+        workspace = Path(record.cwd)
+        user_file = workspace / "keep.txt"
+        user_file.write_text("keep", encoding="utf-8")
+
+        self.store.delete_project(project_id)
+
+        self.assertEqual(user_file.read_text(encoding="utf-8"), "keep")
+        self.assertFalse((workspace / "WORK.md").exists())
+        self.assertFalse((workspace / "资料库" / "source.txt").exists())
+
     def test_dashboard_never_exposes_provider_storage_paths(self):
         project_id = self.store.create_project("知识库")
         self.store.add_source(
@@ -59,10 +155,48 @@ class WorkRegistryTests(unittest.TestCase):
         second = self.store.claim_due_schedules(time.time())
         self.assertEqual([row["schedule_id"] for row in first], [schedule_id])
         self.assertEqual(second, [])
-        self.store.complete_schedule(schedule_id, "session-1", None)
+        self.store.complete_schedule(first[0]["run_id"], "session-1", None)
         schedule = self.store.dashboard()["schedules"][0]
         self.assertEqual(schedule["last_session_id"], "session-1")
+        self.assertEqual(schedule["last_run_status"], "succeeded")
         self.assertTrue(schedule["enabled"])
+
+    def test_one_shot_schedule_recovers_same_run_after_lease_expiry(self):
+        now = time.time()
+        schedule_id = self.store.create_schedule("一次任务", "生成报告", now - 1)
+
+        first = self.store.claim_due_schedules(now, lease_seconds=10)
+        self.assertEqual(first[0]["schedule_id"], schedule_id)
+        run_id = first[0]["run_id"]
+        self.assertEqual(self.store.claim_due_schedules(now + 5), [])
+
+        recovered = self.store.claim_due_schedules(now + 11, lease_seconds=10)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["run_id"], run_id)
+        self.assertEqual(recovered[0]["attempt"], 2)
+        self.assertFalse(self.store.dashboard()["schedules"][0]["enabled"])
+
+    def test_failed_schedule_run_retries_with_backoff_then_succeeds(self):
+        now = time.time()
+        self.store.create_schedule("重试任务", "生成报告", now - 1)
+        first = self.store.claim_due_schedules(now)[0]
+
+        status = self.store.complete_schedule(
+            first["run_id"], None, "temporary failure", now=now)
+        self.assertEqual(status, "queued")
+        self.assertEqual(self.store.claim_due_schedules(now + 14), [])
+        second = self.store.claim_due_schedules(now + 15)[0]
+        self.assertEqual(second["run_id"], first["run_id"])
+        self.assertEqual(second["attempt"], 2)
+
+        self.assertEqual(
+            self.store.complete_schedule(
+                second["run_id"], "session-ok", None, now=now + 16),
+            "succeeded",
+        )
+        schedule = self.store.dashboard()["schedules"][0]
+        self.assertEqual(schedule["last_run_status"], "succeeded")
+        self.assertEqual(schedule["last_session_id"], "session-ok")
 
     def test_delete_session_removes_only_registry_owned_random_directory(self):
         record = self.store.create_session()

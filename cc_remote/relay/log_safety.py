@@ -21,7 +21,7 @@ _NAMED_SECRET = re.compile(
 _BEARER = re.compile(r"(?i)\bbearer\s+[^\s,;}]+")
 _SENSITIVE_KEYS = frozenset({
     "token", "password", "secret", "answer", "authorization", "cookie",
-    "set-cookie",
+    "set-cookie", "login_users_json", "wrapper_tokens_json",
 })
 _FILTER_NAME = "cc_remote_sensitive_log_redaction"
 
