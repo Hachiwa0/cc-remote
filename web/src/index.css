@@ -1160,12 +1160,59 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   border-radius:10px; background:var(--surface); color:var(--text); padding:9px 11px; font:13px/1.45 inherit; outline:none; }
 .work-form textarea{ min-height:76px; resize:vertical; }
 .work-form input:focus,.work-form textarea:focus,.work-form select:focus,.work-project-picker:focus{ border-color:var(--accent-line); }
-.work-form .primary,.work-form-actions button,.file-action{ justify-self:start; padding:9px 14px; border-radius:10px;
+.work-form>.primary,.work-form-actions>button,.file-action{ justify-self:start; padding:9px 14px; border-radius:10px;
   background:var(--accent); color:#fff; font-size:13px; font-weight:650; cursor:pointer; }
 .work-form button:disabled{ opacity:.45; cursor:not-allowed; }
 .work-form small{ color:var(--dim); font-size:11.5px; line-height:1.5; }
 .work-form-actions{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .work-form-actions>*{ flex:1 1 160px; }
+.date-time-picker{ position:relative; min-width:250px; }
+.date-time-trigger{ width:100%; min-height:48px; display:flex; align-items:center; gap:10px; padding:7px 11px;
+  border:1px solid var(--border); border-radius:11px; background:var(--surface); color:var(--dim); text-align:left;
+  transition:border-color .14s,box-shadow .14s,background .14s; }
+.date-time-trigger:hover,.date-time-trigger:focus-visible{ border-color:var(--accent-line); box-shadow:0 0 0 3px var(--accent-weak); }
+.date-time-trigger>span:nth-child(2){ display:flex; min-width:0; flex:1; flex-direction:column; gap:1px; }
+.date-time-trigger small{ color:var(--faint); font-size:10px; font-weight:600; letter-spacing:.04em; }
+.date-time-trigger b{ overflow:hidden; font-size:12.5px; font-weight:560; text-overflow:ellipsis; white-space:nowrap; }
+.date-time-trigger.has-value b{ color:var(--text); }
+.date-time-trigger-icon{ width:30px; height:30px; flex:none; display:grid; place-items:center; border-radius:9px;
+  background:var(--accent-weak); color:var(--accent-ink); }
+.date-time-trigger>svg{ flex:none; color:var(--faint); }
+.date-time-scrim{ position:fixed; z-index:60; inset:0; cursor:default; background:transparent; }
+.date-time-popover{ position:fixed; z-index:61; top:var(--date-time-top); left:var(--date-time-left); width:min(344px,calc(100vw - 32px));
+  max-height:calc(100dvh - 32px); overflow-y:auto; overscroll-behavior:contain;
+  padding:12px; border:1px solid var(--border-strong); border-radius:16px; background:var(--surface);
+  box-shadow:0 18px 60px rgba(21,18,12,.2); color:var(--text); animation:panel-in .16s var(--ease); }
+:root[data-theme="dark"] .date-time-popover{ box-shadow:0 22px 70px rgba(0,0,0,.48); }
+.date-time-popover>header{ display:grid; grid-template-columns:34px 1fr 34px; align-items:center; margin-bottom:8px; }
+.date-time-popover>header strong{ text-align:center; font-size:14px; }
+.date-time-popover>header button{ width:32px; height:32px; display:grid; place-items:center; border-radius:9px; color:var(--dim); }
+.date-time-popover>header button:hover{ color:var(--text); background:var(--raised); }
+.date-time-quick{ display:flex; gap:6px; margin-bottom:10px; }
+.date-time-quick button{ padding:5px 9px; border:1px solid var(--border); border-radius:999px; color:var(--dim); font-size:11px; }
+.date-time-quick button:hover{ color:var(--accent-ink); border-color:var(--accent-line); background:var(--accent-weak); }
+.date-time-week,.date-time-days{ display:grid; grid-template-columns:repeat(7,1fr); gap:3px; }
+.date-time-week{ margin-bottom:3px; }
+.date-time-week span{ padding:3px 0; color:var(--faint); font-size:10px; font-weight:650; text-align:center; }
+.date-time-days button{ height:32px; min-width:0; display:grid; place-items:center; border:1px solid transparent;
+  border-radius:9px; color:var(--dim); font-size:11.5px; font-variant-numeric:tabular-nums; }
+.date-time-days button:hover{ color:var(--text); background:var(--raised); }
+.date-time-days button.outside{ color:var(--faint); opacity:.55; }
+.date-time-days button.today{ border-color:var(--accent-line); color:var(--accent-ink); }
+.date-time-days button.selected{ border-color:var(--accent); background:var(--accent); color:#fff; font-weight:700; }
+.date-time-clock{ display:flex; align-items:center; gap:7px; margin-top:11px; padding:10px; border-radius:12px; background:var(--raised); }
+.date-time-clock>span{ display:flex; align-items:center; gap:6px; margin-right:auto; color:var(--dim); font-size:11px; font-weight:650; }
+.date-time-clock label{ position:relative; }
+.date-time-clock label>span{ position:absolute; top:3px; left:8px; color:var(--faint); font-size:8px; pointer-events:none; }
+.date-time-clock select{ width:62px; min-width:0; height:42px; padding:13px 7px 3px; border:1px solid var(--border);
+  border-radius:9px; background:var(--surface); color:var(--text); font:650 13px/1 var(--mono); text-align:center; }
+.date-time-clock i{ color:var(--faint); font-style:normal; font-weight:700; }
+.date-time-popover>footer{ display:flex; align-items:center; gap:5px; margin-top:10px; padding-top:10px; border-top:1px solid var(--border); }
+.date-time-popover>footer span{ flex:1; }
+.date-time-popover>footer button{ padding:7px 10px; border-radius:9px; color:var(--dim); font-size:11.5px; font-weight:600; }
+.date-time-popover>footer button:hover{ background:var(--raised); color:var(--text); }
+.date-time-popover>footer button.primary{ background:var(--accent); color:#fff; }
+.date-time-popover>footer button.date-time-clear{ color:var(--danger); }
 .work-items{ display:grid; gap:7px; }
 .work-items article{ display:flex; align-items:flex-start; gap:12px; padding:12px 13px; border:1px solid var(--border);
   border-radius:13px; background:var(--surface); cursor:pointer; }
@@ -1186,6 +1233,10 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
     border-radius:18px 18px 0 0; }
   .work-artifacts-sheet>header{ padding-top:14px; }
   .work-artifacts-list{ padding-bottom:calc(10px + env(safe-area-inset-bottom)); }
+  .date-time-picker{ min-width:100%; }
+  .date-time-popover{ top:auto; right:0; bottom:0; left:0; width:auto; padding:15px 16px calc(14px + env(safe-area-inset-bottom));
+    border-width:1px 0 0; border-radius:20px 20px 0 0; }
+  .date-time-days button{ height:36px; }
 }
 
 /* DIRECTORY PICKER */

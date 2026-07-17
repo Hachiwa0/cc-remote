@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Icon } from "../icons";
 import type { QueryFile, WorkDashboard } from "../protocol";
 import { MAX_FILENAME_BYTES, MAX_SINGLE_ATTACHMENT_BYTES } from "../img";
+import { DateTimePicker } from "./DateTimePicker";
 
 type Tab = "projects" | "library" | "schedules" | "plugins";
 
@@ -143,7 +144,7 @@ export function WorkDashboardSheet(props: Props) {
               <input value={scheduleTitle} onChange={(e) => setScheduleTitle(e.target.value)} placeholder="任务名称" />
               <textarea value={schedulePrompt} onChange={(e) => setSchedulePrompt(e.target.value)} placeholder="到时间后让 Agent 完成什么？" />
               <div className="work-form-actions">
-                <input type="datetime-local" value={scheduleAt} onChange={(e) => setScheduleAt(e.target.value)} />
+                <DateTimePicker value={scheduleAt} onChange={setScheduleAt} />
                 <select value={repeat} onChange={(e) => setRepeat(e.target.value)}>
                   <option value="">仅一次</option><option value="86400">每天</option><option value="604800">每周</option>
                 </select>

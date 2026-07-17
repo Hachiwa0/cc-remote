@@ -284,50 +284,56 @@ export default function App() {
     document.documentElement.setAttribute("data-space", space);
     localStorage.setItem(SPACE_KEY, space);
   }, [space]);
-  // Tapping the engine pill switches engine AND drops you into a fresh chat for
-  // it — otherwise "switch to Codex" silently only affects the *next* new session,
-  // which reads as "nothing happened". Existing sessions stay in the sidebar.
+  const rememberSurfaceFocus = (currentEngine: Engine, currentSpace: Space) => {
+    if (focusedSid && !state.newChat) {
+      lastFocusBySurfaceRef.current[`${currentSpace}:${currentEngine}`] = focusedSid;
+    }
+  };
+
+  const prepareSurfaceSwitch = (nextEngine: Engine, nextSpace: Space) => {
+    rememberSurfaceFocus(engine, space);
+    const surfaceKey = `${nextSpace}:${nextEngine}`;
+    dispatch({
+      type: "restore_session_list",
+      sessions: sessionListsBySurfaceRef.current[surfaceKey] ?? [],
+    });
+    const remembered = lastFocusBySurfaceRef.current[surfaceKey];
+    preferredSurfaceFocusRef.current = remembered
+      ? { key: surfaceKey, sid: remembered } : null;
+    didInitFocusRef.current = false;
+    wsRef.current?.setSurface(nextEngine, nextSpace);
+    wsRef.current?.setFocusedSid(null);
+    // Keep the previous surface's transcript out of view while its accepted
+    // list is restored. The focus effect below exits this temporary new page as
+    // soon as the remembered (or latest valid) session is available.
+    dispatch({ type: "enter_new_chat", cwd: "~" });
+    setNewChatAutoFocus(false);
+  };
+
+  // Engine and Work/Code switches are navigation. Each surface restores the
+  // session that was last open there instead of silently starting a new one.
   const toggleEngine = () => {
     const nextEngine: Engine = engine === "codex" ? "claude" : "codex";
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
     setWorkArtifactsOpen(false);
-    preferredSurfaceFocusRef.current = null;
     setWorkProjectId(null);
-    dispatch({
-      type: "restore_session_list",
-      sessions: sessionListsBySurfaceRef.current[`${space}:${nextEngine}`] ?? [],
-    });
-    // Switching engines is navigation, not an intent to type. In particular,
-    // mounting NewChatView must not summon the mobile keyboard automatically.
-    setNewChatAutoFocus(false);
+    prepareSurfaceSwitch(nextEngine, space);
     setEngine(nextEngine);
-    dispatch({ type: "enter_new_chat", cwd: "~" });  // fresh chat defaults to home
     if (isMobile()) setSidebarOpen(false);
   };
 
   const switchSpace = (next: Space) => {
     if (next === space || !confirmArtifactDiscard()) return;
-    if (focusedSid) lastFocusBySurfaceRef.current[`${space}:${engine}`] = focusedSid;
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
     setForkWorktreeSession(null);
     setForkWorktreeError(null);
     setWorkArtifactsOpen(false);
-    dispatch({
-      type: "restore_session_list",
-      sessions: sessionListsBySurfaceRef.current[`${next}:${engine}`] ?? [],
-    });
-    const remembered = lastFocusBySurfaceRef.current[`${next}:${engine}`];
-    preferredSurfaceFocusRef.current = remembered
-      ? { key: `${next}:${engine}`, sid: remembered } : null;
-    didInitFocusRef.current = false;
-    wsRef.current?.setSurface(engine, next);
-    wsRef.current?.setFocusedSid(null);
+    prepareSurfaceSwitch(engine, next);
     setSpace(next);
-    dispatch({ type: "enter_new_chat", cwd: "~" });
   };
 
   // WebSocket lifecycle
@@ -760,12 +766,26 @@ export default function App() {
       ?? state.sessions[0];
     didInitFocusRef.current = true;
     if (latest && latest.session_id !== state.focusedSid) {
+      dispatch({ type: "exit_new_chat" });
       dispatch({ type: "focus_session", sid: latest.session_id });
       const latestEngine = (latest.engine as "claude" | "codex") || engineRef.current;
       wsRef.current.setFocusedSid(latest.session_id, latestEngine, spaceRef.current);
       wsRef.current.sendSwitchSession(latest.session_id, latestEngine, spaceRef.current);
     }
   }, [state.sessions, state.focusedSid]);
+
+  // Direct sidebar selection and newly-created sessions both update the
+  // per-surface bookmark. A later Work/Code or engine toggle can therefore
+  // restore the exact view without relying on whichever list row happens to be
+  // newest at that moment.
+  useEffect(() => {
+    if (!focusedSid || state.newChat) return;
+    const selected = state.sessions.find((session) => session.session_id === focusedSid);
+    if (!selected) return;
+    const selectedEngine = (selected.engine as Engine | undefined) ?? engine;
+    const selectedSpace: Space = selected.space === "work" ? "work" : "code";
+    lastFocusBySurfaceRef.current[`${selectedSpace}:${selectedEngine}`] = focusedSid;
+  }, [focusedSid, state.newChat, state.sessions, engine]);
 
   // Drain every resident session, not just the one currently visible. A queued
   // background turn must resume when that runtime becomes idle even if the user

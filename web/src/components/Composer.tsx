@@ -571,7 +571,7 @@ export function Composer(p: Props) {
           <div className="work-compose-card">
             <div className="work-compose-caption">
               <span className="work-compose-icon"><Icon name="work" size={17} /></span>
-              <span><b>继续这项工作</b><small>围绕当前资料生成、整理或修改交付物</small></span>
+              <span><b>继续这项工作</b><small>围绕当前资料生成、整理或修改 Artifacts</small></span>
               <span className="work-private"><Icon name="lock" size={12} />私有工作区</span>
             </div>
             <div className="work-inrow">
@@ -587,10 +587,10 @@ export function Composer(p: Props) {
               {!!p.workArtifactCount && (
                 <button type="button" className="work-compose-tool"
                   onClick={p.onOpenArtifacts}
-                  aria-label={`交付物 · ${p.workArtifactCount} 个文件`}
-                  title="查看交付物">
+                  aria-label={`Artifacts · ${p.workArtifactCount} 个文件`}
+                  title="查看 Artifacts">
                   <Icon name="read" size={15} />
-                  <span>交付物 · {p.workArtifactCount}</span>
+                  <span>Artifacts · {p.workArtifactCount}</span>
                 </button>
               )}
               <details className="work-settings" ref={workSettingsRef}>

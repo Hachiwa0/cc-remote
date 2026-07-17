@@ -761,6 +761,41 @@ try {
   );
   assert.deepEqual(restored.sessions, cachedSessions);
   assert.equal(restored.focusedSid, null);
+  const refocused = reduce(reduce(reduce(restored,
+    { type: "enter_new_chat", cwd: "~" }),
+  { type: "focus_session", sid: "cached-work-session" }),
+  { type: "exit_new_chat" });
+  assert.equal(refocused.focusedSid, "cached-work-session");
+  assert.equal(refocused.newChat, null,
+    "restoring a surface focus must also leave the temporary new-work page");
+
+  const {
+    buildCalendarDays, parseLocalDateTime, placeDateTimePopover, toLocalDateTime,
+  } =
+    await reducerHarness.ssrLoadModule("/src/date-time.ts");
+  const { DateTimePicker } =
+    await reducerHarness.ssrLoadModule("/src/components/DateTimePicker.tsx");
+  const sampleDate = new Date(2026, 6, 17, 9, 5);
+  assert.equal(toLocalDateTime(sampleDate), "2026-07-17T09:05");
+  assert.equal(parseLocalDateTime("2026-02-30T09:05"), null,
+    "invalid local calendar dates must fail closed");
+  const calendarDays = buildCalendarDays(new Date(2026, 6, 1), sampleDate);
+  assert.equal(calendarDays.length, 42);
+  assert.equal(toLocalDateTime(calendarDays[0].date).slice(0, 10), "2026-06-29",
+    "the custom calendar must use a stable Monday-first six-week grid");
+  assert.deepEqual(placeDateTimePopover(
+    { left: 275, top: 234, bottom: 284 }, { width: 1280, height: 720 }),
+  { left: 275, top: 232 },
+  "a short viewport must clamp the complete popover inside the visible area");
+  assert.deepEqual(placeDateTimePopover(
+    { left: 548, top: 600, bottom: 650 }, { width: 1920, height: 1200 }),
+  { left: 548, top: 658 },
+  "a tall viewport should keep the popover directly below its trigger");
+  const datePickerMarkup = renderToStaticMarkup(createElement(DateTimePicker, {
+    value: "2026-07-17T09:05", onChange: () => undefined,
+  }));
+  assert.match(datePickerMarkup, /执行时间/);
+  assert.match(datePickerMarkup, /aria-haspopup="dialog"/);
 
   const snapshotOnly = reduce(initialState, { type: "event", event: event({
     type: "snapshot", sid: "background-code", cc_session_id: "background-code",
@@ -2644,6 +2679,12 @@ assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
 assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
 assert.match(appSource, /setNewChatAutoFocus\(false\)/,
   "switching engines must not summon the new-chat keyboard");
+assert.match(appSource, /prepareSurfaceSwitch\(nextEngine, space\)/,
+  "engine switches must restore their own remembered surface session");
+assert.match(appSource, /prepareSurfaceSwitch\(engine, next\)/,
+  "Work/Code switches must share the remembered-session restoration path");
+assert.match(appSource, /if \(latest && latest\.session_id !== state\.focusedSid\) \{\s*dispatch\(\{ type: "exit_new_chat" \}\)/,
+  "restored focus must replace the temporary new-session page");
 assert.match(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/);
 assert.match(appSource, /rt\.replaying \|\| !rt\.syncReady \? "syncing" : "online"/,
   "cached terminal state must be downgraded until the focused session is authoritative");
@@ -2665,7 +2706,8 @@ const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
 assert.match(composerSource, /workSurface \? \(/);
 assert.match(composerSource, /className="work-compose-card"/);
-assert.match(composerSource, /交付物 · \{p\.workArtifactCount\}/);
+assert.match(composerSource, /Artifacts · \{p\.workArtifactCount\}/);
+assert.doesNotMatch(composerSource, /交付物/);
 assert.doesNotMatch(composerSource, /项目与资料/);
 assert.match(composerSource, /工作设置/);
 assert.match(composerSource, /会话新增上下文/);
@@ -2683,6 +2725,23 @@ assert.doesNotMatch(composerSource, /终端占用/,
 assert.match(composerSource, /presentLegacyExternalControl/);
 assert.doesNotMatch(composerSource, /control-bar/,
   "terminal state no longer consumes a permanent row above the composer");
+const workDashboardSource = readFileSync(
+  resolve(process.cwd(), "src/components/WorkDashboardSheet.tsx"), "utf8");
+assert.match(workDashboardSource, /<DateTimePicker value=\{scheduleAt\}/,
+  "Work schedules must use the themed date-time picker");
+assert.doesNotMatch(workDashboardSource, /datetime-local/,
+  "Work schedules must not expose the browser-native date-time popup");
+const dateTimePickerSource = readFileSync(
+  resolve(process.cwd(), "src/components/DateTimePicker.tsx"), "utf8");
+assert.match(dateTimePickerSource, /createPortal\(<>.*document\.body\)/s,
+  "the date-time popover must escape the scrollable Work manager container");
+const appCssSource = readFileSync(resolve(process.cwd(), "src/index.css"), "utf8");
+assert.doesNotMatch(appCssSource, /\.work-form-actions button/,
+  "Work action styles must not repaint nested calendar buttons");
+assert.match(appCssSource, /\.work-form-actions>button/,
+  "Work action styles must be limited to direct action buttons");
+assert.match(appCssSource, /\.date-time-days button\{ height:32px/,
+  "desktop calendar rows must stay compact enough to fit above the viewport edge");
 const sessionControlUiSource = readFileSync(
   resolve(process.cwd(), "src/session-control-ui.ts"), "utf8");
 assert.match(sessionControlUiSource, /桌面端控制 · 只读/);

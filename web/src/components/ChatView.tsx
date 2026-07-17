@@ -253,9 +253,9 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     return (
       <div className="turn-files">
         <button className="turn-files-summary" onClick={openSummary}
-          title={surface === "work" ? "预览交付物" : "查看全部改动"}>
+          title={surface === "work" ? "预览 Artifacts" : "查看全部改动"}>
           <Icon name={surface === "work" ? "folder" : "edit"} size={13} />{
-            surface === "work" ? `交付物 · ${arr.length} 个文件` : `改动 ${arr.length} 个文件`
+            surface === "work" ? `Artifacts · ${arr.length} 个文件` : `改动 ${arr.length} 个文件`
           }
         </button>
         <div className="turn-files-list">

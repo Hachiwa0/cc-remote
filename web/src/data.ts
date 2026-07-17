@@ -46,7 +46,7 @@ export const WORK_COMMANDS: Command[] = [
   { g: "工作" },
   { slash: "goal", name: "工作目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "临时侧聊，不影响当前工作主线", ic: "spark" },
-  { slash: "preview", name: "预览交付物", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
+  { slash: "preview", name: "预览 Artifacts", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "context", name: "上下文用量", ds: "查看本次工作的 token 占用", ic: "cpu" },
   { slash: "clear", name: "新工作", ds: "开始一项独立的新工作", ic: "close" },
 ];
