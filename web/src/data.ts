@@ -27,7 +27,6 @@ export const COMMANDS: Command[] = [
   { slash: "init", name: "初始化 CLAUDE.md", ds: "生成代码库说明", ic: "init" },
   { g: "会话" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
-  { slash: "rewind", name: "回到上一轮", ds: "选择只回滚对话、代码或两者", ic: "history" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "clear", name: "清空会话", ds: "开新会话，清空上下文", ic: "close" },
@@ -179,6 +178,8 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // Slashes handled locally by the web client (never forwarded to cc as a prompt).
 // Everything else (code-review, verify, run, deep-research, …) is a cc skill and
 // is forwarded verbatim so cc's own slash-command layer runs it.
+// /rewind stays reserved locally while its UI is hidden so manually typing it
+// cannot fall through to Claude's interactive-only slash layer.
 export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "preview"]);
 
 // Codex engine command palette. Native app-server controls are handled locally

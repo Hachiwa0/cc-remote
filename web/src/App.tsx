@@ -985,29 +985,6 @@ export default function App() {
     if (command.kind === "show") wsRef.current?.sendGetGoal();
     else wsRef.current?.sendSetGoal(command.objective, "active", null);
   };
-  const openClaudeRewind = (checkpointId: string, prompt: string) => {
-    if (!focusedSid || focusedEngine !== "claude" || space !== "code") return;
-    const selectedIndex = rt.turns.findIndex(
-      (turn) => turn.done && turn.checkpointId === checkpointId);
-    const numTurns = selectedIndex < 0 ? 1 : Math.max(1, Math.min(1000,
-      rt.turns.slice(selectedIndex).filter(
-        (turn) => turn.done && Boolean(turn.checkpointId)).length));
-    const label = prompt.trim()
-      ? `回到“${prompt.trim().slice(0, 48)}${prompt.trim().length > 48 ? "…" : ""}”`
-      : "回到所选消息";
-    setRollbackTarget({
-      sessionId: focusedSid, engine: "claude", checkpointId,
-      numTurns, label,
-    });
-  };
-  const openLatestClaudeRewind = () => {
-    const turn = [...rt.turns].reverse().find((item) => item.done && item.checkpointId);
-    if (!turn?.checkpointId) {
-      dispatch({ type: "command_error", detail: "当前历史没有可用的 Claude checkpoint；请在新回合完成后重试" });
-      return;
-    }
-    openClaudeRewind(turn.checkpointId, turn.prompt);
-  };
   const openCodexRollback = (numTurns: number, sessionId = focusedSid) => {
     if (!sessionId) return;
     setRollbackTarget({
@@ -1306,8 +1283,7 @@ export default function App() {
                 }
                 setWorkArtifactsOpen(true);
               }}
-              onFork={space === "code" ? forkFromTurn : undefined}
-              onRewind={space === "code" ? openClaudeRewind : undefined} />
+              onFork={space === "code" ? forkFromTurn : undefined} />
 
             <GoalPanel engine={engine} goal={rt.goal}
               revealed={!!goalUi?.revealed} open={!!goalUi?.open}
@@ -1361,7 +1337,6 @@ export default function App() {
           onOpenBtw={openBtw}
           onPreview={previewMarkdown}
           onGoal={runGoal}
-          onRewind={openLatestClaudeRewind}
           onStatus={openStatus}
           onReview={(target, value) => {
             if (focusedSid) wsRef.current?.sendStartReview(focusedSid, target, value);

@@ -58,7 +58,6 @@ interface Props {
   onOpenBtw?: () => void;
   onPreview?: (path: string) => void;
   onGoal?: (args: string) => void;
-  onRewind?: () => void;
   onStatus?: () => void;
   onReview?: (
     target: "uncommittedChanges" | "baseBranch" | "commit" | "custom",
@@ -301,10 +300,7 @@ export function Composer(p: Props) {
       case "context": p.onContext(); setCtxOpen(true); break;
       case "status": p.onStatus?.(); break;
       case "goal": p.onGoal?.(args); break;
-      case "rewind":
-        if (args.trim()) { flash("/rewind 不接受参数；请在消息下方选择具体回滚点"); return; }
-        p.onRewind?.();
-        break;
+      case "rewind": flash("Claude Rewind 暂未开放"); break;
       case "review": {
         const trimmed = args.trim();
         if (!trimmed) {

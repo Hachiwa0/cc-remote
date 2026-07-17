@@ -153,9 +153,19 @@ assert.match(historyAppSource,
   "a failed non-authoritative History must not reopen the IndexedDB cache barrier");
 assert.match(historyAppSource, /artifact_invalidated[\s\S]*sendGetWorkArtifacts/,
   "file rollback must refresh the Work artifact inventory");
-assert.match(historyAppSource,
-  /selectedIndex[\s\S]*rt\.turns\.slice\(selectedIndex\)[\s\S]*numTurns, label/,
-  "Claude rewind must report the visible turn distance instead of always one turn");
+const rewindChatViewSource = readFileSync(resolve(
+  process.cwd(), "src/components/ChatView.tsx"), "utf8");
+const rewindComposerSource = readFileSync(resolve(
+  process.cwd(), "src/components/Composer.tsx"), "utf8");
+assert.equal(commandsFor("claude").some((command) => (
+  "slash" in command && command.slash === "rewind"
+)), false, "Claude rewind must stay hidden from the command palette");
+assert.doesNotMatch(historyAppSource, /openClaudeRewind|openLatestClaudeRewind/,
+  "Claude rewind must not have an App entry point while unsupported");
+assert.doesNotMatch(rewindChatViewSource, /onRewind|回到这里/,
+  "Claude messages must not expose a rewind action while unsupported");
+assert.match(rewindComposerSource, /case "rewind": flash\("Claude Rewind 暂未开放"\)/,
+  "a manually typed hidden rewind command must be blocked locally");
 assert.match(historyAppSource, /replay_start[\s\S]*sendGetHistory/,
   "a replay gap must request authoritative history instead of ending on an empty view");
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
