@@ -102,9 +102,9 @@ export const CODEX_MODELS: Model[] = [
   { id: "gpt-5.4", name: "GPT-5.4", ds: "更早 · 旧会话兼容", ic: "cpu" },
 ];
 export const CODEX_PERMS: Perm[] = [
-  { id: "never", name: "不询问", short: "不询问", ds: "不询问 · 需要审批时拒绝", ic: "shield" },
-  { id: "on-request", name: "按需", short: "按需", ds: "需要时才询问", ic: "shield" },
-  { id: "untrusted", name: "严格", short: "严格", ds: "每步都先询问", ic: "shield" },
+  { id: "never", name: "Never", short: "Never", ds: "不询问 · 需要审批时拒绝", ic: "shield" },
+  { id: "on-request", name: "On Request", short: "On Request", ds: "需要时才询问", ic: "shield" },
+  { id: "untrusted", name: "Untrusted", short: "Untrusted", ds: "每步都先询问", ic: "shield" },
 ];
 
 /** Live catalogs by engine, as reported by the wrapper (`models` frame). */
@@ -180,11 +180,11 @@ export function matchModelId(m: string, engine?: string): string {
 
 export interface Perm { id: string; name: string; short: string; ds: string; ic: string; danger?: boolean }
 export const PERMS: Perm[] = [
-  { id: "default", name: "默认", short: "询问", ds: "每次动作前询问", ic: "shield" },
-  { id: "acceptEdits", name: "自动接受编辑", short: "编辑", ds: "文件编辑免询问，命令仍询问", ic: "edit" },
-  { id: "plan", name: "Plan 模式", short: "Plan", ds: "只读 · 先出方案再执行", ic: "plan" },
-  { id: "auto", name: "自动", short: "自动", ds: "自动执行常规操作", ic: "run" },
-  { id: "bypassPermissions", name: "危险模式", short: "危险", ds: "危险 · 不询问直接执行 · --dangerously-skip-permissions", ic: "bolt", danger: true },
+  { id: "default", name: "Default", short: "Default", ds: "每次动作前询问", ic: "shield" },
+  { id: "acceptEdits", name: "Accept Edits", short: "Accept Edits", ds: "文件编辑免询问，命令仍询问", ic: "edit" },
+  { id: "plan", name: "Plan", short: "Plan", ds: "只读 · 先出方案再执行", ic: "plan" },
+  { id: "auto", name: "Auto", short: "Auto", ds: "自动执行常规操作", ic: "run" },
+  { id: "bypassPermissions", name: "Bypass Permissions", short: "Bypass Permissions", ds: "危险 · 不询问直接执行 · --dangerously-skip-permissions", ic: "bolt", danger: true },
 ];
 
 export function isCmd(c: Command): c is Cmd {

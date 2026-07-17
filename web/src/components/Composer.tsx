@@ -655,7 +655,7 @@ export function Composer(p: Props) {
             disabled={locked}
             title="点击切换权限模式"
           >
-            {perm ? `${perm.short}模式` : "权限读取中"} · {stateZh[p.state]} <span className="hint-mode-ch">▾</span>
+            {perm ? perm.short : "Mode loading"} · {stateZh[p.state]} <span className="hint-mode-ch">▾</span>
           </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令</span>
           <div className="hint-right" ref={ctxWrapRef}>

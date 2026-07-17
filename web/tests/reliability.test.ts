@@ -37,6 +37,7 @@ import {
   isKnownCodeOnlySlash,
   matchCommands,
   modelsFor,
+  permsFor,
 } from "../src/data.ts";
 import {
   createMobileViewportSync,
@@ -68,6 +69,27 @@ assert.equal(sessionActivityTime("2026-07-17T10:00:00Z"),
   Date.parse("2026-07-17T10:00:00Z"), "ISO Claude activity timestamps must sort correctly");
 assert.ok(sessionActivityTime("1752746400000") > sessionActivityTime("1752746399"),
   "millisecond and second timestamps must share one ordering scale");
+
+assert.deepEqual(
+  permsFor("claude").map(({ id, name, short }) => ({ id, name, short })),
+  [
+    { id: "default", name: "Default", short: "Default" },
+    { id: "acceptEdits", name: "Accept Edits", short: "Accept Edits" },
+    { id: "plan", name: "Plan", short: "Plan" },
+    { id: "auto", name: "Auto", short: "Auto" },
+    { id: "bypassPermissions", name: "Bypass Permissions", short: "Bypass Permissions" },
+  ],
+  "Claude permission labels should match the official English mode names",
+);
+assert.deepEqual(
+  permsFor("codex").map(({ id, name, short }) => ({ id, name, short })),
+  [
+    { id: "never", name: "Never", short: "Never" },
+    { id: "on-request", name: "On Request", short: "On Request" },
+    { id: "untrusted", name: "Untrusted", short: "Untrusted" },
+  ],
+  "Codex permission labels should match the official approval-policy names",
+);
 const recentProject = { session_id: "project-new", cwd: "/home/nancy/project",
   last_modified: "300" };
 const oldHome = { session_id: "home-old", cwd: "/home/nancy", last_modified: "100" };
