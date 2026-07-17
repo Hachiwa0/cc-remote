@@ -31,7 +31,9 @@ export function RollbackSheet({ target, onClose, onConfirm }: {
     },
     {
       mode: "both", icon: "refresh", title: "对话和代码",
-      detail: "先安全恢复代码，再回滚对话；两部分结果会分别确认。",
+      detail: isClaude
+        ? "先回到所选对话，再恢复对应 checkpoint 文件；对话失败时不会修改文件。"
+        : "先安全恢复代码，再回滚对话；两部分结果会分别确认。",
     },
   ];
   return <>

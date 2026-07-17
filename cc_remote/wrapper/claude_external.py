@@ -7,9 +7,10 @@ watched session unambiguously.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Collection, Literal, Mapping
 
 from cc_remote.wrapper.codex_external import (
     MAX_PROC_SCAN,
@@ -27,6 +28,100 @@ _CONTINUE_FLAGS = frozenset({b"--continue", b"-c"})
 _BACKGROUND_ROLES = frozenset({
     b"daemon", b"bg-pty-host", b"bg-spare", b"--bg-pty-host", b"--bg-spare",
 })
+
+_SDK_ENTRYPOINTS = frozenset({"sdk-py"})
+_SDK_PROMPT_SOURCES = frozenset({"sdk"})
+_NEUTRAL_METADATA_TYPES = frozenset({
+    "mode",
+    "permission-mode",
+    "queue-operation",
+})
+
+
+def classify_claude_growth(
+    data: bytes,
+    owned_message_ids: Collection[str] = (),
+) -> tuple[Literal["sdk", "external", "unknown"], tuple[str, ...]]:
+    """Attribute complete Claude JSONL growth without a time heuristic.
+
+    Agent SDK transcript rows carry ``entrypoint=sdk-py`` (and user rows also
+    carry ``promptSource=sdk``), while native TUI rows carry ``entrypoint=cli``.
+    A few metadata rows have no direct origin; ``last-prompt`` and file-history
+    rows can still be attributed through the message UUID they reference.
+
+    Unknown or partial data deliberately remains unknown so the machine can
+    fail closed unless an SDK operation is actively writing. An explicit
+    foreign entrypoint always wins, even during an SDK operation.
+    """
+    if not data or not data.endswith(b"\n"):
+        return "unknown", ()
+
+    rows: list[dict] = []
+    try:
+        for raw_line in data.splitlines():
+            if not raw_line.strip():
+                continue
+            value = json.loads(raw_line)
+            if not isinstance(value, dict):
+                return "unknown", ()
+            rows.append(value)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "unknown", ()
+    if not rows:
+        return "unknown", ()
+
+    known_owned = {
+        value for value in owned_message_ids
+        if isinstance(value, str) and value
+    }
+    new_owned: list[str] = []
+    sdk_evidence = False
+    external_evidence = False
+    unresolved_rows: list[dict] = []
+
+    for row in rows:
+        entrypoint = row.get("entrypoint")
+        prompt_source = row.get("promptSource")
+        if (isinstance(entrypoint, str) and entrypoint
+                and entrypoint not in _SDK_ENTRYPOINTS):
+            external_evidence = True
+            continue
+        if (isinstance(prompt_source, str) and prompt_source
+                and prompt_source not in _SDK_PROMPT_SOURCES):
+            external_evidence = True
+            continue
+        if entrypoint in _SDK_ENTRYPOINTS or prompt_source in _SDK_PROMPT_SOURCES:
+            sdk_evidence = True
+            message_id = row.get("uuid")
+            if isinstance(message_id, str) and message_id:
+                known_owned.add(message_id)
+                new_owned.append(message_id)
+            continue
+        unresolved_rows.append(row)
+
+    # Resolve origin-less metadata after collecting SDK ids from the entire
+    # chunk: file snapshots can precede/follow their referenced user row.
+    for row in unresolved_rows:
+        row_type = str(row.get("type") or "")
+        if row_type == "last-prompt":
+            reference = row.get("leafUuid")
+        elif row_type == "file-history-snapshot":
+            reference = row.get("messageId")
+        elif row_type in _NEUTRAL_METADATA_TYPES:
+            continue
+        else:
+            return "external" if external_evidence else "unknown", ()
+        if isinstance(reference, str) and reference in known_owned:
+            sdk_evidence = True
+        else:
+            return "external" if external_evidence else "unknown", ()
+
+    if external_evidence:
+        return "external", ()
+    if sdk_evidence:
+        # Preserve insertion order while avoiding unbounded duplicate ids.
+        return "sdk", tuple(dict.fromkeys(new_owned))
+    return "unknown", ()
 
 
 def _is_claude_cli(args: tuple[bytes, ...] | None) -> bool:

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Icon, ClaudeMark } from "../icons";
 import { useImeSubmit } from "../use-ime-submit";
 
@@ -15,6 +15,12 @@ export function LoginForm({
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const pendingPasswordSelection = useRef<{
+    start: number | null;
+    end: number | null;
+    direction: "forward" | "backward" | "none" | null;
+    restoreFocus: boolean;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -48,6 +54,49 @@ export function LoginForm({
     }
   };
   const imeSubmit = useImeSubmit<HTMLInputElement>((value) => { void submit(value); });
+  const passwordInputRef = imeSubmit.inputRef;
+
+  useLayoutEffect(() => {
+    const selection = pendingPasswordSelection.current;
+    const input = passwordInputRef.current;
+    if (!selection || !input) {
+      pendingPasswordSelection.current = null;
+      return;
+    }
+    const restoreSelection = () => {
+      if (selection.restoreFocus) input.focus({ preventScroll: true });
+      if (selection.start !== null && selection.end !== null) {
+        input.setSelectionRange(
+          selection.start, selection.end, selection.direction ?? undefined);
+      }
+    };
+    restoreSelection();
+    // Safari can reset the caret again while committing the input type change.
+    // Repeat after that browser-native update instead of relying on layout timing.
+    const frame = window.requestAnimationFrame(() => {
+      restoreSelection();
+      if (pendingPasswordSelection.current === selection) {
+        pendingPasswordSelection.current = null;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [passwordVisible, passwordInputRef]);
+
+  const rememberPasswordSelection = () => {
+    const input = passwordInputRef.current;
+    pendingPasswordSelection.current = {
+      start: input?.selectionStart ?? null,
+      end: input?.selectionEnd ?? null,
+      direction: input?.selectionDirection ?? null,
+      restoreFocus: document.activeElement === input,
+    };
+  };
+
+  const togglePasswordVisibility = () => {
+    // Keyboard activation has no pointerdown, so retain an onClick fallback.
+    if (!pendingPasswordSelection.current) rememberPasswordSelection();
+    setPasswordVisible((visible) => !visible);
+  };
 
   return (
     <div className="login">
@@ -80,7 +129,7 @@ export function LoginForm({
         <div className="login-field">
           <Icon name="lock" size={18} />
           <input
-            ref={imeSubmit.inputRef}
+            ref={passwordInputRef}
             type={passwordVisible ? "text" : "password"}
             name="password"
             placeholder="访问密码"
@@ -113,8 +162,11 @@ export function LoginForm({
             aria-label={passwordVisible ? "隐藏密码" : "显示密码"}
             aria-pressed={passwordVisible}
             title={passwordVisible ? "隐藏密码，恢复密码输入模式" : "显示密码"}
-            onPointerDown={(event) => event.preventDefault()}
-            onClick={() => setPasswordVisible((visible) => !visible)}
+            onPointerDown={(event) => {
+              rememberPasswordSelection();
+              event.preventDefault();
+            }}
+            onClick={togglePasswordVisibility}
             disabled={loading}>
             <Icon name={passwordVisible ? "eye-off" : "eye"} size={19} />
           </button>

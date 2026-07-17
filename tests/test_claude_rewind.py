@@ -5,6 +5,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+import cc_remote.wrapper.machine as machine_module
 from cc_remote.config import WrapperConfig
 from cc_remote.protocol import (
     Error,
@@ -20,6 +21,8 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 
 SESSION_ID = "019f60cf-85f5-7881-8521-7d943df84a4b"
 TARGET_ID = "12345678-1234-4234-8234-123456789abc"
+NEWER_TARGET_ID = "22345678-1234-4234-8234-123456789abc"
+LATEST_TARGET_ID = "32345678-1234-4234-8234-123456789abc"
 ASSISTANT_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 PROBE_ID = "00000000-0000-0000-0000-000000000000"
 
@@ -284,6 +287,208 @@ def test_conversation_rewind_surfaces_structured_native_failure():
         assert result.files == "skipped"
         assert "state_changed" in (result.detail or "")
         assert "会话发生了变化" in (result.detail or "")
+
+    asyncio.run(go())
+
+
+def test_claude_combined_rewind_never_touches_files_after_stale_target():
+    class RejectedSdk:
+        def __init__(self):
+            self.calls = []
+
+        async def prepare_conversation_rewind(self, **_kwargs):
+            self.calls.append("prepare")
+
+        async def rewind_conversation(self, *_args, **_kwargs):
+            self.calls.append("conversation")
+            raise ClaudeRewindError(
+                "stale_target", operation="conversation", retryable=True)
+
+        async def rewind_files(self, _target):
+            self.calls.append("files")
+
+    async def go():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.cwd = "/tmp/stale-combined-rewind"
+        ctx.sdk = RejectedSdk()
+        machine.sessions[SESSION_ID] = ctx
+
+        async def code_context(_cmd, _action):
+            return ctx
+
+        machine._claude_code_context = code_context
+        outcome = await machine._handle_rollback_session(RollbackSession(
+            session_id=SESSION_ID,
+            engine="claude",
+            restore="both",
+            checkpoint_id=TARGET_ID,
+            cmd_id="stale-combined-rewind",
+            client_id="client-1",
+        ))
+        result = (
+            outcome if isinstance(outcome, RollbackResult)
+            else next(item for item in outcome if isinstance(item, RollbackResult))
+        )
+
+        assert result.conversation == "failed"
+        assert result.files == "skipped"
+        assert ctx.sdk.calls == ["prepare", "conversation"]
+
+    asyncio.run(go())
+
+
+def test_claude_stale_rewind_targets_follow_visible_human_turns(monkeypatch):
+    def user_row(message_id, content):
+        return SimpleNamespace(
+            type="user",
+            uuid=message_id,
+            session_id=SESSION_ID,
+            message={"role": "user", "content": content},
+            parent_tool_use_id=None,
+        )
+
+    messages = [
+        user_row(TARGET_ID, "first visible prompt"),
+        user_row(
+            "42345678-1234-4234-8234-123456789abc",
+            "<command-name>/model</command-name>",
+        ),
+        user_row(NEWER_TARGET_ID, "second visible prompt"),
+        user_row(LATEST_TARGET_ID, "latest visible prompt"),
+    ]
+    monkeypatch.setattr(
+        machine_module, "get_session_messages",
+        lambda *_args, **_kwargs: messages,
+    )
+    monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
+    monkeypatch.setattr(
+        machine_module, "transcript_timestamps", lambda _sid: {})
+
+    async def go():
+        machine, _transport = _mk_machine()
+        targets = await machine._claude_rewind_targets_after_stale(
+            SESSION_ID, "/tmp/visible-history", TARGET_ID
+        )
+        assert targets == [LATEST_TARGET_ID, NEWER_TARGET_ID, TARGET_ID]
+
+    asyncio.run(go())
+
+
+def test_claude_stale_target_is_rewound_newest_to_selected_before_files():
+    class SequentialSdk:
+        def __init__(self):
+            self.calls = []
+            self.rewind_attempts = 0
+
+        async def prepare_conversation_rewind(self, **_kwargs):
+            self.calls.append("prepare")
+
+        async def rewind_conversation(self, target, *, interrupt_if_running):
+            assert interrupt_if_running is False
+            self.calls.append(("conversation", target))
+            self.rewind_attempts += 1
+            if self.rewind_attempts == 1:
+                raise ClaudeRewindError(
+                    "stale_target", operation="conversation", retryable=True)
+            return SimpleNamespace(prefill_text=f"prefill:{target}")
+
+        async def rewind_files(self, target):
+            self.calls.append(("files", target))
+
+        async def force_reconnect(self, **_kwargs):
+            self.calls.append("reconnect")
+
+    async def go():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.cwd = "/tmp/sequential-rewind"
+        ctx.sdk = SequentialSdk()
+        machine.sessions[SESSION_ID] = ctx
+
+        async def code_context(_cmd, _action):
+            return ctx
+
+        async def rewind_targets(_sid, _cwd, _selected):
+            return [LATEST_TARGET_ID, TARGET_ID]
+
+        machine._claude_code_context = code_context
+        machine._claude_rewind_targets_after_stale = rewind_targets
+        outcome = await machine._handle_rollback_session(RollbackSession(
+            session_id=SESSION_ID,
+            engine="claude",
+            restore="both",
+            num_turns=2,
+            checkpoint_id=TARGET_ID,
+            cmd_id="sequential-stale-combined-rewind",
+            client_id="client-1",
+        ))
+        result = next(
+            item for item in outcome if isinstance(item, RollbackResult)
+        )
+
+        assert result.conversation == "succeeded"
+        assert result.files == "succeeded"
+        assert result.restored_turns == 2
+        assert result.prefill_text == f"prefill:{TARGET_ID}"
+        assert ctx.sdk.calls == [
+            "prepare",
+            ("conversation", TARGET_ID),
+            ("conversation", LATEST_TARGET_ID),
+            ("conversation", TARGET_ID),
+            ("files", TARGET_ID),
+            "reconnect",
+        ]
+
+    asyncio.run(go())
+
+
+def test_claude_combined_rewind_orders_conversation_before_files():
+    class RewoundSdk:
+        def __init__(self):
+            self.calls = []
+
+        async def prepare_conversation_rewind(self, **_kwargs):
+            self.calls.append("prepare")
+
+        async def rewind_conversation(self, *_args, **_kwargs):
+            self.calls.append("conversation")
+            return SimpleNamespace(prefill_text=None)
+
+        async def rewind_files(self, _target):
+            self.calls.append("files")
+
+        async def force_reconnect(self, **_kwargs):
+            self.calls.append("reconnect")
+
+    async def go():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.cwd = "/tmp/successful-combined-rewind"
+        ctx.sdk = RewoundSdk()
+        machine.sessions[SESSION_ID] = ctx
+
+        async def code_context(_cmd, _action):
+            return ctx
+
+        machine._claude_code_context = code_context
+        outcome = await machine._handle_rollback_session(RollbackSession(
+            session_id=SESSION_ID,
+            engine="claude",
+            restore="both",
+            checkpoint_id=TARGET_ID,
+            cmd_id="successful-combined-rewind",
+            client_id="client-1",
+        ))
+        result = next(
+            item for item in outcome if isinstance(item, RollbackResult)
+        )
+
+        assert result.conversation == "succeeded"
+        assert result.files == "succeeded"
+        assert ctx.sdk.calls == [
+            "prepare", "conversation", "files", "reconnect",
+        ]
 
     asyncio.run(go())
 

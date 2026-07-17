@@ -11,6 +11,7 @@ interface Props {
   cwd: string;
   space?: Space;
   engine?: "claude" | "codex";  // which backend this new chat will use
+  autoFocus?: boolean;
   createError?: string | null;
   workDashboard?: WorkDashboard | null;
   selectedProjectId?: string | null;
@@ -23,7 +24,8 @@ interface Props {
            serviceTier?: CodexServiceTier) => boolean;
 }
 
-export function NewChatView({ cwd, space = "code", engine = "claude", createError,
+export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus = true,
+  createError,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
   onSend }: Props) {
   const [text, setText] = useState("");
@@ -166,7 +168,8 @@ export function NewChatView({ cwd, space = "code", engine = "claude", createErro
 
         <textarea className="newchat-input"
           placeholder={space === "work" ? "描述要完成的工作，或上传文档、表格、演示…" : "发条消息开始…"} ref={taRef}
-          value={text} onChange={(e) => setText(e.target.value)} onPaste={onPaste} autoFocus rows={3}
+          value={text} onChange={(e) => setText(e.target.value)} onPaste={onPaste}
+          autoFocus={autoFocus} rows={3}
           disabled={creating || importing}
           onCompositionStart={() => imeSubmitRef.current.startComposition()}
           onCompositionEnd={(e) => {

@@ -124,6 +124,16 @@ assert.match(loginFormSource, /spellCheck=\{false\}/);
 assert.match(loginFormSource, /enterKeyHint="go"/);
 assert.match(loginFormSource, /aria-label=\{passwordVisible \? "隐藏密码" : "显示密码"\}/);
 assert.match(loginFormSource, /aria-pressed=\{passwordVisible\}/);
+assert.match(loginFormSource, /selectionStart/);
+assert.match(loginFormSource, /selectionEnd/);
+assert.match(loginFormSource, /focus\(\{ preventScroll: true \}\)/);
+assert.match(loginFormSource, /setSelectionRange\(/,
+  "password visibility toggles must restore the desktop caret and selection");
+assert.match(loginFormSource,
+  /onPointerDown=\{\(event\) => \{\s*rememberPasswordSelection\(\);/,
+  "the caret must be captured before a desktop browser handles pointer focus");
+assert.match(loginFormSource, /requestAnimationFrame\(\(\) => \{\s*restoreSelection\(\);/,
+  "the caret must be restored after the browser commits the input type change");
 
 const reconnectBannerSource = readFileSync(resolve(
   process.cwd(), "src/components/ReconnectBanner.tsx"), "utf8");
@@ -143,6 +153,9 @@ assert.match(historyAppSource,
   "a failed non-authoritative History must not reopen the IndexedDB cache barrier");
 assert.match(historyAppSource, /artifact_invalidated[\s\S]*sendGetWorkArtifacts/,
   "file rollback must refresh the Work artifact inventory");
+assert.match(historyAppSource,
+  /selectedIndex[\s\S]*rt\.turns\.slice\(selectedIndex\)[\s\S]*numTurns, label/,
+  "Claude rewind must report the visible turn distance instead of always one turn");
 assert.match(historyAppSource, /replay_start[\s\S]*sendGetHistory/,
   "a replay gap must request authoritative history instead of ending on an empty view");
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
@@ -2499,6 +2512,8 @@ assert.match(appSource, /data-lock-horizontal-swipe/);
 assert.match(appSource, /surface=\{space\}/);
 assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
 assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
+assert.match(appSource, /setNewChatAutoFocus\(false\)/,
+  "switching engines must not summon the new-chat keyboard");
 assert.match(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/);
 assert.match(appSource, /rt\.replaying \|\| !rt\.syncReady \? "syncing" : "online"/,
   "cached terminal state must be downgraded until the focused session is authoritative");
@@ -2512,6 +2527,10 @@ assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
 const sidebarSource = readFileSync(
   resolve(process.cwd(), "src/components/SessionsSidebar.tsx"), "utf8");
 assert.doesNotMatch(sidebarSource, /onGrant|目录授权/);
+const newChatSource = readFileSync(
+  resolve(process.cwd(), "src/components/NewChatView.tsx"), "utf8");
+assert.match(newChatSource, /autoFocus=\{autoFocus\}/,
+  "new-chat focus must follow the navigation intent instead of being unconditional");
 const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
 assert.match(composerSource, /workSurface \? \(/);

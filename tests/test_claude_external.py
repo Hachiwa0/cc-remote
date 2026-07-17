@@ -8,7 +8,10 @@ from pathlib import Path
 from claude_agent_sdk.types import ResultMessage, SystemMessage
 
 from cc_remote.protocol import Query, Takeover
-from cc_remote.wrapper.claude_external import claude_session_holders
+from cc_remote.wrapper.claude_external import (
+    claude_session_holders,
+    classify_claude_growth,
+)
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -565,6 +568,84 @@ def test_only_an_active_wrapper_query_can_attribute_growth_as_own(tmp_path):
         assert mirrored == []
 
     asyncio.run(go())
+
+
+def test_delayed_sdk_rows_remain_owned_after_result(tmp_path):
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        mirrored = []
+
+        async def mirror(sid):
+            mirrored.append(sid)
+
+        machine._push_mirrored_history = mirror
+        assistant_id = "11111111-1111-4111-8111-111111111111"
+        with path.open("ab") as stream:
+            stream.write(
+                ("{\"type\":\"assistant\",\"entrypoint\":\"sdk-py\","
+                 f"\"uuid\":\"{assistant_id}\"}}\n").encode()
+            )
+        await machine._poll_claude_watch(
+            "sid", watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        # Claude flushes these after ResultMessage and after the wrapper has
+        # already cleared claude_write_active. The leaf UUID still proves that
+        # the metadata belongs to the SDK-authored assistant row above.
+        with path.open("ab") as stream:
+            stream.write(
+                ("{\"type\":\"last-prompt\","
+                 f"\"leafUuid\":\"{assistant_id}\"}}\n"
+                 "{\"type\":\"mode\",\"mode\":\"normal\"}\n").encode()
+            )
+        await machine._poll_claude_watch(
+            "sid", watch, set(), 1001.0,
+            ownership_scan_complete=True,
+        )
+
+        assert ctx.claude_write_active is False
+        assert ctx.needs_reload is False
+        assert machine._is_external("sid") is False
+        assert mirrored == []
+
+    asyncio.run(go())
+
+
+def test_explicit_cli_row_wins_during_wrapper_write(tmp_path):
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.claude_write_active = True
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        machine._push_mirrored_history = lambda _sid: asyncio.sleep(0)
+
+        path.write_bytes(
+            b'{"type":"user","entrypoint":"cli","uuid":"external"}\n')
+        await machine._poll_claude_watch(
+            "sid", watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert ctx.needs_reload is True
+
+    asyncio.run(go())
+
+
+def test_claude_growth_classifier_rejects_partial_jsonl():
+    assert classify_claude_growth(
+        b'{"type":"assistant","entrypoint":"sdk-py"'
+    ) == ("unknown", ())
 
 
 def test_growth_after_a_finished_wrapper_turn_is_never_hidden_by_a_ttl(

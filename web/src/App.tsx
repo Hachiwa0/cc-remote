@@ -66,6 +66,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [newChatAutoFocus, setNewChatAutoFocus] = useState(true);
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   // right slot is shared by diff + /btw; rightView picks which shows.
   const [rightView, setRightView] = useState<"diff" | "btw">("diff");
@@ -290,6 +291,9 @@ export default function App() {
       type: "restore_session_list",
       sessions: sessionListsBySurfaceRef.current[`${space}:${nextEngine}`] ?? [],
     });
+    // Switching engines is navigation, not an intent to type. In particular,
+    // mounting NewChatView must not summon the mobile keyboard automatically.
+    setNewChatAutoFocus(false);
     setEngine(nextEngine);
     dispatch({ type: "enter_new_chat", cwd: "~" });  // fresh chat defaults to home
     if (isMobile()) setSidebarOpen(false);
@@ -983,12 +987,17 @@ export default function App() {
   };
   const openClaudeRewind = (checkpointId: string, prompt: string) => {
     if (!focusedSid || focusedEngine !== "claude" || space !== "code") return;
+    const selectedIndex = rt.turns.findIndex(
+      (turn) => turn.done && turn.checkpointId === checkpointId);
+    const numTurns = selectedIndex < 0 ? 1 : Math.max(1, Math.min(1000,
+      rt.turns.slice(selectedIndex).filter(
+        (turn) => turn.done && Boolean(turn.checkpointId)).length));
     const label = prompt.trim()
       ? `回到“${prompt.trim().slice(0, 48)}${prompt.trim().length > 48 ? "…" : ""}”`
       : "回到所选消息";
     setRollbackTarget({
       sessionId: focusedSid, engine: "claude", checkpointId,
-      numTurns: 1, label,
+      numTurns, label,
     });
   };
   const openLatestClaudeRewind = () => {
@@ -1172,8 +1181,8 @@ export default function App() {
         liveStates={Object.fromEntries(Object.entries(state.runtimes).map(([sid, r]) => [sid, r.state]))}
         activeSessionId={focusedSid}
         onSelect={(id) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setWorkArtifactsOpen(false); const selected = state.sessions.find((s) => s.session_id === id); const selectedEngine = (selected?.engine as "claude" | "codex") || engine; const selectedSpace = selected?.space === "work" ? "work" : space; dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace); wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace); if (selectedSpace === "work") wsRef.current?.sendGetWorkArtifacts(selectedEngine, id); if (isMobile()) setSidebarOpen(false); }}
-        onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~" }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~" }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -1273,6 +1282,7 @@ export default function App() {
         {state.newChat ? (
           <NewChatView cwd={state.newChat.cwd} space={space}
             createError={createError}
+            autoFocus={newChatAutoFocus}
             engine={engine}
             workDashboard={workDashboards[engine] ?? null}
             selectedProjectId={workProjectId}
