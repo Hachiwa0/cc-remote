@@ -241,7 +241,8 @@ python3 "$NEW_RELEASE_DIR/deploy/validate_protocol_bundle.py" \
 echo "==> release-local python venv + deps"
 python3 -m venv "$NEW_RELEASE_DIR/.venv"
 "$NEW_RELEASE_DIR/.venv/bin/python" -m pip install \
-  --require-hashes --only-binary=:all: -r "$NEW_RELEASE_DIR/requirements.lock"
+  --require-hashes --only-binary=:all: --no-binary=http-ece \
+  -r "$NEW_RELEASE_DIR/requirements.lock"
 (
   cd "$NEW_RELEASE_DIR"
   CC_REMOTE_ENV_FILE="$ENV_FILE" \

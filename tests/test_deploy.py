@@ -178,6 +178,9 @@ def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     assert "previous relay passed /healthz" in transaction_source
     assert "--require-hashes" in source
     assert "--only-binary=:all:" in source
+    # pywebpush's pure-Python http-ece dependency publishes no wheel. Keep the
+    # hash-locked exception narrow instead of disabling the wheel-only policy.
+    assert "--no-binary=http-ece" in source
     assert 'requirements.lock' in source
     assert "apt-get install -y" in source and "gnupg" in source
     assert "command -v gpg" in source
