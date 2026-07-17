@@ -2326,7 +2326,8 @@ try {
   assert.doesNotMatch(sharedControl.detail, /占用/);
   const passiveSharedControl = presentSessionControl(control(
     31, "codex_shared", "writable", { terminal_attached: false }));
-  assert.equal(passiveSharedControl.tone, "shared");
+  assert.equal(passiveSharedControl.tone, "remote",
+    "an available daemon stays visually neutral until this session has a terminal");
   assert.equal(passiveSharedControl.title, "Codex 后台通道可用");
   assert.equal(passiveSharedControl.backend, "可用");
   assert.equal(passiveSharedControl.terminal, "未检测到本机终端",
@@ -2345,7 +2346,8 @@ try {
   assert.doesNotMatch(reconnectingSharedControl.remote, /只读/);
   const passiveBrokerControl = presentSessionControl(control(
     33, "claude_broker", "writable", { terminal_attached: false }));
-  assert.equal(passiveBrokerControl.tone, "shared");
+  assert.equal(passiveBrokerControl.tone, "remote",
+    "Claude and Codex use the same neutral state without an attached terminal");
   assert.equal(passiveBrokerControl.title, "Claude Broker 通道可用");
   assert.equal(passiveBrokerControl.terminal, "未检测到本机终端");
   const attachedBrokerControl = presentSessionControl(control(
@@ -2389,7 +2391,9 @@ try {
     availability: "online",
   }));
   assert.match(terminalControlMarkup, /终端状态：Codex 后台通道可用/);
-  assert.match(terminalControlMarkup, /tone-shared/);
+  assert.match(terminalControlMarkup, /tone-remote/);
+  assert.doesNotMatch(terminalControlMarkup, /tone-attached/,
+    "a passive Codex app-server must not use the connected accent colour");
   assert.doesNotMatch(terminalControlMarkup, /terminal-control-card/,
     "the status card stays closed until the terminal icon is clicked");
   const staleTerminalControlMarkup = renderToStaticMarkup(createElement(TerminalControl, {

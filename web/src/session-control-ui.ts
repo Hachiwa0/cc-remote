@@ -3,7 +3,6 @@ import { sessionControlLocksInput } from "./protocol";
 
 export type TerminalControlTone =
   | "remote"
-  | "shared"
   | "attached"
   | "attention"
   | "disconnected";
@@ -52,9 +51,6 @@ function toneFor(control: SessionControl, disconnected: boolean): TerminalContro
   if (sessionControlLocksInput(control)) return "attention";
   if ((control.control_mode === "codex_shared" || control.control_mode === "claude_broker")
       && control.terminal_attached) return "attached";
-  if (control.control_mode === "codex_shared" || control.control_mode === "claude_broker") {
-    return "shared";
-  }
   return "remote";
 }
 

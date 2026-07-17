@@ -140,18 +140,16 @@ body{
 @keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.25} }
 
 /* Per-session terminal state lives in the header instead of consuming a row
-   above the composer. Blue means shared backend only; green is reserved for a
-   terminal positively matched to this session and writable from both ends. */
+   above the composer. A passive shared backend stays gray; the accent colour
+   is reserved for a terminal positively matched to this exact session. */
 .terminal-control-trigger{ position:relative; display:grid; place-items:center; width:40px; height:40px;
   flex:none; border:1px solid transparent; border-radius:10px; color:var(--faint); transition:.14s; }
 .terminal-control-trigger:hover,.terminal-control-trigger[aria-expanded="true"]{
   color:var(--text); background:var(--raised); border-color:var(--border); }
 .terminal-control-dot{ position:absolute; right:5px; bottom:5px; width:7px; height:7px; border-radius:50%;
   border:1.5px solid var(--bg); background:var(--faint); }
-.terminal-control-trigger.tone-shared{ color:var(--accent-ink); }
-.terminal-control-trigger.tone-shared .terminal-control-dot{ background:var(--accent); }
-.terminal-control-trigger.tone-attached{ color:var(--ok); }
-.terminal-control-trigger.tone-attached .terminal-control-dot{ background:var(--ok); }
+.terminal-control-trigger.tone-attached{ color:var(--accent-ink); }
+.terminal-control-trigger.tone-attached .terminal-control-dot{ background:var(--accent); }
 .terminal-control-trigger.tone-attention{ color:var(--warn); }
 .terminal-control-trigger.tone-attention .terminal-control-dot{ background:var(--warn); }
 .terminal-control-trigger.tone-disconnected{ color:var(--danger); }
@@ -167,8 +165,7 @@ body{
 .terminal-control-card>header p{ margin:3px 0 0; color:var(--dim); font-size:11.5px; line-height:1.45; }
 .terminal-control-mark{ width:34px; height:34px; display:grid; place-items:center; flex:none;
   border-radius:10px; color:var(--faint); background:var(--raised); border:1px solid var(--border); }
-.terminal-control-card.tone-shared .terminal-control-mark{ color:var(--accent-ink); background:var(--accent-weak); border-color:var(--accent-line); }
-.terminal-control-card.tone-attached .terminal-control-mark{ color:var(--ok); background:var(--ok-weak); border-color:color-mix(in srgb,var(--ok) 28%,var(--border)); }
+.terminal-control-card.tone-attached .terminal-control-mark{ color:var(--accent-ink); background:var(--accent-weak); border-color:var(--accent-line); }
 .terminal-control-card.tone-attention .terminal-control-mark{ color:var(--warn); background:var(--warn-weak); border-color:color-mix(in srgb,var(--warn) 28%,var(--border)); }
 .terminal-control-card.tone-disconnected .terminal-control-mark{ color:var(--danger); background:var(--danger-weak); border-color:color-mix(in srgb,var(--danger) 28%,var(--border)); }
 .terminal-control-close{ width:40px; height:40px; display:grid; place-items:center; flex:none;
