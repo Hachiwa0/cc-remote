@@ -41,7 +41,9 @@ from cc_remote.claude_broker.session import (
     PTYSession, SessionError, _launch_controls, _model_from_command_stdout,
     _parse_context_markdown,
 )
-from cc_remote.protocol import Model, Perm, SetEffort, SetModel, SetPerm
+from cc_remote.protocol import (
+    AnswerQuestion, AskUser, Model, Perm, SetEffort, SetModel, SetPerm,
+)
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -110,6 +112,8 @@ if supports_auto:
     cycle.append("auto")
 permission = "bypassPermissions" if dangerous else arg("--permission-mode", "default")
 model = arg("--model", "claude-sonnet-5")
+pending_model = None
+model_confirm_attempts = 0
 context_requests = 0
 
 def emit(record):
@@ -167,10 +171,36 @@ while True:
             break
         raw, pending = pending.split(b"\r", 1)
         line = raw.decode("utf-8", errors="replace")
+        if pending_model is not None:
+            if line == "":
+                model_confirm_attempts += 1
+                if (os.environ.get("FAKE_CLAUDE_IGNORE_FIRST_MODEL_CONFIRM") == "1"
+                        and model_confirm_attempts == 1):
+                    continue
+                value = pending_model
+                pending_model = None
+                model = value
+                command("model", value, f"Set model to {value} and saved as your default for new sessions")
+            continue
         if line.startswith("/model "):
             value = line[len("/model "):]
-            model = value
-            command("model", value, f"Set model to {value} and saved as your default for new sessions")
+            if value == model:
+                command("model", value, f"Set model to {value} and saved as your default for new sessions")
+            else:
+                pending_model = value
+                if os.environ.get("FAKE_CLAUDE_UNKNOWN_MODEL_PROMPT") == "1":
+                    os.write(1, b"Switch model?\nMODEL CONFIRMATION UI\n")
+                else:
+                    os.write(1, (
+                        "\x1b[93mSwitch model?\x1b[39m\n"
+                        "Your next response will be slower and use more tokens\n"
+                        "This conversation is cached\x1b[32Gfor\x1b[36Gthe"
+                        "\x1b[40Gcurrent\x1b[48Gmodel. "
+                        f"Switching\x1b[65Gto\x1b[68G{value} means the full history "
+                        "gets re-read on your next message.\n"
+                        f"1. Yes, switch\x1b[24Gto {value}\n"
+                        "2. No, go back\n"
+                    ).encode())
         elif line.startswith("/effort "):
             value = line[len("/effort "):]
             command("effort", value, f"Set effort level to {value}")
@@ -306,6 +336,49 @@ async def test_context_query_retries_one_ignored_startup_command(
         await _output_until(terminal, b"READY")
         response = await client.get_context_usage(sid)
         assert response["context_usage"]["model"] == "claude-sonnet-5"
+        await terminal.close()
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_model_control_confirms_changed_native_prompt_after_fresh_output(
+    tmp_path: Path,
+    control_fake_claude: Path,
+    short_socket_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "model-confirm-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FAKE_CLAUDE_UNKNOWN_MODEL_PROMPT", "1")
+    monkeypatch.setenv("FAKE_CLAUDE_IGNORE_FIRST_MODEL_CONFIRM", "1")
+    monkeypatch.setattr(
+        broker_session_module, "MODEL_CONFIRM_MIN_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        broker_session_module, "MODEL_CONFIRM_OUTPUT_QUIET_SECONDS", 0.01)
+    monkeypatch.setattr(
+        broker_session_module, "MODEL_CONFIRM_RETRY_SECONDS", 0.05)
+    socket_path = short_socket_dir / "model-confirm-broker.sock"
+    server = BrokerServer(BrokerConfig(
+        socket_path=str(socket_path),
+        claude_binary=str(control_fake_claude),
+        max_sessions=1,
+        history_bytes=128 * 1024,
+    ))
+    await server.start()
+    client = BrokerClient(str(socket_path))
+    try:
+        project = tmp_path / "model-confirm-project"
+        project.mkdir()
+        created = await client.new(cwd=str(project))
+        sid = created["session"]["id"]
+        terminal = await client.attach(sid, keyboard=False)
+        await _output_until(terminal, b"READY")
+
+        response = await client.set_model(sid, "claude-opus-4-8")
+
+        assert response["session"]["model"] == "claude-opus-4-8"
         await terminal.close()
     finally:
         await server.close()
@@ -513,9 +586,25 @@ async def test_machine_broker_controls_reach_native_tui_and_use_footer_confirmat
 
     await machine._process_command(SetPerm(
         sid=sid, mode="default", cmd_id="perm-native", client_id="client-1"))
-    await machine._process_command(SetModel(
+    model_task = asyncio.create_task(machine._process_command(SetModel(
         sid=sid, model="claude-opus-4-1",
-        cmd_id="model-native", client_id="client-1"))
+        cmd_id="model-native", client_id="client-1")))
+    async with asyncio.timeout(1.0):
+        while True:
+            question = next(
+                (event for event in reversed(transport.sent)
+                 if isinstance(event, AskUser)), None)
+            if question is not None:
+                break
+            await asyncio.sleep(0.01)
+    assert "重新读取完整历史" in question.question
+    assert question.to == "client-1"
+    await machine._process_command(AnswerQuestion(
+        sid=sid,
+        ask_id=question.ask_id,
+        answer=question.options[0]["label"],
+    ))
+    await model_task
     await machine._process_command(SetEffort(
         sid=sid, effort="max", cmd_id="effort-native", client_id="client-1"))
 

@@ -10,8 +10,8 @@ import pytest
 
 from cc_remote.claude_broker.client import BrokerClientError
 from cc_remote.protocol import (
-    Error, ListSessions, Model, Perm, Query, SetEffort, SetModel, SetPerm,
-    SwitchSession, Takeover,
+    AnswerQuestion, AskUser, Error, ListSessions, Model, Perm, Query,
+    SetEffort, SetModel, SetPerm, SwitchSession, Takeover,
 )
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
@@ -316,6 +316,53 @@ def test_broker_controls_emit_only_after_confirmed_handle_mutation(tmp_path):
         assert ctx.sdk.permissions == ["default"]
         assert ctx.announced_perm == "default"
         assert transport.sent[-1] is permission
+
+    asyncio.run(go())
+
+
+def test_remote_broker_model_switch_waits_for_visible_confirmation(tmp_path):
+    async def go():
+        machine, transport = _mk_machine()
+        ctx = _broker_ctx(tmp_path)
+        ctx.sdk.model = "claude-sonnet-5"
+        ctx.sdk.metadata["model"] = ctx.sdk.model
+        ctx.announced_model = ctx.sdk.model
+        machine.sessions[SESSION_ID] = ctx
+
+        machine._start_interactive_control_command(SetModel(
+            sid=SESSION_ID,
+            model="claude-opus-4-1",
+            client_id="client-1",
+            cmd_id="model-confirm-1",
+        ))
+        async with asyncio.timeout(1.0):
+            while True:
+                question = next(
+                    (event for event in reversed(transport.sent)
+                     if isinstance(event, AskUser)), None)
+                if question is not None:
+                    break
+                await asyncio.sleep(0.01)
+
+        assert question.header == "切换模型"
+        assert question.to == "client-1"
+        assert "重新读取完整历史" in question.question
+        assert ctx.sdk.models == []
+        await machine._process_command(AnswerQuestion(
+            sid=SESSION_ID,
+            ask_id=question.ask_id,
+            answer=question.options[0]["label"],
+        ))
+        async with asyncio.timeout(1.0):
+            while machine._interactive_control_tasks:
+                await asyncio.sleep(0.01)
+
+        assert ctx.sdk.models == ["claude-opus-4-1"]
+        assert ctx.announced_model == "claude-opus-4-1"
+        assert any(
+            isinstance(event, Model) and event.model == "claude-opus-4-1"
+            for event in transport.sent
+        )
 
     asyncio.run(go())
 

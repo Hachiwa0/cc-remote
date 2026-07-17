@@ -9,6 +9,8 @@ from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from cc_remote.protocol import (
+    AnswerQuestion,
+    AskUser,
     BtwOpened,
     CloseBtw,
     CommandAck,
@@ -310,7 +312,21 @@ def test_duplicate_claude_broker_model_and_permission_controls_replay_without_re
             sid="session-1", effort="max",
             cmd_id="effort-1", client_id="client-1",
         )
-        await machine._process_command(model)
+        model_task = asyncio.create_task(machine._process_command(model))
+        async with asyncio.timeout(1.0):
+            while True:
+                question = next(
+                    (event for event in reversed(transport.sent)
+                     if isinstance(event, AskUser)), None)
+                if question is not None:
+                    break
+                await asyncio.sleep(0.01)
+        await machine._process_command(AnswerQuestion(
+            sid="session-1",
+            ask_id=question.ask_id,
+            answer=question.options[0]["label"],
+        ))
+        await model_task
         await machine._process_command(model)
         await machine._process_command(effort)
         await machine._process_command(effort)

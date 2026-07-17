@@ -389,6 +389,11 @@ class WrapperMachine:
             tuple[str, str], asyncio.Task
         ] = {}
         self._capabilities_command_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        # A broker-owned Claude model change can pause for a Remote answer.
+        # Keep it off the serial receive lane so AnswerQuestion can be handled.
+        self._interactive_control_tasks: dict[
+            tuple[str, str], asyncio.Task
+        ] = {}
         # Narrow test/embedded configs often omit the new Work roots. Keep those
         # stores below their temporary state_dir instead of touching the real
         # user's ~/.claude or ~/.codex during a read-only Code session listing.
@@ -1411,6 +1416,12 @@ class WrapperMachine:
                 if cmd.type in {"get_engine_capabilities", "manage_engine_plugin"}:
                     self._start_capabilities_command(cmd)
                     continue
+                if cmd.type == "set_model":
+                    ctx = self._ctx_for(getattr(cmd, "sid", None))
+                    if (ctx is not None and ctx.engine == "claude"
+                            and ctx.space == "code"):
+                        self._start_interactive_control_command(cmd)
+                        continue
                 await self._process_command_safely(cmd)
         finally:
             models_tasks = list(self._models_command_tasks.values())
@@ -1425,6 +1436,12 @@ class WrapperMachine:
             if capabilities_tasks:
                 await asyncio.gather(*capabilities_tasks, return_exceptions=True)
             self._capabilities_command_tasks.clear()
+            control_tasks = list(self._interactive_control_tasks.values())
+            for task in control_tasks:
+                task.cancel()
+            if control_tasks:
+                await asyncio.gather(*control_tasks, return_exceptions=True)
+            self._interactive_control_tasks.clear()
             fork_tasks = [
                 *self._codex_fork_tasks.values(),
                 *self._claude_fork_tasks.values(),
@@ -1822,6 +1839,28 @@ class WrapperMachine:
         def forget(done: asyncio.Task) -> None:
             if self._capabilities_command_tasks.get(key) is done:
                 self._capabilities_command_tasks.pop(key, None)
+
+        task.add_done_callback(forget)
+
+    def _start_interactive_control_command(self, cmd) -> None:
+        """Run one answerable control without blocking the receive loop.
+
+        Reliable command ids coalesce reconnect retries while the question is
+        open.  The normal command processor still owns the final ACK/cache
+        boundary after the user answers and the native TUI confirms the change.
+        """
+        client_id = getattr(cmd, "client_id", None) or ""
+        cmd_id = getattr(cmd, "cmd_id", None) or f"untracked-{id(cmd)}"
+        key = (client_id, cmd_id)
+        current = self._interactive_control_tasks.get(key)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(self._process_command_safely(cmd))
+        self._interactive_control_tasks[key] = task
+
+        def forget(done: asyncio.Task) -> None:
+            if self._interactive_control_tasks.get(key) is done:
+                self._interactive_control_tasks.pop(key, None)
 
         task.add_done_callback(forget)
 
@@ -4103,6 +4142,67 @@ class WrapperMachine:
         await self._emit(ctx, error)
         return error
 
+    async def _confirm_claude_broker_model_switch(
+        self,
+        ctx: SessionContext,
+        target: str,
+        client_id: Optional[str],
+    ) -> bool:
+        """Mirror Claude TUI's cached-history model confirmation to Remote."""
+        current = getattr(ctx.sdk, "model", None)
+        if not client_id or current == target:
+            return True
+
+        previous_ask_id = ctx.pending_model_ask_id
+        if previous_ask_id:
+            previous = ctx.pending_asks.get(previous_ask_id)
+            if previous is not None and not previous.done():
+                previous.set_result("(已被新的模型选择替代)")
+
+        ask_id = f"ask-{uuid4().hex}"
+        accept_label = f"是，切换到 {target}"
+        event = AskUser(
+            ask_id=ask_id,
+            header="切换模型",
+            question=(
+                f"当前会话已为现有模型建立缓存。切换到 {target} 后，"
+                "下一次回复会重新读取完整历史，因此速度更慢并消耗更多 token。"
+                "是否继续？"
+            ),
+            options=[
+                {"label": accept_label,
+                 "ds": "确认切换；下一次回复会重新读取完整历史"},
+                {"label": "不，返回", "ds": "保留当前模型"},
+            ],
+            to=client_id,
+        )
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        ctx.pending_asks[ask_id] = future
+        ctx.pending_model_ask_id = ask_id
+        await self._emit(ctx, event)
+        log.info(
+            "Claude model switch confirmation emitted",
+            session_id=ctx.session_id,
+            ask_id=ask_id,
+            current=current,
+            target=target,
+        )
+        try:
+            answer = await asyncio.wait_for(future, timeout=30 * 60)
+            return answer == accept_label
+        except asyncio.TimeoutError:
+            log.warning(
+                "Claude model switch confirmation timed out",
+                session_id=ctx.session_id,
+                ask_id=ask_id,
+            )
+            return False
+        finally:
+            ctx.pending_asks.pop(ask_id, None)
+            if ctx.pending_model_ask_id == ask_id:
+                ctx.pending_model_ask_id = None
+
     async def _handle_set_model(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
@@ -4112,6 +4212,22 @@ class WrapperMachine:
         if control_error is not None:
             return control_error
         try:
+            if getattr(ctx.sdk, "is_claude_broker", False):
+                confirmed = await self._confirm_claude_broker_model_switch(
+                    ctx, cmd.model, getattr(cmd, "client_id", None))
+                if not confirmed:
+                    current = getattr(ctx.sdk, "model", None)
+                    if isinstance(current, str) and current:
+                        event = Model(model=current)
+                        await self._emit(ctx, event)
+                        return event
+                    return None
+                # The user may answer after the terminal exits or ownership is
+                # replaced. Re-bind the command before touching a runtime.
+                control_error = await self._runtime_control_preflight(
+                    ctx, action="切换模型")
+                if control_error is not None:
+                    return control_error
             await ctx.sdk.set_model(cmd.model)
             await self._refresh_pending_claude_work_baseline(ctx)
             await self._persist_claude_session_controls(ctx)

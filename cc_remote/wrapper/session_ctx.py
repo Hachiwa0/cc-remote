@@ -133,6 +133,10 @@ class SessionContext:
     # record; it never owns or kills that process on an ordinary disconnect.
     claude_broker_generation: Optional[str] = None
     pending_asks: dict = field(default_factory=dict)
+    # A Remote model chip can trigger Claude TUI's cached-history confirmation.
+    # Track its question separately so a newer model choice can supersede the
+    # old one without leaving an unreachable Future behind.
+    pending_model_ask_id: Optional[str] = None
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Serialize the tiny "final preflight check -> query accepted by engine"
     # window against interrupt().  Reconnects happen before this lock; once held,

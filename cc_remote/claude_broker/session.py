@@ -44,6 +44,10 @@ CONTROL_CONFIRM_TIMEOUT_SECONDS = 10.0
 CONTEXT_CONFIRM_TIMEOUT_SECONDS = 5.0
 PERMISSION_CONFIRM_TIMEOUT_SECONDS = 2.5
 CONTROL_TRANSCRIPT_READY_SECONDS = 2.0
+MODEL_CONFIRM_MIN_WAIT_SECONDS = 0.50
+MODEL_CONFIRM_OUTPUT_QUIET_SECONDS = 0.20
+MODEL_CONFIRM_RETRY_SECONDS = 0.75
+MODEL_CONFIRM_MAX_ATTEMPTS = 8
 MAX_CONTROL_VALUE_BYTES = 256
 _PERMISSION_BASE_CYCLE = ("default", "acceptEdits", "plan")
 _PERMISSION_AUTO = "auto"
@@ -792,10 +796,16 @@ class PTYSession:
         data: bytes,
     ) -> None:
         cursor = await self._ready_control_cursor()
+        output_cursor = self._control_output_total
         self._control_in_progress = True
         try:
             await self._enqueue_input(data)
-            await self._await_transcript_control(cursor, kind=kind, target=target)
+            await self._await_transcript_control(
+                cursor,
+                kind=kind,
+                target=target,
+                output_cursor=output_cursor,
+            )
             self._set_runtime_control(kind, target)
         finally:
             self._control_in_progress = False
@@ -973,12 +983,18 @@ class PTYSession:
         *,
         kind: Literal["model", "effort", "permission"],
         target: str,
+        output_cursor: int,
     ) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + CONTROL_CONFIRM_TIMEOUT_SECONDS
         offset = cursor.offset
         partial = b""
         matched_command = False
+        model_confirm_attempts = 0
+        model_confirm_ready_at: float | None = None
+        control_started_at = loop.time()
+        model_output_total = output_cursor
+        model_last_output_at: float | None = None
         while loop.time() < deadline:
             if not self.running:
                 raise SessionError(
@@ -1026,6 +1042,36 @@ class PTYSession:
                         "control_rejected",
                         f"Claude TUI rejected the {kind} change",
                     )
+            if (kind == "model"
+                    and model_confirm_attempts < MODEL_CONFIRM_MAX_ATTEMPTS):
+                # Remote already obtained the user's equivalent confirmation.
+                # Ink uses differential screen repainting, so repeated model
+                # prompts may not emit their unchanged title or option text at
+                # all. Treat fresh output that has gone quiet without a durable
+                # command result as the native modal boundary. A direct switch
+                # writes its JSONL result synchronously and returns above before
+                # this bounded fallback can touch the normal composer.
+                now = loop.time()
+                if self._control_output_total != model_output_total:
+                    model_output_total = self._control_output_total
+                    model_last_output_at = now
+                output_quiet = (
+                    model_last_output_at is not None
+                    and now - control_started_at >= MODEL_CONFIRM_MIN_WAIT_SECONDS
+                    and now - model_last_output_at
+                    >= MODEL_CONFIRM_OUTPUT_QUIET_SECONDS
+                )
+                if model_confirm_ready_at is None and output_quiet:
+                    model_confirm_ready_at = now
+                if (model_confirm_ready_at is not None
+                        and now >= model_confirm_ready_at):
+                    # Claude opens this confirmation with Yes focused. Submit
+                    # that native default without sending a relative arrow:
+                    # arrows wrap at list boundaries and can move Yes onto No,
+                    # while digit keys are ignored by Ink's select widget.
+                    await self._enqueue_input(b"\r")
+                    model_confirm_attempts += 1
+                    model_confirm_ready_at = now + MODEL_CONFIRM_RETRY_SECONDS
             await asyncio.sleep(0.05)
         raise SessionError(
             "control_unconfirmed",
