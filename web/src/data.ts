@@ -1,4 +1,6 @@
-// Slash commands, models, permission modes. Slash commands split into
+// Slash commands, models, permission modes. Slash commands split by surface:
+// Work exposes only generic conversation/workspace controls; Code additionally
+// exposes engine-specific coding commands. Commands then split into
 // client-side ones (CLIENT_SLASHES: model/plan/normal/permissions/clear/context,
 // handled in Composer.send) and cc skills (forwarded verbatim to cc). Model/perm
 // chips drive set_model / set_permission_mode on the wrapper.
@@ -31,6 +33,22 @@ export const COMMANDS: Command[] = [
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "clear", name: "清空会话", ds: "开新会话，清空上下文", ic: "close" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
+];
+
+// Work is a separate product surface, not a differently styled Code session.
+// Keep its palette limited to controls that are meaningful for a private work
+// conversation. Engine/user-provided slash skills may still be typed manually;
+// known Code commands are rejected by the composer instead of leaking through.
+export const WORK_COMMANDS: Command[] = [
+  { g: "设置" },
+  { slash: "model", name: "切换模型", ds: "选择本次工作的模型与思考强度", ic: "cpu" },
+  { slash: "permissions", name: "访问权限", ds: "选择执行工作时的审批策略", ic: "shield" },
+  { g: "工作" },
+  { slash: "goal", name: "工作目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
+  { slash: "btw", name: "侧边对话 (btw)", ds: "临时侧聊，不影响当前工作主线", ic: "spark" },
+  { slash: "preview", name: "预览交付物", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
+  { slash: "context", name: "上下文用量", ds: "查看本次工作的 token 占用", ic: "cpu" },
+  { slash: "clear", name: "新工作", ds: "开始一项独立的新工作", ic: "close" },
 ];
 
 // `efforts` overrides the engine's baseline effort list for THIS model — reasoning
@@ -212,9 +230,22 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
+const WORK_CMD_LIST: Cmd[] = WORK_COMMANDS.filter(isCmd) as Cmd[];
 export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview", "review", "compact", "rollback"]);
-export const commandsFor = (engine?: string): Command[] => (engine === "codex" ? CODEX_COMMANDS : COMMANDS);
+export type CommandSurface = "code" | "work";
+export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (
+  surface === "work" ? WORK_COMMANDS : engine === "codex" ? CODEX_COMMANDS : COMMANDS
+);
 export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
+
+/** A built-in command intentionally available on Code but absent from Work.
+ * Unknown slashes return false so user-installed Claude skills remain usable. */
+export function isKnownCodeOnlySlash(slash: string, engine?: string): boolean {
+  const normalized = slash.toLowerCase();
+  return (engine === "codex" ? CODEX_CMD_LIST : CMD_LIST).some(
+    (command) => command.slash === normalized,
+  ) && !WORK_CMD_LIST.some((command) => command.slash === normalized);
+}
 // codex slash -> the prompt actually sent to codex (agentic; no TUI slash layer).
 export const CODEX_PROMPTS: Record<string, string> = {
   init: "Create or update AGENTS.md at the repo root: a concise overview of this codebase, how to build/test/run it, and key conventions.",
@@ -231,9 +262,11 @@ export function slashToken(input: string): string | null {
 }
 
 // Commands whose slash starts with `token` (case-insensitive, prefix match).
-export function matchCommands(token: string, engine?: string): Cmd[] {
+export function matchCommands(token: string, engine?: string,
+                              surface: CommandSurface = "code"): Cmd[] {
   const t = token.toLowerCase();
-  const list = engine === "codex" ? CODEX_CMD_LIST : CMD_LIST;
+  const list = surface === "work"
+    ? WORK_CMD_LIST : engine === "codex" ? CODEX_CMD_LIST : CMD_LIST;
   return list.filter((c) => c.slash.toLowerCase().startsWith(t));
 }
 

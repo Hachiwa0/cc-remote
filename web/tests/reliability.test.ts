@@ -34,6 +34,7 @@ import { RelayWs } from "../src/ws.ts";
 import {
   clientSlashesFor,
   commandsFor,
+  isKnownCodeOnlySlash,
   matchCommands,
   modelsFor,
 } from "../src/data.ts";
@@ -160,6 +161,30 @@ const rewindComposerSource = readFileSync(resolve(
 assert.equal(commandsFor("claude").some((command) => (
   "slash" in command && command.slash === "rewind"
 )), false, "Claude rewind must stay hidden from the command palette");
+const claudeWorkSlashes = commandsFor("claude", "work")
+  .filter((command) => "slash" in command)
+  .map((command) => command.slash);
+const codexWorkSlashes = commandsFor("codex", "work")
+  .filter((command) => "slash" in command)
+  .map((command) => command.slash);
+assert.deepEqual(codexWorkSlashes, claudeWorkSlashes,
+  "Work must expose one engine-neutral command surface");
+for (const slash of ["model", "permissions", "goal", "btw", "preview", "context", "clear"]) {
+  assert.equal(claudeWorkSlashes.includes(slash), true, `Work must retain /${slash}`);
+}
+for (const slash of ["plan", "code-review", "security-review", "verify", "simplify", "run", "init"]) {
+  assert.equal(claudeWorkSlashes.includes(slash), false, `Work must hide Code /${slash}`);
+  assert.equal(isKnownCodeOnlySlash(slash, "claude"), true);
+}
+for (const slash of ["review", "init", "plan", "fast", "status", "compact", "rollback"]) {
+  assert.equal(codexWorkSlashes.includes(slash), false, `Work must hide Codex Code /${slash}`);
+  assert.equal(isKnownCodeOnlySlash(slash, "codex"), true);
+}
+assert.equal(isKnownCodeOnlySlash("my-personal-skill", "claude"), false,
+  "unknown user skills must remain available in Work");
+assert.deepEqual(matchCommands("", "claude", "work").map((command) => command.slash),
+  claudeWorkSlashes);
+assert.deepEqual(matchCommands("pla", "codex", "work"), []);
 assert.doesNotMatch(historyAppSource, /openClaudeRewind|openLatestClaudeRewind/,
   "Claude rewind must not have an App entry point while unsupported");
 assert.doesNotMatch(rewindChatViewSource, /onRewind|回到这里/,

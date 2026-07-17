@@ -3,7 +3,7 @@ import type { State, QueryImg, QueryFile, ContextReport, CollaborationModeName, 
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
-import { clientSlashesFor, CODEX_PROMPTS, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor, type Catalog } from "../data";
+import { clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor, type Catalog } from "../data";
 import { CommandSheet } from "./CommandSheet";
 import { attachmentBytes, pickFiles } from "../img";
 import type { PendingQuery } from "../reducer";
@@ -192,7 +192,8 @@ export function Composer(p: Props) {
   // at least one command. Typing past a match (/pet) hides it; deleting back
   // (/pe) shows it again — no separate input, no modal scrim over the composer.
   const cmdToken = slashToken(input);
-  const cmdMatches = cmdToken !== null ? matchCommands(cmdToken, p.engine) : [];
+  const cmdMatches = cmdToken !== null
+    ? matchCommands(cmdToken, p.engine, p.surface ?? "code") : [];
   const cmdOpen = cmdMatches.length > 0;
 
   const onPickFiles = async (fl: FileList | File[] | null) => {
@@ -395,6 +396,11 @@ export function Composer(p: Props) {
     const raw = value.trim();
     if (raw === "/") return;
     const parsed = parseSlash(raw);
+    if (p.surface === "work" && parsed
+        && isKnownCodeOnlySlash(parsed.slash, p.engine)) {
+      flash(`/${parsed.slash} 是 Code 指令，请切换到 Code 使用`);
+      return;
+    }
     if (parsed && clientSlashesFor(p.engine).has(parsed.slash)) { runClientSlash(parsed.slash, parsed.args); return; }
     // Codex has no TUI slash layer over the app-server. /init is the one
     // compatibility prompt left; lifecycle operations above use native RPCs.
