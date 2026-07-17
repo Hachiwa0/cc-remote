@@ -25,7 +25,11 @@ from cc_remote.protocol import (
     TurnEnd, TurnResult, is_downstream,
 )
 from cc_remote.wrapper import machine as mm
-from cc_remote.wrapper.stream import StreamTranslator, translate_history
+from cc_remote.wrapper.stream import (
+    StreamTranslator,
+    last_assistant_model,
+    translate_history,
+)
 from tests.test_multisession import _mk_machine, _mk_ctx
 
 
@@ -402,6 +406,75 @@ def test_translate_history_stamps_real_timestamps():
     assert te.ts == 1005.0        # answer-done = last (assistant) message time
     # missing timestamps must not crash (falls back to the _Base default)
     assert any(e.type == "user_msg" for e in translate_history(msgs, 10000))
+
+
+def test_history_hides_cancelled_command_placeholders_without_hiding_real_text():
+    user_id = "11111111-1111-4111-8111-111111111111"
+    answer_id = "22222222-2222-4222-8222-222222222222"
+    synthetic_ids = (
+        "33333333-3333-4333-8333-333333333333",
+        "44444444-4444-4444-8444-444444444444",
+    )
+    messages = [
+        SimpleNamespace(
+            uuid=user_id,
+            type="user",
+            message={"role": "user", "content": "hello"},
+        ),
+        SimpleNamespace(
+            uuid=answer_id,
+            type="assistant",
+            message={
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "real answer"}],
+            },
+        ),
+        *[
+            SimpleNamespace(
+                uuid=uid,
+                type="assistant",
+                message={
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{
+                        "type": "text",
+                        "text": "No response requested.",
+                    }],
+                },
+            )
+            for uid in synthetic_ids
+        ],
+    ]
+    timestamps = {
+        user_id: 1000.0,
+        answer_id: 1005.0,
+        synthetic_ids[0]: 1010.0,
+        synthetic_ids[1]: 1015.0,
+    }
+
+    events = translate_history(messages, 10_000, timestamps=timestamps)
+    deltas = [event.text for event in events if isinstance(event, Delta)]
+    assert deltas == ["real answer"]
+    terminal = next(event for event in events if isinstance(event, TurnEnd))
+    assert terminal.turn_id == answer_id
+    assert terminal.ts == 1005.0
+    assert last_assistant_model(messages) == "claude-sonnet-5"
+
+    real_same_text = SimpleNamespace(
+        uuid="55555555-5555-4555-8555-555555555555",
+        type="assistant",
+        message={
+            "role": "assistant",
+            "model": "claude-sonnet-5",
+            "content": [{"type": "text", "text": "No response requested."}],
+        },
+    )
+    visible = translate_history([messages[0], real_same_text], 10_000)
+    assert any(
+        isinstance(event, Delta) and event.text == "No response requested."
+        for event in visible
+    )
 
 
 def test_live_claude_turn_end_uses_last_assistant_transcript_uuid():

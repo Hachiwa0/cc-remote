@@ -55,6 +55,7 @@ _MAX_DIFF_SOURCE_CHARS = 512 * 1024
 _MAX_DIFF_SOURCE_LINES = 4096
 _MAX_LIVE_TOOL_ITEMS = 4096
 _LIVE_TOOL_ITEMS_OMITTED_ID = "cc-remote-live-tools-omitted"
+_SYNTHETIC_NO_RESPONSE_TEXT = "No response requested."
 _DIFF_LINE_BREAK = re.compile(
     r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
@@ -1185,6 +1186,8 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
         elif role == "assistant":
             if not isinstance(content, list):
                 continue
+            if _is_synthetic_no_response(msg):
+                continue
             if _CLAUDE_MESSAGE_UUID.fullmatch(source_uid):
                 last_assistant_uuid = source_uid
             mid = message_uid
@@ -1574,11 +1577,33 @@ def _is_meta_user_text(text: str) -> bool:
     )
 
 
+def _is_synthetic_no_response(message: dict[str, Any]) -> bool:
+    """Hide Claude's non-response placeholder for cancelled native commands.
+
+    Claude persists this as an assistant row even though no model response was
+    produced. Match both the synthetic model marker and the exact single text
+    block so a real assistant reply with the same words remains visible.
+    """
+    if message.get("model") != "<synthetic>":
+        return False
+    content = message.get("content")
+    return (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+        and content[0]["text"].strip() == _SYNTHETIC_NO_RESPONSE_TEXT
+    )
+
+
 def last_assistant_model(messages) -> str | None:
     """Most recent assistant message's model id, for restoring the model readout
     when loading a switched session's history."""
     for m in reversed(messages):
         if getattr(m, "type", None) == "assistant" and isinstance(m.message, dict):
+            if _is_synthetic_no_response(m.message):
+                continue
             mdl = m.message.get("model")
             if mdl:
                 return mdl
