@@ -557,6 +557,11 @@ class CodexHandle:
             else default_codex_daemon_manager(self.daemon_mode)
         )
         self._using_daemon_proxy = False
+        # Once a Code session has joined the official shared app-server, a
+        # transport interruption must not silently turn it into a private stdio
+        # session.  Keep this affinity across proxy reconnects so Machine can
+        # preserve bidirectional ownership while the short-lived proxy is down.
+        self._daemon_proxy_established = False
         self._proxy_read_buffer = bytearray()
         self._proxy_close_sent = False
         self._send_lock = asyncio.Lock()
@@ -669,6 +674,21 @@ class CodexHandle:
             and self.proc is not None
             and not self._dead
             and getattr(self.proc, "returncode", None) is None
+        )
+
+    @property
+    def shared_daemon_affinity(self) -> bool:
+        """Whether this Code session belongs to the shared app-server.
+
+        Unlike ``using_daemon_proxy``, this remains true while the per-client
+        proxy reconnects.  It is deliberately sticky for the handle lifetime:
+        falling back to a private stdio app-server after joining the shared
+        daemon would split one thread into two independently writable owners.
+        """
+        return bool(
+            not self.work_mode
+            and self.daemon_mode == "auto"
+            and (self._daemon_proxy_established or self._using_daemon_proxy)
         )
 
     async def _publish_runtime_event(self, event: RuntimeEvent) -> None:
@@ -872,6 +892,14 @@ class CodexHandle:
             [(proxy_argv, True), (stdio_argv, False)]
             if proxy_argv is not None else [(stdio_argv, False)]
         )
+        if self._daemon_proxy_established:
+            if proxy_argv is None:
+                raise RuntimeError(
+                    "shared Codex app-server proxy is unavailable")
+            # A previously shared thread must never reconnect through private
+            # stdio.  Leave the handle disconnected and let Machine retry the
+            # shared proxy instead of manufacturing a false external-CLI lock.
+            attempts = [(proxy_argv, True)]
         initialized: Any = None
         for argv, daemon_proxy in attempts:
             try:
@@ -881,6 +909,8 @@ class CodexHandle:
                     "initialize", _initialize_params())
                 self.app_server_version = _app_server_version(initialized)
                 await self._notify("initialized")
+                if daemon_proxy:
+                    self._daemon_proxy_established = True
                 break
             except asyncio.CancelledError:
                 await self.disconnect()
@@ -890,6 +920,12 @@ class CodexHandle:
                 if not daemon_proxy:
                     raise
                 self.daemon_manager.invalidate()
+                if self._daemon_proxy_established:
+                    log.warning(
+                        "Codex shared daemon proxy unavailable; reconnect required",
+                        error_type=type(exc).__name__,
+                    )
+                    raise
                 log.warning(
                     "Codex daemon proxy unavailable; using stdio",
                     error_type=type(exc).__name__,

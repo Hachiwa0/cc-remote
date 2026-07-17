@@ -151,7 +151,8 @@ from cc_remote.wrapper.claude_external import (
     classify_claude_growth,
 )
 from cc_remote.wrapper.codex_external import (
-    ProcessIdentity, parse_turn_markers, process_identity,
+    CodexTuiLogTracker, HolderScan, ProcessIdentity,
+    parse_turn_markers, process_identity,
     writable_rollout_holders,
 )
 from cc_remote.wrapper.transport import WrapperTransport
@@ -322,6 +323,7 @@ class WrapperMachine:
         self._work_schedule_runs: set[asyncio.Task] = set()
         self._codex_watch_lock = asyncio.Lock()
         self._codex_probe_warned = False
+        self._codex_tui_log_tracker = CodexTuiLogTracker()
         self._claude_probe_warned = False
         # ``claude -c`` selects the cwd's latest conversation only once at
         # process startup. Keep that exact pid+start-ticks assignment across
@@ -502,6 +504,83 @@ class WrapperMachine:
             await self._emit(ctx, snapshot)
         return snapshot
 
+    @staticmethod
+    def _codex_shared_affinity(ctx: SessionContext) -> bool:
+        """Whether a Code context belongs to the shared Codex app-server.
+
+        ``using_daemon_proxy`` describes only the current proxy process.  A
+        restarted app-server closes that process before the replacement proxy
+        connects, but ownership of the thread remains shared throughout.
+        """
+        if ctx.engine != "codex" or ctx.space != "code":
+            return False
+        return bool(
+            getattr(ctx.sdk, "shared_daemon_affinity", False)
+            or getattr(ctx.sdk, "using_daemon_proxy", False)
+        )
+
+    @staticmethod
+    def _codex_shared_live(ctx: SessionContext) -> bool:
+        return bool(
+            ctx.engine == "codex"
+            and getattr(ctx.sdk, "using_daemon_proxy", False)
+        )
+
+    async def _reconnect_codex_shared(
+        self,
+        ctx: SessionContext,
+        *,
+        reason: str,
+    ) -> bool:
+        """Restore one interrupted shared proxy without changing ownership."""
+        if not self._codex_shared_affinity(ctx):
+            return False
+        if self._codex_shared_live(ctx):
+            return True
+        watch = self._watch.get(ctx.session_id or "")
+        await self._set_session_control(
+            ctx,
+            control_mode="codex_shared",
+            write_state="writable",
+            terminal_attached=bool((watch or {}).get("holders")),
+            reason="Codex 共享通道连接断开，正在重新连接",
+            can_takeover=False,
+        )
+        try:
+            await ctx.sdk.force_reconnect(
+                resume_id=ctx.session_id,
+                cwd=ctx.cwd,
+                reason=reason,
+            )
+        except Exception as exc:
+            log.warning(
+                "Codex shared proxy reconnect failed",
+                session_id=ctx.session_id,
+                reason=reason,
+                error_type=type(exc).__name__,
+            )
+            await self._set_session_control(
+                ctx,
+                control_mode="codex_shared",
+                write_state="writable",
+                terminal_attached=bool((watch or {}).get("holders")),
+                reason="Codex 共享通道连接断开；下次操作会自动重试",
+                can_takeover=False,
+            )
+            return False
+        if not self._codex_shared_live(ctx):
+            await self._set_session_control(
+                ctx,
+                control_mode="codex_shared",
+                write_state="writable",
+                terminal_attached=bool((watch or {}).get("holders")),
+                reason="Codex 共享通道尚未恢复；下次操作会自动重试",
+                can_takeover=False,
+            )
+            return False
+        await self._sync_external_control(ctx, watch)
+        return True
+
     async def _sync_external_control(
         self,
         ctx: SessionContext,
@@ -536,14 +615,17 @@ class WrapperMachine:
                 ),
                 can_takeover=False,
             )
-        if (ctx.engine == "codex"
-                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+        if self._codex_shared_affinity(ctx):
+            live = self._codex_shared_live(ctx)
             return await self._set_session_control(
                 ctx,
                 control_mode="codex_shared",
                 write_state="writable",
                 terminal_attached=bool((watch or {}).get("holders")),
-                reason=None,
+                reason=(
+                    None if live
+                    else "Codex 共享通道连接断开；下次操作会自动重试"
+                ),
                 can_takeover=False,
             )
         pending = bool((watch or {}).get("takeover_pending"))
@@ -2190,8 +2272,7 @@ class WrapperMachine:
         ctx = self._ctx_by_sid(sid)
         if ctx is not None and getattr(ctx.sdk, "is_claude_broker", False):
             return False
-        if (ctx is not None and ctx.engine == "codex"
-                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+        if ctx is not None and self._codex_shared_affinity(ctx):
             return False
         w = self._watch.get(sid)
         if w and w.get("engine") == "codex":
@@ -2414,6 +2495,22 @@ class WrapperMachine:
         for holders in scan.passive_holders.values():
             holders.difference_update(initial_own)
             holders.difference_update(current_own)
+        for identity in initial_own | current_own:
+            scan.client_proxies.pop(identity, None)
+        tui_bindings, log_complete = await asyncio.to_thread(
+            self._codex_tui_log_tracker.bindings,
+            paths,
+            scan.client_proxies,
+        )
+        for sid, holders in tui_bindings.items():
+            scan.holders.setdefault(sid, set()).update(holders)
+        if not log_complete and scan.client_proxies:
+            scan = HolderScan(
+                scan.holders,
+                False,
+                scan.passive_holders,
+                scan.client_proxies,
+            )
         if not scan.complete:
             if not self._codex_probe_warned:
                 log.warning("codex rollout owner scan incomplete; preserving prior state")
@@ -2650,8 +2747,7 @@ class WrapperMachine:
             return
 
         ctx = self._ctx_by_sid(sid)
-        if (ctx is not None and ctx.engine == "codex"
-                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+        if ctx is not None and self._codex_shared_affinity(ctx):
             changed = False
             file_id = (st.st_dev, st.st_ino)
             if file_id != w.get("file_id") or st.st_size < w.get("size", 0):
@@ -3480,8 +3576,7 @@ class WrapperMachine:
             error = Error(code=ERR_NOT_RUNNING, message="该会话尚无可接管的会话 ID")
             await self._emit(ctx, error)
             return error
-        if (ctx.engine == "codex"
-                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+        if self._codex_shared_affinity(ctx):
             await self._sync_external_control(
                 ctx, self._watch.get(resolved_sid))
             await self._emit(ctx, TakeoverState(
@@ -3659,9 +3754,17 @@ class WrapperMachine:
                 await self._emit(ctx, error)
                 return error
         is_claude_broker = bool(getattr(ctx.sdk, "is_claude_broker", False))
-        is_codex_shared = bool(
-            ctx.engine == "codex"
-            and getattr(ctx.sdk, "using_daemon_proxy", False))
+        is_codex_shared = self._codex_shared_affinity(ctx)
+        if (is_codex_shared and not self._codex_shared_live(ctx)
+                and not await self._reconnect_codex_shared(
+                    ctx, reason="query preflight")):
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message="Codex 共享通道重连失败，本次未发送；请重试",
+                msg_id=getattr(cmd, "msg_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         if is_claude_broker:
             try:
                 metadata = await ctx.sdk.refresh_status()
@@ -4122,9 +4225,17 @@ class WrapperMachine:
             return None
         if ctx.engine == "claude" and ctx.space != "code":
             return None
-        if (ctx.engine == "codex"
-                and bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
-            return None
+        if self._codex_shared_affinity(ctx):
+            if (self._codex_shared_live(ctx)
+                    or await self._reconnect_codex_shared(
+                        ctx, reason=f"runtime control preflight: {action}")):
+                return None
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message=f"Codex 共享通道重连失败，无法{action}；请重试",
+            )
+            await self._emit(ctx, error)
+            return error
 
         self._watch_session(ctx.session_id)
         external = (
@@ -7766,7 +7877,19 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
-        if (not bool(getattr(ctx.sdk, "using_daemon_proxy", False))
+        if (self._codex_shared_affinity(ctx)
+                and not self._codex_shared_live(ctx)
+                and not await self._reconnect_codex_shared(
+                    ctx, reason=f"before {action}")):
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message=f"Codex 共享通道重连失败，无法{action}；请重试",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if (not self._codex_shared_affinity(ctx)
                 and await self._prime_codex_ownership(sid)):
             error = Error(
                 code=ERR_BUSY,
@@ -10230,7 +10353,7 @@ class WrapperMachine:
                 ctx,
                 control_mode=(
                     "codex_shared"
-                    if getattr(ctx.sdk, "using_daemon_proxy", False)
+                    if self._codex_shared_affinity(ctx)
                     else "remote"
                 ),
                 write_state="writable",
@@ -10269,7 +10392,7 @@ class WrapperMachine:
         if resume_id:
             self._watch_session(resume_id)
             if (engine == "codex"
-                    and not bool(getattr(ctx.sdk, "using_daemon_proxy", False))):
+                    and not self._codex_shared_affinity(ctx)):
                 await self._prime_codex_ownership(resume_id)
             elif engine == "claude" and broker_handle is None:
                 await self._prime_claude_ownership(resume_id)
@@ -10798,8 +10921,7 @@ class WrapperMachine:
     async def _run_turn(self, ctx: SessionContext, prompt: str,
                         images: Optional[list] = None, files: Optional[list] = None) -> None:
         is_codex = ctx.engine == "codex"
-        is_codex_shared = bool(
-            is_codex and getattr(ctx.sdk, "using_daemon_proxy", False))
+        is_codex_shared = self._codex_shared_affinity(ctx)
         ctx.translator = (CodexStreamTranslator(self.cfg.tool_result_max) if is_codex
                           else StreamTranslator(
                               self.cfg.tool_result_max,
@@ -11080,9 +11202,18 @@ class WrapperMachine:
                     # short native turn can finish between the earlier reload and
                     # this probe: no holder remains, but consuming its markers sets
                     # needs_reload. Reconnect once, then probe again before sending.
-                    if (ctx.session_id
-                            and not bool(getattr(
-                                ctx.sdk, "using_daemon_proxy", False))):
+                    if (is_codex_shared
+                            and not self._codex_shared_live(ctx)
+                            and not await self._reconnect_codex_shared(
+                                ctx, reason="final query preflight")):
+                        await self._emit(ctx, Error(
+                            code=ERR_NOT_RUNNING,
+                            message="Codex 共享通道重连失败，本次未发送；请重试",
+                            msg_id=ctx.active_msg_id,
+                        ))
+                        await self._set_idle_after_managed_turn(ctx)
+                        return
+                    if ctx.session_id and not is_codex_shared:
                         external = await self._prime_codex_ownership(ctx.session_id)
                         if (ctx.interrupt_event.is_set()
                                 or ctx.state == "interrupting"):

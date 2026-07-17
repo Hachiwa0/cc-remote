@@ -48,6 +48,22 @@ class _SharedSdk(_CodexSdk):
         self.reconnects += 1
 
 
+class _InterruptedSharedSdk(_SharedSdk):
+    shared_daemon_affinity = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.live = False
+
+    @property
+    def using_daemon_proxy(self) -> bool:
+        return self.live
+
+    async def force_reconnect(self, *_args, **_kwargs) -> None:
+        self.reconnects += 1
+        self.live = True
+
+
 def test_shared_code_watcher_mirrors_growth_without_legacy_lock(tmp_path):
     async def go() -> None:
         machine, _transport = _mk_machine()
@@ -295,6 +311,57 @@ def test_shared_code_query_never_calls_legacy_ownership_probe(
     asyncio.run(go())
 
 
+def test_interrupted_shared_query_reconnects_without_legacy_lock(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _InterruptedSharedSdk()
+        machine.sessions[ctx.key] = ctx
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        watch = _watch(path)
+        watch.update({
+            "external": True,
+            "holders": {ProcessIdentity(111, 1101)},
+            "writers": {ProcessIdentity(111, 1101)},
+        })
+        machine._watch["sid"] = watch
+        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+
+        async def legacy_probe_must_not_run(_sid: str) -> bool:
+            raise AssertionError("interrupted shared Code entered legacy ownership")
+
+        ran: list[tuple[str, str]] = []
+
+        async def fake_turn(session_ctx, prompt, _images=None, _files=None):
+            ran.append((session_ctx.session_id, prompt))
+            await machine._set_state(session_ctx, "idle")
+
+        monkeypatch.setattr(
+            machine, "_prime_codex_ownership", legacy_probe_must_not_run
+        )
+        monkeypatch.setattr(machine, "_run_turn", fake_turn)
+
+        result = await machine._handle_query(Query(
+            sid="sid", prompt="hello", msg_id="shared-reconnect-query"
+        ))
+        assert result is None
+        assert ctx.turn_task is not None
+        await ctx.turn_task
+        assert ctx.sdk.reconnects == 1
+        assert ctx.sdk.using_daemon_proxy is True
+        assert ran == [("sid", "hello")]
+        assert ctx.control_mode == "codex_shared"
+        assert ctx.write_state == "writable"
+        assert ctx.control_can_takeover is False
+
+    asyncio.run(go())
+
+
 def test_shared_code_final_launch_never_calls_legacy_ownership_probe(
     monkeypatch,
 ):
@@ -372,16 +439,13 @@ def test_shared_takeover_is_an_idempotent_noop(monkeypatch, tmp_path):
     asyncio.run(go())
 
 
-def test_final_preflight_uses_live_proxy_state_after_mode_change(monkeypatch):
+def test_final_preflight_never_downgrades_interrupted_shared_proxy(monkeypatch):
     class ProxyFallsBackSdk(_SharedSdk):
-        def __init__(self) -> None:
-            super().__init__()
-            self.proxy_reads = 0
+        shared_daemon_affinity = True
 
         @property
         def using_daemon_proxy(self) -> bool:
-            self.proxy_reads += 1
-            return self.proxy_reads == 1
+            return False
 
     async def go() -> None:
         machine, transport = _mk_machine()
@@ -403,15 +467,16 @@ def test_final_preflight_uses_live_proxy_state_after_mode_change(monkeypatch):
 
         await asyncio.wait_for(machine._run_turn(ctx, "must not send"), timeout=0.5)
 
-        assert probes == ["sid"]
+        assert probes == []
+        assert ctx.sdk.reconnects == 1
         assert ctx.sdk.queries == []
         assert ctx.state == "idle"
-        busy = [
+        disconnected = [
             event for event in transport.sent
-            if isinstance(event, Error) and event.code == "busy"
+            if isinstance(event, Error) and event.code == "not_running"
         ]
-        assert len(busy) == 1
-        assert busy[0].msg_id == "fallback-turn"
+        assert len(disconnected) == 1
+        assert disconnected[0].msg_id == "fallback-turn"
 
     asyncio.run(go())
 

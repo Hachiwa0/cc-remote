@@ -431,6 +431,35 @@ def test_code_daemon_unavailable_falls_back_and_work_never_probes(monkeypatch):
     asyncio.run(run(True))
 
 
+def test_established_shared_session_never_falls_back_to_private_stdio(
+    monkeypatch,
+):
+    async def run():
+        manager = _Manager(None)
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            raise AssertionError("private stdio must not be started")
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+        handle = CodexHandle(
+            _Cfg(), daemon_mode="auto", daemon_manager=manager)
+        handle._daemon_proxy_established = True
+
+        with pytest.raises(RuntimeError, match="shared Codex app-server"):
+            await handle.connect(resume_id="shared-thread", cwd="/tmp")
+
+        assert handle.shared_daemon_affinity is True
+        assert handle.using_daemon_proxy is False
+        assert spawned == []
+
+    asyncio.run(run())
+
+
 def test_proxy_handshake_failure_falls_back_to_stdio(monkeypatch):
     async def run():
         nonce = b"0123456789abcdef"

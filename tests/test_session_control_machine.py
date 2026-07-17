@@ -122,3 +122,36 @@ def test_external_cli_is_read_only_but_shared_codex_stays_writable():
         assert control.can_takeover is False
 
     asyncio.run(go())
+
+
+def test_interrupted_shared_codex_never_degrades_to_external_cli():
+    async def go():
+        machine, _ = _mk_machine()
+
+        class InterruptedShared:
+            using_daemon_proxy = False
+            shared_daemon_affinity = True
+
+        codex = _mk_ctx("codex-sid", "codex-sid")
+        codex.engine = "codex"
+        codex.space = "code"
+        codex.sdk = InterruptedShared()
+        machine.sessions[codex.key] = codex
+        watch = {
+            "engine": "codex",
+            "external": True,
+            "holders": {object()},
+            "takeover_pending": False,
+        }
+        machine._watch["codex-sid"] = watch
+
+        control = await machine._sync_external_control(codex, watch)
+
+        assert control.control_mode == "codex_shared"
+        assert control.write_state == "writable"
+        assert control.terminal_attached is True
+        assert control.can_takeover is False
+        assert "连接断开" in (control.reason or "")
+        assert machine._is_external("codex-sid") is False
+
+    asyncio.run(go())

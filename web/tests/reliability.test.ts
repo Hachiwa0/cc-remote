@@ -2230,30 +2230,40 @@ try {
     "a passive Codex daemon is shown as backend topology, not terminal ownership");
   assert.doesNotMatch(passiveSharedControl.title, /已连接/,
     "a live shared daemon must not be presented as a live terminal connection");
+  const reconnectingSharedControl = presentSessionControl(control(
+    32, "codex_shared", "writable", {
+      terminal_attached: true,
+      reason: "Codex 共享通道连接断开；下次操作会自动重试",
+    }));
+  assert.equal(reconnectingSharedControl.locked, false,
+    "an interrupted Codex proxy remains writable instead of becoming an external lock");
+  assert.equal(reconnectingSharedControl.disconnected, true);
+  assert.equal(reconnectingSharedControl.action, undefined);
+  assert.doesNotMatch(reconnectingSharedControl.remote, /只读/);
   const passiveBrokerControl = presentSessionControl(control(
-    32, "claude_broker", "writable", { terminal_attached: false }));
+    33, "claude_broker", "writable", { terminal_attached: false }));
   assert.equal(passiveBrokerControl.tone, "shared");
   assert.equal(passiveBrokerControl.title, "Claude Broker 通道可用");
   assert.equal(passiveBrokerControl.terminal, "未检测到本机终端");
   const attachedBrokerControl = presentSessionControl(control(
-    33, "claude_broker", "writable", { terminal_attached: true }));
+    34, "claude_broker", "writable", { terminal_attached: true }));
   assert.equal(attachedBrokerControl.tone, "attached");
   assert.match(attachedBrokerControl.detail, /浏览器与终端共享同一会话/);
   const externalControl = presentSessionControl(control(
-    34, "external_cli", "read_only", { can_takeover: true }));
+    35, "external_cli", "read_only", { can_takeover: true }));
   assert.equal(externalControl.locked, true);
   assert.equal(externalControl.action, "迁移");
   assert.equal(externalControl.tone, "attention");
   assert.match(externalControl.detail, /只读.*接管/);
   const desktopControl = presentSessionControl(control(
-    35, "desktop", "writable", { can_takeover: true }));
+    36, "desktop", "writable", { can_takeover: true }));
   assert.equal(desktopControl.locked, true,
     "desktop remains fail-closed even if a producer says writable");
   assert.equal(desktopControl.action, undefined);
   assert.equal(desktopControl.remote, "只读");
   assert.match(desktopControl.title, /只读/);
   const exitedBrokerControl = presentSessionControl(control(
-    36, "claude_broker", "input_busy", {
+    37, "claude_broker", "input_busy", {
       terminal_attached: false,
       reason: "session_exited: Claude broker 已断开",
     }));

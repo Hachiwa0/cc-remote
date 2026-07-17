@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sqlite3
 from dataclasses import dataclass, field
 import glob
 from pathlib import Path
@@ -22,6 +24,16 @@ MAX_PARTIAL_RECORD_BYTES = 16 * 1024 * 1024
 MAX_CMDLINE_BYTES = 64 * 1024
 _TUI_SNAPSHOT_START_SLOP_NS = 2_000_000_000
 _TUI_SNAPSHOT_READY_WINDOW_NS = 20_000_000_000
+_CODEX_TUI_CLIENT = 'app_server.client_name="codex-tui"'
+_CONNECTION_ID_RE = re.compile(
+    r"(?:app_server\.connection_id=|connection_id=ConnectionId\()(\d+)"
+)
+_THREAD_ID_RE = re.compile(
+    r"ThreadId \{ uuid: ([0-9a-fA-F-]{36}) \}"
+)
+_ROLLOUT_SID_RE = re.compile(
+    r"rollout-[^\s\"']*-([0-9a-fA-F-]{36})\.jsonl"
+)
 _TERMINAL_EVENTS = frozenset({
     "task_complete", "turn_aborted", "task_failed", "task_cancelled",
 })
@@ -55,6 +67,137 @@ class HolderScan:
     # writers for turn attribution, but are not by themselves an interactive
     # terminal owner; their task markers drive the active lock instead.
     passive_holders: dict[str, set[ProcessIdentity]] = field(default_factory=dict)
+    # A remote TUI reaches the shared daemon through a headless proxy which
+    # never opens the rollout itself. Its exact thread is resolved separately
+    # from the app-server's structured connection log.
+    client_proxies: dict[ProcessIdentity, int] = field(default_factory=dict)
+
+
+class CodexTuiLogTracker:
+    """Bind live remote Codex proxies to the exact subscribed thread."""
+
+    MAX_ROWS = 20_000
+
+    def __init__(self, log_path: str | None = None) -> None:
+        self.log_path = log_path
+        self._process_uuid: str | None = None
+        self._last_id = 0
+        self._proxy_epoch: frozenset[ProcessIdentity] = frozenset()
+        self._connections: dict[int, tuple[str, int]] = {}
+
+    def _path(self) -> str:
+        if self.log_path is not None:
+            return self.log_path
+        codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+        return os.path.join(codex_home, "logs_2.sqlite")
+
+    @staticmethod
+    def _connection_id(body: str) -> int | None:
+        match = _CONNECTION_ID_RE.search(body)
+        return int(match.group(1)) if match is not None else None
+
+    @staticmethod
+    def _thread_id(body: str) -> str | None:
+        match = _THREAD_ID_RE.search(body) or _ROLLOUT_SID_RE.search(body)
+        return match.group(1).lower() if match is not None else None
+
+    def bindings(
+        self,
+        watched_sids: Iterable[str],
+        proxies: Mapping[ProcessIdentity, int],
+    ) -> tuple[dict[str, set[ProcessIdentity]], bool]:
+        """Return exact terminal holders and whether the log scan completed."""
+        watched = set(watched_sids)
+        result = {sid: set() for sid in watched}
+        proxy_epoch = frozenset(proxies)
+        if not proxy_epoch:
+            self._proxy_epoch = proxy_epoch
+            self._connections.clear()
+            return result, True
+
+        try:
+            db = sqlite3.connect(
+                f"file:{Path(self._path()).as_posix()}?mode=ro",
+                uri=True,
+                timeout=0.2,
+            )
+        except sqlite3.Error:
+            return result, False
+        try:
+            db.execute("PRAGMA query_only=ON")
+            row = db.execute(
+                "SELECT process_uuid FROM logs "
+                "WHERE thread_id IS NULL AND process_uuid IS NOT NULL "
+                "AND feedback_log_body LIKE '%rpc.transport=\"unix_socket\"%' "
+                "AND feedback_log_body LIKE '%app_server.connection_id=%' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            process_uuid = row[0] if row and isinstance(row[0], str) else None
+            if process_uuid is None:
+                return result, False
+
+            if (process_uuid != self._process_uuid
+                    or proxy_epoch != self._proxy_epoch):
+                self._process_uuid = process_uuid
+                self._last_id = 0
+                self._connections.clear()
+                self._proxy_epoch = proxy_epoch
+
+            ceiling_row = db.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM logs "
+                "WHERE process_uuid=? AND thread_id IS NULL",
+                (process_uuid,),
+            ).fetchone()
+            ceiling = int(ceiling_row[0]) if ceiling_row else 0
+            rows = [] if ceiling <= self._last_id else db.execute(
+                "SELECT id, target, feedback_log_body FROM logs "
+                "WHERE process_uuid=? AND thread_id IS NULL "
+                "AND id>? AND id<=? "
+                "AND (feedback_log_body LIKE ? OR "
+                "(target='codex_app_server::message_processor' "
+                "AND feedback_log_body LIKE '%thread/unsubscribe%')) "
+                "ORDER BY id LIMIT ?",
+                (
+                    process_uuid,
+                    self._last_id,
+                    ceiling,
+                    f'%{_CODEX_TUI_CLIENT}%',
+                    self.MAX_ROWS + 1,
+                ),
+            ).fetchall()
+            if len(rows) > self.MAX_ROWS:
+                return result, False
+            for row_id, target, body in rows:
+                if not isinstance(body, str):
+                    continue
+                connection_id = self._connection_id(body)
+                if connection_id is None:
+                    continue
+                if (target == "codex_app_server::message_processor"
+                        and "thread/unsubscribe" in body):
+                    self._connections.pop(connection_id, None)
+                    continue
+                if _CODEX_TUI_CLIENT not in body or "thread/resume" not in body:
+                    continue
+                sid = self._thread_id(body)
+                if sid is not None:
+                    self._connections[connection_id] = (sid, int(row_id))
+            self._last_id = ceiling
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return result, False
+        finally:
+            db.close()
+
+        # One stdio proxy carries one app-server connection. A client may die
+        # before thread/unsubscribe; the live process count is therefore the
+        # authoritative cap and newer subscriptions win over stale rows.
+        active = sorted(
+            self._connections.values(), key=lambda item: item[1], reverse=True
+        )[:len(proxy_epoch)]
+        for identity, (sid, _row_id) in zip(sorted(proxy_epoch), active):
+            if sid in result:
+                result[sid].add(identity)
+        return result, True
 
 
 def _process_stat(proc_dir: Path) -> tuple[int, int, int] | None:
@@ -102,6 +245,15 @@ def _is_passive_app_server(
     if args is None:
         args = _process_cmdline(proc_dir)
     return bool(args and b"app-server" in args)
+
+
+def _is_app_server_proxy(
+    args: tuple[bytes, ...] | None, tty_nr: int,
+) -> bool:
+    return bool(
+        tty_nr == 0 and args
+        and b"app-server" in args and b"proxy" in args
+    )
 
 
 def _codex_resume_sids(
@@ -264,6 +416,7 @@ def writable_rollout_holders(
     by_inode: dict[tuple[int, int], set[str]] = {}
     result = {sid: set() for sid in paths}
     passive = {sid: set() for sid in paths}
+    client_proxies: dict[ProcessIdentity, int] = {}
     sid_by_arg = {sid.encode(): sid for sid in paths}
     for sid, path in paths.items():
         try:
@@ -272,7 +425,7 @@ def writable_rollout_holders(
             continue
         by_inode.setdefault((st.st_dev, st.st_ino), set()).add(sid)
     if not by_inode:
-        return HolderScan(result, True, passive)
+        return HolderScan(result, True, passive, client_proxies)
 
     own = set(own_processes)
     root = Path(proc_root)
@@ -294,7 +447,7 @@ def writable_rollout_holders(
             except OSError:
                 continue
         if not own_fd_visible:
-            return HolderScan(result, False, passive)
+            return HolderScan(result, False, passive, client_proxies)
     complete = True
     try:
         processes = (entry for entry in root.iterdir() if entry.name.isdigit())
@@ -311,6 +464,11 @@ def writable_rollout_holders(
             if identity in own:
                 continue
             args = _process_cmdline(proc_dir)
+            if _is_app_server_proxy(args, tty_nr):
+                try:
+                    client_proxies[identity] = proc_dir.stat().st_ctime_ns
+                except OSError:
+                    complete = False
             logical_sids = (
                 _codex_resume_sids(args, sid_by_arg) if tty_nr != 0 else set())
             interactive_tui = _is_interactive_codex_tui(args, tty_nr)
@@ -366,12 +524,12 @@ def writable_rollout_holders(
                 if _is_passive_app_server(proc_dir, tty_nr, args):
                     passive[sid].add(identity)
     except OSError:
-        return HolderScan(result, False, passive)
+        return HolderScan(result, False, passive, client_proxies)
     for identity, sid in _snapshot_tui_bindings(
         unresolved_tuis, snapshots,
     ).items():
         result[sid].add(identity)
-    return HolderScan(result, complete, passive)
+    return HolderScan(result, complete, passive, client_proxies)
 
 
 def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:

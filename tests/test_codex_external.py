@@ -5,11 +5,13 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 from cc_remote.protocol import History, Query, Takeover
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_external import (
-    HolderScan, ProcessIdentity, parse_turn_markers, writable_rollout_holders,
+    CodexTuiLogTracker, HolderScan, ProcessIdentity, parse_turn_markers,
+    writable_rollout_holders,
 )
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -41,6 +43,26 @@ def _fake_process(root: Path, pid: int, start: int, *, tty: int = 0,
 def _fake_fd(proc: Path, fd: int, target: Path, flags: int) -> None:
     (proc / "fd" / str(fd)).symlink_to(target)
     (proc / "fdinfo" / str(fd)).write_text(f"flags:\t0{flags:o}\n")
+
+
+def _codex_log_db(path: Path) -> sqlite3.Connection:
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE logs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, "
+        "feedback_log_body TEXT, process_uuid TEXT, thread_id TEXT)"
+    )
+    return db
+
+
+def _log(db: sqlite3.Connection, target: str, body: str,
+         *, process_uuid: str = "host-1") -> None:
+    db.execute(
+        "INSERT INTO logs(target, feedback_log_body, process_uuid, thread_id) "
+        "VALUES (?, ?, ?, NULL)",
+        (target, body, process_uuid),
+    )
+    db.commit()
 
 
 def _watch(path: Path) -> dict:
@@ -157,6 +179,126 @@ def test_headless_daemon_and_stdio_proxy_are_both_passive(tmp_path):
     assert scan.complete is True
     assert scan.holders["sid"] == expected
     assert scan.passive_holders["sid"] == expected
+
+
+def test_headless_external_proxy_is_reported_for_connection_binding(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    proxy = _fake_process(
+        proc_root, 215, 2105,
+        cmdline=("codex", "app-server", "proxy"),
+    )
+    identity = ProcessIdentity(215, 2105)
+
+    scan = writable_rollout_holders(
+        {"sid": str(rollout)}, proc_root=str(proc_root))
+
+    assert scan.complete is True
+    assert scan.holders["sid"] == set()
+    assert set(scan.client_proxies) == {identity}
+    assert scan.client_proxies[identity] > 0
+    assert proxy.exists()
+
+
+def test_tui_log_tracker_binds_only_exact_resumed_thread(tmp_path):
+    first = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    second = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    proxy = ProcessIdentity(216, 2106)
+    log_path = tmp_path / "logs.sqlite"
+    db = _codex_log_db(log_path)
+    _log(
+        db,
+        "codex_app_server::message_processor",
+        "app-server request: initialize connection_id=ConnectionId(7)",
+    )
+    _log(
+        db,
+        "codex_rollout::recorder",
+        "app_server.request{otel.name=\"thread/resume\" "
+        "rpc.transport=\"unix_socket\" app_server.connection_id=7 "
+        "app_server.client_name=\"codex-tui\"}:"
+        "resume_running_thread: Resumed rollout with 1 items, thread ID: "
+        f"Some(ThreadId {{ uuid: {first} }}), parse errors: 0",
+    )
+    db.close()
+    tracker = CodexTuiLogTracker(str(log_path))
+
+    bindings, complete = tracker.bindings(
+        {first, second}, {proxy: 1_000_000_000})
+
+    assert complete is True
+    assert bindings == {first: {proxy}, second: set()}
+
+
+def test_tui_log_tracker_clears_binding_on_unsubscribe(tmp_path):
+    sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    proxy = ProcessIdentity(217, 2107)
+    log_path = tmp_path / "logs.sqlite"
+    db = _codex_log_db(log_path)
+    _log(
+        db,
+        "codex_app_server::message_processor",
+        "app-server request: initialize connection_id=ConnectionId(8)",
+    )
+    _log(
+        db,
+        "codex_rollout::recorder",
+        "app_server.request{otel.name=\"thread/resume\" "
+        "rpc.transport=\"unix_socket\" app_server.connection_id=8 "
+        "app_server.client_name=\"codex-tui\"}:"
+        f"resume_running_thread: Resuming rollout from /tmp/rollout-x-{sid}.jsonl",
+    )
+    tracker = CodexTuiLogTracker(str(log_path))
+    first, complete = tracker.bindings({sid}, {proxy: 1_000_000_000})
+    assert complete is True and first[sid] == {proxy}
+
+    _log(
+        db,
+        "codex_app_server::message_processor",
+        "app-server request: thread/unsubscribe "
+        "connection_id=ConnectionId(8) request_id=Integer(9)",
+    )
+    db.close()
+    second, complete = tracker.bindings({sid}, {proxy: 1_000_000_000})
+
+    assert complete is True
+    assert second == {sid: set()}
+
+
+def test_machine_merges_exact_tui_proxy_binding(monkeypatch):
+    async def go():
+        machine, _transport = _mk_machine()
+        proxy = ProcessIdentity(218, 2108)
+
+        class Tracker:
+            @staticmethod
+            def bindings(paths, proxies):
+                assert set(paths) == {"target", "sibling"}
+                assert set(proxies) == {proxy}
+                return {"target": {proxy}, "sibling": set()}, True
+
+        machine._codex_tui_log_tracker = Tracker()
+        monkeypatch.setattr(
+            machine_module,
+            "writable_rollout_holders",
+            lambda _paths, _own: HolderScan(
+                {"target": set(), "sibling": set()},
+                True,
+                {"target": set(), "sibling": set()},
+                {proxy: 1_000_000_000},
+            ),
+        )
+
+        scan = await machine._probe_codex_holders({
+            "target": "/tmp/target.jsonl",
+            "sibling": "/tmp/sibling.jsonl",
+        })
+
+        assert scan.complete is True
+        assert scan.holders == {"target": {proxy}, "sibling": set()}
+
+    asyncio.run(go())
 
 
 def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
