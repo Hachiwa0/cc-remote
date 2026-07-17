@@ -53,6 +53,69 @@ import {
   isSettlingStopDisabled,
 } from "../src/composer-submit.ts";
 import { workContextMetrics } from "../src/work-context.ts";
+import { processBlocks } from "../src/process-blocks.ts";
+import {
+  bumpSessionActivity,
+  compareSessionsByActivity,
+  orderCodeDirectoryGroups,
+  sessionCommandTarget,
+  setSessionPinned,
+  sessionActivityTime,
+  visibleDirectorySessions,
+} from "../src/session-order.ts";
+
+assert.equal(sessionActivityTime("2026-07-17T10:00:00Z"),
+  Date.parse("2026-07-17T10:00:00Z"), "ISO Claude activity timestamps must sort correctly");
+assert.ok(sessionActivityTime("1752746400000") > sessionActivityTime("1752746399"),
+  "millisecond and second timestamps must share one ordering scale");
+const recentProject = { session_id: "project-new", cwd: "/home/nancy/project",
+  last_modified: "300" };
+const oldHome = { session_id: "home-old", cwd: "/home/nancy", last_modified: "100" };
+const projectOld = { session_id: "project-old", cwd: "/home/nancy/project",
+  last_modified: "200" };
+const directoryGroups = {
+  "/home/nancy": [oldHome],
+  "/home/nancy/project": [projectOld, recentProject].sort(compareSessionsByActivity),
+};
+assert.deepEqual(directoryGroups["/home/nancy/project"].map((session) => session.session_id),
+  ["project-new", "project-old"], "sessions inside a directory must be newest first");
+assert.deepEqual(orderCodeDirectoryGroups(directoryGroups),
+  ["/home/nancy/project", "/home/nancy"],
+  "the directory containing the newest session must be first");
+const bumpedSessions = bumpSessionActivity(
+  [oldHome, recentProject], "home-old", 400_000);
+assert.equal(bumpedSessions[0].last_modified, "400000",
+  "a live message must update sidebar activity without waiting for another list request");
+assert.deepEqual(orderCodeDirectoryGroups({
+  "/home/nancy": [bumpedSessions[0]],
+  "/home/nancy/project": [recentProject],
+}), ["/home/nancy", "/home/nancy/project"],
+"an optimistically updated directory must move immediately");
+assert.equal(setSessionPinned([oldHome], "home-old", true)[0].pinned, true,
+  "pinning must update the visible list immediately");
+assert.deepEqual(sessionCommandTarget(
+  { ...recentProject, engine: "codex", space: "code" }, "claude", "work"),
+{ engine: "codex", space: "code" },
+"session actions must target the card engine and space, not the current page");
+const sevenSessions = Array.from({ length: 7 }, (_, index) => ({
+  session_id: `session-${index}`, last_modified: String(100 - index),
+}));
+assert.equal(visibleDirectorySessions(sevenSessions, false, false).length, 5,
+  "a directory must show only five sessions by default");
+assert.equal(visibleDirectorySessions(sevenSessions, true, false).length, 7,
+  "expanded directories must show every session");
+assert.equal(visibleDirectorySessions(sevenSessions, false, true).length, 7,
+  "search results must never be hidden behind the five-session limit");
+
+const visibleAgentTimeline = processBlocks([
+  { kind: "tool", message_id: "assistant-1", tool_use_id: "agent-tool",
+    tool: "Agent", input: {}, category: "agent", done: false },
+  { kind: "process", item_id: "agent:agent-tool", processKind: "agent",
+    phase: "start", status: "running", parent_id: "agent-tool",
+    title: "审查后端", done: false },
+] as import("../src/reducer.ts").Block[]);
+assert.deepEqual(visibleAgentTimeline.map((block) => block.kind), ["process"],
+  "a dedicated live agent row must replace the duplicate generic ToolUse row");
 
 const legacyWorkContext = workContextMetrics({
   v: 15, ts: 0, type: "context_report",

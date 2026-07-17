@@ -86,6 +86,7 @@ from cc_remote.protocol import (
     ERR_FORK_RECONCILING,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
+from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
@@ -278,7 +279,7 @@ class WrapperMachine:
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
-        "get_history", "switch_session", "rename_session", "archive_session",
+        "get_history", "switch_session", "rename_session", "archive_session", "pin_session",
         "delete_work_session", "delete_session", "rollback_session",
         "compact_session", "start_review",
         "fork_session", "fork_session_worktree",
@@ -368,6 +369,12 @@ class WrapperMachine:
         self._uncertain_claude_forks: OrderedDict[str, Optional[str]] = OrderedDict()
         self._claude_fork_tasks: dict[str, asyncio.Task] = {}
         self._claude_fork_locks: dict[str, asyncio.Lock] = {}
+        try:
+            self._session_pins: SessionPinStore | None = SessionPinStore(
+                self.cfg.state_dir)
+        except SessionPinStoreError:
+            self._session_pins = None
+            log.exception("session pin store unavailable")
         try:
             self._rollback_commands: RollbackCommandJournal | None = (
                 RollbackCommandJournal(self.cfg.state_dir)
@@ -2002,6 +2009,8 @@ class WrapperMachine:
             await self._handle_rename_session(cmd)
         elif t == "archive_session":
             await self._handle_archive_session(cmd)
+        elif t == "pin_session":
+            await self._handle_pin_session(cmd)
         elif t == "delete_work_session":
             return await self._handle_delete_work_session(cmd)
         elif t == "delete_session":
@@ -6865,6 +6874,8 @@ class WrapperMachine:
             resident_state = {c.session_id: c.state for c in self.sessions.values() if c.session_id}
             work_records = await asyncio.to_thread(
                 self._work.for_engine("claude").records_by_session)
+            pinned_ids = (self._session_pins.ids("claude")
+                          if self._session_pins is not None else frozenset())
             sessions = []
             for info in infos:
                 record = work_records.get(info.session_id)
@@ -6886,6 +6897,7 @@ class WrapperMachine:
                     cwd=(info.cwd or "")[:4096] or None,
                     tag=("archived" if record and record.archived else
                          (info.tag or "")[:128] or None),
+                    pinned=info.session_id in pinned_ids,
                     state=resident_state.get(info.session_id),
                     engine="claude", space=space,
                     work_id=record.work_id if record else None,
@@ -6923,6 +6935,7 @@ class WrapperMachine:
                                 summary="Claude Remote",
                                 cwd=broker_cwd[:4096],
                                 state=resident_state.get(broker_sid, "idle"),
+                                pinned=broker_sid in pinned_ids,
                                 engine="claude",
                                 space="code",
                             ))
@@ -6956,6 +6969,8 @@ class WrapperMachine:
             space = getattr(cmd, "space", "code")
             store = self._work.for_engine("codex")
             work_records = await asyncio.to_thread(store.records_by_session)
+            pinned_ids = (self._session_pins.ids("codex")
+                          if self._session_pins is not None else frozenset())
             # thread/start commits the native rollout before WorkRegistry can bind
             # it. If the wrapper dies in that narrow window, recover only an
             # unambiguous exact-cwd match inside the private Work root.
@@ -7004,6 +7019,7 @@ class WrapperMachine:
                     git_branch=row.get("git_branch"),
                     tag=("archived" if record and record.archived
                          else row.get("tag")),
+                    pinned=row["session_id"] in pinned_ids,
                     engine="codex", space=space,
                     work_id=record.work_id if record else None,
                     state=(resident_state.get(row["session_id"])
@@ -7383,9 +7399,8 @@ class WrapperMachine:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
-        requested_engine = getattr(cmd, "engine", engine)
-        if "engine" in getattr(cmd, "model_fields_set", set()) \
-                and requested_engine != engine:
+        requested_engine = getattr(cmd, "engine", None)
+        if requested_engine is not None and requested_engine != engine:
             await self._emit_to_sid(sid, Error(
                 code=ERR_AUTH, message="会话不属于请求的引擎"))
             return
@@ -7434,9 +7449,8 @@ class WrapperMachine:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
-        requested_engine = getattr(cmd, "engine", engine)
-        if "engine" in getattr(cmd, "model_fields_set", set()) \
-                and requested_engine != engine:
+        requested_engine = getattr(cmd, "engine", None)
+        if requested_engine is not None and requested_engine != engine:
             await self._emit_to_sid(sid, Error(
                 code=ERR_AUTH, message="会话不属于请求的引擎"))
             return
@@ -7483,6 +7497,49 @@ class WrapperMachine:
             log.exception("archive_session failed", error=str(e))
             await self._emit_focused(Error(code=ERR_INTERNAL, message=f"archive failed: {e}"))
 
+    async def _handle_pin_session(self, cmd) -> None:
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        is_codex = await self._is_codex_session(sid)
+        engine = "codex" if is_codex else "claude"
+        requested_engine = getattr(cmd, "engine", None)
+        if requested_engine is not None and requested_engine != engine:
+            await self._emit_to_sid(sid, Error(
+                code=ERR_AUTH, message="会话不属于请求的引擎"))
+            return
+        work_record = await asyncio.to_thread(
+            self._work.for_engine(engine).get_by_session, sid)
+        requested_space = getattr(cmd, "space", "code")
+        if (work_record is not None) != (requested_space == "work"):
+            await self._emit_to_sid(sid, Error(
+                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间"))
+            return
+        if (work_record is None and self._ctx_by_sid(sid) is None
+                and not is_codex):
+            info = await asyncio.to_thread(get_session_info, sid)
+            if info is None:
+                await self._emit_to_sid(sid, Error(
+                    code=ERR_NOT_RUNNING, message="Claude 会话不存在"))
+                await self._handle_list_sessions(cmd)
+                return
+        if (self._session_pins is None):
+            await self._emit_to_sid(sid, Error(
+                code=ERR_INTERNAL, message="置顶状态存储暂不可用"))
+            await (self._list_codex_sessions(cmd) if is_codex
+                   else self._handle_list_sessions(cmd))
+            return
+        try:
+            await asyncio.to_thread(
+                self._session_pins.set_pinned, engine, sid, bool(cmd.pinned))
+            log.info("session pin toggled", engine=engine, session_id=sid,
+                     pinned=bool(cmd.pinned))
+        except SessionPinStoreError as exc:
+            log.warning("session pin update failed", engine=engine,
+                        session_id=sid, error=str(exc))
+            await self._emit_to_sid(sid, Error(
+                code=ERR_INTERNAL, message="置顶状态保存失败"))
+        await (self._list_codex_sessions(cmd) if is_codex
+               else self._handle_list_sessions(cmd))
+
     async def _handle_delete_work_session(self, cmd):
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         engine = getattr(cmd, "engine", "claude")
@@ -7528,6 +7585,13 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        if self._session_pins is not None:
+            try:
+                await asyncio.to_thread(
+                    self._session_pins.set_pinned, engine, sid, False)
+            except SessionPinStoreError:
+                log.warning("stale Work session pin cleanup failed",
+                            engine=engine, session_id=sid)
         if self.focused_sid in {sid, getattr(ctx, "key", None)}:
             self.focused_sid = None
         await self._handle_list_sessions(cmd)
@@ -7654,6 +7718,13 @@ class WrapperMachine:
                 log.warning(
                     "Codex checkpoint cleanup after delete failed", session_id=sid
                 )
+        if self._session_pins is not None:
+            try:
+                await asyncio.to_thread(
+                    self._session_pins.set_pinned, engine, sid, False)
+            except SessionPinStoreError:
+                log.warning("stale Code session pin cleanup failed",
+                            engine=engine, session_id=sid)
         self._watch.pop(sid, None)
         if self.focused_sid in {sid, getattr(ctx, "key", None)}:
             self.focused_sid = None

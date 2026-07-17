@@ -592,6 +592,17 @@ export class RelayWs {
     this.send(obj);
   }
 
+  sendPinSession(sessionId: string, pinned: boolean,
+                 engine?: "claude" | "codex", space: Space = "code"): void {
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "pin_session", session_id: sessionId,
+      pinned, ts: nowTs(),
+    };
+    if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    this.send(obj);
+  }
+
   sendDeleteWorkSession(sessionId: string, engine: "claude" | "codex"): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "delete_work_session", session_id: sessionId,

@@ -41,6 +41,12 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
 import type { EngineCapabilities, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { resolveSidebarSwipe } from "./responsive-layout";
+import {
+  bumpSessionActivity,
+  compareSessionsByActivity,
+  sessionCommandTarget,
+  setSessionPinned,
+} from "./session-order";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -106,6 +112,7 @@ export default function App() {
   const pendingSessionForkRef = useRef<PendingSessionFork | null>(null);
   const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
   const sessionListsBySurfaceRef = useRef<Record<string, SessionInfo[]>>({});
+  const sessionActivityPendingRef = useRef<Set<string>>(new Set());
   const prefetchedSurfacesRef = useRef<Set<string>>(new Set());
   const lastFocusBySurfaceRef = useRef<Record<string, string>>({});
   const preferredSurfaceFocusRef = useRef<{ key: string; sid: string } | null>(null);
@@ -157,6 +164,7 @@ export default function App() {
     pendingBtwRef.current = null;
     activeBtwRef.current = null;
     sessionListsBySurfaceRef.current = {};
+    sessionActivityPendingRef.current.clear();
     prefetchedSurfacesRef.current.clear();
     historyInvalidationsRef.current.clear();
     historyCacheEpochRef.current.clear();
@@ -346,6 +354,21 @@ export default function App() {
       if (cancelled) return;
       const ws = new RelayWs({
         onEvent: (msg) => {
+          if ((msg.type === "user_msg" || msg.type === "turn_end") && msg.sid) {
+            const activityMs = Math.round(msg.ts * 1000);
+            let changed = false;
+            for (const [key, listed] of Object.entries(
+              sessionListsBySurfaceRef.current)) {
+              const updated = bumpSessionActivity(listed, msg.sid, activityMs);
+              if (updated !== listed) {
+                sessionListsBySurfaceRef.current[key] = updated;
+                changed = true;
+              }
+            }
+            if (msg.type === "user_msg" && changed) {
+              sessionActivityPendingRef.current.add(msg.sid);
+            }
+          }
           if (msg.type === "history_invalidated") {
             const sid = msg.session_id;
             if (historyInvalidationsRef.current.get(sid) !== msg.revision) {
@@ -615,6 +638,14 @@ export default function App() {
           // refresh the context ring after each turn (local SDK query, no model tokens)
           if (msg.type === "turn_end" && msg.sid) {
             ws.sendGetContextTo(msg.sid);
+            if (sessionActivityPendingRef.current.delete(msg.sid)) {
+              const listed = Object.values(sessionListsBySurfaceRef.current)
+                .flat().find((session) => session.session_id === msg.sid);
+              ws.sendListSessions(
+                (listed?.engine as Engine | undefined) ?? engineRef.current,
+                listed?.space ?? spaceRef.current,
+              );
+            }
             const session = stateRef.current.sessions.find(
               (candidate) => candidate.session_id === msg.sid);
             if (session?.space === "work"
@@ -725,7 +756,7 @@ export default function App() {
     preferredSurfaceFocusRef.current = null;
     const latest = preferred ?? [...state.sessions]
       .filter((s) => s.tag !== "archived")
-      .sort((a, b) => (parseInt(b.last_modified || "0", 10) || 0) - (parseInt(a.last_modified || "0", 10) || 0))[0]
+      .sort(compareSessionsByActivity)[0]
       ?? state.sessions[0];
     didInitFocusRef.current = true;
     if (latest && latest.session_id !== state.focusedSid) {
@@ -917,7 +948,16 @@ export default function App() {
     if (!wsRef.current || !focusedSid) return false;
     const msg_id = uuid();
     if (!wsRef.current.sendQuery(prompt, msg_id, images, files)) return false;
-    dispatch({ type: "query_sent", sid: focusedSid, prompt, msg_id, images, files, ts: Date.now() });
+    const activityMs = Date.now();
+    const surfaceKey = `${space}:${engine}`;
+    const cached = sessionListsBySurfaceRef.current[surfaceKey];
+    if (cached) {
+      sessionListsBySurfaceRef.current[surfaceKey] = bumpSessionActivity(
+        cached, focusedSid, activityMs);
+    }
+    sessionActivityPendingRef.current.add(focusedSid);
+    dispatch({ type: "query_sent", sid: focusedSid, prompt, msg_id, images, files,
+      ts: activityMs });
     return true;
   };
   // One command creates the session and starts its first query atomically. The
@@ -1130,6 +1170,7 @@ export default function App() {
       pendingBtwRef.current = null;
       pendingSessionForkRef.current = null;
       pendingWorktreeForkRef.current = null;
+      sessionActivityPendingRef.current.clear();
       activeBtwRef.current = null;
       btwRequestIdsRef.current.clear();
       discardedBtwSidsRef.current.clear();
@@ -1163,6 +1204,18 @@ export default function App() {
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
+        onPin={(session, pinned) => {
+          const target = sessionCommandTarget(session, engine, space);
+          const surfaceKey = `${target.space}:${target.engine}`;
+          const cached = sessionListsBySurfaceRef.current[surfaceKey];
+          if (cached) {
+            sessionListsBySurfaceRef.current[surfaceKey] = setSessionPinned(
+              cached, session.session_id, pinned);
+          }
+          dispatch({ type: "set_session_pinned", sid: session.session_id, pinned });
+          wsRef.current?.sendPinSession(
+            session.session_id, pinned, target.engine, target.space);
+        }}
         onDelete={(id) => {
           const warning = space === "work"
             ? "删除后将永久移除这项工作及其私有文件，确定继续吗？"

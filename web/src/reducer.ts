@@ -26,6 +26,7 @@ import { matchModelId } from "./data";
 import { canEnqueueQuery, collectWaitingQueries, reduceTargetedRuntime } from "./runtime-drain";
 import { mergeInitialHistory } from "./history-merge";
 import { boundRuntimeTurns, pruneRuntimeMap } from "./runtime-bounds";
+import { bumpSessionActivity, setSessionPinned } from "./session-order";
 
 export interface TextBlock {
   kind: "text";
@@ -305,6 +306,7 @@ export type Action =
   | { type: "clear_btw" }
   | { type: "clear_session_list" }
   | { type: "restore_session_list"; sessions: SessionInfo[] }
+  | { type: "set_session_pinned"; sid: string; pinned: boolean }
   | { type: "focus_session"; sid: string }
   | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null }
   | { type: "prune_runtimes"; protectedSids: string[] }
@@ -807,8 +809,9 @@ export function reduce(state: AppState, action: Action): AppState {
       };
       const runtimes = reduceTargetedRuntime(
         state.runtimes, action.sid, { type: "query_sent", turn });
-      if (runtimes === state.runtimes) return state;
-      return { ...state, runtimes };
+      const sessions = bumpSessionActivity(state.sessions, action.sid, action.ts);
+      if (runtimes === state.runtimes && sessions === state.sessions) return state;
+      return { ...state, runtimes, sessions };
     }
     case "enqueue": {
       const allQueued = collectWaitingQueries(state.runtimes);
@@ -889,6 +892,10 @@ export function reduce(state: AppState, action: Action): AppState {
       // Clearing first exposed Codex app-server startup time as a blank/frozen
       // sidebar even though the browser already had the exact rows in memory.
       return { ...state, sessions: action.sessions, focusedSid: null };
+    case "set_session_pinned": {
+      const sessions = setSessionPinned(state.sessions, action.sid, action.pinned);
+      return sessions === state.sessions ? state : { ...state, sessions };
+    }
     case "focus_session": {
       // optimistic view switch: focus the session locally right away (its runtime
       // is usually already in memory) instead of waiting for the round-trip
@@ -1594,8 +1601,8 @@ function reduceEvent(
         rt.pendingQuestion = null;
       }, true);
     }
-    case "user_msg":
-      return patch(state, e.sid, (rt) => {
+    case "user_msg": {
+      const next = patch(state, e.sid, (rt) => {
         markTurnAsLive(rt, e.msg_id, boundCompletedTurns, e.seq);
         const turns = cloneTurns(rt.turns);
         const existing = turns.find((t) => t.id === e.msg_id);
@@ -1619,6 +1626,11 @@ function reduceEvent(
         }
         rt.turns = turns;
       });
+      const sessions = e.sid
+        ? bumpSessionActivity(next.sessions, e.sid, Math.round(e.ts * 1000))
+        : next.sessions;
+      return sessions === next.sessions ? next : { ...next, sessions };
+    }
     case "assistant_msg_start":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);

@@ -196,6 +196,7 @@ export interface SessionInfo {
   git_branch?: string | null;
   cwd?: string | null;
   tag?: string | null;
+  pinned?: boolean;
   state?: State | null;
   engine?: Engine | null;
   forked_from_id?: string | null;
@@ -230,6 +231,7 @@ export interface SessionFocus extends Base { type: "session_focus"; session_id: 
 export interface SessionRekey extends Base { type: "session_rekey"; old_key: string; session_id: string; cwd?: string | null }
 export interface RenameSession extends Base { type: "rename_session"; session_id: string; title: string; engine?: Engine; space?: Space }
 export interface ArchiveSession extends Base { type: "archive_session"; session_id: string; archived: boolean; engine?: Engine; space?: Space }
+export interface PinSession extends Base { type: "pin_session"; session_id: string; pinned: boolean; engine?: Engine; space?: Space }
 export interface DeleteWorkSession extends Base { type: "delete_work_session"; session_id: string; engine: Engine; space?: "work" }
 export interface DeleteSession extends Base { type: "delete_session"; session_id: string; engine: Engine; space?: Space }
 export interface RollbackSession extends Base {

@@ -338,6 +338,11 @@ def _task_progress(usage: Any, last_tool_name: str | None = None) -> str | None:
     return " · ".join(bits) or None
 
 
+def _agent_process_id(tool_id: str) -> str:
+    """Stable process row paired with one Claude Agent/Task tool call."""
+    return _wire_id(f"agent:{tool_id}", "agent")
+
+
 class StreamTranslator:
     def __init__(self, tool_result_max: int, turn_id: str | None = None,
                  item_turns: dict[str, str] | None = None,
@@ -443,6 +448,23 @@ class StreamTranslator:
         self._started_channels.clear()
         self._emitted = {"thinking": 0, "text": 0}
 
+    def _agent_tool_event(
+        self, tool_id: str, *, phase: str, status: str,
+        title: str | None = None, summary: str | None = None,
+        progress: str | None = None, duration_ms: int | None = None,
+    ) -> ProcessEvent:
+        item_id = _agent_process_id(tool_id)
+        resolved_title = (title or self.item_titles.get(item_id)
+                          or self.item_titles.get(tool_id) or "协作代理")
+        self.item_titles[item_id] = resolved_title
+        self.item_meta[item_id] = ("agent", tool_id)
+        return ProcessEvent(
+            item_id=item_id, kind="agent", phase=phase, status=status,
+            turn_id=self._remember_turn(item_id, tool_id), parent_id=tool_id,
+            title=resolved_title, summary=summary, progress=progress,
+            duration_ms=duration_ms,
+        )
+
     def _emit_tool_use(self, events: list, block: ToolUseBlock | ServerToolUseBlock,
                        message_id: str, parent_id: str | None,
                        server_tool: bool = False) -> None:
@@ -469,7 +491,14 @@ class StreamTranslator:
             self._tool_diffs[tool_id] = (diff, was_truncated)
 
         lower = block.name.lower()
-        if lower == "enterplanmode":
+        if category == "agent":
+            agent_type = (_short_text(block.input.get("subagent_type"), 1024)
+                          or _short_text(block.input.get("agent_type"), 1024))
+            events.append(self._agent_tool_event(
+                tool_id, phase="start", status="running", title=title,
+                summary=(f"类型：{agent_type}" if agent_type else None),
+            ))
+        elif lower == "enterplanmode":
             self._plan_item_id = _wire_id(
                 f"plan:{self.turn_id or tool_id}", "plan")
             events.append(ProcessEvent(
@@ -494,7 +523,8 @@ class StreamTranslator:
             ))
 
     def _emit_tool_result(self, events: list, tool_use_id: Any, content: Any,
-                          is_error: bool = False, summary: str | None = None) -> None:
+                          is_error: bool = False, summary: str | None = None,
+                          duration_ms: int | None = None) -> None:
         self._ambiguous_final_mid = None
         tool_id = _wire_id(tool_use_id, "tool")
         # Fail closed for a result whose ToolUse was omitted/never observed. In
@@ -515,6 +545,12 @@ class StreamTranslator:
             truncated=truncated, status="failed" if is_error else "succeeded",
             summary=summary, diff=diff,
         ))
+        if (self._tool_names.get(tool_id) or "").lower() in {"agent", "task"}:
+            events.append(self._agent_tool_event(
+                tool_id, phase="end",
+                status="failed" if is_error else "succeeded",
+                summary=summary, duration_ms=duration_ms,
+            ))
         self._finished_tool_items.add(tool_id)
         self._tool_outputs.pop(tool_id, None)
         self._tool_delta_totals.pop(tool_id, None)
@@ -703,8 +739,12 @@ class StreamTranslator:
             if isinstance(value, (str, int, float)) and not isinstance(value, bool):
                 summary_bits.append(f"{label}：{value}")
         duration = result_meta.get("totalDurationMs")
-        if isinstance(duration, (int, float)) and duration >= 0:
+        if (isinstance(duration, (int, float)) and not isinstance(duration, bool)
+                and duration >= 0):
             summary_bits.append(f"耗时：{duration / 1000:g}s")
+            duration_ms = int(duration)
+        else:
+            duration_ms = None
         summary = _short_text(" · ".join(summary_bits), 64 * 1024) if summary_bits else None
         if has_tool_result:
             self._ambiguous_final_mid = None
@@ -712,7 +752,8 @@ class StreamTranslator:
             if isinstance(block, ToolResultBlock):
                 self._emit_tool_result(
                     events, block.tool_use_id, block.content,
-                    bool(block.is_error), summary=summary)
+                    bool(block.is_error), summary=summary,
+                    duration_ms=duration_ms)
             elif isinstance(block, ServerToolResultBlock):
                 self._emit_tool_result(events, block.tool_use_id, block.content)
         return events
@@ -752,7 +793,14 @@ class StreamTranslator:
             if progress == self._tool_last_progress.get(tool_id):
                 return []
             self._tool_last_progress[tool_id] = progress
-            return events + self._queue_tool_delta(tool_id, "progress", progress)
+            emitted = events + self._queue_tool_delta(
+                tool_id, "progress", progress)
+            if (self._tool_names.get(tool_id) or "").lower() in {"agent", "task"}:
+                emitted.append(self._agent_tool_event(
+                    tool_id, phase="update", status="running",
+                    progress=progress,
+                ))
+            return emitted
         return events
 
     def _feed_tool_summary(self, msg: SystemMessage) -> list:
@@ -778,6 +826,12 @@ class StreamTranslator:
                 if self._admit_tool_item(tool_id, events):
                     events.extend(self._queue_tool_delta(
                         tool_id, "summary", summary))
+                    if (self._tool_names.get(tool_id) or "").lower() in {
+                            "agent", "task"}:
+                        events.append(self._agent_tool_event(
+                            tool_id, phase="update", status="running",
+                            progress=summary,
+                        ))
         return events
 
     def _feed_task(self, msg: SystemMessage) -> list:
@@ -790,30 +844,38 @@ class StreamTranslator:
             task_id, ("task", None))
         parent = (_wire_id(parent_raw, "tool") if parent_raw
                   else remembered_parent)
-        turn = self._remember_turn(task_id, parent)
+        kind = ("agent" if parent
+                else remembered_kind if remembered_kind in {"agent", "task"}
+                else "task")
+        item_id = _agent_process_id(parent) if parent else task_id
+        turn = self._remember_turn(item_id, parent)
         title = (getattr(msg, "description", None)
+                 or self.item_titles.get(item_id)
                  or self.item_titles.get(task_id) or "后台任务")
         title = _short_text(title, 1000) or "后台任务"
         self.item_titles[task_id] = title
+        self.item_titles[item_id] = title
+        self.item_meta[task_id] = (kind, parent)
+        self.item_meta[item_id] = (kind, parent)
         if isinstance(msg, TaskStartedMessage):
-            kind = "agent" if (msg.task_type or "").lower() in {"agent", "subagent"} or parent else "task"
+            if ((msg.task_type or "").lower() in {"agent", "subagent"}
+                    or parent):
+                kind = "agent"
             self.item_meta[task_id] = (kind, parent)
+            self.item_meta[item_id] = (kind, parent)
             return [ProcessEvent(
-                item_id=task_id, kind=kind, phase="start", status="running",
+                item_id=item_id, kind=kind, phase="start", status="running",
                 turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.task_type, 1024),
             )]
         if isinstance(msg, TaskProgressMessage):
-            kind = remembered_kind if task_id in self.item_meta else ("agent" if parent else "task")
-            self.item_meta[task_id] = (kind, parent)
             return [ProcessEvent(
-                item_id=task_id, kind=kind,
+                item_id=item_id, kind=kind,
                 phase="update", status="running", turn_id=turn,
                 parent_id=parent, title=title,
                 progress=_task_progress(msg.usage, msg.last_tool_name),
             )]
         if isinstance(msg, TaskUpdatedMessage):
-            kind = remembered_kind
             status = _task_status(msg.status)
             terminal = status in {"succeeded", "failed", "cancelled"}
             patch_summary = None
@@ -821,15 +883,14 @@ class StreamTranslator:
                 patch_summary = _short_text(
                     msg.patch.get("description") or msg.patch.get("subject"), 4096)
             return [ProcessEvent(
-                item_id=task_id, kind=kind, phase="end" if terminal else "update",
+                item_id=item_id, kind=kind, phase="end" if terminal else "update",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=patch_summary,
             )]
         if isinstance(msg, TaskNotificationMessage):
-            kind = remembered_kind if task_id in self.item_meta else ("agent" if parent else "task")
             status = _task_status(msg.status)
             return [ProcessEvent(
-                item_id=task_id, kind=kind, phase="end",
+                item_id=item_id, kind=kind, phase="end",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.summary, 64 * 1024),
                 progress=_task_progress(msg.usage),

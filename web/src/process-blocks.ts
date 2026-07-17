@@ -1,9 +1,24 @@
 import type { Block, TextBlock } from "./reducer";
 
 export function processBlocks(blocks: Block[]): Block[] {
-  return blocks.filter((block) => block.kind !== "text"
-    || (block.text.length > 0
-      && (block.channel === "thinking" || block.channel === "commentary")));
+  const dedicatedAgents = new Set(blocks.flatMap((block) => (
+    block.kind === "process" && block.processKind === "agent" && block.parent_id
+      ? [block.parent_id] : []
+  )));
+  return blocks.filter((block) => {
+    if (block.kind === "text") {
+      return block.text.length > 0
+        && (block.channel === "thinking" || block.channel === "commentary");
+    }
+    // Keep ToolUse in reducer state for result correlation and older peers,
+    // while presenting the dedicated live agent lifecycle only once.
+    if (block.kind === "tool"
+        && (block.category === "agent"
+          || ["agent", "task"].includes(block.tool.toLowerCase()))) {
+      return !dedicatedAgents.has(block.tool_use_id);
+    }
+    return true;
+  });
 }
 
 export function finalTextBlocks(blocks: Block[]): TextBlock[] {

@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState, type TouchEvent } from "react";
 import type { SessionInfo, Space, State } from "../protocol";
 import { Icon, ClaudeMark } from "../icons";
+import {
+  compareSessionsByActivity,
+  orderCodeDirectoryGroups,
+  visibleDirectorySessions,
+} from "../session-order";
 import { isWorktreeForkBlockedByState, sessionMenuCapabilities } from "../session-worktree";
 import { useImeSubmit } from "../use-ime-submit";
 
@@ -19,6 +24,7 @@ interface Props {
   onClose: () => void;
   onRename: (id: string, title: string) => void;
   onArchive: (id: string, archived: boolean) => void;
+  onPin: (session: SessionInfo, pinned: boolean) => void;
   onDelete: (id: string) => void;
   onRollback: (id: string) => void;
   onForkWorktree: (session: SessionInfo) => void;
@@ -48,7 +54,7 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 
 export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStates,
   activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive,
-  onDelete, onRollback, onForkWorktree }: Props) {
+  onPin, onDelete, onRollback, onForkWorktree }: Props) {
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
@@ -56,6 +62,7 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
   const [copiedId, setCopiedId] = useState<string | null>(null);
   // "archived" group starts collapsed; project groups start expanded.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ archived: true });
+  const [expandedDirectories, setExpandedDirectories] = useState<Record<string, boolean>>({});
   const pressTimer = useRef<number | null>(null);
   const pressStart = useRef<{ x: number; y: number } | null>(null);
 
@@ -69,19 +76,20 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
   const filtered = sessions.filter(matches);
   const archived = filtered.filter((s) => s.tag === "archived");
   const active = filtered.filter((s) => s.tag !== "archived");
+  const pinned = active.filter((s) => s.pinned).sort(compareSessionsByActivity);
+  const regular = active.filter((s) => !s.pinned);
 
   const groups: Record<string, SessionInfo[]> = {};
-  for (const s of active) {
+  for (const s of regular) {
     const key = space === "work" ? sessionDateGroup(s.last_modified).key : (s.cwd || "");
     (groups[key] = groups[key] || []).push(s);
   }
   for (const k of Object.keys(groups)) {
-    groups[k].sort((a, b) =>
-      (parseInt(b.last_modified || "0", 10) || 0) - (parseInt(a.last_modified || "0", 10) || 0));
+    groups[k].sort(compareSessionsByActivity);
   }
   const groupKeys = space === "work"
     ? ["today", "yesterday", "week", "older"].filter((key) => groups[key]?.length)
-    : Object.keys(groups).sort();
+    : orderCodeDirectoryGroups(groups);
 
   const toggleGroup = (key: string) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
   const commitRename = (value = renaming?.value ?? "") => {
@@ -95,6 +103,10 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
   };
   const doArchive = (s: SessionInfo, archived: boolean) => {
     onArchive(s.session_id, archived);
+    setMenuCardId(null); setLifting(false);
+  };
+  const doPin = (s: SessionInfo) => {
+    onPin(s, !s.pinned);
     setMenuCardId(null); setLifting(false);
   };
   const doForkWorktree = (s: SessionInfo) => {
@@ -156,7 +168,7 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
     if (pressTimer.current) { clearTimeout(pressTimer.current); pressTimer.current = null; }
   };
 
-  const renderCard = (s: SessionInfo) => {
+  const renderCard = (s: SessionInfo, showLocation = false) => {
     const isActive = s.session_id === activeSessionId;
     const isArchived = s.tag === "archived";
     const isMenu = menuCardId === s.session_id;
@@ -222,6 +234,12 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
             <span className={"pill " + st}><span className="sd" />{st === "running" ? "运行" : "中断"}</span>
           )}
         </div>
+        {showLocation && s.cwd && (
+          <div className="scard-location" title={s.cwd}>
+            <Icon name="folder" size={12} />
+            <span>{basename(s.cwd)}</span>
+          </div>
+        )}
         {s.first_prompt && !s.summary && <div className="scard-prev">{s.first_prompt}</div>}
         <div className="scard-actions">
           <button className="scard-act" aria-label="更多操作"
@@ -234,6 +252,9 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
             {capabilities.rename && (
               <button onClick={() => startRename(s)}><Icon name="edit" size={15} />重命名</button>
             )}
+            <button onClick={() => doPin(s)}>
+              <Icon name="pin" size={15} />{s.pinned ? "取消置顶" : "置顶"}
+            </button>
             {space === "code" && capabilities.forkWorktree && (
               <button onClick={() => doForkWorktree(s)} disabled={forkBlocked}
                 title={forkBlocked ? "请等待当前任务结束" : "从当前 Git HEAD 创建新工作树"}>
@@ -271,6 +292,12 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
     const isCodeDirectoryGroup = space === "code" && !label;
     const canAdd = isCodeDirectoryGroup && !!key;
     const showDirectoryPath = isCodeDirectoryGroup && !!key;
+    const showPinnedLocation = key === "__pinned__";
+    const directoryExpanded = !!expandedDirectories[key];
+    const visibleItems = isCodeDirectoryGroup
+      ? visibleDirectorySessions(items, directoryExpanded, !!filter)
+      : items;
+    const hiddenCount = items.length - visibleItems.length;
     return (
       <div key={key || "other"} className="sgroup-wrap">
         <div className="sgroup-head">
@@ -292,7 +319,19 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
           )}
           {showDirectoryPath && <span className="sgroup-path-tip" role="tooltip">{key}</span>}
         </div>
-        {!isCollapsed && <div className="sgroup-items">{items.map(renderCard)}</div>}
+        {!isCollapsed && <div className="sgroup-items">
+          {visibleItems.map((session) => renderCard(session, showPinnedLocation))}
+          {isCodeDirectoryGroup && !filter && items.length > 5 && (
+            <button className="sgroup-more" onClick={(event) => {
+              event.stopPropagation();
+              setExpandedDirectories((current) => ({
+                ...current, [key]: !directoryExpanded,
+              }));
+            }}>
+              {directoryExpanded ? "收起" : `展开其余 ${hiddenCount} 个会话`}
+            </button>
+          )}
+        </div>}
       </div>
     );
   };
@@ -331,6 +370,7 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
           </div>
           <div className="s-scroll" onClick={closeMenu}>
             {filtered.length === 0 && <div className="s-group">{sessions.length === 0 ? "暂无会话" : "无匹配"}</div>}
+            {pinned.length > 0 && renderGroup("__pinned__", pinned, "置顶")}
             {groupKeys.map((k) => renderGroup(k, groups[k]))}
             {archived.length > 0 && renderGroup("archived", archived, "已归档")}
             <div className={"s-lift-scrim" + (lifting ? " show" : "")} onClick={closeMenu} />

@@ -11,7 +11,7 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from pydantic import ValidationError
 
 from cc_remote.protocol import (
-    CollaborationMode, Error, GoalState, Model, NewSession, StateEvent,
+    CollaborationMode, Error, GoalState, Model, NewSession, PinSession, StateEvent,
     ThreadGoal, TurnEnd, UserMsg,
 )
 from cc_remote.wrapper import codex_handle as codex_handle_module
@@ -2374,6 +2374,33 @@ def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sess
     asyncio.run(run())
 
 
+def test_codex_pin_is_wrapper_persistent_and_refreshes_sidebar():
+    async def run():
+        machine, transport = _mk_machine()
+        machine.sessions = {"codex-id": _control_ctx("codex-id", "codex")}
+        refreshed = []
+
+        async def refresh(cmd):
+            refreshed.append(cmd)
+
+        machine._list_codex_sessions = refresh
+        pin = PinSession(
+            session_id="codex-id", pinned=True, engine="codex",
+            client_id="client-1")
+        unpin = PinSession(
+            session_id="codex-id", pinned=False, engine="codex",
+            client_id="client-1")
+        await machine._handle_pin_session(pin)
+        assert machine._session_pins.ids("codex") == {"codex-id"}
+        await machine._handle_pin_session(unpin)
+        assert machine._session_pins.ids("codex") == set()
+        assert refreshed == [pin, unpin]
+        assert not [message for message in transport.sent
+                    if message.type == "error"]
+
+    asyncio.run(run())
+
+
 def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
     async def run():
         machine, transport = _mk_machine()
@@ -2410,6 +2437,7 @@ def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
             ]
 
         monkeypatch.setattr(machine_module, "list_codex_sessions", listed)
+        machine._session_pins.set_pinned("codex", "resident-id", True)
         await machine._list_codex_sessions(SimpleNamespace(client_id="client-1"))
 
         session_list = transport.sent[-1]
@@ -2419,6 +2447,7 @@ def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
         assert hot.summary == "resident" and hot.git_branch == "main"
         assert hot.forked_from_id == "parent-id" and hot.codex_status == "active"
         assert hot.state == "interrupting"
+        assert hot.pinned is True and cold.pinned is False
         assert cold.tag == "archived" and cold.state == "running"
         assert requested_limits == [200]
 

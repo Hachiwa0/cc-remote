@@ -685,6 +685,7 @@ class SessionInfo(BaseModel):
     git_branch: Optional[str] = None
     cwd: Optional[str] = None
     tag: Optional[str] = None  # SDK session tag; "archived" hides the card in the sidebar
+    pinned: bool = False  # cc-remote sidebar preference; engine transcripts stay untouched
     state: Optional[State] = None  # if resident: this session's idle/running/... (sidebar status dot)
     engine: Optional[str] = None  # "claude" | "codex"; None = claude (legacy sidebar badge)
     forked_from_id: Optional[WireId] = None  # Codex thread/fork parent, when present
@@ -1058,6 +1059,15 @@ class ArchiveSession(_Command):
     type: Literal["archive_session"] = "archive_session"
     session_id: WireId
     archived: bool
+    engine: Optional[Engine] = None
+    space: Space = "code"
+
+
+class PinSession(_Command):
+    """client -> wrapper: persist a cross-client sidebar pin preference."""
+    type: Literal["pin_session"] = "pin_session"
+    session_id: WireId
+    pinned: bool
     engine: Optional[Engine] = None
     space: Space = "code"
 
@@ -1664,7 +1674,7 @@ class GoalState(_Base):
 AnyMessage = Union[
     Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, GetEngineCapabilities, ManageEnginePlugin, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
-    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, WorkDashboard, WorkArtifacts,
+    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
@@ -1731,6 +1741,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_work_artifacts": GetWorkArtifacts,
     "rename_session": RenameSession,
     "archive_session": ArchiveSession,
+    "pin_session": PinSession,
     "fork_session": ForkSession,
     "fork_session_worktree": ForkSessionWorktree,
     "session_forked": SessionForked,
