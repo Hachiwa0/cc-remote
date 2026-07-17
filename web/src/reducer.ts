@@ -218,8 +218,12 @@ export interface SessionRuntime {
   ccSessionId?: string;
   pendingQuestion: { ask_id: string; header?: string | null; question: string; options: { label: string; ds?: string }[]; allow_text?: boolean; secret?: boolean } | null;
   contextReport: ContextReport | null;
+  contextRequestId: string | null;
+  contextError: string | null;
   goal: ThreadGoal | null;
   statusReport: StatusReport | null;
+  statusRequestId: string | null;
+  statusError: string | null;
   notices: Notice[];
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
@@ -273,8 +277,9 @@ export function createRuntime(): SessionRuntime {
     historyRevision: null, pendingHistoryRevision: null,
     historyGeneration: null, historyBuildSeq: 0, lastLiveSeq: 0,
     hydratedCacheTurnIds: [],
-    pendingQuestion: null, contextReport: null, goal: null,
-    statusReport: null,
+    pendingQuestion: null, contextReport: null,
+    contextRequestId: null, contextError: null, goal: null,
+    statusReport: null, statusRequestId: null, statusError: null,
     notices: [],
     queue: [], pendingSend: null,
   };
@@ -297,9 +302,11 @@ export type Action =
   | { type: "set_collaboration_mode"; mode: CollaborationModeName }
   | { type: "set_context"; report: ContextReport }
   | { type: "clear_context" }
+  | { type: "begin_context_request"; sid: string; requestId: string }
+  | { type: "begin_status_request"; sid: string; requestId: string }
   | { type: "set_turns"; sid: string; turns: Turn[] }
   | { type: "set_artifact"; artifact: Artifact }
-  | { type: "open_artifact_loading"; file: string; sid: string | null }
+  | { type: "open_artifact_loading"; file: string; sid: string | null; requestId: string }
   | { type: "open_file_loading"; file: string; sid: string | null; requestId: string; kind: "md" | "file"; line?: number }
   | { type: "start_file_save"; requestId: string; content: string }
   | { type: "clear_artifact" }
@@ -855,12 +862,25 @@ export function reduce(state: AppState, action: Action): AppState {
       return patch(state, state.focusedSid, (rt) => { rt.contextReport = action.report; });
     case "clear_context":
       return patch(state, state.focusedSid, (rt) => { rt.contextReport = null; });
+    case "begin_context_request":
+      return patch(state, action.sid, (rt) => {
+        rt.contextRequestId = action.requestId;
+        rt.contextError = null;
+      });
+    case "begin_status_request":
+      return patch(state, action.sid, (rt) => {
+        rt.statusRequestId = action.requestId;
+        rt.statusError = null;
+      });
     case "set_artifact":
       return { ...state, artifact: action.artifact };
     case "open_artifact_loading":
       // optimistic: show the diff panel (with a spinner) instantly on click; the
       // diff_report event replaces it with the real sections when it arrives.
-      return { ...state, artifact: { file: action.file, sid: action.sid, kind: "gitdiff", sections: [], loading: true } };
+      return { ...state, artifact: {
+        file: action.file, sid: action.sid, requestId: action.requestId,
+        kind: "gitdiff", sections: [], loading: true,
+      } };
     case "open_file_loading":
       return { ...state, artifact: {
         file: action.file, sid: action.sid, requestId: action.requestId,
@@ -1089,8 +1109,19 @@ function reduceEvent(
         currentCwd: wasFocused && e.cwd ? e.cwd : state.currentCwd,
       };
     }
-    case "session_list":
-      return { ...state, sessions: e.sessions };
+    case "session_list": {
+      const focusedMissing = !!state.focusedSid
+        && !state.focusedSid.startsWith("tmp-")
+        && !e.sessions.some((session) => session.session_id === state.focusedSid);
+      return {
+        ...state,
+        sessions: e.sessions,
+        focusedSid: focusedMissing ? null : state.focusedSid,
+        newChat: focusedMissing
+          ? { cwd: state.currentCwd, model: null, effort: null }
+          : state.newChat,
+      };
+    }
     case "work_dashboard":
     case "work_artifacts":
       // Work dashboard state is owned by App because it is engine-scoped and
@@ -1359,9 +1390,11 @@ function reduceEvent(
       return { ...state, wrapperOnline: false, banner: "machine reconnected — syncing…" };
     case "diff_report":
       if (!state.artifact || state.artifact.file !== e.file
+          || state.artifact.requestId !== e.request_id
           || state.artifact.sid !== (e.sid ?? state.focusedSid)) return state;
       return { ...state, artifact: {
-        file: e.file, sid: state.artifact.sid, kind: "gitdiff", sections: parseGitDiff(e.diff),
+        file: e.file, sid: state.artifact.sid, requestId: e.request_id,
+        kind: "gitdiff", sections: parseGitDiff(e.diff),
       } };
     case "file_preview":
       if (!state.artifact || !["md", "file", "html", "image", "pdf"].includes(state.artifact.kind)
@@ -1475,7 +1508,11 @@ function reduceEvent(
     case "perm":
       return patch(state, e.sid, (rt) => { rt.perm = e.mode; });
     case "context_report":
-      return patch(state, e.sid, (rt) => { rt.contextReport = e; });
+      return patch(state, e.sid, (rt) => {
+        rt.contextReport = e;
+        rt.contextRequestId = null;
+        rt.contextError = null;
+      });
     case "ask_user":
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret }; });
     case "goal_state":
@@ -1512,7 +1549,11 @@ function reduceEvent(
         : next;
     }
     case "status_report":
-      return patch(state, e.sid, (rt) => { rt.statusReport = e; });
+      return patch(state, e.sid, (rt) => {
+        rt.statusReport = e;
+        rt.statusRequestId = null;
+        rt.statusError = null;
+      });
     case "notice":
       return patch(state, e.sid, (rt) => {
         rt.notices = mergeNotices(rt.notices, [e]);
@@ -1578,6 +1619,27 @@ function reduceEvent(
           wrapperOnline: false,
           banner: "machine offline — waiting for reconnect",
         };
+      }
+      if (e.request_id && e.sid) {
+        if (state.artifact?.requestId === e.request_id
+            && state.artifact.sid === e.sid) {
+          return { ...state, artifact: {
+            ...state.artifact, loading: false, error: e.message,
+          } };
+        }
+        const runtime = state.runtimes[e.sid];
+        if (runtime?.contextRequestId === e.request_id) {
+          return patch(state, e.sid, (rt) => {
+            rt.contextRequestId = null;
+            rt.contextError = e.message;
+          });
+        }
+        if (runtime?.statusRequestId === e.request_id) {
+          return patch(state, e.sid, (rt) => {
+            rt.statusRequestId = null;
+            rt.statusError = e.message;
+          });
+        }
       }
       if (!e.msg_id) {
         return { ...state, banner: `${e.code}: ${e.message}` };

@@ -50,7 +50,7 @@ API key 烤进网页。
 | **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
 | **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。 |
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
-| **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Claude 支持按消息 Rewind（只回滚对话、官方文件 checkpoint 或两者）；Codex 支持对话与冲突安全的代码回滚、主动 compact、原生 Review，以及在 Git 仓库中派生到独立 worktree。 |
+| **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Codex 支持对话与冲突安全的代码回滚、主动 compact、原生 Review，以及在 Git 仓库中派生到独立 worktree。 |
 | **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 通过 `/permissions` 控制审批并继承本机 Sandbox 配置；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
 | **真实扩展目录** | 按需读取 Claude/Codex 当前可见的 Skills、Plugins、Apps 与 MCP 状态；插件安装/卸载调用两家原生管理器，不用静态假列表。 |
 | **连续性** | 后台会话继续运行，多端实时同步；从 Claude transcript / Codex rollout 分页恢复历史，断线后按游标补流。 |
@@ -168,7 +168,7 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### 常用操作速查
 
-- **会话**：新建、搜索、后台运行、重命名、归档、删除、派生、Claude Rewind、Codex 对话与代码回滚、compact、Review、Codex worktree。
+- **会话**：新建、搜索、后台运行、重命名、归档、删除、派生、Codex 对话与代码回滚、compact、Review、Codex worktree。
 - **回合**：流式输出、排队、打断、复制、编辑重发、从指定消息派生。
 - **工具**：命令输出、文件修改与 diff、MCP、协作代理、Hook、审批和用户输入回传。
 - **终端协同**：Codex Code 共享官方 daemon；Claude 用显式 `claude-remote` 保留官方
@@ -411,6 +411,8 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `SESSION_TTL_SECONDS` | `604800` | 会话 token 有效期（默认 7 天）。 |
 | `LOGIN_BODY_MAX_BYTES` / `LOGIN_READ_TIMEOUT` / `LOGIN_INFLIGHT_CAP` | `4096` / `10` / `32` | 登录请求体字节数、总读取秒数和并发读取数的硬上限。 |
 | `SESSION_REGISTRY_CAP` | `1024` | 进程内可撤销浏览器会话注册表的硬上限。 |
+| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` / `PUSH_VAPID_SUBJECT` | 空 | 可选真实 Web Push；三项必须同时配置。私钥建议填写 relay 用户可读的 PEM 绝对路径。通知只含完成/失败状态，不含对话内容。 |
+| `PUSH_DB_PATH` | `~/.cc-remote/relay-push.sqlite3` | 持久化、按用户和机器隔离的浏览器 Push 订阅库。 |
 | `PUBLIC_ORIGIN` | 空 | 浏览器允许连接 WS 的精确来源，如 `https://remote.example.com`；**必须设**，非 loopback 必须 HTTPS。 |
 | `WRAPPER_TOKEN` | 占位值 | 单机器/兼容模式下的 wrapper Bearer token；未设置 `WRAPPER_TOKENS_JSON` 时必须配置。 |
 | `WRAPPER_TOKENS_JSON` | 空 | 可选机器绑定 token：`{"mac":"…","nono":"…"}`；设置后替代 relay 的通配 `WRAPPER_TOKEN`。 |
@@ -492,6 +494,11 @@ deploy/            # Caddyfile / systemd / setup-vps.sh / env 示例
 python -m pip install -r requirements-dev.txt
 pytest                              # 单元测试（不触模型，零 token）
 npm --prefix web run test:reliability # 前端可靠性纯测试
+
+# 显式真实链路测试（需要已运行的 relay + wrapper，会调用模型）
+CC_REMOTE_RUN_E2E=1 CC_REMOTE_E2E_SCENARIO=smoke \
+  RELAY_URL=wss://remote.example/ws LOGIN_PASSWORD='...' \
+  pytest -q tests/test_e2e_entry.py
 npm --prefix web run lint           # 前端静态检查
 npm --prefix web run dev            # 网页开发模式
 npm --prefix web run build          # 网页生产构建

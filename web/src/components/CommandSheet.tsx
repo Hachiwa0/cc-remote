@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { isCmd, commandsFor, modelsFor, effortsFor, permsFor, type Cmd, type CmdGroup, type Catalog } from "../data";
 import { Icon } from "../icons";
 
@@ -18,6 +19,23 @@ interface Props {
   onPickEffort?: (effort: string) => void;
   currentPerm?: string;
   onPickPerm?: (perm: string) => void;
+}
+
+function CustomClaudeModel({ onPick }: { onPick?: (model: string) => void }) {
+  const [customModel, setCustomModel] = useState("");
+  return <form className="custom-model" onSubmit={(event) => {
+    event.preventDefault();
+    const value = customModel.trim();
+    if (!value) return;
+    onPick?.(value);
+    setCustomModel("");
+  }}>
+    <label htmlFor="custom-claude-model">自定义 / Provider 模型 ID</label>
+    <div><input id="custom-claude-model" value={customModel}
+      onChange={(event) => setCustomModel(event.target.value)}
+      placeholder="例如 provider-model-id" autoComplete="off" />
+      <button type="submit" disabled={!customModel.trim()}>使用</button></div>
+  </form>;
 }
 
 export function CommandSheet({ open, kind, engine, catalog, filter = "", onClose, onPickCommand, currentModel, onPickModel, currentEffort, onPickEffort, currentPerm, onPickPerm }: Props) {
@@ -106,22 +124,25 @@ export function CommandSheet({ open, kind, engine, catalog, filter = "", onClose
               </button>
             ))
           ) : (
-            MODELS.map((m) => (
-              <button
-                key={m.id}
-                className={"cmd" + (m.id === currentModel ? " sel" : "")}
-                onClick={() => onPickModel?.(m.id)}
-              >
-                <span className="cmd-ic"><Icon name={m.ic} size={17} /></span>
-                <span className="cmd-tx">
-                  <span className="cmd-nm">{m.name}</span>
-                  <span className="cmd-ds">{m.ds}</span>
-                </span>
-                {m.id === currentModel
-                  ? <span className="cmd-check"><Icon name="check" size={19} /></span>
-                  : <span className="cmd-kbd" />}
-              </button>
-            ))
+            <>
+              {engine === "claude" && <CustomClaudeModel onPick={onPickModel} />}
+              {MODELS.map((m) => (
+                <button
+                  key={m.id}
+                  className={"cmd" + (m.id === currentModel ? " sel" : "")}
+                  onClick={() => onPickModel?.(m.id)}
+                >
+                  <span className="cmd-ic"><Icon name={m.ic} size={17} /></span>
+                  <span className="cmd-tx">
+                    <span className="cmd-nm">{m.name}</span>
+                    <span className="cmd-ds">{m.ds}</span>
+                  </span>
+                  {m.id === currentModel
+                    ? <span className="cmd-check"><Icon name="check" size={19} /></span>
+                    : <span className="cmd-kbd" />}
+                </button>
+              ))}
+            </>
           )}
         </div>
       </div>

@@ -84,6 +84,19 @@ class RelayConfig:
     # Exact browser Origin accepted for cookie-authenticated WebSockets, for
     # example https://remote.example.com (no path or trailing slash).
     public_origin: str = field(default_factory=lambda: _env("PUBLIC_ORIGIN", ""))
+    # Optional Web Push. Configure all three VAPID values to deliver completion
+    # notices even when no browser WebSocket is connected.
+    push_vapid_public_key: str = field(
+        default_factory=lambda: _env("PUSH_VAPID_PUBLIC_KEY", "").strip()
+    )
+    push_vapid_private_key: str = field(
+        default_factory=lambda: _env("PUSH_VAPID_PRIVATE_KEY", "").strip()
+    )
+    push_vapid_subject: str = field(
+        default_factory=lambda: _env("PUSH_VAPID_SUBJECT", "").strip()
+    )
+    push_db_path: str = field(default_factory=lambda: _env(
+        "PUSH_DB_PATH", str(Path.home() / ".cc-remote" / "relay-push.sqlite3")))
 
 
 @dataclass
@@ -282,6 +295,26 @@ def validate_relay_config(cfg: RelayConfig) -> None:
         errors.append("WS_MAX_SIZE_BYTES must be between 12582912 and 67108864")
     if cfg.client_queue_bytes < cfg.ws_max_size_bytes:
         errors.append("CLIENT_QUEUE_BYTES must be at least WS_MAX_SIZE_BYTES")
+
+    push_values = (
+        cfg.push_vapid_public_key,
+        cfg.push_vapid_private_key,
+        cfg.push_vapid_subject,
+    )
+    if any(push_values) and not all(push_values):
+        errors.append(
+            "PUSH_VAPID_PUBLIC_KEY, PUSH_VAPID_PRIVATE_KEY and "
+            "PUSH_VAPID_SUBJECT must be configured together")
+    if cfg.push_vapid_public_key and not re.fullmatch(
+            r"[A-Za-z0-9_-]{80,128}", cfg.push_vapid_public_key):
+        errors.append("PUSH_VAPID_PUBLIC_KEY has an invalid format")
+    if cfg.push_vapid_subject and not (
+            cfg.push_vapid_subject.startswith("mailto:")
+            or cfg.push_vapid_subject.startswith("https://")):
+        errors.append("PUSH_VAPID_SUBJECT must use mailto: or https://")
+    if (not cfg.push_db_path or "\x00" in cfg.push_db_path
+            or len(cfg.push_db_path.encode("utf-8", errors="surrogatepass")) > 4096):
+        errors.append("PUSH_DB_PATH must be a non-empty path of at most 4096 UTF-8 bytes")
 
     origin = cfg.public_origin.strip()
     try:

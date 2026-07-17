@@ -122,7 +122,7 @@ export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus 
               <span>{workDashboard.projects.length} 个项目</span>
               <span>{workDashboard.sources.length} 份资料</span>
               <span>{workDashboard.schedules.length} 个定时任务</span>
-              <span>{workDashboard.plugins.length} 个插件</span>
+              <span>{workDashboard.plugins.length} 个工作模板</span>
             </div>}
           </>
         ) : (

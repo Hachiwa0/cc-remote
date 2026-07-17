@@ -403,16 +403,21 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }
 
-  sendGetContext(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj() });
+  sendGetContext(): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj(),
+    });
   }
 
   sendGetContextTo(sid: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs() });
   }
 
-  sendGetDiff(file: string, theme: DiffTheme): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_diff", file, theme, ts: nowTs(), ...this.sidObj() });
+  sendGetDiff(file: string, theme: DiffTheme): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_diff", file, theme,
+      ts: nowTs(), ...this.sidObj(),
+    });
   }
 
   sendGetFilePreview(path: string, requestId = uuid()): string | null {
@@ -504,8 +509,11 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "get_goal", ts: nowTs(), ...this.sidObj() });
   }
 
-  sendGetStatus(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_status", client_id: this.clientId, ts: nowTs(), ...this.sidObj() });
+  sendGetStatus(): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_status", client_id: this.clientId,
+      ts: nowTs(), ...this.sidObj(),
+    });
   }
 
   sendSetGoal(objective: string | null, status: GoalStatus | null, tokenBudget: number | null): void {
@@ -763,15 +771,21 @@ export class RelayWs {
   }
 
   private send(obj: Record<string, unknown>): boolean {
-    const result = this.outbox.enqueue(obj, this.clientId, uuid());
+    return this.sendTracked(obj) !== null;
+  }
+
+  private sendTracked(
+    obj: Record<string, unknown>, commandId = uuid(),
+  ): string | null {
+    const result = this.outbox.enqueue(obj, this.clientId, commandId);
     if (!result.ok) {
       const detail = `命令未发送：${result.reason}。请等待连接恢复后重试。`;
       console.error(detail);
       this.cb.onCommandError?.(detail);
-      return false;
+      return null;
     }
     this.sendRaw(result.raw);
-    return true;
+    return commandId;
   }
 
   private sendUntracked(obj: Record<string, unknown>): void {
@@ -804,15 +818,6 @@ export class RelayWs {
         this.lastRecvAt = Date.now();  // any valid JSON frame proves the link is alive
         const msg = this.filterControl(decoded);
         if (!msg) return;
-        // Debug hook: record inbound frames so a live-sync issue is diagnosable
-        // from the browser console. Inspect `window.__wsLog`; set
-        // `window.__CCDEBUG = true` to also console.debug each frame.
-        try {
-          const w = window as unknown as { __wsLog?: unknown[]; __CCDEBUG?: boolean };
-          (w.__wsLog ||= []).push({ t: (msg as { type: string }).type, sid: (msg as { sid?: string }).sid, seq: (msg as { seq?: number }).seq });
-          if (w.__wsLog!.length > 800) w.__wsLog!.shift();
-          if (w.__CCDEBUG) console.debug(`[ws] ${(msg as { type: string }).type} sid=${(msg as { sid?: string }).sid ?? "-"} seq=${(msg as { seq?: number }).seq ?? "-"}`);
-        } catch { /* ignore */ }
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
         if (msg.type === "command_ack") {
           if (this.outbox.ack(msg.client_id, msg.cmd_id)) {

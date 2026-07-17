@@ -16,13 +16,15 @@ UMask=0077
 LimitCORE=0
 
 # Relay only reads the current immutable release, shared .env, and static web
-# build under /opt.
-# Keep those paths visible but read-only; private /tmp remains available to
+# build under /opt. The dedicated state directory is the sole persistent
+# writable path and holds the Web Push subscription database.
+# Keep all other paths visible but read-only; private /tmp remains available to
 # Python and uploaded request bodies.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
+ReadWritePaths=/opt/cc-remote/state
 ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelModules=true

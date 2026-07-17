@@ -16,9 +16,12 @@ from cc_remote.protocol import (
     CommandAck,
     Effort,
     Error,
+    GetContext,
+    GetDiff,
     GetHistory,
     History,
     Hello,
+    Interrupt,
     ListSessions,
     Model,
     OpenBtw,
@@ -236,6 +239,124 @@ def test_wrapper_does_not_ack_or_remember_a_crashed_handler():
 
         assert calls == 2
         assert not [msg for msg in transport.sent if isinstance(msg, CommandAck)]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        SetModel(
+            sid="missing-session", model="claude-sonnet-4-5",
+            cmd_id="missing-model", client_id="client-1",
+        ),
+        GetContext(
+            sid="missing-session",
+            cmd_id="missing-context", client_id="client-1",
+        ),
+    ],
+)
+def test_reliable_controls_reject_missing_session_before_ack(command):
+    async def run():
+        machine, transport = _mk_machine()
+
+        await machine._process_command(command)
+
+        assert [event.type for event in transport.sent] == [
+            "error", "command_ack"]
+        error = transport.sent[0]
+        assert error.sid == "missing-session"
+        assert error.request_id == command.cmd_id
+        assert error.to == "client-1"
+
+    asyncio.run(run())
+
+
+def test_interrupt_missing_target_never_leaks_error_to_focused_session():
+    async def run():
+        machine, transport = _mk_machine()
+        visible = _mk_ctx("visible-session", "visible-session")
+        machine.sessions[visible.key] = visible
+        machine.focused_sid = visible.key
+        command = Interrupt(
+            sid="missing-session",
+            cmd_id="missing-interrupt", client_id="client-1",
+        )
+
+        await machine._process_command(command)
+
+        assert [event.type for event in transport.sent] == [
+            "error", "command_ack"]
+        error = transport.sent[0]
+        assert error.sid == "missing-session"
+        assert error.request_id == command.cmd_id
+        assert error.to == "client-1"
+        assert visible.buffer.tail_seq == 0
+
+    asyncio.run(run())
+
+
+def test_non_running_interrupt_returns_correlated_failure_before_ack():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("idle-session", "idle-session")
+        ctx.state = "idle"
+        machine.sessions[ctx.key] = ctx
+        command = Interrupt(
+            sid=ctx.key, cmd_id="idle-interrupt", client_id="client-1",
+        )
+
+        await machine._process_command(command)
+
+        errors = [event for event in transport.sent if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].request_id == command.cmd_id
+        assert errors[0].to == command.client_id
+        assert isinstance(transport.sent[-1], CommandAck)
+
+    asyncio.run(run())
+
+
+def test_get_diff_missing_target_returns_targeted_correlated_failure():
+    async def run():
+        machine, transport = _mk_machine()
+        command = GetDiff(
+            sid="missing-diff", file="README.md",
+            cmd_id="diff-command", client_id="client-1",
+        )
+
+        await machine._process_command(command)
+
+        assert [event.type for event in transport.sent] == [
+            "error", "command_ack"]
+        error = transport.sent[0]
+        assert error.sid == command.sid
+        assert error.request_id == command.cmd_id
+        assert error.to == command.client_id
+
+    asyncio.run(run())
+
+
+def test_unknown_interaction_answer_returns_correlated_failure():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        machine.sessions[ctx.key] = ctx
+        command = AnswerQuestion(
+            sid=ctx.key,
+            ask_id="expired-question",
+            answer="允许一次",
+            cmd_id="answer-command",
+            client_id="client-1",
+        )
+
+        await machine._process_command(command)
+
+        error = next(event for event in transport.sent
+                     if isinstance(event, Error))
+        assert error.request_id == command.cmd_id
+        assert error.to == command.client_id
+        assert isinstance(transport.sent[-1], CommandAck)
 
     asyncio.run(run())
 

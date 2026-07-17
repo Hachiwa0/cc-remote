@@ -47,6 +47,7 @@ import {
   sessionCommandTarget,
   setSessionPinned,
 } from "./session-order";
+import { disableRemotePush, enableRemotePush } from "./push";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -103,6 +104,7 @@ export default function App() {
   const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
   const [state, dispatch] = useReducer(reduce, initialState);
+  const remotePushActiveRef = useRef(false);
   const stateRef = useRef(state);
   stateRef.current = state;
   const wsRef = useRef<RelayWs | null>(null);
@@ -112,6 +114,9 @@ export default function App() {
   const pendingSessionForkRef = useRef<PendingSessionFork | null>(null);
   const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
   const sessionListsBySurfaceRef = useRef<Record<string, SessionInfo[]>>({});
+  // Cached lists are paint-only during a surface switch. A surface may choose
+  // its remembered/latest focus only after a fresh wrapper list is accepted.
+  const authoritativeSurfaceListsRef = useRef<Set<string>>(new Set());
   const sessionActivityPendingRef = useRef<Set<string>>(new Set());
   const prefetchedSurfacesRef = useRef<Set<string>>(new Set());
   const lastFocusBySurfaceRef = useRef<Record<string, string>>({});
@@ -164,6 +169,7 @@ export default function App() {
     pendingBtwRef.current = null;
     activeBtwRef.current = null;
     sessionListsBySurfaceRef.current = {};
+    authoritativeSurfaceListsRef.current.clear();
     sessionActivityPendingRef.current.clear();
     prefetchedSurfacesRef.current.clear();
     historyInvalidationsRef.current.clear();
@@ -238,6 +244,18 @@ export default function App() {
     return () => { cancelled = true; };
   }, [authed, machineId]);
 
+  useEffect(() => {
+    let cancelled = false;
+    if (!authed || !notificationsEnabled) {
+      remotePushActiveRef.current = false;
+      return;
+    }
+    void enableRemotePush(machineId).then((enabled) => {
+      if (!cancelled) remotePushActiveRef.current = enabled;
+    });
+    return () => { cancelled = true; };
+  }, [authed, machineId, notificationsEnabled]);
+
   // Swipe right -> open sidebar, swipe left -> close (mobile). Interactive
   // vertical scrollers opt out so a diagonal scroll never becomes navigation.
   const onTouchStart = (e: TouchEvent) => {
@@ -293,6 +311,7 @@ export default function App() {
   const prepareSurfaceSwitch = (nextEngine: Engine, nextSpace: Space) => {
     rememberSurfaceFocus(engine, space);
     const surfaceKey = `${nextSpace}:${nextEngine}`;
+    authoritativeSurfaceListsRef.current.delete(surfaceKey);
     dispatch({
       type: "restore_session_list",
       sessions: sessionListsBySurfaceRef.current[surfaceKey] ?? [],
@@ -341,6 +360,7 @@ export default function App() {
     if (!authed) return;
     const draining = drainingRef.current;
     didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
+    authoritativeSurfaceListsRef.current.delete(`${spaceRef.current}:${engineRef.current}`);
 
     let cancelled = false;
 
@@ -577,6 +597,7 @@ export default function App() {
             const listedSpace = msg.space ?? "code";
             const surfaceKey = `${listedSpace}:${msg.engine}`;
             sessionListsBySurfaceRef.current[surfaceKey] = msg.sessions;
+            authoritativeSurfaceListsRef.current.add(surfaceKey);
             prefetchedSurfacesRef.current.add(surfaceKey);
             // Warm the sibling Work/Code surface once per page lifetime. Codex
             // reuses the just-read native catalog in the wrapper, so this does
@@ -608,6 +629,7 @@ export default function App() {
           }
           if (msg.type === "turn_end" && msg.sid && document.hidden
               && localStorage.getItem(NOTIFY_KEY) === "1"
+              && !remotePushActiveRef.current
               && typeof Notification !== "undefined"
               && Notification.permission === "granted") {
             const session = stateRef.current.sessions.find(
@@ -626,6 +648,14 @@ export default function App() {
           }
           if (msg.type === "session_list"
               && !shouldAcceptSessionList(engineRef.current, spaceRef.current, msg)) return;
+          if (msg.type === "session_list") {
+            const currentSid = stateRef.current.focusedSid;
+            if (currentSid && !currentSid.startsWith("tmp-")
+                && !msg.sessions.some((session) => session.session_id === currentSid)) {
+              didInitFocusRef.current = false;
+              preferredSurfaceFocusRef.current = null;
+            }
+          }
           if ((msg.type === "turn_end"
               || (msg.type === "error" && msg.code !== "wrapper_offline"))
               && msg.sid) {
@@ -750,8 +780,13 @@ export default function App() {
   // active engine+space arrives. Background snapshots never pick focus.
   useEffect(() => {
     if (didInitFocusRef.current || !wsRef.current) return;
-    if (state.sessions.length === 0) return;  // wait for the list
     const surfaceKey = `${spaceRef.current}:${engineRef.current}`;
+    if (!authoritativeSurfaceListsRef.current.has(surfaceKey)) return;
+    if (state.sessions.length === 0) {
+      preferredSurfaceFocusRef.current = null;
+      didInitFocusRef.current = true;
+      return;
+    }
     const preferred = preferredSurfaceFocusRef.current?.key === surfaceKey
       ? state.sessions.find((session) => (
           session.session_id === preferredSurfaceFocusRef.current?.sid
@@ -1048,7 +1083,7 @@ export default function App() {
   const openCodexRollback = (numTurns: number, sessionId = focusedSid) => {
     if (!sessionId) return;
     setRollbackTarget({
-      sessionId, engine: "codex", numTurns,
+      sessionId, numTurns,
       label: `最近 ${numTurns} 轮`,
     });
   };
@@ -1056,14 +1091,24 @@ export default function App() {
     const target = rollbackTarget;
     if (!target) return;
     wsRef.current?.sendRollbackSession(
-      target.sessionId, target.engine, mode, target.numTurns,
+      target.sessionId, "codex", mode, target.numTurns,
       target.checkpointId);
     setRollbackTarget(null);
   };
   const openStatus = () => {
     if (!focusedSid) return;
     setStatusOpenSid(focusedSid);
-    wsRef.current?.sendGetStatus();
+    const requestId = wsRef.current?.sendGetStatus();
+    if (requestId) {
+      dispatch({ type: "begin_status_request", sid: focusedSid, requestId });
+    }
+  };
+  const requestContext = () => {
+    if (!focusedSid) return;
+    const requestId = wsRef.current?.sendGetContext();
+    if (requestId) {
+      dispatch({ type: "begin_context_request", sid: focusedSid, requestId });
+    }
   };
   const forkFromTurn = (forkPointId: string) => {
     if (!focusedSid
@@ -1110,9 +1155,10 @@ export default function App() {
   };
   const getDiff = (file: string) => {
     if (!confirmArtifactDiscard()) return;
+    const requestId = wsRef.current?.sendGetDiff(file, theme) ?? null;
+    if (!requestId) return;
     setRightView("diff");
-    dispatch({ type: "open_artifact_loading", file, sid: focusedSid });
-    wsRef.current?.sendGetDiff(file, theme);
+    dispatch({ type: "open_artifact_loading", file, sid: focusedSid, requestId });
   };
   const previewFile = (file: string, line?: number) => {
     if (!focusedSid) return;
@@ -1303,6 +1349,8 @@ export default function App() {
               if (notificationsEnabled) {
                 localStorage.removeItem(NOTIFY_KEY);
                 setNotificationsEnabled(false);
+                remotePushActiveRef.current = false;
+                await disableRemotePush();
                 return;
               }
               const permission = await Notification.requestPermission();
@@ -1310,6 +1358,8 @@ export default function App() {
               if (enabled) localStorage.setItem(NOTIFY_KEY, "1");
               else localStorage.removeItem(NOTIFY_KEY);
               setNotificationsEnabled(enabled);
+              remotePushActiveRef.current = enabled
+                ? await enableRemotePush(machineId) : false;
             })(); }} aria-label="完成提醒"
             title={notificationsEnabled ? "后台完成提醒已开启" : "开启后台完成提醒"}>
             <Icon name="notify" />
@@ -1406,7 +1456,7 @@ export default function App() {
           onSetPerm={setPerm}
           onSetCollaborationMode={setCollaborationMode}
           onClear={() => dispatch({ type: "enter_new_chat", cwd: space === "work" ? "~" : state.currentCwd })}
-          onContext={() => wsRef.current?.sendGetContext()}
+          onContext={requestContext}
           onOpenBtw={openBtw}
           onPreview={previewMarkdown}
           onGoal={runGoal}
@@ -1429,6 +1479,7 @@ export default function App() {
             setWorkArtifactsOpen(true);
           }}
           contextReport={rt.contextReport}
+          contextError={rt.contextError}
         />
           </>
         )}
@@ -1469,8 +1520,9 @@ export default function App() {
         />
       )}
       <StatusSheet open={shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)} report={rt.statusReport}
+        error={rt.statusError}
         onClose={() => setStatusOpenSid(null)}
-        onRefresh={() => wsRef.current?.sendGetStatus()} />
+        onRefresh={openStatus} />
       <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
         creating={forkWorktreeCreating} error={forkWorktreeError}
         onConfirm={submitForkWorktree} onClose={closeForkWorktree} />

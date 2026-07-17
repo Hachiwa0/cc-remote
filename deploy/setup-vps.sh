@@ -16,6 +16,7 @@ SOURCE_DIR="$(cd "${2:-$SCRIPT_ROOT}" && pwd -P)"
 APPDIR=/opt/cc-remote
 ENV_FILE="$APPDIR/.env"
 RELEASES_DIR="$APPDIR/releases"
+STATE_DIR="$APPDIR/state"
 CURRENT_LINK="$APPDIR/current"
 NEW_RELEASE_DIR=""
 PREVIOUS_RELEASE=""
@@ -176,9 +177,10 @@ id -u ccremote >/dev/null 2>&1 || \
   useradd --system --gid ccremote --no-create-home --home-dir /nonexistent \
     --shell /usr/sbin/nologin ccremote
 
-mkdir -p "$RELEASES_DIR"
+mkdir -p "$RELEASES_DIR" "$STATE_DIR"
 chown root:ccremote "$APPDIR" "$RELEASES_DIR"
-chmod 0750 "$APPDIR" "$RELEASES_DIR"
+chown ccremote:ccremote "$STATE_DIR"
+chmod 0750 "$APPDIR" "$RELEASES_DIR" "$STATE_DIR"
 chown root:ccremote "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
 

@@ -245,6 +245,7 @@ class WorkRegistry:
                     last_run_at REAL,
                     last_session_id TEXT,
                     last_error TEXT,
+                    deleted_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -284,6 +285,14 @@ class WorkRegistry:
                 db.execute(
                     "ALTER TABLE work_sessions "
                     "ADD COLUMN context_baseline_tokens INTEGER"
+                )
+            schedule_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(work_schedules)")
+            }
+            if "deleted_at" not in schedule_columns:
+                db.execute(
+                    "ALTER TABLE work_schedules ADD COLUMN deleted_at REAL"
                 )
         self._chmod_file(self.db_path)
 
@@ -331,7 +340,8 @@ class WorkRegistry:
             plugins = [dict(row) for row in db.execute(
                 "SELECT * FROM work_plugins ORDER BY updated_at DESC").fetchall()]
             schedules = [dict(row) for row in db.execute(
-                "SELECT * FROM work_schedules ORDER BY next_run_at ASC").fetchall()]
+                "SELECT * FROM work_schedules WHERE deleted_at IS NULL "
+                "ORDER BY next_run_at ASC").fetchall()]
             latest_runs = {
                 row["schedule_id"]: dict(row)
                 for row in db.execute(
@@ -579,7 +589,43 @@ class WorkRegistry:
         return schedule_id
 
     def delete_schedule(self, schedule_id: str) -> None:
-        self._delete_row("work_schedules", "schedule_id", schedule_id)
+        """Delete an idle schedule or tombstone one whose run is executing.
+
+        Running workers must retain their parent row until they record their
+        terminal result because the run table intentionally has a cascading
+        foreign key. Queued/claimed work has not begun and can be cancelled
+        immediately. The terminal writer removes the tombstone atomically.
+        """
+        self.initialize()
+        now = time.time()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT 1 FROM work_schedules WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"unknown Work item: {schedule_id}")
+            db.execute(
+                "UPDATE work_schedules SET enabled = 0, deleted_at = ?, "
+                "updated_at = ? WHERE schedule_id = ?",
+                (now, now, schedule_id),
+            )
+            db.execute(
+                "DELETE FROM work_schedule_runs WHERE schedule_id = ? "
+                "AND status IN ('queued', 'claimed')",
+                (schedule_id,),
+            )
+            running = db.execute(
+                "SELECT 1 FROM work_schedule_runs WHERE schedule_id = ? "
+                "AND status = 'running' LIMIT 1",
+                (schedule_id,),
+            ).fetchone()
+            if running is None:
+                db.execute(
+                    "DELETE FROM work_schedules WHERE schedule_id = ?",
+                    (schedule_id,),
+                )
 
     def claim_due_schedules(
         self, now: float, limit: int = 8, lease_seconds: float = 90.0,
@@ -613,7 +659,7 @@ class WorkRegistry:
             )
             rows = db.execute(
                 """SELECT * FROM work_schedules
-                   WHERE enabled = 1 AND next_run_at <= ?
+                   WHERE enabled = 1 AND deleted_at IS NULL AND next_run_at <= ?
                    ORDER BY next_run_at ASC LIMIT ?""", (now, limit),
             ).fetchall()
             for row in rows:
@@ -653,6 +699,7 @@ class WorkRegistry:
                    FROM work_schedule_runs r
                    JOIN work_schedules s ON s.schedule_id = r.schedule_id
                    WHERE r.status = 'queued' AND r.available_at <= ?
+                     AND s.deleted_at IS NULL
                    ORDER BY r.scheduled_for ASC LIMIT ?""",
                 (now, limit),
             ).fetchall()
@@ -706,15 +753,19 @@ class WorkRegistry:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT schedule_id, attempt FROM work_schedule_runs WHERE run_id = ?",
+                """SELECT r.schedule_id, r.attempt, s.deleted_at
+                   FROM work_schedule_runs r
+                   JOIN work_schedules s ON s.schedule_id = r.schedule_id
+                   WHERE r.run_id = ?""",
                 (run_id,),
             ).fetchone()
             if row is None:
                 raise LookupError(f"unknown Work schedule run: {run_id}")
+            deleting = row["deleted_at"] is not None
             if error is None:
                 status = "succeeded"
                 available_at = completed_at
-            elif int(row["attempt"]) < _WORK_SCHEDULE_MAX_ATTEMPTS:
+            elif not deleting and int(row["attempt"]) < _WORK_SCHEDULE_MAX_ATTEMPTS:
                 status = "queued"
                 available_at = completed_at + min(
                     300, 15 * (2 ** max(0, int(row["attempt"]) - 1)))
@@ -732,6 +783,11 @@ class WorkRegistry:
                    last_error = ?, updated_at = ? WHERE schedule_id = ?""",
                 (completed_at, session_id, error, completed_at, row["schedule_id"]),
             )
+            if deleting:
+                db.execute(
+                    "DELETE FROM work_schedules WHERE schedule_id = ?",
+                    (row["schedule_id"],),
+                )
         return status
 
     def _delete_row(self, table: str, key: str, value: str) -> None:

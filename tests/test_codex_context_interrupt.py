@@ -2,6 +2,11 @@
 No model calls — feeds synthetic notifications shaped exactly like the real ones
 (captured from gpt-5.5: tokenUsage.{last,total,modelContextWindow})."""
 import asyncio
+import os
+import tempfile
+
+import cc_remote.wrapper.codex_sessions as codex_sessions
+
 from cc_remote.wrapper.codex_handle import CodexHandle
 from cc_remote.wrapper.codex_stream import CodexStreamTranslator
 
@@ -46,7 +51,6 @@ def test_context_uses_last_not_cumulative_total():
         "modelContextWindow": 258400}}}))
     u = asyncio.run(h.get_context_usage())
     assert u["used_tokens"] == 40000, u   # last, NOT 120000
-    print(f"  context uses last(40000) not total(120000)  OK")
 
 
 def test_interrupt_status_maps_to_cc_vocab():
@@ -67,30 +71,28 @@ def test_interrupt_status_maps_to_cc_vocab():
         "id": "turn-completed", "status": "completed", "durationMs": 500}}})
     assert ok[-1].result.subtype == "success" and ok[-1].result.is_error is False
     assert ok[-1].turn_id == "turn-completed"
-    print(f"  completed -> subtype=success is_error=False  OK")
 
     tr3 = CodexStreamTranslator(8000)
     fail = tr3.feed({"method": "turn/completed", "params": {"turn": {"status": "failed"}}})
     assert fail[-1].result.subtype == "error" and fail[-1].result.is_error is True
-    print(f"  failed -> subtype=error is_error=True  OK")
 
 
 def test_config_fast_default_read_never_writes_file():
     """Reading a fresh-thread Fast default is strictly read-only."""
-    import os, tempfile, cc_remote.wrapper.codex_sessions as cs
     src = ('model_provider = "cubence"\nmodel = "gpt-5.5"\n'
            'model_reasoning_effort = "xhigh"\nservice_tier = "fast"\n\n'
            '[model_providers.cubence]\nbase_url = "https://x/v1"\n')
     tf = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False)
-    tf.write(src); tf.close()
-    orig = cs._CONFIG
-    cs._CONFIG = tf.name
+    tf.write(src)
+    tf.close()
+    orig = codex_sessions._CONFIG
+    codex_sessions._CONFIG = tf.name
     try:
         before = open(tf.name).read()
-        assert cs.codex_fast_enabled() is True
+        assert codex_sessions.codex_fast_enabled() is True
         assert open(tf.name).read() == before
     finally:
-        cs._CONFIG = orig
+        codex_sessions._CONFIG = orig
         os.unlink(tf.name)
 
 
@@ -153,13 +155,3 @@ def test_codex_empty_completed_is_an_error_but_tool_activity_is_not():
     final = completed_only.feed({"method": "turn/completed", "params": {
         "turn": {"status": "completed", "durationMs": 20}}})
     assert final[-1].result.subtype == "success"
-
-
-if __name__ == "__main__":
-    import os
-    test_context_window_capture_and_usage()
-    test_context_uses_last_not_cumulative_total()
-    test_interrupt_status_maps_to_cc_vocab()
-    test_config_fast_toggle_preserves_file()
-    test_codex_errors_surface()
-    print("ALL PASS")

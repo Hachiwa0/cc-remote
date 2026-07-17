@@ -1408,6 +1408,7 @@ class DiffReport(_Base):
     type: Literal["diff_report"] = "diff_report"
     file: str
     diff: str
+    request_id: Optional[WireId] = None
 
 
 class GetFilePreview(_Command):

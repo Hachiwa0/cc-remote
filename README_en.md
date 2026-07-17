@@ -51,7 +51,7 @@ not proxy model APIs or bake API keys into the web client.
 | **Complete process** | Expand the reasoning summaries, plans, command output, file diffs, MCP calls, collaboration agents, Hooks, and terminal interaction events exposed by each engine. |
 | **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. |
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
-| **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Claude supports message-level Rewind (conversation, official file checkpoint, or both). Codex supports conversation rollback, conflict-safe code rollback, explicit compact, native Review, and isolated Git worktree forks. |
+| **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Codex supports conversation rollback, conflict-safe code rollback, explicit compact, native Review, and isolated Git worktree forks. |
 | **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses `/permissions` for approval control while inheriting the local Sandbox configuration. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
 | **Real extension catalog** | Read the current Claude/Codex Skills, Plugins, Apps, and MCP status on demand. Plugin install/uninstall calls the engines' native managers rather than a static placeholder list. |
 | **Continuity** | Let background sessions keep running and synchronize them across clients. Restore paged history from Claude transcripts or Codex rollouts and resume from a cursor after reconnecting. |
@@ -204,7 +204,7 @@ context usage, and command entry points such as `/goal` and `/status`.
 
 ### Common operations at a glance
 
-- **Sessions:** create, search, run in the background, rename, archive, delete, fork, use Claude Rewind, roll back Codex conversation and code, compact, Review, and create a Codex worktree.
+- **Sessions:** create, search, run in the background, rename, archive, delete, fork, roll back Codex conversation and code, compact, Review, and create a Codex worktree.
 - **Turns:** stream, queue, interrupt, copy, edit and resend, or fork from a specific message.
 - **Tools:** inspect command output, file changes and diffs, MCP, collaboration agents, Hooks, approvals, and user-input requests.
 - **Terminal coordination:** Codex Code shares the official daemon; Claude uses
@@ -459,6 +459,8 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `SESSION_TTL_SECONDS` | `604800` | Session token lifetime (default 7 days). |
 | `LOGIN_BODY_MAX_BYTES` / `LOGIN_READ_TIMEOUT` / `LOGIN_INFLIGHT_CAP` | `4096` / `10` / `32` | Hard limits for login body bytes, total read seconds, and concurrent body reads. |
 | `SESSION_REGISTRY_CAP` | `1024` | Hard limit for process-local revocable browser sessions. |
+| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` / `PUSH_VAPID_SUBJECT` | empty | Optional real Web Push; all three must be configured. Prefer an absolute PEM path readable by the relay user. Payloads contain only completion/failure state, never conversation content. |
+| `PUSH_DB_PATH` | `~/.cc-remote/relay-push.sqlite3` | Durable browser subscription store, isolated by user and machine. |
 | `PUBLIC_ORIGIN` | empty | Exact browser origin allowed to connect, e.g. `https://remote.example.com`; **required**, and non-loopback origins must use HTTPS. |
 | `WRAPPER_TOKEN` | placeholder | Wrapper Bearer token for single-machine/compatibility mode; required unless `WRAPPER_TOKENS_JSON` is set. |
 | `WRAPPER_TOKENS_JSON` | empty | Optional machine-bound tokens: `{"mac":"…","nono":"…"}`; replaces the relay's wildcard `WRAPPER_TOKEN`. |
@@ -540,6 +542,11 @@ deploy/            # Caddyfile / systemd / setup-vps.sh / env examples
 python -m pip install -r requirements-dev.txt
 pytest                              # unit tests (no model, zero tokens)
 npm --prefix web run test:reliability # pure web reliability tests
+
+# Explicit live path (requires a running relay + wrapper and calls the model)
+CC_REMOTE_RUN_E2E=1 CC_REMOTE_E2E_SCENARIO=smoke \
+  RELAY_URL=wss://remote.example/ws LOGIN_PASSWORD='...' \
+  pytest -q tests/test_e2e_entry.py
 npm --prefix web run lint           # web static checks
 npm --prefix web run dev            # web dev server
 npm --prefix web run build          # web production build

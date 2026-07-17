@@ -120,6 +120,28 @@ def test_connection_routed_replay_never_crosses_client_replacement():
     asyncio.run(run())
 
 
+def test_only_live_turn_end_triggers_relay_event_hook():
+    async def run():
+        notified: list[tuple[str, object]] = []
+        ready = asyncio.Event()
+
+        async def on_turn_end(machine_id, msg):
+            notified.append((machine_id, msg))
+            ready.set()
+
+        hub = RelayHub(SimpleNamespace(), on_live_turn_end=on_turn_end)
+        result = TurnResult(subtype="success", duration_ms=1, is_error=False)
+        await hub._on_wrapper_msg(TurnEnd(result=result, to="replay-client"), "nono")
+        await asyncio.sleep(0)
+        assert notified == [], "a client replay must not emit a second push"
+
+        await hub._on_wrapper_msg(TurnEnd(result=result), "nono")
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        assert notified[0][0] == "nono"
+
+    asyncio.run(run())
+
+
 def test_relay_overwrites_untrusted_client_hello_route_id():
     class CapturingWrapper:
         def __init__(self):

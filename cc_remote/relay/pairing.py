@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -42,9 +42,19 @@ WRAPPER_LIMIT_CLOSE_CODE = 1013
 WRAPPER_LIMIT_CLOSE_REASON = "wrapper capacity reached"
 
 
+WrapperEventHook = Callable[[str, object], Awaitable[None]]
+
+
 class RelayHub:
-    def __init__(self, cfg: RelayConfig):
+    def __init__(
+        self,
+        cfg: RelayConfig,
+        *,
+        on_live_turn_end: WrapperEventHook | None = None,
+    ):
         self.cfg = cfg
+        self._on_live_turn_end = on_live_turn_end
+        self._event_tasks: set[asyncio.Task[None]] = set()
         # Preserve the original attributes as the default-machine fast path and
         # test/integration compatibility surface.
         self._wrapper_ws: Optional[WebSocket] = None
@@ -104,6 +114,15 @@ class RelayHub:
             and self._machine_clients.get(machine_id) is clients
         ):
             del self._machine_clients[machine_id]
+
+    def _event_task_done(self, task: asyncio.Task[None]) -> None:
+        self._event_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("relay event hook failed")
 
     # ---- wrapper side ----
 
@@ -245,6 +264,16 @@ class RelayHub:
                 log.debug("routed frame for unknown client, dropping", to=to, type=msg.type)
         else:
             await self._broadcast(msg, machine_id)
+        # Replay is routed to one client via ``to`` and must never generate a
+        # second notification. Only a new live completion reaches this hook.
+        if (
+            msg.type == "turn_end"
+            and not to
+            and self._on_live_turn_end is not None
+        ):
+            task = asyncio.create_task(self._on_live_turn_end(machine_id, msg))
+            self._event_tasks.add(task)
+            task.add_done_callback(self._event_task_done)
 
     async def _wrapper_gone(self, machine_id: str = "default", ws=None) -> None:
         async with self._lock:

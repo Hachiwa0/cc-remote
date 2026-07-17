@@ -68,6 +68,7 @@ interface Props {
   workArtifactCount?: number;
   onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
+  contextError?: string | null;
 }
 
 export function Composer(p: Props) {
@@ -604,10 +605,6 @@ export function Composer(p: Props) {
                     disabled={locked}>
                     <span>思考强度</span><b>{effort?.name ?? "读取中"}</b>
                   </button>
-                  <button type="button" onClick={() => setSheetKind("perms")}
-                    disabled={locked}>
-                    <span>访问权限</span><b>{perm?.short ?? "读取中"}</b>
-                  </button>
                   <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
                     <span>会话上下文</span><b>{workContext ? `${workContext.sessionPercentage.toFixed(0)}%` : "查看"}</b>
                   </button>
@@ -699,7 +696,9 @@ export function Composer(p: Props) {
             </button>
             {ctxOpen && (
               <div className="ctx-pop" role="dialog" aria-label="上下文占用">
-                {p.contextReport ? (
+                {p.contextError ? (
+                  <div className="ctx-pop-loading" role="alert">{p.contextError}</div>
+                ) : p.contextReport ? (
                   <>
                     <div className="ctx-pop-row">
                       <span>上下文窗口</span>

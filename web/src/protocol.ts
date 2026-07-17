@@ -281,7 +281,7 @@ export interface SetPerm extends Base { type: "set_perm"; mode: PermissionMode }
 export interface Perm extends Base { type: "perm"; mode: string }
 export interface GetContext extends Base { type: "get_context" }
 export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: DiffTheme }
-export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string }
+export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string; request_id?: string }
 export interface GetFilePreview extends Base { type: "get_file_preview"; path: string; request_id: string }
 export interface FilePreview extends Base { type: "file_preview"; path: string; request_id: string; format: "markdown" | "text" | "html" | "image" | "pdf"; content: string; media_type?: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "application/pdf" | null; data?: string | null; converted_from?: string | null; size: number; truncated: boolean; mtime_ns: string; revision?: string | null; error?: string | null }
 export interface SaveMarkdown extends Base { type: "save_markdown"; path: string; request_id: string; content: string; expected_size: number; expected_mtime_ns: string; expected_revision: string }

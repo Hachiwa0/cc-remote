@@ -254,9 +254,13 @@ const codexWorkSlashes = commandsFor("codex", "work")
   .map((command) => command.slash);
 assert.deepEqual(codexWorkSlashes, claudeWorkSlashes,
   "Work must expose one engine-neutral command surface");
-for (const slash of ["model", "permissions", "goal", "btw", "preview", "context", "clear"]) {
+for (const slash of ["model", "goal", "btw", "preview", "context", "clear"]) {
   assert.equal(claudeWorkSlashes.includes(slash), true, `Work must retain /${slash}`);
 }
+assert.equal(claudeWorkSlashes.includes("permissions"), false,
+  "Work permissions are fixed by its private workspace and must not be presented as editable");
+assert.equal(isKnownCodeOnlySlash("permissions", "claude"), true);
+assert.equal(isKnownCodeOnlySlash("permissions", "codex"), true);
 for (const slash of ["plan", "code-review", "security-review", "verify", "simplify", "run", "init"]) {
   assert.equal(claudeWorkSlashes.includes(slash), false, `Work must hide Code /${slash}`);
   assert.equal(isKnownCodeOnlySlash(slash, "claude"), true);
@@ -768,6 +772,17 @@ try {
   assert.equal(refocused.focusedSid, "cached-work-session");
   assert.equal(refocused.newChat, null,
     "restoring a surface focus must also leave the temporary new-work page");
+  const staleFocused = reduce({
+    ...refocused,
+    sessions: [{ session_id: "deleted-elsewhere", engine: "codex", space: "work" }],
+    focusedSid: "deleted-elsewhere",
+  }, { type: "event", event: event({
+    type: "session_list", engine: "codex", space: "work", sessions: cachedSessions,
+  }) });
+  assert.equal(staleFocused.focusedSid, null,
+    "an authoritative list must clear a session deleted by another client");
+  assert.ok(staleFocused.newChat,
+    "the removed transcript must not remain painted while a replacement focus is chosen");
 
   const {
     buildCalendarDays, parseLocalDateTime, placeDateTimePopover, toLocalDateTime,
@@ -775,6 +790,8 @@ try {
     await reducerHarness.ssrLoadModule("/src/date-time.ts");
   const { DateTimePicker } =
     await reducerHarness.ssrLoadModule("/src/components/DateTimePicker.tsx");
+  const { CommandSheet: ModelCommandSheet } =
+    await reducerHarness.ssrLoadModule("/src/components/CommandSheet.tsx");
   const sampleDate = new Date(2026, 6, 17, 9, 5);
   assert.equal(toLocalDateTime(sampleDate), "2026-07-17T09:05");
   assert.equal(parseLocalDateTime("2026-02-30T09:05"), null,
@@ -796,6 +813,16 @@ try {
   }));
   assert.match(datePickerMarkup, /执行时间/);
   assert.match(datePickerMarkup, /aria-haspopup="dialog"/);
+  const claudeModelsMarkup = renderToStaticMarkup(createElement(ModelCommandSheet, {
+    open: true, kind: "models", engine: "claude", onClose: () => undefined,
+  }));
+  assert.match(claudeModelsMarkup, /自定义 \/ Provider 模型 ID/,
+    "Claude's static suggestions must be paired with a provider model-id input");
+  const codexModelsMarkup = renderToStaticMarkup(createElement(ModelCommandSheet, {
+    open: true, kind: "models", engine: "codex", onClose: () => undefined,
+  }));
+  assert.doesNotMatch(codexModelsMarkup, /自定义 \/ Provider 模型 ID/,
+    "Codex must keep using its authoritative app-server catalog");
 
   const snapshotOnly = reduce(initialState, { type: "event", event: event({
     type: "snapshot", sid: "background-code", cc_session_id: "background-code",
@@ -810,6 +837,47 @@ try {
   assert.equal(unannounced.fast, null);
   const sid = "race-a";
   const otherSid = "race-b";
+  let controlRequestState = {
+    ...initialState,
+    focusedSid: sid,
+    runtimes: { [sid]: createRuntime() },
+  };
+  controlRequestState = reduce(controlRequestState, {
+    type: "begin_context_request", sid, requestId: "context-request",
+  });
+  controlRequestState = reduce(controlRequestState, { type: "event", event: event({
+    type: "error", sid, code: "not_running", message: "会话已离线",
+    request_id: "context-request",
+  }) });
+  assert.equal(controlRequestState.runtimes[sid].contextRequestId, null);
+  assert.equal(controlRequestState.runtimes[sid].contextError, "会话已离线",
+    "a targeted context failure must replace the infinite loading state");
+  controlRequestState = reduce(controlRequestState, {
+    type: "begin_status_request", sid, requestId: "status-request",
+  });
+  controlRequestState = reduce(controlRequestState, { type: "event", event: event({
+    type: "error", sid, code: "not_running", message: "状态不可用",
+    request_id: "status-request",
+  }) });
+  assert.equal(controlRequestState.runtimes[sid].statusRequestId, null);
+  assert.equal(controlRequestState.runtimes[sid].statusError, "状态不可用",
+    "a targeted status failure must close its loading state");
+  let diffRequestState = reduce(controlRequestState, {
+    type: "open_artifact_loading", sid, file: "src/app.ts", requestId: "diff-request",
+  });
+  diffRequestState = reduce(diffRequestState, { type: "event", event: event({
+    type: "diff_report", sid, file: "src/app.ts", diff: "stale",
+    request_id: "older-diff-request",
+  }) });
+  assert.equal(diffRequestState.artifact?.loading, true,
+    "a stale diff response must not replace the active request");
+  diffRequestState = reduce(diffRequestState, { type: "event", event: event({
+    type: "error", sid, code: "not_running", message: "差异不可用",
+    request_id: "diff-request",
+  }) });
+  assert.equal(diffRequestState.artifact?.loading, false);
+  assert.equal(diffRequestState.artifact?.error, "差异不可用",
+    "a correlated diff failure must close its loading state");
   const untouched = {
     id: "b-turn", prompt: "other", done: true, blocks: [], ts: 1000,
   };

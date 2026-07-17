@@ -198,6 +198,31 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(schedule["last_run_status"], "succeeded")
         self.assertEqual(schedule["last_session_id"], "session-ok")
 
+    def test_deleting_running_schedule_defers_cleanup_until_completion(self):
+        now = time.time()
+        schedule_id = self.store.create_schedule(
+            "可删除任务", "生成报告", now - 1)
+        run = self.store.claim_due_schedules(now)[0]
+        self.assertTrue(self.store.mark_schedule_running(run["run_id"], now))
+
+        self.store.delete_schedule(schedule_id)
+
+        self.assertEqual(self.store.dashboard()["schedules"], [])
+        self.assertEqual(
+            self.store.complete_schedule(
+                run["run_id"], "session-finished", None, now=now + 1),
+            "succeeded",
+        )
+        with sqlite3.connect(self.store.db_path) as db:
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM work_schedules WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone())
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM work_schedule_runs WHERE run_id = ?",
+                (run["run_id"],),
+            ).fetchone())
+
     def test_delete_session_removes_only_registry_owned_random_directory(self):
         record = self.store.create_session()
         self.store.bind_session(record.work_id, "session-1")

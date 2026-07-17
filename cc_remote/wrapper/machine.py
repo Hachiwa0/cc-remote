@@ -1590,12 +1590,24 @@ class WrapperMachine:
                         task = asyncio.create_task(
                             self._run_work_schedule(engine, schedule))
                         self._work_schedule_runs.add(task)
-                        task.add_done_callback(self._work_schedule_runs.discard)
+                        task.add_done_callback(self._finish_work_schedule_task)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("Work schedule scan failed")
             await asyncio.sleep(15)
+
+    def _finish_work_schedule_task(self, task: asyncio.Task) -> None:
+        """Consume background failures so asyncio never drops them silently."""
+        self._work_schedule_runs.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error(
+                "Work schedule task escaped its failure boundary",
+                error_type=type(error).__name__,
+            )
 
     async def _run_work_schedule(
         self, engine: str, schedule: dict[str, object]
@@ -1808,6 +1820,23 @@ class WrapperMachine:
         else:
             msg.sid = sid or self.focused_sid
             await self.transport.send(msg)
+
+    async def _missing_session_error(self, cmd, action: str) -> Error:
+        """Reject a routed command whose session is no longer resident.
+
+        Reliable commands are ACKed after their handler returns.  Returning a
+        targeted Error here prevents an expired sid from becoming an ACK-only
+        false success and keeps the failure out of an unrelated focused view.
+        """
+        sid = getattr(cmd, "sid", None)
+        error = Error(
+            code=ERR_NOT_RUNNING,
+            message=f"该会话未启动，无法{action}",
+            request_id=getattr(cmd, "cmd_id", None),
+            to=getattr(cmd, "client_id", None),
+        )
+        await self._emit_to_sid(sid, error)
+        return error
 
     async def _set_state(self, ctx: SessionContext, state: State) -> None:
         ctx.state = state
@@ -2034,7 +2063,7 @@ class WrapperMachine:
         elif t == "query":
             return await self._handle_query(cmd)
         elif t == "interrupt":
-            await self._handle_interrupt(cmd)
+            return await self._handle_interrupt(cmd)
         elif t == "takeover":
             return await self._handle_takeover(cmd)
         elif t == "set_model":
@@ -2042,21 +2071,21 @@ class WrapperMachine:
         elif t == "set_effort":
             return await self._handle_set_effort(cmd)
         elif t == "set_service_tier":
-            await self._handle_set_service_tier(cmd)
+            return await self._handle_set_service_tier(cmd)
         elif t == "set_collaboration_mode":
-            await self._handle_set_collaboration_mode(cmd)
+            return await self._handle_set_collaboration_mode(cmd)
         elif t == "open_btw":
             return await self._handle_open_btw(cmd)
         elif t == "close_btw":
-            await self._handle_close_btw(cmd)
+            return await self._handle_close_btw(cmd)
         elif t == "set_perm":
             return await self._handle_set_perm(cmd)
         elif t == "get_context":
-            await self._handle_get_context(cmd)
+            return await self._handle_get_context(cmd)
         elif t == "get_status":
             return await self._handle_get_status(cmd)
         elif t == "get_diff":
-            await self._handle_get_diff(cmd)
+            return await self._handle_get_diff(cmd)
         elif t == "get_file_preview":
             return await self._handle_get_file_preview(cmd)
         elif t == "save_markdown":
@@ -2064,15 +2093,15 @@ class WrapperMachine:
         elif t == "get_preview_asset":
             return await self._handle_get_preview_asset(cmd)
         elif t == "get_history":
-            await self._handle_get_history(cmd)
+            return await self._handle_get_history(cmd)
         elif t == "get_models":
-            await self._handle_get_models(cmd)
+            return await self._handle_get_models(cmd)
         elif t == "get_engine_capabilities":
             return await self._handle_get_engine_capabilities(cmd)
         elif t == "manage_engine_plugin":
             return await self._handle_manage_engine_plugin(cmd)
         elif t == "answer_question":
-            await self._handle_answer_question(cmd)
+            return await self._handle_answer_question(cmd)
         elif t == "get_goal":
             return await self._handle_get_goal(cmd)
         elif t == "set_goal":
@@ -2080,19 +2109,19 @@ class WrapperMachine:
         elif t == "clear_goal":
             return await self._handle_clear_goal(cmd)
         elif t == "list_sessions":
-            await self._handle_list_sessions(cmd)
+            return await self._handle_list_sessions(cmd)
         elif t == "switch_session":
             return await self._handle_switch_session(cmd)
         elif t == "new_session":
             return await self._handle_new_session(cmd)
         elif t == "list_dir":
-            await self._handle_list_dir(cmd)
+            return await self._handle_list_dir(cmd)
         elif t == "rename_session":
-            await self._handle_rename_session(cmd)
+            return await self._handle_rename_session(cmd)
         elif t == "archive_session":
-            await self._handle_archive_session(cmd)
+            return await self._handle_archive_session(cmd)
         elif t == "pin_session":
-            await self._handle_pin_session(cmd)
+            return await self._handle_pin_session(cmd)
         elif t == "delete_work_session":
             return await self._handle_delete_work_session(cmd)
         elif t == "delete_session":
@@ -3544,6 +3573,7 @@ class WrapperMachine:
         log.info("history sent", session_id=sid, events=len(hist.events),
                  has_more=hist.has_more, before=bool(hist.before),
                  external=hist.external, client_id=client_id)
+        return hist
 
     async def _handle_takeover(self, cmd):
         """Explicitly transfer a read-only terminal session back to Remote.
@@ -3866,8 +3896,7 @@ class WrapperMachine:
     async def _handle_interrupt(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
-            await self._emit_focused(Error(code=ERR_NOT_RUNNING, message="no active session"))
-            return
+            return await self._missing_session_error(cmd, "打断")
         # Reliable command retries and impatient second clicks are expected.
         # Once the first interrupt has been accepted, another stop must be an
         # idempotent no-op rather than a misleading `not_running` error that also
@@ -3875,8 +3904,14 @@ class WrapperMachine:
         if ctx.state in {"interrupting", "draining"}:
             return
         if ctx.state != "running":
-            await self._emit(ctx, Error(code=ERR_NOT_RUNNING, message="该会话没有正在运行的回合"))
-            return
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message="该会话没有正在运行的回合",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         # Set the deadline and wake the turn consumer before entering any await:
         # it may already be blocked in the queue.get() that began while running.
         ctx.interrupt_deadline = (
@@ -4092,6 +4127,7 @@ class WrapperMachine:
         log.info("models sent", engine=engine, count=len(models),
                  default_model=default_model, default_effort=default_effort,
                  client_id=client_id)
+        return msg
 
     async def _handle_get_engine_capabilities(self, cmd):
         engine = cmd.engine
@@ -4147,6 +4183,7 @@ class WrapperMachine:
             error = Error(
                 code=ERR_BAD_PROMPT,
                 message=str(exc)[:500],
+                request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
             await self.transport.send(error)
@@ -4161,6 +4198,7 @@ class WrapperMachine:
             error = Error(
                 code=ERR_INTERNAL,
                 message="插件操作失败，状态未确认",
+                request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
             await self.transport.send(error)
@@ -4326,7 +4364,7 @@ class WrapperMachine:
     async def _handle_set_model(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "切换模型")
         control_error = await self._runtime_control_preflight(
             ctx, action="切换模型")
         if control_error is not None:
@@ -4403,7 +4441,7 @@ class WrapperMachine:
         # immediately — no reconnect needed.
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "切换思考强度")
         control_error = await self._runtime_control_preflight(
             ctx, action="切换思考强度")
         if control_error is not None:
@@ -4439,12 +4477,21 @@ class WrapperMachine:
         log.info("effort set", sid=ctx.session_id, effort=applied, engine=ctx.engine)
         return event
 
-    async def _handle_set_service_tier(self, cmd) -> None:
+    async def _handle_set_service_tier(self, cmd):
         # Codex Fast is a thread setting in app-server 0.144.1. Never mutate the
         # user's global config.toml and never leak one session's choice to another.
         ctx = self._ctx_for(getattr(cmd, "sid", None))
-        if ctx is None or ctx.engine != "codex":
-            return
+        if ctx is None:
+            return await self._missing_session_error(cmd, "切换服务档位")
+        if ctx.engine != "codex":
+            error = Error(
+                code=ERR_PROTOCOL,
+                message="Fast 服务档位仅适用于 Codex 会话",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         if cmd.service_tier == "toggle":
             on = not _codex_fast_on(
                 getattr(ctx.sdk, "service_tier", None))
@@ -4454,35 +4501,53 @@ class WrapperMachine:
             await ctx.sdk.set_service_tier("fast" if on else None)
             applied_on = _codex_fast_on(
                 getattr(ctx.sdk, "service_tier", None))
-            await self._emit(ctx, Fast(on=applied_on))
+            event = Fast(on=applied_on)
+            await self._emit(ctx, event)
             log.info("codex thread service tier set", sid=ctx.session_id,
                      requested=on, applied=applied_on)
+            return event
         except Exception as e:
             log.exception("set_service_tier failed", error=str(e))
-            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"set_service_tier failed: {e}"))
+            error = Error(
+                code=ERR_INTERNAL,
+                message=f"set_service_tier failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
 
-    async def _handle_set_collaboration_mode(self, cmd) -> None:
+    async def _handle_set_collaboration_mode(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "切换协作模式")
         if ctx.engine != "codex" or cmd.mode not in CODEX_COLLABORATION_MODES:
-            await self._emit(ctx, Error(
+            error = Error(
                 code=ERR_INTERNAL,
                 message=(f"{ctx.engine} 不支持 Codex 协作模式 {cmd.mode!r}; "
                          "可选: default, plan"),
-            ))
-            return
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         try:
             await ctx.sdk.set_collaboration_mode(cmd.mode)
             applied = getattr(ctx.sdk, "collaboration_mode", cmd.mode)
             ctx.announced_collaboration_mode = applied
-            await self._emit(ctx, CollaborationMode(mode=applied))
+            event = CollaborationMode(mode=applied)
+            await self._emit(ctx, event)
+            return event
         except Exception as e:
             log.exception("set_collaboration_mode failed", error=str(e))
-            await self._emit(ctx, Error(
+            error = Error(
                 code=ERR_INTERNAL,
                 message=f"set_collaboration_mode failed: {e}",
-            ))
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
 
     async def _refresh_codex_collaboration_mode(
             self, ctx: SessionContext) -> None:
@@ -4651,7 +4716,7 @@ class WrapperMachine:
     async def _handle_set_perm(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "切换权限模式")
         control_error = await self._runtime_control_preflight(
             ctx, action="切换权限模式")
         if control_error is not None:
@@ -4766,10 +4831,10 @@ class WrapperMachine:
             ctx.sdk.work_context_baseline_tokens = refreshed
             ctx.work_context_baseline_tokens = refreshed
 
-    async def _handle_get_context(self, cmd) -> None:
+    async def _handle_get_context(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "读取上下文")
         try:
             usage = await ctx.sdk.get_context_usage()
             work_fields: dict[str, int | float] = {}
@@ -4798,13 +4863,14 @@ class WrapperMachine:
             if ctx.engine == "codex":
                 used = usage.get("used_tokens") or 0
                 win = usage.get("context_window") or 0
-                await self._emit(ctx, ContextReport(
+                event = ContextReport(
                     total_tokens=used, max_tokens=win,
                     percentage=(used / win * 100.0) if win else 0.0,
                     model=ctx.sdk.model, is_auto_compact_enabled=None,
-                    categories=[], **work_fields))
-                return
-            await self._emit(ctx, ContextReport(
+                    categories=[], **work_fields)
+                await self._emit(ctx, event)
+                return event
+            event = ContextReport(
                 total_tokens=usage.get("totalTokens", 0),
                 max_tokens=usage.get("maxTokens", 0),
                 percentage=usage.get("percentage", 0.0),
@@ -4812,21 +4878,33 @@ class WrapperMachine:
                 is_auto_compact_enabled=usage.get("isAutoCompactEnabled"),
                 categories=usage.get("categories", []) or [],
                 **work_fields,
-            ))
+            )
+            await self._emit(ctx, event)
+            return event
         except Exception as e:
             log.exception("get_context_usage failed", error=str(e))
-            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"get_context failed: {e}"))
+            error = Error(
+                code=ERR_INTERNAL,
+                message=f"get_context failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
 
     async def _handle_get_status(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "读取状态")
         if ctx.engine != "codex":
-            await self._emit(ctx, Error(
+            error = Error(
                 code=ERR_INTERNAL,
                 message="/status 需要 Codex app-server 会话",
-            ))
-            return
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         try:
             event = StatusReport(
                 **await ctx.sdk.get_status(),
@@ -5615,6 +5693,7 @@ class WrapperMachine:
         error = Error(
             code=ERR_INTERNAL,
             message=message,
+            request_id=getattr(cmd, "cmd_id", None),
             to=getattr(cmd, "client_id", None),
         )
         await self._emit(ctx, error)
@@ -5623,7 +5702,7 @@ class WrapperMachine:
     async def _handle_get_goal(self, cmd) -> None:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "读取 Goal")
         try:
             ctx.goal_visible = True
             goal = (await ctx.sdk.get_goal() if ctx.engine == "codex"
@@ -5641,12 +5720,13 @@ class WrapperMachine:
     async def _handle_set_goal(self, cmd) -> None:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "设置 Goal")
         if ctx.engine != "codex":
             if getattr(cmd, "token_budget", None) is not None:
                 error = Error(
                     code=ERR_PROTOCOL,
                     message="Claude /goal 不支持 token budget",
+                    request_id=getattr(cmd, "cmd_id", None),
                     to=getattr(cmd, "client_id", None),
                 )
                 await self._emit(ctx, error)
@@ -5655,6 +5735,7 @@ class WrapperMachine:
                 error = Error(
                     code=ERR_PROTOCOL,
                     message="Claude /goal 只支持设置目标或 clear，不支持暂停/状态切换",
+                    request_id=getattr(cmd, "cmd_id", None),
                     to=getattr(cmd, "client_id", None),
                 )
                 await self._emit(ctx, error)
@@ -5664,6 +5745,7 @@ class WrapperMachine:
                 error = Error(
                     code=ERR_BAD_PROMPT,
                     message="Claude /goal 需要非空完成条件",
+                    request_id=getattr(cmd, "cmd_id", None),
                     to=getattr(cmd, "client_id", None),
                 )
                 await self._emit(ctx, error)
@@ -5671,6 +5753,7 @@ class WrapperMachine:
             if ctx.state != "idle":
                 error = Error(
                     code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                    request_id=getattr(cmd, "cmd_id", None),
                     to=getattr(cmd, "client_id", None))
                 await self._emit(ctx, error)
                 return error
@@ -5705,6 +5788,7 @@ class WrapperMachine:
                 if ctx.state != "idle":
                     error = Error(
                         code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                        request_id=getattr(cmd, "cmd_id", None),
                         to=getattr(cmd, "client_id", None))
                     await self._emit(ctx, error)
                     return error
@@ -5735,11 +5819,12 @@ class WrapperMachine:
     async def _handle_clear_goal(self, cmd) -> None:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "清除 Goal")
         if ctx.engine != "codex":
             if ctx.state != "idle":
                 error = Error(
                     code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                    request_id=getattr(cmd, "cmd_id", None),
                     to=getattr(cmd, "client_id", None))
                 await self._emit(ctx, error)
                 return error
@@ -5767,6 +5852,7 @@ class WrapperMachine:
                 and ctx.codex_spontaneous_turn_id is None):
             error = Error(
                 code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None))
             await self._emit(ctx, error)
             return error
@@ -5793,19 +5879,31 @@ class WrapperMachine:
             error = Error(
                 code=ERR_NOT_RUNNING,
                 message="该会话未启动，无法读取代码差异",
+                request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
-            if sid:
-                await self._emit_to_sid(sid, error)
-            else:
-                await self._emit_focused(error)
-            return
+            await self._emit_to_sid(sid, error)
+            return error
         try:
             diff = await self._git_diff(ctx.cwd, cmd.file)
-            await self._emit(ctx, DiffReport(file=cmd.file, diff=diff))
+            event = DiffReport(
+                file=cmd.file,
+                diff=diff,
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, event)
+            return event
         except Exception as e:
             log.exception("get_diff failed", error=str(e))
-            await self._emit(ctx, Error(code=ERR_INTERNAL, message=f"get_diff failed: {e}"))
+            error = Error(
+                code=ERR_INTERNAL,
+                message=f"get_diff failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
 
     async def _handle_get_file_preview(self, cmd):
         sid = getattr(cmd, "sid", None)
@@ -6205,11 +6303,18 @@ class WrapperMachine:
     async def _handle_answer_question(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
-            return
+            return await self._missing_session_error(cmd, "回答交互问题")
         fut = ctx.pending_asks.get(cmd.ask_id)
         if fut is None:
             log.warning("answer for unknown ask_id", ask_id=cmd.ask_id)
-            return
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message="该交互问题已经结束或不存在",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         if not fut.done():
             fut.set_result(cmd.answer)
             log.info("ask_user answered", ask_id=cmd.ask_id)
@@ -6957,8 +7062,7 @@ class WrapperMachine:
         engine = getattr(cmd, "engine", "claude")
         space = getattr(cmd, "space", "code")
         if engine == "codex":
-            await self._list_codex_sessions(cmd)
-            return
+            return await self._list_codex_sessions(cmd)
         # Claude may create the fork transcript before its init/session id reaches
         # our turn consumer. Until capture durably tombstones that real id, scanning
         # the global session store could publish it to another client. Fail closed
@@ -6969,11 +7073,14 @@ class WrapperMachine:
         ):
             client_id = getattr(cmd, "client_id", None)
             if client_id:
-                await self.transport.send(Error(
+                error = Error(
                     code=ERR_BUSY,
                     message="临时 btw 会话正在初始化，请稍后刷新会话列表",
+                    request_id=getattr(cmd, "cmd_id", None),
                     to=client_id,
-                ))
+                )
+                await self.transport.send(error)
+                return error
             log.warning("Claude session list withheld during btw id capture",
                         client_id=client_id)
             return
@@ -7051,17 +7158,26 @@ class WrapperMachine:
                                 space="code",
                             ))
                             known.add(broker_sid)
-            await self.transport.send(SessionList(
+            event = SessionList(
                 engine="claude",
                 space=space,
                 sessions=sessions,
                 to=getattr(cmd, "client_id", None),
-            ))
+            )
+            await self.transport.send(event)
             log.info("listed sessions", count=len(sessions), resident=len(resident_ids),
                      client_id=getattr(cmd, "client_id", None))
+            return event
         except Exception as e:
             log.exception("list_sessions failed", error=str(e))
-            await self._emit_focused(Error(code=ERR_INTERNAL, message=f"list_sessions failed: {e}"))
+            error = Error(
+                code=ERR_INTERNAL,
+                message=f"list_sessions failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
 
     async def _list_codex_sessions(self, cmd) -> None:
         """Sidebar list from the app-server's authoritative thread state DB."""
@@ -7138,17 +7254,26 @@ class WrapperMachine:
                     forked_from_id=row.get("forked_from_id"),
                     codex_status=row.get("status"),
                 ))
-            await self.transport.send(SessionList(
+            event = SessionList(
                 engine="codex",
                 space=space,
                 sessions=sessions,
                 to=getattr(cmd, "client_id", None),
-            ))
+            )
+            await self.transport.send(event)
             log.info("listed codex sessions", count=len(sessions),
                      client_id=getattr(cmd, "client_id", None))
+            return event
         except Exception as e:
             log.exception("list_codex_sessions failed", error=str(e))
-            await self._emit_focused(Error(code=ERR_INTERNAL, message=f"list_codex_sessions failed: {e}"))
+            error = Error(
+                code=ERR_INTERNAL,
+                message=f"list_codex_sessions failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
 
     async def _handle_switch_session(self, cmd) -> None:
         # Focus change — NO disconnect. If the session is already resident, just
@@ -7512,16 +7637,22 @@ class WrapperMachine:
         engine = "codex" if is_codex else "claude"
         requested_engine = getattr(cmd, "engine", None)
         if requested_engine is not None and requested_engine != engine:
-            await self._emit_to_sid(sid, Error(
-                code=ERR_AUTH, message="会话不属于请求的引擎"))
-            return
+            error = Error(
+                code=ERR_AUTH, message="会话不属于请求的引擎",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            return error
         work_record = await asyncio.to_thread(
             self._work.for_engine(engine).get_by_session, sid)
         requested_space = getattr(cmd, "space", "code")
         if (work_record is not None) != (requested_space == "work"):
-            await self._emit_to_sid(sid, Error(
-                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间"))
-            return
+            error = Error(
+                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            return error
         if is_codex:
             self._codex_session_list_cache = None
             try:
@@ -7534,13 +7665,16 @@ class WrapperMachine:
                         sid, cmd.title)
                 log.info("codex session renamed", session_id=sid,
                          title_length=len(cmd.title))
-                await self._list_codex_sessions(cmd)
+                return await self._list_codex_sessions(cmd)
             except Exception as e:
                 log.exception("codex rename_session failed", error=str(e))
-                await self._emit_to_sid(sid, Error(
-                    code=ERR_INTERNAL, message=f"rename failed: {e}"))
-                await self._list_codex_sessions(cmd)
-            return
+                error = Error(
+                    code=ERR_INTERNAL, message=f"rename failed: {e}",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None))
+                await self._emit_to_sid(sid, error)
+                listing = await self._list_codex_sessions(cmd)
+                return error, listing
         try:
             await asyncio.to_thread(rename_session, sid, cmd.title)
             if work_record is not None:
@@ -7551,10 +7685,15 @@ class WrapperMachine:
             self._resync_watch(sid)
             log.info("session renamed", session_id=sid,
                      title_length=len(cmd.title))
-            await self._handle_list_sessions(cmd)
+            return await self._handle_list_sessions(cmd)
         except Exception as e:
             log.exception("rename_session failed", error=str(e))
-            await self._emit_focused(Error(code=ERR_INTERNAL, message=f"rename failed: {e}"))
+            error = Error(
+                code=ERR_INTERNAL, message=f"rename failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            return error
 
     async def _handle_archive_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
@@ -7562,16 +7701,22 @@ class WrapperMachine:
         engine = "codex" if is_codex else "claude"
         requested_engine = getattr(cmd, "engine", None)
         if requested_engine is not None and requested_engine != engine:
-            await self._emit_to_sid(sid, Error(
-                code=ERR_AUTH, message="会话不属于请求的引擎"))
-            return
+            error = Error(
+                code=ERR_AUTH, message="会话不属于请求的引擎",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            return error
         work_record = await asyncio.to_thread(
             self._work.for_engine(engine).get_by_session, sid)
         requested_space = getattr(cmd, "space", "code")
         if (work_record is not None) != (requested_space == "work"):
-            await self._emit_to_sid(sid, Error(
-                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间"))
-            return
+            error = Error(
+                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            return error
         if is_codex:
             self._codex_session_list_cache = None
             method = "thread/archive" if cmd.archived else "thread/unarchive"
@@ -7583,16 +7728,19 @@ class WrapperMachine:
                         sid, cmd.archived)
                 log.info("codex session archive toggled", session_id=sid,
                          archived=cmd.archived)
-                await self._list_codex_sessions(cmd)
+                return await self._list_codex_sessions(cmd)
             except Exception as e:
                 log.exception("codex archive_session failed", error=str(e))
-                await self._emit_to_sid(sid, Error(
-                    code=ERR_INTERNAL, message=f"archive failed: {e}"))
+                error = Error(
+                    code=ERR_INTERNAL, message=f"archive failed: {e}",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None))
+                await self._emit_to_sid(sid, error)
                 # The UI waits for this authoritative result instead of moving
                 # the card optimistically. It also reconciles a timeout where the
                 # app-server committed the mutation but its response was lost.
-                await self._list_codex_sessions(cmd)
-            return
+                listing = await self._list_codex_sessions(cmd)
+                return error, listing
         try:
             tag = "archived" if cmd.archived else None
             await asyncio.to_thread(tag_session, sid, tag)
@@ -7603,10 +7751,15 @@ class WrapperMachine:
             # our own append -> re-baseline (see _resync_watch)
             self._resync_watch(sid)
             log.info("session archive toggled", session_id=sid, archived=cmd.archived)
-            await self._handle_list_sessions(cmd)
+            return await self._handle_list_sessions(cmd)
         except Exception as e:
             log.exception("archive_session failed", error=str(e))
-            await self._emit_focused(Error(code=ERR_INTERNAL, message=f"archive failed: {e}"))
+            error = Error(
+                code=ERR_INTERNAL, message=f"archive failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            return error
 
     async def _handle_pin_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
@@ -7614,30 +7767,42 @@ class WrapperMachine:
         engine = "codex" if is_codex else "claude"
         requested_engine = getattr(cmd, "engine", None)
         if requested_engine is not None and requested_engine != engine:
-            await self._emit_to_sid(sid, Error(
-                code=ERR_AUTH, message="会话不属于请求的引擎"))
-            return
+            error = Error(
+                code=ERR_AUTH, message="会话不属于请求的引擎",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            return error
         work_record = await asyncio.to_thread(
             self._work.for_engine(engine).get_by_session, sid)
         requested_space = getattr(cmd, "space", "code")
         if (work_record is not None) != (requested_space == "work"):
-            await self._emit_to_sid(sid, Error(
-                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间"))
-            return
+            error = Error(
+                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            return error
         if (work_record is None and self._ctx_by_sid(sid) is None
                 and not is_codex):
             info = await asyncio.to_thread(get_session_info, sid)
             if info is None:
-                await self._emit_to_sid(sid, Error(
-                    code=ERR_NOT_RUNNING, message="Claude 会话不存在"))
-                await self._handle_list_sessions(cmd)
-                return
+                error = Error(
+                    code=ERR_NOT_RUNNING, message="Claude 会话不存在",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None))
+                await self._emit_to_sid(sid, error)
+                listing = await self._handle_list_sessions(cmd)
+                return error, listing
         if (self._session_pins is None):
-            await self._emit_to_sid(sid, Error(
-                code=ERR_INTERNAL, message="置顶状态存储暂不可用"))
-            await (self._list_codex_sessions(cmd) if is_codex
-                   else self._handle_list_sessions(cmd))
-            return
+            error = Error(
+                code=ERR_INTERNAL, message="置顶状态存储暂不可用",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            listing = await (self._list_codex_sessions(cmd) if is_codex
+                             else self._handle_list_sessions(cmd))
+            return error, listing
         try:
             await asyncio.to_thread(
                 self._session_pins.set_pinned, engine, sid, bool(cmd.pinned))
@@ -7646,10 +7811,16 @@ class WrapperMachine:
         except SessionPinStoreError as exc:
             log.warning("session pin update failed", engine=engine,
                         session_id=sid, error=str(exc))
-            await self._emit_to_sid(sid, Error(
-                code=ERR_INTERNAL, message="置顶状态保存失败"))
-        await (self._list_codex_sessions(cmd) if is_codex
-               else self._handle_list_sessions(cmd))
+            error = Error(
+                code=ERR_INTERNAL, message="置顶状态保存失败",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None))
+            await self._emit_to_sid(sid, error)
+            listing = await (self._list_codex_sessions(cmd) if is_codex
+                             else self._handle_list_sessions(cmd))
+            return error, listing
+        return await (self._list_codex_sessions(cmd) if is_codex
+                      else self._handle_list_sessions(cmd))
 
     async def _handle_delete_work_session(self, cmd):
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
@@ -9903,10 +10074,21 @@ class WrapperMachine:
     async def _handle_list_dir(self, cmd) -> None:
         try:
             path, parent, dirs = await asyncio.to_thread(self._scan_dir, cmd.path)
-            await self._emit_focused(DirList(path=path, parent=parent, dirs=dirs))
+            event = DirList(
+                path=path, parent=parent, dirs=dirs,
+                to=getattr(cmd, "client_id", None))
+            await self.transport.send(event)
+            return event
         except Exception as e:
             log.exception("list_dir failed", path=getattr(cmd, "path", None), error=str(e))
-            await self._emit_focused(Error(code=ERR_INTERNAL, message=f"list_dir failed: {e}"))
+            error = Error(
+                code=ERR_INTERNAL,
+                message=f"list_dir failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
 
     @staticmethod
     def _scan_dir(path: Optional[str]) -> tuple[str, Optional[str], list[dict[str, str]]]:

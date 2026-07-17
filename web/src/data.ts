@@ -42,7 +42,6 @@ export const COMMANDS: Command[] = [
 export const WORK_COMMANDS: Command[] = [
   { g: "设置" },
   { slash: "model", name: "切换模型", ds: "选择本次工作的模型与思考强度", ic: "cpu" },
-  { slash: "permissions", name: "访问权限", ds: "选择执行工作时的审批策略", ic: "shield" },
   { g: "工作" },
   { slash: "goal", name: "工作目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "临时侧聊，不影响当前工作主线", ic: "spark" },
@@ -54,6 +53,9 @@ export const WORK_COMMANDS: Command[] = [
 // `efforts` overrides the engine's baseline effort list for THIS model — reasoning
 // levels are per-model, not per-engine.
 export interface Model { id: string; name: string; ds: string; ic: string; efforts?: Effort[] }
+// Claude Code exposes the active/default model but no supported model catalog.
+// These are presentation-only common aliases, never a capability claim. The
+// model sheet also accepts a custom/provider model id verbatim.
 export const MODELS: Model[] = [
   { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "crown" },
   { id: "claude-opus-4-8", name: "Opus 4.8", ds: "最强推理", ic: "gem" },
@@ -145,8 +147,8 @@ export const defaultModelFor = (engine?: string, catalog?: Catalog,
   const list = modelsFor(engine, catalog);
   const want = engine ? defaults?.[engine] : undefined;
   // Codex defaults are accepted only when app-server's live catalog contains
-  // them. Claude may legitimately use a custom/hidden alias absent from our
-  // static presentation table, so preserve its wrapper-resolved id.
+  // them. Claude may legitimately use a custom/provider alias absent from the
+  // common suggestions above, so preserve its wrapper-resolved id.
   return want && (engine !== "codex" || list.some((m) => m.id === want))
     ? want : list[0].id;
 };

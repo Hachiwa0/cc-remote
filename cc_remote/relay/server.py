@@ -24,13 +24,18 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse
 
-from cc_remote.config import RelayConfig, relay_config, validate_relay_config
+from cc_remote.config import (
+    RelayConfig, relay_config, valid_machine_id, validate_relay_config,
+)
 from cc_remote.log import logger
 from cc_remote.relay.auth import (
     SESSION_COOKIE_NAME, SessionClaims, authenticate, authenticate_login,
     make_session_token, session_token_claims, wrapper_machine_scope,
 )
 from cc_remote.relay.pairing import RelayHub
+from cc_remote.relay.push import (
+    PushDispatcher, PushSubscription, PushSubscriptionStore,
+)
 
 log = logger("cc_remote.relay.server")
 
@@ -43,6 +48,8 @@ SESSION_EXPIRED_CLOSE_CODE = 1008
 SESSION_EXPIRED_CLOSE_REASON = "session expired"
 SESSION_REVOKED_CLOSE_CODE = 1008
 SESSION_REVOKED_CLOSE_REASON = "session revoked"
+_PUSH_BODY_MAX_BYTES = 16 * 1024
+_PUSH_KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,1024}")
 
 
 class LoginRateLimiter:
@@ -155,10 +162,13 @@ class SessionRegistry:
             return True
 
     async def active(self, claims: SessionClaims) -> bool:
+        return await self.active_id(claims.jti, claims.expires_at)
+
+    async def active_id(self, jti: str, expires_at: float) -> bool:
         async with self._lock:
             self._prune_locked(time.time())
-            entry = self._entries.get(claims.jti)
-            return entry is not None and entry.expires_at == claims.expires_at
+            entry = self._entries.get(jti)
+            return entry is not None and entry.expires_at == expires_at
 
     async def subscribe(self, claims: SessionClaims) -> Optional[asyncio.Event]:
         async with self._lock:
@@ -240,6 +250,78 @@ async def _read_json_limited(req: Request, max_bytes: int):
     return json.loads(body)
 
 
+async def _active_claims(
+    req: Request,
+    cfg: RelayConfig,
+    sessions: SessionRegistry,
+) -> SessionClaims | None:
+    token = req.cookies.get(SESSION_COOKIE_NAME, "")
+    claims = session_token_claims(token, cfg.session_secret)
+    if (
+        claims is None
+        or claims.expires_at <= time.time()
+        or not await sessions.active(claims)
+    ):
+        return None
+    return claims
+
+
+def _push_subject(claims: SessionClaims) -> str:
+    # Legacy password mode intentionally represents one shared user.
+    return claims.subject or "legacy"
+
+
+def _parse_push_subscription(
+    body: object,
+    claims: SessionClaims,
+) -> PushSubscription | None:
+    if not isinstance(body, dict):
+        return None
+    machine_id = body.get("machine_id")
+    endpoint = body.get("endpoint")
+    keys = body.get("keys")
+    if (
+        not isinstance(machine_id, str)
+        or not valid_machine_id(machine_id)
+        or not claims.allows_machine(machine_id)
+        or not isinstance(endpoint, str)
+        or len(endpoint) > 4096
+        or not isinstance(keys, dict)
+    ):
+        return None
+    try:
+        parsed = urlsplit(endpoint)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        return None
+    p256dh = keys.get("p256dh")
+    auth = keys.get("auth")
+    if (
+        not isinstance(p256dh, str)
+        or not _PUSH_KEY_RE.fullmatch(p256dh)
+        or not isinstance(auth, str)
+        or not _PUSH_KEY_RE.fullmatch(auth)
+    ):
+        return None
+    return PushSubscription(
+        subject=_push_subject(claims),
+        machine_id=machine_id,
+        endpoint=endpoint,
+        p256dh=p256dh,
+        auth=auth,
+        session_jti=claims.jti,
+        expires_at=claims.expires_at,
+    )
+
+
 async def _serve_client_until_expiry(
     websocket: WebSocket,
     hub: RelayHub,
@@ -290,12 +372,35 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
         cfg = relay_config()
     validate_relay_config(cfg)
     app = FastAPI(title="cc-remote relay")
-    hub = RelayHub(cfg)
     sessions = SessionRegistry(cfg.session_registry_cap)
+    push_store: PushSubscriptionStore | None = None
+    push_dispatcher: PushDispatcher | None = None
+    if cfg.push_vapid_public_key:
+        push_store = PushSubscriptionStore(cfg.push_db_path)
+        push_dispatcher = PushDispatcher(
+            push_store,
+            vapid_private_key=cfg.push_vapid_private_key,
+            vapid_subject=cfg.push_vapid_subject,
+            session_active=lambda subscription: sessions.active_id(
+                subscription.session_jti, subscription.expires_at),
+        )
+
+    async def on_live_turn_end(machine_id: str, msg: object) -> None:
+        if push_dispatcher is None:
+            return
+        result = getattr(msg, "result", None)
+        await push_dispatcher.notify_turn_end(
+            machine_id,
+            is_error=bool(getattr(result, "is_error", False)),
+        )
+
+    hub = RelayHub(cfg, on_live_turn_end=on_live_turn_end)
     login_slots = asyncio.Semaphore(cfg.login_inflight_cap)
     app.state.hub = hub
     app.state.sessions = sessions
     app.state.login_slots = login_slots
+    app.state.push_store = push_store
+    app.state.push_dispatcher = push_dispatcher
 
     @app.get("/api/auth-config")
     async def auth_config() -> JSONResponse:
@@ -303,6 +408,67 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
             {"multi_user": bool(cfg.login_users_json)},
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.get("/api/push-config")
+    async def push_config(req: Request) -> JSONResponse:
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse(
+                {"ok": False}, status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(
+            {
+                "enabled": push_dispatcher is not None,
+                "public_key": cfg.push_vapid_public_key
+                if push_dispatcher is not None else "",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/push/subscribe")
+    async def push_subscribe(req: Request) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        if push_store is None:
+            return JSONResponse({"error": "push_disabled"}, status_code=503)
+        try:
+            body = await _read_json_limited(req, _PUSH_BODY_MAX_BYTES)
+        except _BodyTooLarge:
+            return JSONResponse({"error": "too_large"}, status_code=413)
+        except Exception:
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        subscription = _parse_push_subscription(body, claims)
+        if subscription is None:
+            return JSONResponse({"error": "invalid_subscription"}, status_code=400)
+        await push_store.upsert(subscription)
+        return JSONResponse(
+            {"ok": True}, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/push/unsubscribe")
+    async def push_unsubscribe(req: Request) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        if push_store is None:
+            return JSONResponse({"ok": True})
+        try:
+            body = await _read_json_limited(req, _PUSH_BODY_MAX_BYTES)
+        except _BodyTooLarge:
+            return JSONResponse({"error": "too_large"}, status_code=413)
+        except Exception:
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        endpoint = body.get("endpoint") if isinstance(body, dict) else None
+        if not isinstance(endpoint, str) or not (1 <= len(endpoint) <= 4096):
+            return JSONResponse({"error": "invalid_subscription"}, status_code=400)
+        await push_store.remove_endpoint(_push_subject(claims), endpoint)
+        return JSONResponse(
+            {"ok": True}, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/login")
     async def login(req: Request) -> JSONResponse:
@@ -419,6 +585,8 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
         token = req.cookies.get(SESSION_COOKIE_NAME, "")
         claims = session_token_claims(token, cfg.session_secret)
         if claims is not None:
+            if push_store is not None:
+                await push_store.remove_session(claims.jti)
             await sessions.revoke(claims.jti)
         response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
         response.delete_cookie(

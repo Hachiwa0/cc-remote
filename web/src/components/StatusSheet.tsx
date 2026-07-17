@@ -6,6 +6,7 @@ import { accountStatsNote } from "../status-capabilities";
 interface Props {
   open: boolean;
   report: StatusReport | null;
+  error?: string | null;
   onClose: () => void;
   onRefresh: () => void;
 }
@@ -48,7 +49,7 @@ function RateLimit({ limit }: { limit: StatusRateLimit }) {
   </div>;
 }
 
-export function StatusSheet({ open, report, onClose, onRefresh }: Props) {
+export function StatusSheet({ open, report, error, onClose, onRefresh }: Props) {
   if (!open) return null;
   const thread = report?.thread;
   const runtime = report?.runtime;
@@ -65,7 +66,8 @@ export function StatusSheet({ open, report, onClose, onRefresh }: Props) {
         <button className="status-refresh" onClick={onRefresh}>刷新</button>
         <button onClick={onClose} aria-label="关闭"><Icon name="close" size={17} /></button>
       </header>
-      {!report ? <div className="status-loading"><span />正在读取 thread、config 和 account…</div> :
+      {error && <div className="status-partial" role="alert"><b>状态读取失败</b><span>{error}</span></div>}
+      {!report && !error ? <div className="status-loading"><span />正在读取 thread、config 和 account…</div> : report ?
       <div className="status-sheet-scroll">
         <section className="status-section">
           <h3>线程</h3>
@@ -133,7 +135,7 @@ export function StatusSheet({ open, report, onClose, onRefresh }: Props) {
           <b>部分状态暂不可用</b>
           {report.component_errors.map((error, index) => <span key={index}>{error}</span>)}
         </section>}
-      </div>}
+      </div> : null}
     </section>
   </>;
 }

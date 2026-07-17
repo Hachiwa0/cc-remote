@@ -1,9 +1,8 @@
-import type { Engine, RestoreMode } from "../protocol";
+import type { RestoreMode } from "../protocol";
 import { Icon } from "../icons";
 
 export interface RollbackTarget {
   sessionId: string;
-  engine: Engine;
   checkpointId?: string;
   numTurns: number;
   label: string;
@@ -15,25 +14,18 @@ export function RollbackSheet({ target, onClose, onConfirm }: {
   onConfirm: (mode: RestoreMode) => void;
 }) {
   if (!target) return null;
-  const isClaude = target.engine === "claude";
   const options: { mode: RestoreMode; icon: string; title: string; detail: string }[] = [
     {
       mode: "conversation", icon: "history", title: "仅回滚对话",
-      detail: isClaude
-        ? "回到所选消息，保留当前文件；原输入会回填到编辑框。"
-        : `移除最近 ${target.numTurns} 轮对话，保留当前文件。`,
+      detail: `移除最近 ${target.numTurns} 轮对话，保留当前文件。`,
     },
     {
       mode: "files", icon: "code", title: "仅恢复代码",
-      detail: isClaude
-        ? "恢复 Claude checkpoint 追踪的文件；Bash 和手动修改不在官方恢复范围。"
-        : `恢复最近 ${target.numTurns} 轮由 Remote 记录的 Git 工作树改动；冲突时不会覆盖。`,
+      detail: `恢复最近 ${target.numTurns} 轮由 Remote 记录的 Git 工作树改动；冲突时不会覆盖。`,
     },
     {
       mode: "both", icon: "refresh", title: "对话和代码",
-      detail: isClaude
-        ? "先回到所选对话，再恢复对应 checkpoint 文件；对话失败时不会修改文件。"
-        : "先安全恢复代码，再回滚对话；两部分结果会分别确认。",
+      detail: "先安全恢复代码，再回滚对话；两部分结果会分别确认。",
     },
   ];
   return <>
@@ -43,7 +35,7 @@ export function RollbackSheet({ target, onClose, onConfirm }: {
       <div className="sheet-grip" />
       <header className="rollback-head">
         <span className="rollback-head-icon"><Icon name="history" size={19} /></span>
-        <span><b>{isClaude ? "Claude Rewind" : "Codex 回滚"}</b><small>{target.label}</small></span>
+        <span><b>Codex 回滚</b><small>{target.label}</small></span>
         <button onClick={onClose} aria-label="关闭"><Icon name="close" size={17} /></button>
       </header>
       <div className="rollback-options">

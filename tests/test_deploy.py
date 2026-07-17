@@ -114,6 +114,9 @@ def test_setup_script_is_valid_shell_and_keeps_safe_install_order():
     assert "RELAY_SERVICE_TOUCHED=1" in source
     assert "flock -n 9" in source
     assert 'RELEASES_DIR="$APPDIR/releases"' in source
+    assert 'STATE_DIR="$APPDIR/state"' in source
+    assert 'mkdir -p "$RELEASES_DIR" "$STATE_DIR"' in source
+    assert 'chown ccremote:ccremote "$STATE_DIR"' in source
     assert 'CURRENT_LINK="$APPDIR/current"' in source
     assert 'NEW_RELEASE_DIR="$(mktemp -d "$RELEASES_DIR/release-' in source
     assert 'atomic_release_link "$NEW_RELEASE_DIR" "$CURRENT_LINK"' in source
@@ -644,6 +647,7 @@ def test_relay_service_is_read_only_but_can_read_static_files():
     assert "NoNewPrivileges=true" in source
     assert "PrivateTmp=true" in source
     assert "ProtectSystem=strict" in source
+    assert "ReadWritePaths=/opt/cc-remote/state" in source
     assert "ProtectHome=true" in source
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in source
     assert "InaccessiblePaths=/opt" not in source
