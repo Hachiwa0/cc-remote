@@ -26,7 +26,6 @@ interface Props {
   onArchive: (id: string, archived: boolean) => void;
   onPin: (session: SessionInfo, pinned: boolean) => void;
   onDelete: (id: string) => void;
-  onRollback: (id: string) => void;
   onForkWorktree: (session: SessionInfo) => void;
 }
 
@@ -54,7 +53,7 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 
 export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStates,
   activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive,
-  onPin, onDelete, onRollback, onForkWorktree }: Props) {
+  onPin, onDelete, onForkWorktree }: Props) {
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
@@ -120,10 +119,6 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
   };
   const doDelete = (s: SessionInfo) => {
     onDelete(s.session_id);
-    setMenuCardId(null); setLifting(false);
-  };
-  const doRollback = (s: SessionInfo) => {
-    onRollback(s.session_id);
     setMenuCardId(null); setLifting(false);
   };
   const closeMenu = () => { setMenuCardId(null); setLifting(false); };
@@ -259,11 +254,6 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
               <button onClick={() => doForkWorktree(s)} disabled={forkBlocked}
                 title={forkBlocked ? "请等待当前任务结束" : "从当前 Git HEAD 创建新工作树"}>
                 <Icon name="branch" size={15} />派生到新工作树…
-              </button>
-            )}
-            {capabilities.rollback && (
-              <button onClick={() => doRollback(s)}>
-                <Icon name="history" size={15} />回滚最近一轮
               </button>
             )}
             <button onClick={() => doCopyId(s)}><Icon name={copiedId === s.session_id ? "check" : "copy"} size={15} />{copiedId === s.session_id ? "已复制" : "复制 session ID"}</button>

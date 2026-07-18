@@ -7160,8 +7160,9 @@ class WrapperMachine:
                     session_id=info.session_id,
                     summary=(
                         (record.title if record else None)
-                        or info.summary
                         or (info.custom_title if hasattr(info, "custom_title") else None)
+                        or info.first_prompt
+                        or info.summary
                         or ""
                     )[:500] or None,
                     last_modified=str(info.last_modified) if info.last_modified else None,

@@ -21,14 +21,12 @@ assert.deepEqual(sessionMenuCapabilities(codex), {
   rename: true,
   archive: true,
   forkWorktree: true,
-  rollback: true,
   delete: true,
 });
 assert.deepEqual(sessionMenuCapabilities(claude), {
   rename: true,
   archive: true,
   forkWorktree: false,
-  rollback: false,
   delete: true,
 });
 assert.equal(sessionMenuCapabilities(archivedCodex).forkWorktree, false);

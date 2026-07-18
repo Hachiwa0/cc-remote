@@ -64,7 +64,6 @@ interface Props {
     value?: string,
   ) => void;
   onCompact?: () => void;
-  onRollback?: (numTurns: number) => void;
   onOpenExtensions?: (kind: EngineCapabilityKind | "all") => void;
   workArtifactCount?: number;
   onOpenArtifacts?: () => void;
@@ -332,20 +331,7 @@ export function Composer(p: Props) {
         p.onCompact?.();
         flash("正在启动 Codex 原生上下文压缩…");
         break;
-      case "rollback": {
-        const rawTurns = args.trim();
-        if (rawTurns && !/^\d+$/.test(rawTurns)) {
-          flash("用法：/rollback [正整数轮数]");
-          return;
-        }
-        const turns = rawTurns ? Number(rawTurns) : 1;
-        if (!Number.isSafeInteger(turns) || turns < 1 || turns > 1000) {
-          flash("回滚轮数必须在 1 到 1000 之间");
-          return;
-        }
-        p.onRollback?.(turns);
-        break;
-      }
+      case "rollback": flash("Codex Rollback 暂未开放"); break;
       // /btw: open an ephemeral side-fork panel (both engines).
       case "btw": p.onOpenBtw?.(); break;
       case "preview":

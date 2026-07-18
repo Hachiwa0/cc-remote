@@ -221,7 +221,7 @@ export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions",
 // and never expanded into natural-language lookalikes. /context is the focused
 // thread's token window; /status is a separate app-server snapshot (thread,
 // config, account and rate limits). /review maps to review/start, /compact maps
-// to thread/compact/start, and /rollback maps to thread/rollback. /init remains
+// to thread/compact/start. /init remains
 // an explicit compatibility prompt because app-server has no init RPC. /fast maps to app-server's per-thread service tier,
 // and /hook is Claude-only. /plan and /normal are handled locally by the web
 // client and mapped to app-server collaborationMode, not sent as prompt text.
@@ -250,12 +250,12 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "status", name: "完整状态", ds: "线程 · 配置 · 账户 · 限额 · token", ic: "cpu" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用与容量", ic: "cpu" },
   { slash: "compact", name: "压缩上下文", ds: "调用 Codex 原生 compact", ic: "simplify" },
-  { slash: "rollback", name: "回滚", ds: "/rollback [轮数] · 可选择对话、代码或两者", ic: "history" },
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
 const WORK_CMD_LIST: Cmd[] = WORK_COMMANDS.filter(isCmd) as Cmd[];
 export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
+const HIDDEN_CODE_ONLY_SLASHES = new Set(["rollback"]);
 export type CommandSurface = "code" | "work";
 export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (
   surface === "work" ? WORK_COMMANDS : engine === "codex" ? CODEX_COMMANDS : COMMANDS
@@ -266,9 +266,10 @@ export const clientSlashesFor = (engine?: string): Set<string> => (engine === "c
  * Unknown slashes return false so user-installed Claude skills remain usable. */
 export function isKnownCodeOnlySlash(slash: string, engine?: string): boolean {
   const normalized = slash.toLowerCase();
-  return (engine === "codex" ? CODEX_CMD_LIST : CMD_LIST).some(
+  return (engine === "codex" && HIDDEN_CODE_ONLY_SLASHES.has(normalized)) || ((
+    engine === "codex" ? CODEX_CMD_LIST : CMD_LIST).some(
     (command) => command.slash === normalized,
-  ) && !WORK_CMD_LIST.some((command) => command.slash === normalized);
+  ) && !WORK_CMD_LIST.some((command) => command.slash === normalized));
 }
 // codex slash -> the prompt actually sent to codex (agentic; no TUI slash layer).
 export const CODEX_PROMPTS: Record<string, string> = {

@@ -262,6 +262,9 @@ const rewindComposerSource = readFileSync(resolve(
 assert.equal(commandsFor("claude").some((command) => (
   "slash" in command && command.slash === "rewind"
 )), false, "Claude rewind must stay hidden from the command palette");
+assert.equal(commandsFor("codex").some((command) => (
+  "slash" in command && command.slash === "rollback"
+)), false, "Codex rollback must stay hidden from the command palette");
 const claudeWorkSlashes = commandsFor("claude", "work")
   .filter((command) => "slash" in command)
   .map((command) => command.slash);
@@ -296,6 +299,8 @@ assert.doesNotMatch(rewindChatViewSource, /onRewind|回到这里/,
   "Claude messages must not expose a rewind action while unsupported");
 assert.match(rewindComposerSource, /case "rewind": flash\("Claude Rewind 暂未开放"\)/,
   "a manually typed hidden rewind command must be blocked locally");
+assert.match(rewindComposerSource, /case "rollback": flash\("Codex Rollback 暂未开放"\)/,
+  "a manually typed hidden Codex rollback command must be blocked locally");
 assert.match(historyAppSource, /replay_start[\s\S]*sendGetHistory/,
   "a replay gap must request authoritative history instead of ending on an empty view");
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,

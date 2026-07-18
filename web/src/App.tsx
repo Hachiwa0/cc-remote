@@ -15,7 +15,6 @@ import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { GoalPanel } from "./components/GoalPanel";
-import { RollbackSheet, type RollbackTarget } from "./components/RollbackSheet";
 import { StatusSheet } from "./components/StatusSheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
@@ -36,7 +35,7 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexServiceTier, type CollaborationModeName,
-  type DiffTheme, type Engine, type Space, type RestoreMode,
+  type DiffTheme, type Engine, type Space,
   type SessionControl, sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
@@ -89,7 +88,6 @@ export default function App() {
   const [forkWorktreeCreating, setForkWorktreeCreating] = useState(false);
   const [forkWorktreeError, setForkWorktreeError] = useState<string | null>(null);
   const [forkingPointId, setForkingPointId] = useState<string | null>(null);
-  const [rollbackTarget, setRollbackTarget] = useState<RollbackTarget | null>(null);
   const [workManagerOpen, setWorkManagerOpen] = useState(false);
   const [workArtifactsOpen, setWorkArtifactsOpen] = useState(false);
   const [capabilitiesOpen, setCapabilitiesOpen] = useState(false);
@@ -722,7 +720,6 @@ export default function App() {
           historyCacheEpochRef.current.clear();
           setBtwOpening(false);
           setForkingPointId(null);
-          setRollbackTarget(null);
           setForkWorktreeSession(null);
           setForkWorktreeCreating(false);
           setForkWorktreeError(null);
@@ -1082,21 +1079,6 @@ export default function App() {
     if (command.kind === "show") wsRef.current?.sendGetGoal();
     else wsRef.current?.sendSetGoal(command.objective, "active", null);
   };
-  const openCodexRollback = (numTurns: number, sessionId = focusedSid) => {
-    if (!sessionId) return;
-    setRollbackTarget({
-      sessionId, numTurns,
-      label: `最近 ${numTurns} 轮`,
-    });
-  };
-  const confirmRollback = (mode: RestoreMode) => {
-    const target = rollbackTarget;
-    if (!target) return;
-    wsRef.current?.sendRollbackSession(
-      target.sessionId, "codex", mode, target.numTurns,
-      target.checkpointId);
-    setRollbackTarget(null);
-  };
   const openStatus = () => {
     if (!focusedSid) return;
     setStatusOpenSid(focusedSid);
@@ -1246,7 +1228,6 @@ export default function App() {
       historyCacheEpochRef.current.clear();
       setCreateError(null);
       setForkingPointId(null);
-      setRollbackTarget(null);
       setForkWorktreeSession(null);
       setForkWorktreeCreating(false);
       setForkWorktreeError(null);
@@ -1292,9 +1273,6 @@ export default function App() {
           if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~" });
           wsRef.current?.sendDeleteSession(id, engine, space);
         }}
-        onRollback={(id) => {
-          openCodexRollback(1, id);
-        }}
         onForkWorktree={openForkWorktree}
       />
       <DirPicker
@@ -1306,8 +1284,6 @@ export default function App() {
         onConfirm={(cwd) => { if (state.newChat) dispatch({ type: "set_new_chat_cwd", cwd }); setDirPickerOpen(false); }}
         onClose={() => setDirPickerOpen(false)}
       />
-      <RollbackSheet target={rollbackTarget}
-        onClose={() => setRollbackTarget(null)} onConfirm={confirmRollback} />
       <section className={`pane ${space}-pane`}>
         <header className={`c-head ${space}-head`}>
           <div className="titlewrap">
@@ -1460,10 +1436,6 @@ export default function App() {
           }}
           onCompact={() => {
             if (focusedSid) wsRef.current?.sendCompactSession(focusedSid);
-          }}
-          onRollback={(numTurns) => {
-            if (!focusedSid) return;
-            openCodexRollback(numTurns);
           }}
           onOpenExtensions={(kind) => {
             setCapabilitiesKind(kind);

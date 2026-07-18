@@ -109,3 +109,29 @@ def test_claude_session_list_includes_durable_pin(monkeypatch):
         assert listing.sessions[0].pinned is True
 
     asyncio.run(run())
+
+
+def test_claude_session_list_uses_stable_title_not_latest_prompt(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        monkeypatch.setattr(machine_module, "list_sessions", lambda limit=200: [
+            SimpleNamespace(
+                session_id="named", summary="latest question",
+                custom_title="official title", first_prompt="first question",
+                last_modified=20, git_branch=None, cwd="/repo", tag=None,
+            ),
+            SimpleNamespace(
+                session_id="unnamed", summary="latest follow-up",
+                custom_title=None, first_prompt="initial question",
+                last_modified=10, git_branch=None, cwd="/repo", tag=None,
+            ),
+        ])
+
+        await machine._handle_list_sessions(ListSessions(client_id="client-1"))
+        listing = next(message for message in transport.sent
+                       if isinstance(message, SessionList))
+        assert [session.summary for session in listing.sessions] == [
+            "official title", "initial question",
+        ]
+
+    asyncio.run(run())
