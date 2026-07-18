@@ -48,6 +48,7 @@ import {
   setSessionPinned,
 } from "./session-order";
 import { disableRemotePush, enableRemotePush } from "./push";
+import { turnNotificationBody, turnNotificationTag } from "./turn-notification";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -635,11 +636,11 @@ export default function App() {
             const session = stateRef.current.sessions.find(
               (candidate) => candidate.session_id === msg.sid);
             const label = session?.engine === "codex" ? "Codex" : "Claude";
-            const body = msg.result.is_error ? `${label} 会话执行失败` : `${label} 会话已经完成`;
+            const body = turnNotificationBody(label, msg.result);
             void navigator.serviceWorker?.ready.then((registration) =>
               registration.showNotification("cc-remote", {
                 body, icon: "/favicon.svg", badge: "/favicon.svg",
-                tag: `turn-${msg.sid}`, data: { url: "/" },
+                tag: turnNotificationTag(msg), data: { url: "/" },
               })).catch(() => undefined);
           }
           if (msg.type === "session_focus" && spaceRef.current === "work"
@@ -1335,7 +1336,7 @@ export default function App() {
           </select>}
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
-          <button className="iconbtn header-secondary" onClick={() => {
+          <button className="iconbtn header-agent" onClick={() => {
             setCapabilitiesOpen(true);
             setCapabilitiesLoading(true);
             wsRef.current?.sendGetEngineCapabilities(
@@ -1344,7 +1345,7 @@ export default function App() {
             <Icon name="spark" />
           </button>
           {typeof Notification !== "undefined" && <button
-            className={`iconbtn header-secondary${notificationsEnabled ? " notify-on" : ""}`}
+            className={`iconbtn header-notify${notificationsEnabled ? " notify-on" : ""}`}
             onClick={() => { void (async () => {
               if (notificationsEnabled) {
                 localStorage.removeItem(NOTIFY_KEY);
@@ -1364,7 +1365,7 @@ export default function App() {
             title={notificationsEnabled ? "后台完成提醒已开启" : "开启后台完成提醒"}>
             <Icon name="notify" />
           </button>}
-          <button className="iconbtn header-secondary" onClick={toggleTheme} aria-label="切换主题">
+          <button className="iconbtn header-theme" onClick={toggleTheme} aria-label="切换主题">
             <Icon name={theme === "dark" ? "sun" : "moon"} />
           </button>
           <button className="iconbtn" onClick={() => void logout()}

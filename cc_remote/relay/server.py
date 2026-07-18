@@ -34,7 +34,7 @@ from cc_remote.relay.auth import (
 )
 from cc_remote.relay.pairing import RelayHub
 from cc_remote.relay.push import (
-    PushDispatcher, PushSubscription, PushSubscriptionStore,
+    PushDispatcher, PushOutcome, PushSubscription, PushSubscriptionStore,
 )
 
 log = logger("cc_remote.relay.server")
@@ -43,6 +43,19 @@ _LOGIN_WINDOW = 60.0
 _LOGIN_MAX = 5
 _LOGIN_MAX_IPS = 4096
 _LOGIN_MAX_TOTAL_ATTEMPTS = 16384
+
+
+def _turn_push_outcome(result: object | None) -> PushOutcome:
+    subtype = str(getattr(result, "subtype", "") or "").lower()
+    if subtype in {
+        "error_during_execution", "interrupted", "cancelled", "canceled",
+    }:
+        return "interrupted"
+    if bool(getattr(result, "is_error", False)):
+        return "failed"
+    return "success"
+
+
 _LOGIN_CLEANUP_INTERVAL = 10.0
 SESSION_EXPIRED_CLOSE_CODE = 1008
 SESSION_EXPIRED_CLOSE_REASON = "session expired"
@@ -391,7 +404,7 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
         result = getattr(msg, "result", None)
         await push_dispatcher.notify_turn_end(
             machine_id,
-            is_error=bool(getattr(result, "is_error", False)),
+            outcome=_turn_push_outcome(result),
         )
 
     hub = RelayHub(cfg, on_live_turn_end=on_live_turn_end)

@@ -7,10 +7,11 @@ import json
 from fastapi.testclient import TestClient
 
 from cc_remote.config import RelayConfig
+from cc_remote.protocol import TurnResult
 from cc_remote.relay.push import (
     PushDispatcher, PushSubscription, PushSubscriptionStore,
 )
-from cc_remote.relay.server import create_app
+from cc_remote.relay.server import _turn_push_outcome, create_app
 
 
 def _cfg(tmp_path, **overrides) -> RelayConfig:
@@ -98,7 +99,7 @@ def test_dispatcher_payload_is_generic_and_prunes_expired_endpoint(tmp_path):
             vapid_subject="mailto:admin@example.com",
             sender=sender,
         )
-        await dispatcher.notify_turn_end("nono", is_error=False)
+        await dispatcher.notify_turn_end("nono", outcome="success")
         assert len(payloads) == 1
         payload = json.loads(payloads[0])
         assert payload["body"] == "远程会话已经完成"
@@ -107,6 +108,58 @@ def test_dispatcher_payload_is_generic_and_prunes_expired_endpoint(tmp_path):
         assert await store.for_machine("nono") == []
 
     asyncio.run(run())
+
+
+def test_dispatcher_distinguishes_terminal_outcomes_without_tag_collisions(tmp_path):
+    async def run():
+        store = PushSubscriptionStore(str(tmp_path / "push.sqlite3"))
+        await store.upsert(PushSubscription(
+            subject="alice",
+            machine_id="nono",
+            endpoint="https://push.example/send/token",
+            p256dh="p" * 87,
+            auth="a" * 22,
+            session_jti="j" * 24,
+            expires_at=4_102_444_800,
+        ))
+        payloads: list[dict[str, object]] = []
+
+        async def sender(_subscription, payload):
+            payloads.append(json.loads(payload))
+            return 201
+
+        dispatcher = PushDispatcher(
+            store,
+            vapid_private_key="unused",
+            vapid_subject="mailto:admin@example.com",
+            sender=sender,
+        )
+        for outcome in ("success", "interrupted", "failed"):
+            await dispatcher.notify_turn_end("nono", outcome=outcome)
+
+        assert [payload["body"] for payload in payloads] == [
+            "远程会话已经完成",
+            "远程会话已中断",
+            "远程会话执行失败",
+        ]
+        tags = [str(payload["tag"]) for payload in payloads]
+        assert all(tag.startswith("cc-remote-turn-") for tag in tags)
+        assert len(set(tags)) == len(tags)
+        serialized = json.dumps(payloads, ensure_ascii=False).lower()
+        assert "session" not in serialized
+        assert "nono" not in serialized
+
+    asyncio.run(run())
+
+
+def test_turn_push_outcome_preserves_interruptions():
+    assert _turn_push_outcome(TurnResult(
+        subtype="success", duration_ms=1, is_error=False)) == "success"
+    assert _turn_push_outcome(TurnResult(
+        subtype="error", duration_ms=1, is_error=True)) == "failed"
+    assert _turn_push_outcome(TurnResult(
+        subtype="error_during_execution", duration_ms=1,
+        is_error=True)) == "interrupted"
 
 
 def test_logout_removes_only_the_current_session_push_subscription(tmp_path):
@@ -172,7 +225,7 @@ def test_inactive_login_subscription_is_pruned_before_delivery(tmp_path):
             session_active=lambda _subscription: asyncio.sleep(
                 0, result=False),
         )
-        await dispatcher.notify_turn_end("nono", is_error=False)
+        await dispatcher.notify_turn_end("nono", outcome="success")
         assert deliveries == 0
         assert await store.for_machine("nono") == []
 

@@ -642,7 +642,7 @@ def _write_rollout(path):
          "payload": {"type": "agent_message", "message": "partial two"}},
         {"timestamp": "2026-01-01T00:01:04Z", "type": "event_msg",
          "payload": {"type": "turn_aborted", "turn_id": "turn-2",
-                     "reason": "interrupted", "duration_ms": 3000,
+                     "duration_ms": 3000,
                      "completed_at": 1767225664}},
         {"timestamp": "2026-01-01T00:02:01Z", "type": "event_msg",
          "payload": {"type": "task_started", "turn_id": "turn-3"}},

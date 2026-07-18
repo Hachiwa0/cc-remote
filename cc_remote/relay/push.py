@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Literal
 
 from cc_remote.log import logger
 
@@ -182,6 +183,13 @@ class PushSubscriptionStore:
 
 PushSender = Callable[[PushSubscription, str], Awaitable[int | None]]
 PushSessionCheck = Callable[[PushSubscription], Awaitable[bool]]
+PushOutcome = Literal["success", "failed", "interrupted"]
+
+_PUSH_BODIES: dict[PushOutcome, str] = {
+    "success": "远程会话已经完成",
+    "failed": "远程会话执行失败",
+    "interrupted": "远程会话已中断",
+}
 
 
 class PushDispatcher:
@@ -226,12 +234,20 @@ class PushDispatcher:
 
         return await asyncio.to_thread(send)
 
-    async def notify_turn_end(self, machine_id: str, *, is_error: bool) -> None:
+    async def notify_turn_end(
+        self,
+        machine_id: str,
+        *,
+        outcome: PushOutcome,
+    ) -> None:
         payload = json.dumps(
             {
                 "title": "cc-remote",
-                "body": "远程会话执行失败" if is_error else "远程会话已经完成",
-                "tag": "cc-remote-turn",
+                "body": _PUSH_BODIES[outcome],
+                # A fresh opaque tag prevents a later turn from replacing an
+                # earlier notification without exposing machine/session ids to
+                # the push provider.
+                "tag": f"cc-remote-turn-{secrets.token_hex(8)}",
                 "url": "/",
             },
             ensure_ascii=False,

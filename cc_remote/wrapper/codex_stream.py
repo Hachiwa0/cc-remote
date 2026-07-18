@@ -2053,7 +2053,11 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                                    _completed_ts(p, ts), p.get("turn_id"))
             elif t == "event_msg" and payload_type == "turn_aborted":
                 if turn_open:
-                    interrupted = p.get("reason") == "interrupted"
+                    # Current Codex rollouts can omit ``reason`` for an
+                    # intentional interrupt. Explicit failure reasons remain
+                    # errors; a bare turn_aborted is an interruption.
+                    reason = str(p.get("reason") or "").lower()
+                    interrupted = reason not in {"error", "failed", "crash"}
                     close_turn(
                         "error_during_execution" if interrupted else "error",
                         _duration(p), True, _completed_ts(p, ts),

@@ -48,6 +48,11 @@ import {
 import type { ServerEvent, SessionControl } from "../src/protocol.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
 import {
+  classifyTurnNotification,
+  turnNotificationBody,
+  turnNotificationTag,
+} from "../src/turn-notification.ts";
+import {
   classifyBusySubmit,
   isComposerBusy,
   isInterruptSettling,
@@ -2829,12 +2834,34 @@ assert.match(terminalControlSource, /aria-label="终端连接状态"/);
 assert.match(terminalControlSource, /event\.key !== "Tab"/);
 assert.match(terminalControlSource, /document\.contains\(trigger\).*trigger\.focus\(\)/,
   "dialog close restores focus to its terminal-status trigger");
-assert.match(layoutCss, /\.header-secondary\{ display:none!important; \}/);
-assert.match(layoutCss, /\.hstat-label\{ display:none; \}/);
-assert.match(layoutCss, /@media\(max-width:380px\)\{ \.c-head \.hstat\{ display:none; \} \}/,
-  "tiny multi-machine headers retain title, terminal and engine before run-state chrome");
+assert.doesNotMatch(layoutCss, /\.header-secondary\{ display:none!important; \}/,
+  "mobile headers must not blanket-hide Agent and notification controls");
+assert.doesNotMatch(layoutCss, /\.hstat-label\{ display:none; \}/,
+  "mobile headers must retain the runtime state label");
+assert.doesNotMatch(layoutCss, /\.c-head \.hstat\{ display:none; \}/,
+  "tiny headers must retain runtime state");
+assert.match(appSource, /className="iconbtn header-agent"/,
+  "Agent capabilities remain reachable on mobile");
+assert.match(appSource, /className=\{`iconbtn header-notify/,
+  "notification settings remain reachable on mobile");
+assert.match(layoutCss, /\.header-theme\{ display:none; \}/,
+  "only the non-essential theme shortcut may collapse on the narrowest header");
 assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\)/,
   "the mobile sheet height accounts for the virtual keyboard inset");
+
+const successfulTurn = {
+  v: 15, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
+  result: { subtype: "success", duration_ms: 1, is_error: false },
+};
+const interruptedTurn = {
+  ...successfulTurn, ts: 2, turn_id: "turn-b",
+  result: { subtype: "error_during_execution", duration_ms: 2, is_error: true },
+};
+assert.equal(classifyTurnNotification(successfulTurn.result), "success");
+assert.equal(classifyTurnNotification(interruptedTurn.result), "interrupted");
+assert.equal(turnNotificationBody("Codex", interruptedTurn.result), "Codex 会话已中断");
+assert.notEqual(turnNotificationTag(successfulTurn), turnNotificationTag(interruptedTurn),
+  "successive turns in one session must not replace each other's notifications");
 const chatViewSource = readFileSync(
   resolve(process.cwd(), "src/components/ChatView.tsx"), "utf8");
 assert.match(chatViewSource, /surface !== "work"/);
