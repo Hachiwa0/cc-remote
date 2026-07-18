@@ -2824,6 +2824,12 @@ const dateTimePickerSource = readFileSync(
 assert.match(dateTimePickerSource, /createPortal\(<>.*document\.body\)/s,
   "the date-time popover must escape the scrollable Work manager container");
 const appCssSource = readFileSync(resolve(process.cwd(), "src/index.css"), "utf8");
+assert.match(appCssSource, /\.capabilities-sheet>header\{[^}]*flex:none/s,
+  "the Extensions header must not collapse under a long capability list");
+assert.match(appCssSource, /\.capabilities-tabs\{[^}]*flex:none/s,
+  "the Extensions tabs must remain visible above a long capability list");
+assert.match(appCssSource, /\.capabilities-body\{[^}]*flex:1; min-height:0/s,
+  "only the Extensions body may consume and scroll through remaining height");
 assert.doesNotMatch(appCssSource, /\.work-form-actions button/,
   "Work action styles must not repaint nested calendar buttons");
 assert.match(appCssSource, /\.work-form-actions>button/,

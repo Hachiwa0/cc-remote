@@ -627,17 +627,17 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   box-shadow:0 24px 70px rgba(0,0,0,.24); overflow:hidden;
 }
 .capabilities-sheet>header{
-  min-height:78px; padding:16px 18px 16px 22px; display:flex;
+  min-height:78px; padding:16px 18px 16px 22px; display:flex; flex:none;
   align-items:center; justify-content:space-between; border-bottom:1px solid var(--border);
 }
 .capabilities-sheet>header>div:first-child{ display:flex; flex-direction:column; gap:3px; }
 .capabilities-sheet>header b{ font-size:18px; }
 .capabilities-sheet>header small{ color:var(--dim); }
 .capabilities-head-actions{ display:flex; gap:6px; }
-.capabilities-tabs{ display:flex; gap:4px; padding:9px 14px; overflow-x:auto; border-bottom:1px solid var(--border); }
+.capabilities-tabs{ display:flex; flex:none; gap:4px; padding:9px 14px; overflow-x:auto; border-bottom:1px solid var(--border); }
 .capabilities-tabs button{ flex:none; padding:7px 11px; border-radius:9px; color:var(--dim); font-size:12px; font-weight:650; }
 .capabilities-tabs button.active{ color:var(--accent-ink); background:var(--accent-weak); box-shadow:inset 0 0 0 1px var(--accent-line); }
-.capabilities-body{ padding:18px; overflow:auto; overscroll-behavior:contain; }
+.capabilities-body{ flex:1; min-height:0; padding:18px; overflow:auto; overscroll-behavior:contain; }
 .capabilities-note,.capabilities-errors{
   margin-bottom:14px; padding:12px 14px; border:1px solid var(--border);
   border-radius:12px; color:var(--dim); background:var(--raised);
