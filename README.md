@@ -52,7 +52,7 @@ API key 烤进网页。
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
 | **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Codex 支持对话与冲突安全的代码回滚、主动 compact、原生 Review，以及在 Git 仓库中派生到独立 worktree。 |
 | **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 通过 `/permissions` 控制审批并继承本机 Sandbox 配置；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
-| **真实扩展目录** | 按需读取 Claude/Codex 当前可见的 Skills、Plugins、Apps 与 MCP 状态；插件安装/卸载调用两家原生管理器，不用静态假列表。 |
+| **真实扩展目录** | 通过 `/extensions`、`/skills`、`/plugins`、`/apps`、`/mcp`、`/hooks` 按需读取当前引擎目录；Skills 与 Claude Hooks 可安全管理，Codex Hooks 按官方只读能力展示，插件安装/卸载调用原生管理器。 |
 | **连续性** | 后台会话继续运行，多端实时同步；从 Claude transcript / Codex rollout 分页恢复历史，断线后按游标补流。 |
 | **多机器与 PWA** | 一个 relay 可连接多个具名 wrapper；可选账号策略把用户限制到指定机器。网页可安装为 PWA，并在后台回合完成/失败时发送不含对话正文的系统通知。 |
 | **自托管** | wrapper 只出站连接；会话、Work 数据和预览转换都留在本机，VPS 只做无状态中继且可替换；网页认证使用 HttpOnly cookie，CLI 凭据与 API key 不进入前端。 |
@@ -174,7 +174,7 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 - **终端协同**：Codex Code 共享官方 daemon；Claude 用显式 `claude-remote` 保留官方
   TUI 并实现双向控制。直接运行的 `claude` / Desktop / Agent View 默认只读镜像。
 - **状态**：模型、思考强度、权限、Plan、上下文、目标、用量、rate limit 和运行告警。
-- **扩展**：实时查看 Skills、Plugins、Apps 和 MCP；通过引擎原生管理器安装/卸载插件。
+- **扩展**：通过斜杠命令实时查看 Skills、Plugins、Apps、MCP 和 Hooks；安全增删本地 Skills、管理 Claude Hooks，并通过引擎原生管理器安装/卸载插件。Codex Hooks 因官方暂无写接口保持只读。
 - **设备**：响应式手机界面、深浅主题、多浏览器/多机器同步、PWA、后台完成提醒与断线重连。
 
 ## 本地快速开始（一台机器，5 分钟）
@@ -291,12 +291,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v15**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v16**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v15 relay 和
-> v15 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v16 relay 和
+> v16 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
 
 ### 3）上传 staging，由原子 release 安装器发布
 
@@ -334,7 +334,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v15 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v16 wrapper。
 
 验证：
 

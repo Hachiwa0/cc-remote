@@ -53,7 +53,7 @@ not proxy model APIs or bake API keys into the web client.
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
 | **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Codex supports conversation rollback, conflict-safe code rollback, explicit compact, native Review, and isolated Git worktree forks. |
 | **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses `/permissions` for approval control while inheriting the local Sandbox configuration. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
-| **Real extension catalog** | Read the current Claude/Codex Skills, Plugins, Apps, and MCP status on demand. Plugin install/uninstall calls the engines' native managers rather than a static placeholder list. |
+| **Real extension catalog** | Open the slash-command manager for current Skills, Plugins, Apps, MCP, and Hooks. Local Skills and Claude Hooks are safely manageable; Codex Hooks reflect its official read-only API; plugin changes use native managers. |
 | **Continuity** | Let background sessions keep running and synchronize them across clients. Restore paged history from Claude transcripts or Codex rollouts and resume from a cursor after reconnecting. |
 | **Multi-machine and PWA** | Connect multiple named wrappers to one relay and optionally restrict accounts to selected machines. Install the web client as a PWA and receive generic background completion/failure notifications without conversation content. |
 | **Self-hosted** | The wrapper only makes outbound connections. Sessions, Work data, and preview conversion stay on that machine; the replaceable VPS remains a stateless relay. Web auth uses an HttpOnly cookie, and CLI credentials or API keys never enter the frontend. |
@@ -211,7 +211,7 @@ context usage, and command entry points such as `/goal` and `/status`.
   explicit `claude-remote` to preserve the official TUI with bidirectional control.
   Direct `claude` / Desktop / Agent View processes remain read-only mirrors.
 - **Status:** inspect the model, reasoning effort, permissions, Plan mode, context, goals, usage, rate limits, and runtime warnings.
-- **Extensions:** inspect live Skills, Plugins, Apps, and MCP status and install/uninstall plugins through the native engine manager.
+- **Extensions:** open `/extensions`, `/skills`, `/plugins`, `/apps`, `/mcp`, or `/hooks` to inspect the live engine inventory; safely create/remove local Skills, manage Claude Hooks, and install/uninstall plugins through native managers. Codex Hooks remain read-only because app-server currently exposes no write API.
 - **Devices:** use a responsive mobile UI, light or dark themes, multi-browser/multi-machine synchronization, PWA installation, background completion alerts, and reconnect recovery.
 
 ## Quick start (local, one machine, 5 min)
@@ -331,7 +331,7 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v15:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v16:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.

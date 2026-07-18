@@ -501,6 +501,51 @@ export class RelayWs {
     return this.send(frame);
   }
 
+  sendManageEngineSkill(
+    engine: "claude" | "codex", space: Space,
+    action: "create" | "remove" | "enable" | "disable",
+    options: {
+      skillId?: string; name?: string; description?: string;
+      instructions?: string; scope?: "user" | "project";
+    },
+    cwd?: string | null,
+  ): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "manage_engine_skill", engine, space, action,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (options.skillId) frame.skill_id = options.skillId;
+    if (options.name) frame.name = options.name;
+    if (options.description !== undefined) frame.description = options.description;
+    if (options.instructions !== undefined) frame.instructions = options.instructions;
+    if (options.scope) frame.scope = options.scope;
+    if (cwd) frame.cwd = cwd;
+    return this.send(frame);
+  }
+
+  sendManageEngineHook(
+    engine: "claude" | "codex", space: Space,
+    action: "create" | "remove",
+    options: {
+      hookId?: string; event?: string; matcher?: string; command?: string;
+      timeout?: number; scope?: "user" | "project";
+    },
+    cwd?: string | null,
+  ): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "manage_engine_hook", engine, space, action,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (options.hookId) frame.hook_id = options.hookId;
+    if (options.event) frame.event = options.event;
+    if (options.matcher !== undefined) frame.matcher = options.matcher;
+    if (options.command !== undefined) frame.command = options.command;
+    if (options.timeout !== undefined) frame.timeout = options.timeout;
+    if (options.scope) frame.scope = options.scope;
+    if (cwd) frame.cwd = cwd;
+    return this.send(frame);
+  }
+
   sendAnswerQuestion(askId: string, answer: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
   }

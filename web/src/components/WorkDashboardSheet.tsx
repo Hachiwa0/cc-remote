@@ -177,7 +177,7 @@ export function WorkDashboardSheet(props: Props) {
                   setPluginName(""); setPluginInstructions("");
                 }
               }}>添加模板</button>
-              <small>工作模板是会进入 WORK.md 的可复用说明，不冒充或执行引擎插件。真实技能、插件与连接请在顶栏的 Agent 能力中查看。</small>
+              <small>工作模板是会进入 WORK.md 的可复用说明，不冒充或执行引擎插件。真实 Skills、Plugins 与连接请使用 /extensions 查看。</small>
             </section>
             <section className="work-items">
               {dashboard.plugins.map((item) => <article key={item.plugin_id}>

@@ -498,7 +498,7 @@ def test_release_docs_and_examples_describe_one_atomic_v15_layout():
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.119" in claude
-    assert "protocol v15" in claude
+    assert "protocol v16" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 

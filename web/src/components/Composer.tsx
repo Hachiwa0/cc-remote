@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ClipboardEvent } from "react";
-import type { State, QueryImg, QueryFile, ContextReport, CollaborationModeName, SessionControl } from "../protocol";
+import type { State, QueryImg, QueryFile, ContextReport, CollaborationModeName, SessionControl, EngineCapabilityKind } from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
@@ -65,6 +65,7 @@ interface Props {
   ) => void;
   onCompact?: () => void;
   onRollback?: (numTurns: number) => void;
+  onOpenExtensions?: (kind: EngineCapabilityKind | "all") => void;
   workArtifactCount?: number;
   onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
@@ -355,6 +356,12 @@ export function Composer(p: Props) {
         }
         p.onPreview?.(args);
         break;
+      case "extensions": p.onOpenExtensions?.("all"); break;
+      case "skills": p.onOpenExtensions?.("skill"); break;
+      case "plugins": p.onOpenExtensions?.("plugin"); break;
+      case "apps": p.onOpenExtensions?.("app"); break;
+      case "mcp": p.onOpenExtensions?.("mcp"); break;
+      case "hooks": p.onOpenExtensions?.("hook"); break;
       // Codex /fast flips only this thread's persisted service tier. The UI
       // waits for the wrapper's authoritative Fast event before changing state.
       case "fast": {

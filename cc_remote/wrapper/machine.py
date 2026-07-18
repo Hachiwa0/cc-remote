@@ -124,7 +124,8 @@ from cc_remote.wrapper.codex_rpc import (
     CodexRpcOutcomeUnknown, CodexRpcRejected, codex_rpc,
 )
 from cc_remote.wrapper.engine_capabilities import (
-    engine_capabilities, manage_engine_plugin,
+    engine_capabilities, manage_engine_plugin, manage_engine_skill,
+    manage_engine_hook,
 )
 from cc_remote.wrapper.source_fetch import capture_public_source
 from cc_remote.wrapper.work_context import (
@@ -1502,7 +1503,10 @@ class WrapperMachine:
                 if cmd.type == "get_models":
                     self._start_models_command(cmd)
                     continue
-                if cmd.type in {"get_engine_capabilities", "manage_engine_plugin"}:
+                if cmd.type in {
+                    "get_engine_capabilities", "manage_engine_plugin",
+                    "manage_engine_skill", "manage_engine_hook",
+                }:
                     self._start_capabilities_command(cmd)
                     continue
                 if cmd.type == "set_model":
@@ -2100,6 +2104,10 @@ class WrapperMachine:
             return await self._handle_get_engine_capabilities(cmd)
         elif t == "manage_engine_plugin":
             return await self._handle_manage_engine_plugin(cmd)
+        elif t == "manage_engine_skill":
+            return await self._handle_manage_engine_skill(cmd)
+        elif t == "manage_engine_hook":
+            return await self._handle_manage_engine_hook(cmd)
         elif t == "answer_question":
             return await self._handle_answer_question(cmd)
         elif t == "get_goal":
@@ -4159,7 +4167,7 @@ class WrapperMachine:
         await self.transport.send(result)
         return result
 
-    async def _handle_manage_engine_plugin(self, cmd):
+    def _engine_capability_cwd(self, cmd) -> str:
         target_cwd = getattr(cmd, "cwd", None)
         focused = self._focused_ctx()
         if (
@@ -4168,8 +4176,24 @@ class WrapperMachine:
             and focused.space == getattr(cmd, "space", "code")
         ):
             target_cwd = focused.cwd
-        if not target_cwd:
-            target_cwd = self.cfg.cc_cwd
+        return target_cwd or self.cfg.cc_cwd
+
+    async def _send_capability_mutation_error(self, cmd, exc: Exception):
+        if isinstance(exc, ValueError):
+            code, message = ERR_BAD_PROMPT, str(exc)[:500]
+        else:
+            code, message = ERR_INTERNAL, "扩展操作失败，状态未确认"
+        error = Error(
+            code=code,
+            message=message,
+            request_id=getattr(cmd, "cmd_id", None),
+            to=getattr(cmd, "client_id", None),
+        )
+        await self.transport.send(error)
+        return error
+
+    async def _handle_manage_engine_plugin(self, cmd):
+        target_cwd = self._engine_capability_cwd(cmd)
         try:
             await manage_engine_plugin(
                 cmd.engine,
@@ -4179,29 +4203,60 @@ class WrapperMachine:
                 space=getattr(cmd, "space", "code"),
                 claude_bin=self.cfg.claude_bin,
             )
-        except ValueError as exc:
-            error = Error(
-                code=ERR_BAD_PROMPT,
-                message=str(exc)[:500],
-                request_id=getattr(cmd, "cmd_id", None),
-                to=getattr(cmd, "client_id", None),
-            )
-            await self.transport.send(error)
+        except Exception as exc:
+            logger_call = log.warning if isinstance(exc, ValueError) else log.exception
+            logger_call("engine plugin mutation failed", engine=cmd.engine,
+                        action=cmd.action, plugin_id=cmd.plugin_id,
+                        error_type=type(exc).__name__)
+            error = await self._send_capability_mutation_error(cmd, exc)
+            await self._handle_get_engine_capabilities(cmd)
             return error
-        except Exception:
-            log.exception(
-                "engine plugin mutation failed",
-                engine=cmd.engine,
-                action=cmd.action,
-                plugin_id=cmd.plugin_id,
+        return await self._handle_get_engine_capabilities(cmd)
+
+    async def _handle_manage_engine_skill(self, cmd):
+        try:
+            await manage_engine_skill(
+                cmd.engine,
+                cmd.action,
+                self._engine_capability_cwd(cmd),
+                space=getattr(cmd, "space", "code"),
+                skill_id=getattr(cmd, "skill_id", None),
+                name=getattr(cmd, "name", None),
+                description=getattr(cmd, "description", None) or "",
+                instructions=getattr(cmd, "instructions", None) or "",
+                scope=getattr(cmd, "scope", "user"),
             )
-            error = Error(
-                code=ERR_INTERNAL,
-                message="插件操作失败，状态未确认",
-                request_id=getattr(cmd, "cmd_id", None),
-                to=getattr(cmd, "client_id", None),
+        except Exception as exc:
+            logger_call = log.warning if isinstance(exc, ValueError) else log.exception
+            logger_call("engine skill mutation failed", engine=cmd.engine,
+                        action=cmd.action, error_type=type(exc).__name__)
+            error = await self._send_capability_mutation_error(cmd, exc)
+            await self._handle_get_engine_capabilities(cmd)
+            return error
+        return await self._handle_get_engine_capabilities(cmd)
+
+    async def _handle_manage_engine_hook(self, cmd):
+        try:
+            await manage_engine_hook(
+                cmd.engine,
+                cmd.action,
+                self._engine_capability_cwd(cmd),
+                space=getattr(cmd, "space", "code"),
+                hook_id=getattr(cmd, "hook_id", None),
+                event=getattr(cmd, "event", None),
+                matcher=getattr(cmd, "matcher", None) or "",
+                command=getattr(cmd, "command", None) or "",
+                timeout=getattr(cmd, "timeout", None) or 60,
+                scope=getattr(cmd, "scope", "user"),
             )
-            await self.transport.send(error)
+        except Exception as exc:
+            # Never log the Hook command: it may legitimately contain tokens or
+            # other local secrets. Engine/action are sufficient diagnostics.
+            logger_call = log.warning if isinstance(exc, ValueError) else log.exception
+            logger_call("engine hook mutation failed", engine=cmd.engine,
+                        action=cmd.action, error_type=type(exc).__name__)
+            error = await self._send_capability_mutation_error(cmd, exc)
+            await self._handle_get_engine_capabilities(cmd)
             return error
         return await self._handle_get_engine_capabilities(cmd)
 

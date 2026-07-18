@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 15
+PROTOCOL_VERSION = 16
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -1191,9 +1191,40 @@ class ManageEnginePlugin(_Command):
     cwd: Optional[str] = Field(default=None, max_length=4096)
 
 
+class ManageEngineSkill(_Command):
+    """Create/remove a local skill, or toggle it through a native engine API."""
+    type: Literal["manage_engine_skill"] = "manage_engine_skill"
+    engine: Engine
+    action: Literal["create", "remove", "enable", "disable"]
+    skill_id: Optional[str] = Field(default=None, min_length=1, max_length=512)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=4096)
+    instructions: Optional[str] = Field(default=None, max_length=128 * 1024)
+    scope: Literal["user", "project"] = "user"
+    space: Space = "code"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class ManageEngineHook(_Command):
+    """Create/remove a Claude command hook. Codex hooks are read-only today."""
+    type: Literal["manage_engine_hook"] = "manage_engine_hook"
+    engine: Engine
+    action: Literal["create", "remove"]
+    hook_id: Optional[str] = Field(default=None, min_length=1, max_length=512)
+    event: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    matcher: Optional[str] = Field(default=None, max_length=2048)
+    command: Optional[str] = Field(default=None, max_length=16 * 1024)
+    timeout: Optional[int] = Field(default=None, ge=1, le=3600)
+    scope: Literal["user", "project"] = "user"
+    space: Space = "code"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
 class EngineCapabilityItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["skill", "plugin", "app", "mcp"]
+    kind: Literal["skill", "plugin", "app", "mcp", "hook"]
     id: str = Field(max_length=512)
     name: str = Field(max_length=512)
     description: Optional[str] = Field(default=None, max_length=16 * 1024)
@@ -1205,6 +1236,12 @@ class EngineCapabilityItem(BaseModel):
     tool_count: Optional[int] = Field(default=None, ge=0, le=100_000)
     resource_count: Optional[int] = Field(default=None, ge=0, le=100_000)
     install_url: Optional[str] = Field(default=None, max_length=4096)
+    actions: list[Literal["install", "uninstall", "enable", "disable", "remove"]] = Field(
+        default_factory=list, max_length=8)
+    event: Optional[str] = Field(default=None, max_length=128)
+    matcher: Optional[str] = Field(default=None, max_length=2048)
+    handler_type: Optional[str] = Field(default=None, max_length=128)
+    detail: Optional[str] = Field(default=None, max_length=4096)
 
 
 class EngineCapabilities(_Base):
@@ -1673,7 +1710,7 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, GetEngineCapabilities, ManageEnginePlugin, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
     SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
@@ -1721,6 +1758,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_engine_capabilities": GetEngineCapabilities,
     "engine_capabilities": EngineCapabilities,
     "manage_engine_plugin": ManageEnginePlugin,
+    "manage_engine_skill": ManageEngineSkill,
+    "manage_engine_hook": ManageEngineHook,
     "list_sessions": ListSessions,
     "switch_session": SwitchSession,
     "new_session": NewSession,

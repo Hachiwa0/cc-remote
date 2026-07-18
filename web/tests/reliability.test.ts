@@ -95,6 +95,17 @@ assert.deepEqual(
   ],
   "Codex permission labels should match the official approval-policy names",
 );
+for (const engine of ["claude", "codex"] as const) {
+  for (const slash of ["extensions", "skills", "plugins", "apps", "mcp", "hooks"]) {
+    assert.equal(clientSlashesFor(engine).has(slash), true,
+      `/${slash} must remain local for ${engine}`);
+    assert.equal(commandsFor(engine, "work").some(
+      (entry) => "slash" in entry && entry.slash === slash), true,
+      `/${slash} must be reachable from Work`);
+  }
+}
+assert.equal(clientSlashesFor("claude").has("hook"), false,
+  "Claude singular /hook remains native; Remote management uses /hooks");
 const recentProject = { session_id: "project-new", cwd: "/home/nancy/project",
   last_modified: "300" };
 const oldHome = { session_id: "home-old", cwd: "/home/nancy", last_modified: "100" };
@@ -145,7 +156,7 @@ assert.deepEqual(visibleAgentTimeline.map((block) => block.kind), ["process"],
   "a dedicated live agent row must replace the duplicate generic ToolUse row");
 
 const legacyWorkContext = workContextMetrics({
-  v: 15, ts: 0, type: "context_report",
+  v: 16, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, categories: [],
 });
@@ -155,7 +166,7 @@ assert.equal(legacyWorkContext.sessionTokens, 25_572,
 assert.equal(legacyWorkContext.sessionPercentage, 2.5572);
 
 const freshWorkContext = workContextMetrics({
-  v: 15, ts: 0, type: "context_report",
+  v: 16, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, session_tokens: 72, fixed_tokens: 25_500,
   session_percentage: 0.0072, categories: [],
@@ -167,7 +178,7 @@ assert.equal(freshWorkContext.sessionPercentage, 0.0072);
 assert.equal(freshWorkContext.totalPercentage, 2.5572);
 
 const derivedWorkContext = workContextMetrics({
-  v: 15, ts: 0, type: "context_report",
+  v: 16, ts: 0, type: "context_report",
   total_tokens: 11_194, max_tokens: 353_400,
   percentage: 3.1675, fixed_tokens: 11_000, categories: [],
 });
@@ -753,7 +764,7 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 15, ts: 10, ...body,
+    v: 16, ts: 10, ...body,
   } as ServerEvent);
   // Work/Code and engine switches restore the target surface's last accepted
   // list immediately. The authoritative refresh may take ~1s for Codex because
@@ -2633,7 +2644,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 15, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 16, ts: 1, ...frame }) });
   }
 }
 
@@ -2840,8 +2851,12 @@ assert.doesNotMatch(layoutCss, /\.hstat-label\{ display:none; \}/,
   "mobile headers must retain the runtime state label");
 assert.doesNotMatch(layoutCss, /\.c-head \.hstat\{ display:none; \}/,
   "tiny headers must retain runtime state");
-assert.match(appSource, /className="iconbtn header-agent"/,
-  "Agent capabilities remain reachable on mobile");
+assert.doesNotMatch(appSource, /className="iconbtn header-agent"/,
+  "extension management is a slash command, not permanent header chrome");
+assert.match(composerSource, /case "skills": p\.onOpenExtensions\?\.\("skill"\)/,
+  "Skills remain reachable from the composer on mobile");
+assert.match(composerSource, /case "hooks": p\.onOpenExtensions\?\.\("hook"\)/,
+  "Hooks remain reachable from the composer on mobile");
 assert.match(appSource, /className=\{`iconbtn header-notify/,
   "notification settings remain reachable on mobile");
 assert.match(layoutCss, /\.header-theme\{ display:none; \}/,
@@ -2850,7 +2865,7 @@ assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\
   "the mobile sheet height accounts for the virtual keyboard inset");
 
 const successfulTurn = {
-  v: 15, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
+  v: 16, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
   result: { subtype: "success", duration_ms: 1, is_error: false },
 };
 const interruptedTurn = {
@@ -2991,7 +3006,7 @@ controlSocket.onopen?.();
 const wireControlSid = "wire-control-revision";
 controlRelay.seedReplayState({}, {}, {
   [wireControlSid]: {
-    v: 15, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 16, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation", revision: 10,
   },
@@ -3009,7 +3024,7 @@ controlSocket.receive({
   revision: "wire-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 15, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 16, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 9,
   },
@@ -3023,7 +3038,7 @@ controlSocket.receive({
   revision: "wire-cross-session-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 15, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 16, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -3037,7 +3052,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation",
   control: {
-    v: 15, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 16, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -3066,7 +3081,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation-next",
   control: {
-    v: 15, ts: 2, type: "session_control", sid: wireControlSid,
+    v: 16, ts: 2, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation-next", revision: 0,
   },
@@ -3100,12 +3115,12 @@ controlRelay.seedReplayState(
   { [aliasOld]: "wire-alias-live", [aliasReal]: "wire-alias-cache" },
   {
     [aliasOld]: {
-      v: 15, ts: 3, type: "session_control", sid: aliasOld,
+      v: 16, ts: 3, type: "session_control", sid: aliasOld,
       control_mode: "remote", write_state: "writable",
       terminal_attached: false, generation: "wire-alias-live", revision: 2,
     },
     [aliasReal]: {
-      v: 15, ts: 2, type: "session_control", sid: aliasReal,
+      v: 16, ts: 2, type: "session_control", sid: aliasReal,
       control_mode: "desktop", write_state: "read_only",
       terminal_attached: true, generation: "wire-alias-cache", revision: 50,
     },

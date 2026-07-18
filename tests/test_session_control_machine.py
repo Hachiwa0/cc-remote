@@ -1,4 +1,4 @@
-"""Wrapper-side ownership projection regressions for protocol v15."""
+"""Wrapper-side ownership projection regressions for protocol v16."""
 from __future__ import annotations
 
 import asyncio

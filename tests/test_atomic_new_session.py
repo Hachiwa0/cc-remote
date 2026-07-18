@@ -19,8 +19,8 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
-def test_protocol_v15_new_session_query_roundtrip_and_validation():
-    assert PROTOCOL_VERSION == 15
+def test_protocol_v16_new_session_query_roundtrip_and_validation():
+    assert PROTOCOL_VERSION == 16
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",

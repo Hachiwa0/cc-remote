@@ -18,6 +18,13 @@ export const COMMANDS: Command[] = [
   { slash: "permissions", name: "权限模式", ds: "选择 cc 的权限模式", ic: "shield" },
   { g: "模型" },
   { slash: "model", name: "切换模型", ds: "/model <id> 切到指定模型(支持隐藏模型),无参数则打开选择器", ic: "cpu" },
+  { g: "扩展" },
+  { slash: "extensions", name: "扩展管理", ds: "Skills、Plugins、Apps、MCP 与 Hooks", ic: "spark" },
+  { slash: "skills", name: "Skills", ds: "查看和管理当前引擎 Skills", ic: "read" },
+  { slash: "plugins", name: "Plugins", ds: "查看和管理当前引擎 Plugins", ic: "spark" },
+  { slash: "apps", name: "Apps", ds: "查看当前引擎 Apps", ic: "run" },
+  { slash: "mcp", name: "MCP", ds: "查看当前引擎 MCP Servers", ic: "cpu" },
+  { slash: "hooks", name: "Hooks", ds: "查看当前引擎 Hooks（与 Claude 原生 /hook 区分）", ic: "shield" },
   { g: "审查" },
   { slash: "code-review", name: "代码审查", ds: "审当前 diff 的正确性与可简化项", ic: "review" },
   { slash: "security-review", name: "安全审查", ds: "扫描分支改动的安全隐患", ic: "shield" },
@@ -42,6 +49,13 @@ export const COMMANDS: Command[] = [
 export const WORK_COMMANDS: Command[] = [
   { g: "设置" },
   { slash: "model", name: "切换模型", ds: "选择本次工作的模型与思考强度", ic: "cpu" },
+  { g: "扩展" },
+  { slash: "extensions", name: "扩展目录", ds: "只读查看当前 Work 可用扩展", ic: "spark" },
+  { slash: "skills", name: "Skills", ds: "只读查看当前 Work Skills", ic: "read" },
+  { slash: "plugins", name: "Plugins", ds: "只读查看当前 Work Plugins", ic: "spark" },
+  { slash: "apps", name: "Apps", ds: "只读查看当前 Work Apps", ic: "run" },
+  { slash: "mcp", name: "MCP", ds: "只读查看当前 Work MCP Servers", ic: "cpu" },
+  { slash: "hooks", name: "Hooks", ds: "只读查看当前 Work Hooks", ic: "shield" },
   { g: "工作" },
   { slash: "goal", name: "工作目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "临时侧聊，不影响当前工作主线", ic: "spark" },
@@ -200,7 +214,8 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // is forwarded verbatim so cc's own slash-command layer runs it.
 // /rewind stays reserved locally while its UI is hidden so manually typing it
 // cannot fall through to Claude's interactive-only slash layer.
-export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "preview"]);
+const EXTENSION_SLASHES = ["extensions", "skills", "plugins", "apps", "mcp", "hooks"];
+export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "preview", ...EXTENSION_SLASHES]);
 
 // Codex engine command palette. Native app-server controls are handled locally
 // and never expanded into natural-language lookalikes. /context is the focused
@@ -221,6 +236,13 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "model", name: "切换模型", ds: "选择模型与思考强度", ic: "cpu" },
   { slash: "permissions", name: "权限模式", ds: "选择 Codex 的审批策略(自动/按需/严格)", ic: "shield" },
   { slash: "fast", name: "Fast 模式", ds: "开/关 Fast 服务档位(更快响应),下条消息生效", ic: "bolt" },
+  { g: "扩展" },
+  { slash: "extensions", name: "扩展管理", ds: "Skills、Plugins、Apps、MCP 与 Hooks", ic: "spark" },
+  { slash: "skills", name: "Skills", ds: "查看和管理 Codex Skills", ic: "read" },
+  { slash: "plugins", name: "Plugins", ds: "查看和管理 Codex Plugins", ic: "spark" },
+  { slash: "apps", name: "Apps", ds: "查看 Codex Apps", ic: "run" },
+  { slash: "mcp", name: "MCP", ds: "查看 Codex MCP Servers", ic: "cpu" },
+  { slash: "hooks", name: "Hooks", ds: "查看 Codex app-server Hooks", ic: "shield" },
   { g: "会话" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
@@ -233,7 +255,7 @@ export const CODEX_COMMANDS: Command[] = [
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
 const WORK_CMD_LIST: Cmd[] = WORK_COMMANDS.filter(isCmd) as Cmd[];
-export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview", "review", "compact", "rollback"]);
+export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
 export type CommandSurface = "code" | "work";
 export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (
   surface === "work" ? WORK_COMMANDS : engine === "codex" ? CODEX_COMMANDS : COMMANDS

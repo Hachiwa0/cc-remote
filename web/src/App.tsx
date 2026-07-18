@@ -20,7 +20,7 @@ import { StatusSheet } from "./components/StatusSheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
 import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
-import { CapabilitiesSheet } from "./components/CapabilitiesSheet";
+import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
@@ -38,7 +38,7 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   type CodexServiceTier, type CollaborationModeName,
   type DiffTheme, type Engine, type Space, type RestoreMode,
   type SessionControl, sessionControlLocksInput } from "./protocol";
-import type { EngineCapabilities, WorkArtifactInfo, WorkDashboard } from "./protocol";
+import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { resolveSidebarSwipe } from "./responsive-layout";
 import {
@@ -93,6 +93,7 @@ export default function App() {
   const [workManagerOpen, setWorkManagerOpen] = useState(false);
   const [workArtifactsOpen, setWorkArtifactsOpen] = useState(false);
   const [capabilitiesOpen, setCapabilitiesOpen] = useState(false);
+  const [capabilitiesKind, setCapabilitiesKind] = useState<EngineCapabilityKind | "all">("all");
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
   const [capabilitiesBySurface, setCapabilitiesBySurface] = useState<Record<string, EngineCapabilities>>({});
   const [notificationsEnabled, setNotificationsEnabled] = useState(
@@ -1336,14 +1337,6 @@ export default function App() {
           </select>}
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
-          <button className="iconbtn header-agent" onClick={() => {
-            setCapabilitiesOpen(true);
-            setCapabilitiesLoading(true);
-            wsRef.current?.sendGetEngineCapabilities(
-              engine, space, state.newChat?.cwd ?? state.currentCwd);
-          }} aria-label="Agent 能力" title="技能、插件、应用与 MCP">
-            <Icon name="spark" />
-          </button>
           {typeof Notification !== "undefined" && <button
             className={`iconbtn header-notify${notificationsEnabled ? " notify-on" : ""}`}
             onClick={() => { void (async () => {
@@ -1472,6 +1465,13 @@ export default function App() {
             if (!focusedSid) return;
             openCodexRollback(numTurns);
           }}
+          onOpenExtensions={(kind) => {
+            setCapabilitiesKind(kind);
+            setCapabilitiesOpen(true);
+            setCapabilitiesLoading(true);
+            wsRef.current?.sendGetEngineCapabilities(
+              focusedEngine, space, state.newChat?.cwd ?? state.currentCwd);
+          }}
           workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
           onOpenArtifacts={() => {
             if (focusedSid) {
@@ -1546,19 +1546,50 @@ export default function App() {
         onOpen={(path) => { setWorkArtifactsOpen(false); previewFile(path); }}
         onClose={() => setWorkArtifactsOpen(false)} />
       <CapabilitiesSheet open={capabilitiesOpen}
-        report={capabilitiesBySurface[`${space}:${engine}`] ?? null}
+        engine={focusedEngine}
+        activeKind={capabilitiesKind}
+        readOnly={space === "work"}
+        report={capabilitiesBySurface[`${space}:${focusedEngine}`] ?? null}
         loading={capabilitiesLoading}
+        onKindChange={setCapabilitiesKind}
         onRefresh={() => {
           setCapabilitiesLoading(true);
           wsRef.current?.sendGetEngineCapabilities(
-            engine, space, state.newChat?.cwd ?? state.currentCwd);
+            focusedEngine, space, state.newChat?.cwd ?? state.currentCwd);
         }}
         onManagePlugin={(item, action) => {
           const verb = action === "install" ? "安装" : "卸载";
-          if (!window.confirm(`${verb}插件「${item.name}」将修改本机 ${engine === "codex" ? "Codex" : "Claude"} 配置，确定继续吗？`)) return;
+          if (!window.confirm(`${verb}插件「${item.name}」将修改本机 ${focusedEngine === "codex" ? "Codex" : "Claude"} 配置，确定继续吗？`)) return;
           setCapabilitiesLoading(true);
           wsRef.current?.sendManageEnginePlugin(
-            engine, space, action, item.id,
+            focusedEngine, space, action, item.id,
+            state.newChat?.cwd ?? state.currentCwd);
+        }}
+        onManageSkill={(item: EngineCapabilityItem, action) => {
+          const labels = { enable: "启用", disable: "停用", remove: "删除" } as const;
+          if (!window.confirm(`${labels[action]} Skill「${item.name}」？${action === "remove" ? "删除会移动到本机可恢复回收目录。" : ""}`)) return;
+          setCapabilitiesLoading(true);
+          wsRef.current?.sendManageEngineSkill(
+            focusedEngine, space, action, { skillId: item.id },
+            state.newChat?.cwd ?? state.currentCwd);
+        }}
+        onCreateSkill={(draft: SkillDraft) => {
+          setCapabilitiesLoading(true);
+          wsRef.current?.sendManageEngineSkill(
+            focusedEngine, space, "create", draft,
+            state.newChat?.cwd ?? state.currentCwd);
+        }}
+        onRemoveHook={(item: EngineCapabilityItem) => {
+          if (!window.confirm(`删除 Hook「${item.name}」？配置文件中的其他内容会原样保留。`)) return;
+          setCapabilitiesLoading(true);
+          wsRef.current?.sendManageEngineHook(
+            focusedEngine, space, "remove", { hookId: item.id },
+            state.newChat?.cwd ?? state.currentCwd);
+        }}
+        onCreateHook={(draft: HookDraft) => {
+          setCapabilitiesLoading(true);
+          wsRef.current?.sendManageEngineHook(
+            focusedEngine, space, "create", draft,
             state.newChat?.cwd ?? state.currentCwd);
         }}
         onClose={() => setCapabilitiesOpen(false)} />
