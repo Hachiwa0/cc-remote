@@ -13,7 +13,7 @@ import { MessageBlock } from "./MessageBlock";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
 import { canForkTurn } from "../session-worktree";
 import { ProcessTimeline } from "./ProcessTimeline";
-import { finalTextBlocks, processBlocks } from "../process-blocks";
+import { finalTextBlocks, hasActiveProcess } from "../process-blocks";
 import { isMarkdownPath } from "../preview-path";
 import {
   anchoredScrollTop,
@@ -305,7 +305,13 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
               <button className="load-more-btn" onClick={doLoadMore}>加载更早的历史</button>
             </div>
           )}
-          {turns.map((t, ti) => (
+          {turns.map((t, ti) => {
+            const activeProcess = hasActiveProcess(t.blocks);
+            const working = !t.done || activeProcess;
+            const workingLabel = t.progress
+              ?? (activeProcess ? "处理中"
+                : finalTextBlocks(t.blocks).length > 0 ? "回答中" : "思考中");
+            return (
             <div className="turn" key={t.id}>
             {(t.prompt || (t.images && t.images.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
@@ -342,10 +348,6 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                   <MessageBlock key={block.message_id} text={block.text}
                     done={block.done} onOpenFile={onOpenFile} />
                 ))}
-                {!t.done && processBlocks(t.blocks).length === 0
-                  && finalTextBlocks(t.blocks).length === 0 && (
-                  <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">{t.progress ?? "思考中"}</span></div>
-                )}
                 {t.done && (
                   <>
                     <div className="ubub-meta ai-meta">
@@ -361,18 +363,24 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                         </button>
                       )}
                     </div>
-                    {ti === turns.length - 1 && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
+                    {ti === turns.length - 1 && !working
+                      && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
                   </>
                 )}
               </>
-            ) : (!t.done && t.prompt) ? (
-              <div className="turn-working"><ClaudeWorking size={24} /><span className="turn-working-tx">{t.progress ?? "思考中"}</span></div>
             ) : null}
+              {working && (
+                <div className="turn-working" role="status" aria-live="polite">
+                  <ClaudeWorking size={24} />
+                  <span className="turn-working-tx">{workingLabel}</span>
+                </div>
+              )}
               {fileChips(t)}
               {t.interrupted && <div className="note interrupted">— 已打断 —</div>}
               {t.error && <div className="note interrupted">{t.error}</div>}
             </div>
-          ))}
+            );
+          })}
         </div>
       </div>
       {(!scrollState.followOutput || !scrollState.nearBottom) && (

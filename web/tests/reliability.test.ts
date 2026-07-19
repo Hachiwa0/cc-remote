@@ -1989,6 +1989,31 @@ try {
   assert.match(richMarkup, /已处理 3s/);
   assert.match(richMarkup, /已经完成/);
   assert.doesNotMatch(richMarkup, /先检查代码/);
+  assert.doesNotMatch(richMarkup, /class="turn-working"/);
+
+  // The animated turn marker is driven by the turn lifecycle, not by an empty
+  // placeholder. It must survive reasoning expansion, process activity, final
+  // answer streaming, and terminal-mirrored history alike.
+  const thinkingMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: richSid, turns: [{
+      id: "thinking-live", prompt: "继续", done: false,
+      blocks: [{ kind: "text", message_id: "thinking-text", channel: "thinking",
+        text: "正在检查实现", done: false }],
+    }], engine: "claude", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(thinkingMarkup, /class="turn-working"/);
+  assert.match(thinkingMarkup, /思考中/);
+  assert.match(thinkingMarkup, /正在检查实现/);
+
+  const answerMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: richSid, turns: [{
+      id: "answer-live", prompt: "继续", done: false,
+      blocks: [{ kind: "text", message_id: "answer-text", channel: "final",
+        text: "正在回答", done: false }],
+    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(answerMarkup, /class="turn-working"/);
+  assert.match(answerMarkup, /回答中/);
   const { ProcessTimeline } = await reducerHarness.ssrLoadModule(
     "/src/components/ProcessTimeline.tsx");
   const declinedMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
@@ -2033,6 +2058,9 @@ try {
   }));
   assert.match(backgroundMarkup, /正在处理/);
   assert.match(backgroundMarkup, /继续检查/);
+  assert.match(backgroundMarkup, /class="turn-working"/);
+  assert.match(backgroundMarkup, /处理中/);
+  assert.doesNotMatch(backgroundMarkup, /class="turn-done-mark"/);
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
     phase: "end", status: "succeeded", turn_id: "turn-rich",
