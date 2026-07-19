@@ -716,7 +716,8 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   .work-compose-card{ padding:10px 10px 8px; border-radius:16px; }
   .work-compose-caption small,.work-private{ display:none; }
   .work-compose-tool,.work-settings>summary{ padding-left:6px; padding-right:6px; }
-  .work-settings-pop{ right:-42px; width:min(270px,calc(100vw - 24px)); }
+  .work-settings{ position:static; }
+  .work-settings-pop{ left:0; right:0; width:auto; }
 }
 @media (max-width:380px){
   .work-compose-tool:nth-of-type(2) span,.work-settings>summary span{ display:none; }

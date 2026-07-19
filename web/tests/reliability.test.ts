@@ -2879,6 +2879,9 @@ assert.match(appCssSource, /\.work-form-actions>button/,
   "Work action styles must be limited to direct action buttons");
 assert.match(appCssSource, /\.date-time-days button\{ height:32px/,
   "desktop calendar rows must stay compact enough to fit above the viewport edge");
+assert.match(appCssSource,
+  /@media \(max-width:640px\)\{[\s\S]*?\.work-settings\{ position:static; \}[\s\S]*?\.work-settings-pop\{ left:0; right:0; width:auto; \}/,
+  "mobile Work settings must use the full composer footer instead of overflowing its trigger");
 const sessionControlUiSource = readFileSync(
   resolve(process.cwd(), "src/session-control-ui.ts"), "utf8");
 assert.match(sessionControlUiSource, /桌面端控制 · 只读/);
