@@ -1,5 +1,16 @@
 #!/bin/sh
+# Unsupported PTY broker experiment. This is intentionally not installed or
+# documented as a customer feature.
 set -eu
+
+case "${CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER:-}" in
+    1|true|TRUE|yes|YES|on|ON) ;;
+    *)
+        echo "claude-remote is an unsupported experimental command." >&2
+        echo "Use the official 'claude' command; cc-remote mirrors it read-only and supports explicit takeover." >&2
+        exit 64
+        ;;
+esac
 
 SCRIPT_PATH=$0
 while [ -h "$SCRIPT_PATH" ]; do
@@ -16,9 +27,8 @@ REPO_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 PYTHON=${CC_REMOTE_PYTHON:-"$REPO_DIR/.venv/bin/python"}
 
 # The wrapper commonly runs as a system service without XDG_RUNTIME_DIR while
-# an interactive terminal has one.  Pin the public launcher to the stable
-# per-user endpoint unless the operator explicitly configured another path, so
-# both sides discover the same broker across login/session boundaries.
+# an interactive terminal has one. Pin this opt-in experiment to a stable
+# per-user endpoint unless its operator explicitly configured another path.
 if [ -z "${CC_REMOTE_CLAUDE_BROKER_SOCKET:-}" ]; then
     CC_REMOTE_CLAUDE_BROKER_SOCKET=$HOME/.cc-remote/claude-broker.sock
     export CC_REMOTE_CLAUDE_BROKER_SOCKET

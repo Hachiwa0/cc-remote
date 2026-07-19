@@ -15,10 +15,40 @@ from cc_remote.protocol import (
 )
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
-from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.test_multisession import _mk_ctx, _mk_machine as _base_mk_machine
 
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _mk_machine():
+    """Broker integration tests explicitly opt into the hidden experiment."""
+    machine, transport = _base_mk_machine()
+    machine._claude_broker_enabled = True
+    return machine, transport
+
+
+def test_customer_machine_does_not_adopt_a_live_broker(monkeypatch):
+    async def run():
+        machine, _transport = _base_mk_machine()
+        ctx = _mk_ctx("customer", SESSION_ID)
+        ctx.engine = "claude"
+        ctx.space = "code"
+        ctx.sdk = _ResidentSdk()
+        machine.sessions["customer"] = ctx
+        called = False
+
+        async def discover(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("customer path must not discover the PTY broker")
+
+        monkeypatch.setattr(ClaudeBrokerHandle, "discover", discover)
+        assert await machine._adopt_claude_broker_handle(ctx) is False
+        assert called is False
+        assert ctx.sdk.__class__ is _ResidentSdk
+
+    asyncio.run(run())
 
 
 def _user_row(uid: str = "user-1", text: str = "hello") -> bytes:
@@ -385,6 +415,7 @@ def test_sdk_controls_persist_for_next_broker_resume(monkeypatch, tmp_path):
                 return {"preferences": controls}
 
         machine._claude_broker = Client()
+        machine._claude_broker_enabled = True
 
         async def ready(_ctx, *, action):
             assert action
@@ -403,6 +434,25 @@ def test_sdk_controls_persist_for_next_broker_resume(monkeypatch, tmp_path):
             "effort": "max",
             "permission_mode": "plan",
         })
+
+    asyncio.run(go())
+
+
+def test_sdk_controls_do_not_touch_hidden_broker_by_default(tmp_path):
+    async def go():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.cwd = str(tmp_path)
+        ctx.engine = "claude"
+        ctx.space = "code"
+        ctx.sdk = _ControlResidentSdk()
+
+        class Client:
+            async def set_preferences(self, *_args, **_kwargs):
+                raise AssertionError("hidden broker must not receive controls")
+
+        machine._claude_broker = Client()
+        await machine._persist_claude_session_controls(ctx)
 
     asyncio.run(go())
 

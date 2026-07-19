@@ -97,19 +97,14 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
 
 - **Claude：**`claude` 始终还是官方命令和官方 TUI，cc-remote 不创建 alias、shim
   或 PATH 劫持。直接用 `claude`、Claude Desktop 或 Agent View 打开的会话在 Remote
-  中默认只读镜像，避免两个输入端同时写入。需要终端与 Remote 双向控制时，显式运行
-  `claude-remote`：同用户本地 broker 在 PTY 中启动真正的官方 `claude`，终端继续显示
-  完整官方 TUI，Remote 与它共用同一会话。迁移必须由用户主动点击；对普通 CLI 的迁移只
-  向扫描到的精确同用户 Claude 进程发送 SIGTERM，不终止终端 Shell、不使用 SIGKILL，
-  也不会静默接管现有进程。
+  中实时只读镜像，避免两个输入端同时写入。需要从 Remote 写入时，由用户主动点击接管；
+  cc-remote 只向扫描到的精确同用户 Claude 进程发送 SIGTERM，确认释放后再由 SDK 恢复
+  同一会话。它不终止终端 Shell、不使用 SIGKILL，也不会静默接管现有进程。
 - **Codex Code：**默认通过 Codex 官方共享 app-server daemon 接入，让原生 Codex
   客户端与 Remote 共享 thread 和控制状态；如果本机版本不支持，会明确降级到私有
   app-server。`CC_REMOTE_CODEX_DAEMON=off` 可用于故障排查。
 - **Work：**Claude 与 Codex Work 都保持各自的私有进程和目录，不加入 Code 的共享
   控制面，避免工作资料与代码会话互相泄漏。
-
-`claude-remote` 的 broker 只监听当前用户拥有的 Unix socket，不开放 TCP 端口；wrapper
-必须和终端 TUI 使用同一系统用户及同一个 socket 路径。
 
 ### Artifact 预览在哪里运行
 
@@ -171,8 +166,8 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 - **会话**：新建、搜索、后台运行、重命名、归档、删除、派生、Codex 对话与代码回滚、compact、Review、Codex worktree。
 - **回合**：流式输出、排队、打断、复制、编辑重发、从指定消息派生。
 - **工具**：命令输出、文件修改与 diff、MCP、协作代理、Hook、审批和用户输入回传。
-- **终端协同**：Codex Code 共享官方 daemon；Claude 用显式 `claude-remote` 保留官方
-  TUI 并实现双向控制。直接运行的 `claude` / Desktop / Agent View 默认只读镜像。
+- **终端协同**：Codex Code 共享官方 daemon 并支持双向控制；Claude 原生 CLI、Desktop
+  和 Agent View 在 Remote 中实时只读镜像，需要写入时由用户明确接管。
 - **状态**：模型、思考强度、权限、Plan、上下文、目标、用量、rate limit 和运行告警。
 - **扩展**：通过斜杠命令实时查看 Skills、Plugins、Apps、MCP 和 Hooks；安全增删本地 Skills、管理 Claude Hooks，并通过引擎原生管理器安装/卸载插件。Codex Hooks 因官方暂无写接口保持只读。
 - **设备**：响应式手机界面、深浅主题、多浏览器/多机器同步、PWA、后台完成提醒与断线重连。
@@ -199,20 +194,6 @@ pip install --require-hashes --only-binary=:all: -r requirements.lock
 npm --prefix web ci
 npm --prefix web run build          # 产出 web/dist/
 ```
-
-可选：如果要让 Claude 官方 TUI 与 Remote 双向控制同一会话，安装**独立命名**的
-launcher（不会修改 `claude`）：
-
-```bash
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$PWD/scripts/claude-remote" "$HOME/.local/bin/claude-remote"
-
-claude-remote                         # 自动启动同用户 broker，新建并附着官方 TUI
-claude-remote list                    # 查看 broker 持有的会话
-claude-remote resume SESSION_UUID --cwd /path/to/project
-```
-
-想继续完全原生、Remote 只读镜像的行为，仍然直接运行 `claude` 即可。
 
 ### 2）配置
 
@@ -368,19 +349,6 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cc-remote-wrapper
 journalctl -u cc-remote-wrapper -f     # 期望：connected to relay / wrapper running
 ```
 
-要启用 Claude 双向终端协同，先把 `CC_REMOTE_CLAUDE_BROKER_SOCKET` 在
-`/etc/cc-remote/wrapper.env` 与终端环境中设为同一绝对路径，再为运行 wrapper 的同一
-普通用户安装 launcher：
-
-```bash
-mkdir -p "$HOME/.local/bin"
-ln -sfn /path/to/cc-remote/scripts/claude-remote "$HOME/.local/bin/claude-remote"
-export CC_REMOTE_CLAUDE_BROKER_SOCKET="$HOME/.cc-remote/claude-broker.sock"
-claude-remote                         # broker 首次使用时自动启动，无需额外 systemd 服务
-```
-
-不要把 `claude-remote` 命名成 `claude`，也不要给官方命令加 alias。
-
 回 VPS 再看 `curl https://your-domain.com/healthz` → 应 `wrapper_connected:true`。
 
 ### 6）手机验证
@@ -429,8 +397,6 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `WRAPPER_TOKEN` | `change-me-wrapper` | 同中继。 |
 | `CC_REMOTE_MACHINE_ID` | `default` | 多机器 relay 中的稳定路由 id；使用 `WRAPPER_TOKENS_JSON` 时必须匹配对应键。 |
 | `CLAUDE_BIN` | 空 | 可选的 Claude CLI 绝对路径；systemd/PATH 找不到 `claude` 时设置。 |
-| `CC_REMOTE_CLAUDE_BROKER_SOCKET` | `$XDG_RUNTIME_DIR/cc-remote/claude-broker.sock`，无 XDG 时 `~/.cc-remote/claude-broker.sock` | `claude-remote` 与 wrapper 共用的同用户 Unix socket。systemd 部署建议双方显式设置为同一绝对路径。 |
-| `CLAUDE_REMOTE_CLAUDE_BIN` | `claude` | 仅供 `claude-remote` broker 选择真正的官方 Claude Code 可执行文件；不会修改官方命令。 |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server。Work 始终私有，不受此项影响。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |
 | `CC_RESUME_SESSION_ID` | 空 | 恢复指定会话 UUID；留空开新会话。首次启动后 id 会持久化到 `~/.cc-remote/`。 |

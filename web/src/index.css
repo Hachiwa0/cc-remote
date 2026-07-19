@@ -852,6 +852,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .sendbtn.interrupt{ background:var(--danger); }
 .hint{ display:flex; align-items:center; gap:12px; font-size:11px; color:var(--faint); padding:7px 2px 1px; }
 .hint-right{ position:relative; display:flex; align-items:center; gap:14px; margin-left:auto; flex:none; }
+.hint-control-scope{ color:var(--faint); font-size:10px; font-weight:600; white-space:nowrap; }
 .hint kbd{ font-family:var(--mono); font-size:10px; background:var(--raised);
   border:1px solid var(--border); border-radius:4px; padding:0 4px; }
 .hint-mode{ white-space:nowrap; cursor:pointer; font:inherit; color:inherit; background:none; border:0; padding:0; display:inline-flex; align-items:center; gap:3px; }
@@ -924,17 +925,6 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .cmd.danger.sel{ background:var(--danger-weak); }
 @media (hover:hover){ .cmd.danger:hover{ background:var(--danger-weak); } }
 .cmd.danger .cmd-nm{ color:var(--danger); } .cmd.danger .cmd-check{ color:var(--danger); }
-.custom-model{ margin:8px 6px 4px; padding:10px 12px; border:1px solid var(--border);
-  border-radius:12px; background:var(--bg); display:flex; flex-direction:column; gap:7px; }
-.custom-model label{ color:var(--dim); font-size:12px; font-weight:600; }
-.custom-model div{ display:flex; gap:8px; }
-.custom-model input{ min-width:0; flex:1; border:1px solid var(--border-strong); border-radius:9px;
-  background:var(--surface); color:var(--text); padding:8px 10px; font:13px var(--mono); outline:none; }
-.custom-model input:focus{ border-color:var(--accent-line); box-shadow:0 0 0 2px var(--accent-weak); }
-.custom-model button{ border:1px solid var(--accent-line); border-radius:9px; padding:0 12px;
-  color:var(--accent-ink); font-size:13px; font-weight:600; }
-.custom-model button:disabled{ opacity:.45; }
-
 /* LOGIN */
 .login{ position:fixed; inset:var(--app-offset-top,0px) 0 auto; height:var(--app-height,100dvh); z-index:60; background:var(--bg);
   display:flex; align-items:center; justify-content:center; padding:24px; transition:opacity .3s; }

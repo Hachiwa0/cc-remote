@@ -18,6 +18,8 @@ from cc_remote.protocol import (
     PREVIEW_ASSET_MAX_BYTES,
     PreviewAsset,
     SaveMarkdown,
+    ToolResult,
+    ToolUse,
 )
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -207,6 +209,98 @@ def test_markdown_preview_rejects_absolute_and_symlink_escape(tmp_path):
         machine._read_markdown_preview(str(root), str(outside))
     with pytest.raises(ValueError, match="超出"):
         machine._read_markdown_preview(str(root), "escape.md")
+
+
+def test_successful_write_grants_exact_cross_cwd_preview_and_edit(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("# created", encoding="utf-8")
+    neighbor = tmp_path / "neighbor.md"
+    neighbor.write_text("secret", encoding="utf-8")
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        machine.sessions[ctx.key] = ctx
+        machine.focused_sid = ctx.key
+
+        machine._observe_preview_path_event(ctx, ToolUse(
+            message_id="message-1",
+            tool_use_id="write-1",
+            tool="Write",
+            input={"file_path": str(outside), "content": "# created"},
+        ))
+        machine._observe_preview_path_event(ctx, ToolResult(
+            tool_use_id="write-1",
+            content=f"File created successfully at: {outside}",
+            is_error=False,
+            status="succeeded",
+        ))
+
+        preview = await machine._handle_get_file_preview(GetFilePreview(
+            sid=ctx.key,
+            client_id="client-1",
+            path=str(outside),
+            request_id="preview-external",
+        ))
+        assert preview.error is None
+        assert preview.path == str(outside.resolve())
+        assert preview.content == "# created"
+
+        denied = await machine._handle_get_file_preview(GetFilePreview(
+            sid=ctx.key,
+            client_id="client-1",
+            path=str(neighbor),
+            request_id="preview-neighbor",
+        ))
+        assert denied.error and "本会话" in denied.error
+
+        saved = await machine._handle_save_markdown(SaveMarkdown(
+            sid=ctx.key,
+            client_id="client-1",
+            path=preview.path,
+            request_id="save-external",
+            content="# edited",
+            expected_size=preview.size,
+            expected_mtime_ns=preview.mtime_ns,
+            expected_revision=preview.revision,
+        ))
+        assert saved.status == "saved"
+        assert saved.path == str(outside.resolve())
+        assert outside.read_text(encoding="utf-8") == "# edited"
+
+    asyncio.run(run())
+
+
+def test_failed_write_never_grants_cross_cwd_preview(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret", encoding="utf-8")
+    machine, _ = _mk_machine()
+    ctx = _mk_ctx("session-1", session_id="session-1")
+    ctx.cwd = str(root)
+
+    machine._observe_preview_path_event(ctx, ToolUse(
+        message_id="message-1",
+        tool_use_id="write-1",
+        tool="Write",
+        input={"file_path": str(outside), "content": "not written"},
+    ))
+    machine._observe_preview_path_event(ctx, ToolResult(
+        tool_use_id="write-1",
+        content="permission denied",
+        is_error=True,
+        status="failed",
+    ))
+
+    with pytest.raises(ValueError, match="本会话"):
+        machine._read_markdown_preview(
+            str(root), str(outside),
+            frozenset(ctx.preview_external_paths),
+        )
 
 
 def test_markdown_preview_rejects_special_files_without_blocking(tmp_path):

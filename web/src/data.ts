@@ -68,8 +68,9 @@ export const WORK_COMMANDS: Command[] = [
 // levels are per-model, not per-engine.
 export interface Model { id: string; name: string; ds: string; ic: string; efforts?: Effort[] }
 // Claude Code exposes the active/default model but no supported model catalog.
-// These are presentation-only common aliases, never a capability claim. The
-// model sheet also accepts a custom/provider model id verbatim.
+// These are presentation-only common aliases, never a capability claim. An
+// advanced user may still type `/model <id>` for a hidden/provider model; the
+// ordinary model sheet stays limited to curated choices.
 export const MODELS: Model[] = [
   { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "crown" },
   { id: "claude-opus-4-8", name: "Opus 4.8", ds: "最强推理", ic: "gem" },

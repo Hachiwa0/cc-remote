@@ -201,6 +201,14 @@ def test_claude_bin_defaults_to_path_and_can_be_configured(monkeypatch, tmp_path
     assert SdkHandle(cfg)._options(None).cli_path == str(cli)
 
 
+def test_claude_pty_broker_is_hidden_and_opt_in(monkeypatch):
+    monkeypatch.delenv("CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER", raising=False)
+    assert WrapperConfig().experimental_claude_broker is False
+
+    monkeypatch.setenv("CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER", "true")
+    assert WrapperConfig().experimental_claude_broker is True
+
+
 def test_claude_bin_rejects_relative_path(monkeypatch):
     monkeypatch.setenv("CLAUDE_BIN", "bin/claude")
     cfg = WrapperConfig()

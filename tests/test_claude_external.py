@@ -4,10 +4,12 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from claude_agent_sdk.types import ResultMessage, SystemMessage
 
 from cc_remote.protocol import Query, Takeover
+from cc_remote.wrapper.claude_controls import ClaudeControls
 from cc_remote.wrapper.claude_external import (
     claude_session_holders,
     classify_claude_growth,
@@ -426,11 +428,14 @@ def test_claude_process_scan_fails_closed_without_proc(tmp_path):
 class _ClaudeRunSdk:
     effort = "max"
     applied_effort = "max"
+    model = "claude-mythos-5"
+    permission_mode = "bypassPermissions"
     next_turn_id = None
 
     def __init__(self):
         self.queries = 0
         self.reconnects = 0
+        self.reconnect_args = []
 
     async def query(self, _prompt):
         self.queries += 1
@@ -445,8 +450,10 @@ class _ClaudeRunSdk:
             session_id="sid",
         )
 
-    async def force_reconnect(self, **_kwargs):
+    async def force_reconnect(self, **kwargs):
         self.reconnects += 1
+        self.reconnect_args.append(kwargs)
+        self.applied_effort = self.effort
 
     async def refresh_goal(self, _sid):
         return None
@@ -801,10 +808,117 @@ def test_claude_takeover_explicitly_migrates_the_terminal_process(
         assert result is None
         assert watch["takeover_pending"] is False
         assert machine._is_external("sid") is False
-        assert ctx.needs_reload is True
+        assert ctx.needs_reload is False
+        assert ctx.sdk.reconnects == 1
         pending = [event for event in transport.sent
                    if getattr(event, "type", None) == "takeover_state"]
         assert [event.pending for event in pending[-2:]] == [True, False]
+
+    asyncio.run(go())
+
+
+def test_claude_takeover_adopts_only_completed_native_controls(
+    tmp_path, monkeypatch,
+):
+    class UpstreamReportingSdk(_ClaudeRunSdk):
+        async def force_reconnect(self, **kwargs):
+            await super().force_reconnect(**kwargs)
+            self.model = "glm-5.2"
+
+    async def go():
+        machine, transport = _mk_machine()
+        session_id = "11111111-1111-4111-8111-111111111111"
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.cwd = str(tmp_path)
+        ctx.sdk = UpstreamReportingSdk()
+        ctx.announced_model = ctx.sdk.model
+        ctx.announced_effort = ctx.sdk.effort
+        machine.sessions[session_id] = ctx
+        holder = ProcessIdentity(203, 2003)
+        watch = _watch(path)
+        watch.update({"external": True, "holders": {holder}})
+        machine._watch[session_id] = watch
+
+        async def probe(_paths, _cwds):
+            return HolderScan({session_id: {holder}}, True)
+
+        async def terminate(_holders):
+            return set()
+
+        async def controls(_ctx):
+            return ClaudeControls(
+                model="claude-opus-4-6[1m]", effort="high")
+
+        monkeypatch.setattr(machine, "_probe_claude_holders", probe)
+        monkeypatch.setattr(
+            machine, "_terminate_external_claude_holders", terminate)
+        monkeypatch.setattr(
+            machine, "_read_claude_handoff_controls", controls)
+
+        result = await machine._handle_takeover(Takeover(
+            sid=session_id, cmd_id="takeover-controls"))
+
+        assert result is None
+        assert ctx.sdk.model == "claude-opus-4-6[1m]"
+        assert ctx.sdk.effort == "high"
+        assert ctx.sdk.reconnect_args[-1]["preserve_model"] is True
+        assert ctx.needs_reload is False
+        assert machine._claude_controls.get(session_id) == ClaudeControls(
+            model="claude-opus-4-6[1m]",
+            effort="high",
+            permission_mode="bypassPermissions",
+        )
+        assert any(getattr(event, "type", None) == "model"
+                   and event.model == "claude-opus-4-6[1m]"
+                   for event in transport.sent)
+        assert any(getattr(event, "type", None) == "effort"
+                   and event.effort == "high" for event in transport.sent)
+
+    asyncio.run(go())
+
+
+def test_claude_takeover_reload_failure_never_opens_remote_writes(
+    tmp_path, monkeypatch,
+):
+    class FailingSdk(_ClaudeRunSdk):
+        async def force_reconnect(self, **kwargs):
+            self.reconnect_args.append(kwargs)
+            raise RuntimeError("resume failed")
+
+    async def go():
+        machine, transport = _mk_machine()
+        session_id = "22222222-2222-4222-8222-222222222222"
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.cwd = str(tmp_path)
+        ctx.sdk = FailingSdk()
+        machine.sessions[session_id] = ctx
+        holder = ProcessIdentity(204, 2004)
+        watch = _watch(path)
+        watch.update({"external": True, "holders": {holder}})
+        machine._watch[session_id] = watch
+
+        async def probe(_paths, _cwds):
+            return HolderScan({session_id: {holder}}, True)
+
+        async def terminate(_holders):
+            return set()
+
+        monkeypatch.setattr(machine, "_probe_claude_holders", probe)
+        monkeypatch.setattr(
+            machine, "_terminate_external_claude_holders", terminate)
+        result = await machine._handle_takeover(Takeover(
+            sid=session_id, cmd_id="takeover-failed-reload"))
+
+        assert result is not None and result.code == "cc_crash"
+        assert ctx.needs_reload is True
+        assert ctx.write_state == "read_only"
+        assert ctx.control_can_takeover is False
+        assert not any(getattr(event, "type", None) == "history"
+                       for event in transport.sent)
 
     asyncio.run(go())
 
@@ -875,6 +989,32 @@ def test_claude_takeover_stays_locked_when_owner_scan_is_incomplete(
         assert result.code == "busy"
         assert machine._is_external("sid") is True
         assert watch["takeover_pending"] is False
+
+    asyncio.run(go())
+
+
+def test_native_claude_owner_blocks_remote_control_mutations(monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        session_id = "33333333-3333-4333-8333-333333333333"
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.sdk = _ClaudeRunSdk()
+        machine.sessions[session_id] = ctx
+
+        async def external(_sid):
+            return True
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", external)
+        result = await machine._handle_set_effort(SimpleNamespace(
+            sid=session_id, effort="low"))
+
+        assert result.code == "busy"
+        assert ctx.sdk.effort == "max"
+        assert "点击『接管』" in result.message
+        assert "claude-remote" not in result.message
+        assert any(getattr(event, "code", None) == "busy"
+                   for event in transport.sent)
 
     asyncio.run(go())
 

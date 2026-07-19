@@ -137,6 +137,13 @@ class SessionContext:
     # Track its question separately so a newer model choice can supersede the
     # old one without leaving an unreachable Future behind.
     pending_model_ask_id: Optional[str] = None
+    # A file outside ``cwd`` is never previewable merely because the browser
+    # knows its path.  The only exception is an exact path that this session's
+    # built-in Write/Edit tool has completed successfully.  Keep the pending
+    # tool/path binding separate so a failed or declined tool call grants no
+    # read capability.  Both maps are bounded by WrapperMachine.
+    preview_write_candidates: dict[str, str] = field(default_factory=dict)
+    preview_external_paths: dict[str, None] = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Serialize the tiny "final preflight check -> query accepted by engine"
     # window against interrupt().  Reconnects happen before this lock; once held,

@@ -39,6 +39,13 @@ def _float(key: str, default: float) -> float:
     return float(v) if v and v.strip() else default
 
 
+def _bool(key: str, default: bool = False) -> bool:
+    value = os.environ.get(key)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class RelayConfig:
     host: str = field(default_factory=lambda: _env("RELAY_HOST", "127.0.0.1"))
@@ -112,8 +119,13 @@ class WrapperConfig:
     # SDK/PATH discovery behavior.
     claude_bin: str = field(default_factory=lambda: _env("CLAUDE_BIN", "").strip())
     # Optional local PTY broker used only by the explicit `claude-remote`
-    # launcher. The normal `claude` executable remains untouched.
+    # experiment. It is intentionally disabled in the supported product path:
+    # direct native Claude owners are mirrored read-only and explicitly taken
+    # over by the SDK instead of sharing a PTY input state machine.
     claude_broker_socket: str = field(default_factory=default_socket_path)
+    experimental_claude_broker: bool = field(
+        default_factory=lambda: _bool(
+            "CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER", False))
     # cwd for the cc session. MUST match the resumed session's cwd, otherwise
     # --resume cannot locate the session jsonl under ~/.claude/projects/.
     cc_cwd: str = field(default_factory=lambda: _env("CC_CWD", os.getcwd()))
@@ -404,15 +416,17 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
     elif (cfg.claude_bin
           and not os.path.isabs(os.path.expanduser(cfg.claude_bin))):
         errors.append("CLAUDE_BIN must be an absolute path")
-    if (not cfg.claude_broker_socket
-            or "\x00" in cfg.claude_broker_socket
-            or len(cfg.claude_broker_socket.encode(
-                "utf-8", errors="surrogatepass")) > 4096):
-        errors.append(
-            "CC_REMOTE_CLAUDE_BROKER_SOCKET must be a non-empty path of at "
-            "most 4096 UTF-8 bytes")
-    elif not os.path.isabs(os.path.expanduser(cfg.claude_broker_socket)):
-        errors.append("CC_REMOTE_CLAUDE_BROKER_SOCKET must be an absolute path")
+    if cfg.experimental_claude_broker:
+        if (not cfg.claude_broker_socket
+                or "\x00" in cfg.claude_broker_socket
+                or len(cfg.claude_broker_socket.encode(
+                    "utf-8", errors="surrogatepass")) > 4096):
+            errors.append(
+                "CC_REMOTE_CLAUDE_BROKER_SOCKET must be a non-empty path of at "
+                "most 4096 UTF-8 bytes")
+        elif not os.path.isabs(os.path.expanduser(cfg.claude_broker_socket)):
+            errors.append(
+                "CC_REMOTE_CLAUDE_BROKER_SOCKET must be an absolute path")
 
     if not (12 * 1024 * 1024 <= cfg.ws_max_size_bytes <= 64 * 1024 * 1024):
         errors.append("WS_MAX_SIZE_BYTES must be between 12582912 and 67108864")

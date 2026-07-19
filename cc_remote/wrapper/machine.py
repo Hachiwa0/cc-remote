@@ -78,7 +78,7 @@ from cc_remote.protocol import (
     HistoryInvalidated, ArtifactInvalidated, AskUser,
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg,
-    TurnEnd, TurnResult, is_downstream, is_reliable_command,
+    ToolUse, ToolResult, TurnEnd, TurnResult, is_downstream, is_reliable_command,
     SessionInfo, SessionList, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
@@ -87,6 +87,13 @@ from cc_remote.protocol import (
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
+from cc_remote.wrapper.claude_controls import (
+    ClaudeControlStore,
+    ClaudeControlStoreError,
+    ClaudeControls,
+    last_completed_assistant_controls,
+    valid_claude_model,
+)
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
@@ -238,6 +245,9 @@ class WrapperMachine:
     # number of resident sessions allowed by config validation.
     PRIVATE_BTW_CAP = 64
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
+    PREVIEW_EXTERNAL_PATH_CAP = 256
+    PREVIEW_WRITE_CANDIDATE_CAP = 64
+    PREVIEW_WRITE_TOOLS = frozenset({"write", "edit", "multiedit"})
     CLAUDE_SETTINGS_MAX_BYTES = 1024 * 1024
     BG_JOB_SCAN_MAX = 1_000
     BG_JOB_STATE_MAX_BYTES = 64 * 1024
@@ -298,6 +308,11 @@ class WrapperMachine:
             getattr(cfg, "codex_daemon_mode", "auto"))
         self._claude_broker = BrokerClient(
             getattr(cfg, "claude_broker_socket", None))
+        # Claude's official SDK/CLI does not expose a supported multi-writer
+        # control plane. Keep the PTY broker code available for development,
+        # but never discover or adopt it in the customer path by default.
+        self._claude_broker_enabled = bool(getattr(
+            cfg, "experimental_claude_broker", False))
         # A History token changes for every wrapper process and every local
         # destructive conversation mutation.  Browsers persist this token with
         # IndexedDB turns, so a fresh wrapper can never merge a pre-crash cache
@@ -378,6 +393,15 @@ class WrapperMachine:
         except SessionPinStoreError:
             self._session_pins = None
             log.exception("session pin store unavailable")
+        try:
+            self._claude_controls: ClaudeControlStore | None = (
+                ClaudeControlStore(self.cfg.state_dir)
+            )
+        except ClaudeControlStoreError:
+            # A malformed preference cache must never prevent the engines from
+            # starting. Keep Remote usable, but do not silently trust it.
+            self._claude_controls = None
+            log.exception("Claude Remote control store unavailable")
         try:
             self._rollback_commands: RollbackCommandJournal | None = (
                 RollbackCommandJournal(self.cfg.state_dir)
@@ -629,6 +653,14 @@ class WrapperMachine:
                 ),
                 can_takeover=False,
             )
+        if (ctx.engine == "claude" and ctx.needs_reload
+                and ctx.control_mode == "remote"
+                and ctx.write_state == "read_only"
+                and ctx.control_reason
+                == "Claude Remote 恢复失败，请重新进入会话后重试"):
+            # The native writer is gone, but this resident SDK did not resume.
+            # A later ownership poll cannot turn that failure into writable.
+            return self._session_control(ctx)
         pending = bool((watch or {}).get("takeover_pending"))
         external = bool(ctx.session_id and self._is_external(ctx.session_id))
         if pending or external:
@@ -727,10 +759,30 @@ class WrapperMachine:
         return tuple(events)
 
     async def _persist_claude_session_controls(self, ctx: SessionContext) -> None:
-        """Save SDK-owned Code controls for the next official TUI resume."""
+        """Persist Remote-owned Claude controls without touching global config."""
         if (ctx.engine != "claude" or ctx.space != "code"
                 or not ctx.session_id
                 or getattr(ctx.sdk, "is_claude_broker", False)):
+            return
+        if self._claude_controls is not None:
+            try:
+                await asyncio.to_thread(
+                    self._claude_controls.update,
+                    ctx.session_id,
+                    model=getattr(ctx.sdk, "model", None),
+                    effort=getattr(ctx.sdk, "effort", None),
+                    permission_mode=getattr(
+                        ctx.sdk, "permission_mode", None),
+                )
+            except Exception as exc:
+                # A live runtime control change already succeeded. Do not roll
+                # it back because its private durability cache is unavailable.
+                log.warning(
+                    "Claude Remote controls could not be persisted",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+        if not self._claude_broker_enabled:
             return
         try:
             await self._claude_broker.set_preferences(
@@ -748,6 +800,107 @@ class WrapperMachine:
                 session_id=ctx.session_id,
                 error_type=type(exc).__name__,
             )
+
+    async def _load_claude_session_controls(
+        self, session_id: str,
+    ) -> ClaudeControls:
+        """Load one private session override; invalid state fails closed."""
+        if self._claude_controls is None:
+            return ClaudeControls()
+        try:
+            return await asyncio.to_thread(
+                self._claude_controls.get, session_id)
+        except Exception as exc:
+            log.warning(
+                "Claude Remote controls could not be loaded",
+                session_id=session_id,
+                error_type=type(exc).__name__,
+            )
+            return ClaudeControls()
+
+    async def _read_claude_handoff_controls(
+        self, ctx: SessionContext,
+    ) -> ClaudeControls:
+        """Read only controls proved by the latest completed native turn."""
+        if not ctx.session_id:
+            return ClaudeControls()
+        try:
+            return await asyncio.to_thread(
+                last_completed_assistant_controls,
+                ctx.session_id,
+                directory=ctx.cwd,
+                max_bytes=self.cfg.history_source_max_bytes,
+            )
+        except Exception as exc:
+            # Transcript controls are advisory during handoff. An unavailable or
+            # malformed tail must preserve the last Remote-owned choices.
+            log.warning(
+                "Claude native handoff controls unavailable",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            return ClaudeControls()
+
+    async def _reload_claude_after_takeover(
+        self, ctx: SessionContext,
+    ) -> Error | None:
+        """Atomically resume SDK ownership after the native writer has exited."""
+        controls = await self._read_claude_handoff_controls(ctx)
+        previous_model = getattr(ctx.sdk, "model", None)
+        previous_effort = getattr(ctx.sdk, "effort", None)
+        model = controls.model or previous_model
+        effort = controls.effort or previous_effort
+        if model:
+            ctx.sdk.model = model
+        if effort:
+            ctx.sdk.effort = effort
+        ctx.needs_reload = True
+        try:
+            await ctx.sdk.force_reconnect(
+                resume_id=ctx.session_id,
+                cwd=ctx.cwd,
+                reason="native Claude takeover handoff",
+                preserve_model=True,
+            )
+        except Exception as exc:
+            log.warning(
+                "Claude takeover SDK reload failed",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            await self._set_session_control(
+                ctx,
+                control_mode="remote",
+                write_state="read_only",
+                terminal_attached=False,
+                reason="Claude Remote 恢复失败，请重新进入会话后重试",
+                can_takeover=False,
+            )
+            error = Error(
+                code=ERR_CC_CRASH,
+                message="Claude CLI 已退出，但 Remote 恢复失败；本次未开放写入",
+            )
+            await self._emit(ctx, error)
+            return error
+
+        ctx.needs_reload = False
+        applied_model = valid_claude_model(
+            getattr(ctx.sdk, "model", None)) or model
+        applied_effort = getattr(ctx.sdk, "effort", None) or effort
+        if applied_model:
+            # A custom provider can expose its upstream id through context
+            # usage even though the selected Claude alias was applied. Never
+            # leak that implementation detail back into Remote's model chip or
+            # its private session store.
+            ctx.sdk.model = applied_model
+        if applied_model and applied_model != ctx.announced_model:
+            ctx.announced_model = applied_model
+            await self._emit(ctx, Model(model=applied_model))
+        if applied_effort and applied_effort != ctx.announced_effort:
+            ctx.announced_effort = applied_effort
+            await self._emit(ctx, Effort(effort=applied_effort))
+        await self._persist_claude_session_controls(ctx)
+        return None
 
     @staticmethod
     def _is_orphaned_claude_broker_turn(ctx: SessionContext) -> bool:
@@ -1047,6 +1200,8 @@ class WrapperMachine:
         the broker child.  Discover the exact sid, stop only our idle SDK child,
         and switch the context to the non-owning broker adapter instead.
         """
+        if not self._claude_broker_enabled:
+            return False
         if (ctx.engine != "claude" or ctx.space != "code"
                 or not ctx.session_id):
             return False
@@ -1156,6 +1311,8 @@ class WrapperMachine:
 
     async def _adopt_live_claude_broker_sessions(self) -> None:
         """Upgrade resident idle contexts from one bounded broker list read."""
+        if not self._claude_broker_enabled:
+            return
         candidates = [
             ctx for ctx in list(self.sessions.values())
             if (ctx.engine == "claude" and ctx.space == "code"
@@ -1783,6 +1940,59 @@ class WrapperMachine:
 
     # ---- emit (per-ctx seq + buffer + best-effort send), serialized per ctx ----
 
+    @staticmethod
+    def _path_is_below(root: str, candidate: str) -> bool:
+        try:
+            return os.path.commonpath((root, candidate)) == root
+        except ValueError:
+            return False
+
+    def _observe_preview_path_event(self, ctx: SessionContext, msg) -> None:
+        """Grant an exact, bounded preview capability after a successful write.
+
+        Normal previews remain cwd-confined.  Claude/Codex can, however, be
+        explicitly asked to create a deliverable elsewhere (for example
+        ``/tmp/test.md``).  The resulting ToolUse + successful ToolResult is an
+        auditable capability for that exact path; knowing any other absolute
+        path is still insufficient to read it through Remote.
+        """
+        if isinstance(msg, ToolUse):
+            if (msg.tool or "").lower() not in self.PREVIEW_WRITE_TOOLS:
+                return
+            raw_path = msg.input.get("file_path") or msg.input.get("path")
+            if (not isinstance(raw_path, str) or not raw_path
+                    or raw_path.startswith("~") or len(raw_path) > 4096):
+                return
+            pending = ctx.preview_write_candidates
+            pending[msg.tool_use_id] = raw_path
+            while len(pending) > self.PREVIEW_WRITE_CANDIDATE_CAP:
+                pending.pop(next(iter(pending)))
+            return
+
+        if not isinstance(msg, ToolResult):
+            return
+        raw_path = ctx.preview_write_candidates.pop(msg.tool_use_id, None)
+        if raw_path is None or msg.is_error or msg.status in {
+                "failed", "declined", "cancelled", "interrupted"}:
+            return
+        root = os.path.realpath(ctx.cwd)
+        candidate = os.path.realpath(
+            raw_path if os.path.isabs(raw_path)
+            else os.path.join(root, raw_path))
+        if self._path_is_below(root, candidate):
+            return
+        paths = ctx.preview_external_paths
+        paths.pop(candidate, None)
+        paths[candidate] = None
+        while len(paths) > self.PREVIEW_EXTERNAL_PATH_CAP:
+            paths.pop(next(iter(paths)))
+
+    @staticmethod
+    def _preview_external_paths(ctx: SessionContext) -> frozenset[str]:
+        # Copy before handing the set to a worker thread.  Live tool events may
+        # add another path while an Office conversion or file read is running.
+        return frozenset(ctx.preview_external_paths)
+
     async def _emit_locked(self, ctx: SessionContext, msg) -> None:
         # Stamp routing before buffering so byte accounting includes the final
         # wire shape.  Every live and replayable /btw frame is owner-only; relay
@@ -1801,6 +2011,7 @@ class WrapperMachine:
         await self.transport.send(msg)
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
+        self._observe_preview_path_event(ctx, msg)
         async with ctx.emit_lock:
             await self._emit_locked(ctx, msg)
 
@@ -3368,6 +3579,12 @@ class WrapperMachine:
                 in_progress=in_progress,
             )
         for ev in events:
+            if ctx is not None:
+                # Rebuild exact cross-cwd preview capabilities from the durable
+                # transcript after a wrapper restart or resident-session
+                # eviction.  The observer grants only completed Write/Edit
+                # pairs, never a path merely mentioned by the assistant.
+                self._observe_preview_path_event(ctx, ev)
             if isinstance(ev, UserMsg):
                 ev.prompt, restored_files = self._strip_attachment_paths(ev.prompt)
                 if restored_files and not ev.files:
@@ -3718,8 +3935,8 @@ class WrapperMachine:
                         await self._emit(ctx, error)
                         return error
                     # Consume final JSONL flushes only after the exact CLI
-                    # identity disappeared. The resident SDK reloads from this
-                    # transcript at the next query boundary.
+                    # identity disappeared. Keep Web read-only until the
+                    # resident SDK has resumed this exact transcript.
                     try:
                         final_stat = await asyncio.to_thread(os.stat, w["path"])
                     except OSError:
@@ -3728,12 +3945,19 @@ class WrapperMachine:
                         w["size"] = final_stat.st_size
                         w["file_id"] = (final_stat.st_dev, final_stat.st_ino)
                         w["file_available"] = True
+                    reload_error = await self._reload_claude_after_takeover(ctx)
                     w["holders"] = set()
                     w["takeover_pending"] = False
                     w["external"] = False
                     w["scan_complete"] = True
                     ctx.external_ts = 0.0
-                    ctx.needs_reload = True
+                    if reload_error is not None:
+                        await self._emit(ctx, TakeoverState(
+                            pending=False,
+                            message=("本机 Claude 已退出，但 Remote 恢复失败；"
+                                     "会话仍禁止写入"),
+                        ))
+                        return reload_error
                     log.info(
                         "Claude external CLI migrated to Remote",
                         session_id=resolved_sid,
@@ -3744,11 +3968,17 @@ class WrapperMachine:
                         message="本机 Claude 已退出，会话已迁移到 Remote",
                     ))
                 else:
+                    reload_error = await self._reload_claude_after_takeover(ctx)
                     w["takeover_pending"] = False
                     w["external"] = False
                     w["scan_complete"] = True
                     ctx.external_ts = 0.0
-                    ctx.needs_reload = True
+                    if reload_error is not None:
+                        await self._emit(ctx, TakeoverState(
+                            pending=False,
+                            message="Remote 恢复失败，会话仍禁止写入",
+                        ))
+                        return reload_error
 
         await self._sync_external_control(ctx, w)
 
@@ -4343,7 +4573,7 @@ class WrapperMachine:
             ctx, self._watch.get(ctx.session_id))
         engine_name = "Codex" if ctx.engine == "codex" else "Claude"
         guidance = (
-            "请先点击『接管』，或使用 claude-remote 启动终端以保持双向同步"
+            "请先点击『接管』，或退出 CLI 后再操作"
             if ctx.engine == "claude"
             else "请先退出终端或点击『接管』"
         )
@@ -5977,13 +6207,16 @@ class WrapperMachine:
 
         try:
             suffix = os.path.splitext(cmd.path)[1].lower()
+            external_paths = self._preview_external_paths(ctx)
             if suffix in self.OFFICE_PREVIEW_SUFFIXES:
                 async with self._preview_conversion_limit:
                     preview = await asyncio.to_thread(
-                        self._read_file_preview, ctx.cwd, cmd.path)
+                        self._read_file_preview, ctx.cwd, cmd.path,
+                        external_paths)
             else:
                 preview = await asyncio.to_thread(
-                    self._read_file_preview, ctx.cwd, cmd.path)
+                    self._read_file_preview, ctx.cwd, cmd.path,
+                    external_paths)
             response = FilePreview(
                 path=preview["path"],
                 request_id=cmd.request_id,
@@ -6043,6 +6276,7 @@ class WrapperMachine:
                 cmd.expected_size,
                 int(cmd.expected_mtime_ns),
                 cmd.expected_revision,
+                self._preview_external_paths(ctx),
             )
             response = FileSaveResult(
                 path=path,
@@ -6101,7 +6335,8 @@ class WrapperMachine:
 
         try:
             _, media_type, data = await asyncio.to_thread(
-                self._read_preview_asset, ctx.cwd, cmd.path)
+                self._read_preview_asset, ctx.cwd, cmd.path,
+                self._preview_external_paths(ctx))
             response = PreviewAsset(
                 path=cmd.path,
                 preview_id=cmd.preview_id,
@@ -6384,6 +6619,7 @@ class WrapperMachine:
         allowed_suffixes: Optional[frozenset[str]],
         max_bytes: int,
         allow_truncate: bool,
+        allowed_external_paths: frozenset[str] = frozenset(),
     ) -> tuple[str, bytes, os.stat_result, bool]:
         """Read a bounded regular file below cwd without following an escape.
 
@@ -6398,17 +6634,21 @@ class WrapperMachine:
         root = os.path.realpath(cwd)
         candidate = os.path.realpath(
             path if os.path.isabs(path) else os.path.join(root, path))
-        try:
-            if os.path.commonpath((root, candidate)) != root:
-                raise ValueError("预览路径超出当前工作目录")
-        except ValueError as exc:
-            raise ValueError("预览路径超出当前工作目录") from exc
+        inside_root = WrapperMachine._path_is_below(root, candidate)
+        if not inside_root and candidate not in allowed_external_paths:
+            raise ValueError(
+                "预览路径超出当前工作目录，且不是本会话成功创建或编辑的文件")
 
         suffix = os.path.splitext(candidate)[1].lower()
         if allowed_suffixes is not None and suffix not in allowed_suffixes:
             raise ValueError("不支持预览该文件类型")
 
-        relative = os.path.relpath(candidate, root)
+        access_root = root if inside_root else os.path.dirname(candidate)
+        relative = (os.path.relpath(candidate, root)
+                    if inside_root else os.path.basename(candidate))
+        display_path = relative.replace(os.sep, "/") if inside_root else candidate
+        if relative in ("", "."):
+            raise ValueError("预览目标必须是普通文件")
         parts = relative.split(os.sep)
         file_flags = os.O_RDONLY
         file_flags |= getattr(os, "O_CLOEXEC", 0)
@@ -6423,7 +6663,7 @@ class WrapperMachine:
             # Walk from an already-open cwd and refuse symlinks at every hop.
             # This closes the realpath/open race where a parent directory could
             # otherwise be replaced by an escaping symlink between both calls.
-            dir_fd = os.open(root, dir_flags)
+            dir_fd = os.open(access_root, dir_flags)
             for part in parts[:-1]:
                 next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
                 os.close(dir_fd)
@@ -6455,11 +6695,12 @@ class WrapperMachine:
         if truncated and not allow_truncate:
             raise ValueError(
                 f"预览文件超过 {max_bytes // (1024 * 1024)} MiB 限制")
-        return relative.replace(os.sep, "/"), data[:max_bytes], file_stat, truncated
+        return display_path, data[:max_bytes], file_stat, truncated
 
     @classmethod
     def _read_text_preview(
         cls, cwd: str, path: str,
+        allowed_external_paths: frozenset[str] = frozenset(),
     ) -> tuple[str, str, int, bool, int, str, Optional[str]]:
         relative, data, file_stat, truncated = cls._read_session_file(
             cwd,
@@ -6467,6 +6708,7 @@ class WrapperMachine:
             allowed_suffixes=None,
             max_bytes=FILE_PREVIEW_MAX_BYTES,
             allow_truncate=True,
+            allowed_external_paths=allowed_external_paths,
         )
         if b"\0" in data:
             raise ValueError("文件不是可预览的 UTF-8 文本")
@@ -6486,7 +6728,10 @@ class WrapperMachine:
         )
 
     @classmethod
-    def _read_file_preview(cls, cwd: str, path: str) -> dict[str, object]:
+    def _read_file_preview(
+        cls, cwd: str, path: str,
+        allowed_external_paths: frozenset[str] = frozenset(),
+    ) -> dict[str, object]:
         """Read or render one artifact entirely on the wrapper host.
 
         The returned dictionary is short-lived and immediately serialized into
@@ -6495,7 +6740,8 @@ class WrapperMachine:
         """
         suffix = os.path.splitext(path)[1].lower()
         if suffix in cls.OFFICE_PREVIEW_SUFFIXES:
-            return cls._convert_office_preview(cwd, path)
+            return cls._convert_office_preview(
+                cwd, path, allowed_external_paths)
 
         if suffix in cls.HTML_PREVIEW_SUFFIXES:
             relative, data, file_stat, truncated = cls._read_session_file(
@@ -6504,6 +6750,7 @@ class WrapperMachine:
                 allowed_suffixes=cls.HTML_PREVIEW_SUFFIXES,
                 max_bytes=FILE_PREVIEW_MAX_BYTES,
                 allow_truncate=True,
+                allowed_external_paths=allowed_external_paths,
             )
             if b"\0" in data:
                 raise ValueError("HTML 文件不是有效的 UTF-8 文本")
@@ -6530,6 +6777,7 @@ class WrapperMachine:
                 allowed_suffixes=frozenset(cls.ARTIFACT_PREVIEW_MEDIA_TYPES),
                 max_bytes=ARTIFACT_PREVIEW_MAX_BYTES,
                 allow_truncate=False,
+                allowed_external_paths=allowed_external_paths,
             )
             cls._validate_rendered_preview(media_type, data)
             return {
@@ -6542,7 +6790,7 @@ class WrapperMachine:
             }
 
         relative, content, size, truncated, mtime_ns, file_format, revision = (
-            cls._read_text_preview(cwd, path))
+            cls._read_text_preview(cwd, path, allowed_external_paths))
         return {
             "path": relative,
             "format": file_format,
@@ -6569,7 +6817,10 @@ class WrapperMachine:
             raise ValueError("文件内容与预览格式不匹配")
 
     @classmethod
-    def _convert_office_preview(cls, cwd: str, path: str) -> dict[str, object]:
+    def _convert_office_preview(
+        cls, cwd: str, path: str,
+        allowed_external_paths: frozenset[str] = frozenset(),
+    ) -> dict[str, object]:
         suffix = os.path.splitext(path)[1].lower()
         relative, data, file_stat, _ = cls._read_session_file(
             cwd,
@@ -6577,6 +6828,7 @@ class WrapperMachine:
             allowed_suffixes=cls.OFFICE_PREVIEW_SUFFIXES,
             max_bytes=cls.OFFICE_PREVIEW_INPUT_MAX_BYTES,
             allow_truncate=False,
+            allowed_external_paths=allowed_external_paths,
         )
         soffice = shutil.which("soffice") or shutil.which("libreoffice")
         bwrap = shutil.which("bwrap")
@@ -6676,6 +6928,7 @@ class WrapperMachine:
         expected_size: int,
         expected_mtime_ns: int,
         expected_revision: str,
+        allowed_external_paths: frozenset[str] = frozenset(),
     ) -> tuple[str, int, int, str]:
         """CAS-style atomic save for one existing Markdown regular file.
 
@@ -6688,18 +6941,29 @@ class WrapperMachine:
         if path.startswith("~"):
             raise ValueError("保存路径必须位于当前工作目录")
 
-        root = os.path.realpath(cwd)
+        session_root = os.path.realpath(cwd)
         candidate = os.path.abspath(
-            path if os.path.isabs(path) else os.path.join(root, path))
-        try:
-            if os.path.commonpath((root, candidate)) != root:
-                raise ValueError("保存路径超出当前工作目录")
-        except ValueError as exc:
-            raise ValueError("保存路径超出当前工作目录") from exc
+            path if os.path.isabs(path) else os.path.join(session_root, path))
+        real_candidate = os.path.realpath(candidate)
+        lexical_inside = cls._path_is_below(session_root, candidate)
+        inside_root = cls._path_is_below(session_root, real_candidate)
+        if lexical_inside and not inside_root:
+            raise ValueError("保存路径不能包含符号链接")
+        if not inside_root:
+            if real_candidate not in allowed_external_paths:
+                raise ValueError(
+                    "保存路径超出当前工作目录，且不是本会话成功创建或编辑的文件")
+            candidate = real_candidate
+            root = os.path.dirname(candidate)
+            relative = os.path.basename(candidate)
+            display_path = candidate
+        else:
+            root = session_root
+            relative = os.path.relpath(candidate, root)
+            display_path = relative.replace(os.sep, "/")
 
         if os.path.splitext(candidate)[1].lower() not in cls.MARKDOWN_PREVIEW_SUFFIXES:
             raise ValueError("只允许保存 Markdown 文件")
-        relative = os.path.relpath(candidate, root)
         parts = relative.split(os.sep)
         if relative in ("", ".") or any(part in ("", ".", "..") for part in parts):
             raise ValueError("保存路径无效")
@@ -6820,7 +7084,7 @@ class WrapperMachine:
             os.fsync(dir_fd)
             saved_stat = os.stat(parts[-1], dir_fd=dir_fd, follow_symlinks=False)
             return (
-                relative.replace(os.sep, "/"),
+                display_path,
                 saved_stat.st_size,
                 saved_stat.st_mtime_ns,
                 hashlib.sha256(payload).hexdigest(),
@@ -6837,6 +7101,7 @@ class WrapperMachine:
     @classmethod
     def _read_markdown_preview(
         cls, cwd: str, path: str,
+        allowed_external_paths: frozenset[str] = frozenset(),
     ) -> tuple[str, str, int, bool, int]:
         relative, data, file_stat, truncated = cls._read_session_file(
             cwd,
@@ -6844,6 +7109,7 @@ class WrapperMachine:
             allowed_suffixes=cls.MARKDOWN_PREVIEW_SUFFIXES,
             max_bytes=FILE_PREVIEW_MAX_BYTES,
             allow_truncate=True,
+            allowed_external_paths=allowed_external_paths,
         )
         decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
         try:
@@ -6874,6 +7140,7 @@ class WrapperMachine:
     @classmethod
     def _read_preview_asset(
         cls, cwd: str, path: str,
+        allowed_external_paths: frozenset[str] = frozenset(),
     ) -> tuple[str, str, bytes]:
         suffix = os.path.splitext(path)[1].lower()
         media_type = cls.PREVIEW_ASSET_MEDIA_TYPES.get(suffix)
@@ -6885,6 +7152,7 @@ class WrapperMachine:
             allowed_suffixes=frozenset(cls.PREVIEW_ASSET_MEDIA_TYPES),
             max_bytes=PREVIEW_ASSET_MAX_BYTES,
             allow_truncate=False,
+            allowed_external_paths=allowed_external_paths,
         )
         return relative, media_type, data
 
@@ -7176,7 +7444,7 @@ class WrapperMachine:
                     engine="claude", space=space,
                     work_id=record.work_id if record else None,
                 ))
-            if space == "code":
+            if space == "code" and self._claude_broker_enabled:
                 # `claude-remote new` reserves the native session UUID before
                 # Claude writes its first transcript row. Merge live broker
                 # metadata so the TUI is immediately selectable in the sidebar;
@@ -7541,6 +7809,7 @@ class WrapperMachine:
             # Start ownership monitoring at capture so a terminal resume during
             # that first response cannot wait until the next Remote query.
             self._watch_session(sid)
+            await self._persist_claude_session_controls(ctx)
         log.info("captured cc session id", sid=sid, focus_followed=(self.focused_sid == sid))
 
     async def _handle_new_session(self, cmd) -> None:
@@ -10237,7 +10506,8 @@ class WrapperMachine:
             ))
             return None
         broker_handle: Optional[ClaudeBrokerHandle] = None
-        if (engine == "claude" and space == "code" and resume_id):
+        if (self._claude_broker_enabled
+                and engine == "claude" and space == "code" and resume_id):
             try:
                 broker_handle = await ClaudeBrokerHandle.discover(
                     self._claude_broker, resume_id)
@@ -10374,6 +10644,16 @@ class WrapperMachine:
                 return None
             work_id = work_record.work_id
 
+        if (resume_id and engine == "claude" and space == "code"
+                and broker_handle is None):
+            # Explicit command controls win. Otherwise restore only the private
+            # session override owned by Remote, never Claude's global settings.
+            saved_controls = await self._load_claude_session_controls(resume_id)
+            model = model or saved_controls.model
+            effort = effort or saved_controls.effort
+            permission_mode = (
+                permission_mode or saved_controls.permission_mode)
+
         sdk = (
             (CodexHandle(
                 self.cfg,
@@ -10402,6 +10682,9 @@ class WrapperMachine:
                     self._work.for_engine("claude").ensure_claude_policy,
                     work_record)
                 sdk.permission_mode = "acceptEdits"
+        elif (engine == "claude"
+              and permission_mode in CLAUDE_PERMISSION_MODES):
+            sdk.permission_mode = permission_mode
         # Pre-select effort at spawn (before connect): cc reads it via _options at
         # connect so --effort is baked into the first turn (no respawn); codex uses
         # it as a per-turn param. codex model is also a per-turn field, so set it

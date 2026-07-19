@@ -80,6 +80,33 @@ def test_live_scripts_require_an_explicit_main_entrypoint():
             )
 
 
+def test_claude_pty_broker_is_not_a_documented_or_installed_feature():
+    public_files = [
+        ROOT / "README.md",
+        ROOT / "README_en.md",
+        ROOT / "deploy" / "README.md",
+        ROOT / "deploy" / "env.wrapper.example",
+    ]
+    for path in public_files:
+        source = path.read_text()
+        assert "claude-remote" not in source
+        assert "CC_REMOTE_CLAUDE_BROKER_SOCKET" not in source
+    assert not (ROOT / "scripts" / "claude-remote").exists()
+
+    experiment = ROOT / "experiments" / "claude-remote"
+    result = subprocess.run(
+        [str(experiment), "status"],
+        env={
+            key: value for key, value in os.environ.items()
+            if key != "CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER"
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 64
+    assert "unsupported experimental command" in result.stderr
+
+
 def test_setup_script_is_valid_shell_and_keeps_safe_install_order():
     script = ROOT / "deploy" / "setup-vps.sh"
     transaction = ROOT / "deploy" / "setup_transaction.sh"

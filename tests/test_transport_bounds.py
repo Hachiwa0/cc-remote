@@ -49,8 +49,15 @@ def test_wrapper_startup_config_fails_closed():
         validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="always"))
     validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="auto"))
     validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="off"))
+    # The hidden broker experiment must not make a stale legacy variable break
+    # the supported native-CLI mirror path. Its socket is validated only after
+    # an explicit opt-in.
+    validate_wrapper_config(_wrapper_cfg(claude_broker_socket="relative.sock"))
     with pytest.raises(ValueError, match="CC_REMOTE_CLAUDE_BROKER_SOCKET"):
-        validate_wrapper_config(_wrapper_cfg(claude_broker_socket="relative.sock"))
+        validate_wrapper_config(_wrapper_cfg(
+            claude_broker_socket="relative.sock",
+            experimental_claude_broker=True,
+        ))
 
 
 def test_wrapper_transport_queues_and_frame_size_are_bounded():

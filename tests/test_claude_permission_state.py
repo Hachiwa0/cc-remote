@@ -11,6 +11,7 @@ from cc_remote.protocol import GetModels, Hello, NewSession, OpenBtw
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper import sdk as sdk_module
 from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.claude_controls import ClaudeControls
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -261,6 +262,58 @@ def test_claude_default_resolution_does_not_block_serial_commands():
 
         release_probe.set()
         await asyncio.gather(*machine._models_command_tasks.values())
+
+    asyncio.run(go())
+
+
+def test_cold_claude_resume_restores_private_remote_controls(
+    monkeypatch, tmp_path,
+):
+    session_id = "11111111-1111-4111-8111-111111111111"
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setattr(
+            SdkHandle, "refresh_goal", lambda *_args: asyncio.sleep(0))
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=str(tmp_path)))
+        monkeypatch.setattr(
+            machine_module, "save_session_id", lambda *_args: None)
+
+        machine, _ = _mk_machine()
+        machine._claude_controls.update(
+            session_id,
+            model="claude-opus-4-6[1m]",
+            effort="high",
+            permission_mode="plan",
+        )
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            session_id, engine="claude", space="code")
+
+        assert ctx is not None
+        assert ctx.sdk.model == "claude-opus-4-6[1m]"
+        assert ctx.sdk.effort == "high"
+        assert ctx.sdk.applied_effort == "high"
+        assert ctx.sdk.permission_mode == "plan"
+        client = _FakeClaudeClient.created[-1]
+        assert client.options.permission_mode == "plan"
+        assert client.options.effort == "high"
+        assert client.model_calls == ["claude-opus-4-6[1m]"]
+        assert machine._claude_controls.get(session_id) == ClaudeControls(
+            model="claude-opus-4-6[1m]",
+            effort="high",
+            permission_mode="plan",
+        )
+        await ctx.sdk.disconnect()
 
     asyncio.run(go())
 

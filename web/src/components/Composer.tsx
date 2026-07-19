@@ -146,6 +146,17 @@ export function Composer(p: Props) {
   const controlUi = p.control ? presentSessionControl(p.control) : legacyControl;
   // The connection and authoritative write state independently gate input.
   const locked = offline || !!controlUi?.locked;
+  const externalClaudeOwner = p.engine === "claude"
+    ? (p.control?.control_mode === "external_cli" ? "外部 CLI"
+      : p.control?.control_mode === "agent_view" ? "Agent View"
+      : p.control?.control_mode === "desktop" ? "Claude Desktop"
+      : (!p.control && p.external) ? "外部 CLI"
+      : null)
+    : null;
+  // Claude's native surfaces do not expose their live model/effort/permission
+  // controls to the Agent SDK. Keep Remote's saved takeover preferences visible,
+  // but never present them as the active native runtime state.
+  const deferredClaudeControls = externalClaudeOwner !== null;
   const hasText = input.trim().length > 0;
   const hasAttachments = images.length > 0 || files.length > 0;
 
@@ -643,16 +654,33 @@ export function Composer(p: Props) {
             className={"hint-mode" + modeCls + (hintBusy ? " busy" : "")}
             onClick={() => setSheetKind("perms")}
             disabled={locked}
-            title="点击切换权限模式"
+            title={deferredClaudeControls
+              ? `${externalClaudeOwner} 当前权限模式未公开`
+              : "点击切换权限模式"}
           >
-            {perm ? perm.short : "Mode loading"} · {stateZh[p.state]} <span className="hint-mode-ch">▾</span>
+            {deferredClaudeControls
+              ? externalClaudeOwner
+              : (perm ? perm.short : "Mode loading")} · {stateZh[p.state]}
+            {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
           </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令</span>
           <div className="hint-right" ref={ctxWrapRef}>
+            {deferredClaudeControls && (
+              <span className="hint-control-scope"
+                title={`以下是 Remote 接管后的配置，不是${externalClaudeOwner}当前状态`}>
+                接管后
+              </span>
+            )}
             <button className="hint-ctl" onClick={() => setSheetKind("models")}
-              disabled={locked} title="选择模型">{model?.name ?? "模型读取中"}</button>
+              disabled={locked}
+              title={deferredClaudeControls
+                ? `Remote 接管后模型：${model?.name ?? "读取中"}；不是${externalClaudeOwner}当前模型`
+                : "选择模型"}>{model?.name ?? "模型读取中"}</button>
             <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
-              disabled={locked} title="思考强度">{effort?.name ?? "强度读取中"}</button>
+              disabled={locked}
+              title={deferredClaudeControls
+                ? `Remote 接管后思考强度：${effort?.name ?? "读取中"}；不是${externalClaudeOwner}当前强度`
+                : "思考强度"}>{effort?.name ?? "强度读取中"}</button>
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"
