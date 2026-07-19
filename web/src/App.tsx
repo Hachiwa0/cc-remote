@@ -39,6 +39,7 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   type SessionControl, sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
+import { parseGitDiff } from "./diff";
 import { resolveSidebarSwipe } from "./responsive-layout";
 import {
   bumpSessionActivity,
@@ -1144,6 +1145,16 @@ export default function App() {
     setRightView("diff");
     dispatch({ type: "open_artifact_loading", file, sid: focusedSid, requestId });
   };
+  const openTurnDiff = (files: string[], diff: string) => {
+    if (!diff || !confirmArtifactDiscard()) return;
+    setRightView("diff");
+    dispatch({ type: "set_artifact", artifact: {
+      file: files.length === 1 ? files[0] : `本轮改动 · ${files.length} 个文件`,
+      sid: focusedSid,
+      kind: "gitdiff",
+      sections: parseGitDiff(diff),
+    } });
+  };
   const previewFile = (file: string, line?: number) => {
     if (!focusedSid) return;
     if (!confirmArtifactDiscard()) return;
@@ -1368,6 +1379,7 @@ export default function App() {
               hasMore={!!rt.hasMore}
               onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_PAGE); }}
               onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff}
+              onOpenTurnDiff={openTurnDiff}
               onPreviewMarkdown={previewMarkdown}
               onOpenFile={previewFile}
               onOpenArtifacts={() => {

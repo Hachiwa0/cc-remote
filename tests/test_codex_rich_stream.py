@@ -177,6 +177,10 @@ def test_codex_plan_command_file_diff_and_delta_metadata():
                         and event.tool_use_id == "patch-1")
     assert patch_result.status == "succeeded"
     assert patch_result.diff and "+new" in patch_result.diff
+    patch_use = [event for event in events
+                 if isinstance(event, ToolUse)
+                 and event.tool_use_id == "patch-1"][-1]
+    assert patch_use.input["file_paths"] == ["/repo/a.py"]
 
 
 def test_codex_live_append_streams_have_cumulative_and_event_budgets():
@@ -923,6 +927,41 @@ def test_codex_history_preserves_phase_tools_and_public_reasoning_once(tmp_path)
             for event in events
         ]
     assert identity(first) == identity(second)
+
+
+def test_codex_history_content_only_add_has_paths_and_diff(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-add"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-add"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "create"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "patch_apply_end", "call_id": "call-add",
+                     "turn_id": "turn-add", "success": True,
+                     "stdout": "ok", "stderr": "", "changes": {
+                         "/tmp/new.txt": {"type": "add", "content": "1\n"},
+                     }}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-add",
+                     "last_agent_message": "done", "duration_ms": 4}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 8_000)
+    use = next(event for event in events if isinstance(event, ToolUse))
+    result = next(event for event in events if isinstance(event, ToolResult))
+    assert use.tool == "apply_patch"
+    assert use.input["file_paths"] == ["/tmp/new.txt"]
+    assert use.input["changes"] == [
+        {"path": "/tmp/new.txt", "kind": "add"},
+    ]
+    assert result.diff
+    assert "--- /dev/null" in result.diff
+    assert "+++ /tmp/new.txt" in result.diff
+    assert "+1" in result.diff
 
 
 def test_codex_history_prefers_authoritative_legacy_event_shapes(tmp_path):

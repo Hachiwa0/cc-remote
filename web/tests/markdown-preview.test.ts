@@ -7,6 +7,7 @@ import { createServer } from "vite";
 
 import { classifyPreviewTarget, isMarkdownPath } from "../src/preview-path.ts";
 import { parseLocalFileTarget } from "../src/file-link.ts";
+import { collectTurnFileChanges, filePathsFromInput, mutatedFilePaths } from "../src/file-changes.ts";
 import type { ServerEvent } from "../src/protocol.ts";
 
 assert.deepEqual(classifyPreviewTarget("docs/README.md", "./img/a.png"), {
@@ -39,6 +40,33 @@ assert.deepEqual(parseLocalFileTarget("file:///tmp/a%20b.py:9"), {
 });
 assert.equal(parseLocalFileTarget("https://example.com/a.py:9"), null);
 assert.equal(parseLocalFileTarget("#L9"), null);
+assert.deepEqual(mutatedFilePaths("Write", {
+  file_path: "/tmp/claude.txt",
+}), ["/tmp/claude.txt"]);
+assert.deepEqual(mutatedFilePaths("apply_patch", {
+  changes: [
+    { path: "/tmp/codex.txt", kind: "add" },
+    { path: "/tmp/old.txt", move_path: "/tmp/new.txt", kind: "move" },
+  ],
+}), ["/tmp/codex.txt", "/tmp/old.txt", "/tmp/new.txt"]);
+assert.deepEqual(filePathsFromInput({
+  file_paths: ["/tmp/a", "/tmp/a"],
+  changes: { "/tmp/b": { type: "add" } },
+}), ["/tmp/a", "/tmp/b"]);
+assert.deepEqual(mutatedFilePaths("Read", {
+  file_path: "/tmp/secret.txt",
+}), [], "read-only tools must never be treated as mutations");
+assert.deepEqual(collectTurnFileChanges([
+  { kind: "tool", tool: "apply_patch", input: {
+    file_paths: ["/tmp/current-turn.md"],
+  }, result: { diff: "--- /dev/null\n+++ /tmp/current-turn.md\n@@ -0,0 +1 @@\n+1\n" } },
+  { kind: "tool", tool: "Read", input: {
+    file_path: "/home/nancy/project/unrelated.py",
+  }, result: { diff: "--- a/unrelated.py\n+++ b/unrelated.py\n" } },
+]), {
+  paths: ["/tmp/current-turn.md"],
+  diff: "--- /dev/null\n+++ /tmp/current-turn.md\n@@ -0,0 +1 @@\n+1",
+}, "a turn summary must use only its mutation events, never the worktree diff");
 
 const harness = await createServer({
   root: process.cwd(),

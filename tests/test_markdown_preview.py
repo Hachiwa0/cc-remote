@@ -303,6 +303,52 @@ def test_failed_write_never_grants_cross_cwd_preview(tmp_path):
         )
 
 
+def test_successful_codex_patch_grants_multiple_exact_cross_cwd_paths(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    first = tmp_path / "one.txt"
+    second = tmp_path / "two.md"
+    first.write_text("1\n", encoding="utf-8")
+    second.write_text("# two\n", encoding="utf-8")
+    machine, _ = _mk_machine()
+    ctx = _mk_ctx("session-1", session_id="session-1")
+    ctx.cwd = str(root)
+    use = ToolUse(
+        message_id="message-1",
+        tool_use_id="patch-1",
+        tool="apply_patch",
+        category="file",
+        input={"changes": [
+            {"path": str(first), "kind": "add"},
+            {"path": str(second), "kind": "add"},
+        ]},
+    )
+
+    machine._observe_preview_path_event(ctx, use)
+    assert use.input["file_paths"] == [str(first), str(second)]
+    assert ctx.preview_write_candidates["patch-1"] == (
+        str(first), str(second))
+    machine._observe_preview_path_event(ctx, ToolResult(
+        tool_use_id="patch-1",
+        content="ok",
+        is_error=False,
+        status="succeeded",
+    ))
+
+    allowed = frozenset(ctx.preview_external_paths)
+    assert allowed == {str(first.resolve()), str(second.resolve())}
+    assert machine._read_text_preview(
+        str(root), str(first), allowed)[1] == "1\n"
+    assert machine._read_markdown_preview(
+        str(root), str(second), allowed)[1] == "# two\n"
+    diff = asyncio.run(machine._git_diff(str(root), str(first), allowed))
+    assert "--- /dev/null" in diff
+    assert "+1" in diff
+    with pytest.raises(ValueError, match="outside the session repository"):
+        asyncio.run(machine._git_diff(
+            str(root), str(tmp_path / "not-authorized.txt"), allowed))
+
+
 def test_markdown_preview_rejects_special_files_without_blocking(tmp_path):
     fifo = tmp_path / "pipe.md"
     os.mkfifo(fifo)

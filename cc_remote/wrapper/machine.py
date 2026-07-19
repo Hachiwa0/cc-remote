@@ -247,7 +247,10 @@ class WrapperMachine:
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
     PREVIEW_EXTERNAL_PATH_CAP = 256
     PREVIEW_WRITE_CANDIDATE_CAP = 64
-    PREVIEW_WRITE_TOOLS = frozenset({"write", "edit", "multiedit"})
+    PREVIEW_WRITE_TOOLS = frozenset({
+        "write", "edit", "multiedit", "notebookedit", "editfile",
+        "apply_patch", "filechange",
+    })
     CLAUDE_SETTINGS_MAX_BYTES = 1024 * 1024
     BG_JOB_SCAN_MAX = 1_000
     BG_JOB_STATE_MAX_BYTES = 64 * 1024
@@ -1959,33 +1962,83 @@ class WrapperMachine:
         if isinstance(msg, ToolUse):
             if (msg.tool or "").lower() not in self.PREVIEW_WRITE_TOOLS:
                 return
-            raw_path = msg.input.get("file_path") or msg.input.get("path")
-            if (not isinstance(raw_path, str) or not raw_path
-                    or raw_path.startswith("~") or len(raw_path) > 4096):
+            raw_paths = self._tool_write_paths(msg.input)
+            if not raw_paths:
                 return
+            # ``file_paths`` is the engine-neutral presentation field.  Keep the
+            # original payload beside it so old clients and detailed tool views
+            # retain the exact SDK/app-server input.
+            if msg.input.get("file_paths") != list(raw_paths):
+                msg.input = dict(msg.input)
+                msg.input["file_paths"] = list(raw_paths)
             pending = ctx.preview_write_candidates
-            pending[msg.tool_use_id] = raw_path
+            pending[msg.tool_use_id] = raw_paths
             while len(pending) > self.PREVIEW_WRITE_CANDIDATE_CAP:
                 pending.pop(next(iter(pending)))
             return
 
         if not isinstance(msg, ToolResult):
             return
-        raw_path = ctx.preview_write_candidates.pop(msg.tool_use_id, None)
-        if raw_path is None or msg.is_error or msg.status in {
+        raw_paths = ctx.preview_write_candidates.pop(msg.tool_use_id, None)
+        if raw_paths is None or msg.is_error or msg.status in {
                 "failed", "declined", "cancelled", "interrupted"}:
             return
         root = os.path.realpath(ctx.cwd)
-        candidate = os.path.realpath(
-            raw_path if os.path.isabs(raw_path)
-            else os.path.join(root, raw_path))
-        if self._path_is_below(root, candidate):
-            return
         paths = ctx.preview_external_paths
-        paths.pop(candidate, None)
-        paths[candidate] = None
+        for raw_path in raw_paths:
+            candidate = os.path.realpath(
+                raw_path if os.path.isabs(raw_path)
+                else os.path.join(root, raw_path))
+            if self._path_is_below(root, candidate):
+                continue
+            paths.pop(candidate, None)
+            paths[candidate] = None
         while len(paths) > self.PREVIEW_EXTERNAL_PATH_CAP:
             paths.pop(next(iter(paths)))
+
+    @staticmethod
+    def _tool_write_paths(tool_input: dict) -> tuple[str, ...]:
+        """Extract exact mutation targets from Claude and Codex tool payloads.
+
+        Claude exposes one ``file_path`` while Codex fileChange/apply_patch uses
+        ``changes`` (a descriptor list live, a path-keyed map in rollouts).  The
+        canonical ``file_paths`` field is accepted first so replaying already-
+        normalized events is idempotent.
+        """
+        candidates: list[object] = []
+        canonical = tool_input.get("file_paths")
+        if isinstance(canonical, (list, tuple)):
+            candidates.extend(canonical)
+        for key in ("file_path", "path", "notebook_path"):
+            candidates.append(tool_input.get(key))
+
+        changes = tool_input.get("changes")
+        if isinstance(changes, list):
+            for change in changes[:64]:
+                if not isinstance(change, dict):
+                    continue
+                for key in ("path", "move_path", "destination_path", "to"):
+                    candidates.append(change.get(key))
+        elif isinstance(changes, dict):
+            for path, change in list(changes.items())[:64]:
+                candidates.append(path)
+                if not isinstance(change, dict):
+                    continue
+                for key in ("path", "move_path", "destination_path", "to"):
+                    candidates.append(change.get(key))
+
+        paths: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if (not isinstance(candidate, str) or not candidate
+                    or candidate.startswith("~") or len(candidate) > 4096
+                    or candidate in seen):
+                continue
+            seen.add(candidate)
+            paths.append(candidate)
+            if len(paths) >= 64:
+                break
+        return tuple(paths)
 
     @staticmethod
     def _preview_external_paths(ctx: SessionContext) -> frozenset[str]:
@@ -6170,7 +6223,8 @@ class WrapperMachine:
             await self._emit_to_sid(sid, error)
             return error
         try:
-            diff = await self._git_diff(ctx.cwd, cmd.file)
+            diff = await self._git_diff(
+                ctx.cwd, cmd.file, self._preview_external_paths(ctx))
             event = DiffReport(
                 file=cmd.file,
                 diff=diff,
@@ -7156,7 +7210,10 @@ class WrapperMachine:
         )
         return relative, media_type, data
 
-    async def _git_diff(self, cwd: str, file: str) -> str:
+    async def _git_diff(
+        self, cwd: str, file: str,
+        allowed_external_paths: frozenset[str] = frozenset(),
+    ) -> str:
         """Raw `git diff` (vs HEAD) text for a cwd. Empty file => all files; a
         single untracked file falls back to --no-index (full-add diff)."""
         max_bytes = max(64 * 1024, min(4 * 1024 * 1024,
@@ -7238,10 +7295,28 @@ class WrapperMachine:
         parent = os.path.realpath(os.path.dirname(candidate))
         contained = os.path.join(parent, os.path.basename(candidate))
         try:
-            if os.path.commonpath((root, contained)) != root:
+            below_root = os.path.commonpath((root, contained)) == root
+        except ValueError:
+            below_root = False
+        if not below_root:
+            resolved = os.path.realpath(contained)
+            if resolved not in allowed_external_paths:
                 raise ValueError("diff path is outside the session repository")
-        except ValueError as exc:
-            raise ValueError("diff path is outside the session repository") from exc
+            try:
+                file_stat = os.lstat(resolved)
+            except OSError:
+                return ""
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("external diff target must be a regular file")
+            source_cap = getattr(
+                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
+            if file_stat.st_size > source_cap:
+                raise ValueError("external diff target exceeds the source size limit")
+            return await self._bounded_process_output(
+                ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
+                 "--no-index", "--", "/dev/null", resolved),
+                max_bytes,
+            )
         rel_file = os.path.relpath(contained, root)
 
         # Work uses a private plain directory rather than a Git repository. A

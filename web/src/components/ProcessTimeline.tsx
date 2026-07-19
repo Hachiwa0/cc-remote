@@ -4,6 +4,7 @@ import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
 import { hasActiveProcess, processBlocks } from "../process-blocks";
+import { filePathsFromInput } from "../file-changes";
 
 function durationLabel(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -48,8 +49,8 @@ function ProcessActivity({ block, onOpenFile }: {
   block: ProcessBlock;
   onOpenFile?: (path: string, line?: number) => void;
 }) {
-  const filePath = typeof block.input?.file_path === "string"
-    ? block.input.file_path : null;
+  const filePaths = block.processKind === "file_change"
+    ? filePathsFromInput(block.input) : [];
   const hasBody = !!(block.summary || block.detail || block.output || block.diff
     || block.progress || block.command || block.cwd || block.plan?.length
     || (block.input && Object.keys(block.input).length));
@@ -71,13 +72,13 @@ function ProcessActivity({ block, onOpenFile }: {
       {block.cwd && <div className="process-meta">{block.cwd}</div>}
       {block.summary && <div className="process-copy">{block.summary}</div>}
       {block.detail && <pre className="tool-pre">{block.detail}</pre>}
-      {filePath && onOpenFile && (
-        <button type="button" className="process-file-link"
+      {onOpenFile && filePaths.map((filePath) => (
+        <button key={filePath} type="button" className="process-file-link"
           onClick={() => onOpenFile(filePath)}>
           <Icon name="file" size={14} /><span>{filePath}</span>
         </button>
-      )}
-      {block.input && Object.keys(block.input).length > 0 && !filePath && (
+      ))}
+      {block.input && Object.keys(block.input).length > 0 && filePaths.length === 0 && (
         <pre className="tool-pre">{JSON.stringify(block.input, null, 2)}</pre>
       )}
       {block.output && <pre className="tool-pre">{block.output}{block.truncated ? "\n…(truncated)" : ""}</pre>}

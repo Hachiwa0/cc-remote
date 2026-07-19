@@ -15,6 +15,7 @@ import { canForkTurn } from "../session-worktree";
 import { ProcessTimeline } from "./ProcessTimeline";
 import { finalTextBlocks, hasActiveProcess } from "../process-blocks";
 import { isMarkdownPath } from "../preview-path";
+import { collectTurnFileChanges } from "../file-changes";
 import {
   anchoredScrollTop,
   createFrameCoalescer,
@@ -46,7 +47,7 @@ function formatTime(ts: number): string {
 }
 
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
-  onLoadMore, onEdit, onGetDiff, onPreviewMarkdown, onOpenFile,
+  onLoadMore, onEdit, onGetDiff, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, surface = "code" }: {
   sid: string | null;
   turns: Turn[];
@@ -57,6 +58,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onLoadMore?: () => void;
   onEdit: (prompt: string) => void;
   onGetDiff: (file: string) => void;
+  onOpenTurnDiff?: (files: string[], diff: string) => void;
   onPreviewMarkdown?: (file: string) => void;
   onOpenFile?: (file: string, line?: number) => void;
   onOpenArtifacts?: () => void;
@@ -227,21 +229,21 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   };
   const aiText = (t: Turn) => finalTextBlocks(t.blocks).map((block) => block.text).join("\n\n");
 
-  // Collect the file_paths this turn mutated (Edit/Write). In Work, the summary
-  // opens the deliverable while the individual file chips remain diff links.
+  // Collect engine-neutral file mutations. The helper also understands old
+  // Claude file_path and Codex changes payloads already stored in browser cache.
   const fileChips = (t: Turn) => {
-    const files = new Set<string>();
-    t.blocks.forEach((b) => {
-      if (b.kind === "tool" && (b.tool === "Edit" || b.tool === "Write")) {
-        const fp = (b.input as { file_path?: string }).file_path;
-        if (fp) files.add(fp);
-      }
-    });
-    if (!files.size) return null;
-    const arr = [...files];
+    const changes = collectTurnFileChanges(t.blocks);
+    if (!changes.paths.length) return null;
+    const arr = changes.paths;
     const openSummary = () => {
       if (surface !== "work") {
-        onGetDiff("");
+        if (changes.diff && onOpenTurnDiff) {
+          onOpenTurnDiff(arr, changes.diff);
+        } else if (arr.length === 1) {
+          // Compatibility fallback for old history without a persisted diff.
+          // It remains path-scoped and must never open the whole worktree.
+          onGetDiff(arr[0]);
+        }
         return;
       }
       if (arr.length === 1 && onOpenFile) {
@@ -253,7 +255,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     return (
       <div className="turn-files">
         <button className="turn-files-summary" onClick={openSummary}
-          title={surface === "work" ? "预览 Artifacts" : "查看全部改动"}>
+          title={surface === "work" ? "预览 Artifacts" : "查看本轮改动"}>
           <Icon name={surface === "work" ? "folder" : "edit"} size={13} />{
             surface === "work" ? `Artifacts · ${arr.length} 个文件` : `改动 ${arr.length} 个文件`
           }

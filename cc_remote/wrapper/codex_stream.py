@@ -7,6 +7,7 @@ marker is still forwarded so the remote timeline does not silently omit the step
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import re
@@ -90,6 +91,7 @@ class CodexStreamTranslator:
         self._text_seen: set[str] = set()
         self._message_channels: dict[str, str] = {}
         self._tools_started: set[str] = set()
+        self._tool_message_ids: dict[str, str] = {}
         self._reasoning_started: set[str] = set()
         self._file_diffs: dict[str, str] = {}
         self._open_msg: str | None = None
@@ -202,6 +204,8 @@ class CodexStreamTranslator:
                     return out
                 if iid not in self._tools_started:
                     out.extend(self._tool_use(item))
+                elif t == "fileChange":
+                    out.append(self._tool_update(item))
                 out.append(self._tool_result(item))
             elif t in _PROCESS_ITEM_TYPES:
                 iid = _live_id(item.get("id"), str(t or "process"))
@@ -332,6 +336,13 @@ class CodexStreamTranslator:
             iid = _live_id(p.get("itemId"), "fileChange-tool")
             if not self._admit_live_item(iid, out):
                 return out
+            if iid in self._tools_started:
+                out.append(self._tool_update({
+                    "type": "fileChange",
+                    "id": p.get("itemId"),
+                    "status": "inProgress",
+                    "changes": p.get("changes"),
+                }))
             latest, _ = bounded_text(_changes_diff(p.get("changes")), 2 * 1024 * 1024)
             previous = self._file_diffs.get(iid, "")
             self._file_diffs[iid] = latest
@@ -727,6 +738,7 @@ class CodexStreamTranslator:
         self._tools_started.add(iid)
         mid = self._open_msg or iid
         self._ensure_block(mid, out)
+        self._tool_message_ids[iid] = self._open_msg or mid
         inp = _tool_input(item)
         tool, category, title, server = _tool_presentation(item)
         out.append(ToolUse(
@@ -739,6 +751,21 @@ class CodexStreamTranslator:
             server=server,
         ))
         return out
+
+    def _tool_update(self, item: dict) -> ToolUse:
+        item_type = str(item.get("type") or "tool")
+        iid = _live_id(item.get("id"), f"{item_type}-tool")
+        tool, category, title, server = _tool_presentation(item)
+        return ToolUse(
+            message_id=self._tool_message_ids.get(iid, iid),
+            tool_use_id=iid,
+            tool=tool,
+            input=bounded_tool_input(
+                _tool_input(item), self.tool_result_max),
+            category=category,
+            title=title,
+            server=server,
+        )
 
     def _tool_result(self, item: dict) -> ToolResult:
         item_type = item.get("type")
@@ -1164,7 +1191,11 @@ def _tool_input(item: dict) -> dict:
             out["process_id"] = item.get("processId")
         return {key: value for key, value in out.items() if value is not None}
     if item_type == "fileChange":
-        return {"changes": _change_descriptors(item.get("changes"))}
+        changes = _change_descriptors(item.get("changes"))
+        return {
+            "changes": changes,
+            "file_paths": _descriptor_paths(changes),
+        }
     if item_type == "mcpToolCall":
         arguments = item.get("arguments")
         if isinstance(arguments, dict):
@@ -1234,23 +1265,44 @@ def _change_descriptors(changes) -> list[dict]:
             kind = entry.get("kind")
             if isinstance(kind, dict):
                 kind = kind.get("type")
-            descriptors.append({
+            descriptor = {
                 "path": str(entry.get("path") or "")[:16 * 1024],
                 "kind": str(kind or "update")[:128],
-            })
+            }
+            move_path = (entry.get("move_path")
+                         or entry.get("destination_path") or entry.get("to"))
+            if isinstance(move_path, str) and move_path:
+                descriptor["move_path"] = move_path[:16 * 1024]
+            descriptors.append(descriptor)
     elif isinstance(changes, dict):
         for path, change in list(changes.items())[:64]:
             kind = change.get("type") if isinstance(change, dict) else "update"
-            descriptors.append({
+            descriptor = {
                 "path": str(path)[:16 * 1024],
                 "kind": str(kind or "update")[:128],
-            })
+            }
+            move_path = (change.get("move_path") if isinstance(change, dict)
+                         else None)
+            if isinstance(move_path, str) and move_path:
+                descriptor["move_path"] = move_path[:16 * 1024]
+            descriptors.append(descriptor)
     return descriptors
 
 
 def _change_paths(changes) -> list[str]:
-    return [entry["path"] for entry in _change_descriptors(changes)
-            if entry.get("path")]
+    return _descriptor_paths(_change_descriptors(changes))
+
+
+def _descriptor_paths(descriptors: list[dict]) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for entry in descriptors:
+        for key in ("path", "move_path"):
+            path = entry.get(key)
+            if isinstance(path, str) and path and path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths
 
 
 def _changes_diff(changes) -> str:
@@ -1260,17 +1312,45 @@ def _changes_diff(changes) -> str:
         for entry in changes[:64]:
             if not isinstance(entry, dict):
                 continue
-            diff = entry.get("diff")
+            diff = _change_diff(str(entry.get("path") or "file"), entry)
             if isinstance(diff, str) and diff:
                 parts.append(diff)
     elif isinstance(changes, dict):
-        for _path, entry in list(changes.items())[:64]:
+        for path, entry in list(changes.items())[:64]:
             if not isinstance(entry, dict):
                 continue
-            diff = entry.get("unified_diff") or entry.get("diff")
+            diff = _change_diff(str(path), entry)
             if isinstance(diff, str) and diff:
                 parts.append(diff)
     return "\n".join(parts)
+
+
+def _change_diff(path: str, entry: dict) -> str:
+    explicit = entry.get("unified_diff") or entry.get("diff")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+
+    kind = entry.get("kind") or entry.get("type") or "update"
+    if isinstance(kind, dict):
+        kind = kind.get("type") or "update"
+    old_content = entry.get("old_content")
+    new_content = entry.get("content")
+    if str(kind).lower() in {"add", "create", "added"}:
+        old_content = ""
+    elif str(kind).lower() in {"delete", "remove", "deleted"}:
+        old_content = (entry.get("content") if old_content is None
+                       else old_content)
+        new_content = ""
+    if not isinstance(old_content, str) or not isinstance(new_content, str):
+        return ""
+    from_file = "/dev/null" if not old_content else path
+    to_file = "/dev/null" if not new_content else path
+    return "".join(difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=from_file,
+        tofile=to_file,
+    ))
 
 
 def _file_summary(paths: list[str], status: str) -> str:
@@ -1931,7 +2011,8 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                 ensure_assistant(line_no, raw_ts)
                 tool_id = _history_id(
                     p.get("call_id"), "tool", line_no, raw_ts)
-                paths = _change_paths(p.get("changes"))
+                descriptors = _change_descriptors(p.get("changes"))
+                paths = _descriptor_paths(descriptors)
                 if tool_id not in seen_tool_uses:
                     seen_tool_uses.add(tool_id)
                     turn_visible = True
@@ -1940,7 +2021,8 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                         tool_use_id=tool_id,
                         tool="apply_patch",
                         input=bounded_tool_input({
-                            "changes": _change_descriptors(p.get("changes")),
+                            "changes": descriptors,
+                            "file_paths": paths,
                         }, 64 * 1024),
                         category="file",
                         title=_file_summary(paths, "running"),
