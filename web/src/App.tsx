@@ -639,7 +639,7 @@ export default function App() {
             const body = turnNotificationBody(label, msg.result);
             void navigator.serviceWorker?.ready.then((registration) =>
               registration.showNotification("cc-remote", {
-                body, icon: "/favicon.svg", badge: "/favicon.svg",
+                body, icon: "/icon-192.png", badge: "/favicon.svg",
                 tag: turnNotificationTag(msg), data: { url: "/" },
               })).catch(() => undefined);
           }

@@ -1,5 +1,8 @@
-const CACHE = "cc-remote-shell-v1";
-const SHELL = ["/", "/manifest.webmanifest", "/favicon.svg"];
+const CACHE = "cc-remote-shell-v2";
+const SHELL = [
+  "/", "/manifest.webmanifest", "/favicon.svg", "/apple-touch-icon.png",
+  "/icon-192.png", "/icon-512.png", "/icon-maskable-512.png",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
@@ -61,6 +64,6 @@ self.addEventListener("push", (event) => {
   const tag = typeof payload.tag === "string" ? payload.tag : "cc-remote-turn";
   const url = typeof payload.url === "string" ? payload.url : "/";
   event.waitUntil(self.registration.showNotification(title, {
-    body, tag, icon: "/favicon.svg", badge: "/favicon.svg", data: { url },
+    body, tag, icon: "/icon-192.png", badge: "/favicon.svg", data: { url },
   }));
 });
