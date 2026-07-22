@@ -532,17 +532,28 @@ export class RelayWs {
     return queued ? requestId : null;
   }
 
-  /** Fetch a session's history as ONE bulk frame, read on-demand from its
-   *  transcript (like a web chat's GET /conversation). client_id lets the wrapper
-   *  route the History reply to=this client. Replaces per-hello buffer replay. */
+  /** Fetch a small canonical conversation page. Heavy per-turn detail remains
+   *  in the wrapper materialized index until the user expands it. */
   sendGetHistory(sessionId: string, before?: string | null, limit?: number | null): void {
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_history", session_id: sessionId,
-      client_id: this.clientId, ts: nowTs(),
+      client_id: this.clientId, detail: "summary", ts: nowTs(),
     };
     if (before) obj.before = before;
     if (limit) obj.limit = limit;
     this.send(obj);
+  }
+
+  sendGetTurnDetail(
+    sessionId: string, turnId: string, revision?: string | null,
+  ): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_turn_detail",
+      session_id: sessionId, turn_id: turnId,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (revision) frame.revision = revision;
+    return this.send(frame);
   }
 
   /** Ask the engine for its catalog and explicit new-session defaults. Claude

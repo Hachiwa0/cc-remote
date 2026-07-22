@@ -74,7 +74,8 @@ from cc_remote.protocol import (
     PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort, Fast,
     CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice,
-    RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History,
+    RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
+    ConversationTurn, History, TurnDetail,
     HistoryInvalidated, ArtifactInvalidated, AskUser,
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg,
@@ -111,6 +112,12 @@ from cc_remote.wrapper.rollback_commands import (
 )
 from cc_remote.wrapper.session import load_session_id, save_session_id
 from cc_remote.wrapper.session_ctx import SessionContext
+from cc_remote.wrapper.history_store import (
+    HistoryIndexStore,
+    HistorySourceFingerprint,
+    MaterializedHistoryPage,
+    materialize_history_turns,
+)
 from cc_remote.wrapper.stream import (
     StreamTranslator, extract_session_id, extract_model,
     translate_history, last_assistant_model, transcript_internal_user_events,
@@ -297,7 +304,7 @@ class WrapperMachine:
         ".pdf": "application/pdf",
     }
     SAFE_RETRY_COMMANDS = frozenset({
-        "list_sessions", "get_history", "get_models", "get_engine_capabilities",
+        "list_sessions", "get_history", "get_turn_detail", "get_models", "get_engine_capabilities",
         "get_context", "get_status", "get_diff", "get_file_preview",
         "get_preview_asset", "get_goal", "list_dir", "get_work_dashboard",
     })
@@ -312,7 +319,7 @@ class WrapperMachine:
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
-        "get_history", "switch_session", "rename_session", "archive_session", "pin_session",
+        "get_history", "get_turn_detail", "switch_session", "rename_session", "archive_session", "pin_session",
         "delete_work_session", "delete_session", "rollback_session",
         "compact_session", "start_review",
         "fork_session", "fork_session_worktree",
@@ -396,6 +403,18 @@ class WrapperMachine:
         self._history_command_tasks: dict[
             tuple[str, str], asyncio.Task
         ] = {}
+        self._history_page_tasks: dict[
+            tuple[str, str, int, str], asyncio.Task
+        ] = {}
+        # Rebuildable local projection of already-translated transcript pages.
+        # Raw transcripts remain authoritative; exact source fingerprints make
+        # the derived SQLite row a safe fast path rather than another history.
+        try:
+            self._history_index: HistoryIndexStore | None = HistoryIndexStore(
+                Path(cfg.state_dir))
+        except Exception as exc:
+            self._history_index = None
+            log.warning("history index unavailable", error=str(exc))
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
         # resets this window (documented residual risk, not durable exactly-once).
@@ -483,6 +502,15 @@ class WrapperMachine:
         self._history_revision_epochs[sid] = (
             self._history_revision_epochs.get(sid, 0) + 1
         )
+        history_index = getattr(self, "_history_index", None)
+        if history_index is not None:
+            try:
+                history_index.invalidate_session(sid)
+            except Exception as exc:
+                log.warning(
+                    "history index invalidation failed", session_id=sid,
+                    error=str(exc),
+                )
         return self._history_revision(sid)
 
     def _focused_ctx(self) -> Optional[SessionContext]:
@@ -1707,7 +1735,7 @@ class WrapperMachine:
                 if cmd.type == "list_sessions":
                     self._start_session_list_command(cmd)
                     continue
-                if cmd.type == "get_history":
+                if cmd.type in {"get_history", "get_turn_detail"}:
                     self._start_history_command(cmd)
                     continue
                 if cmd.type == "get_models":
@@ -1757,6 +1785,12 @@ class WrapperMachine:
             if history_tasks:
                 await asyncio.gather(*history_tasks, return_exceptions=True)
             self._history_command_tasks.clear()
+            page_tasks = list(self._history_page_tasks.values())
+            for task in page_tasks:
+                task.cancel()
+            if page_tasks:
+                await asyncio.gather(*page_tasks, return_exceptions=True)
+            self._history_page_tasks.clear()
             if self._codex_session_list_refresh_task is not None:
                 self._codex_session_list_refresh_task.cancel()
                 await asyncio.gather(
@@ -2454,6 +2488,8 @@ class WrapperMachine:
             return await self._handle_get_preview_asset(cmd)
         elif t == "get_history":
             return await self._handle_get_history(cmd)
+        elif t == "get_turn_detail":
+            return await self._handle_get_turn_detail(cmd)
         elif t == "get_models":
             return await self._handle_get_models(cmd)
         elif t == "get_engine_capabilities":
@@ -2652,7 +2688,7 @@ class WrapperMachine:
     CLAUDE_OWNED_MESSAGE_MAX = 512
     WATCH_READ_MAX = 4 * 1024 * 1024
     CODEX_TAIL_READ_MAX = 16 * 1024 * 1024
-    MIRROR_LIMIT = 60       # turns per mirrored push (matches the client's initial page)
+    MIRROR_LIMIT = 4        # lightweight moving head; older turns stay paged
     WATCH_MAX = 32          # cap on simultaneously watched transcripts
 
     def _ctx_by_sid(self, sid: str) -> Optional[SessionContext]:
@@ -3141,7 +3177,12 @@ class WrapperMachine:
             return stream.read(min(max(0, available), cls.WATCH_READ_MAX))
 
     async def _push_mirrored_history(self, sid: str) -> History:
-        hist = await self._build_history(sid, limit=self.MIRROR_LIMIT)
+        # Native CLI/Desktop growth is a moving conversation head. Broadcasting
+        # the old full translated page made every external append re-send
+        # megabytes to every browser. Keep the same authoritative replacement
+        # semantics with the lightweight projection; detail remains on demand.
+        hist = await self._build_history(
+            sid, limit=self.MIRROR_LIMIT, detail="summary")
         hist.sid = sid
         await self.transport.send(hist)
         return hist
@@ -3706,7 +3747,10 @@ class WrapperMachine:
             except Exception:
                 log.exception("transcript watch loop error")
 
-    async def _build_history(self, sid: str, before=None, limit=None, cwd_hint=None) -> History:
+    async def _build_history(
+        self, sid: str, before=None, limit=None, cwd_hint=None,
+        detail: str = "full",
+    ) -> History:
         """Read a session's transcript and assemble ONE History frame. Shared by
         GetHistory (routed to the requester) and the watcher (broadcast on external
         append). No spawn, no ring buffer; the parse runs in a thread."""
@@ -3737,6 +3781,8 @@ class WrapperMachine:
         is_codex_hist = bool(
             (ctx is not None and ctx.engine == "codex") or watched_engine == "codex")
         source_path = None
+        source_fingerprint = None
+        indexed_page = None
         source_window_has_more = False
         source_window_oldest_cursor = None
         source_window_boundary_offset = None
@@ -3769,6 +3815,96 @@ class WrapperMachine:
                 )
         except OSError:
             source_path = None
+        if source_path and self._history_index is not None:
+            try:
+                source_fingerprint = await asyncio.to_thread(
+                    HistorySourceFingerprint.capture, source_path)
+                indexed_page = await asyncio.to_thread(
+                    self._history_index.get_page,
+                    sid,
+                    "codex" if is_codex_hist else "claude",
+                    source_fingerprint,
+                    before=before,
+                    limit=int(limit) if isinstance(limit, int) else 0,
+                )
+            except OSError:
+                source_fingerprint = None
+            except Exception as exc:
+                log.warning(
+                    "history index read failed", session_id=sid,
+                    error=str(exc),
+                )
+        if indexed_page is not None:
+            cached_events = [dict(row) for row in indexed_page.events]
+            if ctx is not None:
+                # Rebuild exact preview capabilities from the materialized
+                # ToolUse/ToolResult pairs.  A wrapper restart must not make a
+                # previously valid cross-cwd file preview disappear merely
+                # because JSONL translation was skipped.
+                for row in cached_events:
+                    try:
+                        if row.get("type") == "tool_use":
+                            self._observe_preview_path_event(
+                                ctx, ToolUse.model_validate(row))
+                        elif row.get("type") == "tool_result":
+                            self._observe_preview_path_event(
+                                ctx, ToolResult.model_validate(row))
+                    except (TypeError, ValueError):
+                        continue
+            if before is None and ctx is not None:
+                live_model = _session_model(ctx)
+                live_effort = _session_effort(ctx)
+                if live_model:
+                    cached_events = [
+                        row for row in cached_events
+                        if row.get("type") != "model"
+                    ]
+                    cached_events.insert(
+                        0, Model(model=live_model, sid=sid).model_dump(mode="json"))
+                if live_effort:
+                    cached_events = [
+                        row for row in cached_events
+                        if row.get("type") != "effort"
+                    ]
+                    model_rows = 1 if cached_events and (
+                        cached_events[0].get("type") == "model") else 0
+                    cached_events.insert(
+                        model_rows,
+                        Effort(effort=live_effort, sid=sid).model_dump(mode="json"),
+                    )
+            log.info(
+                "history index hit", session_id=sid,
+                events=len(cached_events), before=bool(before), limit=limit,
+                source_bytes=source_fingerprint.size,
+            )
+            cached_history = History(
+                session_id=sid,
+                revision=revision,
+                generation=self.instance_id,
+                build_seq=build_seq,
+                live_seq=live_seq,
+                events=cached_events,
+                has_more=indexed_page.has_more,
+                before=before,
+                control=control,
+                oldest_id=indexed_page.oldest_id,
+                newest_id=indexed_page.newest_id,
+                external=self._is_external(sid),
+                takeover_pending=bool(
+                    (self._watch.get(sid) or {}).get("takeover_pending")),
+                in_progress=in_progress,
+            )
+            if detail == "summary":
+                cached_history.turns = [
+                    ConversationTurn.model_validate(turn)
+                    for turn in indexed_page.turns
+                ]
+                cached_history.detail = "summary"
+                cached_history.events = [
+                    row for row in cached_events
+                    if row.get("type") in {"model", "effort"}
+                ]
+            return cached_history
         history_error = None
         if is_codex_hist:
             # Codex history lives in ~/.codex/sessions rollout files, not the
@@ -4062,7 +4198,96 @@ class WrapperMachine:
             history.events = [notice.model_dump(mode="json")]
             history.oldest_id = None
             history.newest_id = None
+        materialized = MaterializedHistoryPage(
+            events=tuple(history.events),
+            has_more=history.has_more,
+            oldest_id=history.oldest_id,
+            newest_id=history.newest_id,
+            turns=materialize_history_turns(history.events),
+        )
+        if source_fingerprint is not None and self._history_index is not None:
+            if (indexed_page is not None
+                    and not indexed_page.semantically_equals(materialized)):
+                # Shadow mismatches never affect the response.  Remove the row
+                # and refresh it below so corruption or a missed source change
+                # cannot become authoritative when the fast path is enabled.
+                log.warning(
+                    "history index parity mismatch", session_id=sid,
+                    before=bool(before), limit=limit,
+                )
+                await asyncio.to_thread(
+                    self._history_index.invalidate_session, sid)
+            try:
+                current_fingerprint = await asyncio.to_thread(
+                    HistorySourceFingerprint.capture, source_fingerprint.path)
+                if current_fingerprint == source_fingerprint:
+                    await asyncio.to_thread(
+                        self._history_index.put_page,
+                        sid,
+                        "codex" if is_codex_hist else "claude",
+                        source_fingerprint,
+                        before=before,
+                        limit=int(limit) if isinstance(limit, int) else 0,
+                        page=materialized,
+                    )
+            except OSError:
+                pass
+            except Exception as exc:
+                log.warning(
+                    "history index write failed", session_id=sid,
+                    error=str(exc),
+                )
+        if detail == "summary":
+            history.turns = [
+                ConversationTurn.model_validate(turn)
+                for turn in materialized.turns
+            ]
+            history.detail = "summary"
+            history.events = [
+                row for row in history.events
+                if row.get("type") in {"model", "effort"}
+            ]
         return history
+
+    async def _build_requested_history(
+        self,
+        sid: str,
+        *,
+        before: str | None,
+        limit: int | None,
+        cwd: str | None,
+        detail: str,
+    ) -> History:
+        """Build one requester-neutral page shared by concurrent clients."""
+        self._watch_session(sid)
+        # Content and ownership are independent projections.  A bounded ps/lsof
+        # scan can take seconds on macOS and must not hold the conversation
+        # first paint. The watch loop and switch/query safety paths refresh
+        # SessionControl separately; history uses the last known control value.
+        return await self._build_history(
+            sid, before=before, limit=limit, cwd_hint=cwd, detail=detail)
+
+    async def _history_page_singleflight(self, cmd, sid: str) -> History:
+        before = getattr(cmd, "before", None)
+        raw_limit = getattr(cmd, "limit", None)
+        limit = int(raw_limit) if isinstance(raw_limit, int) else None
+        cwd = getattr(cmd, "cwd", None)
+        detail = getattr(cmd, "detail", "full")
+        key = (sid, before or "", limit or 0, f"{cwd or ''}\0{detail}")
+        task = self._history_page_tasks.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._build_requested_history(
+                sid, before=before, limit=limit, cwd=cwd, detail=detail))
+            self._history_page_tasks[key] = task
+
+            def forget(done: asyncio.Task) -> None:
+                if self._history_page_tasks.get(key) is done:
+                    self._history_page_tasks.pop(key, None)
+
+            task.add_done_callback(forget)
+        # A browser disconnect cancels only its routing handler; other clients
+        # awaiting the same immutable page keep the shared read alive.
+        return await asyncio.shield(task)
 
     async def _handle_get_history(self, cmd) -> None:
         """Client opened a session: return its history as ONE bulk frame, routed to
@@ -4071,26 +4296,100 @@ class WrapperMachine:
         stream through to every client (read-only)."""
         started_at = time.perf_counter()
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
-        self._watch_session(sid)   # snapshot size before we read, so no append is missed
-        watched_engine = (self._watch.get(sid) or {}).get("engine")
-        # Do not leave a short ownership window while waiting for the 1.5s poll.
-        if watched_engine == "codex":
-            await self._prime_codex_ownership(sid)
-        elif watched_engine == "claude":
-            await self._prime_claude_ownership(sid)
-        hist = await self._build_history(
-            sid, before=getattr(cmd, "before", None), limit=getattr(cmd, "limit", None),
-            cwd_hint=getattr(cmd, "cwd", None))
+        template = await self._history_page_singleflight(cmd, sid)
+        # Routing and command correlation are requester-specific; never mutate
+        # the shared task's History instance in place.
+        hist = template.model_copy(deep=True)
         client_id = getattr(cmd, "client_id", None)
         if client_id:
             hist.to = client_id            # relay routes it to just this client
         hist.sid = sid                     # tag with THIS session (never the focused one)
         await self.transport.send(hist)
+        frame_bytes = len(hist.model_dump_json().encode("utf-8"))
         log.info("history sent", session_id=sid, events=len(hist.events),
+                 turns=len(hist.turns), detail=hist.detail,
+                 frame_bytes=frame_bytes,
                  has_more=hist.has_more, before=bool(hist.before),
                  external=hist.external, client_id=client_id,
                  elapsed_ms=round((time.perf_counter() - started_at) * 1000))
         return hist
+
+    async def _handle_get_turn_detail(self, cmd) -> TurnDetail:
+        """Return one heavyweight turn projection to its requesting browser."""
+        started_at = time.perf_counter()
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        revision = self._history_revision(sid)
+        client_id = getattr(cmd, "client_id", None)
+
+        async def send(
+            events: list[dict] | None = None,
+            *,
+            error: str | None = None,
+        ) -> TurnDetail:
+            detail = TurnDetail(
+                session_id=sid,
+                turn_id=cmd.turn_id,
+                revision=revision,
+                authoritative=error is None,
+                error=error,
+                events=events or [],
+                sid=sid,
+                to=client_id,
+            )
+            await self.transport.send(detail)
+            frame_bytes = len(detail.model_dump_json().encode("utf-8"))
+            log.info(
+                "turn detail sent",
+                session_id=sid,
+                turn_id=cmd.turn_id,
+                events=len(detail.events),
+                frame_bytes=frame_bytes,
+                authoritative=detail.authoritative,
+                client_id=client_id,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return detail
+
+        requested_revision = getattr(cmd, "revision", None)
+        if requested_revision and requested_revision != revision:
+            return await send(error="会话历史已更新，请重新展开该轮")
+        if self._history_index is None:
+            return await send(error="详细过程暂时不可用，请稍后重试")
+
+        self._watch_session(sid)
+        watch = self._watch.get(sid) or {}
+        ctx = self._ctx_by_sid(sid)
+        is_codex = bool(
+            (ctx is not None and ctx.engine == "codex")
+            or watch.get("engine") == "codex"
+        )
+        try:
+            source_path = await asyncio.to_thread(
+                codex_rollout_path if is_codex else transcript_path, sid)
+            if not source_path:
+                return await send(error="详细过程尚未生成")
+            source = await asyncio.to_thread(
+                HistorySourceFingerprint.capture, source_path)
+            rows = await asyncio.to_thread(
+                self._history_index.get_turn_detail,
+                sid,
+                "codex" if is_codex else "claude",
+                source,
+                cmd.turn_id,
+            )
+        except OSError:
+            rows = None
+        except Exception as exc:
+            log.warning(
+                "turn detail index read failed",
+                session_id=sid,
+                turn_id=cmd.turn_id,
+                error=str(exc),
+            )
+            rows = None
+        if rows is None:
+            return await send(error="详细过程已过期，请刷新会话后重试")
+        return await send([dict(row) for row in rows])
 
     async def _handle_takeover(self, cmd):
         """Explicitly transfer a read-only terminal session back to Remote.
@@ -9058,7 +9357,8 @@ class WrapperMachine:
                 )
             try:
                 history = await self._build_history(
-                    sid, limit=self.MIRROR_LIMIT, cwd_hint=ctx.cwd
+                    sid, limit=self.MIRROR_LIMIT, cwd_hint=ctx.cwd,
+                    detail="summary",
                 )
                 history.reset = True
                 history.to = None

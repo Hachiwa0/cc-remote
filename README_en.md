@@ -54,7 +54,7 @@ not proxy model APIs or bake API keys into the web client.
 | **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Codex supports conversation rollback, conflict-safe code rollback, explicit compact, native Review, and isolated Git worktree forks. |
 | **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses `/permissions` for approval control while inheriting the local Sandbox configuration. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
 | **Real extension catalog** | Open the slash-command manager for current Skills, Plugins, Apps, MCP, and Hooks. Local Skills and Claude Hooks are safely manageable; Codex Hooks reflect its official read-only API; plugin changes use native managers. |
-| **Continuity** | Let background sessions keep running and synchronize them across clients. Restore paged history from Claude transcripts or Codex rollouts and resume from a cursor after reconnecting. |
+| **Continuity** | Let background sessions keep running and synchronize them across clients. Paint the browser projection first, validate paged materialized summaries from Claude transcripts or Codex rollouts, and resume only the live tail after reconnecting. |
 | **Multi-machine and PWA** | Connect multiple named wrappers to one relay and optionally restrict accounts to selected machines. Install the web client as a PWA and receive generic background completion/failure notifications without conversation content. |
 | **Self-hosted** | The wrapper only makes outbound connections. Sessions, Work data, and preview conversion stay on that machine; the replaceable VPS remains a stateless relay. Web auth uses an HttpOnly cookie, and CLI credentials or API keys never enter the frontend. |
 
@@ -310,14 +310,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v17:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v18:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v17 relay and v17 wrapper so the old wrapper cannot occupy the
+> then start the v18 relay and v18 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`.
 
 ### 3) Upload staging, then publish it as an atomic release
@@ -358,7 +358,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v17 wrapper after success.
+release's `/healthz` is verified. Start the v18 wrapper after success.
 
 Verify:
 
@@ -499,7 +499,7 @@ Each message accepts at most 8 attachments, at most 6 MiB each and 8 MiB decoded
 
 - The Web and TUI attach a stable `cmd_id` to retryable commands and resend them after a socket reconnect or wrapper recovery. The wrapper deduplicates them and ACKs completion within the same wrapper process lifetime. Each live session also pairs its cursor with a wrapper generation so a restart cannot make an old sequence number look current.
 - Unacknowledged-command queues and the general command-deduplication table are **bounded in-memory state**. A hard browser refresh, TUI exit, or wrapper crash does not promise cross-process exactly-once delivery. cc-remote is an interactive control plane, not a durable job queue; after such a failure, inspect the transcript/rollout and live session state before resending.
-- Persisted Claude transcripts and Codex rollouts are the history source of truth. The live ring only provides bounded reconnect catch-up; it does not replace those files.
+- Persisted Claude transcripts and Codex rollouts are the history source of truth. The wrapper SQLite summary index and browser IndexedDB are rebuildable projections; the live ring only provides bounded reconnect catch-up. Heavy tool/reasoning detail loads per turn instead of blocking first paint.
 - Work schedules are the exception: schedules, run records, leases, heartbeats, retry counts, and next-run timestamps live in SQLite. An expired lease is recovered after a wrapper restart, but an uncertain outcome is never reported as success.
 
 ## Security (please read)

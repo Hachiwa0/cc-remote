@@ -33,7 +33,7 @@ def test_pin_command_and_session_info_roundtrip():
 def test_relay_roundtrip_null_engine_does_not_reject_claude_pin():
     async def run():
         raw = (
-            '{"v":17,"ts":1,"type":"pin_session",'
+            '{"v":18,"ts":1,"type":"pin_session",'
             '"session_id":"claude-1","pinned":true}'
         )
         command = deserialize(serialize(deserialize(raw)))

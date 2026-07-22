@@ -50,7 +50,7 @@ function formatTime(ts: number): string {
 }
 
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
-  onLoadMore, onEdit, onGetDiff, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
+  onLoadMore, onLoadDetail, onEdit, onGetDiff, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, surface = "code" }: {
   sid: string | null;
   turns: Turn[];
@@ -59,6 +59,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   loading?: boolean;
   hasMore?: boolean;
   onLoadMore?: () => void;
+  onLoadDetail?: (turnId: string) => void;
   onEdit: (prompt: string) => void;
   onGetDiff: (file: string) => void;
   onOpenTurnDiff?: (files: string[], diff: string) => void;
@@ -380,6 +381,17 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                   {t.prompt && <button className={"ubub-act" + (copiedId === t.id ? " copied" : "")} onClick={() => copyText(t.id, t.prompt!)} aria-label="复制"><Icon name="check" size={13} /></button>}
                 </div>
               </div>
+            )}
+            {!!t.detailEventCount && !t.detailLoaded && (
+              <button type="button" className="turn-detail-btn"
+                aria-busy={!!t.detailLoading}
+                disabled={!!t.detailLoading || !onLoadDetail}
+                onClick={() => onLoadDetail?.(t.id)}>
+                {t.detailLoading
+                  ? "正在加载完整过程…"
+                  : `展开完整过程（${t.detailEventCount} 项）`}
+                <Icon name="chev" size={14} />
+              </button>
             )}
             {t.blocks.length > 0 ? (
               <>

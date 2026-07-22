@@ -46,6 +46,7 @@ import {
   type ViewportReading,
 } from "../src/use-mobile-viewport.ts";
 import type { ServerEvent, SessionControl } from "../src/protocol.ts";
+import type { Block } from "../src/reducer.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
 import {
   classifyTurnNotification,
@@ -163,7 +164,7 @@ assert.deepEqual(visibleAgentTimeline.map((block) => block.kind), ["process"],
   "a dedicated live agent row must replace the duplicate generic ToolUse row");
 
 const legacyWorkContext = workContextMetrics({
-  v: 17, ts: 0, type: "context_report",
+  v: 18, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, categories: [],
 });
@@ -173,7 +174,7 @@ assert.equal(legacyWorkContext.sessionTokens, 25_572,
 assert.equal(legacyWorkContext.sessionPercentage, 2.5572);
 
 const freshWorkContext = workContextMetrics({
-  v: 17, ts: 0, type: "context_report",
+  v: 18, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, session_tokens: 72, fixed_tokens: 25_500,
   session_percentage: 0.0072, categories: [],
@@ -185,7 +186,7 @@ assert.equal(freshWorkContext.sessionPercentage, 0.0072);
 assert.equal(freshWorkContext.totalPercentage, 2.5572);
 
 const derivedWorkContext = workContextMetrics({
-  v: 17, ts: 0, type: "context_report",
+  v: 18, ts: 0, type: "context_report",
   total_tokens: 11_194, max_tokens: 353_400,
   percentage: 3.1675, fixed_tokens: 11_000, categories: [],
 });
@@ -259,7 +260,7 @@ assert.match(historyAppSource, /history_invalidated[\s\S]*invalidateSessionCache
   "history invalidation must evict the matching IndexedDB row");
 assert.match(historyAppSource, /historyCacheEpochRef[\s\S]*loadSession/,
   "an IndexedDB read started before the marker must be rejected");
-assert.match(historyAppSource, /history_invalidated[\s\S]*sendGetHistory/,
+assert.match(historyAppSource, /history_invalidated[\s\S]*requestHistory/,
   "a visible invalidated session must request authoritative history");
 assert.match(historyAppSource,
   /msg\.type === "history" && msg\.authoritative !== false[\s\S]*allowSessionCache/,
@@ -318,7 +319,7 @@ assert.match(rewindComposerSource, /case "rewind": flash\("Claude Rewind 暂未�
   "a manually typed hidden rewind command must be blocked locally");
 assert.match(rewindComposerSource, /case "rollback": flash\("Codex Rollback 暂未开放"\)/,
   "a manually typed hidden Codex rollback command must be blocked locally");
-assert.match(historyAppSource, /replay_start[\s\S]*sendGetHistory/,
+assert.match(historyAppSource, /replay_start[\s\S]*requestHistory/,
   "a replay gap must request authoritative history instead of ending on an empty view");
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
   "a replay gap must discard a possibly stale Work artifact inventory");
@@ -786,7 +787,7 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 17, ts: 10, ...body,
+    v: 18, ts: 10, ...body,
   } as ServerEvent);
   // Work/Code and engine switches restore the target surface's last accepted
   // list immediately. The authoritative refresh may take ~1s for Codex because
@@ -931,6 +932,91 @@ try {
   assert.equal(duplicateState.runtimes[duplicateSid].turns[0].forkPointId,
     "native-turn");
   assert.equal(duplicateState.runtimes[duplicateSid].turns[0].done, true);
+
+  const summarySid = "materialized-summary";
+  const summaryState = reduce({
+    ...initialState, focusedSid: summarySid,
+    runtimes: { [summarySid]: createRuntime() },
+  }, { type: "event", event: event({
+    type: "history", session_id: summarySid, revision: "summary-r1",
+    generation: "summary-g1", build_seq: 1, live_seq: 0,
+    detail: "summary", has_more: true, oldest_id: "summary-message",
+    events: [event({ type: "model", sid: summarySid, model: "gpt-summary" })],
+    turns: [{
+      id: "summary-message", prompt: "inspect", done: true,
+      blocks: [{ kind: "text", message_id: "summary-final",
+        text: "finished", done: true, channel: "final" }],
+      detailEventCount: 74, detailLoaded: false,
+    }],
+  }) });
+  assert.equal(summaryState.runtimes[summarySid].turns.length, 1);
+  assert.equal(summaryState.runtimes[summarySid].turns[0].blocks[0].kind, "text");
+  assert.equal(summaryState.runtimes[summarySid].turns[0].detailEventCount, 74);
+  assert.equal(summaryState.runtimes[summarySid].model, "gpt-summary");
+  assert.equal(summaryState.runtimes[summarySid].hasMore, true);
+
+  let detailState = reduce(summaryState, {
+    type: "turn_detail_requested", sid: summarySid,
+    turnId: "summary-message",
+  });
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, true);
+  detailState = reduce(detailState, { type: "event", event: event({
+    type: "turn_detail", session_id: summarySid, turn_id: "summary-message",
+    revision: "summary-r1", events: [
+      event({ type: "user_msg", sid: summarySid, msg_id: "summary-message",
+        prompt: "inspect" }),
+      event({ type: "assistant_msg_start", sid: summarySid,
+        message_id: "summary-commentary", channel: "commentary" }),
+      event({ type: "delta", sid: summarySid,
+        message_id: "summary-commentary", channel: "commentary",
+        text: "checking" }),
+      event({ type: "tool_use", sid: summarySid,
+        message_id: "summary-tool-message", tool_use_id: "summary-tool",
+        tool: "Read", input: { file_path: "/tmp/example" } }),
+      event({ type: "tool_result", sid: summarySid,
+        tool_use_id: "summary-tool", content: "ok", is_error: false }),
+      event({ type: "assistant_msg_start", sid: summarySid,
+        message_id: "summary-final", channel: "final" }),
+      event({ type: "delta", sid: summarySid,
+        message_id: "summary-final", channel: "final", text: "finished" }),
+      event({ type: "assistant_msg_end", sid: summarySid,
+        message_id: "summary-final", channel: "final" }),
+      event({ type: "turn_end", sid: summarySid, turn_id: "summary-turn",
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  }) });
+  assert.equal(detailState.runtimes[summarySid].turns.length, 1);
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailLoaded, true);
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, false);
+  assert.ok(detailState.runtimes[summarySid].turns[0].blocks.some(
+    (block: Block) => block.kind === "tool"));
+  assert.equal(detailState.runtimes[summarySid].turns[0].blocks.filter(
+    (block: Block) => block.kind === "text" && block.channel === "final").length, 1,
+  "detail replaces the summary projection instead of duplicating its final text");
+
+  const staleDetail = reduce(detailState, { type: "event", event: event({
+    type: "turn_detail", session_id: summarySid, turn_id: "summary-message",
+    revision: "stale-revision", events: [],
+  }) });
+  assert.equal(staleDetail, detailState,
+    "a detail response from another history revision cannot rewrite the turn");
+
+  const refreshedSummary = reduce(detailState, { type: "event", event: event({
+    type: "history", session_id: summarySid, revision: "summary-r1",
+    generation: "summary-g1", build_seq: 2, live_seq: 0,
+    detail: "summary", has_more: true, oldest_id: "summary-message",
+    events: [], turns: [{
+      id: "summary-message", prompt: "inspect", done: true,
+      blocks: [{ kind: "text", message_id: "summary-final",
+        text: "finished", done: true, channel: "final" }],
+      detailEventCount: 74, detailLoaded: false,
+    }],
+  }) });
+  assert.equal(refreshedSummary.runtimes[summarySid].turns[0].detailLoaded, true);
+  assert.ok(refreshedSummary.runtimes[summarySid].turns[0].blocks.some(
+    (block: Block) => block.kind === "tool"),
+  "a same-revision head refresh must not collapse detail the user opened");
+
   const backgroundRunning = reduce({
     ...initialState,
     sessions: [{
@@ -2279,6 +2365,27 @@ try {
     "switching to a long session must not synchronously render its full DOM");
   assert.match(boundedInitialMarkup, /prompt-29</);
   assert.match(boundedInitialMarkup, /显示更早的已加载消息/);
+  const summaryMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "summary-session",
+    turns: [{
+      id: "summary-turn", prompt: "inspect", done: true,
+      blocks: [], detailEventCount: 12, detailLoaded: false,
+    }],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.match(summaryMarkup, /展开完整过程（12 项）/,
+    "summary history must expose deferred tool and reasoning detail");
+  const loadedDetailMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "summary-session",
+    turns: [{
+      id: "summary-turn", prompt: "inspect", done: true,
+      blocks: [], detailEventCount: 12, detailLoaded: true,
+    }],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.doesNotMatch(loadedDetailMarkup, /展开完整过程/);
   const richMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [richTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {},
@@ -3046,7 +3153,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 17, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 18, ts: 1, ...frame }) });
   }
 }
 
@@ -3290,7 +3397,7 @@ assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\
   "the mobile sheet height accounts for the virtual keyboard inset");
 
 const successfulTurn = {
-  v: 17, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
+  v: 18, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
   result: { subtype: "success", duration_ms: 1, is_error: false },
 };
 const interruptedTurn = {
@@ -3431,7 +3538,7 @@ controlSocket.onopen?.();
 const wireControlSid = "wire-control-revision";
 controlRelay.seedReplayState({}, {}, {
   [wireControlSid]: {
-    v: 17, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 18, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation", revision: 10,
   },
@@ -3449,7 +3556,7 @@ controlSocket.receive({
   revision: "wire-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 17, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 18, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 9,
   },
@@ -3463,7 +3570,7 @@ controlSocket.receive({
   revision: "wire-cross-session-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 17, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 18, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -3477,7 +3584,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation",
   control: {
-    v: 17, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 18, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -3506,7 +3613,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation-next",
   control: {
-    v: 17, ts: 2, type: "session_control", sid: wireControlSid,
+    v: 18, ts: 2, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation-next", revision: 0,
   },
@@ -3540,12 +3647,12 @@ controlRelay.seedReplayState(
   { [aliasOld]: "wire-alias-live", [aliasReal]: "wire-alias-cache" },
   {
     [aliasOld]: {
-      v: 17, ts: 3, type: "session_control", sid: aliasOld,
+      v: 18, ts: 3, type: "session_control", sid: aliasOld,
       control_mode: "remote", write_state: "writable",
       terminal_attached: false, generation: "wire-alias-live", revision: 2,
     },
     [aliasReal]: {
-      v: 17, ts: 2, type: "session_control", sid: aliasReal,
+      v: 18, ts: 2, type: "session_control", sid: aliasReal,
       control_mode: "desktop", write_state: "read_only",
       terminal_attached: true, generation: "wire-alias-cache", revision: 50,
     },

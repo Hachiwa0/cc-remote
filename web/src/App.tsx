@@ -51,6 +51,7 @@ import {
 } from "./session-order";
 import { disableRemotePush, enableRemotePush } from "./push";
 import { turnNotificationBody, turnNotificationTag } from "./turn-notification";
+import { HistoryRequestCoordinator } from "./history-requests";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -119,6 +120,7 @@ export default function App() {
   const stateRef = useRef(state);
   stateRef.current = state;
   const wsRef = useRef<RelayWs | null>(null);
+  const historyRequestsRef = useRef(new HistoryRequestCoordinator());
   const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
   const createRequestsRef = useRef<Map<string, {
@@ -163,6 +165,21 @@ export default function App() {
     artifactDirtyRef.current = false;
     return true;
   }, []);
+  const requestHistory = useCallback((
+    sid: string,
+    before: string | null | undefined,
+    limit: number,
+    generation?: string | null,
+    revision?: string | null,
+  ) => {
+    const ws = wsRef.current;
+    if (!ws) return false;
+    return historyRequestsRef.current.request({
+      sid, before, limit,
+      generation: generation ?? ws.generationFor(sid),
+      revision,
+    }, () => ws.sendGetHistory(sid, before, limit));
+  }, []);
   // guards the once-per-connection "land on the latest session" auto-focus below
   const didInitFocusRef = useRef(false);
   const shortcutRef = useRef<{
@@ -187,6 +204,7 @@ export default function App() {
     sessionListsBySurfaceRef.current = {};
     authoritativeSurfaceListsRef.current.clear();
     sessionActivityPendingRef.current.clear();
+    historyRequestsRef.current.clear();
     prefetchedSurfacesRef.current.clear();
     historyInvalidationsRef.current.clear();
     historyCacheEpochRef.current.clear();
@@ -384,6 +402,7 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const draining = drainingRef.current;
+    const historyRequests = historyRequestsRef.current;
     didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
     authoritativeSurfaceListsRef.current.delete(`${spaceRef.current}:${engineRef.current}`);
 
@@ -434,7 +453,8 @@ export default function App() {
             // size bound. Fetch immediately when visible; a background session
             // gets the same authoritative request when it is later focused.
             if (stateRef.current.focusedSid === sid) {
-              ws.sendGetHistory(sid, undefined, HISTORY_INITIAL_PAGE);
+              requestHistory(
+                sid, undefined, HISTORY_INITIAL_PAGE, undefined, msg.revision);
             }
           } else if (msg.type === "artifact_invalidated") {
             const sid = msg.session_id;
@@ -473,7 +493,8 @@ export default function App() {
               return next;
             });
             if (stateRef.current.focusedSid === sid) {
-              ws.sendGetHistory(sid, undefined, HISTORY_INITIAL_PAGE);
+              requestHistory(
+                sid, undefined, HISTORY_INITIAL_PAGE, msg.generation);
             }
           } else if (msg.type === "history" && msg.authoritative !== false && !msg.before
               && historyInvalidationsRef.current.has(msg.session_id)) {
@@ -485,6 +506,9 @@ export default function App() {
               void import("./cache").then((module) =>
                 module.allowSessionCache(msg.session_id));
             }
+          }
+          if (msg.type === "history") {
+            historyRequestsRef.current.complete(msg);
           }
           if (msg.type === "rollback_result" && msg.files === "succeeded"
               && stateRef.current.artifact?.sid === msg.session_id) {
@@ -735,7 +759,8 @@ export default function App() {
             }
             ws.sendGetModels("codex");
             const currentSid = stateRef.current.focusedSid;
-            if (currentSid) ws.sendGetHistory(currentSid, undefined, HISTORY_INITIAL_PAGE);
+            if (currentSid) requestHistory(
+              currentSid, undefined, HISTORY_INITIAL_PAGE, msg.generation);
           }
           // refresh the context ring after each turn (local SDK query, no model tokens)
           if (msg.type === "turn_end" && msg.sid) {
@@ -760,6 +785,7 @@ export default function App() {
         onConnState: (s, detail) => {
           dispatch({ type: "conn", connState: s, detail });
           if (s === "connected") {
+            historyRequestsRef.current.beginConnection();
             ws.sendListSessions(engineRef.current, spaceRef.current);
             if (spaceRef.current === "work") {
               ws.sendGetWorkDashboard(engineRef.current);
@@ -785,6 +811,7 @@ export default function App() {
           discardedBtwSidsRef.current.clear();
           historyInvalidationsRef.current.clear();
           historyCacheEpochRef.current.clear();
+          historyRequestsRef.current.clear();
           setBtwOpening(false);
           setForkingPointId(null);
           setForkWorktreeSession(null);
@@ -838,9 +865,10 @@ export default function App() {
       cancelled = true;
       wsRef.current?.stop();
       wsRef.current = null;
+      historyRequests.clear();
       draining.clear();
     };
-  }, [authed, machineId]);
+  }, [authed, machineId, requestHistory]);
 
   // Land on the preferred/recent session only after an accepted list for the
   // active engine+space arrives. Background snapshots never pick focus.
@@ -946,44 +974,53 @@ export default function App() {
     });
   }, [focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control]);
 
-  // Hydrate the focused session's turns from IndexedDB for an INSTANT render on
-  // switch — the wrapper's replay (for non-resident sessions) then reconciles.
-  // This completes the previously write-only cache: switching no longer shows an
-  // empty view while waiting on a cold wrapper round-trip. A 6s fallback clears
-  // the spinner if a session has no cache and the wrapper stays silent.
+  // Paint IndexedDB before starting the newest-page network read.  A browser
+  // can otherwise receive a very fast summary response in the same task that
+  // opened the session, leaving no frame in which the local projection is
+  // visible.  The next animation frame is the cache-first boundary; the wrapper
+  // then validates/replaces it in the background. A 6s fallback clears the
+  // spinner only when both cache and wrapper stay silent.
   useEffect(() => {
     const sid = focusedSid;
     if (!sid) return;
     let cancelled = false;
+    let requestFrame: number | null = null;
     const cacheEpoch = historyCacheEpochRef.current.get(sid) ?? 0;
-    import("./cache").then(({ loadSession }) => loadSession(sid)).then((cached) => {
-      if (!cancelled
+    void import("./cache").then(({ loadSession }) => loadSession(sid)).then((cached) => {
+      const valid = !cancelled
           && cacheEpoch === (historyCacheEpochRef.current.get(sid) ?? 0)
           && !historyInvalidationsRef.current.has(sid)
           && cached && Array.isArray(cached.turns)
-          && (cached.turns.length || cached.control)) {
+          && (cached.turns.length || cached.control);
+      if (valid && cached) {
         dispatch({
-          type: "hydrate_cache", sid, turns: cached.turns as Turn[],
+          type: "hydrate_cache", sid,
+          turns: (cached.turns as Turn[]).map((turn) => ({
+            ...turn, detailLoading: false,
+          })),
           revision: cached.revision,
           generation: cached.generation ?? cached.control?.generation,
           control: cached.control,
+        });
+      }
+      if (!cancelled && state.connState === "connected") {
+        requestFrame = window.requestAnimationFrame(() => {
+          requestFrame = null;
+          if (!cancelled) {
+            requestHistory(sid, undefined, HISTORY_INITIAL_PAGE);
+          }
         });
       }
     });
     const t = window.setTimeout(() => dispatch({
       type: "hydrate_cache", sid, turns: [], revision: null,
     }), 6000);
-    return () => { cancelled = true; window.clearTimeout(t); };
-  }, [focusedSid]);
-
-  // Fetch authoritative history for the focused session — bulk, on-demand, read
-  // from the transcript (like a web chat's GET /conversation). Fires on focus
-  // change AND on (re)connect, so a reconnect re-syncs any turns that completed
-  // while we were away. The `history` event reconciles over the instant cache paint.
-  useEffect(() => {
-    if (!focusedSid || state.connState !== "connected") return;
-    wsRef.current?.sendGetHistory(focusedSid, undefined, HISTORY_INITIAL_PAGE);
-  }, [focusedSid, state.connState]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+      if (requestFrame != null) window.cancelAnimationFrame(requestFrame);
+    };
+  }, [focusedSid, requestHistory, state.connState]);
 
   // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Shift+B => open latest turn's diff
   useEffect(() => {
@@ -1473,7 +1510,16 @@ export default function App() {
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={!!rt.hasMore}
-              onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_MORE_PAGE); }}
+              onLoadMore={() => { if (focusedSid) requestHistory(
+                focusedSid, rt.oldestId, HISTORY_MORE_PAGE); }}
+              onLoadDetail={(turnId) => {
+                if (!focusedSid) return;
+                const sent = wsRef.current?.sendGetTurnDetail(
+                  focusedSid, turnId, rt.historyRevision) ?? false;
+                if (sent) dispatch({
+                  type: "turn_detail_requested", sid: focusedSid, turnId,
+                });
+              }}
               onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff}
               onOpenTurnDiff={openTurnDiff}
               onPreviewMarkdown={previewMarkdown}

@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 17
+PROTOCOL_VERSION = 18
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -1562,11 +1562,13 @@ class PreviewAsset(_Base):
 
 
 class GetHistory(_Command):
-    """client -> wrapper: request a session's history, read ON-DEMAND from its
-    transcript (NOT the ring buffer, NOT requiring the session to be resident).
-    This replaces per-session buffer replay on hello — history is fetched once
-    when a session is opened, like a web chat's GET /conversation. `before`/
-    `limit` page older turns (load-more); omit both for the whole history."""
+    """client -> wrapper: request a source-bound materialized history page.
+
+    This never uses the live ring and never requires a resident engine. Web
+    clients request the lightweight canonical summary; compatibility clients
+    may still request the translated full event page. ``before``/``limit`` page
+    older turns.
+    """
     type: Literal["get_history"] = "get_history"
     session_id: WireId
     client_id: Optional[WireId] = None  # requester, so the wrapper routes History back to=<client_id>
@@ -1575,15 +1577,38 @@ class GetHistory(_Command):
     # authoritative engine turn_id for an assistant-only automatic continuation.
     before: Optional[WireId] = None
     limit: Optional[int] = Field(default=None, ge=1, le=200)
+    detail: Literal["summary", "full"] = "full"
+
+
+class ConversationTurn(BaseModel):
+    """Canonical lightweight turn rendered without replaying raw events."""
+    model_config = ConfigDict(extra="forbid")
+    id: WireId
+    prompt: str = Field(default="", max_length=128 * 1024)
+    blocks: list[dict[str, Any]] = Field(default_factory=list, max_length=32)
+    done: bool = False
+    forkPointId: Optional[WireId] = None
+    checkpointId: Optional[WireId] = None
+    interrupted: Optional[bool] = None
+    error: Optional[str] = Field(default=None, max_length=64 * 1024)
+    images: Optional[list[QueryImage]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+    files: Optional[list[UserFileMeta]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+    ts: Optional[int] = Field(default=None, ge=0)
+    doneTs: Optional[int] = Field(default=None, ge=0)
+    durationMs: Optional[int] = Field(default=None, ge=0)
+    detailEventCount: int = Field(default=0, ge=0)
+    detailLoaded: bool = False
 
 
 class History(_Base):
-    """wrapper -> client: a session's history as ONE bulk frame (one-shot, like
-    ContextReport/SessionList — NOT seq'd/buffered). `events` are already-
-    serialized narrative event dicts (same shape as the live stream) that the
-    client applies in a single reducer pass into runtimes[session_id], deduped
-    by msg_id/message_id against any live tail. Routed to=<client_id>, EXCEPT the
-    mirror push below, which is broadcast."""
+    """wrapper -> client: one summary or compatibility event page.
+
+    The frame is one-shot and requester-routed, not seq'd/buffered. Summary
+    pages carry canonical ``turns`` plus small control rows; full pages carry
+    translated ``events``. Live incomplete turns are reconciled client-side.
+    """
     type: Literal["history"] = "history"
     session_id: WireId
     # Boot-scoped authoritative transcript revision.  Browsers persist this
@@ -1608,6 +1633,8 @@ class History(_Base):
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
     events: list[dict[str, Any]] = []
+    turns: list[ConversationTurn] = []
+    detail: Literal["summary", "full"] = "full"
     has_more: bool = False            # older turns exist beyond what's returned (pagination)
     oldest_id: Optional[str] = None   # first returned stable turn cursor
     newest_id: Optional[str] = None   # last returned stable turn cursor
@@ -1633,6 +1660,26 @@ class History(_Base):
     # Codex rollback. Ordinary loads merge with a live tail; reset loads must
     # discard turns that the engine has just removed.
     reset: bool = False
+
+
+class GetTurnDetail(_Command):
+    """client -> wrapper: fetch heavyweight records for one visible turn."""
+    type: Literal["get_turn_detail"] = "get_turn_detail"
+    session_id: WireId
+    turn_id: WireId
+    client_id: Optional[WireId] = None
+    revision: Optional[WireId] = None
+
+
+class TurnDetail(_Base):
+    """wrapper -> requester: full translated events for one turn."""
+    type: Literal["turn_detail"] = "turn_detail"
+    session_id: WireId
+    turn_id: WireId
+    revision: WireId
+    authoritative: bool = True
+    error: Optional[str] = Field(default=None, max_length=4096)
+    events: list[dict[str, Any]] = []
 
 
 class HistoryInvalidated(_Base):
@@ -1743,8 +1790,8 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
     SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
@@ -1787,6 +1834,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "save_markdown": SaveMarkdown,
     "get_preview_asset": GetPreviewAsset,
     "get_history": GetHistory,
+    "get_turn_detail": GetTurnDetail,
     "get_models": GetModels,
     "models": Models,
     "get_engine_capabilities": GetEngineCapabilities,
@@ -1843,6 +1891,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "preview_asset": PreviewAsset,
     "work_artifacts": WorkArtifacts,
     "history": History,
+    "turn_detail": TurnDetail,
     "history_invalidated": HistoryInvalidated,
     "artifact_invalidated": ArtifactInvalidated,
     "ask_user": AskUser,

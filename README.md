@@ -53,7 +53,7 @@ API key 烤进网页。
 | **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Codex 支持对话与冲突安全的代码回滚、主动 compact、原生 Review，以及在 Git 仓库中派生到独立 worktree。 |
 | **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 通过 `/permissions` 控制审批并继承本机 Sandbox 配置；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
 | **真实扩展目录** | 通过 `/extensions`、`/skills`、`/plugins`、`/apps`、`/mcp`、`/hooks` 按需读取当前引擎目录；Skills 与 Claude Hooks 可安全管理，Codex Hooks 按官方只读能力展示，插件安装/卸载调用原生管理器。 |
-| **连续性** | 后台会话继续运行，多端实时同步；从 Claude transcript / Codex rollout 分页恢复历史，断线后按游标补流。 |
+| **连续性** | 后台会话继续运行，多端实时同步；浏览器本地投影先绘制，wrapper 从 Claude transcript / Codex rollout 的物化摘要索引分页校验，断线后只按游标补实时尾巴。 |
 | **多机器与 PWA** | 一个 relay 可连接多个具名 wrapper；可选账号策略把用户限制到指定机器。网页可安装为 PWA，并在后台回合完成/失败时发送不含对话正文的系统通知。 |
 | **自托管** | wrapper 只出站连接；会话、Work 数据和预览转换都留在本机，VPS 只做无状态中继且可替换；网页认证使用 HttpOnly cookie，CLI 凭据与 API key 不进入前端。 |
 
@@ -453,7 +453,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 
 - Web 与 TUI 会给可重试命令附加稳定的 `cmd_id`，断线重连或 wrapper 恢复后重发；wrapper 在同一进程生命周期内去重并返回 ACK。每个实时会话还用 wrapper generation 配对 cursor，避免 wrapper 重启后把旧序号误当成新序号。
 - 未确认命令队列和通用命令去重表是**有界内存状态**：浏览器硬刷新、TUI 退出或 wrapper 进程崩溃，不承诺跨进程的 exactly-once。cc-remote 是交互控制面，不是持久任务队列；这类故障后应先核对 transcript/rollout 和会话状态，再决定是否重发。
-- 已落盘的 Claude transcript / Codex rollout 是历史事实来源；实时 ring 只负责有界的断线补流，不替代历史文件。
+- 已落盘的 Claude transcript / Codex rollout 是历史事实来源；wrapper 的 SQLite 摘要索引和浏览器 IndexedDB 都是可重建投影，实时 ring 只负责有界的断线补流。工具/思考等大块详情按单轮展开，不阻塞会话首屏。
 - Work 定时任务是例外：计划、运行记录、租约、心跳、重试次数和下次运行时间写入 SQLite；wrapper 重启后会恢复过期租约，但仍不会把不确定结果伪装成成功。
 
 ## 安全须知（务必读）

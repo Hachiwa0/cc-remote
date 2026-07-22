@@ -63,22 +63,17 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   (rename tmp-key→sid), which moves focus ONLY if the client was already viewing
   the temp key. Emitting SessionFocus on id-capture = focus-steal by background
   sessions.
-- **History = on-demand bulk read; reconnect recovery = bounded ring replay**
-  (protocol v17; aligns
-  with cc-on-web / web chats): the client fetches a session's history via
-  `GetHistory` → the wrapper reads the transcript (`get_session_messages` +
-  `translate_history`, in a thread) and returns it as ONE `History` frame
-  (paginated by turn via `before`/`limit`), routed to the requester — no spawn,
-  no ring buffer. A fresh hello sends one lightweight `Snapshot` per resident
-  session (state dot); a reconnecting client supplies per-session cursors and
-  gets only the missing bounded live tail. It never replays every resident ring
-  wholesale (that multi-thousand-frame flood made refreshes slow and serialized).
-  History and the live stream are the
-  SAME event types, deduped client-side by msg_id/message_id, so a completed turn
-  from the transcript never doubles a live one; an in-flight (`!done`) turn is
-  preserved across a refetch. History timestamps come from the transcript
-  entries (`transcript_timestamps`), not `time.time()`, so past turns show their
-  real ask/answer time.
+- **History = local projection + materialized summary pages; reconnect = live-tail replay**
+  (protocol v18): IndexedDB paints the browser's last projection before network
+  validation. `GetHistory(detail="summary")` returns a small canonical turn page
+  (newest four, then `before`/`limit` pagination), while the wrapper's rebuildable
+  SQLite index avoids retranslating unchanged transcript/rollout bytes. Heavy
+  tools, reasoning, process output and oversized final text stay local until
+  `GetTurnDetail` expands that exact turn. The relay remains stateless. A fresh
+  hello sends lightweight resident `Snapshot`s; reconnect cursors replay only
+  the bounded missing live tail. Source fingerprints invalidate appended pages,
+  and rollback explicitly invalidates both server and browser projections. These
+  reads never spawn/resume an engine or create a model turn.
 - **Token-aware residency**: `resume` = cold prompt cache = full context re-send,
   so it only happens on first spawn / re-focus-after-eviction; raising the cap
   trades RAM for fewer cold re-sends. Reading history is free (plain transcript
@@ -88,7 +83,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - `cc_remote/protocol.py` — pydantic wire schema; all modules depend on it.
   `serialize`/`deserialize` with `v` check; `is_downstream` for seq/buffer.
   Control frames: `SessionFocus` / `SessionRekey` / `GetHistory` / `History` /
-  `SessionInfo.state`.
+  `GetTurnDetail` / `TurnDetail` / `SessionInfo.state`.
 - `cc_remote/config.py` — env-driven config (`RelayConfig`, `WrapperConfig`).
 - `cc_remote/log.py` — JSON logging with token redaction; use `logger("...")`.
 - `cc_remote/wrapper/` — sdk.py (client lifecycle), machine.py (session pool +
@@ -100,8 +95,8 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   (wrapper bearer + HMAC cookie session), pairing.py (single wrapper slot +
   `to=`/broadcast fan-out), forward.py (bounded per-client queues; slow clients
   are disconnected without silently shedding deltas).
-- `web/src/` — reducer.ts (per-session runtimes + `history` reducer), ws.ts (WS
-  client + `sendGetHistory`), protocol.ts (mirror of protocol.py — keep in sync),
+- `web/src/` — reducer.ts (per-session runtimes + history/detail projection), ws.ts (WS
+  client + `sendGetHistory`/`sendGetTurnDetail`), protocol.ts (mirror of protocol.py — keep in sync),
   components/.
 
 ## Run / test

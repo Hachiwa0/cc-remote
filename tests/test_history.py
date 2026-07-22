@@ -22,10 +22,17 @@ from claude_agent_sdk.types import (
 
 from cc_remote.protocol import (
     serialize, deserialize,
-    GetHistory, History, HistoryInvalidated, UserMsg, AssistantMsgStart, Delta,
+    GetHistory, GetTurnDetail, History, TurnDetail, HistoryInvalidated,
+    UserMsg, AssistantMsgStart, Delta,
     TurnEnd, TurnResult, is_downstream,
 )
 from cc_remote.wrapper import machine as mm
+from cc_remote.wrapper.history_store import (
+    HistoryIndexStore,
+    HistorySourceFingerprint,
+    MaterializedHistoryPage,
+    materialize_history_turns,
+)
 from cc_remote.wrapper.stream import (
     StreamTranslator,
     last_assistant_model,
@@ -35,17 +42,26 @@ from cc_remote.wrapper.stream import (
 from tests.test_multisession import _mk_machine, _mk_ctx
 
 
-def test_protocol_v6_get_history_and_history_roundtrip():
-    gh = GetHistory(session_id="s1", client_id="c1", limit=50)
+def test_protocol_v18_get_history_and_materialized_summary_roundtrip():
+    gh = GetHistory(
+        session_id="s1", client_id="c1", limit=50, detail="summary")
     assert deserialize(serialize(gh)) == gh
     h = History(session_id="s1", revision="test-revision",
                 generation="test-generation", build_seq=4, live_seq=11,
                 events=[{"type": "user_msg", "msg_id": "u1"}],
+                turns=[{
+                    "id": "u1", "prompt": "hello", "blocks": [],
+                    "done": True, "detailEventCount": 3,
+                    "detailLoaded": False,
+                }],
+                detail="summary",
                 has_more=True, oldest_id="u1", newest_id="u9",
                 in_progress=True)
     got = deserialize(serialize(h))
     assert got.type == "history" and got.session_id == "s1" and got.has_more is True
     assert got.events[0]["type"] == "user_msg"
+    assert got.turns[0].id == "u1" and got.turns[0].detailEventCount == 3
+    assert got.detail == "summary"
     assert got.in_progress is True
     assert got.build_seq == 4 and got.live_seq == 11
     assert got.generation == "test-generation"
@@ -56,6 +72,17 @@ def test_protocol_v6_get_history_and_history_roundtrip():
     )
     assert deserialize(serialize(marker)) == marker
     assert is_downstream(marker) is True
+
+    request = GetTurnDetail(
+        session_id="s1", turn_id="u1", client_id="c1",
+        revision="test-revision",
+    )
+    assert deserialize(serialize(request)) == request
+    detail = TurnDetail(
+        session_id="s1", turn_id="u1", revision="test-revision",
+        events=[{"type": "user_msg", "msg_id": "u1", "prompt": "hello"}],
+    )
+    assert deserialize(serialize(detail)) == detail
 
 
 def test_history_revision_is_boot_scoped_and_monotonic():
@@ -102,6 +129,218 @@ def test_history_read_does_not_block_serial_commands_or_duplicate_retries():
 
         release_history.set()
         await asyncio.gather(*machine._history_command_tasks.values())
+
+    asyncio.run(go())
+
+
+def test_distinct_history_commands_share_one_page_build_and_route_per_client():
+    async def go():
+        machine, transport = _mk_machine()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def build(sid, *, before, limit, cwd, detail):
+            nonlocal calls
+            calls += 1
+            assert (sid, before, limit, cwd) == ("session-1", None, 4, None)
+            assert detail == "full"
+            started.set()
+            await release.wait()
+            return History(
+                session_id=sid,
+                revision="revision-1",
+                events=[{"type": "user_msg", "msg_id": "turn-1"}],
+                has_more=False,
+            )
+
+        machine._build_requested_history = build
+        first = SimpleNamespace(
+            session_id="session-1", client_id="client-1",
+            cmd_id="command-1", before=None, limit=4, cwd=None,
+        )
+        second = SimpleNamespace(
+            session_id="session-1", client_id="client-2",
+            cmd_id="command-2", before=None, limit=4, cwd=None,
+        )
+        tasks = [
+            asyncio.create_task(machine._handle_get_history(first)),
+            asyncio.create_task(machine._handle_get_history(second)),
+        ]
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert calls == 1
+        release.set()
+        await asyncio.gather(*tasks)
+
+        histories = [message for message in transport.sent
+                     if isinstance(message, History)]
+        assert {message.to for message in histories} == {"client-1", "client-2"}
+        assert all(message.events == [
+            {"type": "user_msg", "msg_id": "turn-1"}
+        ] for message in histories)
+        assert calls == 1
+
+    asyncio.run(go())
+
+
+def test_history_content_does_not_wait_for_external_ownership_scan():
+    async def go():
+        machine, _ = _mk_machine()
+        machine._watch_session = lambda sid: machine._watch.setdefault(
+            sid, {"engine": "codex"})
+        prime_called = False
+
+        async def blocked_prime(_sid):
+            nonlocal prime_called
+            prime_called = True
+            await asyncio.Event().wait()
+
+        async def build(sid, **kwargs):
+            return History(
+                session_id=sid,
+                revision="revision-1",
+                detail=kwargs["detail"],
+            )
+
+        machine._prime_codex_ownership = blocked_prime
+        machine._build_history = build
+        history = await asyncio.wait_for(machine._build_requested_history(
+            "session-1", before=None, limit=4, cwd=None, detail="summary",
+        ), timeout=0.1)
+        assert history.session_id == "session-1"
+        assert prime_called is False
+
+    asyncio.run(go())
+
+
+def test_get_turn_detail_is_routed_and_revision_bound(monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    events = (
+        {"type": "user_msg", "sid": "session-1", "msg_id": "message-1",
+         "prompt": "inspect"},
+        {"type": "tool_use", "sid": "session-1", "tool_use_id": "tool-1",
+         "tool": "Read", "input": {"file_path": "/tmp/example"}},
+        {"type": "tool_result", "sid": "session-1", "tool_use_id": "tool-1",
+         "content": "ok", "is_error": False},
+        {"type": "turn_end", "sid": "session-1", "turn_id": "turn-1",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    )
+
+    async def go():
+        machine, transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state")
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        page = MaterializedHistoryPage(
+            events=events, has_more=False,
+            oldest_id="message-1", newest_id="message-1",
+            turns=materialize_history_turns(events),
+        )
+        machine._history_index.put_page(
+            "session-1", "codex", source, before=None, limit=4, page=page)
+        revision = machine._history_revision("session-1")
+
+        response = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id="session-1", turn_id="message-1",
+            client_id="client-1", revision=revision,
+        ))
+        assert isinstance(response, TurnDetail)
+        assert response.to == "client-1" and response.sid == "session-1"
+        assert response.authoritative is True
+        assert response.events == list(events)
+
+        stale = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id="session-1", turn_id="message-1",
+            client_id="client-2", revision="old-revision",
+        ))
+        assert stale.to == "client-2"
+        assert stale.authoritative is False and stale.events == []
+
+        assert transport.sent[-2:] == [response, stale]
+
+    asyncio.run(go())
+
+
+def test_history_build_materializes_source_bound_shadow_page(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-1"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-1"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "hello"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-1",
+                     "last_agent_message": "world"}},
+    ]))
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    translate = mm.codex_translate_history
+    translate_calls = 0
+
+    def counted_translate(*args, **kwargs):
+        nonlocal translate_calls
+        translate_calls += 1
+        return translate(*args, **kwargs)
+
+    monkeypatch.setattr(mm, "codex_translate_history", counted_translate)
+
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_history("session-1", limit=4)
+        source = HistorySourceFingerprint.capture(rollout)
+        indexed = machine._history_index.get_page(
+            "session-1", "codex", source, before=None, limit=4)
+        assert indexed is not None
+        assert list(indexed.events) == history.events
+        assert indexed.oldest_id == history.oldest_id
+        assert indexed.newest_id == history.newest_id
+
+        # A second identical build must preserve exact shadow parity.
+        repeated = await machine._build_history("session-1", limit=4)
+        repeated_page = machine._history_index.get_page(
+            "session-1", "codex", source, before=None, limit=4)
+        assert repeated_page is not None
+        assert repeated_page.semantically_equals(indexed)
+        assert [row["type"] for row in repeated.events] == [
+            row["type"] for row in history.events]
+        assert translate_calls == 1
+
+        # A destructive revision barrier invalidates the materialized page even
+        # if a coarse filesystem timestamp happens not to change.
+        machine._bump_history_revision("session-1")
+        await machine._build_history("session-1", limit=4)
+        assert translate_calls == 2
+
+        # Ordinary append invalidation is source-fingerprint based.
+        with rollout.open("a") as stream:
+            stream.write(json.dumps({
+                "timestamp": "2026-01-01T00:00:04Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-2"},
+            }) + "\n")
+        await machine._build_history("session-1", limit=4)
+        assert translate_calls == 3
+
+        summary = await machine._build_history(
+            "session-1", limit=4, detail="summary")
+        assert summary.detail == "summary"
+        assert summary.turns
+        assert all(row["type"] in {"model", "effort"}
+                   for row in summary.events)
+        assert len(summary.model_dump_json()) < len(history.model_dump_json())
 
     asyncio.run(go())
 

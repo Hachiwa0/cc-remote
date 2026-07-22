@@ -122,6 +122,11 @@ export interface Turn {
   ts?: number;
   doneTs?: number;
   durationMs?: number;
+  // Summary history pages omit heavy tool/reasoning bodies. The count keeps
+  // that omission explicit and becomes the affordance for on-demand detail.
+  detailEventCount?: number;
+  detailLoaded?: boolean;
+  detailLoading?: boolean;
 }
 
 export interface PendingQuery {
@@ -331,6 +336,7 @@ export type Action =
   | { type: "restore_session_list"; sessions: SessionInfo[] }
   | { type: "set_session_pinned"; sid: string; pinned: boolean }
   | { type: "focus_session"; sid: string }
+  | { type: "turn_detail_requested"; sid: string; turnId: string }
   | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null }
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question" }
@@ -947,6 +953,12 @@ export function reduce(state: AppState, action: Action): AppState {
       const runtimes = { ...state.runtimes, [sid]: { ...rt, loading: rt.turns.length === 0 } };
       return { ...state, focusedSid: sid, runtimes, artifact: null };
     }
+    case "turn_detail_requested":
+      return patch(state, action.sid, (rt) => {
+        rt.turns = rt.turns.map((turn) => turn.id === action.turnId
+          ? { ...turn, detailLoading: true }
+          : turn);
+      }, true);
     case "hydrate_cache":
       // fill a session's turns from the IndexedDB cache for an INSTANT render;
       // only if still empty (never clobber live/streaming or already-replayed turns).
@@ -1299,6 +1311,21 @@ function reduceEvent(
         scratch = reduceEvent(scratch, ev as ServerEvent, false);
       }
       const built = scratch.runtimes[sid] ?? createRuntime();
+      if (e.detail === "summary" && Array.isArray(e.turns)) {
+        built.turns = e.turns.map((turn) => ({
+          ...turn,
+          blocks: turn.blocks as Turn["blocks"],
+          forkPointId: turn.forkPointId ?? undefined,
+          checkpointId: turn.checkpointId ?? undefined,
+          interrupted: turn.interrupted ?? undefined,
+          error: turn.error ?? undefined,
+          images: turn.images ?? undefined,
+          files: turn.files ?? undefined,
+          ts: turn.ts ?? undefined,
+          doneTs: turn.doneTs ?? undefined,
+          durationMs: turn.durationMs ?? undefined,
+        }));
+      }
       // A pre-rollback first page and an older pagination response can arrive
       // after the replayable marker. Only the marker's exact revision may cross
       // the destructive boundary; pagination is valid only for the revision
@@ -1363,6 +1390,13 @@ function reduceEvent(
             turns, wasInterrupting,
             e.ts ? Math.round(e.ts * 1000) : Date.now());
         }
+      }
+      if (e.detail === "summary" && !base.historyInvalidated
+          && base.historyRevision === e.revision) {
+        const loadedDetail = new Map(base.turns
+          .filter((turn) => turn.detailLoaded)
+          .map((turn) => [turn.id, turn]));
+        turns = turns.map((turn) => loadedDetail.get(turn.id) ?? turn);
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
@@ -1439,6 +1473,55 @@ function reduceEvent(
           },
         },
       };
+    }
+    case "turn_detail": {
+      const sid = e.session_id;
+      const base = state.runtimes[sid];
+      if (!base || base.historyRevision !== e.revision) return state;
+      if (e.authoritative === false) {
+        const next = patch(state, sid, (rt) => {
+          rt.turns = rt.turns.map((turn) => turn.id === e.turn_id
+            ? { ...turn, detailLoading: false }
+            : turn);
+        });
+        return e.error && state.focusedSid === sid
+          ? { ...next, banner: e.error }
+          : next;
+      }
+      let scratch: AppState = {
+        ...state,
+        banner: undefined,
+        runtimes: { [sid]: createRuntime() },
+      };
+      for (const event of e.events) {
+        scratch = reduceEvent(scratch, event as ServerEvent, false);
+      }
+      const detailed = (scratch.runtimes[sid]?.turns ?? []).find(
+        (turn) => turn.id === e.turn_id,
+      );
+      if (!detailed) {
+        return patch(state, sid, (rt) => {
+          rt.turns = rt.turns.map((turn) => turn.id === e.turn_id
+            ? { ...turn, detailLoading: false }
+            : turn);
+        });
+      }
+      return patch(state, sid, (rt) => {
+        rt.turns = rt.turns.map((turn) => {
+          if (turn.id !== e.turn_id) return turn;
+          return withLimitedTurnBlocks({
+            ...turn,
+            ...detailed,
+            id: turn.id,
+            prompt: detailed.prompt || turn.prompt,
+            images: detailed.images ?? turn.images,
+            files: detailed.files ?? turn.files,
+            detailEventCount: turn.detailEventCount,
+            detailLoaded: true,
+            detailLoading: false,
+          });
+        });
+      });
     }
     case "dir_list":
       return { ...state, dirPicker: { path: e.path, parent: e.parent ?? null, dirs: e.dirs } };

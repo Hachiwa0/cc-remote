@@ -292,11 +292,14 @@ export interface GetPreviewAsset extends Base { type: "get_preview_asset"; path:
 export interface PreviewAsset extends Base { type: "preview_asset"; path: string; preview_id: string; request_id: string; media_type?: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | null; data?: string | null; error?: string | null }
 // On-demand bulk history: fetched once when a session is opened (like a web
 // chat's GET /conversation) instead of replaying the ring buffer on every hello.
-export interface GetHistory extends Base { type: "get_history"; session_id: string; client_id?: string | null; cwd?: string | null; before?: string | null; limit?: number | null }
+export interface GetHistory extends Base { type: "get_history"; session_id: string; client_id?: string | null; cwd?: string | null; before?: string | null; limit?: number | null; detail?: "summary" | "full" }
 // `external`: this session's transcript is being appended to by a native `claude`/
 // `codex` in the user's terminal. The wrapper mirrors those appends by broadcasting
 // a fresh History; we render the session read-only (a cc session has one owner).
-export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; control?: SessionControl | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; reset?: boolean }
+export interface ConversationTurn { id: string; prompt: string; blocks: unknown[]; done: boolean; forkPointId?: string | null; checkpointId?: string | null; interrupted?: boolean | null; error?: string | null; images?: QueryImg[] | null; files?: QueryFile[] | null; ts?: number | null; doneTs?: number | null; durationMs?: number | null; detailEventCount: number; detailLoaded: boolean }
+export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; turns?: ConversationTurn[]; detail?: "summary" | "full"; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; control?: SessionControl | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; reset?: boolean }
+export interface GetTurnDetail extends Base { type: "get_turn_detail"; session_id: string; turn_id: string; client_id?: string | null; revision?: string | null }
+export interface TurnDetail extends Base { type: "turn_detail"; session_id: string; turn_id: string; revision: string; authoritative?: boolean; error?: string | null; events: ServerEvent[] }
 // Replayable barrier for a destructive history mutation. The full History
 // replacement is one-shot and may exceed the ring byte budget; this small frame
 // guarantees that reconnecting clients never retain turns removed by rollback.
@@ -434,7 +437,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | TurnDetail | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionActivity | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
@@ -442,7 +445,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 17;
+export const PROTOCOL_VERSION = 18;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",
