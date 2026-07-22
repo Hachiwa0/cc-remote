@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 from claude_agent_sdk.types import ResultMessage, SystemMessage
 
+from cc_remote.wrapper import claude_external as claude_external_module
+from cc_remote.wrapper import machine as machine_module
 from cc_remote.protocol import Query, Takeover
 from cc_remote.wrapper.claude_controls import ClaudeControls
 from cc_remote.wrapper.claude_external import (
@@ -423,6 +425,178 @@ def test_claude_process_scan_fails_closed_without_proc(tmp_path):
         proc_root=str(tmp_path / "missing-proc"),
     )
     assert scan.complete is False and scan.holders == {"sid": set()}
+
+
+def _darwin_scan(monkeypatch, processes, cwds, identities=None,
+                 cwd_complete=True):
+    monkeypatch.setattr(claude_external_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        claude_external_module, "darwin_process_snapshot",
+        lambda: (processes, True),
+    )
+    monkeypatch.setattr(
+        claude_external_module, "_darwin_process_cwds",
+        lambda _pids: (cwds, cwd_complete),
+    )
+    stable = identities or {info[0].pid: info[0] for info in processes}
+    monkeypatch.setattr(
+        claude_external_module, "process_identity",
+        lambda pid: stable.get(pid),
+    )
+
+
+def test_claude_scan_on_darwin_binds_explicit_session_before_growth(
+        monkeypatch):
+    identity = ProcessIdentity(201, 2001)
+    sid = "session-explicit"
+    _darwin_scan(monkeypatch, [
+        (identity, 1, 1, (b"/Applications/Claude.app/Contents/MacOS/claude",
+                          b"--resume", sid.encode())),
+    ], {}, cwd_complete=False)
+    scan = claude_session_holders(
+        {sid: "unused"}, {sid: "/tmp/project"},
+        wrapper_pid=900, proc_root="/proc",
+    )
+    assert scan.complete is True
+    assert scan.holders[sid] == {identity}
+
+
+def test_claude_scan_on_darwin_unknown_explicit_sid_never_uses_cwd(
+        monkeypatch):
+    identity = ProcessIdentity(202, 2002)
+    _darwin_scan(monkeypatch, [
+        (identity, 1, 1, (b"claude", b"--resume", b"not-watched")),
+    ], {202: "/tmp/project"})
+    scan = claude_session_holders(
+        {"watched": "unused"}, {"watched": "/tmp/project"},
+        wrapper_pid=900, proc_root="/proc",
+    )
+    assert scan.complete is True
+    assert scan.holders == {"watched": set()}
+
+
+def test_claude_scan_on_darwin_does_not_guess_same_cwd_siblings(monkeypatch):
+    identity = ProcessIdentity(203, 2003)
+    _darwin_scan(monkeypatch, [
+        (identity, 1, 1, (b"claude",)),
+    ], {203: "/tmp/project"})
+    scan = claude_session_holders(
+        {"first": "a", "second": "b"},
+        {"first": "/tmp/project", "second": "/tmp/project"},
+        wrapper_pid=900, proc_root="/proc",
+    )
+    assert scan.complete is True
+    assert scan.holders == {"first": set(), "second": set()}
+
+
+def test_claude_scan_on_darwin_excludes_sdk_grandchild_and_background_role(
+        monkeypatch):
+    child = ProcessIdentity(210, 2010)
+    grandchild = ProcessIdentity(211, 2011)
+    background = ProcessIdentity(212, 2012)
+    sid = "owned-by-wrapper"
+    _darwin_scan(monkeypatch, [
+        (child, 900, 0, (b"python", b"sdk-host")),
+        (grandchild, 210, 1, (b"claude", b"--resume", sid.encode())),
+        (background, 1, 0, (b"claude", b"daemon", b"run")),
+    ], {211: "/tmp/project", 212: "/tmp/project"})
+    scan = claude_session_holders(
+        {sid: "unused"}, {sid: "/tmp/project"},
+        wrapper_pid=900, proc_root="/proc",
+    )
+    assert scan.complete is True
+    assert scan.holders == {sid: set()}
+
+
+def test_claude_scan_on_darwin_fails_closed_when_ps_or_lsof_is_unavailable(
+        monkeypatch):
+    monkeypatch.setattr(claude_external_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        claude_external_module, "darwin_process_snapshot",
+        lambda: ([], False),
+    )
+    unavailable_ps = claude_session_holders(
+        {"sid": "unused"}, {"sid": "/tmp/project"},
+        wrapper_pid=900, proc_root="/proc",
+    )
+    assert unavailable_ps.complete is False
+
+    identity = ProcessIdentity(220, 2020)
+    _darwin_scan(monkeypatch, [
+        (identity, 1, 1, (b"claude",)),
+    ], {}, cwd_complete=False)
+    unavailable_lsof = claude_session_holders(
+        {"sid": "unused"}, {"sid": "/tmp/project"},
+        wrapper_pid=900, proc_root="/proc",
+    )
+    assert unavailable_lsof.complete is False
+
+
+def test_claude_scan_on_darwin_rejects_reused_pid(monkeypatch):
+    identity = ProcessIdentity(230, 2030)
+    replacement = ProcessIdentity(230, 9999)
+    _darwin_scan(monkeypatch, [
+        (identity, 1, 1, (b"claude", b"--resume", b"sid")),
+    ], {}, identities={230: replacement})
+    scan = claude_session_holders(
+        {"sid": "unused"}, {"sid": "/tmp/project"},
+        wrapper_pid=900, proc_root="/proc",
+    )
+    assert scan.complete is False
+    assert scan.holders == {"sid": set()}
+
+
+def test_claude_takeover_signals_only_same_identity_and_uid(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        identity = ProcessIdentity(240, 2040)
+        calls = 0
+
+        def current(_pid):
+            nonlocal calls
+            calls += 1
+            return identity if calls <= 2 else None
+
+        signals = []
+        monkeypatch.setattr(machine_module, "process_identity", current)
+        monkeypatch.setattr(
+            machine_module, "process_owner_uid", lambda _pid: machine_module.os.getuid())
+        monkeypatch.setattr(
+            machine_module.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+        remaining = await machine._terminate_external_claude_holders(
+            {identity}, timeout=0.1)
+        assert remaining == set()
+        assert signals == [(identity.pid, machine_module.signal.SIGTERM)]
+
+    asyncio.run(run())
+
+
+def test_claude_takeover_rejects_pid_reuse_and_unknown_uid(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        identity = ProcessIdentity(241, 2041)
+        replacement = ProcessIdentity(241, 9999)
+        signals = []
+        monkeypatch.setattr(
+            machine_module.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+        monkeypatch.setattr(
+            machine_module, "process_identity", lambda _pid: replacement)
+        reused = await machine._terminate_external_claude_holders(
+            {identity}, timeout=0.1)
+        assert reused == set()
+
+        monkeypatch.setattr(
+            machine_module, "process_identity", lambda _pid: identity)
+        monkeypatch.setattr(
+            machine_module, "process_owner_uid", lambda _pid: None)
+        unknown_uid = await machine._terminate_external_claude_holders(
+            {identity}, timeout=0.1)
+        assert unknown_uid == {identity}
+        assert signals == []
+
+    asyncio.run(run())
 
 
 class _ClaudeRunSdk:

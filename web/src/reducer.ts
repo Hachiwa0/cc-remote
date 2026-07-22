@@ -9,7 +9,7 @@
 // Inbound frames carry `sid`; narrative events route to runtimes[msg.sid]
 // (unknown sid → drop; null sid → focused). Control frames (session_list,
 // session_focus, wrapper_reconnected, diff_report, ...) are global.
-import type { ConnState } from "./ws";
+import type { ConnState, EventOwnership } from "./ws";
 import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ToolCategory, ProcessKind,
@@ -245,11 +245,16 @@ export interface AppState {
   banner?: string;
   artifact: Artifact | null;
   dirPicker: { path: string; parent: string | null; dirs: DirEntry[] } | null;
-  currentCwd: string;
+  cwdByScope: Record<string, string>;
   sendMode: "interrupt" | "queue";
   // new-chat welcome page (global; only one new-chat flow at a time). model/effort
   // are the pre-selected values (null = use the wrapper's engine default).
-  newChat: { cwd: string; model: string | null; effort: string | null } | null;
+  newChat: {
+    cwd: string;
+    cwdSource: "default" | "inherited" | "explicit";
+    model: string | null;
+    effort: string | null;
+  } | null;
   // sessions + multi-session runtimes
   sessions: SessionInfo[];
   focusedSid: string | null;
@@ -298,7 +303,7 @@ export function createRuntime(): SessionRuntime {
 
 export type Action =
   | { type: "reset" }
-  | { type: "event"; event: ServerEvent }
+  | { type: "event"; event: ServerEvent; ownership?: EventOwnership }
   | { type: "query_sent"; sid: string; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[]; ts: number }
   | { type: "conn"; connState: ConnState; detail?: string }
   | { type: "command_error"; detail: string }
@@ -330,8 +335,9 @@ export type Action =
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question" }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
-  | { type: "enter_new_chat"; cwd: string; model?: string | null; effort?: string | null }
-  | { type: "set_new_chat_cwd"; cwd: string }
+  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null }
+  | { type: "set_new_chat_cwd"; cwd: string; cwdSource?: "default" | "inherited" | "explicit" }
+  | { type: "clear_scope_cwd"; scopeKey: string }
   | { type: "set_new_chat_model"; model: string | null }
   | { type: "set_new_chat_effort"; effort: string | null }
   | { type: "exit_new_chat" };
@@ -343,7 +349,7 @@ export const initialState: AppState = {
   wrapperOnline: false,
   artifact: null,
   dirPicker: null,
-  currentCwd: "",
+  cwdByScope: {},
   sendMode: "interrupt",
   newChat: null,
   sessions: [],
@@ -979,9 +985,24 @@ export function reduce(state: AppState, action: Action): AppState {
           (notice) => notice.notice_id !== action.noticeId);
       });
     case "enter_new_chat":
-      return { ...state, newChat: { cwd: action.cwd, model: action.model ?? null, effort: action.effort ?? null } };
+      return { ...state, newChat: {
+        cwd: action.cwd,
+        cwdSource: action.cwdSource ?? "default",
+        model: action.model ?? null,
+        effort: action.effort ?? null,
+      } };
     case "set_new_chat_cwd":
-      return state.newChat ? { ...state, newChat: { ...state.newChat, cwd: action.cwd } } : state;
+      return state.newChat ? { ...state, newChat: {
+        ...state.newChat,
+        cwd: action.cwd,
+        cwdSource: action.cwdSource ?? "explicit",
+      } } : state;
+    case "clear_scope_cwd": {
+      if (!(action.scopeKey in state.cwdByScope)) return state;
+      const cwdByScope = { ...state.cwdByScope };
+      delete cwdByScope[action.scopeKey];
+      return { ...state, cwdByScope };
+    }
     case "set_new_chat_model":
       return state.newChat ? { ...state, newChat: { ...state.newChat, model: action.model } } : state;
     case "set_new_chat_effort":
@@ -989,12 +1010,13 @@ export function reduce(state: AppState, action: Action): AppState {
     case "exit_new_chat":
       return { ...state, newChat: null };
     case "event":
-      return reduceEvent(state, action.event);
+      return reduceEvent(state, action.event, true, action.ownership);
   }
 }
 
 function reduceEvent(
   state: AppState, e: ServerEvent, boundCompletedTurns = true,
+  ownership?: EventOwnership,
 ): AppState {
   // History is built asynchronously. Any newer replayable frame — including a
   // state/ownership update with no message block — makes an older History
@@ -1043,10 +1065,26 @@ function reduceEvent(
           syncReady: true,
         },
       };
+      const cwdByScope = ownership && e.cwd
+        ? { ...state.cwdByScope, [ownership.scopeKey]: e.cwd }
+        : state.cwdByScope;
+      const hasSession = state.sessions.some(
+        (session) => session.session_id === newF);
+      const sessions = e.request_id && ownership && !hasSession
+        ? [{
+          session_id: newF,
+          summary: "新会话",
+          last_modified: String(e.ts),
+          cwd: e.cwd,
+          state: base.state,
+          engine: ownership.engine,
+          space: ownership.space,
+        } satisfies SessionInfo, ...state.sessions]
+        : state.sessions;
       return {
-        ...state, focusedSid: newF, runtimes,
+        ...state, focusedSid: newF, runtimes, sessions,
         artifact: state.focusedSid && state.focusedSid !== newF ? null : state.artifact,
-        currentCwd: e.cwd ?? state.currentCwd,
+        cwdByScope,
       };
     }
     case "session_rekey": {
@@ -1116,11 +1154,32 @@ function reduceEvent(
         runtimes[session_id] = createRuntime();
       }
       const wasFocused = state.focusedSid === old_key;
+      const sourceSession = state.sessions.find(
+        (session) => session.session_id === old_key);
+      const targetSession = state.sessions.find(
+        (session) => session.session_id === session_id);
+      const sessions = sourceSession
+        ? [
+          ...state.sessions.filter((session) => (
+            session.session_id !== old_key
+            && session.session_id !== session_id
+          )),
+          {
+            ...sourceSession,
+            ...targetSession,
+            session_id,
+            cwd: e.cwd ?? targetSession?.cwd ?? sourceSession.cwd,
+          },
+        ]
+        : state.sessions;
+      const cwdByScope = ownership && e.cwd
+        ? { ...state.cwdByScope, [ownership.scopeKey]: e.cwd }
+        : state.cwdByScope;
       return {
         ...state,
-        runtimes,
+        runtimes, sessions,
         focusedSid: wasFocused ? session_id : state.focusedSid,
-        currentCwd: wasFocused && e.cwd ? e.cwd : state.currentCwd,
+        cwdByScope,
       };
     }
     case "session_list": {
@@ -1132,7 +1191,15 @@ function reduceEvent(
         sessions: e.sessions,
         focusedSid: focusedMissing ? null : state.focusedSid,
         newChat: focusedMissing
-          ? { cwd: state.currentCwd, model: null, effort: null }
+          ? {
+            cwd: (ownership
+              ? state.cwdByScope[ownership.scopeKey] : "") || "~",
+            cwdSource: ownership
+              && !!state.cwdByScope[ownership.scopeKey]
+              ? "inherited" : "default",
+            model: null,
+            effort: null,
+          }
           : state.newChat,
       };
     }
@@ -1975,6 +2042,29 @@ function reduceEvent(
         t.progress = undefined;
         limitTurnBlocks(t);
         rt.turns = turns;
+      });
+    case "turn_binding":
+      return patch(state, e.sid, (rt) => {
+        const turns = cloneTurns(rt.turns);
+        const optimisticIndex = turns.findIndex((turn) => turn.id === e.msg_id);
+        if (optimisticIndex < 0) return;
+        turns[optimisticIndex].forkPointId = e.turn_id;
+        const authoritativeIndex = turns.findIndex((turn, index) => (
+          index !== optimisticIndex
+          && (turn.forkPointId === e.turn_id || turn.id === e.turn_id)
+        ));
+        if (authoritativeIndex >= 0) {
+          const optimistic = turns[optimisticIndex];
+          const authoritative = turns[authoritativeIndex];
+          const merged = mergeInitialHistory(
+            [authoritative], [optimistic])[0] ?? optimistic;
+          merged.forkPointId = e.turn_id;
+          const first = Math.min(optimisticIndex, authoritativeIndex);
+          const second = Math.max(optimisticIndex, authoritativeIndex);
+          turns.splice(second, 1);
+          turns.splice(first, 1, merged);
+        }
+        replaceWithBoundedTurns(rt, turns);
       });
     case "turn_end":
       return patch(state, e.sid, (rt) => {

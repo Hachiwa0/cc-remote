@@ -78,11 +78,12 @@ from cc_remote.protocol import (
     HistoryInvalidated, ArtifactInvalidated, AskUser,
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg,
-    ToolUse, ToolResult, TurnEnd, TurnResult, is_downstream, is_reliable_command,
+    ToolUse, ToolResult, TurnBinding, TurnEnd, TurnResult, is_downstream,
+    is_reliable_command,
     SessionInfo, SessionList, SessionActivity, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
-    ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
+    ERR_CC_CRASH, ERR_INTERNAL, ERR_INVALID_CWD, ERR_AUTH, ERR_PROTOCOL,
     ERR_FORK_RECONCILING,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
@@ -112,7 +113,8 @@ from cc_remote.wrapper.session import load_session_id, save_session_id
 from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.wrapper.stream import (
     StreamTranslator, extract_session_id, extract_model,
-    translate_history, last_assistant_model, transcript_timestamps, transcript_path,
+    translate_history, last_assistant_model, transcript_internal_user_events,
+    transcript_timestamps, transcript_path,
     translate_subagent_history, merge_subagent_history,
 )
 from cc_remote.wrapper.codex_handle import (
@@ -161,9 +163,14 @@ from cc_remote.wrapper.claude_external import (
     classify_claude_growth,
 )
 from cc_remote.wrapper.codex_external import (
-    CodexTuiLogTracker, HolderScan, ProcessIdentity,
-    parse_turn_markers, process_identity,
+    CodexTuiLogTracker, HolderScan,
+    parse_turn_markers,
     writable_rollout_holders,
+)
+from cc_remote.wrapper.process_scan import (
+    ProcessIdentity,
+    process_identity,
+    process_owner_uid,
 )
 from cc_remote.wrapper.transport import WrapperTransport
 
@@ -211,6 +218,15 @@ def _codex_list_state(status: Optional[str]) -> Optional[State]:
 
 class _BtwSpawnFailure(Exception):
     """Expected /btw rejection that must be correlated and ACKed."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class _SpawnFailure(Exception):
+    """Synchronous new-session failure routed only to its initiating client."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -368,6 +384,18 @@ class WrapperMachine:
         # catalog. The browser warms both back-to-back, so briefly reuse one
         # authoritative read instead of starting app-server twice.
         self._codex_session_list_cache: tuple[float, list[dict]] | None = None
+        self._codex_session_list_refresh_task: Optional[asyncio.Task] = None
+        self._codex_session_list_epoch = 0
+        self._codex_session_list_refresh_epoch = -1
+        # Catalog reads must never hold the serial command lane: a cold Codex
+        # app-server startup can take tens of seconds on a very large store.
+        self._session_list_command_tasks: set[asyncio.Task] = set()
+        # Transcript/rollout parsing is read-only but can still take seconds for
+        # a large session. Keep it off the serial query/interrupt lane and
+        # coalesce reliable reconnect retries by their stable command id.
+        self._history_command_tasks: dict[
+            tuple[str, str], asyncio.Task
+        ] = {}
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
         # resets this window (documented residual risk, not durable exactly-once).
@@ -1676,6 +1704,12 @@ class WrapperMachine:
             self._work_schedule_task = asyncio.create_task(
                 self._work_schedule_loop())
             async for cmd in self.transport.incoming():
+                if cmd.type == "list_sessions":
+                    self._start_session_list_command(cmd)
+                    continue
+                if cmd.type == "get_history":
+                    self._start_history_command(cmd)
+                    continue
                 if cmd.type == "get_models":
                     self._start_models_command(cmd)
                     continue
@@ -1711,6 +1745,25 @@ class WrapperMachine:
             if control_tasks:
                 await asyncio.gather(*control_tasks, return_exceptions=True)
             self._interactive_control_tasks.clear()
+            list_tasks = list(self._session_list_command_tasks)
+            for task in list_tasks:
+                task.cancel()
+            if list_tasks:
+                await asyncio.gather(*list_tasks, return_exceptions=True)
+            self._session_list_command_tasks.clear()
+            history_tasks = list(self._history_command_tasks.values())
+            for task in history_tasks:
+                task.cancel()
+            if history_tasks:
+                await asyncio.gather(*history_tasks, return_exceptions=True)
+            self._history_command_tasks.clear()
+            if self._codex_session_list_refresh_task is not None:
+                self._codex_session_list_refresh_task.cancel()
+                await asyncio.gather(
+                    self._codex_session_list_refresh_task,
+                    return_exceptions=True,
+                )
+                self._codex_session_list_refresh_task = None
             fork_tasks = [
                 *self._codex_fork_tasks.values(),
                 *self._claude_fork_tasks.values(),
@@ -2227,6 +2280,29 @@ class WrapperMachine:
 
         task.add_done_callback(forget)
 
+    def _start_session_list_command(self, cmd) -> None:
+        """Resolve sidebar catalogs without blocking query/new-session input."""
+        task = asyncio.create_task(self._process_command_safely(cmd))
+        self._session_list_command_tasks.add(task)
+        task.add_done_callback(self._session_list_command_tasks.discard)
+
+    def _start_history_command(self, cmd) -> None:
+        """Read one history page without blocking query/interrupt intake."""
+        client_id = getattr(cmd, "client_id", None) or ""
+        cmd_id = getattr(cmd, "cmd_id", None) or f"untracked-{id(cmd)}"
+        key = (client_id, cmd_id)
+        current = self._history_command_tasks.get(key)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(self._process_command_safely(cmd))
+        self._history_command_tasks[key] = task
+
+        def forget(done: asyncio.Task) -> None:
+            if self._history_command_tasks.get(key) is done:
+                self._history_command_tasks.pop(key, None)
+
+        task.add_done_callback(forget)
+
     def _start_capabilities_command(self, cmd) -> None:
         """Keep extension discovery off the serial query/mutation lane."""
         client_id = getattr(cmd, "client_id", None) or ""
@@ -2620,24 +2696,27 @@ class WrapperMachine:
 
         This is called only from the reliable, explicit Takeover command. It
         never kills a process group (which may contain the user's shell), never
-        escalates to SIGKILL, and re-checks Linux start ticks immediately before
-        SIGTERM so PID reuse cannot target an unrelated process.
+        escalates to SIGKILL, and re-checks the cross-platform stable identity
+        immediately before SIGTERM so PID reuse cannot target another process.
         """
         remaining: set[ProcessIdentity] = set()
         for identity in holders:
             current = process_identity(identity.pid)
             if current != identity:
                 continue
-            try:
-                proc_info = os.stat(f"/proc/{identity.pid}")
-            except OSError:
+            owner_uid = process_owner_uid(identity.pid)
+            if owner_uid is None:
+                if process_identity(identity.pid) == identity:
+                    remaining.add(identity)
                 continue
-            if proc_info.st_uid != os.getuid():
+            if owner_uid != os.getuid():
                 log.warning(
                     "refusing to migrate Claude process owned by another uid",
                     pid=identity.pid,
                 )
                 remaining.add(identity)
+                continue
+            if process_identity(identity.pid) != identity:
                 continue
             try:
                 os.kill(identity.pid, signal.SIGTERM)
@@ -3712,6 +3791,12 @@ class WrapperMachine:
                         self.cfg.tool_result_max,
                         start_offset=start_offset,
                         end_offset=end_offset,
+                        source_continuation=(
+                            "authoritative_page"
+                            if source_window_oldest_cursor is not None
+                            and source_window_boundary_offset is not None
+                            else None
+                        ),
                     )
                     if (source_window_oldest_cursor is not None
                             and source_window_boundary_offset is not None
@@ -3740,9 +3825,18 @@ class WrapperMachine:
             try:
                 def _read():
                     return (get_session_messages(sid, directory=directory),
-                            transcript_timestamps(sid))
-                msgs, tss = await asyncio.to_thread(_read)
-                events = translate_history(msgs, self.cfg.tool_result_max, timestamps=tss)
+                            transcript_timestamps(sid),
+                            transcript_internal_user_events(sid))
+                msgs, tss, internal_events = await asyncio.to_thread(_read)
+                if internal_events:
+                    events = translate_history(
+                        msgs, self.cfg.tool_result_max, timestamps=tss,
+                        internal_user_events=internal_events)
+                else:
+                    # Keep the long-standing call shape for embedders/tests
+                    # which supply a compatible transcript translator.
+                    events = translate_history(
+                        msgs, self.cfg.tool_result_max, timestamps=tss)
                 subagent_events = await asyncio.to_thread(
                     translate_subagent_history, sid, self.cfg.tool_result_max)
                 events = merge_subagent_history(events, subagent_events)
@@ -3975,6 +4069,7 @@ class WrapperMachine:
         the requester — like a web chat's GET /conversation. Opening it also starts
         MIRRORING its transcript, so appends made by a native Claude/Codex process
         stream through to every client (read-only)."""
+        started_at = time.perf_counter()
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         self._watch_session(sid)   # snapshot size before we read, so no append is missed
         watched_engine = (self._watch.get(sid) or {}).get("engine")
@@ -3993,7 +4088,8 @@ class WrapperMachine:
         await self.transport.send(hist)
         log.info("history sent", session_id=sid, events=len(hist.events),
                  has_more=hist.has_more, before=bool(hist.before),
-                 external=hist.external, client_id=client_id)
+                 external=hist.external, client_id=client_id,
+                 elapsed_ms=round((time.perf_counter() - started_at) * 1000))
         return hist
 
     async def _handle_takeover(self, cmd):
@@ -7765,18 +7861,66 @@ class WrapperMachine:
             await self.transport.send(error)
             return error
 
-    async def _list_codex_sessions(self, cmd) -> None:
-        """Sidebar list from the app-server's authoritative thread state DB."""
+    def _invalidate_codex_session_catalog(self) -> None:
+        self._codex_session_list_cache = None
+        self._codex_session_list_epoch += 1
+
+    async def _refresh_codex_session_catalog(self) -> list[dict]:
+        """Share one cold app-server catalog read across concurrent clients."""
+        epoch = self._codex_session_list_epoch
+        task = self._codex_session_list_refresh_task
+        if (task is None or task.done()
+                or self._codex_session_list_refresh_epoch != epoch):
+            task = asyncio.create_task(list_codex_sessions(200))
+            self._codex_session_list_refresh_task = task
+            self._codex_session_list_refresh_epoch = epoch
         try:
-            # Load the bounded app-server maximum for each archive state. Search
-            # is client-side, so stopping at the old 60-row page made older
-            # threads impossible to rename, restore, or fork.
-            cached = self._codex_session_list_cache
-            if cached is not None and time.monotonic() - cached[0] <= 1.0:
-                raw = cached[1]
-            else:
-                raw = await list_codex_sessions(200)
-                self._codex_session_list_cache = (time.monotonic(), raw)
+            raw = await asyncio.shield(task)
+        finally:
+            if task.done() and self._codex_session_list_refresh_task is task:
+                self._codex_session_list_refresh_task = None
+                self._codex_session_list_refresh_epoch = -1
+        if epoch != self._codex_session_list_epoch:
+            # A create/rename/archive committed while this snapshot was being
+            # built. Never let the old rows replace the optimistic temp row.
+            return await self._refresh_codex_session_catalog()
+        self._codex_session_list_cache = (time.monotonic(), raw)
+        return raw
+
+    async def _list_codex_sessions(self, cmd) -> None:
+        """Paint cached rows now, then reconcile a stale catalog in background."""
+        cached = self._codex_session_list_cache
+        cached_event = None
+        if cached is not None:
+            cached_event = await self._send_codex_session_list(cmd, cached[1])
+            # Code and Work are normally requested back-to-back. One second
+            # preserves that reuse while every later visit still reconciles
+            # native CLI/Desktop changes after painting the cache.
+            if time.monotonic() - cached[0] <= 1.0:
+                return cached_event
+        try:
+            raw = await self._refresh_codex_session_catalog()
+        except Exception as e:
+            if cached_event is not None:
+                log.warning("stale Codex session catalog refresh failed",
+                            error_type=type(e).__name__)
+                return cached_event
+            log.exception("list_codex_sessions failed", error=str(e))
+            error = Error(
+                code=ERR_INTERNAL,
+                message=f"list_codex_sessions failed: {e}",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if cached is not None and raw == cached[1]:
+            return cached_event
+        return await self._send_codex_session_list(cmd, raw)
+
+    async def _send_codex_session_list(self, cmd, raw: list[dict]) -> None:
+        """Filter and route one already-read native Codex catalog."""
+        try:
             self._prime_codex_sidebar_watches(raw)
             resident_state = {c.session_id: c.state for c in self.sessions.values()
                               if c.session_id and c.engine == "codex"}
@@ -8055,7 +8199,7 @@ class WrapperMachine:
                 )
                 ctx.work_context_baseline_pending = False
         if ctx.engine == "codex":
-            self._codex_session_list_cache = None
+            self._invalidate_codex_session_catalog()
         if ctx.engine != "codex":
             rekey_goal = getattr(ctx.sdk, "rekey_goal", None)
             if rekey_goal is not None:
@@ -8112,27 +8256,39 @@ class WrapperMachine:
                 return error
             target_cwd = work_record.cwd
 
-        ctx = await self._spawn(resume_id=None, cwd=target_cwd,
-                                engine=engine,
-                                model=getattr(cmd, "model", None),
-                                effort=getattr(cmd, "effort", None),
-                                collaboration_mode=getattr(
-                                    cmd, "collaboration_mode", None),
-                                permission_mode=getattr(
-                                    cmd, "permission_mode", None),
-                                service_tier=getattr(
-                                    cmd, "service_tier", None),
-                                space=space,
-                                work_id=(work_record.work_id
-                                         if work_record else None))
+        try:
+            ctx = await self._spawn(
+                resume_id=None,
+                cwd=target_cwd,
+                engine=engine,
+                model=getattr(cmd, "model", None),
+                effort=getattr(cmd, "effort", None),
+                collaboration_mode=getattr(cmd, "collaboration_mode", None),
+                permission_mode=getattr(cmd, "permission_mode", None),
+                service_tier=getattr(cmd, "service_tier", None),
+                space=space,
+                work_id=(work_record.work_id if work_record else None),
+                raise_on_failure=True,
+            )
+        except _SpawnFailure as exc:
+            ctx = None
+            failure = exc
+        except Exception as exc:
+            log.exception("new session spawn failed unexpectedly", engine=engine)
+            ctx = None
+            failure = _SpawnFailure(
+                ERR_CC_CRASH, f"新会话启动失败: {exc}")
+        else:
+            failure = None
         if ctx is None:
             if work_record is not None:
                 await asyncio.to_thread(
                     self._work.for_engine(engine).abandon,
                     work_record.work_id)
             error = Error(
-                code=ERR_CC_CRASH,
-                message="新会话启动失败，请检查工作目录和引擎配置",
+                code=(failure.code if failure else ERR_CC_CRASH),
+                message=(failure.message if failure else
+                         "新会话启动失败，请检查工作目录和引擎配置"),
                 request_id=getattr(cmd, "request_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -8245,7 +8401,7 @@ class WrapperMachine:
             await self._emit_to_sid(sid, error)
             return error
         if is_codex:
-            self._codex_session_list_cache = None
+            self._invalidate_codex_session_catalog()
             try:
                 await codex_rpc("thread/name/set", {
                     "threadId": sid, "name": cmd.title,
@@ -8309,7 +8465,7 @@ class WrapperMachine:
             await self._emit_to_sid(sid, error)
             return error
         if is_codex:
-            self._codex_session_list_cache = None
+            self._invalidate_codex_session_catalog()
             method = "thread/archive" if cmd.archived else "thread/unarchive"
             try:
                 await codex_rpc(method, {"threadId": sid})
@@ -8569,7 +8725,7 @@ class WrapperMachine:
                     remaining = await list_codex_sessions(200)
                     if any(row.get("session_id") == sid for row in remaining):
                         raise
-                self._codex_session_list_cache = None
+                self._invalidate_codex_session_catalog()
             else:
                 await asyncio.to_thread(delete_session, sid, directory=cwd)
         except Exception:
@@ -8922,7 +9078,7 @@ class WrapperMachine:
                     error_type=type(exc).__name__,
                 )
             if ctx.engine == "codex":
-                self._codex_session_list_cache = None
+                self._invalidate_codex_session_catalog()
                 try:
                     await self._handle_list_sessions(
                         ListSessions(engine="codex", space="code")
@@ -10753,22 +10909,40 @@ class WrapperMachine:
                      permission_mode: Optional[str] = None,
                      service_tier: Optional[str] = None,
                      space: str = "code",
-                     work_id: Optional[str] = None) -> Optional[SessionContext]:
+                     work_id: Optional[str] = None,
+                     raise_on_failure: bool = False) -> Optional[SessionContext]:
         """Create a SessionContext, connect its SDK subprocess, load history.
         Returns the ctx (added to the pool under its real or temp key) or None
-        on failure (an Error has been emitted). `bootstrap` exempts the cap and
+        on legacy-route failure (an Error has been emitted). NewSession uses
+        ``raise_on_failure`` so its handler can send one correlated Error.
+        `bootstrap` exempts the cap and
         retries resume→fresh on connect failure. `model`/`effort` (new_session
         only) pre-select those at spawn: effort BEFORE connect so the first turn
         runs at that strength with no respawn; cc model via a live set_model
         after connect; codex model as a per-turn field. Omitted => engine
         defaults (unchanged behavior)."""
+        async def reject(
+            code: str,
+            message: str,
+            *,
+            route: str = "focused",
+            sid: Optional[str] = None,
+            typed_code: Optional[str] = None,
+        ) -> None:
+            if raise_on_failure:
+                raise _SpawnFailure(typed_code or code, message)
+            error = Error(code=code, message=message)
+            if route == "sid":
+                await self._emit_to_sid(sid, error)
+            else:
+                await self._emit_focused(error)
+
         if resume_id and resume_id in self._private_btw_sessions:
             log.warning("refusing cold resume of private btw transcript",
                         session_id=resume_id)
-            await self._emit_to_sid(resume_id, Error(
-                code=ERR_AUTH,
-                message="临时 btw 会话不可恢复",
-            ))
+            await reject(
+                ERR_AUTH, "临时 btw 会话不可恢复",
+                route="sid", sid=resume_id)
             return None
         broker_handle: Optional[ClaudeBrokerHandle] = None
         if (self._claude_broker_enabled
@@ -10784,10 +10958,10 @@ class WrapperMachine:
                     session_id=resume_id,
                     error_code=exc.code,
                 )
-                await self._emit_to_sid(resume_id, Error(
-                    code=ERR_BUSY,
-                    message="本机 Claude broker 状态无法安全确认，未启动第二个会话进程",
-                ))
+                await reject(
+                    ERR_BUSY,
+                    "本机 Claude broker 状态无法安全确认，未启动第二个会话进程",
+                    route="sid", sid=resume_id)
                 return None
         # Claude's CLI/version preflight belongs to Claude spawn, not wrapper
         # process startup.  Keep it before cap eviction: an unavailable optional
@@ -10798,10 +10972,9 @@ class WrapperMachine:
             except Exception as exc:
                 log.warning("Claude preflight failed; engine unavailable",
                             error=str(exc))
-                await self._emit_to_sid(resume_id, Error(
-                    code=ERR_CC_CRASH,
-                    message=f"Claude 引擎不可用: {exc}",
-                ))
+                await reject(
+                    ERR_CC_CRASH, f"Claude 引擎不可用: {exc}",
+                    route="sid", sid=resume_id)
                 return None
 
         # Concurrency cap (bootstrap always allowed). When full, evict an idle,
@@ -10812,9 +10985,8 @@ class WrapperMachine:
             victim = next((k for k, c in self.sessions.items()
                            if k != self.focused_sid and c.state == "idle" and not c.btw), None)
             if victim is None:
-                await self._emit_focused(Error(
-                    code=ERR_BUSY,
-                    message="所有会话都在运行,先中断一个再切换"))
+                await reject(
+                    ERR_BUSY, "所有会话都在运行,先中断一个再切换")
                 return None
             vc = self.sessions.pop(victim)
             try:
@@ -10838,10 +11010,9 @@ class WrapperMachine:
             # from Remote until somebody had already typed in the terminal.
             target_cwd = broker_handle.cwd
             if not os.path.isdir(target_cwd):
-                await self._emit_to_sid(resume_id, Error(
-                    code=ERR_BUSY,
-                    message="Claude broker 的工作目录已不存在，未连接该会话",
-                ))
+                await reject(
+                    ERR_BUSY, "Claude broker 的工作目录已不存在，未连接该会话",
+                    route="sid", sid=resume_id)
                 return None
         elif resume_id:
             try:
@@ -10858,7 +11029,8 @@ class WrapperMachine:
                     resume_id = None
                     target_cwd = self.cfg.cc_cwd
                 else:
-                    await self._emit_focused(Error(code=ERR_INTERNAL, message=f"session not found: {resume_id}"))
+                    await reject(
+                        ERR_INTERNAL, f"session not found: {resume_id}")
                     return None
             else:
                 target_cwd = info.cwd or self.cfg.cc_cwd
@@ -10877,7 +11049,9 @@ class WrapperMachine:
         elif cwd:
             target_cwd = os.path.realpath(os.path.expanduser(cwd))
             if not os.path.isdir(target_cwd):
-                await self._emit_focused(Error(code=ERR_INTERNAL, message=f"目录不存在: {cwd}"))
+                await reject(
+                    ERR_INTERNAL, f"目录不存在: {cwd}",
+                    typed_code=ERR_INVALID_CWD)
                 return None
         else:
             target_cwd = self.cfg.cc_cwd
@@ -10889,23 +11063,20 @@ class WrapperMachine:
                            if resume_id else
                            await asyncio.to_thread(store.get_by_work_id, work_id or ""))
             if work_record is None:
-                await self._emit_to_sid(resume_id, Error(
-                    code=ERR_AUTH,
-                    message="Work 会话注册信息不存在，已拒绝启动",
-                ))
+                await reject(
+                    ERR_AUTH, "Work 会话注册信息不存在，已拒绝启动",
+                    route="sid", sid=resume_id)
                 return None
             registered_cwd = os.path.realpath(work_record.cwd)
             if os.path.realpath(target_cwd) != registered_cwd:
-                await self._emit_to_sid(resume_id, Error(
-                    code=ERR_AUTH,
-                    message="Work 会话目录与原生 Session 不一致，已拒绝启动",
-                ))
+                await reject(
+                    ERR_AUTH, "Work 会话目录与原生 Session 不一致，已拒绝启动",
+                    route="sid", sid=resume_id)
                 return None
             if not store.contains_cwd(registered_cwd):
-                await self._emit_to_sid(resume_id, Error(
-                    code=ERR_AUTH,
-                    message="Work 会话目录越过受控根目录，已拒绝启动",
-                ))
+                await reject(
+                    ERR_AUTH, "Work 会话目录越过受控根目录，已拒绝启动",
+                    route="sid", sid=resume_id)
                 return None
             work_id = work_record.work_id
 
@@ -11061,11 +11232,11 @@ class WrapperMachine:
                     await ctx.sdk.connect(resume_id=None, cwd=target_cwd)
                 except Exception as e2:
                     log.exception("fresh connect also failed", error=str(e2))
-                    await self._emit_focused(Error(code=ERR_CC_CRASH, message=f"connect failed: {e2}"))
+                    await reject(ERR_CC_CRASH, f"connect failed: {e2}")
                     return None
             else:
                 log.exception("connect failed", error=str(e))
-                await self._emit_focused(Error(code=ERR_CC_CRASH, message=f"connect failed: {e}"))
+                await reject(ERR_CC_CRASH, f"connect failed: {e}")
                 return None
 
         if (ctx.space == "work" and ctx.work_context_baseline_pending
@@ -11103,10 +11274,8 @@ class WrapperMachine:
                     await ctx.sdk.disconnect()
                 except Exception:
                     pass
-                await self._emit_focused(Error(
-                    code=ERR_CC_CRASH,
-                    message="Codex 未返回新会话 ID，已拒绝创建",
-                ))
+                await reject(
+                    ERR_CC_CRASH, "Codex 未返回新会话 ID，已拒绝创建")
                 return None
             ctx.session_id = native_sid
             if space == "work" and work_id:
@@ -11122,12 +11291,9 @@ class WrapperMachine:
                         await ctx.sdk.disconnect()
                     except Exception:
                         pass
-                    await self._emit_focused(Error(
-                        code=ERR_INTERNAL,
-                        message="Codex Work 会话登记失败",
-                    ))
+                    await reject(ERR_INTERNAL, "Codex Work 会话登记失败")
                     return None
-            self._codex_session_list_cache = None
+            self._invalidate_codex_session_catalog()
 
         if space == "work" and engine == "codex":
             # thread/resume may restore the Code-time policy recorded in the
@@ -12075,11 +12241,17 @@ class WrapperMachine:
                         )))
                         await self._set_idle_after_managed_turn(ctx)
                         return
-                    await ctx.sdk.query(prompt, images=img_paths)
+                    native_turn_id = await ctx.sdk.query(
+                        prompt, images=img_paths)
                     # CodexHandle marks turn/start failure by raising with
                     # turn_active=False. Reaching here is the authoritative
                     # acceptance boundary, including an ultra-fast turn that
                     # already completed before the RPC coroutine resumed.
+                    if native_turn_id and ctx.active_msg_id:
+                        await self._emit(ctx, TurnBinding(
+                            msg_id=ctx.active_msg_id,
+                            turn_id=native_turn_id,
+                        ))
                     await self._accept_codex_checkpoint(ctx)
                 elif images:
                     content: list = []

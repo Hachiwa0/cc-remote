@@ -175,6 +175,7 @@ export interface ProcessEvent extends Base {
 export interface PlanEntry { step: string; status: "pending" | "inProgress" | "completed" }
 export interface TurnPlan extends Base { type: "turn_plan"; item_id: string; turn_id?: string | null; explanation?: string | null; plan: PlanEntry[] }
 export interface TurnDiff extends Base { type: "turn_diff"; item_id: string; turn_id?: string | null; diff: string; truncated?: boolean | null }
+export interface TurnBinding extends Base { type: "turn_binding"; msg_id: string; turn_id: string }
 export interface TurnResult { subtype: string; duration_ms: number; is_error: boolean; total_cost_usd?: number | null; num_turns?: number | null }
 export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null; checkpoint_id?: string | null }
 export interface ErrorMsg extends Base {
@@ -438,10 +439,10 @@ export type ServerEvent =
   | SessionList | SessionActivity | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
-  | ProcessEvent | TurnPlan | TurnDiff
+  | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 16;
+export const PROTOCOL_VERSION = 17;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

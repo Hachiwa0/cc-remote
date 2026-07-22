@@ -17,8 +17,23 @@ import { uuid } from "./util.ts";
 
 export type ConnState = "connecting" | "connected" | "reconnecting" | "disconnected";
 
+export interface EventOwnership {
+  scopeKey: string;
+  machineId: string;
+  engine: "claude" | "codex";
+  space: Space;
+  surfaceEpoch: number;
+  connectionGeneration: number;
+}
+
+export function sessionScopeKey(
+  machineId: string, engine: "claude" | "codex", space: Space,
+): string {
+  return `${machineId}:${space}:${engine}`;
+}
+
 export interface WsCallbacks {
-  onEvent: (msg: ServerEvent) => void;
+  onEvent: (msg: ServerEvent, ownership?: EventOwnership) => void;
   onConnState: (s: ConnState, detail?: string) => void;
   onAuthFail?: () => void;
   onCommandError?: (detail: string) => void;
@@ -58,6 +73,13 @@ export class RelayWs {
   private newSessionFocusRequestId: string | null = null;
   private newSessionEngine: "claude" | "codex" = "claude";
   private newSessionSpace: Space = "code";
+  private connectionGeneration = 0;
+  private surfaceEpoch = 1;
+  private readonly surfaceEpochByScope: Record<string, number> = {};
+  private readonly ownershipBySession: Record<string, EventOwnership> = {};
+  private readonly pendingOwnershipByRequest: Record<string, EventOwnership> = {};
+  private readonly pendingSwitchOwnership: Record<string, EventOwnership[]> = {};
+  private readonly pendingListOwnership: Record<string, EventOwnership[]> = {};
   private readonly outbox = new CommandOutbox(
     OUTBOX_MAX_COMMANDS, OUTBOX_MAX_BYTES, OUTBOX_MAX_FRAME_BYTES);
   private readonly clientId: string;
@@ -82,6 +104,9 @@ export class RelayWs {
     const url = new URL(`${proto}//${window.location.host}/ws`);
     if (machineId !== "default") url.searchParams.set("machine", machineId);
     this.url = url.toString();
+    this.surfaceEpochByScope[
+      sessionScopeKey(machineId, this.activeEngine, this.activeSpace)
+    ] = this.surfaceEpoch;
   }
 
   start(): void {
@@ -291,6 +316,9 @@ export class RelayWs {
       if (space) this.spaceBySession[sid] = space;
       this.touchReplay(sid);
     }
+    if (this.newSessionFocusRequestId) {
+      delete this.pendingOwnershipByRequest[this.newSessionFocusRequestId];
+    }
     this.newSessionFocusRequestId = null;
   }
 
@@ -299,11 +327,18 @@ export class RelayWs {
     const changed = engine !== this.activeEngine || space !== this.activeSpace;
     this.activeEngine = engine;
     this.activeSpace = space;
+    if (changed) {
+      this.surfaceEpoch += 1;
+      this.surfaceEpochByScope[
+        sessionScopeKey(this.machineId, engine, space)
+      ] = this.surfaceEpoch;
+    }
     if (this.focusedSid && !this.sessionMatchesSurface(this.focusedSid, engine, space)) {
       this.focusedSid = null;
     }
     if (changed && this.newSessionFocusRequestId
         && (this.newSessionEngine !== engine || this.newSessionSpace !== space)) {
+      delete this.pendingOwnershipByRequest[this.newSessionFocusRequestId];
       this.newSessionFocusRequestId = null;
     }
   }
@@ -323,6 +358,47 @@ export class RelayWs {
         this.spaceBySession[session.session_id] = session.space;
       }
     }
+  }
+
+  private ownershipSnapshot(
+    engine = this.activeEngine, space = this.activeSpace,
+  ): EventOwnership {
+    const scopeKey = sessionScopeKey(this.machineId, engine, space);
+    return {
+      scopeKey,
+      machineId: this.machineId,
+      engine,
+      space,
+      surfaceEpoch: this.surfaceEpochByScope[scopeKey] ?? 0,
+      connectionGeneration: this.connectionGeneration,
+    };
+  }
+
+  private acceptsOwnership(
+    ownership: EventOwnership | undefined, socketGeneration: number,
+  ): ownership is EventOwnership {
+    return !!ownership
+      && ownership.connectionGeneration === socketGeneration
+      && ownership.connectionGeneration === this.connectionGeneration
+      && this.surfaceEpochByScope[ownership.scopeKey] === ownership.surfaceEpoch;
+  }
+
+  private queueOwnership(
+    target: Record<string, EventOwnership[]>, key: string,
+    ownership: EventOwnership,
+  ): void {
+    const queue = target[key] ?? [];
+    queue.push(ownership);
+    target[key] = queue.slice(-32);
+  }
+
+  private shiftOwnership(
+    target: Record<string, EventOwnership[]>, key: string,
+  ): EventOwnership | undefined {
+    const queue = target[key];
+    const ownership = queue?.shift();
+    if (queue?.length === 0) delete target[key];
+    return ownership;
   }
 
   private sidObj(): Record<string, unknown> {
@@ -574,19 +650,28 @@ export class RelayWs {
   }
 
   sendListSessions(engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine ?? "claude";
+    const scopeKey = sessionScopeKey(this.machineId, targetEngine, space);
+    const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    if (this.send(obj)) {
+      this.queueOwnership(this.pendingListOwnership, scopeKey, ownership);
+    }
   }
 
   sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine ?? this.activeEngine;
     if (engine) this.engineBySession[sessionId] = engine;
     this.spaceBySession[sessionId] = space;
+    const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    if (this.send(obj)) {
+      this.queueOwnership(this.pendingSwitchOwnership, sessionId, ownership);
+    }
   }
 
   sendNewSession(cwd?: string | null, engine?: "claude" | "codex",
@@ -600,6 +685,9 @@ export class RelayWs {
     this.newSessionFocusRequestId = requestId;
     this.newSessionEngine = engine ?? "claude";
     this.newSessionSpace = space;
+    const ownership = this.ownershipSnapshot(
+      this.newSessionEngine, this.newSessionSpace);
+    this.pendingOwnershipByRequest[requestId] = ownership;
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "new_session", request_id: requestId, ts: nowTs(),
     };
@@ -625,7 +713,10 @@ export class RelayWs {
       if (initial.files?.length) obj.files = initial.files;
     }
     const queued = this.send(obj);
-    if (!queued) this.newSessionFocusRequestId = null;
+    if (!queued) {
+      this.newSessionFocusRequestId = null;
+      delete this.pendingOwnershipByRequest[requestId];
+    }
     return queued;
   }
 
@@ -849,6 +940,7 @@ export class RelayWs {
 
   private connect(): void {
     this.cb.onConnState("connecting");
+    const socketGeneration = ++this.connectionGeneration;
     const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
@@ -858,6 +950,7 @@ export class RelayWs {
       this.cb.onConnState("connected");  // triggers sendListSessions
     };
     ws.onmessage = (e) => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       try {
         const decoded = JSON.parse(e.data) as ServerEvent;
         this.lastRecvAt = Date.now();  // any valid JSON frame proves the link is alive
@@ -877,6 +970,22 @@ export class RelayWs {
           if (msg.generation) this.noteWrapperGeneration(msg.generation);
           this.sendRecoveryPreamble();
         }
+        let eventOwnership: EventOwnership | undefined;
+        if (msg.type === "session_list") {
+          const listedSpace = msg.space ?? "code";
+          const scopeKey = sessionScopeKey(
+            this.machineId, msg.engine, listedSpace);
+          const listedOwnership = this.shiftOwnership(
+            this.pendingListOwnership, scopeKey);
+          if (this.acceptsOwnership(listedOwnership, socketGeneration)) {
+            eventOwnership = listedOwnership;
+            for (const session of msg.sessions) {
+              this.engineBySession[session.session_id] = msg.engine;
+              this.spaceBySession[session.session_id] = listedSpace;
+              this.ownershipBySession[session.session_id] = listedOwnership;
+            }
+          }
+        }
         if (msg.type === "session_focus") {
           // Drop a STALE switch-confirmation: when you click through several
           // sessions quickly, the wrapper processes each switch in turn and emits
@@ -886,28 +995,45 @@ export class RelayWs {
           // or the very first focus when we have none yet.
           const isCreatedFocus = !!msg.request_id
             && msg.request_id === this.newSessionFocusRequestId;
-          const targetEngine = isCreatedFocus
-            ? this.newSessionEngine : this.engineBySession[msg.session_id];
-          const targetSpace = isCreatedFocus
-            ? this.newSessionSpace : this.spaceBySession[msg.session_id];
+          const pendingOwnership = isCreatedFocus && msg.request_id
+            ? this.pendingOwnershipByRequest[msg.request_id]
+            : this.shiftOwnership(
+              this.pendingSwitchOwnership, msg.session_id);
+          const ownership = pendingOwnership
+            ?? this.ownershipBySession[msg.session_id];
+          const targetEngine = ownership?.engine
+            ?? (isCreatedFocus
+              ? this.newSessionEngine : this.engineBySession[msg.session_id]);
+          const targetSpace = ownership?.space
+            ?? (isCreatedFocus
+              ? this.newSessionSpace : this.spaceBySession[msg.session_id]);
           if (targetEngine !== this.activeEngine || targetSpace !== this.activeSpace) {
             return; // delayed/foreign Code↔Work or Claude↔Codex focus
           }
           if (this.focusedSid != null && msg.session_id !== this.focusedSid && !isCreatedFocus) {
             return; // superseded — ignore
           }
-          if (isCreatedFocus) this.newSessionFocusRequestId = null;
+          if (isCreatedFocus) {
+            this.newSessionFocusRequestId = null;
+            if (msg.request_id) delete this.pendingOwnershipByRequest[msg.request_id];
+          }
           this.focusedSid = msg.session_id;
           if (isCreatedFocus) this.engineBySession[msg.session_id] = this.newSessionEngine;
           if (isCreatedFocus) this.spaceBySession[msg.session_id] = this.newSessionSpace;
+          if (ownership) this.ownershipBySession[msg.session_id] = ownership;
           this.touchReplay(msg.session_id);
-          this.cb.onEvent(msg);
+          this.cb.onEvent(
+            msg,
+            this.acceptsOwnership(ownership, socketGeneration)
+              ? ownership : undefined,
+          );
           return;
         }
         if (msg.type === "session_rekey") {
           // Runtime re-key (tmp -> real id): migrate the cursor and, ONLY if we
           // were viewing old_key, the focus. Never a focus change by itself.
           const { old_key, session_id } = msg;
+          const ownership = this.ownershipBySession[old_key];
           if (old_key !== session_id) {
             const oldSeq = this.lastSeqBySession[old_key];
             const realSeq = this.lastSeqBySession[session_id];
@@ -935,12 +1061,20 @@ export class RelayWs {
               this.spaceBySession[session_id] = this.spaceBySession[old_key];
             }
             delete this.spaceBySession[old_key];
+            if (ownership) {
+              this.ownershipBySession[session_id] = ownership;
+              delete this.ownershipBySession[old_key];
+            }
             this.outbox.rekeySession(old_key, session_id);
             this.replayOrder = this.replayOrder.filter((sid) => sid !== old_key);
             this.touchReplay(session_id);
             if (this.focusedSid === old_key) this.focusedSid = session_id;
           }
-          this.cb.onEvent(msg);
+          this.cb.onEvent(
+            msg,
+            this.acceptsOwnership(ownership, socketGeneration)
+              ? ownership : undefined,
+          );
           return;
         }
         if (msg.type === "snapshot") {
@@ -978,7 +1112,7 @@ export class RelayWs {
         }
         this.noteSeq(msg.sid, msg.type === "replay_end"
           ? msg.to_seq : eventSeq);
-        this.cb.onEvent(msg);
+        this.cb.onEvent(msg, eventOwnership);
         if (msg.type === "replay_end" && msg.sid) {
           this.rebuildingSessions.delete(msg.sid);
         }
@@ -987,6 +1121,7 @@ export class RelayWs {
       }
     };
     ws.onclose = (ev: CloseEvent) => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       if (this.ws === ws) this.ws = null;
       this.stopHeartbeat();
       if (ev.code === 4406) {

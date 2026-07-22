@@ -32,6 +32,9 @@ interface HistoryAnchor {
   scrollTop: number;
 }
 
+export const INITIAL_RENDER_TURNS = 24;
+const RENDER_TURN_BATCH = 24;
+
 function readScrollMetrics(el: HTMLDivElement): ScrollMetrics {
   return {
     scrollHeight: el.scrollHeight,
@@ -81,8 +84,15 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   const [zoom, setZoom] = useState<string | null>(null);   // lightbox image src
   const [zoomBig, setZoomBig] = useState(false);           // fit-to-screen vs actual size
   const anchorRef = useRef<HistoryAnchor | null>(null);
+  const requestedOlderRef = useRef<{ sid: string | null; length: number } | null>(null);
   const renderedSidRef = useRef<string | null | undefined>(undefined);
   const touchYRef = useRef<number | null>(null);
+  const [renderWindow, setRenderWindow] = useState({
+    sid, limit: INITIAL_RENDER_TURNS,
+  });
+  const renderLimit = renderWindow.sid === sid
+    ? renderWindow.limit : INITIAL_RENDER_TURNS;
+  const visibleTurns = turns.slice(-renderLimit);
 
   const syncScrollState = useCallback((next: ScrollFollowSnapshot) => {
     setScrollState((previous) =>
@@ -122,14 +132,40 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     if (el) {
       anchorRef.current = {
         sid,
-        firstTurnId: turns[0]?.id ?? null,
+        firstTurnId: visibleTurns[0]?.id ?? null,
         scrollHeight: el.scrollHeight,
         scrollTop: el.scrollTop,
       };
       pauseOutputFollow();
     }
+    if (turns.length > renderLimit) {
+      setRenderWindow({
+        sid,
+        limit: Math.min(turns.length, renderLimit + RENDER_TURN_BATCH),
+      });
+      return;
+    }
+    requestedOlderRef.current = { sid, length: turns.length };
     onLoadMore?.();
   };
+
+  useLayoutEffect(() => {
+    if (renderWindow.sid !== sid) {
+      setRenderWindow({ sid, limit: INITIAL_RENDER_TURNS });
+    }
+    const requested = requestedOlderRef.current;
+    if (requested?.sid === sid && turns.length > requested.length) {
+      const added = turns.length - requested.length;
+      requestedOlderRef.current = null;
+      setRenderWindow((current) => ({
+        sid,
+        limit: Math.min(
+          turns.length,
+          (current.sid === sid ? current.limit : INITIAL_RENDER_TURNS) + added,
+        ),
+      }));
+    }
+  }, [renderWindow.sid, sid, turns.length]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -151,7 +187,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     const anchor = anchorRef.current;
     const prepended = anchor
       && anchor.sid === sid
-      && anchor.firstTurnId !== (turns[0]?.id ?? null);
+      && anchor.firstTurnId !== (visibleTurns[0]?.id ?? null);
     if (prepended) {
       el.scrollTop = anchoredScrollTop(
         anchor.scrollTop,
@@ -165,7 +201,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     }
 
     if (controller.isFollowing()) requestOutputFollow();
-  }, [requestOutputFollow, sid, syncScrollState, turns]);
+  }, [requestOutputFollow, sid, syncScrollState, turns, visibleTurns]);
 
   useLayoutEffect(() => {
     const content = threadInRef.current;
@@ -302,17 +338,21 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         onTouchStart={onTouchStart} onTouchMove={onTouchMove}
         onTouchEnd={clearTouch} onTouchCancel={clearTouch}>
         <div className="thread-in" ref={threadInRef}>
-          {hasMore && (
+          {(turns.length > visibleTurns.length || hasMore) && (
             <div className="load-more-wrap">
-              <button className="load-more-btn" onClick={doLoadMore}>加载更早的历史</button>
+              <button className="load-more-btn" onClick={doLoadMore}>{
+                turns.length > visibleTurns.length
+                  ? "显示更早的已加载消息" : "加载更早的历史"
+              }</button>
             </div>
           )}
-          {turns.map((t, ti) => {
+          {visibleTurns.map((t, ti) => {
             const activeProcess = hasActiveProcess(t.blocks);
+            const finalBlocks = finalTextBlocks(t.blocks);
             const working = !t.done || activeProcess;
             const workingLabel = t.progress
               ?? (activeProcess ? "处理中"
-                : finalTextBlocks(t.blocks).length > 0 ? "回答中" : "思考中");
+                : finalBlocks.length > 0 ? "回答中" : "思考中");
             return (
             <div className="turn" key={t.id}>
             {(t.prompt || (t.images && t.images.length) || (t.files && t.files.length)) && (
@@ -346,7 +386,18 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                 <ProcessTimeline blocks={t.blocks} done={t.done} engine={engine}
                   durationMs={t.durationMs} startTs={t.ts}
                   onOpenFile={onOpenFile} />
-                {finalTextBlocks(t.blocks).map((block) => (
+                {t.done && finalBlocks.length > 0 && (
+                  <div className="assistant-actions">
+                    <button type="button"
+                      className={"assistant-copy" + (copiedId === t.id + "-ai" ? " copied" : "")}
+                      onClick={() => copyText(t.id + "-ai", aiText(t))}
+                      aria-label="复制回复">
+                      <Icon name={copiedId === t.id + "-ai" ? "check" : "copy"} size={13} />
+                      <span>{copiedId === t.id + "-ai" ? "已复制" : "复制回复"}</span>
+                    </button>
+                  </div>
+                )}
+                {finalBlocks.map((block) => (
                   <MessageBlock key={block.message_id} text={block.text}
                     done={block.done} onOpenFile={onOpenFile} />
                 ))}
@@ -354,7 +405,6 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                   <>
                     <div className="ubub-meta ai-meta">
                       {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
-                      <button className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")} onClick={() => copyText(t.id + "-ai", aiText(t))} aria-label="复制"><Icon name="check" size={13} /></button>
                       {onFork && canForkTurn(engine, t) && (
                         <button className="ubub-act" aria-label="派生"
                           data-tooltip="从此回复派生新会话"
@@ -365,7 +415,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                         </button>
                       )}
                     </div>
-                    {ti === turns.length - 1 && !working
+                    {ti === visibleTurns.length - 1 && !working
                       && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
                   </>
                 )}

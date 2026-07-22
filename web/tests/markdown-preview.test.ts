@@ -82,6 +82,13 @@ try {
     "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
+  const codeCopyMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "请执行：\n\n```sh\necho ready\n```",
+    done: true,
+  }));
+  assert.match(codeCopyMarkup, /aria-label="复制代码"/,
+    "fenced commands need a local copy action without scrolling to turn end");
+  assert.match(codeCopyMarkup, /echo ready/);
   let state = reduce(initialState, {
     type: "open_file_loading",
     file: "README.md",
@@ -301,7 +308,7 @@ try {
     kind: "file",
   });
   state = reduce(state, { type: "event", event: {
-    v: 16,
+    v: 17,
     type: "file_preview",
     ts: 6,
     sid: "session-1",

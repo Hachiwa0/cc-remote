@@ -1909,6 +1909,7 @@ def codex_translate_history(
     *,
     start_offset: int = 0,
     end_offset: int | None = None,
+    source_continuation: str | None = None,
 ) -> tuple[list, str | None]:
     """Translate a Codex rollout .jsonl into wire events (same vocabulary as the
     live stream) + the model used. Codex analog of stream.translate_history.
@@ -1926,6 +1927,10 @@ def codex_translate_history(
     turn_visible = False
     turn_text_visible = False
     turn_final_visible = False
+    turn_has_user = False
+    turn_continuation_reason: str | None = None
+    source_continuation_available = (
+        source_continuation == "authoritative_page")
     assistant_open = False
     cur_mid: str | None = None
     cur_channel = "unknown"
@@ -2053,7 +2058,7 @@ def codex_translate_history(
         seen_tool_results.add(result.tool_use_id)
         turn_visible = True
 
-    def open_assistant_only_turn():
+    def open_assistant_only_turn(reason: str | None = None):
         """Start a visible continuation that has no user_message record.
 
         Goal/background continuations can begin with task_started after the
@@ -2062,7 +2067,12 @@ def codex_translate_history(
         """
         nonlocal turn_open, active_turn_id, active_msg_id
         nonlocal turn_visible, turn_text_visible, turn_final_visible
+        nonlocal turn_has_user, turn_continuation_reason
+        nonlocal source_continuation_available
         if turn_open:
+            if (not turn_has_user and reason is not None
+                    and turn_continuation_reason is None):
+                turn_continuation_reason = reason
             return
         turn_open = True
         active_turn_id = pending_turn_id
@@ -2070,6 +2080,12 @@ def codex_translate_history(
         turn_visible = False
         turn_text_visible = False
         turn_final_visible = False
+        turn_has_user = False
+        turn_continuation_reason = reason
+        if (turn_continuation_reason is None
+                and source_continuation_available):
+            turn_continuation_reason = "authoritative_page"
+        source_continuation_available = False
 
     def close_turn(
         subtype: str,
@@ -2081,7 +2097,7 @@ def codex_translate_history(
     ):
         nonlocal turn_open, active_turn_id, active_msg_id, pending_turn_id
         nonlocal assistant_open, cur_mid, turn_visible, turn_text_visible
-        nonlocal turn_final_visible
+        nonlocal turn_final_visible, turn_has_user, turn_continuation_reason
         if not turn_open:
             return
         close_assistant()
@@ -2110,6 +2126,8 @@ def codex_translate_history(
         turn_visible = False
         turn_text_visible = False
         turn_final_visible = False
+        turn_has_user = False
+        turn_continuation_reason = None
 
     try:
         f = open(path, "rb")
@@ -2164,9 +2182,20 @@ def codex_translate_history(
                         # No terminal record proved where the previous visible
                         # reply ended. In particular, pending_turn_id now often
                         # belongs to this NEW user turn; never attach it to the
-                        # synthetic error boundary.
+                        # synthetic boundary. Visible output is not completion
+                        # evidence: only an assistant-only continuation carrying
+                        # an authoritative compact/page reason may close cleanly.
+                        proven_continuation = bool(
+                            not turn_has_user
+                            and turn_visible
+                            and turn_continuation_reason in {
+                                "context_compacted",
+                                "authoritative_page",
+                            }
+                        )
                         close_turn(
-                            "error", 0, True,
+                            "success" if proven_continuation else "error",
+                            0, not proven_continuation,
                             authoritative_boundary=False)
                     active_turn_id = str(next_turn_id) if next_turn_id else None
                     pending_turn_id = active_turn_id
@@ -2192,6 +2221,9 @@ def codex_translate_history(
                         um.ts = ts
                     events.append(um)
                     turn_open = True
+                    turn_has_user = True
+                    turn_continuation_reason = None
+                    source_continuation_available = False
                     task_has_user = True
                 pending_images = []   # consume (per user turn)
             elif (t == "response_item"
@@ -2508,7 +2540,7 @@ def codex_translate_history(
                 ))
                 turn_visible = True
             elif t == "event_msg" and payload_type == "context_compacted":
-                open_assistant_only_turn()
+                open_assistant_only_turn("context_compacted")
                 events.append(ProcessEvent(
                     item_id=_history_id(
                         p.get("id"), "compaction", line_no, raw_ts),

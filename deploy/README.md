@@ -28,11 +28,11 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
 - `env.relay.example` / `env.wrapper.example` — environment templates for each
   side. Install the wrapper template as root:root mode 0600 at the path above.
 
-Protocol v15 is a coordinated upgrade: publish the Python package and freshly
+Protocol v17 is a coordinated upgrade: publish the Python package and freshly
 built `web/dist` as one release, then restart relay and wrapper. The strict
 protocol gate is intentional and mixed protocol versions will not communicate.
 `setup-vps.sh` rejects a missing or mismatched web build manifest. Stop the
-wrapper first; activate the v15 relay/web release; then start the v15 wrapper.
+wrapper first; activate the v17 relay/web release; then start the v17 wrapper.
 
 ## Native terminal coordination
 

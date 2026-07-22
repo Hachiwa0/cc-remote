@@ -29,6 +29,7 @@ from cc_remote.wrapper import machine as mm
 from cc_remote.wrapper.stream import (
     StreamTranslator,
     last_assistant_model,
+    transcript_internal_user_events,
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
@@ -65,6 +66,44 @@ def test_history_revision_is_boot_scoped_and_monotonic():
     assert restarted._history_revision("s1") != initial
     assert first._bump_history_revision("s1") != initial
     assert first._history_revision("s1").endswith("-1")
+
+
+def test_history_read_does_not_block_serial_commands_or_duplicate_retries():
+    """A slow transcript read must not hold query/interrupt command intake."""
+    async def go():
+        machine, _ = _mk_machine()
+        history_started = asyncio.Event()
+        release_history = asyncio.Event()
+        query_seen = asyncio.Event()
+        history_calls = 0
+
+        async def process(command):
+            nonlocal history_calls
+            if command.type == "get_history":
+                history_calls += 1
+                history_started.set()
+                await release_history.wait()
+                return
+            if command.type == "query":
+                query_seen.set()
+
+        machine._process_command = process
+        history = SimpleNamespace(
+            type="get_history", client_id="client-1", cmd_id="history-1")
+        machine._start_history_command(history)
+        await asyncio.wait_for(history_started.wait(), timeout=1)
+
+        # A reconnect retry shares the in-flight read instead of scanning the
+        # same rollout/transcript twice.
+        machine._start_history_command(history)
+        await machine._process_command_safely(SimpleNamespace(type="query"))
+        assert query_seen.is_set()
+        assert history_calls == 1
+
+        release_history.set()
+        await asyncio.gather(*machine._history_command_tasks.values())
+
+    asyncio.run(go())
 
 
 def test_external_codex_turn_is_history_activity_not_resident_state(monkeypatch):
@@ -467,6 +506,107 @@ def test_compacted_codex_tail_recovers_omitted_current_prompt(
     asyncio.run(go())
 
 
+def test_compact_continuation_split_from_terminal_is_not_an_error_turn(
+        tmp_path):
+    """A compact-continuation turn (turn_context + context_compacted + visible
+    assistant content) that never reaches its terminal record before the next
+    user_message — e.g. a history page that split the continuation from its
+    task_complete — must close as a normal truncated turn, not a synthetic
+    error turn."""
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+    source = tmp_path / "compact-dangling.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "s"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "t1"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "first"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "first answer"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "t1"}},
+        # compact continuation with visible content but NO terminal record
+        # before the next user turn (mimics a page split).
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "turn_context",
+         "payload": {"turn_id": "t2"}},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+        {"timestamp": "2026-01-01T00:00:07Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "continuation answer"}},
+        # next user turn closes the dangling continuation.
+        {"timestamp": "2026-01-01T00:00:08Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "second"}},
+        {"timestamp": "2026-01-01T00:00:09Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "second answer"}},
+        {"timestamp": "2026-01-01T00:00:10Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "t3"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    turn_ends = [e for e in events if type(e).__name__ == "TurnEnd"]
+    assert [e.turn_id for e in turn_ends] == ["t1", None, "t3"]
+    assert [e.result.subtype for e in turn_ends] == [
+        "success", "success", "success"]
+    assert [e.result.is_error for e in turn_ends] == [False, False, False]
+
+
+def test_authoritative_page_continuation_can_close_without_terminal(tmp_path):
+    """Only the history selector can authorize a page-prefix continuation."""
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+    source = tmp_path / "page-continuation.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "tail from an oversized turn"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "next"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "next answer"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "next-turn"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(
+        str(source), tool_result_max=4096,
+        source_continuation="authoritative_page",
+    )
+    turn_ends = [e for e in events if type(e).__name__ == "TurnEnd"]
+    assert [e.turn_id for e in turn_ends] == [None, "next-turn"]
+    assert [e.result.subtype for e in turn_ends] == ["success", "success"]
+
+
+def test_assistant_only_dangling_without_source_evidence_is_error(tmp_path):
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+    source = tmp_path / "unproven-assistant-only.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "turn_context",
+         "payload": {"turn_id": "background"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "partial background output"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "next"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "next answer"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "next-turn"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    turn_ends = [e for e in events if type(e).__name__ == "TurnEnd"]
+    assert [e.turn_id for e in turn_ends] == [None, "next-turn"]
+    assert [e.result.subtype for e in turn_ends] == ["error", "success"]
+    assert [e.result.is_error for e in turn_ends] == [True, False]
+
+
 def test_get_history_survives_transcript_read_failure(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("no transcript")
@@ -534,6 +674,75 @@ def test_translate_history_stamps_real_timestamps():
     assert te.ts == 1005.0        # answer-done = last (assistant) message time
     # missing timestamps must not crash (falls back to the _Base default)
     assert any(e.type == "user_msg" for e in translate_history(msgs, 10000))
+
+
+def test_task_notification_history_is_structured_only_with_raw_origin_evidence(
+        monkeypatch, tmp_path):
+    notification = """<task-notification>
+<task-id>agent-task-1</task-id>
+<tool-use-id>call-agent-1</tool-use-id>
+<status>completed</status>
+<summary>Agent \"code survey\" finished</summary>
+<result>{}</result>
+<usage><subagent_tokens>123</subagent_tokens><tool_uses>7</tool_uses><duration_ms>4500</duration_ms></usage>
+</task-notification>""".format("very large private result " * 2000)
+    path = tmp_path / "session.jsonl"
+    rows = [
+        {
+            "type": "queue-operation", "operation": "enqueue",
+            "content": notification,
+        },
+        {
+            "type": "user", "uuid": "notification-row",
+            "origin": {"kind": "task-notification"},
+            "message": {"role": "user", "content": notification},
+        },
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path", lambda _sid: str(path))
+
+    metadata = transcript_internal_user_events("session")
+    messages = [
+        SimpleNamespace(
+            uuid="human-turn", type="user",
+            message={"role": "user", "content": "research"}),
+        SimpleNamespace(
+            uuid="assistant-row", type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use", "id": "call-agent-1", "name": "Agent",
+                "input": {"description": "code survey"},
+            }]}),
+        SimpleNamespace(
+            uuid="notification-row", type="user",
+            message={"role": "user", "content": notification}),
+    ]
+    events = translate_history(
+        messages, 10_000, internal_user_events=metadata)
+
+    assert not any(
+        isinstance(event, UserMsg) and "task-notification" in event.prompt
+        for event in events)
+    process = next(
+        event for event in events
+        if event.type == "process" and event.item_id == "agent:call-agent-1")
+    assert process.kind == "agent" and process.phase == "end"
+    assert process.status == "succeeded"
+    assert process.parent_id == "call-agent-1"
+    assert process.turn_id == "human-turn"
+    assert process.title == 'Agent "code survey" finished'
+    assert process.progress == "7 次工具调用 · 4.5s"
+    assert process.output is None
+
+    # Content shape alone is not authority. A human pasting the same XML stays
+    # a visible user message when the raw transcript origin does not mark it as
+    # an internal task notification.
+    visible = translate_history([SimpleNamespace(
+        uuid="human-paste", type="user",
+        message={"role": "user", "content": notification},
+    )], 10_000, internal_user_events=metadata)
+    assert next(event for event in visible if isinstance(event, UserMsg)).prompt \
+        == notification
 
 
 def test_history_hides_cancelled_command_placeholders_without_hiding_real_text():

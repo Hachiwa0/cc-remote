@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +13,7 @@ from pydantic import ValidationError
 
 from cc_remote.protocol import (
     CollaborationMode, Error, GoalState, Model, NewSession, PinSession, StateEvent,
-    ThreadGoal, TurnEnd, UserMsg,
+    ThreadGoal, TurnBinding, TurnEnd, UserMsg,
 )
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
@@ -142,6 +143,69 @@ def test_codex_sessions_toml_loader_falls_back_on_python_310(monkeypatch):
 
     assert codex_sessions_module._load_tomllib() is fallback
     assert imports == ["tomllib", "tomli"]
+
+
+def test_codex_session_list_cold_reads_are_singleflight(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        calls = 0
+
+        async def fake_list(_limit):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return [{
+                "session_id": "catalog-session", "summary": "catalog",
+                "cwd": "/tmp", "status": "idle",
+            }]
+
+        monkeypatch.setattr(machine_module, "list_codex_sessions", fake_list)
+        await asyncio.gather(*[
+            machine._handle_list_sessions(SimpleNamespace(
+                engine="codex", space="code", client_id=client))
+            for client in ("client-a", "client-b")
+        ])
+
+        assert calls == 1
+        lists = [event for event in transport.sent if event.type == "session_list"]
+        assert len(lists) == 2
+        assert {event.to for event in lists} == {"client-a", "client-b"}
+
+    asyncio.run(run())
+
+
+def test_stale_codex_session_list_paints_before_refresh_finishes(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        machine._codex_session_list_cache = (time.monotonic() - 60, [{
+            "session_id": "stale-session", "summary": "stale",
+            "cwd": "/tmp", "status": "idle",
+        }])
+        release = asyncio.Event()
+
+        async def fake_list(_limit):
+            await release.wait()
+            return [{
+                "session_id": "fresh-session", "summary": "fresh",
+                "cwd": "/tmp", "status": "idle",
+            }]
+
+        monkeypatch.setattr(machine_module, "list_codex_sessions", fake_list)
+        task = asyncio.create_task(machine._handle_list_sessions(
+            SimpleNamespace(engine="codex", space="code", client_id="client")))
+        for _ in range(100):
+            if any(event.type == "session_list" for event in transport.sent):
+                break
+            await asyncio.sleep(0.001)
+        assert [event.sessions[0].session_id for event in transport.sent
+                if event.type == "session_list"] == ["stale-session"]
+        release.set()
+        await task
+        assert [event.sessions[0].session_id for event in transport.sent
+                if event.type == "session_list"] == [
+                    "stale-session", "fresh-session"]
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-5.6-luna"])
@@ -2212,6 +2276,50 @@ def test_managed_turn_exception_does_not_unlock_live_auto_turn():
         await machine._on_codex_turn_lifecycle(
             ctx, "completed", "auto-after-error")
         assert ctx.state == "idle"
+
+    asyncio.run(run())
+
+
+def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("binding-session", "binding-session")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-message"
+        ctx.turn_task = asyncio.current_task()
+
+        class AcceptedSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(self, _prompt, images=None):
+                return "native-turn"
+
+            async def receive_response(self):
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "native-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = AcceptedSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        binding = next(
+            event for event in transport.sent if isinstance(event, TurnBinding))
+        assert binding.sid == "binding-session"
+        assert binding.msg_id == "browser-message"
+        assert binding.turn_id == "native-turn"
+        assert [event.type for event in transport.sent].index("turn_binding") < [
+            event.type for event in transport.sent
+        ].index("turn_end")
 
     asyncio.run(run())
 

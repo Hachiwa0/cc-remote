@@ -822,7 +822,10 @@ def test_codex_history_synthetic_boundary_never_steals_next_turn_id(tmp_path):
 
     terminals = [event for event in events if isinstance(event, TurnEnd)]
     assert [event.turn_id for event in terminals] == [None, "turn-next"]
+    # Visible partial output is not completion evidence. The synthetic error
+    # boundary keeps turn_id=None so it never steals turn-next's id.
     assert [event.result.subtype for event in terminals] == ["error", "success"]
+    assert [event.result.is_error for event in terminals] == [True, False]
 
 
 def test_codex_history_goal_continuation_after_completed_turn_is_own_turn(tmp_path):

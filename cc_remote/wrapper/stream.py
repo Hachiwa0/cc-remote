@@ -44,6 +44,7 @@ _CLAUDE_MESSAGE_UUID = re.compile(
 _MAX_TRANSCRIPT_MATCHES = 1000
 _MAX_TRANSCRIPT_RECORD_CHARS = 16 * 1024 * 1024
 _MAX_TIMESTAMP_ENTRIES = 200_000
+_MAX_INTERNAL_USER_EVENTS = 10_000
 _MAX_SUBAGENT_FILES = 128
 _MAX_SUBAGENT_TOTAL_BYTES = 32 * 1024 * 1024
 _MAX_SUBAGENT_EVENTS = 50_000
@@ -1091,7 +1092,101 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
     return out
 
 
-def translate_history(messages, tool_result_max: int, timestamps: dict | None = None) -> list:
+def _notification_tag(text: str, name: str, limit: int) -> str | None:
+    start_token = f"<{name}>"
+    end_token = f"</{name}>"
+    start = text.find(start_token)
+    if start < 0:
+        return None
+    start += len(start_token)
+    end = text.find(end_token, start)
+    if end < 0:
+        return None
+    return _short_text(text[start:end].strip(), limit)
+
+
+def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
+    """Recover structured Claude-internal user rows from raw transcript proof.
+
+    ``get_session_messages`` drops ``origin`` and queue-operation records.  We
+    therefore classify a task notification only when the raw JSONL contains
+    both Claude's enqueue record and a user row whose authoritative origin is
+    ``task-notification`` with the exact same content.  XML-looking human text
+    remains ordinary conversation content.
+    """
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return {}
+    path = transcript_path(session_id)
+    if not path:
+        return {}
+    queued: set[tuple[int, str]] = set()
+    events: dict[str, ProcessEvent] = {}
+    try:
+        with open(path, encoding="utf-8") as source:
+            for line in _bounded_jsonl_lines(source):
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("type") == "queue-operation" \
+                        and row.get("operation") == "enqueue":
+                    content = row.get("content")
+                    if (isinstance(content, str)
+                            and content.lstrip().startswith("<task-notification>")):
+                        queued.add((len(content), hashlib.sha256(
+                            content.encode("utf-8", "surrogatepass")
+                        ).hexdigest()))
+                    continue
+                origin = row.get("origin")
+                message = row.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                uid = row.get("uuid")
+                if not (row.get("type") == "user"
+                        and isinstance(origin, dict)
+                        and origin.get("kind") == "task-notification"
+                        and isinstance(content, str)
+                        and isinstance(uid, str)
+                        and _SAFE_WIRE_ID.fullmatch(uid)):
+                    continue
+                fingerprint = (len(content), hashlib.sha256(
+                    content.encode("utf-8", "surrogatepass")
+                ).hexdigest())
+                if fingerprint not in queued:
+                    continue
+                task_id = _notification_tag(content, "task-id", 128)
+                tool_id = _notification_tag(content, "tool-use-id", 128)
+                if not task_id or not _SAFE_WIRE_ID.fullmatch(task_id):
+                    continue
+                if tool_id and not _SAFE_WIRE_ID.fullmatch(tool_id):
+                    tool_id = None
+                raw_status = _notification_tag(content, "status", 64)
+                summary = _notification_tag(content, "summary", 1000)
+                usage: dict[str, int] = {}
+                for tag in ("tool_uses", "total_tokens", "duration_ms"):
+                    value = _notification_tag(content, tag, 32)
+                    if value and value.isdigit():
+                        usage[tag] = int(value)
+                status = _task_status(raw_status)
+                item_id = _agent_process_id(tool_id) if tool_id else task_id
+                events[uid] = ProcessEvent(
+                    item_id=item_id,
+                    kind="agent" if tool_id else "task",
+                    phase="end",
+                    status=status,
+                    parent_id=tool_id,
+                    title=summary or ("协作代理" if tool_id else "后台任务"),
+                    progress=_task_progress(usage),
+                    duration_ms=usage.get("duration_ms"),
+                )
+                if len(events) >= _MAX_INTERNAL_USER_EVENTS:
+                    break
+    except (OSError, UnicodeError):
+        return {}
+    return events
+
+
+def translate_history(messages, tool_result_max: int, timestamps: dict | None = None,
+                      internal_user_events: dict[str, ProcessEvent] | None = None) -> list:
     """Translate a session's on-disk transcript (list[SessionMessage]) into wire
     events the client reducer renders as past turns.
 
@@ -1184,12 +1279,22 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
 
         if role == "user":
             if isinstance(content, str):
-                if _is_meta_user_text(content):
+                internal_event = (internal_user_events or {}).get(source_uid)
+                if internal_event is not None:
+                    event = internal_event.model_copy(deep=True)
+                    event.turn_id = event.turn_id or current_turn_id
+                    t = _ts(source_uid)
+                    if t is not None:
+                        event.ts = t
+                    events.append(event)
+                    turn_open = True
+                elif _is_meta_user_text(content):
                     continue
-                close_turn()
-                events.append(_um(message_uid, content))
-                turn_open = True
-                current_turn_id = message_uid
+                else:
+                    close_turn()
+                    events.append(_um(message_uid, content))
+                    turn_open = True
+                    current_turn_id = message_uid
             elif isinstance(content, list):
                 # collect any uploaded images up front so they attach to this turn's
                 # UserMsg (replay on reload — the transcript stores the base64).
@@ -1451,8 +1556,12 @@ def translate_subagent_history(session_id: str, tool_result_max: int) -> list:
                 role = msg.get("role") or row.get("type")
                 content = msg.get("content")
                 if role == "user":
+                    origin = row.get("origin")
                     visible = (isinstance(content, str) and content
                                and not _is_meta_user_text(content))
+                    if (isinstance(origin, dict)
+                            and origin.get("kind") == "task-notification"):
+                        visible = False
                     if isinstance(content, list):
                         visible = any(
                             isinstance(block, dict) and block.get("type") == "text"

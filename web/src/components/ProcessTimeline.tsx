@@ -195,7 +195,9 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
   }, [complete]);
 
   if (!items.length) return null;
-  const rows = groupTimelineRows(items);
+  // A completed timeline is collapsed. Do not allocate/group hundreds of
+  // historical rows until the user actually opens it.
+  const rows = open ? groupTimelineRows(items) : [];
   const toolCount = items.reduce((count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
   const countLabel = engine === "codex" && toolCount === items.length
     ? `${toolCount} 个工具调用`

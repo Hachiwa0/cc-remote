@@ -11,12 +11,21 @@ import asyncio
 import json
 import os
 import re
+import signal
 import shutil
+import stat
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from cc_remote.log import logger
+from cc_remote.wrapper.process_scan import (
+    _darwin_process_info,
+    process_owner_uid,
+)
 
 log = logger("cc_remote.wrapper.codex_daemon")
 
@@ -24,6 +33,8 @@ _DAEMON_ENV = "CC_REMOTE_CODEX_DAEMON"
 _DAEMON_MODES = frozenset({"auto", "off"})
 _COMMAND_TIMEOUT = 30.0
 _OUTPUT_MAX = 64 * 1024
+_PID_RECORD_MAX = 4096
+_STALE_UPDATER_EXIT_TIMEOUT = 3.0
 
 
 def codex_daemon_mode(value: Optional[str] = None) -> str:
@@ -95,6 +106,115 @@ def _json_object(data: bytes) -> Optional[dict[str, Any]]:
 
 def _text(value: Any, limit: int = 4096) -> Optional[str]:
     return value[:limit] if isinstance(value, str) and value else None
+
+
+def _managed_pid(path: Path) -> Optional[int]:
+    """Read one bounded, same-user daemon PID record without following links."""
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        return None
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+        )
+        file_stat = os.fstat(descriptor)
+        if (not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != os.getuid()
+                or file_stat.st_size > _PID_RECORD_MAX):
+            return None
+        data = os.read(descriptor, _PID_RECORD_MAX + 1)
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(data) > _PID_RECORD_MAX:
+        return None
+    payload = _json_object(data)
+    pid = payload.get("pid") if payload is not None else None
+    return pid if isinstance(pid, int) and pid > 1 else None
+
+
+def _darwin_process_state(pid: int) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "state="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value if value else None
+
+
+def _terminate_stale_darwin_daemon_updater(
+    codex_bin: str,
+    env: Mapping[str, str],
+) -> bool:
+    """SIGTERM one exact updater whose sole managed app-server is a zombie.
+
+    Current official macOS daemon builds can leave ``pid-update-loop`` alive
+    after its child becomes defunct.  Every official lifecycle command then
+    blocks on the stale parent and the control socket refuses connections.  Do
+    not generalize this into process killing: all persisted/process identities,
+    ownership, ancestry, zombie state, and argv must agree before one SIGTERM.
+    """
+    if sys.platform != "darwin":
+        return False
+    codex_home = env.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    daemon_root = Path(codex_home) / "app-server-daemon"
+    app_server_pid = _managed_pid(daemon_root / "app-server.pid")
+    updater_pid = _managed_pid(daemon_root / "app-server-updater.pid")
+    if (app_server_pid is None or updater_pid is None
+            or app_server_pid == updater_pid):
+        return False
+    updater = _darwin_process_info(updater_pid)
+    app_server = _darwin_process_info(app_server_pid)
+    if updater is None or app_server is None:
+        return False
+    updater_identity, _updater_parent, updater_tty, updater_args = updater
+    app_server_identity, app_server_parent, _server_tty, _server_args = app_server
+    expected_args = (b"app-server", b"daemon", b"pid-update-loop")
+    if (updater_tty != 0 or app_server_parent != updater_pid
+            or len(updater_args) != 4
+            or updater_args[1:] != expected_args):
+        return False
+    try:
+        updater_bin = os.path.realpath(os.fsdecode(updater_args[0]))
+    except (TypeError, ValueError):
+        return False
+    if updater_bin != os.path.realpath(codex_bin):
+        return False
+    if (process_owner_uid(updater_pid) != os.getuid()
+            or process_owner_uid(app_server_pid) != os.getuid()
+            or not (_darwin_process_state(app_server_pid) or "").startswith("Z")):
+        return False
+    # Close the PID-reuse window immediately before signalling both identities.
+    current_updater = _darwin_process_info(updater_pid)
+    current_app_server = _darwin_process_info(app_server_pid)
+    if (current_updater is None or current_updater[0] != updater_identity
+            or current_app_server is None
+            or current_app_server[0] != app_server_identity
+            or current_app_server[1] != updater_pid):
+        return False
+    try:
+        os.kill(updater_pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    deadline = time.monotonic() + _STALE_UPDATER_EXIT_TIMEOUT
+    while time.monotonic() < deadline:
+        current = _darwin_process_info(updater_pid)
+        if current is None or current[0] != updater_identity:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _release_version(value: Any) -> Optional[tuple[int, int, int]]:
@@ -347,11 +467,27 @@ class CodexDaemonManager:
 
             lifecycle = await self.version(codex_bin, env)
             if lifecycle is None:
-                started = await self.start(codex_bin, env)
-                lifecycle = (
-                    await self.version(codex_bin, env)
-                    if started is not None else None
+                await self.start(codex_bin, env)
+                lifecycle = await self.version(codex_bin, env)
+            if lifecycle is None:
+                recovered = await asyncio.to_thread(
+                    _terminate_stale_darwin_daemon_updater, codex_bin, env,
                 )
+                if recovered:
+                    log.warning(
+                        "terminated exact stale Codex daemon updater; "
+                        "starting replacement"
+                    )
+                    await self.start(codex_bin, env)
+                    lifecycle = await self.version(codex_bin, env)
+            if lifecycle is None:
+                # Non-Darwin failures, and stale states that did not satisfy
+                # every identity check above, get only the official lifecycle
+                # command.  Never signal an ambiguous process.
+                log.warning(
+                    "Codex daemon start unavailable; attempting restart")
+                if await self.restart(codex_bin, env):
+                    lifecycle = await self.version(codex_bin, env)
             if lifecycle is None:
                 log.warning("Codex daemon start unavailable; using stdio")
                 self.invalidate()

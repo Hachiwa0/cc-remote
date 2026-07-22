@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
-import { RelayWs } from "./ws";
+import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
 import { reduce, initialState, createRuntime, type Turn } from "./reducer";
 import { uuid } from "./util";
 import { Icon } from "./icons";
@@ -57,7 +57,11 @@ const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session us
 const SPACE_KEY = "cc_remote_space";
 const NOTIFY_KEY = "cc_remote_notifications";
 const MACHINE_KEY = "cc_remote_machine";
-const HISTORY_PAGE = 60;  // turns fetched per GetHistory (initial load + each "load more")
+// Paint the newest few turns first. Older history is intentionally fetched in
+// follow-up pages so one tool-heavy conversation cannot monopolize the socket,
+// reducer, and main thread before the current answer becomes usable.
+const HISTORY_INITIAL_PAGE = 4;
+const HISTORY_MORE_PAGE = 12;
 
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
@@ -117,6 +121,10 @@ export default function App() {
   const wsRef = useRef<RelayWs | null>(null);
   const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
+  const createRequestsRef = useRef<Map<string, {
+    scopeKey: string;
+    cwdSource: "default" | "inherited" | "explicit";
+  }>>(new Map());
   const pendingBtwRef = useRef<string | null>(null);
   const pendingSessionForkRef = useRef<PendingSessionFork | null>(null);
   const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
@@ -173,6 +181,7 @@ export default function App() {
     previousMachineRef.current = machineId;
     localStorage.setItem(MACHINE_KEY, machineId);
     pendingCreateRef.current = null;
+    createRequestsRef.current.clear();
     pendingBtwRef.current = null;
     activeBtwRef.current = null;
     sessionListsBySurfaceRef.current = {};
@@ -188,6 +197,8 @@ export default function App() {
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
   const focusedSid = state.focusedSid;
+  const activeScopeKey = sessionScopeKey(machineId, engine, space);
+  const currentCwd = state.cwdByScope[activeScopeKey] ?? "";
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const focusedEngine = (state.sessions.find(
     (session) => session.session_id === focusedSid)?.engine ?? engine) as "claude" | "codex";
@@ -339,7 +350,7 @@ export default function App() {
     // Keep the previous surface's transcript out of view while its accepted
     // list is restored. The focus effect below exits this temporary new page as
     // soon as the remembered (or latest valid) session is available.
-    dispatch({ type: "enter_new_chat", cwd: "~" });
+    dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
     setNewChatAutoFocus(false);
   };
 
@@ -382,8 +393,8 @@ export default function App() {
     // the cursor here anymore — cursors are seeded from the IndexedDB cache before
     // connecting, so hello asks the wrapper only for the DELTA instead of a full
     // history replay of every resident session (that flood wedged reconnect).
-    function handleSnapshot(e: Snapshot) {
-      dispatch({ type: "event", event: e });
+    function handleSnapshot(e: Snapshot, ownership?: EventOwnership) {
+      dispatch({ type: "event", event: e, ownership });
     }
 
     (async () => {
@@ -393,7 +404,7 @@ export default function App() {
       try { seeded = await import("./cache").then((m) => m.loadAllReplayState()); } catch { /* best-effort */ }
       if (cancelled) return;
       const ws = new RelayWs({
-        onEvent: (msg) => {
+        onEvent: (msg, ownership) => {
           if ((msg.type === "user_msg" || msg.type === "turn_end") && msg.sid) {
             const activityMs = Math.round(msg.ts * 1000);
             let changed = false;
@@ -423,7 +434,7 @@ export default function App() {
             // size bound. Fetch immediately when visible; a background session
             // gets the same authoritative request when it is later focused.
             if (stateRef.current.focusedSid === sid) {
-              ws.sendGetHistory(sid, undefined, HISTORY_PAGE);
+              ws.sendGetHistory(sid, undefined, HISTORY_INITIAL_PAGE);
             }
           } else if (msg.type === "artifact_invalidated") {
             const sid = msg.session_id;
@@ -462,7 +473,7 @@ export default function App() {
               return next;
             });
             if (stateRef.current.focusedSid === sid) {
-              ws.sendGetHistory(sid, undefined, HISTORY_PAGE);
+              ws.sendGetHistory(sid, undefined, HISTORY_INITIAL_PAGE);
             }
           } else if (msg.type === "history" && msg.authoritative !== false && !msg.before
               && historyInvalidationsRef.current.has(msg.session_id)) {
@@ -570,19 +581,41 @@ export default function App() {
             setForkWorktreeError(msg.message);
             return;
           }
-          if (msg.type === "session_focus" && msg.request_id
-              && msg.request_id === pendingCreateRef.current) {
+          const createResponseRequestId = (msg.type === "session_focus"
+              || msg.type === "error") ? msg.request_id : null;
+          const createRequest = createResponseRequestId
+            ? createRequestsRef.current.get(createResponseRequestId) : undefined;
+          if (createRequest && (msg.type === "session_focus"
+              || (msg.type === "error" && msg.code !== "wrapper_offline"))) {
+            createRequestsRef.current.delete(createResponseRequestId!);
+            if (createResponseRequestId !== pendingCreateRef.current) return;
             pendingCreateRef.current = null;
-            setCreateError(null);
-            dispatch({ type: "exit_new_chat" });
-          } else if (msg.type === "error" && msg.code !== "wrapper_offline" && msg.request_id
-              && msg.request_id === pendingCreateRef.current) {
-            pendingCreateRef.current = null;
-            setCreateError(msg.message);
+            const currentScopeKey = sessionScopeKey(
+              machineId, engineRef.current, spaceRef.current);
+            if (createRequest.scopeKey !== currentScopeKey) return;
+            if (msg.type === "session_focus") {
+              setCreateError(null);
+              dispatch({ type: "exit_new_chat" });
+            } else {
+              if (msg.code === "invalid_cwd"
+                  && createRequest.cwdSource === "inherited") {
+                dispatch({
+                  type: "clear_scope_cwd",
+                  scopeKey: createRequest.scopeKey,
+                });
+                dispatch({
+                  type: "set_new_chat_cwd",
+                  cwd: "~",
+                  cwdSource: "default",
+                });
+              }
+              setCreateError(msg.message);
+              return;
+            }
           }
           if (msg.type === "snapshot") {
             if (consumeDiscardedBtwSnapshot(discardedBtwSidsRef.current, msg)) return;
-            handleSnapshot(msg);
+            handleSnapshot(msg, ownership);
             return;
           }
           if (msg.type === "session_rekey") {
@@ -593,10 +626,17 @@ export default function App() {
               delete next[msg.old_key];
               return next;
             });
-            if (spaceRef.current === "work"
-                && stateRef.current.focusedSid === msg.old_key) {
-              ws.sendListSessions(engineRef.current, "work");
-              ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
+            if (stateRef.current.focusedSid === msg.old_key
+                && ownership?.engine === engineRef.current
+                && ownership.space === spaceRef.current) {
+              // The reducer has already got enough correlated metadata to paint
+              // a temp sidebar row. Rekey is the durability boundary: refresh
+              // the active surface so its title/status comes from the native
+              // catalog without making the user toggle or reload the page.
+              ws.sendListSessions(engineRef.current, spaceRef.current);
+              if (spaceRef.current === "work") {
+                ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
+              }
             }
             setGoalUiBySid((current) => {
               const prior = current[msg.old_key];
@@ -687,7 +727,7 @@ export default function App() {
               && msg.sid) {
             draining.delete(msg.sid);
           }
-          dispatch({ type: "event", event: msg });
+          dispatch({ type: "event", event: msg, ownership });
           if (msg.type === "wrapper_reconnected") {
             ws.sendListSessions(engineRef.current, spaceRef.current);
             if (spaceRef.current === "work") {
@@ -695,7 +735,7 @@ export default function App() {
             }
             ws.sendGetModels("codex");
             const currentSid = stateRef.current.focusedSid;
-            if (currentSid) ws.sendGetHistory(currentSid, undefined, HISTORY_PAGE);
+            if (currentSid) ws.sendGetHistory(currentSid, undefined, HISTORY_INITIAL_PAGE);
           }
           // refresh the context ring after each turn (local SDK query, no model tokens)
           if (msg.type === "turn_end" && msg.sid) {
@@ -736,6 +776,7 @@ export default function App() {
           setAuthReady(false);
           clearLegacyAuthMarkers(localStorage);
           pendingCreateRef.current = null;
+          createRequestsRef.current.clear();
           pendingBtwRef.current = null;
           pendingSessionForkRef.current = null;
           pendingWorktreeForkRef.current = null;
@@ -941,7 +982,7 @@ export default function App() {
   // while we were away. The `history` event reconciles over the instant cache paint.
   useEffect(() => {
     if (!focusedSid || state.connState !== "connected") return;
-    wsRef.current?.sendGetHistory(focusedSid, undefined, HISTORY_PAGE);
+    wsRef.current?.sendGetHistory(focusedSid, undefined, HISTORY_INITIAL_PAGE);
   }, [focusedSid, state.connState]);
 
   // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Shift+B => open latest turn's diff
@@ -1048,7 +1089,7 @@ export default function App() {
                             permissionMode?: CodexPermissionMode,
                             serviceTier?: CodexServiceTier): boolean => {
     if (!wsRef.current || !state.newChat) return false;
-    const { cwd, model, effort } = state.newChat;
+    const { cwd, cwdSource, model, effort } = state.newChat;
     // Null is meaningful: let the local CLI/app-server use its configured defaults.
     // Only explicit user choices cross the wire; otherwise a stale fallback catalog
     // could silently override the machine's real model or reasoning configuration.
@@ -1064,6 +1105,15 @@ export default function App() {
       space, space === "work" ? workProjectId : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
+      createRequestsRef.current.set(msg_id, {
+        scopeKey: sessionScopeKey(machineId, engine, space),
+        cwdSource,
+      });
+      while (createRequestsRef.current.size > 64) {
+        const oldest = createRequestsRef.current.keys().next().value;
+        if (!oldest) break;
+        createRequestsRef.current.delete(oldest);
+      }
       setCreateError(null);
     }
     return queued;
@@ -1253,6 +1303,7 @@ export default function App() {
       await import("./cache").then((module) => module.clearCache());
       wsRef.current?.stop();
       pendingCreateRef.current = null;
+      createRequestsRef.current.clear();
       pendingBtwRef.current = null;
       pendingSessionForkRef.current = null;
       pendingWorktreeForkRef.current = null;
@@ -1303,8 +1354,8 @@ export default function App() {
         }))}
         activeSessionId={focusedSid}
         onSelect={(id) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setWorkArtifactsOpen(false); const selected = state.sessions.find((s) => s.session_id === id); const selectedEngine = (selected?.engine as "claude" | "codex") || engine; const selectedSpace = selected?.space === "work" ? "work" : space; dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace); wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace); if (selectedSpace === "work") wsRef.current?.sendGetWorkArtifacts(selectedEngine, id); if (isMobile()) setSidebarOpen(false); }}
-        onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~" }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit" }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -1325,7 +1376,7 @@ export default function App() {
             ? "删除后将永久移除这项工作及其私有文件，确定继续吗？"
             : "删除后将永久移除这条会话历史；代码文件不会被删除，确定继续吗？";
           if (!window.confirm(warning)) return;
-          if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~" });
+          if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
           wsRef.current?.sendDeleteSession(id, engine, space);
         }}
         onForkWorktree={openForkWorktree}
@@ -1336,7 +1387,7 @@ export default function App() {
         parent={state.dirPicker?.parent ?? null}
         dirs={state.dirPicker?.dirs ?? []}
         onBrowse={(p) => wsRef.current?.sendListDir(p)}
-        onConfirm={(cwd) => { if (state.newChat) dispatch({ type: "set_new_chat_cwd", cwd }); setDirPickerOpen(false); }}
+        onConfirm={(cwd) => { if (state.newChat) dispatch({ type: "set_new_chat_cwd", cwd, cwdSource: "explicit" }); setDirPickerOpen(false); }}
         onClose={() => setDirPickerOpen(false)}
       />
       <section className={`pane ${space}-pane`}>
@@ -1422,7 +1473,7 @@ export default function App() {
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={!!rt.hasMore}
-              onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_PAGE); }}
+              onLoadMore={() => { if (focusedSid) wsRef.current?.sendGetHistory(focusedSid, rt.oldestId, HISTORY_MORE_PAGE); }}
               onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff}
               onOpenTurnDiff={openTurnDiff}
               onPreviewMarkdown={previewMarkdown}
@@ -1482,7 +1533,11 @@ export default function App() {
           onSetServiceTier={setServiceTier}
           onSetPerm={setPerm}
           onSetCollaborationMode={setCollaborationMode}
-          onClear={() => dispatch({ type: "enter_new_chat", cwd: space === "work" ? "~" : state.currentCwd })}
+          onClear={() => dispatch({
+            type: "enter_new_chat",
+            cwd: space === "work" ? "~" : (currentCwd || "~"),
+            cwdSource: space === "work" || !currentCwd ? "default" : "inherited",
+          })}
           onContext={requestContext}
           onOpenBtw={openBtw}
           onPreview={previewMarkdown}
@@ -1499,7 +1554,7 @@ export default function App() {
             setCapabilitiesOpen(true);
             setCapabilitiesLoading(true);
             wsRef.current?.sendGetEngineCapabilities(
-              focusedEngine, space, state.newChat?.cwd ?? state.currentCwd);
+              focusedEngine, space, state.newChat?.cwd ?? currentCwd);
           }}
           workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
           onOpenArtifacts={() => {
@@ -1584,7 +1639,7 @@ export default function App() {
         onRefresh={() => {
           setCapabilitiesLoading(true);
           wsRef.current?.sendGetEngineCapabilities(
-            focusedEngine, space, state.newChat?.cwd ?? state.currentCwd);
+            focusedEngine, space, state.newChat?.cwd ?? currentCwd);
         }}
         onManagePlugin={(item, action) => {
           const verb = action === "install" ? "安装" : "卸载";
@@ -1592,7 +1647,7 @@ export default function App() {
           setCapabilitiesLoading(true);
           wsRef.current?.sendManageEnginePlugin(
             focusedEngine, space, action, item.id,
-            state.newChat?.cwd ?? state.currentCwd);
+            state.newChat?.cwd ?? currentCwd);
         }}
         onManageSkill={(item: EngineCapabilityItem, action) => {
           const labels = { enable: "启用", disable: "停用", remove: "删除" } as const;
@@ -1600,26 +1655,26 @@ export default function App() {
           setCapabilitiesLoading(true);
           wsRef.current?.sendManageEngineSkill(
             focusedEngine, space, action, { skillId: item.id },
-            state.newChat?.cwd ?? state.currentCwd);
+            state.newChat?.cwd ?? currentCwd);
         }}
         onCreateSkill={(draft: SkillDraft) => {
           setCapabilitiesLoading(true);
           wsRef.current?.sendManageEngineSkill(
             focusedEngine, space, "create", draft,
-            state.newChat?.cwd ?? state.currentCwd);
+            state.newChat?.cwd ?? currentCwd);
         }}
         onRemoveHook={(item: EngineCapabilityItem) => {
           if (!window.confirm(`删除 Hook「${item.name}」？配置文件中的其他内容会原样保留。`)) return;
           setCapabilitiesLoading(true);
           wsRef.current?.sendManageEngineHook(
             focusedEngine, space, "remove", { hookId: item.id },
-            state.newChat?.cwd ?? state.currentCwd);
+            state.newChat?.cwd ?? currentCwd);
         }}
         onCreateHook={(draft: HookDraft) => {
           setCapabilitiesLoading(true);
           wsRef.current?.sendManageEngineHook(
             focusedEngine, space, "create", draft,
-            state.newChat?.cwd ?? state.currentCwd);
+            state.newChat?.cwd ?? currentCwd);
         }}
         onClose={() => setCapabilitiesOpen(false)} />
       <DeviceSheet open={deviceSheetOpen}

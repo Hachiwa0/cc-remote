@@ -163,7 +163,7 @@ assert.deepEqual(visibleAgentTimeline.map((block) => block.kind), ["process"],
   "a dedicated live agent row must replace the duplicate generic ToolUse row");
 
 const legacyWorkContext = workContextMetrics({
-  v: 16, ts: 0, type: "context_report",
+  v: 17, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, categories: [],
 });
@@ -173,7 +173,7 @@ assert.equal(legacyWorkContext.sessionTokens, 25_572,
 assert.equal(legacyWorkContext.sessionPercentage, 2.5572);
 
 const freshWorkContext = workContextMetrics({
-  v: 16, ts: 0, type: "context_report",
+  v: 17, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, session_tokens: 72, fixed_tokens: 25_500,
   session_percentage: 0.0072, categories: [],
@@ -185,7 +185,7 @@ assert.equal(freshWorkContext.sessionPercentage, 0.0072);
 assert.equal(freshWorkContext.totalPercentage, 2.5572);
 
 const derivedWorkContext = workContextMetrics({
-  v: 16, ts: 0, type: "context_report",
+  v: 17, ts: 0, type: "context_report",
   total_tokens: 11_194, max_tokens: 353_400,
   percentage: 3.1675, fixed_tokens: 11_000, categories: [],
 });
@@ -251,6 +251,10 @@ assert.ok(reconnectBannerSource.includes('busy && <span className="sp"'),
 
 const historyAppSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 const cacheSource = readFileSync(resolve(process.cwd(), "src/cache.ts"), "utf8");
+assert.match(historyAppSource, /HISTORY_INITIAL_PAGE\s*=\s*4/,
+  "the newest history page must stay small enough for an immediate first paint");
+assert.match(historyAppSource, /HISTORY_MORE_PAGE\s*=\s*12/,
+  "older history must be delivered in bounded follow-up pages");
 assert.match(historyAppSource, /history_invalidated[\s\S]*invalidateSessionCache/,
   "history invalidation must evict the matching IndexedDB row");
 assert.match(historyAppSource, /historyCacheEpochRef[\s\S]*loadSession/,
@@ -782,7 +786,7 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 16, ts: 10, ...body,
+    v: 17, ts: 10, ...body,
   } as ServerEvent);
   // Work/Code and engine switches restore the target surface's last accepted
   // list immediately. The authoritative refresh may take ~1s for Codex because
@@ -817,6 +821,116 @@ try {
     "an authoritative list must clear a session deleted by another client");
   assert.ok(staleFocused.newChat,
     "the removed transcript must not remain painted while a replacement focus is chosen");
+  const ownerA = {
+    scopeKey: "machine-a:code:claude", machineId: "machine-a",
+    engine: "claude" as const, space: "code" as const,
+    surfaceEpoch: 1, connectionGeneration: 1,
+  };
+  const ownerB = {
+    scopeKey: "machine-b:code:codex", machineId: "machine-b",
+    engine: "codex" as const, space: "code" as const,
+    surfaceEpoch: 4, connectionGeneration: 2,
+  };
+  const scopedA = reduce(initialState, { type: "event", ownership: ownerA,
+    event: event({ type: "session_focus", session_id: "a", cwd: "/work/a" }) });
+  const scopedB = reduce(scopedA, { type: "event", ownership: ownerB,
+    event: event({ type: "session_focus", session_id: "b", cwd: "/work/b" }) });
+  assert.deepEqual(scopedB.cwdByScope, {
+    [ownerA.scopeKey]: "/work/a", [ownerB.scopeKey]: "/work/b",
+  });
+  const unknownOwner = reduce(scopedB, { type: "event",
+    event: event({ type: "session_focus", session_id: "unknown", cwd: "/deleted" }) });
+  assert.deepEqual(unknownOwner.cwdByScope, scopedB.cwdByScope,
+    "an unowned focus must never update any scoped cwd");
+  const backgroundRekey = reduce(scopedB, { type: "event", ownership: ownerA,
+    event: event({
+      type: "session_rekey", old_key: "tmp-background",
+      session_id: "real-background", cwd: "/work/a/new",
+    }) });
+  assert.equal(backgroundRekey.cwdByScope[ownerA.scopeKey], "/work/a/new");
+  assert.equal(backgroundRekey.cwdByScope[ownerB.scopeKey], "/work/b",
+    "a valid background rekey updates only its own scope");
+  const clearedInherited = reduce(backgroundRekey, {
+    type: "clear_scope_cwd", scopeKey: ownerA.scopeKey,
+  });
+  assert.equal(ownerA.scopeKey in clearedInherited.cwdByScope, false);
+
+  const createdPlaceholder = reduce(initialState, {
+    type: "event", ownership: ownerB,
+    event: event({
+      type: "session_focus", session_id: "tmp-created", cwd: "/work/new",
+      request_id: "create-message",
+    }),
+  });
+  assert.deepEqual(createdPlaceholder.sessions.map((session: { session_id: string }) =>
+    session.session_id), ["tmp-created"],
+  "a correlated create focus must paint a temporary sidebar row immediately");
+  assert.equal(createdPlaceholder.sessions[0].engine, "codex");
+  assert.equal(createdPlaceholder.sessions[0].space, "code");
+  const rekeyedPlaceholder = reduce(createdPlaceholder, {
+    type: "event", ownership: ownerB,
+    event: event({
+      type: "session_rekey", old_key: "tmp-created", session_id: "real-created",
+      cwd: "/work/new",
+    }),
+  });
+  assert.deepEqual(rekeyedPlaceholder.sessions.map((session: { session_id: string }) =>
+    session.session_id), ["real-created"],
+  "rekey must atomically migrate the temporary sidebar row");
+  const authoritativeCreated = reduce(rekeyedPlaceholder, {
+    type: "event", ownership: ownerB,
+    event: event({
+      type: "session_list", engine: "codex", space: "code", sessions: [{
+        session_id: "real-created", engine: "codex", space: "code",
+        summary: "authoritative title",
+      }],
+    }),
+  });
+  assert.equal(authoritativeCreated.sessions[0].summary, "authoritative title");
+
+  const duplicateSid = "duplicate-first-message";
+  let duplicateState = reduce({
+    ...initialState, focusedSid: duplicateSid,
+    runtimes: { [duplicateSid]: createRuntime() },
+  }, {
+    type: "query_sent", sid: duplicateSid, prompt: "在？测试测试",
+    msg_id: "browser-message", ts: 1_000,
+  });
+  duplicateState = reduce(duplicateState, { type: "event", event: event({
+    type: "state", sid: duplicateSid, state: "running",
+  }) });
+  duplicateState = reduce(duplicateState, { type: "event", event: event({
+    type: "user_msg", sid: duplicateSid, msg_id: "browser-message",
+    prompt: "在？测试测试", ts: 1,
+  }) });
+  duplicateState = reduce(duplicateState, { type: "event", event: event({
+    type: "history", session_id: duplicateSid, revision: "r1",
+    generation: "g1", build_seq: 1, live_seq: 0, has_more: false,
+    in_progress: true, events: [
+      event({ type: "user_msg", sid: duplicateSid, msg_id: "native-user",
+        prompt: "在？测试测试", ts: 10 }),
+      event({ type: "assistant_msg_start", sid: duplicateSid,
+        message_id: "native-answer", channel: "final", ts: 11 }),
+      event({ type: "delta", sid: duplicateSid, message_id: "native-answer",
+        channel: "final", text: "收到", ts: 11 }),
+      event({ type: "assistant_msg_end", sid: duplicateSid,
+        message_id: "native-answer", channel: "final", ts: 11 }),
+      event({ type: "turn_end", sid: duplicateSid, turn_id: "native-turn",
+        result: { subtype: "success", duration_ms: 1, is_error: false }, ts: 11 }),
+    ],
+  }) });
+  assert.equal(duplicateState.runtimes[duplicateSid].turns.length, 2,
+    "timestamps outside the narrow legacy heuristic intentionally remain separate");
+  duplicateState = reduce(duplicateState, { type: "event", event: event({
+    type: "turn_binding", sid: duplicateSid,
+    msg_id: "browser-message", turn_id: "native-turn",
+  }) });
+  assert.equal(duplicateState.runtimes[duplicateSid].turns.length, 1,
+    "authoritative turn binding collapses history/live regardless of arrival order");
+  assert.equal(duplicateState.runtimes[duplicateSid].turns[0].id, "browser-message");
+  assert.equal(duplicateState.runtimes[duplicateSid].turns[0].forkPointId,
+    "native-turn");
+  assert.equal(duplicateState.runtimes[duplicateSid].turns[0].done, true);
   const backgroundRunning = reduce({
     ...initialState,
     sessions: [{
@@ -2154,12 +2268,25 @@ try {
 
   const { ChatView } = await reducerHarness.ssrLoadModule(
     "/src/components/ChatView.tsx");
+  const boundedInitialMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "long-session",
+    turns: Array.from({ length: 30 }, (_, index) => ({
+      id: `long-${index}`, prompt: `prompt-${index}`, done: true, blocks: [],
+    })),
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.doesNotMatch(boundedInitialMarkup, /prompt-0</,
+    "switching to a long session must not synchronously render its full DOM");
+  assert.match(boundedInitialMarkup, /prompt-29</);
+  assert.match(boundedInitialMarkup, /显示更早的已加载消息/);
   const richMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [richTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(richMarkup, /已处理 3s/);
   assert.match(richMarkup, /已经完成/);
+  assert.match(richMarkup, /aria-label="复制回复"/,
+    "a long answer needs a copy action before its body, not only at the bottom");
   assert.doesNotMatch(richMarkup, /先检查代码/);
   assert.doesNotMatch(richMarkup, /class="turn-working"/);
 
@@ -2316,12 +2443,12 @@ try {
     sid, turns: [forkableTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
   }));
-  assert.match(codexMarkup, /aria-label="复制"/);
+  assert.match(codexMarkup, /aria-label="复制回复"/);
   assert.match(codexMarkup, /aria-label="派生"/);
   assert.match(codexMarkup, /data-tooltip="从此回复派生新会话"/);
   assert.doesNotMatch(codexMarkup, /title="从此回复派生/);
   assert.ok(codexMarkup.indexOf('aria-label="派生"')
-    > codexMarkup.indexOf('aria-label="复制"'));
+    > codexMarkup.indexOf('aria-label="复制回复"'));
   const claudeMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid, turns: [forkableTurn], engine: "claude",
     onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
@@ -2919,7 +3046,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 16, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 17, ts: 1, ...frame }) });
   }
 }
 
@@ -3035,7 +3162,7 @@ const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
   assert.doesNotMatch(appSource, new RegExp(`dispatch\\(\\{ type: ["']${optimisticAction}["']`));
 }
-assert.match(appSource, /const \{ cwd, model, effort \} = state\.newChat/);
+assert.match(appSource, /const \{ cwd, cwdSource, model, effort \} = state\.newChat/);
 assert.match(appSource, /data-lock-horizontal-swipe/);
 assert.match(appSource, /surface=\{space\}/);
 assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
@@ -3163,7 +3290,7 @@ assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\
   "the mobile sheet height accounts for the virtual keyboard inset");
 
 const successfulTurn = {
-  v: 16, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
+  v: 17, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
   result: { subtype: "success", duration_ms: 1, is_error: false },
 };
 const interruptedTurn = {
@@ -3304,7 +3431,7 @@ controlSocket.onopen?.();
 const wireControlSid = "wire-control-revision";
 controlRelay.seedReplayState({}, {}, {
   [wireControlSid]: {
-    v: 16, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 17, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation", revision: 10,
   },
@@ -3322,7 +3449,7 @@ controlSocket.receive({
   revision: "wire-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 16, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 17, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 9,
   },
@@ -3336,7 +3463,7 @@ controlSocket.receive({
   revision: "wire-cross-session-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 16, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 17, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -3350,7 +3477,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation",
   control: {
-    v: 16, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 17, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -3379,7 +3506,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation-next",
   control: {
-    v: 16, ts: 2, type: "session_control", sid: wireControlSid,
+    v: 17, ts: 2, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation-next", revision: 0,
   },
@@ -3413,12 +3540,12 @@ controlRelay.seedReplayState(
   { [aliasOld]: "wire-alias-live", [aliasReal]: "wire-alias-cache" },
   {
     [aliasOld]: {
-      v: 16, ts: 3, type: "session_control", sid: aliasOld,
+      v: 17, ts: 3, type: "session_control", sid: aliasOld,
       control_mode: "remote", write_state: "writable",
       terminal_attached: false, generation: "wire-alias-live", revision: 2,
     },
     [aliasReal]: {
-      v: 16, ts: 2, type: "session_control", sid: aliasReal,
+      v: 17, ts: 2, type: "session_control", sid: aliasReal,
       control_mode: "desktop", write_state: "read_only",
       terminal_attached: true, generation: "wire-alias-cache", revision: 50,
     },
@@ -3438,5 +3565,65 @@ controlSocket.receive({
 assert.equal(controlObserved.length, afterAliasRekey,
   "rekey must not retain the stale real-id generation watermark");
 controlRelay.stop();
+
+// Cwd ownership is local transport metadata. A create response freezes the
+// surface epoch at send time; a later temp rekey cannot borrow the epoch of a
+// surface selected after the request was sent.
+const scopedObserved: Array<{ event: ServerEvent; ownership?: {
+  scopeKey: string; surfaceEpoch: number; connectionGeneration: number;
+} }> = [];
+const scopedRelay = new RelayWs({
+  onEvent: (event, ownership) => { scopedObserved.push({ event, ownership }); },
+  onConnState: () => {},
+}, "machine-scope");
+scopedRelay.start();
+const scopedSocket = FakeWebSocket.instances.at(-1);
+assert.ok(scopedSocket);
+scopedSocket.onopen?.();
+assert.equal(scopedRelay.sendNewSession(
+  "/work/a", "claude", null, null,
+  { prompt: "hi", msg_id: "create-scope-a" },
+), true);
+scopedSocket.receive({
+  type: "session_focus", session_id: "tmp-scope-a",
+  request_id: "create-scope-a", cwd: "/work/a",
+});
+const createdScoped = scopedObserved.at(-1);
+assert.equal(createdScoped?.event.type, "session_focus");
+assert.equal(createdScoped?.ownership?.scopeKey, "machine-scope:code:claude");
+assert.equal(createdScoped?.ownership?.connectionGeneration, 1);
+const originalEpoch = createdScoped?.ownership?.surfaceEpoch;
+
+scopedRelay.setSurface("codex", "code");
+scopedRelay.setSurface("claude", "code");
+scopedSocket.receive({
+  type: "session_rekey", old_key: "tmp-scope-a",
+  session_id: "real-scope-a", cwd: "/work/a",
+});
+const staleRekey = scopedObserved.at(-1);
+assert.equal(staleRekey?.event.type, "session_rekey");
+assert.equal(staleRekey?.ownership, undefined,
+  "A→B→A must not relabel an old temp rekey with the current surface epoch");
+assert.ok(originalEpoch != null);
+
+scopedSocket.receive({
+  type: "session_rekey", old_key: "unknown-temp",
+  session_id: "unknown-real", cwd: "/deleted",
+});
+assert.equal(scopedObserved.at(-1)?.ownership, undefined,
+  "an unknown temp key has no cwd ownership");
+
+const beforeReconnectFrame = scopedObserved.length;
+(scopedRelay as unknown as { connect: () => void }).connect();
+const replacementSocket = FakeWebSocket.instances.at(-1);
+assert.ok(replacementSocket && replacementSocket !== scopedSocket);
+replacementSocket.onopen?.();
+scopedSocket.receive({
+  type: "session_rekey", old_key: "real-scope-a",
+  session_id: "too-late", cwd: "/deleted/old-socket",
+});
+assert.equal(scopedObserved.length, beforeReconnectFrame,
+  "a delayed frame from an older underlying WebSocket generation is dropped");
+scopedRelay.stop();
 
 console.log("web reliability tests passed");

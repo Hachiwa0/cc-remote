@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 16
+PROTOCOL_VERSION = 17
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -218,6 +218,7 @@ ERR_CC_CRASH = "cc_crash"
 ERR_BAD_PROMPT = "bad_prompt"
 ERR_PROTOCOL = "protocol"
 ERR_INTERNAL = "internal"
+ERR_INVALID_CWD = "invalid_cwd"
 ERR_WRAPPER_OFFLINE = "wrapper_offline"
 ERR_WRAPPER_ALREADY_CONNECTED = "wrapper_already_connected"
 ERR_AUTH = "auth"
@@ -624,6 +625,18 @@ class TurnDiff(_Base):
     turn_id: Optional[WireId] = None
     diff: str = Field(max_length=2 * 1024 * 1024)
     truncated: Optional[bool] = None
+
+
+class TurnBinding(_Base):
+    """Bind one browser optimistic message id to Codex's native turn id.
+
+    Codex persists the native id in rollout history, while the browser creates
+    ``msg_id`` before ``turn/start``.  The mapping is authoritative and lets a
+    history refresh reconcile the same turn without timestamp heuristics.
+    """
+    type: Literal["turn_binding"] = "turn_binding"
+    msg_id: WireId
+    turn_id: WireId
 
 
 class TurnResult(BaseModel):
@@ -1736,7 +1749,7 @@ AnyMessage = Union[
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
-    AssistantMsgEnd, ProcessEvent, TurnPlan, TurnDiff,
+    AssistantMsgEnd, ProcessEvent, TurnPlan, TurnDiff, TurnBinding,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
 
@@ -1747,7 +1760,8 @@ DOWNSTREAM_TYPES = frozenset({
     "user_msg", "state", "model", "effort", "perm", "fast",
     "collaboration_mode", "session_control", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
-    "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_end",
+    "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_binding",
+    "turn_end",
     "error", "ask_user", "history_invalidated", "artifact_invalidated",
 })
 
@@ -1852,6 +1866,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "process": ProcessEvent,
     "turn_plan": TurnPlan,
     "turn_diff": TurnDiff,
+    "turn_binding": TurnBinding,
     "turn_end": TurnEnd,
     "error": Error,
     "wrapper_disconnected": WrapperDisconnected,

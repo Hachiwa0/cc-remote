@@ -1,7 +1,37 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { isValidElement, useEffect, useMemo, useRef, useState,
+  type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { parseLocalFileTarget } from "../file-link";
+import { Icon } from "../icons";
+
+function nodeText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join("");
+  if (isValidElement<{ children?: ReactNode }>(node)) return nodeText(node.props.children);
+  return "";
+}
+
+function CopyableCodeBlock({ children }: { children?: ReactNode }) {
+  const [copied, setCopied] = useState(false);
+  const code = nodeText(children).replace(/\n$/, "");
+  const copy = () => {
+    void navigator.clipboard?.writeText(code).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {});
+  };
+  return (
+    <div className="message-code-block">
+      <button type="button" className={"message-code-copy" + (copied ? " copied" : "")}
+        onClick={copy} aria-label="复制代码" title={copied ? "已复制" : "复制代码"}>
+        <Icon name={copied ? "check" : "copy"} size={13} />
+        <span>{copied ? "已复制" : "复制"}</span>
+      </button>
+      <pre>{children}</pre>
+    </div>
+  );
+}
 
 // Streams markdown with a ~50ms throttle: re-parsing react-markdown on every
 // token delta is wasteful, so we hold a "shown" buffer that catches up on a
@@ -34,6 +64,7 @@ export function MessageBlock({ text, done, onOpenFile }: {
   }, []);
 
   const components = useMemo<Components>(() => ({
+    pre: ({ children }) => <CopyableCodeBlock>{children}</CopyableCodeBlock>,
     a: ({ href = "", children, title }) => {
       const file = parseLocalFileTarget(href);
       if (file && onOpenFile) {

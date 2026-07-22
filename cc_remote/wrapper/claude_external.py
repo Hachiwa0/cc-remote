@@ -9,16 +9,22 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, Collection, Literal, Mapping
 
 from cc_remote.wrapper.codex_external import (
-    MAX_PROC_SCAN,
     HolderScan,
+)
+from cc_remote.wrapper.process_scan import (
+    MAX_PROC_SCAN,
     ProcessIdentity,
     _process_cmdline,
     _process_start_ticks,
     _process_stat,
+    darwin_process_snapshot,
+    process_identity,
 )
 
 
@@ -36,6 +42,7 @@ _NEUTRAL_METADATA_TYPES = frozenset({
     "permission-mode",
     "queue-operation",
 })
+_MAX_DARWIN_CLAUDE_CANDIDATES = 256
 
 
 def classify_claude_growth(
@@ -182,6 +189,166 @@ def _is_continue(args: tuple[bytes, ...]) -> bool:
     )
 
 
+def _is_descendant(
+    pid: int,
+    parent_pid: int,
+    wrapper_pid: int,
+    parent_by_pid: Mapping[int, int] | None = None,
+    proc_root: Path | None = None,
+) -> bool:
+    """Return whether pid belongs to the wrapper's complete SDK process tree."""
+    seen = {pid}
+    current = parent_pid
+    for _ in range(64):
+        if current == wrapper_pid:
+            return True
+        if current <= 1 or current in seen:
+            return False
+        seen.add(current)
+        if parent_by_pid is not None:
+            next_parent = parent_by_pid.get(current)
+        elif proc_root is not None:
+            stat = _process_stat(proc_root / str(current))
+            next_parent = stat[0] if stat is not None else None
+        else:
+            next_parent = None
+        if next_parent is None:
+            return False
+        current = next_parent
+    return False
+
+
+def _darwin_process_cwds(
+    pids: Collection[int],
+) -> tuple[dict[int, str], bool]:
+    if not pids:
+        return {}, True
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/sbin/lsof", "-n", "-P", "-w", "-a",
+                "-p", ",".join(str(pid) for pid in sorted(pids)),
+                "-d", "cwd", "-Fpn",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}, False
+    if completed.returncode not in (0, 1):
+        return {}, False
+    result: dict[int, str] = {}
+    pid: int | None = None
+    for line in completed.stdout.splitlines():
+        if not line:
+            continue
+        if line[0] == "p":
+            try:
+                pid = int(line[1:])
+            except ValueError:
+                return {}, False
+        elif line[0] == "n" and pid is not None:
+            result[pid] = os.path.realpath(line[1:])
+    return result, True
+
+
+def _darwin_claude_session_holders(
+    paths: Mapping[str, str],
+    cwds: Mapping[str, str],
+    *,
+    wrapper_pid: int,
+    continue_bindings: dict[ProcessIdentity, str],
+    continue_candidates: dict[ProcessIdentity, str],
+    continue_resolver: Callable[[str], str | None] | None,
+) -> HolderScan:
+    holders = {sid: set() for sid in paths}
+    snapshot, complete = darwin_process_snapshot()
+    if not complete:
+        return HolderScan(holders, False)
+    parent_by_pid = {info[0].pid: info[1] for info in snapshot}
+    candidates = [
+        info for info in snapshot
+        if _is_claude_cli(info[3])
+        and not _is_descendant(
+            info[0].pid, info[1], wrapper_pid, parent_by_pid=parent_by_pid)
+    ]
+    if len(candidates) > _MAX_DARWIN_CLAUDE_CANDIDATES:
+        return HolderScan(holders, False)
+
+    process_cwds, cwd_scan_complete = _darwin_process_cwds(
+        [info[0].pid for info in candidates])
+    sid_by_arg = {sid.encode(): sid for sid in paths}
+    cwd_sids: dict[str, set[str]] = {}
+    for sid in paths:
+        cwd = cwds.get(sid)
+        if cwd:
+            cwd_sids.setdefault(os.path.realpath(cwd), set()).add(sid)
+    missing_cwds = set(paths).difference(
+        sid for sids in cwd_sids.values() for sid in sids)
+    seen_continue: set[ProcessIdentity] = set()
+
+    for identity, _parent_pid, _tty_nr, args in candidates:
+        matched, has_explicit_session = _explicit_session_ids(
+            args, sid_by_arg)
+        continue_command = (
+            not matched and not has_explicit_session and _is_continue(args))
+        if continue_command:
+            seen_continue.add(identity)
+            bound_sid = continue_bindings.get(identity)
+            if bound_sid is None:
+                bound_sid = continue_candidates.get(identity)
+            if bound_sid is None:
+                process_cwd = process_cwds.get(identity.pid)
+                if process_cwd is None or not cwd_scan_complete:
+                    complete = False
+                    continue
+                if continue_resolver is None:
+                    complete = False
+                    continue
+                try:
+                    bound_sid = continue_resolver(process_cwd)
+                except Exception:
+                    complete = False
+                    continue
+                if bound_sid is None:
+                    complete = False
+                    continue
+                continue_candidates[identity] = bound_sid
+            if bound_sid in paths:
+                continue_bindings[identity] = bound_sid
+                matched.add(bound_sid)
+        elif not matched and not has_explicit_session:
+            process_cwd = process_cwds.get(identity.pid)
+            if process_cwd is None:
+                if not cwd_scan_complete or process_identity(identity.pid) == identity:
+                    complete = False
+                continue
+            cwd_matches = cwd_sids.get(process_cwd, ())
+            if len(cwd_matches) == 1:
+                matched.update(cwd_matches)
+
+        if not matched:
+            if missing_cwds and not has_explicit_session:
+                complete = False
+            continue
+        if process_identity(identity.pid) != identity:
+            continue_bindings.pop(identity, None)
+            continue_candidates.pop(identity, None)
+            complete = False
+            continue
+        for sid in matched:
+            holders[sid].add(identity)
+
+    if complete:
+        for identity in set(continue_bindings).difference(seen_continue):
+            continue_bindings.pop(identity, None)
+        for identity in set(continue_candidates).difference(seen_continue):
+            continue_candidates.pop(identity, None)
+    return HolderScan(holders, complete)
+
+
 def claude_session_holders(
     paths: Mapping[str, str],
     cwds: Mapping[str, str],
@@ -194,14 +361,26 @@ def claude_session_holders(
 ) -> HolderScan:
     """Return stable external Claude process identities for watched sessions.
 
-    Direct children of ``wrapper_pid`` are the SDK processes owned by this
-    wrapper and are excluded.  A foreign process with an explicit session flag
+    Descendants of ``wrapper_pid`` are SDK processes owned by this wrapper and
+    are excluded.  A foreign process with an explicit session flag
     owns only that session.  A foreign Claude process without a session id is
     associated by cwd only when exactly one watched session uses that cwd.
     Ambiguous same-cwd processes must not make every sibling session read-only.
     """
     holders = {sid: set() for sid in paths}
     root = Path(proc_root)
+    bindings = continue_bindings if continue_bindings is not None else {}
+    candidates = (
+        continue_candidates if continue_candidates is not None else {})
+    if sys.platform == "darwin" and proc_root == "/proc":
+        return _darwin_claude_session_holders(
+            paths,
+            cwds,
+            wrapper_pid=wrapper_pid,
+            continue_bindings=bindings,
+            continue_candidates=candidates,
+            continue_resolver=continue_resolver,
+        )
     sid_by_arg = {sid.encode(): sid for sid in paths}
     cwd_sids: dict[str, set[str]] = {}
     for sid in paths:
@@ -211,9 +390,6 @@ def claude_session_holders(
         cwd_sids.setdefault(os.path.realpath(cwd), set()).add(sid)
     missing_cwds = set(paths).difference(
         sid for sids in cwd_sids.values() for sid in sids)
-    bindings = continue_bindings if continue_bindings is not None else {}
-    candidates = (
-        continue_candidates if continue_candidates is not None else {})
     seen_continue: set[ProcessIdentity] = set()
 
     complete = True
@@ -236,7 +412,9 @@ def claude_session_holders(
                 continue
             if not _is_claude_cli(args):
                 continue
-            if parent_pid == wrapper_pid:
+            if _is_descendant(
+                    int(proc_dir.name), parent_pid, wrapper_pid,
+                    proc_root=root):
                 continue
 
             matched, has_explicit_session = _explicit_session_ids(

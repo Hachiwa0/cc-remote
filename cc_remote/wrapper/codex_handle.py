@@ -1276,7 +1276,7 @@ class CodexHandle:
         log.info("codex connected", thread_id=self.thread_id, cwd=self._cwd,
                  resume=bool(resume_id), fork=fork)
 
-    async def query(self, prompt, images=None) -> None:
+    async def query(self, prompt, images=None) -> Optional[str]:
         if self.thread_id and (
             self.proc is None or self._dead or self.proc.returncode is not None
         ):
@@ -1342,6 +1342,8 @@ class CodexHandle:
             # notification already cleared turn_active.
             if self.turn_active:
                 self.turn_id = returned_turn_id
+            return returned_turn_id
+        return None
 
     def remember_owned_turn_id(self, turn_id: str) -> None:
         self._owned_turn_ids[turn_id] = None

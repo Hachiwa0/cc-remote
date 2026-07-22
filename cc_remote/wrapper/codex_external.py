@@ -11,21 +11,25 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import sqlite3
 import subprocess
 import sys
-import time
-from dataclasses import dataclass, field
 import glob
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from cc_remote.wrapper.process_scan import (
+    MAX_PROC_SCAN,
+    ProcessIdentity,
+    _darwin_process_info,
+    _process_cmdline,
+    _process_start_ticks,
+    _process_stat,
+)
 
-MAX_PROC_SCAN = 8192
 MAX_FDS_PER_PROCESS = 8192
 MAX_PARTIAL_RECORD_BYTES = 16 * 1024 * 1024
-MAX_CMDLINE_BYTES = 64 * 1024
 _TUI_SNAPSHOT_START_SLOP_NS = 2_000_000_000
 _TUI_SNAPSHOT_READY_WINDOW_NS = 20_000_000_000
 _CODEX_TUI_CLIENT = 'app_server.client_name="codex-tui"'
@@ -47,12 +51,6 @@ _RESUME_OPTIONS_WITH_VALUE = frozenset({
     b"-p", b"--profile", b"-s", b"--sandbox", b"-C", b"--cd",
     b"--add-dir", b"-a", b"--ask-for-approval", b"-i", b"--image",
 })
-
-
-@dataclass(frozen=True, order=True)
-class ProcessIdentity:
-    pid: int
-    start_ticks: int
 
 
 @dataclass(frozen=True)
@@ -208,49 +206,6 @@ class CodexTuiLogTracker:
             if sid in result:
                 result[sid].add(identity)
         return result, True
-
-
-def _process_stat(proc_dir: Path) -> tuple[int, int, int] | None:
-    """Return (parent pid, start ticks, tty number) from /proc stat."""
-    try:
-        raw = (proc_dir / "stat").read_bytes()
-        end = raw.rfind(b") ")
-        if end < 0:
-            return None
-        fields = raw[end + 2:].split()  # starts at field 3 (state)
-        return int(fields[1]), int(fields[19]), int(fields[4])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def _process_start_ticks(proc_dir: Path) -> int | None:
-    stat = _process_stat(proc_dir)
-    return stat[1] if stat is not None else None
-
-
-def process_identity(pid: int, *, proc_root: str = "/proc",
-                     parent_pid: int | None = None) -> ProcessIdentity | None:
-    stat = _process_stat(Path(proc_root) / str(pid))
-    if stat is not None:
-        if parent_pid is not None and stat[0] != parent_pid:
-            return None
-        return ProcessIdentity(pid, stat[1])
-    if sys.platform == "darwin" and proc_root == "/proc":
-        info = _darwin_process_info(pid)
-        if info is None or (parent_pid is not None and info[1] != parent_pid):
-            return None
-        return info[0]
-    return None
-
-
-def _process_cmdline(proc_dir: Path) -> tuple[bytes, ...] | None:
-    try:
-        raw = (proc_dir / "cmdline").read_bytes()
-    except OSError:
-        return None
-    if not raw or len(raw) > MAX_CMDLINE_BYTES:
-        return ()
-    return tuple(arg for arg in raw.split(b"\0") if arg)
 
 
 def _is_passive_app_server(
@@ -427,47 +382,6 @@ def _fd_is_writable(proc_dir: Path, fd_name: str) -> bool | None:
     except (OSError, ValueError):
         return None
     return None
-
-
-_DARWIN_PS_RE = re.compile(
-    r"^\s*(\d+)\s+(\d+)\s+"
-    r"([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})"
-    r"\s+(\S+)\s+(.*)$"
-)
-
-
-def _darwin_process_info(
-    pid: int,
-) -> tuple[ProcessIdentity, int, int, tuple[bytes, ...]] | None:
-    """Return stable process metadata on macOS where procfs is unavailable."""
-    try:
-        completed = subprocess.run(
-            [
-                "/bin/ps", "-p", str(pid),
-                "-o", "pid=", "-o", "ppid=", "-o", "lstart=",
-                "-o", "tty=", "-o", "command=",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    match = _DARWIN_PS_RE.match(completed.stdout.strip())
-    if match is None or int(match.group(1)) != pid:
-        return None
-    try:
-        started = int(time.mktime(time.strptime(
-            match.group(3), "%a %b %d %H:%M:%S %Y")))
-        parsed = shlex.split(match.group(5))
-    except (ValueError, OverflowError):
-        return None
-    args = tuple(arg.encode(errors="surrogateescape") for arg in parsed)
-    tty_nr = 0 if match.group(4) in {"??", "?", "-"} else 1
-    return ProcessIdentity(pid, started), int(match.group(2)), tty_nr, args
 
 
 def _darwin_writable_rollout_holders(

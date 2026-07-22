@@ -77,7 +77,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   shared sessions stay on the daemon; only the guarded oversized-resume path may
   select a newer official private app-server for compatibility.
 - **History = on-demand bulk read; reconnect recovery = bounded ring replay**
-  (protocol v16; aligns
+  (protocol v17; aligns
   with cc-on-web / web chats): the client fetches a session's history via
   `GetHistory` → the wrapper reads the transcript (`get_session_messages` +
   `translate_history`, in a thread) and returns it as ONE `History` frame

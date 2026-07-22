@@ -513,7 +513,7 @@ def test_release_docs_and_examples_describe_one_atomic_v15_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v15" in deploy_readme
+    assert "Protocol v17" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
         assert "sudo rsync -a --delete" not in document
@@ -525,7 +525,7 @@ def test_release_docs_and_examples_describe_one_atomic_v15_layout():
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.119" in claude
-    assert "protocol v16" in claude
+    assert "protocol v17" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 

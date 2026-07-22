@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import os
+import signal
 
 import pytest
 
@@ -18,6 +20,7 @@ from cc_remote.wrapper.codex_handle import (
     CodexProxyProtocolError,
     _websocket_client_frame,
 )
+from cc_remote.wrapper.process_scan import ProcessIdentity
 
 
 class _Cfg:
@@ -149,6 +152,254 @@ def test_daemon_manager_starts_enables_versions_and_reconnects(monkeypatch):
         ]
 
     asyncio.run(run())
+
+
+def test_stale_darwin_updater_is_recovered_before_generic_restart(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
+        monkeypatch.setattr(
+            daemon_module,
+            "_terminate_stale_darwin_daemon_updater",
+            lambda _bin, _env: True,
+        )
+        manager = CodexDaemonManager("auto")
+        calls: list[tuple[str, ...]] = []
+        recovered = False
+
+        async def command(_bin, _env, *args):
+            nonlocal recovered
+            calls.append(args)
+            if args[-1] == "--help":
+                return _result(0)
+            if args[-1] == "version":
+                if not recovered:
+                    return _result(1)
+                return _result(0, {
+                    "status": "running",
+                    "managedCodexPath": "/opt/codex/current/codex",
+                    "managedCodexVersion": "0.145.0",
+                    "socketPath": "/tmp/codex.sock",
+                    "cliVersion": "0.145.0",
+                    "appServerVersion": "0.145.0",
+                })
+            if args[-1] == "start":
+                if len([call for call in calls if call[-1] == "start"]) > 1:
+                    recovered = True
+                return _result(1)
+            assert args[-1] == "enable-remote-control"
+            return _result(0, {
+                "status": "enabled",
+                "remoteControlEnabled": True,
+                "socketPath": "/tmp/codex.sock",
+            })
+
+        manager._run = command  # type: ignore[method-assign]
+        assert await manager.proxy_args("/bin/codex", {}) == [
+            "/bin/codex", "app-server", "proxy",
+            "--sock", "/tmp/codex.sock",
+        ]
+        assert manager.strict_shared_affinity is True
+        assert calls == [
+            ("app-server", "daemon", "--help"),
+            ("app-server", "proxy", "--help"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "start"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "start"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "enable-remote-control"),
+            ("app-server", "daemon", "version"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_stale_managed_daemon_uses_official_restart_when_not_exact(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
+        monkeypatch.setattr(
+            daemon_module,
+            "_terminate_stale_darwin_daemon_updater",
+            lambda _bin, _env: False,
+        )
+        manager = CodexDaemonManager("auto")
+        calls: list[tuple[str, ...]] = []
+        restarted = False
+
+        async def command(_bin, _env, *args):
+            nonlocal restarted
+            calls.append(args)
+            if args[-1] == "--help":
+                return _result(0)
+            if args[-1] == "version":
+                if not restarted:
+                    return _result(1)
+                return _result(0, {
+                    "status": "running",
+                    "managedCodexPath": "/opt/codex/current/codex",
+                    "managedCodexVersion": "0.145.0",
+                    "socketPath": "/tmp/codex.sock",
+                    "cliVersion": "0.145.0",
+                    "appServerVersion": "0.145.0",
+                })
+            if args[-1] == "start":
+                return _result(1)
+            if args[-1] == "restart":
+                restarted = True
+                return _result(0, {"status": "restarted"})
+            assert args[-1] == "enable-remote-control"
+            return _result(0, {
+                "status": "enabled",
+                "remoteControlEnabled": True,
+                "socketPath": "/tmp/codex.sock",
+            })
+
+        manager._run = command  # type: ignore[method-assign]
+        assert await manager.proxy_args("/bin/codex", {}) == [
+            "/bin/codex", "app-server", "proxy",
+            "--sock", "/tmp/codex.sock",
+        ]
+        assert calls[2:7] == [
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "start"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "restart"),
+            ("app-server", "daemon", "version"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_unrecoverable_stale_daemon_still_falls_back_to_stdio(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
+        monkeypatch.setattr(
+            daemon_module,
+            "_terminate_stale_darwin_daemon_updater",
+            lambda _bin, _env: False,
+        )
+        manager = CodexDaemonManager("auto")
+        calls: list[tuple[str, ...]] = []
+
+        async def command(_bin, _env, *args):
+            calls.append(args)
+            if args[-1] == "--help":
+                return _result(0)
+            return _result(1)
+
+        manager._run = command  # type: ignore[method-assign]
+        assert await manager.proxy_args("/bin/codex", {}) is None
+        assert manager.info is None
+        assert manager.strict_shared_affinity is False
+        assert calls == [
+            ("app-server", "daemon", "--help"),
+            ("app-server", "proxy", "--help"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "start"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "restart"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_exact_zombie_daemon_updater_gets_sigterm_only(monkeypatch, tmp_path):
+    daemon_root = tmp_path / "app-server-daemon"
+    daemon_root.mkdir()
+    (daemon_root / "app-server.pid").write_text('{"pid": 41002}')
+    (daemon_root / "app-server-updater.pid").write_text('{"pid": 41001}')
+    updater_identity = ProcessIdentity(41001, 101)
+    server_identity = ProcessIdentity(41002, 102)
+    updater = (
+        updater_identity,
+        1,
+        0,
+        (b"/opt/codex", b"app-server", b"daemon", b"pid-update-loop"),
+    )
+    server = (server_identity, 41001, 0, (b"codex-app-server",))
+    processes = {41001: updater, 41002: server}
+    signals: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        daemon_module, "_darwin_process_info", lambda pid: processes.get(pid))
+    monkeypatch.setattr(
+        daemon_module, "process_owner_uid", lambda _pid: os.getuid())
+    monkeypatch.setattr(
+        daemon_module, "_darwin_process_state", lambda _pid: "Z+")
+
+    def terminate(pid, sig):
+        signals.append((pid, sig))
+        processes.pop(pid)
+
+    monkeypatch.setattr(daemon_module.os, "kill", terminate)
+    assert daemon_module._terminate_stale_darwin_daemon_updater(
+        "/opt/codex", {"CODEX_HOME": str(tmp_path)},
+    ) is True
+    assert signals == [(41001, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("mismatch", [
+    "server_not_zombie",
+    "different_binary",
+    "different_parent",
+    "different_uid",
+    "updater_has_tty",
+    "pid_reused",
+])
+def test_ambiguous_darwin_daemon_state_never_signals(
+    monkeypatch, tmp_path, mismatch,
+):
+    daemon_root = tmp_path / "app-server-daemon"
+    daemon_root.mkdir()
+    (daemon_root / "app-server.pid").write_text('{"pid": 42002}')
+    (daemon_root / "app-server-updater.pid").write_text('{"pid": 42001}')
+    updater_identity = ProcessIdentity(42001, 201)
+    server_identity = ProcessIdentity(42002, 202)
+    updater = (
+        updater_identity,
+        1,
+        1 if mismatch == "updater_has_tty" else 0,
+        (b"/wrong/codex" if mismatch == "different_binary" else b"/opt/codex",
+         b"app-server", b"daemon", b"pid-update-loop"),
+    )
+    server = (
+        server_identity,
+        999 if mismatch == "different_parent" else 42001,
+        0,
+        (b"codex-app-server",),
+    )
+    calls = {42001: 0, 42002: 0}
+
+    def process_info(pid):
+        calls[pid] += 1
+        if mismatch == "pid_reused" and pid == 42001 and calls[pid] > 1:
+            return (ProcessIdentity(pid, 999), *updater[1:])
+        return updater if pid == 42001 else server
+
+    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
+    monkeypatch.setattr(daemon_module, "_darwin_process_info", process_info)
+    monkeypatch.setattr(
+        daemon_module,
+        "process_owner_uid",
+        lambda pid: os.getuid() + (1 if mismatch == "different_uid" else 0),
+    )
+    monkeypatch.setattr(
+        daemon_module,
+        "_darwin_process_state",
+        lambda _pid: "S" if mismatch == "server_not_zombie" else "Z",
+    )
+    monkeypatch.setattr(
+        daemon_module.os,
+        "kill",
+        lambda _pid, _sig: pytest.fail("ambiguous process was signalled"),
+    )
+    assert daemon_module._terminate_stale_darwin_daemon_updater(
+        "/opt/codex", {"CODEX_HOME": str(tmp_path)},
+    ) is False
 
 
 def test_lagging_managed_daemon_restarts_before_shared_proxy(monkeypatch):
