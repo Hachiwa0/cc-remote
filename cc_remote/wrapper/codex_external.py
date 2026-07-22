@@ -76,9 +76,10 @@ class HolderScan:
     # never opens the rollout itself. Its exact thread is resolved separately
     # from the app-server's structured connection log.
     client_proxies: dict[ProcessIdentity, int] = field(default_factory=dict)
-    # A private Codex App app-server is a second independent rollout writer,
-    # unlike cc-remote's managed shared daemon.  Letting both write the same
-    # JSONL can interleave large records and corrupt the official transcript.
+    # A private Codex App app-server is distinct from cc-remote's managed shared
+    # daemon.  Keeping this identity separate lets the machine attribute a real
+    # foreign active turn to App; merely opening/subscribing to a rollout is not
+    # ownership and must not make an idle Remote session read-only.
     private_holders: dict[str, set[ProcessIdentity]] = field(default_factory=dict)
 
 
@@ -510,6 +511,37 @@ def _darwin_writable_rollout_holders(
     if completed.returncode not in (0, 1):
         return HolderScan(result, False, passive, client_proxies, private)
 
+    # Native Codex TUIs connect through a short headless proxy which does not
+    # open the rollout. Preserve the existing log-based exact thread binding on
+    # macOS instead of regressing the terminal-attached indicator.
+    try:
+        proxies = subprocess.run(
+            ["/usr/bin/pgrep", "-f", "codex.*app-server.*proxy"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        proxies = None
+        complete = False
+    else:
+        complete = proxies.returncode in (0, 1)
+    if proxies is not None and proxies.returncode == 0:
+        for value in proxies.stdout.split():
+            try:
+                proxy_pid = int(value)
+            except ValueError:
+                complete = False
+                continue
+            info = _darwin_process_info(proxy_pid)
+            if info is None:
+                complete = False
+                continue
+            identity, _ppid, tty_nr, args = info
+            if _is_app_server_proxy(args, tty_nr):
+                client_proxies[identity] = identity.start_ticks * 1_000_000_000
+
     pid: int | None = None
     access = ""
     device: int | None = None
@@ -546,7 +578,6 @@ def _darwin_writable_rollout_holders(
                     by_inode.get((device, inode), ()))
 
     own = set(own_processes)
-    complete = True
     for holder_pid, sids in matches.items():
         before = _darwin_process_info(holder_pid)
         if before is None:

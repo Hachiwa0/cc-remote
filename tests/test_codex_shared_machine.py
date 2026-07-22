@@ -314,7 +314,7 @@ def test_shared_headless_backends_do_not_report_terminal_attached(tmp_path):
             {ctx.session_id: passive},
         )
 
-        holders, writers = machine._codex_holder_sets(
+        holders, writers, private_holders = machine._codex_holder_sets(
             watch, scan, ctx.session_id)
         await machine._poll_codex_watch(
             ctx.session_id,
@@ -322,6 +322,7 @@ def test_shared_headless_backends_do_not_report_terminal_attached(tmp_path):
             holders,
             1000.0,
             writers=writers,
+            private_holders=private_holders,
         )
 
         assert holders == set()
@@ -329,6 +330,212 @@ def test_shared_headless_backends_do_not_report_terminal_attached(tmp_path):
         assert ctx.control_mode == "codex_shared"
         assert ctx.write_state == "writable"
         assert ctx.terminal_attached is False
+
+    asyncio.run(go())
+
+
+def test_shared_private_app_holder_is_informational_while_idle(tmp_path):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[ctx.session_id] = watch
+        managed = ProcessIdentity(105, 1005)
+        private = ProcessIdentity(106, 1006)
+        scan = HolderScan(
+            {ctx.session_id: {managed, private}},
+            True,
+            {ctx.session_id: {managed, private}},
+            {},
+            {ctx.session_id: {private}},
+        )
+
+        holders, writers, private_holders = machine._codex_holder_sets(
+            watch, scan, ctx.session_id)
+        await machine._poll_codex_watch(
+            ctx.session_id,
+            watch,
+            holders,
+            1000.0,
+            writers=writers,
+            private_holders=private_holders,
+        )
+
+        assert holders == set()
+        assert writers == {managed, private}
+        assert watch["private_app_loaded"] is True
+        assert watch["desktop_active"] is False
+        assert watch["external"] is False
+        assert ctx.control_mode == "codex_shared"
+        assert ctx.write_state == "writable"
+        assert ctx.needs_reload is False
+
+        await machine._poll_codex_watch(
+            ctx.session_id,
+            watch,
+            set(),
+            1001.0,
+            writers={managed},
+            private_holders=set(),
+        )
+
+        assert watch["private_app_loaded"] is False
+        assert watch["external"] is False
+        assert ctx.control_mode == "codex_shared"
+        assert ctx.write_state == "writable"
+        assert ctx.needs_reload is False
+
+    asyncio.run(go())
+
+
+def test_stdio_private_app_holder_is_informational_while_idle(tmp_path):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _CodexSdk()
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[ctx.session_id] = watch
+        private = ProcessIdentity(107, 1007)
+
+        await machine._poll_codex_watch(
+            ctx.session_id,
+            watch,
+            set(),
+            1000.0,
+            writers={private},
+            private_holders={private},
+        )
+
+        assert watch["private_app_loaded"] is True
+        assert watch["desktop_active"] is False
+        assert watch["external"] is False
+        assert ctx.control_mode == "remote"
+        assert ctx.write_state == "writable"
+        assert ctx.control_can_takeover is False
+
+    asyncio.run(go())
+
+
+def test_private_app_idle_client_does_not_block_remote_query(
+        tmp_path, monkeypatch):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        machine.sessions[ctx.key] = ctx
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        watch = _watch(path)
+        watch.update({"external": False, "private_app_loaded": True})
+        machine._watch[ctx.session_id] = watch
+        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+
+        async def refresh_idle_app(_sid: str) -> bool:
+            return False
+
+        ran: list[tuple[str, str]] = []
+
+        async def fake_turn(session_ctx, prompt, _images=None, _files=None):
+            ran.append((session_ctx.session_id, prompt))
+            await machine._set_state(session_ctx, "idle")
+
+        monkeypatch.setattr(
+            machine, "_prime_codex_ownership", refresh_idle_app)
+        monkeypatch.setattr(machine, "_run_turn", fake_turn)
+
+        result = await machine._handle_query(Query(
+            sid="sid", prompt="remote-owned", msg_id="private-app-query"
+        ))
+
+        assert result is None
+        assert ctx.turn_task is not None
+        await ctx.turn_task
+        assert ran == [("sid", "remote-owned")]
+        assert ctx.state == "idle"
+
+    asyncio.run(go())
+
+
+def test_remote_owned_turn_mirrored_into_private_app_stays_writable(tmp_path):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        ctx.sdk.remember_owned_turn_id("remote-turn")
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[ctx.session_id] = watch
+        private = ProcessIdentity(108, 1008)
+
+        with path.open("ab") as stream:
+            stream.write(_event("task_started", "remote-turn"))
+        await machine._poll_codex_watch(
+            ctx.session_id,
+            watch,
+            set(),
+            1000.0,
+            writers={private},
+            private_holders={private},
+        )
+
+        assert watch["private_app_loaded"] is True
+        assert watch["active_external_turns"] == {}
+        assert watch["desktop_active"] is False
+        assert watch["external"] is False
+        assert ctx.control_mode == "codex_shared"
+        assert ctx.write_state == "writable"
+
+    asyncio.run(go())
+
+
+def test_private_app_foreign_active_turn_is_read_only(tmp_path):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[ctx.session_id] = watch
+        private = ProcessIdentity(109, 1009)
+
+        with path.open("ab") as stream:
+            stream.write(_event("task_started", "app-turn"))
+        await machine._poll_codex_watch(
+            ctx.session_id,
+            watch,
+            set(),
+            1000.0,
+            writers={private},
+            private_holders={private},
+        )
+
+        assert watch["active_external_turns"] == {"app-turn": 1000.0}
+        assert watch["desktop_active"] is True
+        assert watch["external"] is True
+        assert ctx.control_mode == "desktop"
+        assert ctx.write_state == "read_only"
+        assert ctx.control_can_takeover is False
 
     asyncio.run(go())
 

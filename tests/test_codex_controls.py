@@ -942,6 +942,53 @@ def test_oversized_resume_prefers_only_a_newer_official_desktop_core(
     assert choose(str(managed), "explicit-bin-thread") is None
 
 
+def test_http_resume_fallback_is_bounded_to_oversized_desktop_openai_rollout(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+
+    def write_meta(**overrides):
+        payload = {
+            "id": "huge-thread",
+            "originator": "Codex Desktop",
+            "model_provider": "openai",
+        }
+        payload.update(overrides)
+        first = json.dumps({
+            "type": "session_meta", "payload": payload,
+        }).encode() + b"\n"
+        with rollout.open("wb") as stream:
+            stream.write(first)
+            stream.truncate(
+                codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES)
+
+    monkeypatch.setattr(
+        codex_handle_module, "codex_rollout_path", lambda _sid: str(rollout))
+    requires_http = (
+        codex_handle_module._oversized_desktop_openai_resume_requires_http)
+
+    write_meta()
+    assert requires_http("huge-thread") is True
+
+    write_meta(originator="codex_cli_rs")
+    assert requires_http("huge-thread") is False
+
+    write_meta(model_provider="cubence")
+    assert requires_http("huge-thread") is False
+
+    write_meta()
+    with rollout.open("r+b") as stream:
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES - 1)
+    assert requires_http("small-thread") is False
+
+    with rollout.open("wb") as stream:
+        stream.write(b"{" + b"x" * (
+            codex_handle_module._ROLLOUT_SESSION_META_MAX_BYTES + 1))
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES)
+    assert requires_http("oversized-meta") is False
+
+
 def test_codex_binary_resolution_reprobes_after_symlink_upgrade(
         monkeypatch, tmp_path):
     old = tmp_path / "codex-0.144.1"
@@ -1182,9 +1229,13 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("work_mode", [False, True])
+@pytest.mark.parametrize("work_mode,http_only", [
+    (False, False),
+    (False, True),
+    (True, False),
+])
 def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
-        monkeypatch, work_mode):
+        monkeypatch, work_mode, http_only):
     class FakeProcess:
         pid = 424243
         returncode = None
@@ -1204,6 +1255,11 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         process = FakeProcess()
         monkeypatch.setattr(
             codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_oversized_desktop_openai_resume_requires_http",
+            lambda _sid: http_only,
+        )
         monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
@@ -1242,6 +1298,9 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
             "threadId": "resume-thread", "cwd": "/tmp",
             "excludeTurns": True,
         }
+        if http_only:
+            expected_resume["modelProvider"] = (
+                codex_handle_module._OPENAI_HTTP_RESUME_PROVIDER_ID)
         if work_mode:
             expected_resume.update({
                 "baseInstructions": WORK_BASE_INSTRUCTIONS,

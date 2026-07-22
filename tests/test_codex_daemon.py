@@ -557,6 +557,45 @@ def test_oversized_resume_newer_core_bypasses_shared_daemon(monkeypatch):
     asyncio.run(run())
 
 
+def test_oversized_desktop_openai_resume_uses_private_http_provider(
+        monkeypatch):
+    async def run():
+        manager = _Manager(["/managed/codex", "app-server", "proxy"])
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            raise RuntimeError("captured HTTP fallback")
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/managed/codex")
+        monkeypatch.setattr(
+            handle_module, "_newer_private_core_for_oversized_resume",
+            lambda _bin, _sid: None,
+        )
+        monkeypatch.setattr(
+            handle_module, "_oversized_desktop_openai_resume_requires_http",
+            lambda _sid: True,
+        )
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+
+        with pytest.raises(RuntimeError, match="captured HTTP fallback"):
+            await CodexHandle(
+                _Cfg(), daemon_mode="auto", daemon_manager=manager,
+            ).connect(resume_id="oversized-thread", cwd="/tmp")
+
+        argv = spawned[0]
+        assert argv[:3] == [
+            "/managed/codex", "app-server", "--stdio",
+        ]
+        assert any(
+            item.endswith("supports_websockets=false") for item in argv)
+        assert manager.proxy_calls == 0
+
+    asyncio.run(run())
+
+
 def test_established_shared_session_never_falls_back_to_private_stdio(
     monkeypatch,
 ):

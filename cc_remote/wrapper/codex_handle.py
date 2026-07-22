@@ -12,7 +12,10 @@ JSON-RPC surface the machine's per-turn consumer expects:
   disconnect()            -> terminate only the owned stdio/proxy subprocess
 
 Model-agnostic: whatever backend Codex is pointed at (user's cc-switch) is Codex's
-concern. We never set a model/provider here.
+concern. The sole exception is a process-local HTTP transport alias for an
+oversized Codex Desktop/OpenAI resume whose native WebSocket transport is known
+to fail before Codex can perform its own HTTPS fallback. It never mutates the
+user's config or changes third-party providers.
 """
 from __future__ import annotations
 
@@ -91,6 +94,9 @@ _LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
 # core.  Only very large rollouts opt into that private core; normal Code
 # sessions keep the shared daemon and its CLI <-> Remote live channel.
 _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES = 256 * 1024 * 1024
+_ROLLOUT_SESSION_META_MAX_BYTES = 1024 * 1024
+_OPENAI_HTTP_RESUME_PROVIDER_ID = "cc_remote_openai_http"
+_OPENAI_HTTP_RESUME_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _CODEX_DESKTOP_BIN_CANDIDATES = (
     "/Applications/ChatGPT.app/Contents/Resources/codex",
     "/Applications/Codex.app/Contents/Resources/codex",
@@ -406,6 +412,66 @@ def _newer_private_core_for_oversized_resume(
             private_version=".".join(map(str, best_version)),
         )
     return best_path
+
+
+def _oversized_desktop_openai_resume_requires_http(
+    resume_id: Optional[str],
+) -> bool:
+    """Use Codex's official Responses HTTP path for one pathological resume.
+
+    Some very large Codex Desktop rollouts contain many compact records whose
+    effective replacement history still includes embedded images.  The native
+    OpenAI Responses WebSocket can close before ``response.completed`` for
+    these requests; Codex retries the same WebSocket five times before falling
+    back to HTTPS.  That turns a valid request into minutes of apparent Remote
+    failure.
+
+    Keep the workaround deliberately narrow: only an oversized rollout whose
+    immutable first ``session_meta`` says it was created by Codex Desktop and
+    uses the built-in ``openai`` provider.  CLI/shared-daemon sessions and every
+    custom provider retain their native transport and live-channel semantics.
+    """
+    if not resume_id:
+        return False
+    rollout_path = codex_rollout_path(resume_id)
+    if not rollout_path:
+        return False
+    try:
+        if os.path.getsize(
+                rollout_path) < _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES:
+            return False
+        with open(rollout_path, "rb") as stream:
+            first_line = stream.readline(_ROLLOUT_SESSION_META_MAX_BYTES + 1)
+    except OSError:
+        return False
+    if (not first_line or len(first_line) > _ROLLOUT_SESSION_META_MAX_BYTES
+            or not first_line.endswith(b"\n")):
+        return False
+    try:
+        record = json.loads(first_line)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return False
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("model_provider") == "openai"
+        and payload.get("originator") == "Codex Desktop"
+    )
+
+
+def _append_openai_http_resume_provider(argv: list[str]) -> None:
+    """Register a private, process-local alias for official OpenAI HTTP."""
+    provider = f"model_providers.{_OPENAI_HTTP_RESUME_PROVIDER_ID}"
+    argv.extend([
+        "-c", f'{provider}.name="cc-remote OpenAI HTTP"',
+        "-c", f'{provider}.base_url={json.dumps(_OPENAI_HTTP_RESUME_BASE_URL)}',
+        "-c", f'{provider}.wire_api="responses"',
+        "-c", f"{provider}.requires_openai_auth=true",
+        "-c", f"{provider}.supports_websockets=false",
+    ])
 
 
 def _semantic_version(value: Optional[str]) -> tuple[int, ...]:
@@ -958,7 +1024,12 @@ class CodexHandle:
         # version-probes subprocesses on first call; keep it off the event loop.
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
         private_core = None
+        http_only_resume = False
         if not self.work_mode and not self._daemon_proxy_established:
+            http_only_resume = await asyncio.to_thread(
+                _oversized_desktop_openai_resume_requires_http,
+                resume_id,
+            )
             private_core = await asyncio.to_thread(
                 _newer_private_core_for_oversized_resume,
                 codex_bin,
@@ -968,6 +1039,12 @@ class CodexHandle:
                 codex_bin = private_core
         child_env = _codex_env(codex_bin)
         stdio_argv = [codex_bin, "app-server", "--stdio"]
+        if http_only_resume:
+            _append_openai_http_resume_provider(stdio_argv)
+            log.info(
+                "oversized Codex Desktop resume uses official HTTP transport",
+                thread_id=resume_id,
+            )
         if self.work_mode:
             # One app-server process belongs to one resident session, so a
             # per-process permission profile can enforce this Work cwd without
@@ -989,7 +1066,7 @@ class CodexHandle:
             ])
         proxy_argv: Optional[list[str]] = None
         strict_shared = False
-        if (private_core is None and not self.work_mode
+        if (private_core is None and not http_only_resume and not self.work_mode
                 and self.daemon_mode == "auto"):
             try:
                 proxy_argv = await self.daemon_manager.proxy_args(
@@ -1086,6 +1163,9 @@ class CodexHandle:
                     "cwd": self._cwd,
                     "approvalPolicy": self.approval_policy,
                 }
+                if http_only_resume:
+                    fork_params["modelProvider"] = (
+                        _OPENAI_HTTP_RESUME_PROVIDER_ID)
                 if self.work_mode:
                     fork_params.update({
                         "baseInstructions": WORK_BASE_INSTRUCTIONS,
@@ -1108,6 +1188,9 @@ class CodexHandle:
                 resume_params: dict[str, Any] = {
                     "threadId": resume_id, "cwd": self._cwd,
                 }
+                if http_only_resume:
+                    resume_params["modelProvider"] = (
+                        _OPENAI_HTTP_RESUME_PROVIDER_ID)
                 if self.work_mode:
                     resume_params.update({
                         "baseInstructions": WORK_BASE_INSTRUCTIONS,

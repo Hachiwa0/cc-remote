@@ -2217,6 +2217,36 @@ try {
   assert.match(codexProcessMarkup, /2 个工具调用/);
   assert.doesNotMatch(codexProcessMarkup, /class="tool-group"/,
     "a completed Codex process must not render tool details until the user opens it");
+
+  const codexHookWrappedBatchMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex", done: false,
+    blocks: [
+      { kind: "process", item_id: "hook-a", processKind: "hook",
+        phase: "end", status: "succeeded", title: "Hook · preToolUse · command",
+        done: true },
+      { kind: "tool", message_id: "tool-a-message", tool_use_id: "tool-a",
+        tool: "shell", input: { command: "pwd" }, done: true,
+        result: { content: "/tmp", is_error: false } },
+      { kind: "process", item_id: "hook-b", processKind: "hook",
+        phase: "end", status: "succeeded", title: "Hook · preToolUse · command",
+        done: true },
+      { kind: "tool", message_id: "tool-b-message", tool_use_id: "tool-b",
+        tool: "shell", input: { command: "ls" }, done: true,
+        result: { content: "file", is_error: false } },
+    ],
+  }));
+  assert.match(codexHookWrappedBatchMarkup, /2 个工具调用/);
+  assert.equal((codexHookWrappedBatchMarkup.match(/class="tool-group"/g) || []).length, 1,
+    "successful Codex hooks must not split one tool batch into many rows");
+  assert.doesNotMatch(codexHookWrappedBatchMarkup, /Hook · preToolUse/);
+
+  const codexFailedHookMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex", done: false,
+    blocks: [{ kind: "process", item_id: "hook-failed", processKind: "hook",
+      phase: "end", status: "failed", title: "Hook 执行失败", done: true }],
+  }));
+  assert.match(codexFailedHookMarkup, /Hook 执行失败/,
+    "actionable Codex hook failures must remain visible");
   const { ToolGroup } = await reducerHarness.ssrLoadModule(
     "/src/components/ToolGroup.tsx");
   const collapsedToolMarkup = renderToStaticMarkup(createElement(ToolGroup, {

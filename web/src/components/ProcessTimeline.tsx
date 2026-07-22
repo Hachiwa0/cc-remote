@@ -152,6 +152,18 @@ function groupTimelineRows(items: Block[]): TimelineRow[] {
   return rows;
 }
 
+function isCodexPresentationNoise(block: Block): boolean {
+  if (block.kind === "text" && block.channel === "thinking") return true;
+  if (block.kind !== "process") return false;
+  if (block.processKind === "reasoning") return true;
+  if (block.processKind !== "hook") return false;
+  // Successful/pending preToolUse hooks are implementation detail around each
+  // command. Rendering them between ToolBlocks splits one useful tool batch
+  // into a noisy Hook -> one tool -> Hook sequence. Keep actionable failures,
+  // but let ordinary hooks disappear so adjacent tools collapse together.
+  return !["failed", "declined", "cancelled", "interrupted"].includes(block.status);
+}
+
 export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
   engine = "claude" }: {
   blocks: Block[];
@@ -162,11 +174,11 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
   engine?: "claude" | "codex";
 }) {
   // Codex does not expose its private chain of thought in official clients.
-  // Keep actionable commentary, plans and tools, but suppress synthetic
-  // reasoning rows so consecutive tool calls collapse into one useful group.
+  // Keep actionable commentary, plans, hook failures and tools, but suppress
+  // synthetic reasoning and successful hook plumbing so consecutive tool calls
+  // collapse into one useful group.
   const items = processBlocks(blocks).filter((block) => engine !== "codex" || !(
-    (block.kind === "text" && block.channel === "thinking")
-    || (block.kind === "process" && block.processKind === "reasoning")
+    isCodexPresentationNoise(block)
   ));
   const complete = done && !hasActiveProcess(items);
   const [open, setOpen] = useState(!complete);

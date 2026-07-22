@@ -154,6 +154,7 @@ def test_headless_app_server_holder_is_classified_passive(tmp_path):
     assert scan.holders["sid"] == {
         ProcessIdentity(211, 2101), ProcessIdentity(212, 2102)}
     assert scan.passive_holders["sid"] == {ProcessIdentity(211, 2101)}
+    assert scan.private_holders["sid"] == {ProcessIdentity(211, 2101)}
 
 
 def test_headless_daemon_and_stdio_proxy_are_both_passive(tmp_path):
@@ -163,7 +164,7 @@ def test_headless_daemon_and_stdio_proxy_are_both_passive(tmp_path):
     daemon = _fake_process(
         proc_root, 213, 2103,
         cmdline=("codex", "-c", "features.code_mode_host=true",
-                 "app-server", "--listen", "unix://"),
+                 "app-server", "--remote-control", "--listen", "unix://"),
     )
     proxy = _fake_process(
         proc_root, 214, 2104,
@@ -179,6 +180,7 @@ def test_headless_daemon_and_stdio_proxy_are_both_passive(tmp_path):
     assert scan.complete is True
     assert scan.holders["sid"] == expected
     assert scan.passive_holders["sid"] == expected
+    assert scan.private_holders["sid"] == {ProcessIdentity(214, 2104)}
 
 
 def test_headless_external_proxy_is_reported_for_connection_binding(tmp_path):
@@ -1630,12 +1632,13 @@ def test_sidebar_watch_preserves_private_app_seed_without_stable_writer(
         machine._watch_session("private-app", sidebar=True)
         watch = machine._watch["private-app"]
         scan = HolderScan({"private-app": set()}, True)
-        holders, writers = machine._codex_holder_sets(
+        holders, writers, private_holders = machine._codex_holder_sets(
             watch, scan, "private-app")
         machine._push_mirrored_history = lambda sid: _record_async([], sid)
         await machine._poll_codex_watch(
             "private-app", watch, holders, 1000.0, writers=writers)
 
+        assert private_holders == set()
         assert set(watch["active_external_turns"]) == {"private-app-turn"}
         assert machine._codex_sidebar_watch_state(watch) == "running"
 

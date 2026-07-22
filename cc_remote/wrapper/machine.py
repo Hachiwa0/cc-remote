@@ -649,16 +649,17 @@ class WrapperMachine:
                 ),
                 can_takeover=False,
             )
+        if ctx.engine == "codex" and bool(
+                (watch or {}).get("desktop_active")):
+            return await self._set_session_control(
+                ctx,
+                control_mode="desktop",
+                write_state="read_only",
+                terminal_attached=True,
+                reason="Codex App 正在运行此会话；完成后 Web 会自动恢复可写",
+                can_takeover=False,
+            )
         if self._codex_shared_affinity(ctx):
-            if bool((watch or {}).get("desktop_active")):
-                return await self._set_session_control(
-                    ctx,
-                    control_mode="desktop",
-                    write_state="read_only",
-                    terminal_attached=True,
-                    reason="Codex App 正在运行此会话；完成后 Web 会自动恢复可写",
-                    can_takeover=False,
-                )
             live = self._codex_shared_live(ctx)
             return await self._set_session_control(
                 ctx,
@@ -2869,6 +2870,9 @@ class WrapperMachine:
         for holders in scan.passive_holders.values():
             holders.difference_update(initial_own)
             holders.difference_update(current_own)
+        for holders in scan.private_holders.values():
+            holders.difference_update(initial_own)
+            holders.difference_update(current_own)
         for identity in initial_own | current_own:
             scan.client_proxies.pop(identity, None)
         tui_bindings, log_complete = await asyncio.to_thread(
@@ -2884,6 +2888,7 @@ class WrapperMachine:
                 False,
                 scan.passive_holders,
                 scan.client_proxies,
+                scan.private_holders,
             )
         if not scan.complete:
             if not self._codex_probe_warned:
@@ -2979,8 +2984,10 @@ class WrapperMachine:
     @staticmethod
     def _codex_holder_sets(
         w: dict, scan, sid: str,
-    ) -> tuple[set[ProcessIdentity], set[ProcessIdentity]]:
-        """Return (interactive owners, all non-ignored external writers)."""
+    ) -> tuple[
+        set[ProcessIdentity], set[ProcessIdentity], set[ProcessIdentity]
+    ]:
+        """Return (interactive owners, writers, private app-server writers)."""
         raw = set(scan.holders.get(sid, ()))
         seeded: set[str] = w.setdefault("seeded_external_turns", set())
         if seeded and scan.complete:
@@ -3002,8 +3009,9 @@ class WrapperMachine:
             ignored.intersection_update(raw)
             ignored_interactive.intersection_update(raw)
         passive = set(scan.passive_holders.get(sid, ()))
+        private = set(scan.private_holders.get(sid, ()))
         writers = raw.difference(ignored)
-        return writers.difference(passive), writers
+        return writers.difference(passive), writers, private.intersection(writers)
 
     async def _prime_codex_ownership(self, sid: str) -> bool:
         """Atomically consume growth and refresh one owner before History/Query."""
@@ -3012,12 +3020,15 @@ class WrapperMachine:
             return False
         async with self._codex_watch_lock:
             scan = await self._probe_codex_holders({sid: w["path"]})
-            holders, writers = self._codex_holder_sets(w, scan, sid)
+            holders, writers, private_holders = self._codex_holder_sets(
+                w, scan, sid)
             if not scan.complete:
                 holders.update(w.get("holders", ()))
                 writers.update(w.get("writers", ()))
+                private_holders.update(w.get("private_holders", ()))
             await self._poll_codex_watch(
                 sid, w, holders, time.time(), writers=writers,
+                private_holders=private_holders,
                 ownership_scan_complete=scan.complete)
             return bool(w.get("external"))
 
@@ -3105,15 +3116,19 @@ class WrapperMachine:
     async def _poll_codex_watch(
         self, sid: str, w: dict, holders: set[ProcessIdentity], now: float,
         *, writers: Optional[set[ProcessIdentity]] = None,
+        private_holders: Optional[set[ProcessIdentity]] = None,
         ownership_scan_complete: bool = True,
     ) -> None:
         if writers is None:
             writers = set(holders)
+        if private_holders is None:
+            private_holders = set()
         was_external = bool(w.get("external"))
         was_sidebar_running = bool(w.get("active_external_turns"))
         was_desktop_active = bool(w.get("desktop_active"))
         w["holders"] = holders
         w["writers"] = writers
+        w["private_holders"] = private_holders
         external_growth = False
         takeover_cleared = False
         takeover_clear_message: Optional[str] = None
@@ -3297,19 +3312,25 @@ class WrapperMachine:
             takeover_cleared = True
             external_growth = True
 
-        # Shared CLI clients have a stable holder and remain collaborators. The
-        # private Codex App app-server has no shared holder; a fresh active marker
-        # is therefore the only shared-daemon case that makes Web read-only.
-        desktop_active = bool(shared_affinity and active and not holders)
+        # An open Codex App window is only a subscriber, not an owner.  Ownership
+        # begins at a foreign active turn.  Remote-owned turn ids were removed
+        # from ``active`` above, so a turn mirrored into App remains writable and
+        # attributed to Remote instead of bouncing the Web UI into read-only.
+        desktop_active = bool(
+            active and not holders and (shared_affinity or private_holders))
+        private_app_loaded = bool(private_holders)
         w["desktop_active"] = desktop_active
+        w["private_app_loaded"] = private_app_loaded
         is_external = (
-            desktop_active if shared_affinity
-            else bool(holders or active or w.get("takeover_pending"))
+            bool(desktop_active) if shared_affinity
+            else bool(
+                holders or active or w.get("takeover_pending"))
         )
         w["external"] = is_external
         if (external_growth or (is_external and not was_external)) and ctx is not None:
             ctx.needs_reload = bool(
-                not shared_affinity or desktop_active or was_desktop_active)
+                not shared_affinity
+                or desktop_active or was_desktop_active)
             if ctx.codex_checkpoint not in (None, False):
                 # Native terminal turns/rollback/compact are outside Remote's
                 # pre-image boundary. Retire the old journal immediately so its
@@ -3346,6 +3367,7 @@ class WrapperMachine:
                 session_id=sid,
                 external=is_external,
                 holders=len(holders),
+                private_holders=len(private_holders),
                 active_turns=len(active),
                 visible_user_growth=visible_user_growth,
             )
@@ -3544,12 +3566,15 @@ class WrapperMachine:
                     w = self._watch.get(sid)
                     if w is None or w.get("path") != path:
                         continue
-                    holders, writers = self._codex_holder_sets(w, scan, sid)
+                    holders, writers, private_holders = self._codex_holder_sets(
+                        w, scan, sid)
                     if not scan.complete:
                         holders.update(w.get("holders", ()))
                         writers.update(w.get("writers", ()))
+                        private_holders.update(w.get("private_holders", ()))
                     await self._poll_codex_watch(
                         sid, w, holders, now, writers=writers,
+                        private_holders=private_holders,
                         ownership_scan_complete=scan.complete)
 
         claude_paths, claude_cwds = self._claude_watch_inputs()
@@ -4002,6 +4027,17 @@ class WrapperMachine:
             error = Error(code=ERR_NOT_RUNNING, message="该会话尚无可接管的会话 ID")
             await self._emit(ctx, error)
             return error
+        existing_watch = self._watch.get(resolved_sid)
+        if (ctx.engine == "codex"
+                and bool((existing_watch or {}).get("desktop_active"))):
+            error = Error(
+                code=ERR_BUSY,
+                message=("Codex App 正在运行此会话，不能安全接管；"
+                         "请等待当前回合结束后重试"),
+            )
+            await self._sync_external_control(ctx, existing_watch)
+            await self._emit(ctx, error)
+            return error
         if self._codex_shared_affinity(ctx):
             await self._sync_external_control(
                 ctx, self._watch.get(resolved_sid))
@@ -4035,11 +4071,20 @@ class WrapperMachine:
                     )
                     await self._emit(ctx, error)
                     return error
-                holders, writers = self._codex_holder_sets(
+                holders, writers, private_holders = self._codex_holder_sets(
                     w, scan, resolved_sid)
                 await self._poll_codex_watch(
                     resolved_sid, w, holders, time.time(), writers=writers,
+                    private_holders=private_holders,
                     ownership_scan_complete=scan.complete)
+                if w.get("desktop_active"):
+                    error = Error(
+                        code=ERR_BUSY,
+                        message=("Codex App 正在运行此会话，不能安全接管；"
+                                 "请等待当前回合结束后重试"),
+                    )
+                    await self._emit(ctx, error)
+                    return error
                 if w["active_external_turns"]:
                     w["takeover_pending"] = {
                         "writers": set(writers),
@@ -4248,10 +4293,21 @@ class WrapperMachine:
             )
             if external:
                 engine_name = "Codex" if ctx.engine == "codex" else "Claude"
+                watch = self._watch.get(ctx.session_id) or {}
+                if (ctx.engine == "codex"
+                        and watch.get("desktop_active")):
+                    message = (
+                        "Codex App 正在运行此会话，本次未发送；"
+                        "请等待当前回合结束后重试"
+                    )
+                else:
+                    message = (
+                        f"该 {engine_name} 会话正在被本机终端使用，或终端状态"
+                        "暂不可确认；请退出终端或点击『接管』"
+                    )
                 error = Error(
                     code=ERR_BUSY,
-                    message=(f"该 {engine_name} 会话正在被本机终端使用，或终端状态"
-                             "暂不可确认；请退出终端或点击『接管』"),
+                    message=message,
                     msg_id=getattr(cmd, "msg_id", None),
                 )
                 await self._emit(ctx, error)
