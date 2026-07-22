@@ -11,6 +11,7 @@ import math
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -44,6 +45,48 @@ def _bool(key: str, default: bool = False) -> bool:
     if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def device_config_path() -> Path:
+    return Path(_env(
+        "CC_REMOTE_DEVICE_CONFIG",
+        str(Path.home() / ".cc-remote" / "device.json"),
+    )).expanduser()
+
+
+def _load_device_config() -> dict[str, str]:
+    path = device_config_path()
+    if not path.exists():
+        return {}
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise ValueError(
+            f"device credential file must not be accessible by group/others: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"invalid device credential file: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid device credential file: {path}")
+    allowed = {"relay_url", "wrapper_token", "machine_id", "label"}
+    return {
+        key: value for key, value in payload.items()
+        if key in allowed and isinstance(value, str)
+    }
+
+
+def _wrapper_value(env_key: str, file_key: str, default: str) -> str:
+    explicit = os.environ.get(env_key)
+    if explicit is not None and explicit.strip():
+        return explicit
+    return _load_device_config().get(file_key, default)
+
+
+def _default_device_db_path() -> str:
+    push_path = _env("PUSH_DB_PATH", "").strip()
+    if push_path:
+        return str(Path(push_path).expanduser().parent / "relay-devices.sqlite3")
+    return str(Path.home() / ".cc-remote" / "relay-devices.sqlite3")
 
 
 @dataclass
@@ -104,20 +147,34 @@ class RelayConfig:
     )
     push_db_path: str = field(default_factory=lambda: _env(
         "PUSH_DB_PATH", str(Path.home() / ".cc-remote" / "relay-push.sqlite3")))
+    # Persistent enrollment metadata and hashed per-device credentials. This
+    # database never contains conversations, artifacts, or plaintext tokens.
+    device_db_path: str = field(default_factory=lambda: _env(
+        "DEVICE_DB_PATH", _default_device_db_path()))
+    device_pairing_ttl_seconds: int = field(
+        default_factory=lambda: _int("DEVICE_PAIRING_TTL_SECONDS", 600))
 
 
 @dataclass
 class WrapperConfig:
-    relay_url: str = field(default_factory=lambda: _env("RELAY_URL", "ws://127.0.0.1:8765/ws"))
+    relay_url: str = field(default_factory=lambda: _wrapper_value(
+        "RELAY_URL", "relay_url", "ws://127.0.0.1:8765/ws"))
     # Token the wrapper presents to the relay at WS upgrade (must match the
     # relay's WRAPPER_TOKEN). Same env name as the relay for convenience.
-    wrapper_token: str = field(default_factory=lambda: _env("WRAPPER_TOKEN", "change-me-wrapper"))
+    wrapper_token: str = field(default_factory=lambda: _wrapper_value(
+        "WRAPPER_TOKEN", "wrapper_token", "change-me-wrapper"))
     # Stable relay routing key. Multiple wrapper hosts may share one relay when
     # each uses a distinct id; "default" preserves the single-machine setup.
-    machine_id: str = field(default_factory=lambda: _env("CC_REMOTE_MACHINE_ID", "default").strip() or "default")
+    machine_id: str = field(default_factory=lambda: _wrapper_value(
+        "CC_REMOTE_MACHINE_ID", "machine_id", "default").strip() or "default")
     # Optional explicit Claude Code executable. Blank preserves the existing
     # SDK/PATH discovery behavior.
     claude_bin: str = field(default_factory=lambda: _env("CLAUDE_BIN", "").strip())
+    # Optional proxy inherited only by Codex subprocesses launched by this
+    # wrapper.  It deliberately does not mutate the wrapper process or the
+    # user's shell/CLI environment.
+    codex_proxy: str = field(
+        default_factory=lambda: _env("CC_REMOTE_CODEX_PROXY", "").strip())
     # Optional local PTY broker used only by the explicit `claude-remote`
     # experiment. It is intentionally disabled in the supported product path:
     # direct native Claude owners are mirrored read-only and explicitly taken
@@ -135,6 +192,10 @@ class WrapperConfig:
     tool_result_max: int = field(default_factory=lambda: _int("TOOL_RESULT_MAX", 65536))
     history_source_max_bytes: int = field(
         default_factory=lambda: _int("HISTORY_SOURCE_MAX_BYTES", 64 * 1024 * 1024)
+    )
+    codex_history_window_max_bytes: int = field(
+        default_factory=lambda: _int(
+            "CODEX_HISTORY_WINDOW_MAX_BYTES", 32 * 1024 * 1024)
     )
     # Bound relay-facing queues and inbound frames. The frame cap must be large
     # enough for an encoded attachment command, but remains finite so one
@@ -327,6 +388,13 @@ def validate_relay_config(cfg: RelayConfig) -> None:
     if (not cfg.push_db_path or "\x00" in cfg.push_db_path
             or len(cfg.push_db_path.encode("utf-8", errors="surrogatepass")) > 4096):
         errors.append("PUSH_DB_PATH must be a non-empty path of at most 4096 UTF-8 bytes")
+    if (not cfg.device_db_path or "\x00" in cfg.device_db_path
+            or len(cfg.device_db_path.encode(
+                "utf-8", errors="surrogatepass")) > 4096):
+        errors.append(
+            "DEVICE_DB_PATH must be a non-empty path of at most 4096 UTF-8 bytes")
+    if not (60 <= cfg.device_pairing_ttl_seconds <= 3600):
+        errors.append("DEVICE_PAIRING_TTL_SECONDS must be between 60 and 3600")
 
     origin = cfg.public_origin.strip()
     try:
@@ -416,6 +484,20 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
     elif (cfg.claude_bin
           and not os.path.isabs(os.path.expanduser(cfg.claude_bin))):
         errors.append("CLAUDE_BIN must be an absolute path")
+    if cfg.codex_proxy:
+        proxy = urlsplit(cfg.codex_proxy)
+        if (
+            proxy.scheme not in {"http", "https", "socks5", "socks5h"}
+            or not proxy.netloc
+            or proxy.username is not None
+            or proxy.password is not None
+            or proxy.query
+            or proxy.fragment
+            or proxy.path not in {"", "/"}
+        ):
+            errors.append(
+                "CC_REMOTE_CODEX_PROXY must be an http(s) or socks5 URL "
+                "without credentials, path, query, or fragment")
     if cfg.experimental_claude_broker:
         if (not cfg.claude_broker_socket
                 or "\x00" in cfg.claude_broker_socket
@@ -457,6 +539,9 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
             "TOOL_RESULT_MAX is too large for WS_MAX_SIZE_BYTES after UTF-8 encoding")
     if not (1024 * 1024 <= cfg.history_source_max_bytes <= 1024 * 1024 * 1024):
         errors.append("HISTORY_SOURCE_MAX_BYTES must be between 1048576 and 1073741824")
+    if not (1024 * 1024 <= cfg.codex_history_window_max_bytes <= 256 * 1024 * 1024):
+        errors.append(
+            "CODEX_HISTORY_WINDOW_MAX_BYTES must be between 1048576 and 268435456")
     if not (0 < cfg.drain_timeout <= 300):
         errors.append("DRAIN_TIMEOUT must be greater than 0 and at most 300")
     if (cfg.codex_turn_idle_warn_seconds != 0

@@ -9,7 +9,10 @@ import pytest
 
 from cc_remote.wrapper import codex_daemon as daemon_module
 from cc_remote.wrapper import codex_handle as handle_module
-from cc_remote.wrapper.codex_daemon import CodexDaemonManager
+from cc_remote.wrapper.codex_daemon import (
+    CodexDaemonManager,
+    CodexDaemonUpgradeRequired,
+)
 from cc_remote.wrapper.codex_handle import (
     CodexHandle,
     CodexProxyProtocolError,
@@ -128,11 +131,12 @@ def test_daemon_manager_starts_enables_versions_and_reconnects(monkeypatch):
             ("app-server", "proxy", "--help"),
             ("app-server", "daemon", "version"),
             ("app-server", "daemon", "start"),
+            ("app-server", "daemon", "version"),
             ("app-server", "daemon", "enable-remote-control"),
             ("app-server", "daemon", "version"),
         ]
         assert await manager.proxy_args("/bin/codex", {}) == argv
-        assert len(calls) == 6
+        assert len(calls) == 7
 
         # Unexpected proxy EOF invalidates only liveness.  Help capability stays
         # cached while reconnect performs version -> enable -> version again.
@@ -143,6 +147,95 @@ def test_daemon_manager_starts_enables_versions_and_reconnects(monkeypatch):
             ("app-server", "daemon", "enable-remote-control"),
             ("app-server", "daemon", "version"),
         ]
+
+    asyncio.run(run())
+
+
+def test_lagging_managed_daemon_restarts_before_shared_proxy(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v2",))
+        manager = CodexDaemonManager("auto")
+        calls: list[tuple[str, ...]] = []
+        restarted = False
+
+        async def command(_bin, _env, *args):
+            nonlocal restarted
+            calls.append(args)
+            if args[-1] == "--help":
+                return _result(0)
+            if args[-1] == "version":
+                version = "0.145.0" if restarted else "0.144.6"
+                return _result(0, {
+                    "status": "running",
+                    "managedCodexPath": "/opt/codex/current/codex",
+                    "managedCodexVersion": version,
+                    "socketPath": "/tmp/codex.sock",
+                    "cliVersion": "0.145.0-alpha.18",
+                    "appServerVersion": version,
+                })
+            if args[-1] == "restart":
+                restarted = True
+                return _result(0, {"status": "restarted"})
+            assert args[-1] == "enable-remote-control"
+            return _result(0, {
+                "status": "enabled",
+                "remoteControlEnabled": True,
+                "socketPath": "/tmp/codex.sock",
+            })
+
+        manager._run = command  # type: ignore[method-assign]
+        assert await manager.proxy_args("/bin/codex", {}) == [
+            "/bin/codex", "app-server", "proxy",
+            "--sock", "/tmp/codex.sock",
+        ]
+        assert manager.strict_shared_affinity is True
+        assert calls == [
+            ("app-server", "daemon", "--help"),
+            ("app-server", "proxy", "--help"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "enable-remote-control"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "restart"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "enable-remote-control"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_lagging_managed_daemon_restart_failure_never_uses_stdio(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v2",))
+        manager = CodexDaemonManager("auto")
+
+        async def command(_bin, _env, *args):
+            if args[-1] == "--help":
+                return _result(0)
+            if args[-1] == "version":
+                return _result(0, {
+                    "status": "running",
+                    "managedCodexPath": "/opt/codex/current/codex",
+                    "managedCodexVersion": "0.144.6",
+                    "socketPath": "/tmp/codex.sock",
+                    "cliVersion": "0.145.0-alpha.18",
+                    "appServerVersion": "0.144.6",
+                })
+            if args[-1] == "enable-remote-control":
+                return _result(0, {
+                    "status": "enabled",
+                    "remoteControlEnabled": True,
+                    "socketPath": "/tmp/codex.sock",
+                })
+            assert args[-1] == "restart"
+            return _result(1)
+
+        manager._run = command  # type: ignore[method-assign]
+        with pytest.raises(CodexDaemonUpgradeRequired, match="could not"):
+            await manager.proxy_args("/bin/codex", {})
+        assert manager.info is None
+        assert manager.strict_shared_affinity is False
 
     asyncio.run(run())
 
@@ -374,8 +467,9 @@ def test_proxy_rejects_masked_server_and_oversized_frames():
 class _Manager:
     mode = "auto"
 
-    def __init__(self, argv=None):
+    def __init__(self, argv=None, *, strict_shared=False):
         self.argv = argv
+        self.strict_shared_affinity = strict_shared
         self.proxy_calls = 0
         self.invalidations = 0
 
@@ -429,6 +523,38 @@ def test_code_daemon_unavailable_falls_back_and_work_never_probes(monkeypatch):
 
     asyncio.run(run(False))
     asyncio.run(run(True))
+
+
+def test_oversized_resume_newer_core_bypasses_shared_daemon(monkeypatch):
+    async def run():
+        manager = _Manager(["/managed/codex", "app-server", "proxy"])
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            raise RuntimeError("captured private core")
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/managed/codex")
+        monkeypatch.setattr(
+            handle_module, "_newer_private_core_for_oversized_resume",
+            lambda _bin, _sid: "/Applications/Codex.app/Resources/codex",
+        )
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+
+        with pytest.raises(RuntimeError, match="captured private core"):
+            await CodexHandle(
+                _Cfg(), daemon_mode="auto", daemon_manager=manager,
+            ).connect(resume_id="oversized-thread", cwd="/tmp")
+
+        assert spawned[0][:3] == [
+            "/Applications/Codex.app/Resources/codex",
+            "app-server", "--stdio",
+        ]
+        assert manager.proxy_calls == 0
+
+    asyncio.run(run())
 
 
 def test_established_shared_session_never_falls_back_to_private_stdio(
@@ -509,6 +635,62 @@ def test_proxy_handshake_failure_falls_back_to_stdio(monkeypatch):
         assert handle.using_daemon_proxy is False
         assert manager.invalidations == 1
         await handle.disconnect()
+
+    asyncio.run(run())
+
+
+def test_verified_shared_proxy_failure_never_falls_back_to_stdio(monkeypatch):
+    async def run():
+        nonce = b"0123456789abcdef"
+        monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
+        manager = _Manager(
+            ["/usr/bin/codex", "app-server", "proxy"],
+            strict_shared=True,
+        )
+        process = _Process(
+            _Reader(_handshake_response(nonce, accept="wrong")), 50004)
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            return process
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+
+        with pytest.raises(CodexProxyProtocolError):
+            await CodexHandle(_Cfg(), daemon_manager=manager).connect(cwd="/tmp")
+
+        assert spawned == [["/usr/bin/codex", "app-server", "proxy"]]
+        assert manager.invalidations == 1
+
+    asyncio.run(run())
+
+
+def test_daemon_upgrade_error_is_not_converted_to_stdio(monkeypatch):
+    async def run():
+        class _UpgradeManager(_Manager):
+            async def proxy_args(self, _bin, _env):
+                raise CodexDaemonUpgradeRequired("upgrade required")
+
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            raise AssertionError("private stdio must not be started")
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+
+        with pytest.raises(CodexDaemonUpgradeRequired, match="upgrade required"):
+            await CodexHandle(
+                _Cfg(), daemon_manager=_UpgradeManager()).connect(cwd="/tmp")
+        assert spawned == []
 
     asyncio.run(run())
 

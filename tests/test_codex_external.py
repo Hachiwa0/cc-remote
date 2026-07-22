@@ -7,7 +7,7 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
-from cc_remote.protocol import History, Query, Takeover
+from cc_remote.protocol import History, Query, SessionActivity, Takeover
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_external import (
     CodexTuiLogTracker, HolderScan, ProcessIdentity, parse_turn_markers,
@@ -521,6 +521,20 @@ def test_turn_marker_parser_preserves_partial_and_skips_malformed():
         ("task_started", "external-1"),
         ("task_complete", "external-1"),
     )
+
+
+def test_turn_marker_parser_reports_visible_user_message_without_turn_id():
+    visible = (json.dumps({
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "CLI prompt"},
+    }) + "\n").encode()
+    envelope = (json.dumps({
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "<environment_context>"},
+    }) + "\n").encode()
+
+    assert parse_turn_markers(visible).has_visible_user_message is True
+    assert parse_turn_markers(envelope).has_visible_user_message is False
 
 
 def test_codex_own_delayed_flush_does_not_mirror_or_lock(tmp_path):
@@ -1600,6 +1614,64 @@ def test_cold_codex_watcher_seeds_unfinished_external_turn(tmp_path, monkeypatch
     watch = machine._watch["cold-active"]
     assert set(watch["active_external_turns"]) == {"still-running"}
     assert watch["external"] is True
+
+
+def test_sidebar_watch_preserves_private_app_seed_without_stable_writer(
+        tmp_path, monkeypatch):
+    async def go():
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(_event("task_started", "private-app-turn"))
+        machine, _ = _mk_machine()
+        monkeypatch.setattr(
+            machine_module, "codex_rollout_path",
+            lambda sid: str(path) if sid == "private-app" else None)
+        monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
+
+        machine._watch_session("private-app", sidebar=True)
+        watch = machine._watch["private-app"]
+        scan = HolderScan({"private-app": set()}, True)
+        holders, writers = machine._codex_holder_sets(
+            watch, scan, "private-app")
+        machine._push_mirrored_history = lambda sid: _record_async([], sid)
+        await machine._poll_codex_watch(
+            "private-app", watch, holders, 1000.0, writers=writers)
+
+        assert set(watch["active_external_turns"]) == {"private-app-turn"}
+        assert machine._codex_sidebar_watch_state(watch) == "running"
+
+    asyncio.run(go())
+
+
+def test_sidebar_watch_emits_running_and_idle_lifecycle(tmp_path, monkeypatch):
+    async def go():
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        monkeypatch.setattr(
+            machine_module, "codex_rollout_path",
+            lambda sid: str(path) if sid == "private-app" else None)
+        monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
+        machine._watch_session("private-app", sidebar=True)
+        watch = machine._watch["private-app"]
+        machine._push_mirrored_history = lambda sid: _record_async([], sid)
+
+        with path.open("ab") as stream:
+            stream.write(_event("task_started", "private-app-turn"))
+        await machine._poll_codex_watch(
+            "private-app", watch, set(), 1000.0, writers=set())
+        with path.open("ab") as stream:
+            stream.write(_event("task_complete", "private-app-turn"))
+        await machine._poll_codex_watch(
+            "private-app", watch, set(), 1001.0, writers=set())
+
+        activity = [message for message in transport.sent
+                    if isinstance(message, SessionActivity)]
+        assert [(message.session_id, message.state) for message in activity] == [
+            ("private-app", "running"),
+            ("private-app", "idle"),
+        ]
+
+    asyncio.run(go())
 
 
 def test_cold_orphan_seed_unlocks_on_first_complete_empty_holder_scan(

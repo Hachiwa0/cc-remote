@@ -224,6 +224,7 @@ export interface NewSession extends Base {
   files?: QueryFile[] | null;
 }
 export interface SessionList extends Base { type: "session_list"; engine: Engine; space?: Space; sessions: SessionInfo[] }
+export interface SessionActivity extends Base { type: "session_activity"; engine: Engine; session_id: string; state: State }
 export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null; request_id?: string | null }
 // NON-focusing re-key: a temp-keyed new session captured its real cc id. Rename
 // the runtime old_key -> session_id + migrate the cursor; focus only follows if
@@ -418,6 +419,8 @@ export interface ContextReport extends Base {
   total_tokens: number;
   max_tokens: number;
   percentage: number;
+  /** False when the engine has not emitted an authoritative tokenUsage yet. */
+  available?: boolean | null;
   /** Work-only conversation growth after the fresh-session startup baseline. */
   session_tokens?: number | null;
   /** Work-only startup zero point; raw total_tokens remains authoritative. */
@@ -432,7 +435,7 @@ export interface ContextReport extends Base {
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
-  | SessionList | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
+  | SessionList | SessionActivity | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | TurnPlan | TurnDiff

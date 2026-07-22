@@ -56,6 +56,10 @@ def test_context_breakdown_is_emitted_only_when_work_has_a_baseline():
     )
     assert not ({"session_tokens", "fixed_tokens", "session_percentage"}
                 & json.loads(serialize(code)).keys())
+    assert "available" not in json.loads(serialize(code))
+
+    unavailable = code.model_copy(update={"available": False})
+    assert json.loads(serialize(unavailable))["available"] is False
 
     work = code.model_copy(update={
         "session_tokens": 10,
@@ -154,10 +158,24 @@ def test_machine_splits_context_only_for_work(tmp_path: Path):
             engine="codex",
             space="code",
         )
+        unknown = SessionContext(
+            session_id="unknown-code-session",
+            sdk=_ContextSdk({
+                "used_tokens": None,
+                "context_window": 256_000,
+                "raw": {},
+            }),
+            buffer=RingBuffer(100, 100_000),
+            cwd="/tmp",
+            key="unknown-code-session",
+            engine="codex",
+            space="code",
+        )
         machine.sessions = {
             "work-session": work,
             "migrated-work-session": migrated,
             "code-session": code,
+            "unknown-code-session": unknown,
         }
 
         await machine._handle_get_context(SimpleNamespace(sid="work-session"))
@@ -189,5 +207,16 @@ def test_machine_splits_context_only_for_work(tmp_path: Path):
         assert code_report.session_tokens is None
         assert code_report.fixed_tokens is None
         assert code_report.session_percentage is None
+
+        # A lightweight Codex resume has no tokenUsage until a model turn emits
+        # it.  The wrapper must preserve that unknown state rather than forge
+        # the 0 / context-window reading that used to appear as 0%.
+        await machine._handle_get_context(SimpleNamespace(
+            sid="unknown-code-session"))
+        unknown_report = transport.sent[-1]
+        assert unknown_report.available is False
+        assert unknown_report.total_tokens == 0
+        assert unknown_report.max_tokens == 256_000
+        assert unknown_report.percentage == 0
 
     asyncio.run(run())

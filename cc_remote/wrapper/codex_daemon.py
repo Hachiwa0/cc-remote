@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -42,6 +43,11 @@ def codex_daemon_mode(value: Optional[str] = None) -> str:
 @dataclass(frozen=True)
 class CodexDaemonInfo:
     socket_path: Optional[str]
+    verified_remote_control: bool = False
+
+
+class CodexDaemonUpgradeRequired(RuntimeError):
+    """The managed shared daemon could not be aligned with the selected CLI."""
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,39 @@ def _text(value: Any, limit: int = 4096) -> Optional[str]:
     return value[:limit] if isinstance(value, str) and value else None
 
 
+def _release_version(value: Any) -> Optional[tuple[int, int, int]]:
+    if not isinstance(value, str):
+        return None
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value.strip())
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def _managed_daemon_lags_cli(lifecycle: dict[str, Any]) -> bool:
+    """Whether the wrapper-owned daemon is older than the selected CLI.
+
+    A private Codex App app-server can also be discoverable through ``version``.
+    Callers must therefore use this only after ``enable-remote-control`` has
+    confirmed official daemon ownership.  Do not depend on ``backend``: the
+    current macOS daemon reports ``pid`` while the Linux daemon omits it.
+    """
+    if lifecycle.get("status") != "running":
+        return False
+    if not all((
+        _text(lifecycle.get("managedCodexPath")),
+        _text(lifecycle.get("managedCodexVersion"), 128),
+    )):
+        return False
+    cli_version = _release_version(lifecycle.get("cliVersion"))
+    app_server_version = _release_version(lifecycle.get("appServerVersion"))
+    return bool(
+        cli_version is not None
+        and app_server_version is not None
+        and app_server_version < cli_version
+    )
+
+
 def _daemon_info(
     lifecycle: dict[str, Any], remote_control: dict[str, Any],
 ) -> Optional[CodexDaemonInfo]:
@@ -102,7 +141,10 @@ def _daemon_info(
     # remotely writable shared daemon.
     if not remote_enabled:
         return None
-    return CodexDaemonInfo(socket_path=socket_path)
+    return CodexDaemonInfo(
+        socket_path=socket_path,
+        verified_remote_control=True,
+    )
 
 
 def _existing_proxy_candidate(
@@ -189,6 +231,14 @@ class CodexDaemonManager:
     def info(self) -> Optional[CodexDaemonInfo]:
         return self._ready
 
+    @property
+    def strict_shared_affinity(self) -> bool:
+        """Whether a verified managed daemon must not degrade to stdio."""
+        return bool(
+            self._ready is not None
+            and self._ready.verified_remote_control
+        )
+
     def invalidate(self) -> None:
         """Forget liveness after unexpected proxy EOF; keep help capability."""
         self._ready_identity = None
@@ -235,6 +285,41 @@ class CodexDaemonManager:
             codex_bin, env, "app-server", "daemon", "start")
         return _json_object(result.stdout) if result.returncode == 0 else None
 
+    async def restart(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> bool:
+        result = await self._run(
+            codex_bin, env, "app-server", "daemon", "restart")
+        return result.returncode == 0
+
+    async def _align_managed_daemon(
+        self,
+        codex_bin: str,
+        env: Mapping[str, str],
+        lifecycle: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not _managed_daemon_lags_cli(lifecycle):
+            return lifecycle
+        log.info(
+            "restarting lagging managed Codex daemon",
+            cli_version=_text(lifecycle.get("cliVersion"), 128),
+            app_server_version=_text(
+                lifecycle.get("appServerVersion"), 128),
+        )
+        if not await self.restart(codex_bin, env):
+            self.invalidate()
+            raise CodexDaemonUpgradeRequired(
+                "Codex shared daemon is older than the selected CLI and "
+                "could not be restarted"
+            )
+        verified = await self.version(codex_bin, env)
+        if verified is None or _managed_daemon_lags_cli(verified):
+            self.invalidate()
+            raise CodexDaemonUpgradeRequired(
+                "Codex shared daemon did not upgrade to the selected CLI"
+            )
+        return verified
+
     async def enable_remote_control(
         self, codex_bin: str, env: Mapping[str, str],
     ) -> Optional[dict[str, Any]]:
@@ -262,12 +347,15 @@ class CodexDaemonManager:
 
             lifecycle = await self.version(codex_bin, env)
             if lifecycle is None:
-                lifecycle = await self.start(codex_bin, env)
+                started = await self.start(codex_bin, env)
+                lifecycle = (
+                    await self.version(codex_bin, env)
+                    if started is not None else None
+                )
             if lifecycle is None:
                 log.warning("Codex daemon start unavailable; using stdio")
                 self.invalidate()
                 return None
-
             remote = await self.enable_remote_control(codex_bin, env)
             if remote is None:
                 existing = _existing_proxy_candidate(lifecycle)
@@ -285,13 +373,27 @@ class CodexDaemonManager:
                 self._ready = existing
                 return existing
 
-            # Enabling can restart a managed daemon.  Re-probe after that restart
-            # so proxy clients never race a stale socket generation.
+            # Only a successful enable proves that this is the official managed
+            # daemon rather than a discoverable private Codex App process.  From
+            # this point it is safe to align an older daemon generation.
             verified = await self.version(codex_bin, env)
             if verified is None:
                 log.warning("Codex daemon version probe failed; using stdio")
                 self.invalidate()
                 return None
+            before_alignment = verified
+            verified = await self._align_managed_daemon(
+                codex_bin, env, before_alignment)
+            if verified is not before_alignment:
+                # A race upgraded the daemon after enable.  Re-enable remote
+                # control on the replacement generation before advertising it.
+                remote = await self.enable_remote_control(codex_bin, env)
+                if remote is None:
+                    self.invalidate()
+                    raise CodexDaemonUpgradeRequired(
+                        "Codex shared daemon restarted but remote control "
+                        "could not be re-enabled"
+                    )
             info = _daemon_info(verified, remote)
             if info is None:
                 log.warning(

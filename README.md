@@ -351,6 +351,31 @@ journalctl -u cc-remote-wrapper -f     # 期望：connected to relay / wrapper r
 
 回 VPS 再看 `curl https://your-domain.com/healthz` → 应 `wrapper_connected:true`。
 
+#### 用设备中心配对 Mac / Linux（推荐）
+
+登录网页，点顶部的设备图标，选择“允许添加设备”。页面会生成一个只使用一次、
+默认 10 分钟过期的配对码和命令。在新机器的 cc-remote 仓库中执行：
+
+```bash
+python -m cc_remote.device pair https://your-domain.com XXXXX-XXXXX-XXXXX-XXXXX \
+  --name "MacBook Pro"
+python -m cc_remote.wrapper
+```
+
+交互运行时，凭据会以 `0600` 保存到 `~/.cc-remote/device.json`。Linux systemd
+部署建议直接写入 root-only EnvironmentFile，再重启服务：
+
+```bash
+sudo .venv/bin/python -m cc_remote.device pair \
+  https://your-domain.com XXXXX-XXXXX-XXXXX-XXXXX \
+  --name nono --env-file /etc/cc-remote/device.env
+sudo systemctl restart cc-remote-wrapper
+```
+
+Relay 只保存设备凭据的哈希；配对成功后明文凭据不会再次显示。设备中心可查看
+在线/离线状态、切换机器、重命名或单独撤销设备。旧的 `WRAPPER_TOKEN` /
+`WRAPPER_TOKENS_JSON` 手工配置方式仍保持兼容。
+
 ### 6）手机验证
 
 手机浏览器（任意网络）开 `https://your-domain.com/` → 用 `LOGIN_PASSWORD` 登录 → 发消息，应看到流式回复 + 可打断 + 多端同步。
@@ -381,6 +406,8 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `SESSION_REGISTRY_CAP` | `1024` | 进程内可撤销浏览器会话注册表的硬上限。 |
 | `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` / `PUSH_VAPID_SUBJECT` | 空 | 可选真实 Web Push；三项必须同时配置。私钥建议填写 relay 用户可读的 PEM 绝对路径。通知只含完成/失败状态，不含对话内容。 |
 | `PUSH_DB_PATH` | `~/.cc-remote/relay-push.sqlite3` | 持久化、按用户和机器隔离的浏览器 Push 订阅库。 |
+| `DEVICE_DB_PATH` | `~/.cc-remote/relay-devices.sqlite3` | 持久设备注册、显示名、最近在线时间和凭据哈希；不保存会话或 Artifact。 |
+| `DEVICE_PAIRING_TTL_SECONDS` | `600` | 一次性配对码有效秒数，允许 60–3600。 |
 | `PUBLIC_ORIGIN` | 空 | 浏览器允许连接 WS 的精确来源，如 `https://remote.example.com`；**必须设**，非 loopback 必须 HTTPS。 |
 | `WRAPPER_TOKEN` | 占位值 | 单机器/兼容模式下的 wrapper Bearer token；未设置 `WRAPPER_TOKENS_JSON` 时必须配置。 |
 | `WRAPPER_TOKENS_JSON` | 空 | 可选机器绑定 token：`{"mac":"…","nono":"…"}`；设置后替代 relay 的通配 `WRAPPER_TOKEN`。 |
@@ -396,7 +423,9 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `RELAY_URL` | `ws://127.0.0.1:8765/ws` | 中继的 WebSocket 地址（公网用 `wss://域名/ws`）。 |
 | `WRAPPER_TOKEN` | `change-me-wrapper` | 同中继。 |
 | `CC_REMOTE_MACHINE_ID` | `default` | 多机器 relay 中的稳定路由 id；使用 `WRAPPER_TOKENS_JSON` 时必须匹配对应键。 |
+| `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | 交互配对凭据路径；文件必须仅当前用户可读。显式的 `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` 优先。 |
 | `CLAUDE_BIN` | 空 | 可选的 Claude CLI 绝对路径；systemd/PATH 找不到 `claude` 时设置。 |
+| `CC_REMOTE_CODEX_PROXY` | 空 | 仅注入 wrapper 启动的 Codex 子进程的 HTTP(S)/SOCKS5 代理；不改 wrapper 到 relay 的连接，也不影响用户终端里的 `codex`。例如 nono 可填 `http://127.0.0.1:7897`。 |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server。Work 始终私有，不受此项影响。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |
 | `CC_RESUME_SESSION_ID` | 空 | 恢复指定会话 UUID；留空开新会话。首次启动后 id 会持久化到 `~/.cc-remote/`。 |
@@ -406,7 +435,8 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `DRAIN_TIMEOUT` | `15` | interrupt 后等终止 ResultMessage 的秒数，超时强制重连（排空保险）。 |
 | `CODEX_TURN_IDLE_WARN_SECONDS` | `90` | Codex app-server 连续无事件时显示“仍在等待”提示；`0` 禁用。只提示，不自动打断 ultra 推理或长工具。 |
 | `RING_MAX_EVENTS` / `RING_MAX_BYTES` / `TOOL_RESULT_MAX` | 见 `.env.example` | 实时尾巴缓冲 / 工具输出截断上限调优。 |
-| `HISTORY_SOURCE_MAX_BYTES` | `67108864` | 单个 transcript/rollout 源文件读取上限；超限返回明确错误，避免全量解析耗尽内存。 |
+| `HISTORY_SOURCE_MAX_BYTES` | `67108864` | 单个 Claude transcript 的安全读取上限；超限返回明确错误，避免 SDK transcript 全量解析耗尽内存。Codex rollout 不受此总文件上限限制。 |
+| `CODEX_HISTORY_WINDOW_MAX_BYTES` | `33554432` | Codex 超长 rollout 每页最多解析的源窗口；历史按轮次从文件尾流式分页，单轮超限时保留最近窗口和可继续加载的稳定游标。 |
 | `WRAPPER_INBOX_CAP` / `WRAPPER_SEND_QUEUE_CAP` | `1024` / `8192` | wrapper 入站/出站内存队列条数硬上限。 |
 | `WRAPPER_INBOX_BYTES` / `WRAPPER_SEND_QUEUE_BYTES` | `33554432` / `33554432` | wrapper 入站/出站队列序列化字节硬上限。 |
 | `TURN_READER_QUEUE_CAP` | `4` | 单回合 SDK/app-server 读取队列上限；满时向模型流施加背压。 |
@@ -416,7 +446,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 ## 鉴权模型
 
 - **网页客户端**：向中继 `POST /api/login` 换一个短期 HMAC 会话，放在 **HttpOnly + SameSite=Strict** cookie 中；JavaScript 读不到，URL 中也没有 token。配置 `LOGIN_USERS_JSON` 后，签名会话还携带允许的机器集合，机器列表和 WebSocket 路由都会再次校验。WebSocket 同时必须通过精确 `Origin` 校验。
-- **wrapper ⇄ 中继**：WS 握手时带 `Authorization: Bearer <WRAPPER_TOKEN>`；配置 `WRAPPER_TOKENS_JSON` 后，该 token 只能声明绑定的 `machine_id`。
+- **wrapper ⇄ 中继**：WS 握手时带机器凭据；手工配置可使用 `WRAPPER_TOKEN` / `WRAPPER_TOKENS_JSON`，设备中心则签发独立、机器绑定且可单独撤销的凭据。Relay 只保存哈希，任何凭据都不能声明另一台机器的 `machine_id`。
 - token 只走 cookie/请求头，从不进 URL 或线协议消息体；日志会自动打码 token/password 字段。
 
 ## 可靠性边界

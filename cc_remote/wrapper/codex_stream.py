@@ -10,6 +10,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
 import re
 import shlex
 from datetime import datetime
@@ -66,22 +67,421 @@ _MODEL_NAME_MAX_CHARS = 256
 _MODEL_ENUM_MAX_CHARS = 256
 _MODEL_LIST_MAX_ITEMS = 32
 _MODEL_DETAIL_MAX_CHARS = 16 * 1024
+_DEFAULT_HISTORY_WINDOW_MAX_BYTES = 32 * 1024 * 1024
+_REVERSE_HISTORY_CHUNK_BYTES = 1024 * 1024
+_MAX_HISTORY_REVERSE_RECORD_BYTES = 1024 * 1024
+_MAX_HISTORY_BOUNDARY_RECORD_BYTES = 1024 * 1024
+_MAX_HISTORY_BOUNDARY_FORWARD_BYTES = 64 * 1024 * 1024
 
 
-def _bounded_jsonl_records(file):
-    """Yield bounded complete records; skip one pathological oversized line."""
-    line_no = 0
+def _bounded_jsonl_records(file, *, end_offset: int | None = None):
+    """Yield bounded complete records with stable absolute byte offsets.
+
+    ``end_offset`` freezes a growing rollout at the snapshot selected by the
+    history pager.  Byte offsets, unlike window-local line numbers, remain
+    stable when a large file is read through different pages.
+    """
     while True:
-        line = file.readline(_MAX_HISTORY_RECORD_CHARS + 1)
+        record_offset = file.tell()
+        if end_offset is not None and record_offset >= end_offset:
+            return
+        read_limit = _MAX_HISTORY_RECORD_CHARS + 1
+        if end_offset is not None:
+            read_limit = min(read_limit, end_offset - record_offset)
+        line = file.readline(read_limit)
         if not line:
             return
-        line_no += 1
-        complete = line.endswith("\n") or len(line) < _MAX_HISTORY_RECORD_CHARS + 1
+        complete = (
+            line.endswith(b"\n")
+            or len(line) < _MAX_HISTORY_RECORD_CHARS + 1
+            or (end_offset is not None and file.tell() >= end_offset)
+        )
         if complete:
-            yield line_no, line
+            yield record_offset, line.decode("utf-8", "replace")
             continue
-        while line and not line.endswith("\n"):
-            line = file.readline(_MAX_HISTORY_RECORD_CHARS + 1)
+        while line and not line.endswith(b"\n"):
+            if end_offset is not None and file.tell() >= end_offset:
+                return
+            read_limit = _MAX_HISTORY_RECORD_CHARS + 1
+            if end_offset is not None:
+                read_limit = min(read_limit, end_offset - file.tell())
+            line = file.readline(read_limit)
+
+
+def _reverse_jsonl_records(path: str):
+    """Yield ``(byte_offset, line)`` from newest to oldest without buffering.
+
+    Fixed-size reverse reads avoid mmap implementations faulting a large part
+    of a multi-gigabyte rollout into RSS. Individual pathological records and
+    the cross-chunk carry remain bounded.
+    """
+    with open(path, "rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        if size <= 0:
+            return
+        position = size
+        carry = b""
+        dropping_oversized = False
+        while position > 0:
+            read_size = min(_REVERSE_HISTORY_CHUNK_BYTES, position)
+            position -= read_size
+            source.seek(position)
+            chunk = source.read(read_size)
+            data = chunk if dropping_oversized else chunk + carry
+            parts = data.split(b"\n")
+            if len(parts) == 1:
+                if (dropping_oversized
+                        or len(data) > _MAX_HISTORY_REVERSE_RECORD_BYTES):
+                    carry = b""
+                    dropping_oversized = True
+                else:
+                    carry = data
+                continue
+
+            starts = [position]
+            for part in parts[:-1]:
+                starts.append(starts[-1] + len(part) + 1)
+            for index in range(len(parts) - 1, 0, -1):
+                # The newest fragment still belongs to a record whose newer
+                # suffix was discarded after it exceeded the per-record cap.
+                if dropping_oversized and index == len(parts) - 1:
+                    continue
+                line = parts[index]
+                if line and len(line) <= _MAX_HISTORY_REVERSE_RECORD_BYTES:
+                    yield starts[index], line
+            carry = parts[0]
+            dropping_oversized = len(carry) > _MAX_HISTORY_REVERSE_RECORD_BYTES
+            if dropping_oversized:
+                carry = b""
+
+        if (not dropping_oversized and carry
+                and len(carry) <= _MAX_HISTORY_REVERSE_RECORD_BYTES):
+            yield 0, carry
+
+
+def _next_jsonl_offset(path: str, offset: int, end_offset: int) -> int:
+    """Move a byte budget boundary to the next complete JSONL record."""
+    if offset <= 0:
+        return 0
+    with open(path, "rb") as source:
+        source.seek(offset - 1)
+        if source.read(1) == b"\n":
+            return offset
+        source.seek(offset)
+        while source.tell() < end_offset:
+            chunk = source.readline(
+                min(_MAX_HISTORY_RECORD_CHARS + 1,
+                    end_offset - source.tell()))
+            if not chunk:
+                return end_offset
+            if chunk.endswith(b"\n"):
+                return source.tell()
+        return end_offset
+
+
+def _previous_jsonl_record_offset(path: str, offset: int) -> int:
+    """Return the start of the complete record immediately before ``offset``.
+
+    A persisted user ``response_item`` can contain a large inline image and is
+    therefore intentionally skipped by the bounded reverse JSON decoder.  The
+    following small ``event_msg/user_message`` remains a useful page boundary,
+    but its page must start one record earlier so history replay still sees the
+    image.  Locate that record by newlines without buffering or decoding it.
+    """
+    if offset <= 0:
+        return 0
+    with open(path, "rb") as source:
+        position = offset - 1  # exclude the newline immediately before offset
+        while position > 0:
+            start = max(0, position - _REVERSE_HISTORY_CHUNK_BYTES)
+            source.seek(start)
+            chunk = source.read(position - start)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                return start + newline + 1
+            position = start
+    return 0
+
+
+def _fallback_history_id(path: str, kind: str, offset: int, raw_ts: str,
+                         identity: str) -> str:
+    seed = "\0".join((path, kind, identity, str(offset), raw_ts))
+    return hashlib.sha256(seed.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def _history_user_cursor(
+    path: str,
+    offset: int,
+    line: bytes,
+    *,
+    prefer_turn_id: bool = True,
+) -> str | None:
+    if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+            or (b'"type":"user_message"' not in line
+                and b'"type": "user_message"' not in line)):
+        return None
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    payload = row.get("payload") if isinstance(row, dict) else None
+    if (row.get("type") != "event_msg" or not isinstance(payload, dict)
+            or payload.get("type") != "user_message"):
+        return None
+    message = payload.get("message") or ""
+    if not message or str(message).lstrip().startswith("<"):
+        return None
+    turn_id = payload.get("turn_id")
+    if (prefer_turn_id and isinstance(turn_id, str)
+            and _SAFE_WIRE_ID.fullmatch(turn_id)):
+        return turn_id
+    raw_ts = row.get("timestamp", "")
+    return _fallback_history_id(
+        path, "user", offset, str(raw_ts), type(turn_id).__name__)
+
+
+def _history_turn_cursor(line: bytes) -> str | None:
+    if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+            or (b'"type":"task_started"' not in line
+                and b'"type": "task_started"' not in line)):
+        return None
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    payload = row.get("payload") if isinstance(row, dict) else None
+    if (row.get("type") != "event_msg" or not isinstance(payload, dict)
+            or payload.get("type") != "task_started"):
+        return None
+    turn_id = payload.get("turn_id")
+    if isinstance(turn_id, str) and _SAFE_WIRE_ID.fullmatch(turn_id):
+        return turn_id
+    return None
+
+
+_HISTORY_TERMINAL_TYPES = frozenset({
+    "task_complete",
+    "turn_aborted",
+    "task_failed",
+    "turn_failed",
+    "task_error",
+    "task_cancelled",
+})
+
+
+def _history_terminal_marker(line: bytes) -> bool:
+    if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+            or not any(marker.encode() in line
+                       for marker in _HISTORY_TERMINAL_TYPES)):
+        return False
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    payload = row.get("payload") if isinstance(row, dict) else None
+    return bool(
+        row.get("type") == "event_msg"
+        and isinstance(payload, dict)
+        and payload.get("type") in _HISTORY_TERMINAL_TYPES
+    )
+
+
+def _history_boundaries(path: str, *, use_turns: bool):
+    if not use_turns:
+        for offset, line in _reverse_jsonl_records(path):
+            cursor = _history_user_cursor(path, offset, line)
+            if cursor is not None:
+                yield offset, cursor
+        return
+
+    # A task_started without a user_message is ambiguous. It is an independent
+    # goal/background turn only when the preceding visible turn had already
+    # reached a terminal record; otherwise it is an automatic continuation of
+    # the same visible reply. Resolve that relationship while walking backwards
+    # so pagination counts visible chat turns, not internal app-server turns.
+    # Multiple user messages may be steered into one still-running Codex task.
+    # The oldest message keeps the authoritative task cursor; every newer
+    # message is an independent visible chat boundary with its own fallback id.
+    # Delaying emission until task_started preserves reverse chronological order
+    # while retaining the long-standing task cursor for ordinary one-user turns.
+    segment_users: list[tuple[int, str, str]] = []
+    pending_assistant_only: tuple[int, str] | None = None
+    for offset, line in _reverse_jsonl_records(path):
+        user_cursor = _history_user_cursor(path, offset, line)
+        if user_cursor is not None:
+            fallback_cursor = _history_user_cursor(
+                path, offset, line, prefer_turn_id=False)
+            if fallback_cursor is None:
+                continue
+            segment_users.append((
+                _previous_jsonl_record_offset(path, offset),
+                user_cursor,
+                fallback_cursor,
+            ))
+            continue
+
+        turn_cursor = _history_turn_cursor(line)
+        if turn_cursor is not None:
+            # An unresolved newer no-user start had no terminal boundary
+            # between it and this older start, so it merely continued this turn.
+            pending_assistant_only = None
+            if segment_users:
+                # Reverse scan order is newest -> oldest. Extra steered messages
+                # need stable per-record cursors; the oldest message keeps the
+                # task id so existing pagination cursors remain compatible.
+                for boundary, _cursor, extra_cursor in segment_users[:-1]:
+                    yield boundary, extra_cursor
+                yield offset, turn_cursor
+            else:
+                pending_assistant_only = (offset, turn_cursor)
+            segment_users = []
+            continue
+
+        if (pending_assistant_only is not None
+                and _history_terminal_marker(line)):
+            yield pending_assistant_only
+            pending_assistant_only = None
+
+
+def codex_history_window(
+    path: str, *, before: str | None, limit: int | None,
+    max_bytes: int = _DEFAULT_HISTORY_WINDOW_MAX_BYTES,
+) -> tuple[int, int, bool, str | None, int | None]:
+    """Select a bounded Codex history page by scanning user turns backwards.
+
+    Returns ``(start_offset, end_offset, has_older, forced_oldest_cursor,
+    forced_boundary_offset)``.
+    The rollout can be many gigabytes: only boundary records are decoded while
+    locating the latest page, and the forward translator sees at most the
+    configured source window.  ``forced_oldest_cursor`` preserves pagination
+    when one visible turn alone is larger than the byte budget and its prefix
+    must be omitted. ``forced_boundary_offset`` lets the caller recover the
+    omitted user boundary without parsing or retaining that entire turn.
+    """
+    size = os.path.getsize(path)
+    if size <= 0 or not isinstance(limit, int) or limit <= 0:
+        return 0, size, False, None, None
+    byte_budget = max(1024 * 1024, int(max_bytes))
+
+    # Current app-server rollouts have an authoritative task_started boundary
+    # for user and assistant-only continuation turns.  Fall back to historical
+    # user_message boundaries only for older rollout shapes.
+    for use_turns in (True, False):
+        end_offset = size
+        target_found = before is None
+        boundaries: list[tuple[int, str]] = []
+        saw_boundary = False
+        for offset, cursor in _history_boundaries(path, use_turns=use_turns):
+            saw_boundary = True
+            if not target_found:
+                if cursor == before:
+                    target_found = True
+                    end_offset = offset
+                continue
+            boundaries.append((offset, cursor))
+            if end_offset - offset > byte_budget:
+                if len(boundaries) > 1:
+                    start_offset, _ = boundaries[-2]
+                    return start_offset, end_offset, True, None, None
+                # Preserve the recent tail of a pathological single turn. The
+                # true task cursor remains the paging cursor for older history.
+                start_offset = _next_jsonl_offset(
+                    path, max(0, end_offset - byte_budget), end_offset)
+                return start_offset, end_offset, True, cursor, offset
+            if len(boundaries) > limit:
+                start_offset, _ = boundaries[limit - 1]
+                return start_offset, end_offset, True, None, None
+        if saw_boundary:
+            if before is not None and not target_found:
+                return 0, 0, False, None, None
+            return 0, end_offset, False, None, None
+    if size > byte_budget:
+        start_offset = _next_jsonl_offset(
+            path, size - byte_budget, size)
+        return start_offset, size, True, None, None
+    return 0, size, False, None, None
+
+
+def codex_history_boundary_user(
+    path: str,
+    boundary_offset: int,
+    cursor: str,
+    *,
+    max_scan_bytes: int = _MAX_HISTORY_BOUNDARY_FORWARD_BYTES,
+) -> UserMsg | None:
+    """Recover the user row omitted from a bounded single-turn tail.
+
+    A single Codex turn can grow far beyond the history byte window, especially
+    after one or more ``compacted`` records.  Reading only its recent tail keeps
+    memory bounded but otherwise leaves the browser with tool/assistant events
+    that have no prompt.  Scan forward from the already-discovered turn boundary
+    only until the first visible user record and reuse the paging cursor as its
+    stable id.  Oversized JSONL records are skipped by ``_bounded_jsonl_records``
+    rather than materialized.
+    """
+    if (not isinstance(boundary_offset, int) or boundary_offset < 0
+            or not isinstance(cursor, str)
+            or not _SAFE_WIRE_ID.fullmatch(cursor)):
+        return None
+    try:
+        size = os.path.getsize(path)
+        end_offset = min(
+            size,
+            boundary_offset + max(
+                1024 * 1024, int(max_scan_bytes)),
+        )
+        source = open(path, "rb")
+    except (OSError, TypeError, ValueError):
+        return None
+
+    saw_task_start = False
+    pending_images: list = []
+    with source:
+        source.seek(boundary_offset)
+        for _offset, line in _bounded_jsonl_records(
+                source, end_offset=end_offset):
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            row_type = row.get("type")
+            payload_type = payload.get("type")
+            if row_type == "event_msg" and payload_type == "task_started":
+                if saw_task_start:
+                    return None
+                saw_task_start = True
+                continue
+            if (row_type == "response_item"
+                    and payload_type == "message"
+                    and payload.get("role") == "user"):
+                for item in payload.get("content") or []:
+                    if (isinstance(item, dict)
+                            and item.get("type") == "input_image"):
+                        image = _data_uri_to_img(item.get("image_url"))
+                        if image:
+                            pending_images.append(image)
+                continue
+            if row_type != "event_msg" or payload_type != "user_message":
+                continue
+            prompt = payload.get("message") or ""
+            if not isinstance(prompt, str) or not prompt \
+                    or prompt.lstrip().startswith("<"):
+                return None
+            event = UserMsg(msg_id=cursor, prompt=prompt)
+            if pending_images:
+                event.images = pending_images
+            raw_ts = row.get("timestamp")
+            if isinstance(raw_ts, str):
+                try:
+                    event.ts = datetime.fromisoformat(
+                        raw_ts.replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError):
+                    pass
+            return event
+    return None
 
 
 class CodexStreamTranslator:
@@ -1503,7 +1903,13 @@ def is_turn_terminal(msg: dict) -> bool:
 
 # ---- on-disk Codex rollout -> wire events (session history) ----
 
-def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str | None]:
+def codex_translate_history(
+    path: str,
+    tool_result_max: int,
+    *,
+    start_offset: int = 0,
+    end_offset: int | None = None,
+) -> tuple[list, str | None]:
     """Translate a Codex rollout .jsonl into wire events (same vocabulary as the
     live stream) + the model used. Codex analog of stream.translate_history.
 
@@ -1513,7 +1919,6 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
     (events, model)."""
     events: list = []
     model: str | None = None
-    session_id: str | None = None
     turn_open = False
     active_turn_id: str | None = None
     active_msg_id: str | None = None
@@ -1526,6 +1931,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
     cur_channel = "unknown"
     last_ts = None
     pending_images: list = []   # input_image blocks seen before the next user_message
+    task_has_user = False
     seen_tool_uses: set[str] = set()
     seen_tool_results: set[str] = set()
     seen_authoritative_results: set[str] = set()
@@ -1543,14 +1949,9 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
 
     def _stable_id(kind: str, line_no: int, raw_ts: str = "", identity=None) -> str:
         """Deterministic fallback for rollout records that carry no item id."""
-        seed = "\0".join((
-            session_id or path,
-            kind,
-            str(identity or active_turn_id or ""),
-            str(line_no),
-            raw_ts,
-        ))
-        return hashlib.sha256(seed.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+        stable_identity = str(identity or active_turn_id or "")
+        return _fallback_history_id(
+            path, kind, line_no, raw_ts, stable_identity)
 
     def _history_id(value, kind: str, line_no: int, raw_ts: str = "") -> str:
         if isinstance(value, str) and _SAFE_WIRE_ID.fullmatch(value):
@@ -1711,11 +2112,13 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         turn_final_visible = False
 
     try:
-        f = open(path)
+        f = open(path, "rb")
     except Exception:
         return [], None
     with f:
-        for line_no, line in _bounded_jsonl_records(f):
+        if start_offset > 0:
+            f.seek(start_offset)
+        for line_no, line in _bounded_jsonl_records(f, end_offset=end_offset):
             try:
                 d = json.loads(line)
             except Exception:
@@ -1726,8 +2129,8 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
             ts = _ts(raw_ts)
             payload_type = p.get("type")
 
-            if t == "session_meta" and p.get("id"):
-                session_id = str(p["id"])
+            if t == "session_meta":
+                continue
             elif t == "turn_context":
                 if p.get("model"):
                     model = p["model"]
@@ -1752,6 +2155,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                 if next_turn_id:
                     next_turn_id = str(next_turn_id)
                     pending_turn_id = next_turn_id
+                task_has_user = False
             elif t == "event_msg" and payload_type == "user_message":
                 msg = p.get("message") or ""
                 if msg and not msg.lstrip().startswith("<"):
@@ -1766,7 +2170,20 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                             authoritative_boundary=False)
                     active_turn_id = str(next_turn_id) if next_turn_id else None
                     pending_turn_id = active_turn_id
-                    uid = _history_id(active_turn_id, "user", line_no, raw_ts)
+                    if task_has_user:
+                        # A steered message inside the same app-server task has
+                        # no fresh turn id. Reusing active_turn_id would make the
+                        # reducer drop it as a duplicate of the first user row.
+                        uid = _fallback_history_id(
+                            path,
+                            "user",
+                            line_no,
+                            raw_ts,
+                            type(p.get("turn_id")).__name__,
+                        )
+                    else:
+                        uid = _history_id(
+                            active_turn_id, "user", line_no, raw_ts)
                     active_msg_id = uid
                     um = UserMsg(msg_id=uid, prompt=msg)
                     if pending_images:
@@ -1775,6 +2192,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                         um.ts = ts
                     events.append(um)
                     turn_open = True
+                    task_has_user = True
                 pending_images = []   # consume (per user turn)
             elif (t == "response_item"
                   and payload_type in {"function_call", "custom_tool_call"}):

@@ -396,6 +396,32 @@ journalctl -u cc-remote-wrapper -f     # expect: connected to relay / wrapper ru
 
 Back on the VPS, `curl https://your-domain.com/healthz` should now show `wrapper_connected:true`.
 
+#### Pair a Mac or Linux machine from Device Center (recommended)
+
+Sign in, open the device icon in the header, and choose **Allow adding devices**.
+The page creates a single-use code that expires after 10 minutes by default:
+
+```bash
+python -m cc_remote.device pair https://your-domain.com XXXXX-XXXXX-XXXXX-XXXXX \
+  --name "MacBook Pro"
+python -m cc_remote.wrapper
+```
+
+Interactive pairing stores a mode-`0600` credential in
+`~/.cc-remote/device.json`. For a Linux systemd service, write the credential
+straight to a root-only EnvironmentFile and restart the wrapper:
+
+```bash
+sudo .venv/bin/python -m cc_remote.device pair \
+  https://your-domain.com XXXXX-XXXXX-XXXXX-XXXXX \
+  --name nono --env-file /etc/cc-remote/device.env
+sudo systemctl restart cc-remote-wrapper
+```
+
+The relay stores only the credential hash. Device Center shows online/offline
+state and supports switching, renaming, and per-device revocation. The legacy
+manual `WRAPPER_TOKEN` / `WRAPPER_TOKENS_JSON` path remains compatible.
+
 ### 6) Verify from a phone
 
 Open `https://your-domain.com/` on your phone (any network) → log in with `LOGIN_PASSWORD` → send a message. You should get streaming replies, interrupt, and multi-device sync.
@@ -426,6 +452,8 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `SESSION_REGISTRY_CAP` | `1024` | Hard limit for process-local revocable browser sessions. |
 | `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` / `PUSH_VAPID_SUBJECT` | empty | Optional real Web Push; all three must be configured. Prefer an absolute PEM path readable by the relay user. Payloads contain only completion/failure state, never conversation content. |
 | `PUSH_DB_PATH` | `~/.cc-remote/relay-push.sqlite3` | Durable browser subscription store, isolated by user and machine. |
+| `DEVICE_DB_PATH` | `~/.cc-remote/relay-devices.sqlite3` | Durable device names, last-seen metadata, and credential hashes; never sessions or artifacts. |
+| `DEVICE_PAIRING_TTL_SECONDS` | `600` | Lifetime of a single-use pairing code in seconds; allowed range 60–3600. |
 | `PUBLIC_ORIGIN` | empty | Exact browser origin allowed to connect, e.g. `https://remote.example.com`; **required**, and non-loopback origins must use HTTPS. |
 | `WRAPPER_TOKEN` | placeholder | Wrapper Bearer token for single-machine/compatibility mode; required unless `WRAPPER_TOKENS_JSON` is set. |
 | `WRAPPER_TOKENS_JSON` | empty | Optional machine-bound tokens: `{"mac":"…","nono":"…"}`; replaces the relay's wildcard `WRAPPER_TOKEN`. |
@@ -441,7 +469,9 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `RELAY_URL` | `ws://127.0.0.1:8765/ws` | Relay WebSocket URL (`wss://domain/ws` in prod). |
 | `WRAPPER_TOKEN` | `change-me-wrapper` | Same as relay. |
 | `CC_REMOTE_MACHINE_ID` | `default` | Stable route id on a multi-machine relay; must match its `WRAPPER_TOKENS_JSON` key when that policy is enabled. |
+| `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | Interactive pairing credential; the file must be private to the current user. Explicit `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` values take precedence. |
 | `CLAUDE_BIN` | empty | Optional absolute Claude CLI path; set it when systemd/PATH cannot find `claude`. |
+| `CC_REMOTE_CODEX_PROXY` | empty | Optional HTTP(S)/SOCKS5 proxy injected only into Codex subprocesses launched by the wrapper. It does not change the wrapper-to-relay connection or the user's terminal `codex`. |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server. Work is always private and ignores this setting. |
 | `CC_CWD` | cwd | Default working directory for new sessions. Claude `--resume` needs it to locate `~/.claude/projects/` — **it must be correct**; Codex resume first recovers the original cwd from its rollout. |
 | `CC_RESUME_SESSION_ID` | empty | Resume a specific session UUID; empty starts fresh. The id is persisted to `~/.cc-remote/` after first start. |
@@ -451,7 +481,8 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `DRAIN_TIMEOUT` | `15` | Seconds to wait for the terminal ResultMessage after interrupt before forcing a reconnect (drain safety net). |
 | `CODEX_TURN_IDLE_WARN_SECONDS` | `90` | Show a non-terminal waiting notice after this many seconds without a Codex app-server event; `0` disables it. It does not auto-interrupt long reasoning or tools. |
 | `RING_MAX_EVENTS` / `RING_MAX_BYTES` / `TOOL_RESULT_MAX` | see `.env.example` | Live-tail buffer / tool-output truncation tuning. |
-| `HISTORY_SOURCE_MAX_BYTES` | `67108864` | Maximum transcript/rollout source file read; larger histories return an explicit error instead of exhausting memory. |
+| `HISTORY_SOURCE_MAX_BYTES` | `67108864` | Safe source limit for one Claude transcript; larger SDK transcripts return an explicit error instead of exhausting memory. Codex rollouts are not subject to this whole-file cap. |
+| `CODEX_HISTORY_WINDOW_MAX_BYTES` | `33554432` | Maximum Codex rollout source window parsed per page. Long histories stream backwards by turn; an oversized single turn keeps its recent tail plus a stable cursor for loading older history. |
 | `WRAPPER_INBOX_CAP` / `WRAPPER_SEND_QUEUE_CAP` | `1024` / `8192` | Hard item-count bounds for the wrapper's inbound and outbound queues. |
 | `WRAPPER_INBOX_BYTES` / `WRAPPER_SEND_QUEUE_BYTES` | `33554432` / `33554432` | Hard serialized-byte bounds for the wrapper's inbound and outbound queues. |
 | `TURN_READER_QUEUE_CAP` | `4` | Per-turn SDK/app-server reader queue; a full queue backpressures the model stream. |
@@ -461,7 +492,7 @@ Each message accepts at most 8 attachments, at most 6 MiB each and 8 MiB decoded
 ## Auth model
 
 - **Web client**: `POST /api/login` creates a short-lived HMAC session in an **HttpOnly, SameSite=Strict** cookie. JavaScript cannot read it and no token appears in the URL. With `LOGIN_USERS_JSON`, the signed session also carries its allowed machines; both discovery and WebSocket routing enforce that set. The WebSocket must also pass an exact `Origin` check.
-- **Wrapper ⇄ relay**: `Authorization: Bearer <WRAPPER_TOKEN>` at the WS handshake. With `WRAPPER_TOKENS_JSON`, that credential can declare only its bound `machine_id`.
+- **Wrapper ⇄ relay**: the WS handshake carries a machine credential. Manual setups use `WRAPPER_TOKEN` / `WRAPPER_TOKENS_JSON`; Device Center issues an independent, machine-bound, individually revocable credential. The relay stores only its hash, and no credential may announce another device's `machine_id`.
 - Tokens travel only in cookies/headers, never in URLs or wire-protocol message bodies; logging redacts token/password fields.
 
 ## Reliability boundary

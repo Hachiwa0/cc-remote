@@ -27,6 +27,7 @@ import re
 import signal
 import shutil
 import subprocess
+from urllib.parse import urlsplit
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
@@ -35,6 +36,7 @@ from typing import Any, Awaitable, Callable, Optional
 from cc_remote.log import logger
 from cc_remote.protocol import Notice, RateLimitUpdate, ThreadGoal
 from cc_remote.wrapper.codex_daemon import (
+    CodexDaemonUpgradeRequired,
     CodexDaemonManager,
     codex_daemon_mode,
     default_codex_daemon_manager,
@@ -45,6 +47,7 @@ from cc_remote.wrapper.codex_sessions import (
     codex_effort,
     codex_fast_enabled,
     codex_model,
+    codex_rollout_path,
 )
 from cc_remote.wrapper.child_env import sanitized_child_env
 from cc_remote.wrapper.work_prompt import (
@@ -82,6 +85,16 @@ _WORK_NAME_MAX = 256
 _PROXY_HANDSHAKE_MAX = 16 * 1024
 _PROXY_HANDSHAKE_TIMEOUT = 5.0
 _PROXY_MESSAGE_MAX = 16 * 1024 * 1024
+_LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
+# The managed shared daemon intentionally follows Codex's standalone release
+# channel.  The desktop app can temporarily bundle a newer official app-server
+# core.  Only very large rollouts opt into that private core; normal Code
+# sessions keep the shared daemon and its CLI <-> Remote live channel.
+_OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES = 256 * 1024 * 1024
+_CODEX_DESKTOP_BIN_CANDIDATES = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+)
 _WEBSOCKET_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _WORK_DISABLED_FEATURES = (
     "apps",
@@ -345,6 +358,69 @@ def _codex_version(path: str) -> tuple[int, ...]:
     return tuple(int(g) for g in m.groups()) if m else (-1,)
 
 
+def _newer_private_core_for_oversized_resume(
+    managed_bin: str, resume_id: Optional[str],
+) -> Optional[str]:
+    """Select a newer official desktop app-server for one oversized thread.
+
+    ``app-server daemon`` always executes the managed standalone Codex binary;
+    it cannot be pointed at the desktop app's bundled core.  During a staggered
+    rollout the desktop core may contain large-history/compaction fixes that the
+    managed daemon does not yet have.  Starting that official core over stdio is
+    therefore a narrow compatibility fallback, not a second history engine:
+    thread/resume still owns all native context and uses ``excludeTurns``.
+
+    Explicit ``CODEX_BIN`` remains authoritative.  Small/ordinary sessions stay
+    on the shared daemon so terminal CLI bidirectional updates are unaffected.
+    """
+    if (not resume_id or os.environ.get("CODEX_BIN")
+            or managed_bin in _CODEX_DESKTOP_BIN_CANDIDATES):
+        return None
+    rollout_path = codex_rollout_path(resume_id)
+    if not rollout_path:
+        return None
+    try:
+        rollout_size = os.path.getsize(rollout_path)
+    except OSError:
+        return None
+    if rollout_size < _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES:
+        return None
+
+    managed_version = _codex_version(managed_bin)
+    if managed_version == (-1,):
+        return None
+    best_path: Optional[str] = None
+    best_version = managed_version
+    for candidate in _CODEX_DESKTOP_BIN_CANDIDATES:
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        version = _codex_version(candidate)
+        if version > best_version:
+            best_path = candidate
+            best_version = version
+    if best_path is not None:
+        log.info(
+            "oversized Codex resume uses newer official private core",
+            rollout_bytes=rollout_size,
+            managed_version=".".join(map(str, managed_version)),
+            private_version=".".join(map(str, best_version)),
+        )
+    return best_path
+
+
+def _semantic_version(value: Optional[str]) -> tuple[int, ...]:
+    """Return the numeric release prefix used for app-server feature gates."""
+    if not isinstance(value, str):
+        return (-1,)
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value.strip())
+    return tuple(int(group) for group in match.groups()) if match else (-1,)
+
+
+def _supports_lightweight_resume(value: Optional[str]) -> bool:
+    """Whether app-server supports excludeTurns on thread/resume/fork."""
+    return _semantic_version(value) >= _LIGHTWEIGHT_RESUME_MIN_VERSION
+
+
 def _codex_inventory(candidates: list[str]) -> tuple[tuple[object, ...], ...]:
     """Fingerprint candidate identities so CLI upgrades invalidate the cache.
 
@@ -412,6 +488,30 @@ def _codex_env(bin_path: str) -> dict:
     dir that also ships node (nvm / npm-global bin), prepend that dir so the
     shebang resolves even if the wrapper's own PATH lacks it."""
     env = sanitized_child_env()
+    proxy = os.environ.get("CC_REMOTE_CODEX_PROXY", "").strip()
+    if proxy:
+        # Keep the proxy scoped to wrapper-owned Codex processes.  In
+        # particular, never export it in the parent or change the user's
+        # ordinary `codex` terminal.  Local daemon/proxy sockets must bypass it.
+        scheme = urlsplit(proxy).scheme.lower()
+        if scheme in {"http", "https"}:
+            env.update({
+                "HTTP_PROXY": proxy,
+                "HTTPS_PROXY": proxy,
+                "http_proxy": proxy,
+                "https_proxy": proxy,
+            })
+        elif scheme in {"socks5", "socks5h"}:
+            env.update({"ALL_PROXY": proxy, "all_proxy": proxy})
+        bypass = [
+            value.strip()
+            for value in (env.get("NO_PROXY") or env.get("no_proxy") or "").split(",")
+            if value.strip()
+        ]
+        for local in ("127.0.0.1", "localhost", "::1"):
+            if local not in bypass:
+                bypass.append(local)
+        env["NO_PROXY"] = env["no_proxy"] = ",".join(bypass)
     bindir = os.path.dirname(os.path.abspath(bin_path)) if os.sep in bin_path else ""
     if bindir and os.path.exists(os.path.join(bindir, "node")):
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
@@ -857,6 +957,15 @@ class CodexHandle:
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
         # version-probes subprocesses on first call; keep it off the event loop.
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
+        private_core = None
+        if not self.work_mode and not self._daemon_proxy_established:
+            private_core = await asyncio.to_thread(
+                _newer_private_core_for_oversized_resume,
+                codex_bin,
+                resume_id,
+            )
+            if private_core is not None:
+                codex_bin = private_core
         child_env = _codex_env(codex_bin)
         stdio_argv = [codex_bin, "app-server", "--stdio"]
         if self.work_mode:
@@ -879,10 +988,23 @@ class CodexHandle:
                 "-c", "permissions.cc_remote_work.network.enabled=false",
             ])
         proxy_argv: Optional[list[str]] = None
-        if not self.work_mode and self.daemon_mode == "auto":
+        strict_shared = False
+        if (private_core is None and not self.work_mode
+                and self.daemon_mode == "auto"):
             try:
                 proxy_argv = await self.daemon_manager.proxy_args(
                     codex_bin, child_env)
+                strict_shared = bool(
+                    getattr(
+                        self.daemon_manager,
+                        "strict_shared_affinity",
+                        False,
+                    )
+                )
+            except CodexDaemonUpgradeRequired:
+                # Starting private stdio here would appear healthy while
+                # silently severing the terminal CLI <-> Remote live channel.
+                raise
             except Exception as exc:
                 log.warning(
                     "Codex daemon preparation failed; using stdio",
@@ -892,6 +1014,8 @@ class CodexHandle:
             [(proxy_argv, True), (stdio_argv, False)]
             if proxy_argv is not None else [(stdio_argv, False)]
         )
+        if strict_shared and proxy_argv is not None:
+            attempts = [(proxy_argv, True)]
         if self._daemon_proxy_established:
             if proxy_argv is None:
                 raise RuntimeError(
@@ -920,7 +1044,7 @@ class CodexHandle:
                 if not daemon_proxy:
                     raise
                 self.daemon_manager.invalidate()
-                if self._daemon_proxy_established:
+                if strict_shared or self._daemon_proxy_established:
                     log.warning(
                         "Codex shared daemon proxy unavailable; reconnect required",
                         error_type=type(exc).__name__,
@@ -969,6 +1093,12 @@ class CodexHandle:
                         "personality": "none",
                         "config": self._work_config,
                     })
+                if _supports_lightweight_resume(self.app_server_version):
+                    # Official app-server pagination contract: fork the durable
+                    # context without serializing its complete turn history over
+                    # this control connection. History remains available through
+                    # thread/turns/list (and cc-remote's bounded projection).
+                    fork_params["excludeTurns"] = True
                 res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
             elif resume_id:
@@ -985,6 +1115,35 @@ class CodexHandle:
                         "personality": "none",
                         "config": self._work_config,
                     })
+                if _supports_lightweight_resume(self.app_server_version):
+                    # Since Codex 0.144.6, excludeTurns is the official way for
+                    # clients with a paged history UI to resume a live thread.
+                    # It prevents a multi-hundred-MiB rollout from becoming one
+                    # oversized JSON-RPC response while preserving native context.
+                    resume_params["excludeTurns"] = True
+                else:
+                    # Older app-servers reject excludeTurns. Preserve legacy
+                    # compatibility only while the rollout can fit within the
+                    # transport ceiling; otherwise fail before the stdout reader
+                    # is destroyed by an oversized thread/resume response.
+                    rollout_path = await asyncio.to_thread(
+                        codex_rollout_path, resume_id)
+                    try:
+                        rollout_size = (
+                            await asyncio.to_thread(os.path.getsize, rollout_path)
+                            if rollout_path else 0
+                        )
+                    except OSError:
+                        rollout_size = 0
+                    if rollout_size > _PROXY_MESSAGE_MAX:
+                        version = self.app_server_version or "unknown"
+                        minimum = ".".join(
+                            str(part) for part in _LIGHTWEIGHT_RESUME_MIN_VERSION)
+                        raise RuntimeError(
+                            "Codex app-server " + version
+                            + " 不支持超长会话的轻量恢复；请升级 Codex 至 "
+                            + minimum + " 或更高版本"
+                        )
                 res = await self._request("thread/resume", resume_params)
                 self.thread_id = _thread_id_of(res) or resume_id
             else:
@@ -2429,6 +2588,19 @@ class CodexHandle:
         # notifications in the v2 schema are attributable; dropping a malformed
         # one is safer than guessing which active reply owns it.
         if method == "error":
+            if self._using_daemon_proxy:
+                # Shared app-server provider errors currently carry neither a
+                # thread nor a turn id.  The daemon can emit one while another
+                # subscribed thread is active; accepting it merely because this
+                # handle also has a live turn renders a foreign retry/failure in
+                # the wrong conversation.  Terminal turn/completed remains the
+                # authoritative, attributable result for this handle.
+                log.warning(
+                    "unattributed shared Codex provider error dropped",
+                    active_thread_id=self.thread_id,
+                    active_turn_id=self.turn_id,
+                )
+                return False
             return self.turn_active
         if isinstance(method, str) and method.startswith("hook/"):
             return self.turn_active
@@ -2515,6 +2687,10 @@ class CodexHandle:
                     task.cancel()
         if not self._notification_is_current(m):
             return
+        if method == "error":
+            diagnostic = _provider_error_diagnostic(m.get("params"))
+            logger_method = log.info if diagnostic["will_retry"] else log.warning
+            logger_method("codex provider error", **diagnostic)
         target_turn_id = _notification_turn_id(m)
         review_execution_frame = bool(
             self._review_active
@@ -2962,6 +3138,49 @@ def _status_error_message(error: BaseException) -> str:
     ):
         return "unavailable for the current account"
     return "app-server request failed"
+
+
+def _provider_error_diagnostic(params: Any) -> dict[str, Any]:
+    """Extract non-sensitive provider failure fields for operator logs.
+
+    The full app-server error can contain account, endpoint or connector data.
+    Keep only retry state, an HTTP status and a coarse failure class so future
+    upstream incidents are attributable without copying provider text to disk.
+    """
+    public = params if isinstance(params, dict) else {}
+    error = public.get("error") if isinstance(public.get("error"), dict) else {}
+    message = error.get("message") if isinstance(error.get("message"), str) else ""
+    details = (error.get("additionalDetails")
+               if isinstance(error.get("additionalDetails"), str) else "")
+    combined = (message + " " + details)[:8192].lower()
+    status_match = re.search(r"\b([45]\d\d)\b", combined)
+    status = int(status_match.group(1)) if status_match else None
+    info = error.get("codexErrorInfo")
+    if isinstance(info, dict):
+        disconnected = info.get("responseStreamDisconnected")
+        if isinstance(disconnected, dict):
+            candidate = disconnected.get("httpStatusCode")
+            if isinstance(candidate, int) and 400 <= candidate <= 599:
+                status = candidate
+    if status in {401, 403}:
+        category = "authentication"
+    elif status == 429:
+        category = "rate_limit"
+    elif isinstance(status, int) and status >= 500:
+        category = "upstream_server"
+    elif "timeout" in combined or "timed out" in combined:
+        category = "timeout"
+    elif any(token in combined for token in (
+        "connect", "network", "dns", "tls", "stream disconnected",
+    )):
+        category = "connection"
+    else:
+        category = "provider"
+    return {
+        "will_retry": bool(public.get("willRetry")),
+        "category": category,
+        "http_status": status,
+    }
 
 
 def _append_status_error(errors: list[str], component: str,

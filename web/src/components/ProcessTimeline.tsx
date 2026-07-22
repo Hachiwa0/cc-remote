@@ -152,14 +152,22 @@ function groupTimelineRows(items: Block[]): TimelineRow[] {
   return rows;
 }
 
-export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile }: {
+export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
+  engine = "claude" }: {
   blocks: Block[];
   done: boolean;
   durationMs?: number;
   startTs?: number;
   onOpenFile?: (path: string, line?: number) => void;
+  engine?: "claude" | "codex";
 }) {
-  const items = processBlocks(blocks);
+  // Codex does not expose its private chain of thought in official clients.
+  // Keep actionable commentary, plans and tools, but suppress synthetic
+  // reasoning rows so consecutive tool calls collapse into one useful group.
+  const items = processBlocks(blocks).filter((block) => engine !== "codex" || !(
+    (block.kind === "text" && block.channel === "thinking")
+    || (block.kind === "process" && block.processKind === "reasoning")
+  ));
   const complete = done && !hasActiveProcess(items);
   const [open, setOpen] = useState(!complete);
   const [now, setNow] = useState(Date.now());
@@ -176,6 +184,10 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile 
 
   if (!items.length) return null;
   const rows = groupTimelineRows(items);
+  const toolCount = items.reduce((count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
+  const countLabel = engine === "codex" && toolCount === items.length
+    ? `${toolCount} 个工具调用`
+    : `${items.length} 项`;
   const elapsed = complete ? (durationMs ?? 0) : Math.max(0, now - (startTs ?? now));
   return (
     <section className={`turn-process${open ? " open" : ""}`}>
@@ -185,7 +197,7 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile 
           {complete ? <Icon name="verify" size={14} /> : <span className="process-spin" />}
         </span>
         <span>{complete ? "已处理" : "正在处理"} {durationLabel(elapsed)}</span>
-        <span className="turn-process-count">{items.length} 项</span>
+        <span className="turn-process-count">{countLabel}</span>
         <Icon name="chev" size={15} />
       </button>
       {open && <div className="process-timeline">{rows.map((row) => (

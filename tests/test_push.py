@@ -24,6 +24,7 @@ def _cfg(tmp_path, **overrides) -> RelayConfig:
         "push_vapid_private_key": str(tmp_path / "vapid-private.pem"),
         "push_vapid_subject": "mailto:admin@example.com",
         "push_db_path": str(tmp_path / "push.sqlite3"),
+        "device_db_path": str(tmp_path / "devices.sqlite3"),
     }
     values.update(overrides)
     return RelayConfig(**values)

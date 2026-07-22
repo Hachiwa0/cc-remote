@@ -11,7 +11,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sqlite3
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 import glob
 from pathlib import Path
@@ -57,6 +61,7 @@ class TurnMarkers:
     finished: frozenset[str]
     partial: bytes
     ordered: tuple[tuple[str, str], ...] = ()
+    has_visible_user_message: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,10 @@ class HolderScan:
     # never opens the rollout itself. Its exact thread is resolved separately
     # from the app-server's structured connection log.
     client_proxies: dict[ProcessIdentity, int] = field(default_factory=dict)
+    # A private Codex App app-server is a second independent rollout writer,
+    # unlike cc-remote's managed shared daemon.  Letting both write the same
+    # JSONL can interleave large records and corrupt the official transcript.
+    private_holders: dict[str, set[ProcessIdentity]] = field(default_factory=dict)
 
 
 class CodexTuiLogTracker:
@@ -221,9 +230,16 @@ def _process_start_ticks(proc_dir: Path) -> int | None:
 def process_identity(pid: int, *, proc_root: str = "/proc",
                      parent_pid: int | None = None) -> ProcessIdentity | None:
     stat = _process_stat(Path(proc_root) / str(pid))
-    if stat is None or (parent_pid is not None and stat[0] != parent_pid):
-        return None
-    return ProcessIdentity(pid, stat[1])
+    if stat is not None:
+        if parent_pid is not None and stat[0] != parent_pid:
+            return None
+        return ProcessIdentity(pid, stat[1])
+    if sys.platform == "darwin" and proc_root == "/proc":
+        info = _darwin_process_info(pid)
+        if info is None or (parent_pid is not None and info[1] != parent_pid):
+            return None
+        return info[0]
+    return None
 
 
 def _process_cmdline(proc_dir: Path) -> tuple[bytes, ...] | None:
@@ -245,6 +261,18 @@ def _is_passive_app_server(
     if args is None:
         args = _process_cmdline(proc_dir)
     return bool(args and b"app-server" in args)
+
+
+def _is_managed_shared_app_server(
+    args: tuple[bytes, ...] | None,
+) -> bool:
+    """Recognize cc-remote's persistent remote-control daemon."""
+    return bool(
+        args
+        and b"app-server" in args
+        and b"--remote-control" in args
+        and b"--listen" in args
+    )
 
 
 def _is_app_server_proxy(
@@ -400,6 +428,146 @@ def _fd_is_writable(proc_dir: Path, fd_name: str) -> bool | None:
     return None
 
 
+_DARWIN_PS_RE = re.compile(
+    r"^\s*(\d+)\s+(\d+)\s+"
+    r"([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})"
+    r"\s+(\S+)\s+(.*)$"
+)
+
+
+def _darwin_process_info(
+    pid: int,
+) -> tuple[ProcessIdentity, int, int, tuple[bytes, ...]] | None:
+    """Return stable process metadata on macOS where procfs is unavailable."""
+    try:
+        completed = subprocess.run(
+            [
+                "/bin/ps", "-p", str(pid),
+                "-o", "pid=", "-o", "ppid=", "-o", "lstart=",
+                "-o", "tty=", "-o", "command=",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = _DARWIN_PS_RE.match(completed.stdout.strip())
+    if match is None or int(match.group(1)) != pid:
+        return None
+    try:
+        started = int(time.mktime(time.strptime(
+            match.group(3), "%a %b %d %H:%M:%S %Y")))
+        parsed = shlex.split(match.group(5))
+    except (ValueError, OverflowError):
+        return None
+    args = tuple(arg.encode(errors="surrogateescape") for arg in parsed)
+    tty_nr = 0 if match.group(4) in {"??", "?", "-"} else 1
+    return ProcessIdentity(pid, started), int(match.group(2)), tty_nr, args
+
+
+def _darwin_writable_rollout_holders(
+    paths: Mapping[str, str],
+    own_processes: Iterable[ProcessIdentity],
+) -> HolderScan:
+    """Use lsof to detect exact rollout writers on macOS.
+
+    Codex App and cc-remote can otherwise keep independent app-servers open on
+    the same inode.  This scan is intentionally inode-based and fail-closed.
+    """
+    by_inode: dict[tuple[int, int], set[str]] = {}
+    result = {sid: set() for sid in paths}
+    passive = {sid: set() for sid in paths}
+    private = {sid: set() for sid in paths}
+    client_proxies: dict[ProcessIdentity, int] = {}
+    filenames: list[str] = []
+    for sid, path in paths.items():
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        by_inode.setdefault((stat.st_dev, stat.st_ino), set()).add(sid)
+        filenames.append(path)
+    if not filenames:
+        return HolderScan(result, True, passive, client_proxies, private)
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/sbin/lsof", "-n", "-P", "-w", "-FpcfnaDi",
+                "--", *filenames,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return HolderScan(result, False, passive, client_proxies, private)
+    # lsof returns 1 when no matching descriptor exists.
+    if completed.returncode not in (0, 1):
+        return HolderScan(result, False, passive, client_proxies, private)
+
+    pid: int | None = None
+    access = ""
+    device: int | None = None
+    inode: int | None = None
+    matches: dict[int, set[str]] = {}
+    for line in completed.stdout.splitlines():
+        if not line:
+            continue
+        tag, value = line[0], line[1:]
+        if tag == "p":
+            try:
+                pid = int(value)
+            except ValueError:
+                pid = None
+        elif tag == "f":
+            access = ""
+            device = None
+            inode = None
+        elif tag == "a":
+            access = value
+        elif tag == "D":
+            try:
+                device = int(value, 0)
+            except ValueError:
+                device = None
+        elif tag == "i":
+            try:
+                inode = int(value)
+            except ValueError:
+                inode = None
+        elif tag == "n" and pid is not None and access in {"w", "u"}:
+            if device is not None and inode is not None:
+                matches.setdefault(pid, set()).update(
+                    by_inode.get((device, inode), ()))
+
+    own = set(own_processes)
+    complete = True
+    for holder_pid, sids in matches.items():
+        before = _darwin_process_info(holder_pid)
+        if before is None:
+            complete = False
+            continue
+        identity, _ppid, tty_nr, args = before
+        if identity in own:
+            continue
+        after = _darwin_process_info(holder_pid)
+        if after is None or after[0] != identity:
+            complete = False
+            continue
+        for sid in sids:
+            result[sid].add(identity)
+            if _is_passive_app_server(Path(), tty_nr, args):
+                passive[sid].add(identity)
+                if not _is_managed_shared_app_server(args):
+                    private[sid].add(identity)
+    return HolderScan(result, complete, passive, client_proxies, private)
+
+
 def writable_rollout_holders(
     paths: Mapping[str, str],
     own_processes: Iterable[ProcessIdentity] = (),
@@ -413,9 +581,13 @@ def writable_rollout_holders(
     renamed paths cannot create false negatives.  PID start ticks are checked
     before and after the FD walk to reject PID/FD reuse races.
     """
+    if sys.platform == "darwin" and proc_root == "/proc":
+        return _darwin_writable_rollout_holders(paths, own_processes)
+
     by_inode: dict[tuple[int, int], set[str]] = {}
     result = {sid: set() for sid in paths}
     passive = {sid: set() for sid in paths}
+    private = {sid: set() for sid in paths}
     client_proxies: dict[ProcessIdentity, int] = {}
     sid_by_arg = {sid.encode(): sid for sid in paths}
     for sid, path in paths.items():
@@ -425,7 +597,7 @@ def writable_rollout_holders(
             continue
         by_inode.setdefault((st.st_dev, st.st_ino), set()).add(sid)
     if not by_inode:
-        return HolderScan(result, True, passive, client_proxies)
+        return HolderScan(result, True, passive, client_proxies, private)
 
     own = set(own_processes)
     root = Path(proc_root)
@@ -447,7 +619,7 @@ def writable_rollout_holders(
             except OSError:
                 continue
         if not own_fd_visible:
-            return HolderScan(result, False, passive, client_proxies)
+            return HolderScan(result, False, passive, client_proxies, private)
     complete = True
     try:
         processes = (entry for entry in root.iterdir() if entry.name.isdigit())
@@ -523,17 +695,25 @@ def writable_rollout_holders(
                 result[sid].add(identity)
                 if _is_passive_app_server(proc_dir, tty_nr, args):
                     passive[sid].add(identity)
+                    if not _is_managed_shared_app_server(args):
+                        private[sid].add(identity)
     except OSError:
-        return HolderScan(result, False, passive, client_proxies)
+        return HolderScan(result, False, passive, client_proxies, private)
     for identity, sid in _snapshot_tui_bindings(
         unresolved_tuis, snapshots,
     ).items():
         result[sid].add(identity)
-    return HolderScan(result, complete, passive, client_proxies)
+    return HolderScan(result, complete, passive, client_proxies, private)
 
 
 def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
-    """Parse complete JSONL records and preserve one incomplete trailing record."""
+    """Parse lifecycle/user records and preserve one incomplete trailing record.
+
+    ``task_started`` is commonly flushed a few milliseconds before the CLI's
+    visible ``user_message``.  Keeping that second signal lets the watcher
+    refresh the browser again when the prompt actually exists in history,
+    without treating ordinary rollout growth as an ownership transition.
+    """
     combined = partial + data
     lines = combined.splitlines(keepends=True)
     carry = b""
@@ -545,6 +725,7 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
     started: set[str] = set()
     finished: set[str] = set()
     ordered: list[tuple[str, str]] = []
+    has_visible_user_message = False
     for line in lines:
         try:
             record = json.loads(line)
@@ -555,10 +736,15 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
         payload = record.get("payload")
         if not isinstance(payload, dict):
             continue
+        kind = payload.get("type")
+        if kind == "user_message":
+            message = payload.get("message")
+            if (isinstance(message, str) and message
+                    and not message.lstrip().startswith("<")):
+                has_visible_user_message = True
         turn_id = payload.get("turn_id")
         if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
             continue
-        kind = payload.get("type")
         if kind == "task_started":
             started.add(turn_id)
             ordered.append((kind, turn_id))
@@ -566,4 +752,6 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
             finished.add(turn_id)
             ordered.append((kind, turn_id))
     return TurnMarkers(
-        frozenset(started), frozenset(finished), carry, tuple(ordered))
+        frozenset(started), frozenset(finished), carry, tuple(ordered),
+        has_visible_user_message,
+    )

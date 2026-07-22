@@ -7,6 +7,7 @@ Run: ./.venv/bin/python -m pytest tests/test_history.py -q
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -64,6 +65,32 @@ def test_history_revision_is_boot_scoped_and_monotonic():
     assert restarted._history_revision("s1") != initial
     assert first._bump_history_revision("s1") != initial
     assert first._history_revision("s1").endswith("-1")
+
+
+def test_external_codex_turn_is_history_activity_not_resident_state(monkeypatch):
+    """A mirrored native turn marks History active without owning Stop."""
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: None)
+
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("external-codex", "external-codex")
+        ctx.engine = "codex"
+        ctx.state = "idle"
+        machine.sessions[ctx.key] = ctx
+        machine._watch["external-codex"] = {
+            "engine": "codex",
+            "external": True,
+            "active_external_turns": {"native-turn": 1.0},
+            "takeover_pending": None,
+        }
+
+        history = await machine._build_history("external-codex", limit=20)
+
+        assert history.external is True
+        assert history.in_progress is True
+        assert ctx.state == "idle"
+
+    asyncio.run(go())
 
 
 def test_inflight_history_keeps_pre_rollback_revision(monkeypatch):
@@ -337,6 +364,107 @@ def test_oversized_transcript_is_rejected_before_full_parse(monkeypatch, tmp_pat
 
     asyncio.run(go())
     assert parsed is False
+
+
+def test_oversized_codex_rollout_reads_recent_turn_window(monkeypatch, tmp_path):
+    source = tmp_path / "huge-rollout.jsonl"
+    with source.open("wb") as rollout:
+        # A sparse prefix makes the source larger than the Claude transcript
+        # safety cap without allocating or parsing a giant test fixture.
+        rollout.seek(70 * 1024 * 1024)
+        rollout.write(b"\n")
+        for index in range(1, 4):
+            for row in (
+                {"timestamp": f"2026-01-01T00:0{index}:01Z",
+                 "type": "event_msg",
+                 "payload": {"type": "task_started",
+                             "turn_id": f"turn-{index}"}},
+                {"timestamp": f"2026-01-01T00:0{index}:02Z",
+                 "type": "event_msg",
+                 "payload": {"type": "user_message",
+                             "message": f"question {index}"}},
+                {"timestamp": f"2026-01-01T00:0{index}:03Z",
+                 "type": "event_msg",
+                 "payload": {"type": "agent_message",
+                             "message": f"answer {index}"}},
+                {"timestamp": f"2026-01-01T00:0{index}:04Z",
+                 "type": "event_msg",
+                 "payload": {"type": "task_complete",
+                             "turn_id": f"turn-{index}"}},
+            ):
+                rollout.write((json.dumps(row) + "\n").encode())
+
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(source))
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine.cfg.history_source_max_bytes = 64 * 1024 * 1024
+        ctx = _mk_ctx("codex-large", "codex-large")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        newest = await machine._build_history("codex-large", limit=2)
+        assert [row["prompt"] for row in newest.events
+                if row["type"] == "user_msg"] == ["question 2", "question 3"]
+        assert newest.oldest_id == "turn-2"
+        assert newest.newest_id == "turn-3"
+        assert newest.has_more is True
+        assert not any("HISTORY_SOURCE_MAX_BYTES" in row.get("message", "")
+                       for row in newest.events)
+
+    asyncio.run(go())
+
+
+def test_compacted_codex_tail_recovers_omitted_current_prompt(
+        monkeypatch, tmp_path):
+    source = tmp_path / "compacted-rollout.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "codex-compacted"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-long"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message",
+                     "message": "the prompt before compact"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "commentary",
+                     "message": "work before compact"}},
+        # One compact record is larger than the configured source window. The
+        # newest-page translator therefore starts after it, just like a real
+        # multi-hundred-MiB turn, while the prompt remains recoverable from the
+        # already-discovered task boundary.
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "compacted",
+         "payload": {"replacement_history": ["x" * (1100 * 1024)]}},
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "answer after compact"}},
+        {"timestamp": "2026-01-01T00:00:07Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-long"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(source))
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine.cfg.codex_history_window_max_bytes = 1024 * 1024
+        ctx = _mk_ctx("codex-compacted", "codex-compacted")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        newest = await machine._build_history("codex-compacted", limit=60)
+        assert [row["prompt"] for row in newest.events
+                if row["type"] == "user_msg"] == [
+                    "the prompt before compact"
+                ]
+        assert any(row.get("type") == "delta"
+                   and "answer after compact" in row.get("text", "")
+                   for row in newest.events)
+        assert newest.oldest_id == "turn-long"
+        assert newest.has_more is True
+
+    asyncio.run(go())
 
 
 def test_get_history_survives_transcript_read_failure(monkeypatch):

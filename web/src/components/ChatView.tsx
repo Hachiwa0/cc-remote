@@ -343,7 +343,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
             )}
             {t.blocks.length > 0 ? (
               <>
-                <ProcessTimeline blocks={t.blocks} done={t.done}
+                <ProcessTimeline blocks={t.blocks} done={t.done} engine={engine}
                   durationMs={t.durationMs} startTs={t.ts}
                   onOpenFile={onOpenFile} />
                 {finalTextBlocks(t.blocks).map((block) => (

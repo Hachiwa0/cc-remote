@@ -36,6 +36,36 @@ def test_codex_child_environment_drops_control_plane_secrets(monkeypatch):
     assert all(key not in sanitized_child_env() for key in CONTROL_PLANE_SECRET_KEYS)
 
 
+def test_codex_proxy_is_scoped_to_codex_children(monkeypatch):
+    monkeypatch.setenv("CC_REMOTE_CODEX_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("NO_PROXY", "internal.example")
+
+    clean = _codex_env("codex")
+
+    assert clean["HTTP_PROXY"] == "http://127.0.0.1:7897"
+    assert clean["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert clean["http_proxy"] == "http://127.0.0.1:7897"
+    assert clean["https_proxy"] == "http://127.0.0.1:7897"
+    assert clean["NO_PROXY"].split(",") == [
+        "internal.example", "127.0.0.1", "localhost", "::1",
+    ]
+    assert os.environ.get("HTTP_PROXY") != "http://127.0.0.1:7897"
+
+
+@pytest.mark.parametrize("value", [
+    "http://user:secret@127.0.0.1:7897",
+    "http://127.0.0.1:7897/path",
+    "ftp://127.0.0.1:7897",
+])
+def test_wrapper_rejects_unsafe_codex_proxy(value):
+    cfg = WrapperConfig(
+        wrapper_token="a" * 32,
+        codex_proxy=value,
+    )
+    with pytest.raises(ValueError, match="CC_REMOTE_CODEX_PROXY"):
+        validate_wrapper_config(cfg)
+
+
 def test_claude_sdk_options_override_inherited_control_secrets(monkeypatch):
     for key in CONTROL_PLANE_SECRET_KEYS:
         monkeypatch.setenv(key, f"secret-{key}")

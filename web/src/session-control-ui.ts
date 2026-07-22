@@ -148,12 +148,12 @@ export function presentSessionControl(control: SessionControl): ControlPresentat
     case "desktop":
       return {
         ...base,
-        title: "桌面端控制 · 只读",
-        detail: reason || "此会话由桌面端控制，Web 仅用于查看实时状态。",
-        placeholder: "桌面端控制中 — Web 仅供查看",
-        connection: "桌面端同步通道",
-        backend: "已连接",
-        terminal: control.terminal_attached ? "已确认桌面端" : "未确认",
+        title: "Codex App 使用中 · Web 只读",
+        detail: reason || "Codex App 正在运行此会话；消息会实时同步，完成后 Web 自动恢复可写。",
+        placeholder: "Codex App 使用中 — Web 只读",
+        connection: "Codex App 私有 app-server",
+        backend: "App 会话运行中",
+        terminal: "Codex App 使用中",
       };
     case "remote":
       return {

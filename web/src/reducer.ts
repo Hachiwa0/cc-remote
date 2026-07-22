@@ -165,6 +165,9 @@ export interface Artifact {
 export interface SessionRuntime {
   turns: Turn[];
   state: State;
+  // Display-only activity observed from a native/external client. It must not
+  // grant Stop/Interrupt semantics to a turn this wrapper does not own.
+  mirroredRunning: boolean;
   model: string;
   effort: string;
   perm: string;
@@ -186,6 +189,12 @@ export interface SessionRuntime {
   // generation. Pagination never advances it.
   historyGeneration: string | null;
   historyBuildSeq: number;
+  // A browser-triggered older-page response has been installed for the current
+  // history revision/generation. Subsequent newest-page refreshes are only a
+  // moving head window and must not discard those already-loaded older pages.
+  // This is deliberately distinct from IndexedDB hydration: an authoritative
+  // first page must still be able to replace stale cached rows.
+  hasLoadedOlderHistory: boolean;
   // Greatest downstream sequence that confirmed a turn on this connection.
   // A History captured before it may merge rows but cannot delete the live tail.
   lastLiveSeq: number;
@@ -267,7 +276,8 @@ export function createRuntime(): SessionRuntime {
     // These are authoritative engine settings.  A newly-created browser runtime
     // has not heard them yet, so keep them unknown instead of briefly claiming a
     // model, effort, or permission policy that may not match the native CLI.
-    turns: [], state: "idle", model: "", effort: "", perm: "",
+    turns: [], state: "idle", mirroredRunning: false,
+    model: "", effort: "", perm: "",
     collaborationMode: "default",
     fast: null,
     control: null, controlGeneration: null, hasRevisionedControl: false,
@@ -276,6 +286,7 @@ export function createRuntime(): SessionRuntime {
     historyInvalidated: false,
     historyRevision: null, pendingHistoryRevision: null,
     historyGeneration: null, historyBuildSeq: 0, lastLiveSeq: 0,
+    hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
     pendingQuestion: null, contextReport: null,
     contextRequestId: null, contextError: null, goal: null,
@@ -691,6 +702,9 @@ function switchControlGeneration(
   if (!generation || generation === runtime.controlGeneration) return;
   clearSessionControl(runtime);
   runtime.controlGeneration = generation;
+  // History pages are scoped to one wrapper generation. A cursor/page loaded
+  // from the previous process must never be merged across a restart boundary.
+  runtime.hasLoadedOlderHistory = false;
 }
 
 function applySessionControl(
@@ -1122,6 +1136,17 @@ function reduceEvent(
           : state.newChat,
       };
     }
+    case "session_activity": {
+      let changed = false;
+      const sessions = state.sessions.map((session) => {
+        if (session.session_id !== e.session_id || session.state === e.state) {
+          return session;
+        }
+        changed = true;
+        return { ...session, state: e.state };
+      });
+      return changed ? { ...state, sessions } : state;
+    }
     case "work_dashboard":
     case "work_artifacts":
       // Work dashboard state is owned by App because it is engine-scoped and
@@ -1144,6 +1169,7 @@ function reduceEvent(
         // Keep the accepted generation until replacement arrives: a slow
         // pre-rollback build from that same generation must remain rejectable.
         rt.historyBuildSeq = 0;
+        rt.hasLoadedOlderHistory = false;
         rt.hydratedCacheTurnIds = [];
         rt.loading = true;
       }, true);
@@ -1218,6 +1244,14 @@ function reduceEvent(
       }
       const racedLiveEvent = !e.before && e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
+      const preserveStableHeadHistory = !e.before
+        && base.turns.length > 0
+        && (base.hasLoadedOlderHistory || e.has_more === true)
+        && !base.historyInvalidated
+        && base.historyRevision === e.revision
+        && (e.generation != null
+          ? base.historyGeneration === e.generation
+          : base.historyGeneration == null);
       let turns: Turn[];
       if (e.before) {
         // pagination (load older): PREPEND the older turns ahead of what we have,
@@ -1229,7 +1263,13 @@ function reduceEvent(
         // genuinely unfinished local tail; arbitrary completed cache rows may
         // have been removed by rollback while this browser was offline.
         const cached = new Set(base.hydratedCacheTurnIds);
-        const liveTail = racedLiveEvent
+        const liveTail = preserveStableHeadHistory
+          // A bounded newest page is a moving head window, not the whole
+          // conversation. Keep rows already painted from live traffic or from
+          // explicit older pages. This is essential when compact makes the
+          // current turn itself larger than the backend byte window.
+          ? base.turns
+          : racedLiveEvent
           // This History started before a live event already painted by the
           // browser. Keep every non-cache local row (including a just-completed
           // TurnEnd); the stale frame may add history but cannot delete it.
@@ -1238,6 +1278,7 @@ function reduceEvent(
         turns = mergeInitialHistory(
           built.turns,
           liveTail, {
+          attachAssistantOnlySuffix: preserveStableHeadHistory,
           // History's final TurnEnd is synthetic: Claude transcripts do not
           // contain ResultMessage. A newer live event always wins; otherwise an
           // explicit in_progress value is authoritative, and only an older
@@ -1273,12 +1314,15 @@ function reduceEvent(
           [sid]: {
             ...base, turns, loading: false,
             state: acceptsControlState && !racedLiveEvent
-              && e.in_progress != null
+              && e.external !== true && e.in_progress != null
               ? (e.in_progress
                   ? (base.state === "interrupting" || base.state === "draining"
                       ? base.state : "running")
                   : "idle")
               : base.state,
+            mirroredRunning: acceptsControlState && !racedLiveEvent
+              ? e.external === true && e.in_progress === true
+              : base.mirroredRunning,
             historyInvalidated: acceptsControlState
               ? false : base.historyInvalidated,
             historyRevision: acceptsControlState
@@ -1291,6 +1335,11 @@ function reduceEvent(
             historyBuildSeq: acceptsControlState
               ? (e.build_seq ?? base.historyBuildSeq)
               : base.historyBuildSeq,
+            hasLoadedOlderHistory: e.before
+              ? true
+              : preserveStableHeadHistory
+                ? base.hasLoadedOlderHistory
+                : false,
             hydratedCacheTurnIds: acceptsControlState
               ? [] : base.hydratedCacheTurnIds,
             // A first-page History can finish after a live thread-settings
@@ -1302,10 +1351,14 @@ function reduceEvent(
               ? built.model : base.model,
             effort: acceptsControlState && !racedLiveEvent && hadEffort
               ? built.effort : base.effort,
-            hasMore: historyTrimmed ? false : e.has_more,
-            oldestId: historyTrimmed
-              ? (turns[0]?.id ?? null)
-              : (e.oldest_id ?? base.oldestId),
+            // Browser retention and server pagination are independent. When
+            // the newest window is bounded locally, keep the authoritative
+            // backend cursor so compacted/older transcript pages remain
+            // reachable through "load earlier history".
+            hasMore: preserveStableHeadHistory
+              ? base.hasMore : e.has_more,
+            oldestId: preserveStableHeadHistory
+              ? base.oldestId : (e.oldest_id ?? base.oldestId),
             truncated: base.truncated || historyTrimmed,
             // A native `claude`/`codex` in the terminal owns this session and is
             // appending to its transcript; the wrapper mirrors those appends here.
@@ -1460,6 +1513,9 @@ function reduceEvent(
     case "state":
       return patch(state, e.sid, (rt) => {
         rt.state = e.state;
+        // A direct lifecycle frame belongs to this wrapper's resident turn and
+        // supersedes any older rollout-only activity projection.
+        rt.mirroredRunning = false;
         const turns = cloneTurns(rt.turns);
         const turn = e.msg_id
           ? turns.find((candidate) => candidate.id === e.msg_id)
@@ -1582,6 +1638,7 @@ function reduceEvent(
           // inside this envelope will immediately replace this with its token.
           rt.pendingHistoryRevision = null;
           rt.hydratedCacheTurnIds = [];
+          rt.hasLoadedOlderHistory = false;
           if (e.rebuild) {
             // The wrapper generation (and every SessionContext seq) restarted.
             // Never compare the new generation against old live/build watermarks.

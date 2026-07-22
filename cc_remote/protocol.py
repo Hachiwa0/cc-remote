@@ -711,6 +711,21 @@ class SessionList(_Base):
     sessions: list[SessionInfo]
 
 
+class SessionActivity(_Base):
+    """Lightweight sidebar lifecycle for a session that need not be resident.
+
+    Native Codex App turns can update a rollout owned by another app-server, so
+    the wrapper may know that a cold session is running without having a live
+    conversation runtime for it.  Keep this separate from ``StateEvent``: the
+    latter controls the composer/runtime, while this event only updates catalog
+    presentation.
+    """
+    type: Literal["session_activity"] = "session_activity"
+    engine: Literal["claude", "codex"]
+    session_id: WireId
+    state: State
+
+
 class SwitchSession(_Command):
     """client -> wrapper: resume a different existing session. `engine` tells the
     wrapper which backend to resume it with (codex threads resume differently)."""
@@ -1278,6 +1293,11 @@ class ContextReport(_Base):
     total_tokens: int
     max_tokens: int
     percentage: float
+    # Codex does not expose tokenUsage immediately after an excludeTurns resume.
+    # Keep the numeric fields for wire compatibility, but mark the reading as
+    # unavailable instead of presenting a fabricated 0% to the user.  ``None``
+    # is omitted so older Code reports retain their exact historical shape.
+    available: Optional[bool] = None
     # Work reports keep the engine's real context usage above for honest
     # remaining-capacity calculations, while exposing the fresh-session startup
     # zero point separately so Work shows later conversation growth.
@@ -1712,7 +1732,7 @@ class GoalState(_Base):
 AnyMessage = Union[
     Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
-    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
+    SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
@@ -1818,6 +1838,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "clear_goal": ClearGoal,
     "goal_state": GoalState,
     "session_list": SessionList,
+    "session_activity": SessionActivity,
     "session_focus": SessionFocus,
     "session_rekey": SessionRekey,
     "work_dashboard": WorkDashboard,
@@ -1871,17 +1892,21 @@ def deserialize(raw: str | bytes) -> AnyMessage:
 
 
 def serialize(msg: BaseModel) -> str:
-    if isinstance(msg, ContextReport) and all(
-        value is None for value in (
-            msg.session_tokens, msg.fixed_tokens, msg.session_percentage,
-        )
-    ):
-        # Keep the existing Code wire shape byte-for-field compatible. The
-        # optional breakdown exists only on Work reports that actually have a
-        # trustworthy new-session baseline.
-        return msg.model_dump_json(exclude={
-            "session_tokens", "fixed_tokens", "session_percentage",
-        })
+    if isinstance(msg, ContextReport):
+        exclude: set[str] = set()
+        if all(value is None for value in (
+                msg.session_tokens, msg.fixed_tokens,
+                msg.session_percentage)):
+            # Keep the existing Code wire shape byte-for-field compatible. The
+            # optional breakdown exists only on Work reports that actually have
+            # a trustworthy new-session baseline.
+            exclude.update({
+                "session_tokens", "fixed_tokens", "session_percentage",
+            })
+        if msg.available is None:
+            exclude.add("available")
+        if exclude:
+            return msg.model_dump_json(exclude=exclude)
     return msg.model_dump_json()
 
 

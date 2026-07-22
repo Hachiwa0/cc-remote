@@ -63,6 +63,7 @@ import { processBlocks } from "../src/process-blocks.ts";
 import {
   bumpSessionActivity,
   compareSessionsByActivity,
+  mergeSessionActivityState,
   orderCodeDirectoryGroups,
   sessionCommandTarget,
   setSessionPinned,
@@ -74,6 +75,12 @@ assert.equal(sessionActivityTime("2026-07-17T10:00:00Z"),
   Date.parse("2026-07-17T10:00:00Z"), "ISO Claude activity timestamps must sort correctly");
 assert.ok(sessionActivityTime("1752746400000") > sessionActivityTime("1752746399"),
   "millisecond and second timestamps must share one ordering scale");
+assert.equal(mergeSessionActivityState("running", "idle"), "running",
+  "catalog-native activity must not be overwritten by an idle resident runtime");
+assert.equal(mergeSessionActivityState("idle", "running"), "running",
+  "a locally running resident runtime remains authoritative");
+assert.equal(mergeSessionActivityState("running", "interrupting"), "interrupting",
+  "an explicit local transition overrides catalog activity");
 
 assert.deepEqual(
   permsFor("claude").map(({ id, name, short }) => ({ id, name, short })),
@@ -255,6 +262,12 @@ assert.match(historyAppSource,
   "a failed non-authoritative History must not reopen the IndexedDB cache barrier");
 assert.match(historyAppSource, /artifact_invalidated[\s\S]*sendGetWorkArtifacts/,
   "file rollback must refresh the Work artifact inventory");
+assert.match(historyAppSource,
+  /const effectiveState = mergeSessionActivityState\([\s\S]*focusedSessionState/,
+  "catalog or mirrored native work must paint a running header without granting a local Stop action");
+assert.match(historyAppSource,
+  /liveStates=\{Object\.fromEntries\(state\.sessions\.map[\s\S]*mergeSessionActivityState/,
+  "catalog or mirrored native work must paint a running session badge in the sidebar");
 const rewindChatViewSource = readFileSync(resolve(
   process.cwd(), "src/components/ChatView.tsx"), "utf8");
 const rewindComposerSource = readFileSync(resolve(
@@ -804,6 +817,33 @@ try {
     "an authoritative list must clear a session deleted by another client");
   assert.ok(staleFocused.newChat,
     "the removed transcript must not remain painted while a replacement focus is chosen");
+  const backgroundRunning = reduce({
+    ...initialState,
+    sessions: [{
+      session_id: "private-app-session",
+      engine: "codex",
+      space: "code",
+      summary: "private app",
+      state: "idle",
+    }],
+  }, { type: "event", event: event({
+    type: "session_activity",
+    engine: "codex",
+    session_id: "private-app-session",
+    state: "running",
+  }) });
+  assert.equal(backgroundRunning.sessions[0].state, "running",
+    "a private Codex App turn must light the non-focused sidebar row");
+  const backgroundIdle = reduce(backgroundRunning, {
+    type: "event", event: event({
+      type: "session_activity",
+      engine: "codex",
+      session_id: "private-app-session",
+      state: "idle",
+    }),
+  });
+  assert.equal(backgroundIdle.sessions[0].state, "idle",
+    "the sidebar row must clear when the private App turn completes");
 
   const {
     buildCalendarDays, parseLocalDateTime, placeDateTimePopover, toLocalDateTime,
@@ -1283,6 +1323,29 @@ try {
   assert.equal(liveHistory.runtimes[liveHistorySid].state, "running");
   assert.equal(liveHistory.runtimes[liveHistorySid].turns[0].done, false);
 
+  // A native/external Codex turn is visually active in the sidebar but does
+  // not become a wrapper-owned running state. Otherwise the composer exposes a
+  // Stop action which cannot interrupt that external writer.
+  const mirroredSid = "external-history-activity";
+  let mirroredState = {
+    ...initialState, focusedSid: mirroredSid,
+    runtimes: { [mirroredSid]: createRuntime() },
+  };
+  mirroredState = reduce(mirroredState, { type: "event", event: event({
+    type: "history", sid: mirroredSid, session_id: mirroredSid,
+    revision: "external-activity-rev", build_seq: 1,
+    external: true, in_progress: true, has_more: false, events: [],
+  }) });
+  assert.equal(mirroredState.runtimes[mirroredSid].state, "idle");
+  assert.equal(mirroredState.runtimes[mirroredSid].mirroredRunning, true);
+  mirroredState = reduce(mirroredState, { type: "event", event: event({
+    type: "history", sid: mirroredSid, session_id: mirroredSid,
+    revision: "external-activity-rev", build_seq: 2,
+    external: false, in_progress: false, has_more: false, events: [],
+  }) });
+  assert.equal(mirroredState.runtimes[mirroredSid].state, "idle");
+  assert.equal(mirroredState.runtimes[mirroredSid].mirroredRunning, false);
+
   const fallbackHistory = reduce({
     ...liveHistory,
     runtimes: { [liveHistorySid]: {
@@ -1407,6 +1470,91 @@ try {
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
     (turn: { id: string }) => turn.id), ["stale-page", "older-page", "new"]);
 
+  // A targeted newest-page refresh is only the moving head window. Once this
+  // browser has explicitly paged backwards, that refresh must retain the older
+  // pages and their floor cursor instead of collapsing the conversation back
+  // to the handful of newest events.
+  const pagedHeadSid = "paged-history-survives-head-refresh";
+  let pagedHead = reduce({ ...initialState, focusedSid: pagedHeadSid }, {
+    type: "event", event: event({
+      type: "history", sid: pagedHeadSid, session_id: pagedHeadSid,
+      revision: "paged-rev", generation: "wrapper-one", build_seq: 1,
+      has_more: true, oldest_id: "head-cursor", events: [
+        event({ type: "user_msg", sid: pagedHeadSid,
+          msg_id: "head-one", prompt: "head one", ts: 30 }),
+        event({ type: "turn_end", sid: pagedHeadSid,
+          result: { subtype: "success", duration_ms: 1, is_error: false } }),
+      ],
+    }),
+  });
+  pagedHead = reduce(pagedHead, { type: "event", event: event({
+    type: "history", sid: pagedHeadSid, session_id: pagedHeadSid,
+    revision: "paged-rev", generation: "wrapper-one", build_seq: 1,
+    before: "head-cursor", has_more: false, oldest_id: "history-floor",
+    events: [
+      event({ type: "user_msg", sid: pagedHeadSid,
+        msg_id: "older-one", prompt: "older one", ts: 10 }),
+      event({ type: "turn_end", sid: pagedHeadSid,
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  }) });
+  pagedHead = reduce(pagedHead, { type: "event", event: event({
+    type: "history", sid: pagedHeadSid, session_id: pagedHeadSid,
+    revision: "paged-rev", generation: "wrapper-one", build_seq: 2,
+    has_more: true, oldest_id: "new-head-cursor", events: [
+      event({ type: "user_msg", sid: pagedHeadSid,
+        msg_id: "head-two", prompt: "head two", ts: 40 }),
+      event({ type: "turn_end", sid: pagedHeadSid,
+        result: { subtype: "success", duration_ms: 1, is_error: false } }),
+    ],
+  }) });
+  assert.deepEqual(pagedHead.runtimes[pagedHeadSid].turns.map(
+    (turn: { id: string }) => turn.id), ["older-one", "head-one", "head-two"]);
+  assert.equal(pagedHead.runtimes[pagedHeadSid].hasMore, false,
+    "a head refresh cannot reopen pagination after the browser reached the floor");
+  assert.equal(pagedHead.runtimes[pagedHeadSid].oldestId, "history-floor");
+  assert.equal(pagedHead.runtimes[pagedHeadSid].hasLoadedOlderHistory, true);
+
+  // Even before the user explicitly paginates, a same-revision compact/head
+  // refresh is only a suffix. It must not erase rows already rendered from the
+  // live stream or the first bounded page.
+  const compactHeadSid = "compact-head-keeps-painted-history";
+  let compactHead = reduce({ ...initialState, focusedSid: compactHeadSid }, {
+    type: "event", event: event({
+      type: "history", sid: compactHeadSid, session_id: compactHeadSid,
+      revision: "compact-rev", generation: "wrapper-one", build_seq: 1,
+      has_more: true, oldest_id: "original-cursor", events: [
+        event({ type: "user_msg", sid: compactHeadSid,
+          msg_id: "long-turn", prompt: "original prompt", ts: 10 }),
+        event({ type: "assistant_msg_start", sid: compactHeadSid,
+          message_id: "before-compact", channel: "commentary" }),
+        event({ type: "delta", sid: compactHeadSid,
+          message_id: "before-compact", text: "before compact" }),
+      ],
+    }),
+  });
+  compactHead = reduce(compactHead, { type: "event", event: event({
+    type: "history", sid: compactHeadSid, session_id: compactHeadSid,
+    revision: "compact-rev", generation: "wrapper-one", build_seq: 2,
+    has_more: true, oldest_id: "forced-tail-cursor", events: [
+      event({ type: "user_msg", sid: compactHeadSid,
+        msg_id: "long-turn", prompt: "original prompt", ts: 10 }),
+      event({ type: "assistant_msg_start", sid: compactHeadSid,
+        message_id: "after-compact", channel: "commentary" }),
+      event({ type: "delta", sid: compactHeadSid,
+        message_id: "after-compact", text: "after compact" }),
+    ],
+  }) });
+  assert.equal(compactHead.runtimes[compactHeadSid].turns.length, 1);
+  assert.equal(compactHead.runtimes[compactHeadSid].turns[0].prompt,
+    "original prompt");
+  assert.match(JSON.stringify(compactHead.runtimes[compactHeadSid].turns[0]),
+    /before compact/);
+  assert.match(JSON.stringify(compactHead.runtimes[compactHeadSid].turns[0]),
+    /after compact/);
+  assert.equal(compactHead.runtimes[compactHeadSid].oldestId,
+    "original-cursor");
+
   // A real wrapper restart owns a new generation, so its build counter may
   // legitimately start from one even when the previous generation reached two.
   orderedHistory = reduce(orderedHistory, { type: "event", event: event({
@@ -1421,6 +1569,30 @@ try {
   }) });
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
     (turn: { id: string }) => turn.id), ["after-restart"]);
+
+  // Browser retention must not erase the backend's pagination cursor. A long
+  // newest page can be locally bounded to 200 completed turns while the server
+  // still has older transcript windows available.
+  const boundedCursorSid = "bounded-history-keeps-server-cursor";
+  const manyHistoryEvents = Array.from({ length: 240 }, (_, index) => [
+    event({ type: "user_msg", sid: boundedCursorSid,
+      msg_id: `bounded-${index}`, prompt: `question ${index}` }),
+    event({ type: "turn_end", sid: boundedCursorSid,
+      result: { subtype: "success", duration_ms: 1, is_error: false } }),
+  ]).flat();
+  const boundedCursorState = reduce({
+    ...initialState, focusedSid: boundedCursorSid,
+  }, { type: "event", event: event({
+    type: "history", sid: boundedCursorSid, session_id: boundedCursorSid,
+    revision: "bounded-cursor-rev", generation: "wrapper-one",
+    build_seq: 1, has_more: true, oldest_id: "server-byte-cursor",
+    events: manyHistoryEvents,
+  }) });
+  assert.equal(boundedCursorState.runtimes[boundedCursorSid].turns.length, 200);
+  assert.equal(boundedCursorState.runtimes[boundedCursorSid].hasMore, true);
+  assert.equal(boundedCursorState.runtimes[boundedCursorSid].oldestId,
+    "server-byte-cursor");
+  assert.equal(boundedCursorState.runtimes[boundedCursorSid].truncated, true);
 
   const failedHistorySid = "non-authoritative-history";
   const preservedTurn = {
@@ -2024,6 +2196,43 @@ try {
   assert.match(declinedMarkup, /process-declined/);
   assert.match(declinedMarkup, /M18 6L6 18M6 6l12 12/);
 
+  const codexProcessMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex", done: true,
+    blocks: [
+      { kind: "text", message_id: "private-thought", channel: "thinking",
+        text: "private reasoning must stay hidden", done: true },
+      { kind: "process", item_id: "reasoning-row", processKind: "reasoning",
+        phase: "end", status: "succeeded", title: "思考",
+        summary: "synthetic reasoning row", done: true },
+      { kind: "tool", message_id: "tool-a-message", tool_use_id: "tool-a",
+        tool: "shell", input: { command: "pwd" }, done: true,
+        result: { content: "/tmp", is_error: false } },
+      { kind: "tool", message_id: "tool-b-message", tool_use_id: "tool-b",
+        tool: "shell", input: { command: "ls" }, done: true,
+        result: { content: "file", is_error: false } },
+    ],
+  }));
+  assert.doesNotMatch(codexProcessMarkup, /private reasoning must stay hidden/);
+  assert.doesNotMatch(codexProcessMarkup, /synthetic reasoning row/);
+  assert.match(codexProcessMarkup, /2 个工具调用/);
+  assert.doesNotMatch(codexProcessMarkup, /class="tool-group"/,
+    "a completed Codex process must not render tool details until the user opens it");
+  const { ToolGroup } = await reducerHarness.ssrLoadModule(
+    "/src/components/ToolGroup.tsx");
+  const collapsedToolMarkup = renderToStaticMarkup(createElement(ToolGroup, {
+    tools: [
+      { kind: "tool", message_id: "tool-a-message", tool_use_id: "tool-a",
+        tool: "shell", input: { command: "pwd" }, done: true,
+        result: { content: "/tmp", is_error: false } },
+      { kind: "tool", message_id: "tool-b-message", tool_use_id: "tool-b",
+        tool: "shell", input: { command: "ls" }, done: true,
+        result: { content: "file", is_error: false } },
+    ],
+  }));
+  assert.match(collapsedToolMarkup, /2 个工具调用/);
+  assert.doesNotMatch(collapsedToolMarkup, /<details class="tool-group" open/,
+    "Codex tool batches must stay collapsed until the user opens them");
+
   // A background task can be consumed after ResultMessage, when a new turn is
   // already open. Its authoritative engine turn id must route it back to the
   // old turn instead of creating a phantom third turn or attaching to the tail.
@@ -2415,7 +2624,10 @@ try {
     "desktop remains fail-closed even if a producer says writable");
   assert.equal(desktopControl.action, undefined);
   assert.equal(desktopControl.remote, "只读");
-  assert.match(desktopControl.title, /只读/);
+  assert.equal(desktopControl.title, "Codex App 使用中 · Web 只读");
+  assert.equal(desktopControl.placeholder, "Codex App 使用中 — Web 只读");
+  assert.equal(desktopControl.connection, "Codex App 私有 app-server");
+  assert.equal(desktopControl.terminal, "Codex App 使用中");
   const exitedBrokerControl = presentSessionControl(control(
     37, "claude_broker", "input_busy", {
       terminal_attached: false,
@@ -2835,6 +3047,10 @@ assert.match(composerSource, /会话新增上下文/);
 assert.match(composerSource, /workContext\.sessionPercentage\.toFixed\(0\)/);
 assert.match(composerSource, /p\.contextReport\.percentage\.toFixed\(0\)/,
   "Code must retain the engine-total context reading");
+assert.match(composerSource, /contextAvailable = p\.contextReport\?\.available !== false/,
+  "an absent tokenUsage report must not be rendered as a real zero");
+assert.match(composerSource, /尚未收到 Codex 的 tokenUsage/,
+  "the context popover must explain the temporary unknown state");
 assert.match(composerSource, /ref=\{workSettingsRef\}/);
 assert.match(composerSource, /document\.addEventListener\("pointerdown", onPointerDown\)/);
 assert.match(composerSource, /disabled=\{locked\}[\s\S]*?: "选择模型"/,
@@ -2884,7 +3100,7 @@ assert.match(appCssSource,
   "mobile Work settings must use the full composer footer instead of overflowing its trigger");
 const sessionControlUiSource = readFileSync(
   resolve(process.cwd(), "src/session-control-ui.ts"), "utf8");
-assert.match(sessionControlUiSource, /桌面端控制 · 只读/);
+assert.match(sessionControlUiSource, /Codex App 使用中 · Web 只读/);
 assert.match(sessionControlUiSource, /外部 CLI 控制中/);
 assert.match(sessionControlUiSource, /未检测到本机终端/,
   "backend connectivity must not be presented as confirmed terminal ownership");

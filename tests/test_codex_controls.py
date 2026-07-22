@@ -18,7 +18,11 @@ from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import machine as machine_module
-from cc_remote.wrapper.codex_handle import CodexHandle, CodexManagedOverflow
+from cc_remote.wrapper.codex_handle import (
+    CodexHandle,
+    CodexManagedOverflow,
+    _provider_error_diagnostic,
+)
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
@@ -32,11 +36,42 @@ class _Cfg:
     tool_result_max = 8000
 
 
+def test_provider_error_diagnostic_keeps_only_safe_classification():
+    diagnostic = _provider_error_diagnostic({
+        "willRetry": True,
+        "error": {
+            "message": "connection failed for SECRET_ENDPOINT",
+            "additionalDetails": "token=SECRET_TOKEN",
+            "codexErrorInfo": {
+                "responseStreamDisconnected": {"httpStatusCode": 503},
+            },
+        },
+    })
+
+    assert diagnostic == {
+        "will_retry": True,
+        "category": "upstream_server",
+        "http_status": 503,
+    }
+    assert "SECRET" not in repr(diagnostic)
+
+
 def test_codex_initialize_declares_experimental_api_for_collaboration_mode():
     assert codex_handle_module._initialize_params() == {
         "clientInfo": {"name": "cc-remote", "version": "0.1.0"},
         "capabilities": {"experimentalApi": True},
     }
+
+
+@pytest.mark.parametrize("version, expected", [
+    ("0.144.5", False),
+    ("0.144.6", True),
+    ("0.145.0-alpha.1", True),
+    (None, False),
+    ("invalid", False),
+])
+def test_codex_lightweight_resume_version_gate(version, expected):
+    assert codex_handle_module._supports_lightweight_resume(version) is expected
 
 
 _WORK_SKILLS_RESPONSE = {
@@ -677,6 +712,75 @@ def test_codex_turn_started_notification_tracks_automatic_turn_id():
     asyncio.run(run())
 
 
+def test_shared_codex_drops_unattributed_provider_error_from_other_thread():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._using_daemon_proxy = True
+        handle.thread_id = "current-thread"
+        handle.turn_id = "current-turn"
+        handle.turn_active = True
+        handle._turn_q = asyncio.Queue()
+
+        await handle._dispatch({
+            "method": "error",
+            "params": {
+                "willRetry": True,
+                "error": {"message": "Reconnecting... 2/5"},
+            },
+        })
+
+        assert handle._turn_q.empty()
+        assert handle.turn_active is True
+
+    asyncio.run(run())
+
+
+def test_shared_codex_keeps_attributed_provider_error_for_current_turn():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._using_daemon_proxy = True
+        handle.thread_id = "current-thread"
+        handle.turn_id = "current-turn"
+        handle.turn_active = True
+        handle._turn_q = asyncio.Queue()
+        message = {
+            "method": "error",
+            "params": {
+                "threadId": "current-thread",
+                "turnId": "current-turn",
+                "willRetry": True,
+                "error": {"message": "Reconnecting... 2/5"},
+            },
+        }
+
+        await handle._dispatch(message)
+
+        assert await asyncio.wait_for(handle._turn_q.get(), timeout=0.1) == message
+
+    asyncio.run(run())
+
+
+def test_private_codex_keeps_legacy_unattributed_provider_error():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "current-thread"
+        handle.turn_active = True
+        handle._turn_q = asyncio.Queue()
+        message = {
+            "method": "error",
+            "params": {
+                "willRetry": True,
+                "error": {"message": "Reconnecting... 2/5"},
+            },
+        }
+
+        await handle._dispatch(message)
+
+        assert await asyncio.wait_for(handle._turn_q.get(), timeout=0.1) == message
+
+    asyncio.run(run())
+
+
 def test_codex_spontaneous_lifecycle_detaches_old_queue_and_filters_local_turn():
     async def run():
         seen = []
@@ -790,6 +894,52 @@ def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
         codex_handle_module, "_codex_version", lambda path: versions[path])
 
     assert codex_handle_module._resolve_codex_bin() == "new"
+
+
+def test_oversized_resume_prefers_only_a_newer_official_desktop_core(
+        monkeypatch, tmp_path):
+    managed = tmp_path / "managed-codex"
+    desktop = tmp_path / "desktop-codex"
+    rollout = tmp_path / "rollout.jsonl"
+    managed.write_text("managed")
+    desktop.write_text("desktop")
+    managed.chmod(0o755)
+    desktop.chmod(0o755)
+    with rollout.open("wb") as stream:
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES)
+
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setattr(
+        codex_handle_module, "_CODEX_DESKTOP_BIN_CANDIDATES",
+        (str(desktop),),
+    )
+    monkeypatch.setattr(
+        codex_handle_module, "codex_rollout_path", lambda _sid: str(rollout))
+    versions = {
+        str(managed): (0, 144, 6),
+        str(desktop): (0, 145, 0),
+    }
+    monkeypatch.setattr(
+        codex_handle_module, "_codex_version", lambda path: versions[path])
+
+    choose = codex_handle_module._newer_private_core_for_oversized_resume
+    assert choose(str(managed), "huge-thread") == str(desktop)
+
+    with rollout.open("r+b") as stream:
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES - 1)
+    assert choose(str(managed), "small-thread") is None
+
+    with rollout.open("r+b") as stream:
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES)
+    versions[str(desktop)] = versions[str(managed)]
+    assert choose(str(managed), "same-version-thread") is None
+
+    versions[str(desktop)] = (0, 145, 0)
+    monkeypatch.setenv("CODEX_BIN", str(managed))
+    assert choose(str(managed), "explicit-bin-thread") is None
 
 
 def test_codex_binary_resolution_reprobes_after_symlink_upgrade(
@@ -1058,7 +1208,6 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
-
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
         calls = []
 
@@ -1068,7 +1217,7 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         async def request(method, params=None):
             calls.append((method, params))
             if method == "initialize":
-                return {"serverInfo": {"version": "0.144.1"}}
+                return {"userAgent": "codex_cli_rs/0.144.6 (test)"}
             if method == "skills/list":
                 return _WORK_SKILLS_RESPONSE
             if method == "config/read":
@@ -1091,6 +1240,7 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
 
         expected_resume = {
             "threadId": "resume-thread", "cwd": "/tmp",
+            "excludeTurns": True,
         }
         if work_mode:
             expected_resume.update({
@@ -1111,6 +1261,62 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
             "persisted-model", "ultra",
             "never" if work_mode else "on-request", "fast")
         await handle.disconnect()
+
+    asyncio.run(run())
+
+
+def test_codex_legacy_resume_rejects_oversized_rollout_before_request(
+        monkeypatch, tmp_path):
+    class FakeProcess:
+        pid = 424245
+        returncode = None
+        stdin = stdout = stderr = SimpleNamespace()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = 0
+
+    async def run():
+        process = FakeProcess()
+        rollout = tmp_path / "large.jsonl"
+        with rollout.open("wb") as stream:
+            stream.seek(codex_handle_module._PROXY_MESSAGE_MAX)
+            stream.write(b"\n")
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module, "codex_rollout_path", lambda _sid: str(rollout))
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec",
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
+        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+
+        handle = CodexHandle(_Cfg())
+        calls = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            if method == "initialize":
+                return {"userAgent": "codex_cli_rs/0.144.5 (test)"}
+            raise AssertionError(method)
+
+        handle._read_loop = idle
+        handle._drain_stderr = idle
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="不支持超长会话的轻量恢复"):
+            await handle.connect(resume_id="large-thread", cwd="/tmp")
+        assert [method for method, _params in calls] == ["initialize"]
+        assert handle.proc is None
 
     asyncio.run(run())
 
@@ -1157,7 +1363,7 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         async def request(method, params=None):
             calls.append((method, params))
             if method == "initialize":
-                return {"serverInfo": {"version": "0.144.1"}}
+                return {"userAgent": "codex_cli_rs/0.144.6 (test)"}
             if method == "skills/list":
                 return _WORK_SKILLS_RESPONSE
             if method == "config/read":
@@ -1289,7 +1495,7 @@ def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
         async def request(method, params=None):
             calls.append((method, params))
             if method == "initialize":
-                return {"serverInfo": {"version": "0.144.1"}}
+                return {"userAgent": "codex_cli_rs/0.144.6 (test)"}
             if method == "skills/list":
                 return _WORK_SKILLS_RESPONSE
             if method == "config/read":
@@ -1310,6 +1516,7 @@ def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
             "ephemeral": True,
             "cwd": "/tmp",
             "approvalPolicy": "never",
+            "excludeTurns": True,
         }
         if work_mode:
             expected_fork.update({

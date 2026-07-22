@@ -5,10 +5,10 @@ import asyncio
 import json
 
 from cc_remote.protocol import (
-    Effort, Error, Model, Query, SessionControl, Takeover,
+    Effort, Error, Model, Query, SessionActivity, SessionControl, Takeover,
 )
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
-from tests.test_codex_external import _CodexSdk, _watch
+from tests.test_codex_external import _CodexSdk, _record_async, _watch
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -16,6 +16,13 @@ def _event(kind: str, turn_id: str) -> bytes:
     return (json.dumps({
         "type": "event_msg",
         "payload": {"type": kind, "turn_id": turn_id},
+    }) + "\n").encode()
+
+
+def _user_event(message: str) -> bytes:
+    return (json.dumps({
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": message},
     }) + "\n").encode()
 
 
@@ -118,6 +125,113 @@ def test_shared_code_watcher_mirrors_growth_without_legacy_lock(tmp_path):
         assert ctx.write_state == "writable"
         assert ctx.terminal_attached is True
         assert ctx.control_can_takeover is False
+
+    asyncio.run(go())
+
+
+def test_shared_code_distinguishes_private_app_turn_from_shared_cli(tmp_path):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+
+        with path.open("ab") as stream:
+            stream.write(_event("task_started", "app-turn"))
+        await machine._poll_codex_watch(
+            "sid", watch, set(), 1000.0, writers=set()
+        )
+
+        assert watch["active_external_turns"] == {"app-turn": 1000.0}
+        assert watch["desktop_active"] is True
+        assert watch["external"] is True
+        assert ctx.control_mode == "desktop"
+        assert ctx.write_state == "read_only"
+        assert ctx.control_can_takeover is False
+        assert any(
+            isinstance(event, SessionActivity)
+            and event.session_id == "sid"
+            and event.state == "running"
+            for event in transport.sent
+        )
+
+        with path.open("ab") as stream:
+            stream.write(_event("task_complete", "app-turn"))
+        await machine._poll_codex_watch(
+            "sid", watch, set(), 1001.0, writers=set()
+        )
+
+        assert watch["active_external_turns"] == {}
+        assert watch["desktop_active"] is False
+        assert watch["external"] is False
+        assert ctx.control_mode == "codex_shared"
+        assert ctx.write_state == "writable"
+        assert any(
+            isinstance(event, SessionActivity)
+            and event.session_id == "sid"
+            and event.state == "idle"
+            for event in transport.sent
+        )
+
+        with path.open("ab") as stream:
+            stream.write(_event("task_started", "cli-turn"))
+        holder = ProcessIdentity(101, 1001)
+        await machine._poll_codex_watch(
+            "sid", watch, {holder}, 1002.0, writers={holder}
+        )
+
+        assert watch["active_external_turns"] == {"cli-turn": 1002.0}
+        assert watch["desktop_active"] is False
+        assert watch["external"] is False
+        assert ctx.control_mode == "codex_shared"
+        assert ctx.write_state == "writable"
+        assert ctx.terminal_attached is True
+
+    asyncio.run(go())
+
+
+def test_shared_cli_user_message_refreshes_after_earlier_task_start(tmp_path):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        mirrored: list[str] = []
+        machine._push_mirrored_history = lambda sid: _record_async(
+            mirrored, sid)
+        holder = ProcessIdentity(101, 1001)
+
+        # The real CLI flushes task_started first. That first refresh cannot
+        # contain the prompt yet.
+        with path.open("ab") as stream:
+            stream.write(_event("task_started", "cli-turn"))
+        await machine._poll_codex_watch(
+            "sid", watch, {holder}, 1000.0, writers={holder})
+        assert mirrored == ["sid"]
+
+        # user_message arrives in a separate append and must independently
+        # refresh the open browser instead of waiting for a session switch.
+        with path.open("ab") as stream:
+            stream.write(_user_event("在？测试测试"))
+        await machine._poll_codex_watch(
+            "sid", watch, {holder}, 1000.1, writers={holder})
+
+        assert mirrored == ["sid", "sid"]
+        assert watch["external"] is False
+        assert ctx.control_mode == "codex_shared"
+        assert ctx.write_state == "writable"
 
     asyncio.run(go())
 
@@ -264,7 +378,7 @@ def test_shared_terminal_exit_clears_attachment_on_next_complete_scan(tmp_path):
     asyncio.run(go())
 
 
-def test_shared_code_query_never_calls_legacy_ownership_probe(
+def test_shared_code_query_refreshes_activity_without_locking_cli(
     tmp_path, monkeypatch,
 ):
     async def go() -> None:
@@ -285,8 +399,11 @@ def test_shared_code_query_never_calls_legacy_ownership_probe(
         machine._watch["sid"] = watch
         monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
 
-        async def legacy_probe_must_not_run(_sid: str) -> bool:
-            raise AssertionError("shared Code queried legacy ownership")
+        activity_probes: list[str] = []
+
+        async def refresh_activity(probe_sid: str) -> bool:
+            activity_probes.append(probe_sid)
+            return False
 
         ran: list[tuple[str, str]] = []
 
@@ -295,7 +412,7 @@ def test_shared_code_query_never_calls_legacy_ownership_probe(
             await machine._set_state(session_ctx, "idle")
 
         monkeypatch.setattr(
-            machine, "_prime_codex_ownership", legacy_probe_must_not_run
+            machine, "_prime_codex_ownership", refresh_activity
         )
         monkeypatch.setattr(machine, "_run_turn", fake_turn)
 
@@ -305,13 +422,14 @@ def test_shared_code_query_never_calls_legacy_ownership_probe(
         assert result is None
         assert ctx.turn_task is not None
         await ctx.turn_task
+        assert activity_probes == ["sid"]
         assert ran == [("sid", "hello")]
         assert ctx.state == "idle"
 
     asyncio.run(go())
 
 
-def test_interrupted_shared_query_reconnects_without_legacy_lock(
+def test_interrupted_shared_query_reconnects_and_refreshes_activity(
     tmp_path, monkeypatch,
 ):
     async def go() -> None:
@@ -332,8 +450,11 @@ def test_interrupted_shared_query_reconnects_without_legacy_lock(
         machine._watch["sid"] = watch
         monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
 
-        async def legacy_probe_must_not_run(_sid: str) -> bool:
-            raise AssertionError("interrupted shared Code entered legacy ownership")
+        activity_probes: list[str] = []
+
+        async def refresh_activity(probe_sid: str) -> bool:
+            activity_probes.append(probe_sid)
+            return False
 
         ran: list[tuple[str, str]] = []
 
@@ -342,7 +463,7 @@ def test_interrupted_shared_query_reconnects_without_legacy_lock(
             await machine._set_state(session_ctx, "idle")
 
         monkeypatch.setattr(
-            machine, "_prime_codex_ownership", legacy_probe_must_not_run
+            machine, "_prime_codex_ownership", refresh_activity
         )
         monkeypatch.setattr(machine, "_run_turn", fake_turn)
 
@@ -353,6 +474,7 @@ def test_interrupted_shared_query_reconnects_without_legacy_lock(
         assert ctx.turn_task is not None
         await ctx.turn_task
         assert ctx.sdk.reconnects == 1
+        assert activity_probes == ["sid"]
         assert ctx.sdk.using_daemon_proxy is True
         assert ran == [("sid", "hello")]
         assert ctx.control_mode == "codex_shared"

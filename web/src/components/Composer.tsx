@@ -440,7 +440,8 @@ export function Composer(p: Props) {
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
   const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
   const workSurface = p.surface === "work";
-  const workContext = workSurface && p.contextReport
+  const contextAvailable = p.contextReport?.available !== false;
+  const workContext = workSurface && p.contextReport && contextAvailable
     ? workContextMetrics(p.contextReport)
     : null;
   // Do not substitute catalog defaults for an existing session.  Until the
@@ -610,11 +611,15 @@ export function Composer(p: Props) {
                     <span>思考强度</span><b>{effort?.name ?? "读取中"}</b>
                   </button>
                   <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
-                    <span>会话上下文</span><b>{workContext ? `${workContext.sessionPercentage.toFixed(0)}%` : "查看"}</b>
+                    <span>会话上下文</span><b>{p.contextReport?.available === false
+                      ? "暂不可用"
+                      : workContext ? `${workContext.sessionPercentage.toFixed(0)}%` : "查看"}</b>
                   </button>
                   {ctxOpen && (
                     <div className="ctx-pop work-ctx-pop" role="dialog" aria-label="Work 上下文占用">
-                      {p.contextReport && workContext ? (
+                      {p.contextReport?.available === false ? (
+                        <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后更新。</div>
+                      ) : p.contextReport && workContext ? (
                         <>
                           <div className="ctx-pop-row"><span>{workContext.hasBreakdown ? "会话新增上下文" : "上下文窗口"}</span>
                             <span className="ctx-pop-nums">{workContext.sessionTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.sessionPercentage.toFixed(0)}%)</span>
@@ -699,7 +704,7 @@ export function Composer(p: Props) {
               >{p.fast == null ? "档位读取中" : p.fast ? "⚡ 快" : "标准"}</button>
             )}
             <button
-              className="hint-ring"
+              className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
               aria-label="上下文占用"
               title="上下文占用"
               onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}
@@ -710,7 +715,8 @@ export function Composer(p: Props) {
                   className="hr-fill"
                   cx="18" cy="18" r="15"
                   strokeDasharray="94.25"
-                  strokeDashoffset={94.25 * (1 - Math.min(p.contextReport?.percentage ?? 0, 100) / 100)}
+                  strokeDashoffset={94.25 * (1 - Math.min(
+                    contextAvailable ? p.contextReport?.percentage ?? 0 : 0, 100) / 100)}
                   transform="rotate(-90 18 18)"
                 />
               </svg>
@@ -719,6 +725,8 @@ export function Composer(p: Props) {
               <div className="ctx-pop" role="dialog" aria-label="上下文占用">
                 {p.contextError ? (
                   <div className="ctx-pop-loading" role="alert">{p.contextError}</div>
+                ) : p.contextReport?.available === false ? (
+                  <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后会自动更新。上下文仍由 Codex 原生管理。</div>
                 ) : p.contextReport ? (
                   <>
                     <div className="ctx-pop-row">

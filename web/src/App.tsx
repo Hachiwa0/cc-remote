@@ -21,6 +21,7 @@ import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
 import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
 import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
+import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
@@ -44,6 +45,7 @@ import { resolveSidebarSwipe } from "./responsive-layout";
 import {
   bumpSessionActivity,
   compareSessionsByActivity,
+  mergeSessionActivityState,
   sessionCommandTarget,
   setSessionPinned,
 } from "./session-order";
@@ -94,13 +96,17 @@ export default function App() {
   const [capabilitiesOpen, setCapabilitiesOpen] = useState(false);
   const [capabilitiesKind, setCapabilitiesKind] = useState<EngineCapabilityKind | "all">("all");
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
+  const [deviceSheetOpen, setDeviceSheetOpen] = useState(false);
   const [capabilitiesBySurface, setCapabilitiesBySurface] = useState<Record<string, EngineCapabilities>>({});
   const [notificationsEnabled, setNotificationsEnabled] = useState(
     () => localStorage.getItem(NOTIFY_KEY) === "1"
       && typeof Notification !== "undefined" && Notification.permission === "granted");
   const [machineId, setMachineId] = useState(
     () => localStorage.getItem(MACHINE_KEY) || "default");
-  const [machines, setMachines] = useState<string[]>([]);
+  const [remoteDevices, setRemoteDevices] = useState<RemoteDevice[]>([]);
+  const [devicePairing, setDevicePairing] = useState<PairingState>({
+    enabled: false, expires_at: null,
+  });
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
   const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
@@ -228,16 +234,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!authed) { setMachines([]); return; }
+    if (!authed) { setRemoteDevices([]); return; }
     let cancelled = false;
-    void fetch("/api/machines", {
+    void fetch("/api/devices", {
       credentials: "same-origin", cache: "no-store",
     }).then(async (response) => response.ok ? response.json() : null)
       .then((payload) => {
-        if (cancelled || !payload || !Array.isArray(payload.machines)) return;
-        const available = payload.machines.filter((value: unknown): value is string =>
-          typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/.test(value));
-        setMachines(available);
+        if (cancelled || !payload || !Array.isArray(payload.devices)) return;
+        const validDevices: RemoteDevice[] = (payload.devices as unknown[]).filter((value: unknown): value is RemoteDevice => {
+          if (!value || typeof value !== "object") return false;
+          const item = value as Partial<RemoteDevice>;
+          return typeof item.machine_id === "string"
+            && /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/.test(item.machine_id)
+            && typeof item.label === "string" && typeof item.online === "boolean";
+        });
+        const available = validDevices.map((device) => device.machine_id);
+        setRemoteDevices(validDevices);
+        setDevicePairing(payload.pairing ?? { enabled: false, expires_at: null });
         if (available.length && !available.includes(machineId)) {
           setMachineId(available[0]);
         }
@@ -608,6 +621,18 @@ export default function App() {
             if (!prefetchedSurfacesRef.current.has(siblingKey)) {
               prefetchedSurfacesRef.current.add(siblingKey);
               ws.sendListSessions(msg.engine, siblingSpace);
+            }
+          }
+          if (msg.type === "session_activity") {
+            for (const [surfaceKey, listed] of Object.entries(
+              sessionListsBySurfaceRef.current,
+            )) {
+              if (!surfaceKey.endsWith(`:${msg.engine}`)) continue;
+              sessionListsBySurfaceRef.current[surfaceKey] = listed.map(
+                (session) => session.session_id === msg.session_id
+                  ? { ...session, state: msg.state }
+                  : session,
+              );
             }
           }
           if (msg.type === "work_dashboard") {
@@ -1248,6 +1273,18 @@ export default function App() {
       dispatch({ type: "command_error", detail: "退出失败：服务暂不可用，请稍后重试" });
     }
   };
+  const activeDevice = remoteDevices.find(
+    (device) => device.machine_id === machineId);
+  const activeDeviceOnline = state.connState === "connected" && state.wrapperOnline;
+  // A native client can advance the transcript without a wrapper-owned turn.
+  // Present that mirrored activity as running in every status surface while
+  // leaving Composer on the authoritative write state (so a read-only App turn
+  // never gains a Stop button it cannot actually control).
+  const focusedSessionState = state.sessions.find(
+    (session) => session.session_id === focusedSid)?.state;
+  const effectiveState = mergeSessionActivityState(
+    focusedSessionState, rt.state, rt.mirroredRunning,
+  ) ?? rt.state;
 
   return (
     <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || state.btwSid || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
@@ -1256,7 +1293,14 @@ export default function App() {
         space={space}
         onSpaceChange={switchSpace}
         sessions={state.sessions}
-        liveStates={Object.fromEntries(Object.entries(state.runtimes).map(([sid, r]) => [sid, r.state]))}
+        liveStates={Object.fromEntries(state.sessions.map((session) => {
+          const runtime = state.runtimes[session.session_id];
+          return [session.session_id, mergeSessionActivityState(
+            session.state,
+            runtime?.state,
+            runtime?.mirroredRunning,
+          ) ?? "idle"];
+        }))}
         activeSessionId={focusedSid}
         onSelect={(id) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setWorkArtifactsOpen(false); const selected = state.sessions.find((s) => s.session_id === id); const selectedEngine = (selected?.engine as "claude" | "codex") || engine; const selectedSpace = selected?.space === "work" ? "work" : space; dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace); wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace); if (selectedSpace === "work") wsRef.current?.sendGetWorkArtifacts(selectedEngine, id); if (isMobile()) setSidebarOpen(false); }}
         onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~" }); if (isMobile()) setSidebarOpen(false); }}
@@ -1306,8 +1350,8 @@ export default function App() {
             </div>
             <div className="sub">{space === "work" ? "私有工作区 · " : ""}{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</div>
           </div>
-          <span className={`hstat ${rt.state}`}><span className="sd" />
-            <span className="hstat-label">{rt.state}</span></span>
+          <span className={`hstat ${effectiveState}`}><span className="sd" />
+            <span className="hstat-label">{effectiveState}</span></span>
           {space === "code" && focusedSid && !state.newChat && (
             <TerminalControl control={rt.control} engine={focusedEngine}
               availability={state.connState !== "connected" || !state.wrapperOnline
@@ -1317,11 +1361,12 @@ export default function App() {
               legacyMessage={rt.takeoverMessage}
               onTakeover={() => wsRef.current?.sendTakeover(focusedSid)} />
           )}
-          {machines.length > 1 && <select className="machine-select"
-            value={machineId} onChange={(event) => setMachineId(event.target.value)}
-            aria-label="远程机器" title="切换远程机器">
-            {machines.map((machine) => <option key={machine} value={machine}>{machine}</option>)}
-          </select>}
+          <button className={`device-trigger${activeDeviceOnline ? " online" : ""}`}
+            onClick={() => setDeviceSheetOpen(true)} aria-label="设备中心"
+            title={`${activeDevice?.label ?? machineId} · ${activeDeviceOnline ? "在线" : "离线"}`}>
+            <Icon name="devices" size={18} />
+            <span>{activeDevice?.label ?? machineId}</span><i />
+          </button>
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
           {typeof Notification !== "undefined" && <button
@@ -1577,6 +1622,19 @@ export default function App() {
             state.newChat?.cwd ?? state.currentCwd);
         }}
         onClose={() => setCapabilitiesOpen(false)} />
+      <DeviceSheet open={deviceSheetOpen}
+        currentId={machineId}
+        devices={remoteDevices}
+        pairing={devicePairing}
+        onDevices={(nextDevices, nextPairing) => {
+          setRemoteDevices(nextDevices);
+          setDevicePairing(nextPairing);
+        }}
+        onSelect={(nextMachineId) => {
+          if (nextMachineId !== machineId) setMachineId(nextMachineId);
+          setDeviceSheetOpen(false);
+        }}
+        onClose={() => setDeviceSheetOpen(false)} />
     </div>
   );
 }

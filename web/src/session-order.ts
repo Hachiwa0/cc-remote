@@ -1,4 +1,18 @@
-import type { Engine, SessionInfo, Space } from "./protocol";
+import type { Engine, SessionInfo, Space, State } from "./protocol";
+
+/** Merge catalog activity with the resident runtime without losing native turns. */
+export function mergeSessionActivityState(
+  catalogState: State | null | undefined,
+  runtimeState: State | null | undefined,
+  mirroredRunning = false,
+): State | undefined {
+  if (runtimeState == null) return catalogState ?? undefined;
+  if (runtimeState === "idle"
+      && (mirroredRunning || catalogState === "running")) {
+    return "running";
+  }
+  return runtimeState;
+}
 
 export function sessionActivityTime(value?: string | null): number {
   if (!value) return Number.NEGATIVE_INFINITY;

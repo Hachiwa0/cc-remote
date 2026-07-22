@@ -29,9 +29,10 @@ from cc_remote.config import (
 )
 from cc_remote.log import logger
 from cc_remote.relay.auth import (
-    SESSION_COOKIE_NAME, SessionClaims, authenticate, authenticate_login,
+    SESSION_COOKIE_NAME, SessionClaims, authenticate_login,
     make_session_token, session_token_claims, wrapper_machine_scope,
 )
+from cc_remote.relay.devices import DeviceStore
 from cc_remote.relay.pairing import RelayHub
 from cc_remote.relay.push import (
     PushDispatcher, PushOutcome, PushSubscription, PushSubscriptionStore,
@@ -62,6 +63,7 @@ SESSION_EXPIRED_CLOSE_REASON = "session expired"
 SESSION_REVOKED_CLOSE_CODE = 1008
 SESSION_REVOKED_CLOSE_REASON = "session revoked"
 _PUSH_BODY_MAX_BYTES = 16 * 1024
+_DEVICE_BODY_MAX_BYTES = 8 * 1024
 _PUSH_KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,1024}")
 
 
@@ -145,6 +147,7 @@ class LoginRateLimiter:
 
 
 _login_limiter = LoginRateLimiter()
+_pair_limiter = LoginRateLimiter(max_per_ip=30)
 
 
 @dataclass
@@ -284,9 +287,35 @@ def _push_subject(claims: SessionClaims) -> str:
     return claims.subject or "legacy"
 
 
+def _device_subject(claims: SessionClaims) -> str:
+    # Legacy single-password mode is one owner, just like Push subscriptions.
+    return claims.subject or "legacy"
+
+
+async def _claims_allow_machine(
+    claims: SessionClaims,
+    machine_id: str,
+    devices: DeviceStore,
+) -> bool:
+    return claims.allows_machine(machine_id) or await devices.owned_by(
+        machine_id, _device_subject(claims))
+
+
+def _clean_device_text(value: object, *, maximum: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if (not normalized or len(normalized) > maximum
+            or any(ord(char) < 32 for char in normalized)):
+        return None
+    return normalized
+
+
 def _parse_push_subscription(
     body: object,
     claims: SessionClaims,
+    *,
+    enrolled_machine: bool = False,
 ) -> PushSubscription | None:
     if not isinstance(body, dict):
         return None
@@ -296,7 +325,7 @@ def _parse_push_subscription(
     if (
         not isinstance(machine_id, str)
         or not valid_machine_id(machine_id)
-        or not claims.allows_machine(machine_id)
+        or (not claims.allows_machine(machine_id) and not enrolled_machine)
         or not isinstance(endpoint, str)
         or len(endpoint) > 4096
         or not isinstance(keys, dict)
@@ -380,12 +409,17 @@ async def _serve_client_until_expiry(
         await asyncio.gather(guard_task, return_exceptions=True)
 
 
-def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
+def create_app(
+    cfg: Optional[RelayConfig] = None,
+    *,
+    device_store: DeviceStore | None = None,
+) -> FastAPI:
     if cfg is None:
         cfg = relay_config()
     validate_relay_config(cfg)
     app = FastAPI(title="cc-remote relay")
     sessions = SessionRegistry(cfg.session_registry_cap)
+    devices = device_store or DeviceStore(cfg.device_db_path)
     push_store: PushSubscriptionStore | None = None
     push_dispatcher: PushDispatcher | None = None
     if cfg.push_vapid_public_key:
@@ -414,6 +448,7 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
     app.state.login_slots = login_slots
     app.state.push_store = push_store
     app.state.push_dispatcher = push_dispatcher
+    app.state.device_store = devices
 
     @app.get("/api/auth-config")
     async def auth_config() -> JSONResponse:
@@ -454,7 +489,14 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
             return JSONResponse({"error": "too_large"}, status_code=413)
         except Exception:
             return JSONResponse({"error": "bad_request"}, status_code=400)
-        subscription = _parse_push_subscription(body, claims)
+        requested_machine = body.get("machine_id") if isinstance(body, dict) else None
+        enrolled_machine = (
+            isinstance(requested_machine, str)
+            and await devices.owned_by(
+                requested_machine, _device_subject(claims))
+        )
+        subscription = _parse_push_subscription(
+            body, claims, enrolled_machine=enrolled_machine)
         if subscription is None:
             return JSONResponse({"error": "invalid_subscription"}, status_code=400)
         await push_store.upsert(subscription)
@@ -611,34 +653,205 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
         )
         return response
 
+    @app.get("/api/devices")
+    async def device_list(req: Request) -> JSONResponse:
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        subject = _device_subject(claims)
+        records = await devices.list_for_subject(subject)
+        connected = set(hub.machine_ids)
+        result = [
+            {
+                "machine_id": record.machine_id,
+                "label": record.label,
+                "platform": record.platform,
+                "hostname": record.hostname,
+                "created_at": record.created_at,
+                "last_seen": record.last_seen,
+                "online": record.machine_id in connected,
+                "managed": True,
+            }
+            for record in records
+        ]
+        known = {record.machine_id for record in records}
+        visible_legacy = {
+            machine_id for machine_id in connected
+            if claims.allows_machine(machine_id)
+        }
+        if "*" not in claims.machines:
+            visible_legacy.update(claims.machines)
+        for machine_id in sorted(visible_legacy - known):
+            result.append({
+                "machine_id": machine_id,
+                "label": machine_id,
+                "platform": "",
+                "hostname": "",
+                "created_at": None,
+                "last_seen": None,
+                "online": machine_id in connected,
+                "managed": False,
+            })
+        pairing_expires_at = await devices.pairing_expires_at(subject)
+        return JSONResponse(
+            {
+                "ok": True,
+                "devices": result,
+                "pairing": {
+                    "enabled": pairing_expires_at is not None,
+                    "expires_at": pairing_expires_at,
+                },
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/devices/pairing")
+    async def device_pairing_start(req: Request) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        grant = await devices.create_pairing(
+            _device_subject(claims), ttl=cfg.device_pairing_ttl_seconds)
+        return JSONResponse(
+            {"ok": True, "code": grant.code, "expires_at": grant.expires_at},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.delete("/api/devices/pairing")
+    async def device_pairing_close(req: Request) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        await devices.close_pairing(_device_subject(claims))
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/devices/pair")
+    async def device_pair(req: Request) -> JSONResponse:
+        if _pair_limiter.limited(_request_ip(req)):
+            return JSONResponse(
+                {"error": "rate_limited"}, status_code=429,
+                headers={"Retry-After": "1", "Cache-Control": "no-store"},
+            )
+        try:
+            body = await _read_json_limited(req, _DEVICE_BODY_MAX_BYTES)
+        except _BodyTooLarge:
+            return JSONResponse({"error": "too_large"}, status_code=413)
+        except Exception:
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        code = _clean_device_text(body.get("code"), maximum=64)
+        label = _clean_device_text(body.get("label"), maximum=64)
+        platform = _clean_device_text(body.get("platform"), maximum=32)
+        hostname = _clean_device_text(body.get("hostname"), maximum=255)
+        if None in (code, label, platform, hostname):
+            return JSONResponse({"error": "invalid_device"}, status_code=400)
+        enrolled = await devices.redeem(
+            code,
+            label=label,
+            platform=platform,
+            hostname=hostname,
+        )
+        if enrolled is None:
+            return JSONResponse(
+                {"error": "invalid_or_expired_code"}, status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        origin = urlsplit(cfg.public_origin)
+        relay_url = (
+            f"{'wss' if origin.scheme == 'https' else 'ws'}://{origin.netloc}/ws"
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "machine_id": enrolled.machine_id,
+                "label": enrolled.label,
+                "token": enrolled.token,
+                "relay_url": relay_url,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.patch("/api/devices/{machine_id}")
+    async def device_rename(machine_id: str, req: Request) -> JSONResponse:
+        if not valid_machine_id(machine_id):
+            return JSONResponse({"error": "invalid_device"}, status_code=400)
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        try:
+            body = await _read_json_limited(req, _DEVICE_BODY_MAX_BYTES)
+        except _BodyTooLarge:
+            return JSONResponse({"error": "too_large"}, status_code=413)
+        except Exception:
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        label = _clean_device_text(
+            body.get("label") if isinstance(body, dict) else None, maximum=64)
+        if label is None:
+            return JSONResponse({"error": "invalid_label"}, status_code=400)
+        changed = await devices.rename(
+            machine_id, _device_subject(claims), label)
+        if not changed:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+
+    @app.delete("/api/devices/{machine_id}")
+    async def device_revoke(machine_id: str, req: Request) -> JSONResponse:
+        if not valid_machine_id(machine_id):
+            return JSONResponse({"error": "invalid_device"}, status_code=400)
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        revoked = await devices.revoke(machine_id, _device_subject(claims))
+        if not revoked:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        await hub.disconnect_wrapper(machine_id, reason="device revoked")
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+
     @app.get("/api/machines")
     async def machine_list(req: Request) -> JSONResponse:
-        token = req.cookies.get(SESSION_COOKIE_NAME, "")
-        claims = session_token_claims(token, cfg.session_secret)
-        if (
-            claims is None
-            or claims.expires_at <= time.time()
-            or not await sessions.active(claims)
-        ):
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
             return JSONResponse(
                 {"ok": False}, status_code=401,
                 headers={"Cache-Control": "no-store"},
             )
-        machines = [machine_id for machine_id in hub.machine_ids
-                    if claims.allows_machine(machine_id)]
+        records = await devices.list_for_subject(_device_subject(claims))
+        machines = {record.machine_id for record in records}
+        machines.update(
+            machine_id for machine_id in hub.machine_ids
+            if claims.allows_machine(machine_id)
+        )
+        if "*" not in claims.machines:
+            machines.update(claims.machines)
         return JSONResponse(
-            {"ok": True, "machines": machines},
+            {"ok": True, "machines": sorted(machines)},
             headers={"Cache-Control": "no-store"},
         )
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
         authorization = websocket.headers.get("authorization", "")
-        role = authenticate(authorization, cfg)  # wrapper Bearer
+        role: str | None = None
         wrapper_scope: str | None = None
-        if role == "wrapper":
-            wrapper_scope = wrapper_machine_scope(
-                authorization[7:].strip(), cfg)
+        dynamic_wrapper_token: str | None = None
+        if authorization.lower().startswith("bearer "):
+            wrapper_token = authorization[7:].strip()
+            wrapper_scope = wrapper_machine_scope(wrapper_token, cfg)
+            if wrapper_scope is None:
+                wrapper_scope = await devices.machine_for_token(wrapper_token)
+                if wrapper_scope is not None:
+                    dynamic_wrapper_token = wrapper_token
+            if wrapper_scope is not None:
+                role = "wrapper"
         claims: Optional[SessionClaims] = None
         if role is None:
             token = websocket.cookies.get(SESSION_COOKIE_NAME, "")
@@ -661,9 +874,17 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
         await websocket.accept()
         log.info("ws accepted", role=role)
         if role == "wrapper":
+            if wrapper_scope not in (None, "*"):
+                await devices.touch_seen(wrapper_scope)
+            async def dynamic_wrapper_authorized(machine_id: str) -> bool:
+                if dynamic_wrapper_token is None:
+                    return True
+                return await devices.machine_for_token(
+                    dynamic_wrapper_token) == machine_id
             await hub.serve_wrapper(
                 websocket,
                 None if wrapper_scope == "*" else wrapper_scope,
+                dynamic_wrapper_authorized,
             )
         else:
             assert claims is not None
@@ -680,20 +901,28 @@ def create_app(cfg: Optional[RelayConfig] = None) -> FastAPI:
             ):
                 await websocket.close(code=1008, reason="invalid machine")
                 return
-            if requested_machine and not claims.allows_machine(requested_machine):
+            if requested_machine and not await _claims_allow_machine(
+                    claims, requested_machine, devices):
                 await websocket.close(code=1008, reason="machine not authorized")
                 return
             if requested_machine:
                 machine_id = requested_machine
             else:
-                connected = [candidate for candidate in hub.machine_ids
-                             if claims.allows_machine(candidate)]
+                connected = [
+                    candidate for candidate in hub.machine_ids
+                    if await _claims_allow_machine(claims, candidate, devices)
+                ]
                 if connected:
                     machine_id = connected[0]
                 elif "*" not in claims.machines:
                     machine_id = claims.machines[0]
                 else:
-                    machine_id = hub.default_machine_id()
+                    enrolled = await devices.list_for_subject(
+                        _device_subject(claims))
+                    machine_id = (
+                        enrolled[0].machine_id if enrolled
+                        else hub.default_machine_id()
+                    )
             if machine_id == "default":
                 # Keep the legacy call shape for embedded relays and tests that
                 # replace the expiry guard. Named machines use the extended

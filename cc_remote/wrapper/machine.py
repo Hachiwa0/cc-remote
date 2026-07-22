@@ -79,7 +79,7 @@ from cc_remote.protocol import (
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg,
     ToolUse, ToolResult, TurnEnd, TurnResult, is_downstream, is_reliable_command,
-    SessionInfo, SessionList, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
+    SessionInfo, SessionList, SessionActivity, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_AUTH, ERR_PROTOCOL,
@@ -120,7 +120,9 @@ from cc_remote.wrapper.codex_handle import (
     CodexSpontaneousClosed, CodexSpontaneousOverflow,
 )
 from cc_remote.wrapper.codex_stream import (
-    CodexStreamTranslator, codex_session_id, is_turn_terminal, codex_translate_history,
+    CodexStreamTranslator, codex_session_id, is_turn_terminal,
+    codex_history_boundary_user, codex_history_window,
+    codex_translate_history,
 )
 from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
@@ -337,6 +339,10 @@ class WrapperMachine:
         # sid -> {"path", "size", "engine"}. The watcher polls each file's SIZE and,
         # when it grows without us having written it, mirrors the append to clients.
         self._watch: dict[str, dict] = {}
+        # Sidebar activity watches are catalog-only and may be discarded before
+        # explicit History/resident watches.  Keep them bounded so a long-lived
+        # wrapper never accumulates one transcript watcher per historical thread.
+        self._codex_sidebar_watches: OrderedDict[str, None] = OrderedDict()
         self._watch_task: Optional[asyncio.Task] = None
         self._work_schedule_task: Optional[asyncio.Task] = None
         self._work_schedule_runs: set[asyncio.Task] = set()
@@ -644,6 +650,15 @@ class WrapperMachine:
                 can_takeover=False,
             )
         if self._codex_shared_affinity(ctx):
+            if bool((watch or {}).get("desktop_active")):
+                return await self._set_session_control(
+                    ctx,
+                    control_mode="desktop",
+                    write_state="read_only",
+                    terminal_attached=True,
+                    reason="Codex App 正在运行此会话；完成后 Web 会自动恢复可写",
+                    can_takeover=False,
+                )
             live = self._codex_shared_live(ctx)
             return await self._set_session_control(
                 ctx,
@@ -2573,9 +2588,12 @@ class WrapperMachine:
         ctx = self._ctx_by_sid(sid)
         if ctx is not None and getattr(ctx.sdk, "is_claude_broker", False):
             return False
-        if ctx is not None and self._codex_shared_affinity(ctx):
-            return False
         w = self._watch.get(sid)
+        if ctx is not None and self._codex_shared_affinity(ctx):
+            # Shared CLI clients are collaborators and never block Remote. A
+            # private Codex App turn has no shared-daemon holder, so the watcher
+            # marks only that case as desktop-owned/read-only.
+            return bool(w and w.get("desktop_active"))
         if w and w.get("engine") == "codex":
             return bool(w.get("external"))
         return bool(w) and bool(
@@ -2659,7 +2677,7 @@ class WrapperMachine:
         w["file_id"] = (st.st_dev, st.st_ino)
         w["file_available"] = True
 
-    def _watch_session(self, sid: str) -> None:
+    def _watch_session(self, sid: str, *, sidebar: bool = False) -> None:
         """Start mirroring a session transcript when a client opens it.
 
         Claude combines stable CLI process identity with unattributed file growth.
@@ -2671,6 +2689,13 @@ class WrapperMachine:
         ctx = self._ctx_by_sid(sid)
         existing = self._watch.get(sid)
         if existing is not None:
+            if sidebar:
+                self._codex_sidebar_watches[sid] = None
+                self._codex_sidebar_watches.move_to_end(sid)
+            else:
+                # Opening the conversation promotes this to an explicit watch;
+                # sidebar rotation must no longer evict it.
+                self._codex_sidebar_watches.pop(sid, None)
             if ctx is None or existing.get("engine") == ctx.engine:
                 if (ctx is not None and ctx.engine == "claude"
                         and not existing.get("cwd")):
@@ -2679,6 +2704,7 @@ class WrapperMachine:
             # A cold history request may have registered before the resident
             # engine was known. Correct the watcher once the real context exists.
             self._watch.pop(sid, None)
+            self._codex_sidebar_watches.pop(sid, None)
         if ctx is not None:
             engine = ctx.engine
             path = codex_rollout_path(sid) if engine == "codex" else transcript_path(sid)
@@ -2698,13 +2724,20 @@ class WrapperMachine:
             return
         if len(self._watch) >= self.WATCH_MAX:
             victim = next(
-                (watched_sid for watched_sid in self._watch
-                 if not self._is_external(watched_sid)), None)
+                (watched_sid for watched_sid in self._codex_sidebar_watches
+                 if not self._is_external(watched_sid)
+                 and self._ctx_by_sid(watched_sid) is None), None)
+            if victim is None:
+                victim = next(
+                    (watched_sid for watched_sid in self._watch
+                     if not self._is_external(watched_sid)
+                     and self._ctx_by_sid(watched_sid) is None), None)
             if victim is None:
                 log.warning("transcript watch cap reached; all watches are external",
                             session_id=sid)
                 return
             self._watch.pop(victim, None)
+            self._codex_sidebar_watches.pop(victim, None)
         watch = {
             "path": path, "size": st.st_size, "file_id": (st.st_dev, st.st_ino),
             "engine": engine, "external_ts": 0.0,
@@ -2726,6 +2759,12 @@ class WrapperMachine:
                 # A cold tail cannot distinguish a live turn from a crashed old
                 # task_started record. The first complete /proc scan confirms it.
                 "seeded_external_turns": set(active_turns),
+                # Codex App's private app-server may append through short-lived
+                # opens and therefore expose no stable writable FD. A catalog
+                # watch registered during that turn must retain the fresh tail
+                # marker until its terminal record (or the normal TTL), instead
+                # of being erased by the first empty holder scan.
+                "preserve_seeded_without_holder": bool(sidebar and active_turns),
                 "pending_wrapper_turns": {},
                 "takeover_holders": set(),
                 "takeover_interactive_holders": set(),
@@ -2760,7 +2799,41 @@ class WrapperMachine:
                 "owned_message_ids": OrderedDict(),
             })
         self._watch[sid] = watch
+        if sidebar and engine == "codex":
+            self._codex_sidebar_watches[sid] = None
+            self._codex_sidebar_watches.move_to_end(sid)
         log.info("watching transcript", session_id=sid, engine=engine, size=st.st_size)
+
+    def _prime_codex_sidebar_watches(self, rows: list[dict]) -> None:
+        """Watch the newest cold Codex threads for native App lifecycle.
+
+        A private Codex App app-server reports such threads as ``notLoaded`` to
+        our standalone ``thread/list`` even while their rollout is active.  The
+        ordered task markers in the rollout are authoritative, and the existing
+        watcher already parses them incrementally.  Reserve only half the global
+        watch budget so explicit browser/resident watches always have room.
+        """
+        limit = max(1, self.WATCH_MAX // 2)
+        candidates = [
+            row.get("session_id") for row in rows
+            if row.get("tag") != "archived"
+            and isinstance(row.get("session_id"), str)
+        ][:limit]
+        wanted = set(candidates)
+        for sid in list(self._codex_sidebar_watches):
+            if (sid in wanted or self._is_external(sid)
+                    or self._ctx_by_sid(sid) is not None):
+                continue
+            self._codex_sidebar_watches.pop(sid, None)
+            self._watch.pop(sid, None)
+        for sid in candidates:
+            self._watch_session(sid, sidebar=True)
+
+    @staticmethod
+    def _codex_sidebar_watch_state(watch: Optional[dict]) -> Optional[State]:
+        if not watch or watch.get("engine") != "codex":
+            return None
+        return "running" if watch.get("active_external_turns") else None
 
     def _codex_own_processes(self) -> set[ProcessIdentity]:
         own: set[ProcessIdentity] = set()
@@ -2914,11 +2987,12 @@ class WrapperMachine:
             # A tail marker is only a cold-start candidate. Without any live
             # foreign writer, an unmatched historical task_started is a crashed
             # orphan and must not manufacture a fresh 60-second read-only lock.
-            if not raw:
+            if not raw and not w.get("preserve_seeded_without_holder"):
                 active = w.setdefault("active_external_turns", {})
                 for turn_id in seeded:
                     active.pop(turn_id, None)
             seeded.clear()
+            w["preserve_seeded_without_holder"] = False
         ignored: set[ProcessIdentity] = w.setdefault("takeover_holders", set())
         ignored_interactive: set[ProcessIdentity] = w.setdefault(
             "takeover_interactive_holders", set())
@@ -3036,50 +3110,34 @@ class WrapperMachine:
         if writers is None:
             writers = set(holders)
         was_external = bool(w.get("external"))
+        was_sidebar_running = bool(w.get("active_external_turns"))
+        was_desktop_active = bool(w.get("desktop_active"))
         w["holders"] = holders
         w["writers"] = writers
         external_growth = False
         takeover_cleared = False
         takeover_clear_message: Optional[str] = None
         data = b""
+        visible_user_growth = False
         try:
             st = await asyncio.to_thread(os.stat, w["path"])
         except OSError:
             return
 
         ctx = self._ctx_by_sid(sid)
-        if ctx is not None and self._codex_shared_affinity(ctx):
-            changed = False
-            file_id = (st.st_dev, st.st_ino)
-            if file_id != w.get("file_id") or st.st_size < w.get("size", 0):
-                w["file_id"] = file_id
-                w["size"] = st.st_size
-                w["partial"] = b""
-                changed = True
-            elif st.st_size > w.get("size", 0):
-                data = await asyncio.to_thread(
-                    self._read_watch_growth,
-                    w["path"],
-                    w["size"],
-                    st.st_size - w["size"],
-                )
-                w["size"] += len(data)
-                changed = bool(data)
-            # The daemon is the single session owner. Other proxy/TUI clients
-            # are collaborators, not foreign writers, so they never create a
-            # takeover lock or stale in-memory fork.
-            w["holders"] = holders
-            w["writers"] = writers
-            w["external"] = False
+        shared_affinity = bool(
+            ctx is not None and self._codex_shared_affinity(ctx))
+        if shared_affinity and not w.get("shared_activity_initialized"):
+            # Retire ownership debris produced by the old shared-daemon branch,
+            # but preserve a genuine active tail seeded when this watch opened.
+            seeded = set(w.get("seeded_external_turns", ()))
+            active = w.setdefault("active_external_turns", {})
+            for turn_id in list(active):
+                if turn_id not in seeded:
+                    active.pop(turn_id, None)
+            w.setdefault("pending_wrapper_turns", {}).clear()
             w["takeover_pending"] = None
-            w["active_external_turns"].clear()
-            w["pending_wrapper_turns"].clear()
-            ctx.needs_reload = False
-            await self._sync_external_control(ctx, w)
-            if changed:
-                await self._refresh_codex_collaboration_mode(ctx)
-                await self._push_mirrored_history(sid)
-            return
+            w["shared_activity_initialized"] = True
 
         pending_takeover = w.get("takeover_pending")
         if pending_takeover:
@@ -3170,6 +3228,7 @@ class WrapperMachine:
         if data:
             markers = parse_turn_markers(data, w.get("partial", b""))
             w["partial"] = markers.partial
+            visible_user_growth = markers.has_visible_user_message
             for turn_id in markers.started:
                 if turn_id in own_turn_ids:
                     continue
@@ -3238,13 +3297,19 @@ class WrapperMachine:
             takeover_cleared = True
             external_growth = True
 
-        # An interactive TUI owns the session even while idle. Headless app-server
-        # daemons are filtered from holders and lock only while an external turn's
-        # task_started marker remains unmatched.
-        is_external = bool(holders or active or w.get("takeover_pending"))
+        # Shared CLI clients have a stable holder and remain collaborators. The
+        # private Codex App app-server has no shared holder; a fresh active marker
+        # is therefore the only shared-daemon case that makes Web read-only.
+        desktop_active = bool(shared_affinity and active and not holders)
+        w["desktop_active"] = desktop_active
+        is_external = (
+            desktop_active if shared_affinity
+            else bool(holders or active or w.get("takeover_pending"))
+        )
         w["external"] = is_external
         if (external_growth or (is_external and not was_external)) and ctx is not None:
-            ctx.needs_reload = True
+            ctx.needs_reload = bool(
+                not shared_affinity or desktop_active or was_desktop_active)
             if ctx.codex_checkpoint not in (None, False):
                 # Native terminal turns/rollback/compact are outside Remote's
                 # pre-image boundary. Retire the old journal immediately so its
@@ -3263,14 +3328,26 @@ class WrapperMachine:
         if ctx is not None:
             await self._sync_external_control(ctx, w)
 
-        if external_growth or is_external != was_external or takeover_cleared:
-            log.info(
-                "codex external ownership changed" if is_external != was_external
-                else "codex external rollout append -> mirroring",
+        sidebar_running = bool(w.get("active_external_turns"))
+        if sidebar_running != was_sidebar_running:
+            await self.transport.send(SessionActivity(
+                engine="codex",
+                session_id=sid,
+                state="running" if sidebar_running else "idle",
+            ))
+
+        if (external_growth or visible_user_growth
+                or is_external != was_external or takeover_cleared):
+            ownership_changed = is_external != was_external
+            logger_method = log.info if ownership_changed else log.debug
+            logger_method(
+                "codex external ownership changed" if ownership_changed
+                else "codex rollout append -> mirroring",
                 session_id=sid,
                 external=is_external,
                 holders=len(holders),
                 active_turns=len(active),
+                visible_user_growth=visible_user_growth,
             )
             await self._push_mirrored_history(sid)
         if takeover_cleared and ctx is not None:
@@ -3543,17 +3620,26 @@ class WrapperMachine:
         ctx = self._ctx_by_sid(sid)
         control = self._session_control(ctx) if ctx is not None else None
         live_seq = ctx.seq if ctx is not None else None
-        in_progress = bool(ctx is not None and ctx.state != "idle")
+        watch = self._watch.get(sid) or {}
+        active_external_turns = watch.get("active_external_turns")
+        in_progress = bool(
+            (ctx is not None and ctx.state != "idle")
+            or (isinstance(active_external_turns, dict)
+                and active_external_turns)
+        )
         events: list = []
         mdl = None
-        watched_engine = (self._watch.get(sid) or {}).get("engine")
+        watched_engine = watch.get("engine")
         is_codex_hist = bool(
             (ctx is not None and ctx.engine == "codex") or watched_engine == "codex")
         source_path = None
+        source_window_has_more = False
+        source_window_oldest_cursor = None
+        source_window_boundary_offset = None
         try:
             source_path = await asyncio.to_thread(
                 codex_rollout_path if is_codex_hist else transcript_path, sid)
-            if (source_path
+            if (source_path and not is_codex_hist
                     and await asyncio.to_thread(os.path.getsize, source_path)
                     > self.cfg.history_source_max_bytes):
                 notice = Error(
@@ -3586,8 +3672,34 @@ class WrapperMachine:
             try:
                 path = source_path or await asyncio.to_thread(codex_rollout_path, sid)
                 if path:
+                    (start_offset, end_offset, source_window_has_more,
+                     source_window_oldest_cursor,
+                     source_window_boundary_offset) = await asyncio.to_thread(
+                        codex_history_window,
+                        path,
+                        before=before,
+                        limit=limit,
+                        max_bytes=self.cfg.codex_history_window_max_bytes,
+                    )
                     events, mdl = await asyncio.to_thread(
-                        codex_translate_history, path, self.cfg.tool_result_max)
+                        codex_translate_history,
+                        path,
+                        self.cfg.tool_result_max,
+                        start_offset=start_offset,
+                        end_offset=end_offset,
+                    )
+                    if (source_window_oldest_cursor is not None
+                            and source_window_boundary_offset is not None
+                            and not any(isinstance(event, UserMsg)
+                                        for event in events)):
+                        recovered_user = await asyncio.to_thread(
+                            codex_history_boundary_user,
+                            path,
+                            source_window_boundary_offset,
+                            source_window_oldest_cursor,
+                        )
+                        if recovered_user is not None:
+                            events.insert(0, recovered_user)
             except Exception as e:
                 log.warning("codex get_history failed", session_id=sid, error=str(e))
                 history_error = "历史暂时不可用，请稍后重试"
@@ -3729,6 +3841,12 @@ class WrapperMachine:
             payload: list[dict] = [row.copy() for row in control_rows]
             for group in selected:
                 payload.extend(ev.model_dump(mode="json") for ev in group)
+            oldest_id = _tid(selected[0]) if selected else None
+            if (source_window_oldest_cursor is not None
+                    and selected
+                    and turns
+                    and selected[0] is turns[0]):
+                oldest_id = source_window_oldest_cursor
             return History(
                 session_id=sid,
                 revision=revision,
@@ -3736,10 +3854,10 @@ class WrapperMachine:
                 build_seq=build_seq,
                 live_seq=live_seq,
                 events=payload,
-                has_more=effective_start > 0,
+                has_more=source_window_has_more or effective_start > 0,
                 before=before,
                 control=control,
-                oldest_id=(_tid(selected[0]) if selected else None),
+                oldest_id=oldest_id,
                 newest_id=(_tid(selected[-1]) if selected else None),
                 external=self._is_external(sid),
                 takeover_pending=bool(
@@ -4123,8 +4241,7 @@ class WrapperMachine:
         if ctx.session_id:
             self._watch_session(ctx.session_id)
             external = (
-                (False if is_codex_shared
-                 else await self._prime_codex_ownership(ctx.session_id))
+                await self._prime_codex_ownership(ctx.session_id)
                 if ctx.engine == "codex"
                 else (False if is_claude_broker
                       else await self._prime_claude_ownership(ctx.session_id))
@@ -5199,11 +5316,25 @@ class WrapperMachine:
                         "session_percentage": session_percentage,
                     }
             if ctx.engine == "codex":
-                used = usage.get("used_tokens") or 0
-                win = usage.get("context_window") or 0
+                raw_used = usage.get("used_tokens")
+                raw_win = usage.get("context_window")
+                available = (
+                    isinstance(raw_used, int)
+                    and not isinstance(raw_used, bool)
+                    and raw_used >= 0
+                )
+                used = raw_used if available else 0
+                win = (
+                    raw_win
+                    if isinstance(raw_win, int)
+                    and not isinstance(raw_win, bool)
+                    and raw_win >= 0
+                    else 0
+                )
                 event = ContextReport(
                     total_tokens=used, max_tokens=win,
                     percentage=(used / win * 100.0) if win else 0.0,
+                    available=False if not available else None,
                     model=ctx.sdk.model, is_auto_compact_enabled=None,
                     categories=[], **work_fields)
                 await self._emit(ctx, event)
@@ -7590,6 +7721,7 @@ class WrapperMachine:
             else:
                 raw = await list_codex_sessions(200)
                 self._codex_session_list_cache = (time.monotonic(), raw)
+            self._prime_codex_sidebar_watches(raw)
             resident_state = {c.session_id: c.state for c in self.sessions.values()
                               if c.session_id and c.engine == "codex"}
             space = getattr(cmd, "space", "code")
@@ -7649,6 +7781,8 @@ class WrapperMachine:
                     engine="codex", space=space,
                     work_id=record.work_id if record else None,
                     state=(resident_state.get(row["session_id"])
+                           or self._codex_sidebar_watch_state(
+                               self._watch.get(row["session_id"]))
                            or _codex_list_state(row.get("status"))),
                     forked_from_id=row.get("forked_from_id"),
                     codex_status=row.get("status"),
@@ -7709,11 +7843,12 @@ class WrapperMachine:
                 resume_id=sid, engine=engine, space=actual_space,
                 work_id=work_record.work_id if work_record else None)
             if ctx is None:
-                # surface it on the session the user switched INTO (not the stale
-                # focused one), so a spawn failure never looks like silent "no
-                # response". Common cause: bad codex config / backend.
+                # Surface it on the session the user switched INTO (not the stale
+                # focused one). _spawn has already emitted the specific cause;
+                # this durable session-scoped row only closes the loading state.
+                engine_name = "Codex" if engine == "codex" else "Claude"
                 error = Error(code=ERR_CC_CRASH,
-                    message="会话启动失败:可能是 codex 配置/后端问题(见服务端日志)")
+                    message=f"{engine_name} 会话启动失败；请查看上方具体错误")
                 await self._emit_to_sid(sid, error)
                 return error
         self.focused_sid = ctx.key
@@ -8460,11 +8595,10 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
-        if (not self._codex_shared_affinity(ctx)
-                and await self._prime_codex_ownership(sid)):
+        if await self._prime_codex_ownership(sid):
             error = Error(
                 code=ERR_BUSY,
-                message=f"会话正由本机终端使用，无法{action}",
+                message=f"会话正由 Codex App 使用，无法{action}",
                 sid=sid,
                 to=getattr(cmd, "client_id", None),
             )
@@ -10987,8 +11121,7 @@ class WrapperMachine:
         ctx.key = key
         if resume_id:
             self._watch_session(resume_id)
-            if (engine == "codex"
-                    and not self._codex_shared_affinity(ctx)):
+            if engine == "codex":
                 await self._prime_codex_ownership(resume_id)
             elif engine == "claude" and broker_handle is None:
                 await self._prime_claude_ownership(resume_id)

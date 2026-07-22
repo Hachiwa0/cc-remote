@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 import time
 from types import SimpleNamespace
+from pathlib import Path
 from urllib.parse import quote
 
 import pytest
@@ -40,6 +42,12 @@ def _cfg(**overrides) -> RelayConfig:
         "wrapper_token": "w" * 48,
         "public_origin": "https://remote.example",
         "session_ttl_seconds": 3600,
+        # Relay construction creates the device registry immediately. Keep
+        # zero-model auth tests out of the developer's real ~/.cc-remote.
+        "device_db_path": str(
+            Path(tempfile.mkdtemp(prefix="cc-remote-auth-test-"))
+            / "devices.sqlite3"
+        ),
     }
     values.update(overrides)
     return RelayConfig(**values)

@@ -43,6 +43,7 @@ WRAPPER_LIMIT_CLOSE_REASON = "wrapper capacity reached"
 
 
 WrapperEventHook = Callable[[str, object], Awaitable[None]]
+WrapperAuthorizer = Callable[[str], Awaitable[bool]]
 
 
 class RelayHub:
@@ -93,6 +94,27 @@ class RelayHub:
         return (self._wrapper_ws if machine_id == "default"
                 else self._wrappers.get(machine_id))
 
+    async def disconnect_wrapper(
+        self,
+        machine_id: str,
+        *,
+        reason: str = "device disconnected",
+    ) -> bool:
+        """Close the current wrapper generation, if any.
+
+        Device revocation uses this to make credential removal effective now
+        rather than after the wrapper's next reconnect.
+        """
+        async with self._lock:
+            wrapper = self._wrapper_for(machine_id)
+        if wrapper is None:
+            return False
+        try:
+            await wrapper.close(code=1008, reason=reason[:123])
+        except Exception:
+            pass
+        return True
+
     def _clients_for(self, machine_id: str) -> dict[str, ClientConn]:
         if machine_id == "default":
             return self._clients
@@ -130,6 +152,7 @@ class RelayHub:
         self,
         ws: WebSocket,
         expected_machine_id: str | None = None,
+        authorize_machine: WrapperAuthorizer | None = None,
     ) -> None:
         announced = False
         machine_id: str | None = None
@@ -217,7 +240,22 @@ class RelayHub:
                         except Exception:
                             pass
                         return
+                    # The WebSocket upgrade and wrapper hello are separate
+                    # protocol steps. Reserve the route first so a concurrent
+                    # revoke can find and close this socket, then re-check a
+                    # dynamic credential before exposing the wrapper as live.
                     announced = True
+                    if (authorize_machine is not None
+                            and not await authorize_machine(machine_id)):
+                        try:
+                            await ws.send_text(serialize(Error(
+                                code=ERR_PROTOCOL,
+                                message="wrapper credential has been revoked",
+                            )))
+                            await ws.close(code=1008, reason="device revoked")
+                        except Exception:
+                            pass
+                        return
                     log.info("wrapper connected", machine_id=machine_id)
                 assert machine_id is not None
                 await self._on_wrapper_msg(msg, machine_id)
