@@ -1,14 +1,17 @@
 import type { ReactNode } from "react";
-import type { StatusRateLimit, StatusRateWindow, StatusReport } from "../protocol";
+import type { Notice, StatusRateLimit, StatusRateWindow, StatusReport } from "../protocol";
 import { Icon } from "../icons";
 import { accountStatsNote } from "../status-capabilities";
+import { statusNotices } from "../notice-presentation";
 
 interface Props {
   open: boolean;
   report: StatusReport | null;
+  notices?: Notice[];
   error?: string | null;
   onClose: () => void;
   onRefresh: () => void;
+  onDismissNotice?: (noticeId: string) => void;
 }
 
 const show = (value: unknown, empty = "—") => value == null || value === "" ? empty : String(value);
@@ -43,19 +46,21 @@ function RateWindow({ name, window }: { name: string; window?: StatusRateWindow 
 function RateLimit({ limit }: { limit: StatusRateLimit }) {
   return <div className="status-rate-card">
     <div className="status-rate-head"><b>{limit.limit_name || limit.limit_id || "Codex"}</b><span>{limit.plan_type || "—"}</span></div>
-    {limit.rate_limit_reached_type && <div className="status-rate-warning">{limit.rate_limit_reached_type}</div>}
+    {limit.rate_limit_reached_type && <div className="status-rate-attention">当前限额已用尽，请等待重置。</div>}
     <RateWindow name="主要限额" window={limit.primary} />
     <RateWindow name="次要限额" window={limit.secondary} />
   </div>;
 }
 
-export function StatusSheet({ open, report, error, onClose, onRefresh }: Props) {
+export function StatusSheet({ open, report, notices = [], error, onClose,
+  onRefresh, onDismissNotice }: Props) {
   if (!open) return null;
   const thread = report?.thread;
   const runtime = report?.runtime;
   const context = report?.context;
   const usage = report?.usage;
   const statsNote = accountStatsNote(report?.account);
+  const presentedNotices = statusNotices(notices);
   return <>
     <div className="scrim show" onClick={onClose} />
     <section className="sheet show status-sheet" role="dialog" aria-modal="true" aria-label="Codex Status">
@@ -69,6 +74,18 @@ export function StatusSheet({ open, report, error, onClose, onRefresh }: Props) 
       {error && <div className="status-partial" role="alert"><b>状态读取失败</b><span>{error}</span></div>}
       {!report && !error ? <div className="status-loading"><span />正在读取 thread、config 和 account…</div> : report ?
       <div className="status-sheet-scroll">
+        {presentedNotices.length > 0 && <section className="status-section">
+          <h3>需要关注</h3>
+          <div className="status-attention-list">{presentedNotices.map((notice) =>
+            <article key={notice.notice_id}>
+              <span><b>{notice.title}</b><small>{notice.message}</small></span>
+              {onDismissNotice && <button type="button"
+                onClick={() => onDismissNotice(notice.notice_id)}
+                aria-label={`关闭提示：${notice.title}`}>
+                <Icon name="close" size={14} />
+              </button>}
+            </article>)}</div>
+        </section>}
         <section className="status-section">
           <h3>线程</h3>
           <div className="status-grid">
@@ -132,8 +149,8 @@ export function StatusSheet({ open, report, error, onClose, onRefresh }: Props) 
         </section>}
 
         {report.component_errors.length > 0 && <section className="status-partial">
-          <b>部分状态暂不可用</b>
-          {report.component_errors.map((error, index) => <span key={index}>{error}</span>)}
+          <b>部分信息暂不可用</b>
+          <span>稍后刷新即可，不影响当前会话。</span>
         </section>}
       </div> : null}
     </section>

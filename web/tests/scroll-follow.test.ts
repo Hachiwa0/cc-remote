@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  AUTO_LOAD_HISTORY_TOP_PX,
   AT_BOTTOM_PX,
-  anchoredScrollTop,
+  anchoredElementScrollTop,
   createFrameCoalescer,
+  OlderHistoryLoadGate,
   measureBottom,
   NEAR_BOTTOM_PX,
+  shouldAutoLoadOlderHistory,
   ScrollFollowController,
 } from "../src/scroll-follow.ts";
 
@@ -25,8 +28,45 @@ assert.equal(measureBottom({
   clientHeight: 600,
 }).atBottom, true);
 assert.equal(AT_BOTTOM_PX, 2);
-assert.equal(anchoredScrollTop(170, 1_000, 1_700), 870);
-assert.equal(anchoredScrollTop(0, 1_000, 800), 0);
+assert.equal(anchoredElementScrollTop(170, 120, 820), 870);
+assert.equal(anchoredElementScrollTop(0, 100, 80), 0);
+
+const historyGate = new OlderHistoryLoadGate();
+historyGate.beginGesture();
+assert.equal(historyGate.acquire(), true);
+assert.equal(historyGate.acquire(), false, "one gesture can start only one prepend");
+historyGate.complete();
+assert.equal(historyGate.acquire(), false,
+  "finishing a page while the same finger is down must not chain another page");
+historyGate.endGesture();
+historyGate.beginGesture();
+assert.equal(historyGate.acquire(), true, "a new pull gesture may load the next page");
+historyGate.complete();
+historyGate.endGesture();
+
+// Merely painting at the top (short history, session switch, or layout clamp)
+// must not start pagination. A real gesture toward older content does, within
+// a small top threshold, and only while another local/server page exists.
+assert.equal(shouldAutoLoadOlderHistory({
+  scrollHeight: 1_200,
+  scrollTop: AUTO_LOAD_HISTORY_TOP_PX,
+  clientHeight: 600,
+}, true, true), true);
+assert.equal(shouldAutoLoadOlderHistory({
+  scrollHeight: 1_200,
+  scrollTop: AUTO_LOAD_HISTORY_TOP_PX + 1,
+  clientHeight: 600,
+}, true, true), false);
+assert.equal(shouldAutoLoadOlderHistory({
+  scrollHeight: 1_200,
+  scrollTop: 0,
+  clientHeight: 600,
+}, false, true), false);
+assert.equal(shouldAutoLoadOlderHistory({
+  scrollHeight: 1_200,
+  scrollTop: 0,
+  clientHeight: 600,
+}, true, false), false);
 
 const controller = new ScrollFollowController();
 assert.deepEqual(controller.reset({
@@ -190,8 +230,17 @@ const chatViewSource = readFileSync(
   "utf8",
 );
 assert.match(chatViewSource, /"thread-shell work-thread-shell"/);
+assert.match(chatViewSource, /onScroll[\s\S]*maybeAutoLoadOlder/,
+  "scrollbar and keyboard movement at the top must auto-load older history");
+assert.match(chatViewSource, /onWheel[\s\S]*maybeAutoLoadOlder/,
+  "an upward wheel gesture at the top must auto-load older history");
+assert.match(chatViewSource, /onTouchMove[\s\S]*maybeAutoLoadOlder/,
+  "a continued pull gesture at the top must auto-load older history");
 const threadShellRule = css.match(/\.thread-shell\{[^}]+\}/)?.[0] ?? "";
 assert.match(threadShellRule, /position:relative/);
+const threadRule = css.match(/\.thread\{[^}]+\}/)?.[0] ?? "";
+assert.match(threadRule, /overflow-anchor:none/,
+  "JS owns prepend anchoring; browser anchoring must be disabled");
 const scrollBottomRule = css.match(/\.scroll-bottom-wrap\{[^}]+\}/)?.[0] ?? "";
 assert.match(scrollBottomRule, /position:absolute/);
 assert.doesNotMatch(scrollBottomRule, /position:sticky/);

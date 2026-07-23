@@ -965,36 +965,24 @@ class CodexStreamTranslator:
                     detail=_retry_detail(err),
                 ))
             else:
-                msg = err.get("message") or "codex 出错"
-                det = err.get("additionalDetails")
-                message_text, _ = bounded_text(msg, 24 * 1024)
-                details_text, _ = bounded_text(det, 8 * 1024)
-                detail = "codex: " + message_text
-                if details_text:
-                    detail += " — " + details_text
                 self._terminal_error = True
-                out.append(Error(code=ERR_CC_CRASH, message=detail))
+                out.append(Error(
+                    code=ERR_CC_CRASH,
+                    message="Codex 本次回复未完成，请重试。",
+                ))
 
         elif method == "turn/completed":
             self._close_open(out)
             turn = p.get("turn") or {}
             st = turn.get("status") or "completed"
-            # a failed turn carries its reason in turn.error — surface it (the
-            # error notifications above may not have fired for every failure mode).
+            # A failed turn may carry provider diagnostics in turn.error. Keep
+            # those on the local engine boundary and emit only stable product
+            # copy (the error notification above may not fire for every mode).
             if st == "failed":
-                te = turn.get("error")
-                emsg = te.get("message") if isinstance(te, dict) else (te if isinstance(te, str) else None)
-                if emsg and not self._terminal_error:
-                    message_text, _ = bounded_text(emsg, 32 * 1024)
+                if not self._terminal_error:
                     out.append(Error(
                         code=ERR_CC_CRASH,
-                        message="codex 回合失败: " + message_text,
-                    ))
-                    self._terminal_error = True
-                elif not self._terminal_error:
-                    out.append(Error(
-                        code=ERR_CC_CRASH,
-                        message="Codex 回合失败，但没有返回错误详情。",
+                        message="Codex 本次回复未完成，请重试。",
                     ))
                     self._terminal_error = True
             # Codex 0.144.1 can record an upstream 503 as completed/error=null with
@@ -2179,6 +2167,13 @@ def codex_translate_history(
                 if msg and not msg.lstrip().startswith("<"):
                     next_turn_id = p.get("turn_id") or pending_turn_id
                     if turn_open:
+                        # Codex accepts another user message while the same
+                        # app-server task is still running.  That is steering,
+                        # not evidence that the preceding visible segment
+                        # crashed.  We still need a synthetic boundary because
+                        # the Web projection stores one user prompt per turn,
+                        # but it must be a neutral non-error boundary.
+                        steered_same_task = task_has_user and turn_has_user
                         # No terminal record proved where the previous visible
                         # reply ended. In particular, pending_turn_id now often
                         # belongs to this NEW user turn; never attach it to the
@@ -2193,10 +2188,15 @@ def codex_translate_history(
                                 "authoritative_page",
                             }
                         )
-                        close_turn(
-                            "success" if proven_continuation else "error",
-                            0, not proven_continuation,
-                            authoritative_boundary=False)
+                        if steered_same_task:
+                            close_turn(
+                                "steered", 0, False,
+                                authoritative_boundary=False)
+                        else:
+                            close_turn(
+                                "success" if proven_continuation else "error",
+                                0, not proven_continuation,
+                                authoritative_boundary=False)
                     active_turn_id = str(next_turn_id) if next_turn_id else None
                     pending_turn_id = active_turn_id
                     if task_has_user:

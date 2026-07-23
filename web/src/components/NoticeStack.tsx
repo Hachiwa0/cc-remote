@@ -1,5 +1,6 @@
 import type { Notice, NoticeCategory } from "../protocol";
 import { Icon } from "../icons";
+import { conversationNotices } from "../notice-presentation";
 
 const CATEGORY_LABEL: Record<NoticeCategory, string> = {
   runtime: "运行时",
@@ -14,12 +15,13 @@ export function NoticeStack({ notices, onDismiss }: {
   notices: Notice[];
   onDismiss: (noticeId: string) => void;
 }) {
-  if (!notices.length) return null;
+  const presented = conversationNotices(notices);
+  if (!presented.length) return null;
   return <section className="notice-stack" aria-label="Codex 通知" aria-live="polite">
-    {notices.map((notice) => <article
+    {presented.map((notice) => <article
       key={notice.notice_id}
-      className={`notice-bar ${notice.severity}`}
-      role={notice.severity === "warning" ? "alert" : "status"}
+      className={`notice-bar ${notice.severity === "warning" ? "attention" : "info"}`}
+      role="status"
     >
       <span className="notice-mark" aria-hidden="true" />
       <div className="notice-copy">

@@ -7,6 +7,8 @@ Run: ./.venv/bin/python -m pytest tests/test_history.py -q
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import threading
 from types import SimpleNamespace
@@ -22,7 +24,8 @@ from claude_agent_sdk.types import (
 
 from cc_remote.protocol import (
     serialize, deserialize,
-    GetHistory, GetTurnDetail, History, TurnDetail, HistoryInvalidated,
+    GetHistory, GetHistoryImage, GetTurnDetail, History, HistoryImage,
+    TurnDetail, HistoryInvalidated,
     UserMsg, AssistantMsgStart, Delta,
     TurnEnd, TurnResult, is_downstream,
 )
@@ -31,6 +34,7 @@ from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
     MaterializedHistoryPage,
+    history_image_id,
     materialize_history_turns,
 )
 from cc_remote.wrapper.stream import (
@@ -42,7 +46,7 @@ from cc_remote.wrapper.stream import (
 from tests.test_multisession import _mk_machine, _mk_ctx
 
 
-def test_protocol_v18_get_history_and_materialized_summary_roundtrip():
+def test_protocol_v19_get_history_and_materialized_summary_roundtrip():
     gh = GetHistory(
         session_id="s1", client_id="c1", limit=50, detail="summary")
     assert deserialize(serialize(gh)) == gh
@@ -51,6 +55,10 @@ def test_protocol_v18_get_history_and_materialized_summary_roundtrip():
                 events=[{"type": "user_msg", "msg_id": "u1"}],
                 turns=[{
                     "id": "u1", "prompt": "hello", "blocks": [],
+                    "imageRefs": [{
+                        "image_id": "u1.img.0", "media_type": "image/png",
+                        "width": 1, "height": 1, "byte_size": 24,
+                    }],
                     "done": True, "detailEventCount": 3,
                     "detailLoaded": False,
                 }],
@@ -61,6 +69,7 @@ def test_protocol_v18_get_history_and_materialized_summary_roundtrip():
     assert got.type == "history" and got.session_id == "s1" and got.has_more is True
     assert got.events[0]["type"] == "user_msg"
     assert got.turns[0].id == "u1" and got.turns[0].detailEventCount == 3
+    assert got.turns[0].imageRefs[0]["image_id"] == "u1.img.0"
     assert got.detail == "summary"
     assert got.in_progress is True
     assert got.build_seq == 4 and got.live_seq == 11
@@ -78,6 +87,54 @@ def test_protocol_v18_get_history_and_materialized_summary_roundtrip():
         revision="test-revision",
     )
     assert deserialize(serialize(request)) == request
+
+    image_request = GetHistoryImage(
+        session_id="s1", turn_id="u1", image_id="u1.img.0",
+        variant="thumbnail", request_id="request-1", client_id="c1",
+        revision="test-revision",
+    )
+    assert deserialize(serialize(image_request)) == image_request
+    image = HistoryImage(
+        session_id="s1", turn_id="u1", image_id="u1.img.0",
+        variant="thumbnail", request_id="request-1",
+        revision="test-revision", media_type="image/png",
+        width=1, height=1, data="aW1n", to="c1",
+    )
+    assert deserialize(serialize(image)) == image
+
+
+def test_materialized_summary_keeps_image_metadata_without_full_payload():
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR" + (
+        b"\x00\x00\x00\x02\x00\x00\x00\x03")
+    encoded = base64.b64encode(png).decode("ascii")
+    events = [
+        {"type": "user_msg", "msg_id": "turn-image", "prompt": "look",
+         "images": [{"media_type": "image/png", "data": encoded}]},
+        {"type": "turn_end", "turn_id": "turn-image",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    ]
+    turns = materialize_history_turns(events)
+    assert len(turns) == 1
+    assert "images" not in turns[0]
+    assert turns[0]["imageRefs"] == [{
+        "image_id": history_image_id("turn-image", 0),
+        "media_type": "image/png",
+        "width": 2,
+        "height": 3,
+        "byte_size": len(png),
+    }]
+    assert encoded not in json.dumps(turns)
+
+
+def test_materialized_summary_never_exposes_bare_error_sentinel():
+    turns = materialize_history_turns((
+        {"type": "user_msg", "msg_id": "message-1", "prompt": "go"},
+        {"type": "turn_end", "turn_id": "turn-1", "result": {
+            "subtype": "error", "is_error": True, "duration_ms": 0,
+        }},
+    ))
+    assert turns[0]["error"] == "该轮未正常结束"
     detail = TurnDetail(
         session_id="s1", turn_id="u1", revision="test-revision",
         events=[{"type": "user_msg", "msg_id": "u1", "prompt": "hello"}],
@@ -263,6 +320,90 @@ def test_get_turn_detail_is_routed_and_revision_bound(monkeypatch, tmp_path):
         assert stale.authoritative is False and stale.events == []
 
         assert transport.sent[-2:] == [response, stale]
+
+    asyncio.run(go())
+
+
+def test_get_history_image_is_revision_bound_lazy_and_cached(
+    monkeypatch, tmp_path,
+):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (640, 320), (26, 84, 140)).save(buffer, "PNG")
+    raw = buffer.getvalue()
+    encoded = base64.b64encode(raw).decode("ascii")
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    events = (
+        {"type": "user_msg", "sid": "session-1", "msg_id": "message-1",
+         "prompt": "inspect", "images": [{
+             "media_type": "image/png", "data": encoded,
+         }]},
+        {"type": "turn_end", "sid": "session-1", "turn_id": "turn-1",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    )
+
+    async def go():
+        machine, transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state")
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        page = MaterializedHistoryPage(
+            events=events, has_more=False,
+            oldest_id="message-1", newest_id="message-1",
+            turns=materialize_history_turns(events),
+        )
+        machine._history_index.put_page(
+            "session-1", "codex", source, before=None, limit=4, page=page)
+        revision = machine._history_revision("session-1")
+        image_id = history_image_id("message-1", 0)
+
+        thumbnail = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-1", turn_id="message-1", image_id=image_id,
+            variant="thumbnail", request_id="request-thumb",
+            client_id="client-1", revision=revision,
+        ))
+        assert isinstance(thumbnail, HistoryImage)
+        assert thumbnail.to == "client-1" and thumbnail.error is None
+        assert thumbnail.media_type == "image/webp"
+        assert thumbnail.width == 360 and thumbnail.height == 180
+        assert len(base64.b64decode(thumbnail.data)) < len(raw)
+
+        full = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-1", turn_id="message-1", image_id=image_id,
+            variant="full", request_id="request-full",
+            client_id="client-1", revision=revision,
+        ))
+        assert full.error is None and full.media_type == "image/png"
+        assert full.width == 640 and full.height == 320
+        assert base64.b64decode(full.data) == raw
+
+        # A second request is served by the source-bound bounded image cache;
+        # decoding/thumbnailing must not run again.
+        monkeypatch.setattr(
+            mm, "_render_history_image",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("re-rendered")),
+        )
+        cached = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-1", turn_id="message-1", image_id=image_id,
+            variant="thumbnail", request_id="request-cached",
+            client_id="client-1", revision=revision,
+        ))
+        assert cached.error is None and cached.data == thumbnail.data
+
+        stale = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-1", turn_id="message-1", image_id=image_id,
+            variant="full", request_id="request-stale",
+            client_id="client-2", revision="old-revision",
+        ))
+        assert stale.to == "client-2" and stale.data is None
+        assert stale.error == "会话历史已更新，请重新加载图片"
+        assert transport.sent[-4:] == [thumbnail, full, cached, stale]
 
     asyncio.run(go())
 

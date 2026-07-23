@@ -14,7 +14,7 @@ import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ToolCategory, ProcessKind,
   ProcessStatus, PlanEntry, CollaborationModeName, Notice, RateLimitUpdate,
-  StatusRateLimit, StatusRateWindow, SessionControl,
+  StatusRateLimit, StatusRateWindow, SessionControl, ConversationImageRef,
 } from "./protocol";
 import {
   compareSessionControl, sessionControlLocksInput, sessionControlTargetsSid,
@@ -27,6 +27,7 @@ import { canEnqueueQuery, collectWaitingQueries, reduceTargetedRuntime } from ".
 import { mergeInitialHistory } from "./history-merge";
 import { boundRuntimeTurns, pruneRuntimeMap } from "./runtime-bounds";
 import { bumpSessionActivity, setSessionPinned } from "./session-order";
+import { presentCommandProblem, presentTurnProblem } from "./problem-presentation";
 
 export interface TextBlock {
   kind: "text";
@@ -118,6 +119,7 @@ export interface Turn {
   error?: string;
   progress?: string;
   images?: QueryImg[];
+  imageRefs?: ConversationImageRef[];
   files?: QueryFile[];
   ts?: number;
   doneTs?: number;
@@ -312,6 +314,7 @@ export type Action =
   | { type: "query_sent"; sid: string; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[]; ts: number }
   | { type: "conn"; connState: ConnState; detail?: string }
   | { type: "command_error"; detail: string }
+  | { type: "dismiss_banner"; banner: string }
   | { type: "enqueue"; query: PendingQuery }
   | { type: "dequeue_at"; sid: string; i: number }
   | { type: "set_send_mode"; mode: "interrupt" | "queue" }
@@ -813,8 +816,8 @@ export function reduce(state: AppState, action: Action): AppState {
     case "conn": {
       let banner = state.banner;
       if (action.connState === "connected") banner = undefined;
-      else if (action.connState === "reconnecting") banner = action.detail || "reconnecting…";
-      else if (action.connState === "connecting") banner = "connecting…";
+      else if (action.connState === "reconnecting") banner = action.detail || "正在重新连接…";
+      else if (action.connState === "connecting") banner = "正在连接…";
       const runtimes = action.connState === "connected"
         ? state.runtimes
         : Object.fromEntries(Object.entries(state.runtimes).map(
@@ -833,6 +836,10 @@ export function reduce(state: AppState, action: Action): AppState {
     }
     case "command_error":
       return { ...state, banner: action.detail };
+    case "dismiss_banner":
+      return state.banner === action.banner
+        ? { ...state, banner: undefined }
+        : state;
     case "query_sent": {
       const turn: Turn = {
         id: action.msg_id, prompt: action.prompt, blocks: [], done: false,
@@ -1295,9 +1302,7 @@ function reduceEvent(
         const next = patch(state, sid, (rt) => {
           rt.loading = false;
         }, true);
-        return e.error && state.focusedSid === sid
-          ? { ...next, banner: e.error }
-          : next;
+        return next;
       }
       // build_seq orders newest-page reads only within the same boot-scoped
       // revision. A restart legitimately resets the sequence while changing
@@ -1320,6 +1325,7 @@ function reduceEvent(
           interrupted: turn.interrupted ?? undefined,
           error: turn.error ?? undefined,
           images: turn.images ?? undefined,
+          imageRefs: turn.imageRefs ?? undefined,
           files: turn.files ?? undefined,
           ts: turn.ts ?? undefined,
           doneTs: turn.doneTs ?? undefined,
@@ -1409,11 +1415,14 @@ function reduceEvent(
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
       return {
         ...state,
-        banner: scratch.banner ?? state.banner,
+        // History can contain legacy Error rows.  They may reconstruct a
+        // turn-local outcome, but must never escape as a fresh global banner.
+        banner: state.banner,
         runtimes: {
           ...state.runtimes,
           [sid]: {
             ...base, turns, loading: false,
+            ccSessionId: acceptsControlState ? sid : base.ccSessionId,
             state: acceptsControlState && !racedLiveEvent
               && e.external !== true && e.in_progress != null
               ? (e.in_progress
@@ -1484,9 +1493,7 @@ function reduceEvent(
             ? { ...turn, detailLoading: false }
             : turn);
         });
-        return e.error && state.focusedSid === sid
-          ? { ...next, banner: e.error }
-          : next;
+        return next;
       }
       let scratch: AppState = {
         ...state,
@@ -1515,6 +1522,7 @@ function reduceEvent(
             id: turn.id,
             prompt: detailed.prompt || turn.prompt,
             images: detailed.images ?? turn.images,
+            imageRefs: detailed.imageRefs ?? turn.imageRefs,
             files: detailed.files ?? turn.files,
             detailEventCount: turn.detailEventCount,
             detailLoaded: true,
@@ -1824,32 +1832,33 @@ function reduceEvent(
               ...runtime, syncReady: false, replaying: false,
             }])),
           wrapperOnline: false,
-          banner: "machine offline — waiting for reconnect",
+          banner: "设备离线，正在等待重新连接…",
         };
       }
       if (e.request_id && e.sid) {
         if (state.artifact?.requestId === e.request_id
             && state.artifact.sid === e.sid) {
           return { ...state, artifact: {
-            ...state.artifact, loading: false, error: e.message,
+            ...state.artifact, loading: false,
+            error: presentCommandProblem(e),
           } };
         }
         const runtime = state.runtimes[e.sid];
         if (runtime?.contextRequestId === e.request_id) {
           return patch(state, e.sid, (rt) => {
             rt.contextRequestId = null;
-            rt.contextError = e.message;
+            rt.contextError = presentCommandProblem(e);
           });
         }
         if (runtime?.statusRequestId === e.request_id) {
           return patch(state, e.sid, (rt) => {
             rt.statusRequestId = null;
-            rt.statusError = e.message;
+            rt.statusError = presentCommandProblem(e);
           });
         }
       }
       if (!e.msg_id) {
-        return { ...state, banner: `${e.code}: ${e.message}` };
+        return { ...state, banner: presentCommandProblem(e) };
       }
       return patch(state, e.sid, (rt) => {
         rt.loading = false; // never leave a spinner spinning behind an error
@@ -1857,14 +1866,14 @@ function reduceEvent(
         const turns = cloneTurns(rt.turns);
         const t = turns.find((turn) => turn.id === e.msg_id);
         if (t) {
-          t.error = `${e.code}: ${e.message}`;
+          t.error = presentTurnProblem(e);
           t.progress = undefined;
           t.done = true;
           t.doneTs ??= Date.now();
           finishOpenBlocks(t, "failed", true);
         }
         else turns.push({ id: e.msg_id!, prompt: "", blocks: [], done: true,
-          error: `${e.code}: ${e.message}`, doneTs: Date.now() });
+          error: presentTurnProblem(e), doneTs: Date.now() });
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
         rt.pendingQuestion = null;
@@ -2177,6 +2186,7 @@ function reduceEvent(
       });
     case "pong":
     case "command_ack":
+    case "history_image":
     case "session_forked":
     case "hello":
       return state;

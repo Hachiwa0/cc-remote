@@ -308,7 +308,7 @@
 .status-rate-head { display:flex; justify-content:space-between; align-items:center; }
 .status-rate-head b { font-size:12.5px; }
 .status-rate-head span { color:var(--faint); font-size:10.5px; }
-.status-rate-warning { margin-top:6px; padding:5px 7px; border-radius:7px; color:var(--danger); background:var(--danger-weak); font-size:10.5px; }
+.status-rate-attention { margin-top:6px; padding:5px 7px; border-radius:7px; color:var(--text); background:var(--raised); font-size:10.5px; }
 .status-rate-window { margin-top:9px; }
 .status-rate-window > div { display:flex; justify-content:space-between; color:var(--dim); font-size:11px; }
 .status-rate-window > div b { color:var(--text); font-size:10.5px; }
@@ -318,6 +318,13 @@
 .status-usage small { color:var(--faint); font-size:9.5px; }
 .status-usage b { font-family:var(--mono); font-size:11px; }
 .status-partial { display:flex; flex-direction:column; gap:3px; margin-top:12px; padding:10px 12px; border-radius:10px; color:var(--warn); background:var(--warn-weak); font-size:10.5px; }
+.status-attention-list { display:grid; gap:7px; }
+.status-attention-list article { display:flex; align-items:flex-start; gap:8px; padding:9px 10px; border:1px solid var(--border); border-radius:10px; background:var(--bg); }
+.status-attention-list article > span { min-width:0; flex:1; display:flex; flex-direction:column; gap:2px; }
+.status-attention-list b { font-size:11.5px; }
+.status-attention-list small { color:var(--dim); font-size:10.5px; line-height:1.45; }
+.status-attention-list button { flex:none; width:26px; height:26px; display:grid; place-items:center; border-radius:7px; color:var(--dim); }
+.status-attention-list button:hover { background:var(--raised); color:var(--text); }
 
 .fork-worktree-sheet { padding:0; }
 .fork-worktree-sheet > form { min-height:0; display:flex; flex:1; flex-direction:column; }

@@ -28,11 +28,11 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
 - `env.relay.example` / `env.wrapper.example` — environment templates for each
   side. Install the wrapper template as root:root mode 0600 at the path above.
 
-Protocol v18 is a coordinated upgrade: publish the Python package and freshly
+Protocol v19 is a coordinated upgrade: publish the Python package and freshly
 built `web/dist` as one release, then restart relay and wrapper. The strict
 protocol gate is intentional and mixed protocol versions will not communicate.
 `setup-vps.sh` rejects a missing or mismatched web build manifest. Stop the
-wrapper first; activate the v18 relay/web release; then start the v18 wrapper.
+wrapper first; activate the v19 relay/web release; then start the v19 wrapper.
 
 ## Native terminal coordination
 

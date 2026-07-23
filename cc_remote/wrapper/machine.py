@@ -41,6 +41,7 @@ import asyncio
 import base64
 import codecs
 import hashlib
+import io
 import json
 import os
 import re
@@ -65,7 +66,12 @@ from claude_agent_sdk.types import (
     TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage,
 )
 
-from cc_remote.attachments import decode_attachment, validate_attachments
+from cc_remote.attachments import (
+    MAX_IMAGE_PIXELS,
+    decode_attachment,
+    image_dimensions,
+    validate_attachments,
+)
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.workspaces import WorkStores
@@ -75,7 +81,7 @@ from cc_remote.protocol import (
     Error, Hello, Query, Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort, Fast,
     CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
-    ConversationTurn, History, TurnDetail,
+    ConversationTurn, History, TurnDetail, HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser,
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg,
@@ -116,6 +122,7 @@ from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
     MaterializedHistoryPage,
+    history_image_from_events,
     materialize_history_turns,
 )
 from cc_remote.wrapper.stream import (
@@ -194,6 +201,82 @@ CODEX_FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
 def _codex_fast_on(value: Optional[str]) -> bool:
     """0.144.1 accepts ``fast`` but reports the persisted tier as ``priority``."""
     return value in CODEX_FAST_SERVICE_TIERS
+
+
+def _codex_terminal_status(message: dict) -> str:
+    params = message.get("params")
+    turn = params.get("turn") if isinstance(params, dict) else None
+    status = turn.get("status") if isinstance(turn, dict) else None
+    return status if isinstance(status, str) and status else "completed"
+
+
+def _codex_success_terminal(message: dict, fallback_turn_id: str) -> TurnEnd:
+    params = message.get("params")
+    turn = params.get("turn") if isinstance(params, dict) else None
+    turn = turn if isinstance(turn, dict) else {}
+    turn_id = turn.get("id")
+    if not isinstance(turn_id, str) or not turn_id:
+        turn_id = fallback_turn_id
+    duration = turn.get("durationMs")
+    try:
+        duration_ms = max(0, int(duration or 0))
+    except (TypeError, ValueError):
+        duration_ms = 0
+    return TurnEnd(
+        result=TurnResult(
+            subtype="success", duration_ms=duration_ms, is_error=False),
+        turn_id=turn_id,
+    )
+
+
+def _render_history_image(
+    image: dict,
+    variant: str,
+) -> tuple[str, int, int, bytes]:
+    """Validate and optionally thumbnail one indexed historical image."""
+    media_type = image.get("media_type")
+    encoded = image.get("data")
+    if not isinstance(media_type, str) or not isinstance(encoded, str):
+        raise ValueError("历史图片数据无效")
+    if validate_attachments([image], None) is not None:
+        raise ValueError("历史图片超出安全限制")
+    raw = decode_attachment(encoded)
+    dimensions = image_dimensions(raw, media_type)
+    if dimensions is None:
+        raise ValueError("历史图片格式无效")
+    width, height = dimensions
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ValueError("历史图片尺寸过大")
+    normalized = "image/jpeg" if media_type == "image/jpg" else media_type
+    if variant == "full":
+        return normalized, width, height, raw
+
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    with Image.open(io.BytesIO(raw)) as source:
+        if int(getattr(source, "n_frames", 1)) != 1:
+            raise ValueError("动态图片暂不支持预览")
+        source.load()
+        source.thumbnail((360, 360), Image.Resampling.LANCZOS)
+        if source.mode not in {"RGB", "RGBA"}:
+            source = source.convert("RGBA" if "transparency" in source.info else "RGB")
+        output = io.BytesIO()
+        source.save(
+            output,
+            format="WEBP",
+            lossless=normalized == "image/png",
+            quality=82,
+            method=4,
+        )
+        thumb = output.getvalue()
+        if len(thumb) > 512 * 1024:
+            source.thumbnail((240, 240), Image.Resampling.LANCZOS)
+            output = io.BytesIO()
+            source.convert("RGB").save(
+                output, format="WEBP", quality=70, method=4)
+            thumb = output.getvalue()
+        return "image/webp", source.width, source.height, thumb
 
 
 def _session_permission_mode(ctx: SessionContext) -> str:
@@ -304,7 +387,8 @@ class WrapperMachine:
         ".pdf": "application/pdf",
     }
     SAFE_RETRY_COMMANDS = frozenset({
-        "list_sessions", "get_history", "get_turn_detail", "get_models", "get_engine_capabilities",
+        "list_sessions", "get_history", "get_turn_detail", "get_history_image",
+        "get_models", "get_engine_capabilities",
         "get_context", "get_status", "get_diff", "get_file_preview",
         "get_preview_asset", "get_goal", "list_dir", "get_work_dashboard",
     })
@@ -319,7 +403,8 @@ class WrapperMachine:
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
-        "get_history", "get_turn_detail", "switch_session", "rename_session", "archive_session", "pin_session",
+        "get_history", "get_turn_detail", "get_history_image", "switch_session",
+        "rename_session", "archive_session", "pin_session",
         "delete_work_session", "delete_session", "rollback_session",
         "compact_session", "start_review",
         "fork_session", "fork_session_worktree",
@@ -2490,6 +2575,8 @@ class WrapperMachine:
             return await self._handle_get_history(cmd)
         elif t == "get_turn_detail":
             return await self._handle_get_turn_detail(cmd)
+        elif t == "get_history_image":
+            return await self._handle_get_history_image(cmd)
         elif t == "get_models":
             return await self._handle_get_models(cmd)
         elif t == "get_engine_capabilities":
@@ -3186,6 +3273,34 @@ class WrapperMachine:
         hist.sid = sid
         await self.transport.send(hist)
         return hist
+
+    async def _repair_codex_projection_after_overflow(
+        self, ctx: SessionContext, turn_id: str,
+    ) -> None:
+        """Replace shed live detail from the authoritative local rollout.
+
+        The terminal status has already reached the browser, so this read must
+        never turn a successful model turn into a user-visible transport error.
+        A newest-page summary is small and merges over the incomplete live tail;
+        heavyweight process bodies remain in the materialized detail index.
+        """
+        sid = ctx.session_id or ctx.key
+        if not sid:
+            return
+        try:
+            await self._push_mirrored_history(sid)
+            log.info(
+                "codex overflow projection repaired",
+                session_id=sid,
+                turn_id=turn_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "codex overflow projection repair failed",
+                session_id=sid,
+                turn_id=turn_id,
+                error_type=type(exc).__name__,
+            )
 
     @classmethod
     def _remember_watch_turn(cls, bucket: dict[str, float], turn_id: str,
@@ -4391,6 +4506,117 @@ class WrapperMachine:
             return await send(error="详细过程已过期，请刷新会话后重试")
         return await send([dict(row) for row in rows])
 
+    async def _handle_get_history_image(self, cmd) -> HistoryImage:
+        """Return one source-bound historical image without resuming an engine."""
+        started_at = time.perf_counter()
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        revision = self._history_revision(sid)
+        client_id = getattr(cmd, "client_id", None)
+
+        async def send(
+            *,
+            media_type: str | None = None,
+            width: int | None = None,
+            height: int | None = None,
+            data: bytes | None = None,
+            error: str | None = None,
+        ) -> HistoryImage:
+            response = HistoryImage(
+                session_id=sid,
+                turn_id=cmd.turn_id,
+                image_id=cmd.image_id,
+                variant=cmd.variant,
+                request_id=cmd.request_id,
+                revision=revision,
+                media_type=media_type,
+                width=width,
+                height=height,
+                data=(base64.b64encode(data).decode("ascii")
+                      if data is not None else None),
+                error=error,
+                sid=sid,
+                to=client_id,
+            )
+            await self.transport.send(response)
+            log.info(
+                "history image sent",
+                session_id=sid,
+                turn_id=cmd.turn_id,
+                image_id=cmd.image_id,
+                variant=cmd.variant,
+                bytes=len(data or b""),
+                authoritative=error is None,
+                client_id=client_id,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return response
+
+        requested_revision = getattr(cmd, "revision", None)
+        if requested_revision and requested_revision != revision:
+            return await send(error="会话历史已更新，请重新加载图片")
+        if self._history_index is None:
+            return await send(error="历史图片暂时不可用")
+
+        self._watch_session(sid)
+        watch = self._watch.get(sid) or {}
+        ctx = self._ctx_by_sid(sid)
+        is_codex = bool(
+            (ctx is not None and ctx.engine == "codex")
+            or watch.get("engine") == "codex"
+        )
+        engine = "codex" if is_codex else "claude"
+        try:
+            source_path = await asyncio.to_thread(
+                codex_rollout_path if is_codex else transcript_path, sid)
+            if not source_path:
+                return await send(error="历史图片尚未生成")
+            source = await asyncio.to_thread(
+                HistorySourceFingerprint.capture, source_path)
+
+            if cmd.variant == "thumbnail":
+                cached = await asyncio.to_thread(
+                    self._history_index.get_image_asset,
+                    sid, engine, source, cmd.turn_id, cmd.image_id,
+                    cmd.variant,
+                )
+                if cached is not None:
+                    media_type, width, height, data = cached
+                    return await send(
+                        media_type=media_type, width=width,
+                        height=height, data=data)
+
+            rows = await asyncio.to_thread(
+                self._history_index.get_turn_detail,
+                sid, engine, source, cmd.turn_id,
+            )
+            if rows is None:
+                return await send(error="历史图片已过期，请刷新会话")
+            image = history_image_from_events(
+                rows, cmd.turn_id, cmd.image_id)
+            if image is None:
+                return await send(error="未找到这张历史图片")
+            media_type, width, height, data = await asyncio.to_thread(
+                _render_history_image, image, cmd.variant)
+            if cmd.variant == "thumbnail":
+                await asyncio.to_thread(
+                    self._history_index.put_image_asset,
+                    sid, engine, source, cmd.turn_id, cmd.image_id,
+                    cmd.variant, media_type, width, height, data,
+                )
+            return await send(
+                media_type=media_type, width=width, height=height, data=data)
+        except ValueError as exc:
+            return await send(error=str(exc))
+        except Exception as exc:
+            log.warning(
+                "history image read failed",
+                session_id=sid,
+                turn_id=cmd.turn_id,
+                image_id=cmd.image_id,
+                error_type=type(exc).__name__,
+            )
+            return await send(error="历史图片读取失败，请重试")
+
     async def _handle_takeover(self, cmd):
         """Explicitly transfer a read-only terminal session back to Remote.
 
@@ -4647,7 +4873,7 @@ class WrapperMachine:
         if is_claude_broker:
             try:
                 metadata = await ctx.sdk.refresh_status()
-            except BrokerClientError as exc:
+            except BrokerClientError:
                 refreshed = await self._refresh_claude_broker_handle(ctx)
                 is_claude_broker = bool(getattr(
                     ctx.sdk, "is_claude_broker", False))
@@ -4656,7 +4882,7 @@ class WrapperMachine:
                 elif is_claude_broker:
                     error = Error(
                         code=ERR_BUSY,
-                        message=f"Claude broker 不可用，本次未发送: {exc}",
+                        message="Claude 连接暂不可用，本次消息未发送，请稍后重试。",
                         msg_id=getattr(cmd, "msg_id", None),
                     )
                     await self._emit(ctx, error)
@@ -4709,7 +4935,8 @@ class WrapperMachine:
                 return error
         if not cmd.prompt and not cmd.images and not cmd.files:
             error = Error(
-                code=ERR_BAD_PROMPT, message="empty prompt",
+                code=ERR_BAD_PROMPT,
+                message="消息内容为空，请输入内容或添加附件。",
                 msg_id=getattr(cmd, "msg_id", None))
             await self._emit(ctx, error)
             return error
@@ -4718,7 +4945,7 @@ class WrapperMachine:
         if attachment_error:
             error = Error(
                 code=ERR_BAD_PROMPT,
-                message=f"invalid attachments: {attachment_error}",
+                message="附件不符合要求，请调整后重试。",
                 msg_id=getattr(cmd, "msg_id", None),
             )
             await self._emit(ctx, error)
@@ -5031,7 +5258,7 @@ class WrapperMachine:
 
     async def _send_capability_mutation_error(self, cmd, exc: Exception):
         if isinstance(exc, ValueError):
-            code, message = ERR_BAD_PROMPT, str(exc)[:500]
+            code, message = ERR_BAD_PROMPT, "扩展设置无效，请检查输入后重试。"
         else:
             code, message = ERR_INTERNAL, "扩展操作失败，状态未确认"
         error = Error(
@@ -5316,7 +5543,7 @@ class WrapperMachine:
             error = (
                 self._claude_broker_control_error("切换模型", e)
                 if getattr(ctx.sdk, "is_claude_broker", False)
-                else Error(code=ERR_INTERNAL, message=f"set_model failed: {e}")
+                else Error(code=ERR_INTERNAL, message="模型切换未完成，请重试。")
             )
             await self._emit(ctx, error)
             return error
@@ -5416,7 +5643,7 @@ class WrapperMachine:
             log.exception("set_service_tier failed", error=str(e))
             error = Error(
                 code=ERR_INTERNAL,
-                message=f"set_service_tier failed: {e}",
+                message="服务档位切换未完成，请重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -5448,7 +5675,7 @@ class WrapperMachine:
             log.exception("set_collaboration_mode failed", error=str(e))
             error = Error(
                 code=ERR_INTERNAL,
-                message=f"set_collaboration_mode failed: {e}",
+                message="协作模式切换未完成，请重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -5661,7 +5888,7 @@ class WrapperMachine:
             error = (
                 self._claude_broker_control_error("切换权限模式", e)
                 if getattr(ctx.sdk, "is_claude_broker", False)
-                else Error(code=ERR_INTERNAL, message=f"set_perm failed: {e}")
+                else Error(code=ERR_INTERNAL, message="权限模式切换未完成，请重试。")
             )
             await self._emit(ctx, error)
             return error
@@ -5805,7 +6032,7 @@ class WrapperMachine:
             log.exception("get_context_usage failed", error=str(e))
             error = Error(
                 code=ERR_INTERNAL,
-                message=f"get_context failed: {e}",
+                message="上下文状态暂不可用，请稍后重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -5991,6 +6218,7 @@ class WrapperMachine:
         overflowed = False
         terminal_seen = False
         stream_closed = False
+        repair_history = False
         try:
             if announce_running:
                 await self._emit(ctx, StateEvent(state="running"))
@@ -6024,13 +6252,6 @@ class WrapperMachine:
             async for raw in ctx.sdk.receive_spontaneous_response(turn_id):
                 if isinstance(raw, CodexSpontaneousOverflow):
                     overflowed = True
-                    if ctx.state == "running":
-                        await self._emit(ctx, StateEvent(
-                            state="running",
-                            phase="waiting",
-                            detail=("部分实时过程因本机积压未展示；回合结束后可刷新历史。"),
-                            msg_id=turn_id,
-                        ))
                     continue
                 if isinstance(raw, CodexSpontaneousClosed):
                     stream_closed = True
@@ -6040,10 +6261,15 @@ class WrapperMachine:
 
                 events = translator.feed(raw)
                 terminal = is_turn_terminal(raw)
-                if overflowed and terminal:
+                completed_after_overflow = (
+                    overflowed and terminal
+                    and _codex_terminal_status(raw) == "completed"
+                )
+                if completed_after_overflow:
                     # Feed the terminal frame so open assistant blocks close, but
-                    # replace its misleading "empty upstream" failure with the
-                    # authoritative local-overflow error below.
+                    # discard the translator's empty-output heuristic.  The
+                    # official terminal is authoritative; missing live detail is
+                    # rebuilt from the local rollout after the turn unlocks.
                     events = [event for event in events
                               if not isinstance(event, (Error, TurnEnd))]
                 for event in events:
@@ -6057,25 +6283,14 @@ class WrapperMachine:
                             event.msg_id = turn_id
                     await self._emit(ctx, event)
                 if terminal:
+                    if completed_after_overflow:
+                        await self._emit(
+                            ctx, _codex_success_terminal(raw, turn_id))
+                        repair_history = True
                     terminal_seen = True
                     break
 
-            if overflowed and terminal_seen:
-                await self._emit(ctx, Error(
-                    code=ERR_CC_CRASH,
-                    message=("Codex 实时事件积压，部分过程未能同步；"
-                             "请刷新会话以从历史恢复。"),
-                    msg_id=turn_id,
-                ))
-                await self._emit(ctx, TurnEnd(
-                    result=TurnResult(
-                        subtype="error",
-                        duration_ms=0,
-                        is_error=True,
-                    ),
-                    turn_id=turn_id,
-                ))
-            elif stream_closed and not terminal_seen:
+            if stream_closed and not terminal_seen:
                 synthetic = {
                     "method": "turn/completed",
                     "params": {"turn": {
@@ -6121,6 +6336,9 @@ class WrapperMachine:
                     turn_id=turn_id,
                     error_type=type(exc).__name__,
                 )
+            if repair_history:
+                await self._repair_codex_projection_after_overflow(
+                    ctx, turn_id)
 
     async def _run_codex_review_turn(
         self, ctx: SessionContext, turn_id: str,
@@ -6139,6 +6357,7 @@ class WrapperMachine:
         reader_exc: list[BaseException] = []
         reader_task: Optional[asyncio.Task] = None
         overflowed = False
+        repair_history = False
 
         async def reader() -> None:
             cancelled = False
@@ -6188,20 +6407,16 @@ class WrapperMachine:
                         "codex review stream ended without turn/completed")
                 if isinstance(raw, CodexManagedOverflow):
                     overflowed = True
-                    if ctx.state == "running":
-                        await self._emit(ctx, StateEvent(
-                            state="running",
-                            phase="waiting",
-                            detail=("部分 Review 实时过程因本机积压未展示；"
-                                    "回合结束后可刷新历史。"),
-                            msg_id=turn_id,
-                        ))
                     continue
                 if not isinstance(raw, dict):
                     continue
                 terminal = is_turn_terminal(raw)
                 events = translator.feed(raw)
-                if overflowed and terminal:
+                completed_after_overflow = (
+                    overflowed and terminal
+                    and _codex_terminal_status(raw) == "completed"
+                )
+                if completed_after_overflow:
                     events = [event for event in events
                               if not isinstance(event, (Error, TurnEnd))]
                 for event in events:
@@ -6215,16 +6430,16 @@ class WrapperMachine:
                             event.msg_id = turn_id
                     await self._emit(ctx, event)
                 if terminal:
-                    if overflowed:
-                        await emit_failure(
-                            ERR_CC_CRASH,
-                            ("Codex Review 实时事件积压，部分过程未能同步；"
-                             "请刷新会话以从历史恢复。"),
-                            interrupted=(ctx.state == "interrupting"),
-                        )
+                    if completed_after_overflow:
+                        await self._emit(
+                            ctx, _codex_success_terminal(raw, turn_id))
+                        repair_history = True
                     break
 
             await self._set_idle_after_managed_turn(ctx)
+            if repair_history:
+                await self._repair_codex_projection_after_overflow(
+                    ctx, turn_id)
         except asyncio.TimeoutError:
             log.error(
                 "codex review interrupt drain timed out", turn_id=turn_id)
@@ -6819,7 +7034,7 @@ class WrapperMachine:
             log.exception("get_diff failed", error=str(e))
             error = Error(
                 code=ERR_INTERNAL,
-                message=f"get_diff failed: {e}",
+                message="文件差异暂不可用，请稍后重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -8153,7 +8368,7 @@ class WrapperMachine:
             log.exception("list_sessions failed", error=str(e))
             error = Error(
                 code=ERR_INTERNAL,
-                message=f"list_sessions failed: {e}",
+                message="会话列表暂不可用，请稍后重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -8207,7 +8422,7 @@ class WrapperMachine:
             log.exception("list_codex_sessions failed", error=str(e))
             error = Error(
                 code=ERR_INTERNAL,
-                message=f"list_codex_sessions failed: {e}",
+                message="Codex 会话列表暂不可用，请稍后重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -8300,7 +8515,7 @@ class WrapperMachine:
             log.exception("list_codex_sessions failed", error=str(e))
             error = Error(
                 code=ERR_INTERNAL,
-                message=f"list_codex_sessions failed: {e}",
+                message="Codex 会话列表暂不可用，请稍后重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -8346,8 +8561,10 @@ class WrapperMachine:
                 # focused one). _spawn has already emitted the specific cause;
                 # this durable session-scoped row only closes the loading state.
                 engine_name = "Codex" if engine == "codex" else "Claude"
-                error = Error(code=ERR_CC_CRASH,
-                    message=f"{engine_name} 会话启动失败；请查看上方具体错误")
+                error = Error(
+                    code=ERR_CC_CRASH,
+                    message=f"{engine_name} 会话暂时无法打开，请稍后重试。",
+                )
                 await self._emit_to_sid(sid, error)
                 return error
         self.focused_sid = ctx.key
@@ -8527,7 +8744,7 @@ class WrapperMachine:
         if attachment_error:
             error = Error(
                 code=ERR_BAD_PROMPT,
-                message=f"invalid attachments: {attachment_error}",
+                message="附件不符合要求，请调整后重试。",
                 request_id=getattr(cmd, "request_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -8572,11 +8789,11 @@ class WrapperMachine:
         except _SpawnFailure as exc:
             ctx = None
             failure = exc
-        except Exception as exc:
+        except Exception:
             log.exception("new session spawn failed unexpectedly", engine=engine)
             ctx = None
             failure = _SpawnFailure(
-                ERR_CC_CRASH, f"新会话启动失败: {exc}")
+                ERR_CC_CRASH, "新会话暂时无法启动，请稍后重试。")
         else:
             failure = None
         if ctx is None:
@@ -8715,7 +8932,7 @@ class WrapperMachine:
             except Exception as e:
                 log.exception("codex rename_session failed", error=str(e))
                 error = Error(
-                    code=ERR_INTERNAL, message=f"rename failed: {e}",
+                    code=ERR_INTERNAL, message="会话重命名未完成，请重试。",
                     request_id=getattr(cmd, "cmd_id", None),
                     to=getattr(cmd, "client_id", None))
                 await self._emit_to_sid(sid, error)
@@ -8735,7 +8952,7 @@ class WrapperMachine:
         except Exception as e:
             log.exception("rename_session failed", error=str(e))
             error = Error(
-                code=ERR_INTERNAL, message=f"rename failed: {e}",
+                code=ERR_INTERNAL, message="会话重命名未完成，请重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None))
             await self._emit_to_sid(sid, error)
@@ -8778,7 +8995,7 @@ class WrapperMachine:
             except Exception as e:
                 log.exception("codex archive_session failed", error=str(e))
                 error = Error(
-                    code=ERR_INTERNAL, message=f"archive failed: {e}",
+                    code=ERR_INTERNAL, message="会话归档未完成，请重试。",
                     request_id=getattr(cmd, "cmd_id", None),
                     to=getattr(cmd, "client_id", None))
                 await self._emit_to_sid(sid, error)
@@ -8801,7 +9018,7 @@ class WrapperMachine:
         except Exception as e:
             log.exception("archive_session failed", error=str(e))
             error = Error(
-                code=ERR_INTERNAL, message=f"archive failed: {e}",
+                code=ERR_INTERNAL, message="会话归档未完成，请重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None))
             await self._emit_to_sid(sid, error)
@@ -10091,7 +10308,7 @@ class WrapperMachine:
                         reason=type(exc).__name__)
             error = Error(
                 code=ERR_BAD_PROMPT,
-                message=f"Work 操作失败：{str(exc)[:500]}",
+                message="Work 操作未完成，请检查输入后重试。",
                 to=getattr(cmd, "client_id", None),
             )
             await self.transport.send(error)
@@ -10648,15 +10865,19 @@ class WrapperMachine:
         except (ValueError, FileNotFoundError) as exc:
             # SDK validates and builds the complete output before opening the
             # child file, so these failures are proven pre-mutation.
+            log.warning(
+                "Claude session fork rejected before mutation",
+                error_type=type(exc).__name__,
+            )
             try:
                 await asyncio.to_thread(
                     self._claude_forks.reject, cmd.request_id,
-                    f"Claude 会话派生失败: {exc}")
+                    "Claude 会话派生未完成，请稍后重试。")
             except ClaudeForkJournalError as journal_exc:
                 log.warning("Claude fork rejection journal failed",
                             error=str(journal_exc))
             return await self._send_session_fork_error(
-                cmd, ERR_INTERNAL, f"Claude 会话派生失败: {exc}")
+                cmd, ERR_INTERNAL, "Claude 会话派生未完成，请稍后重试。")
         except Exception as exc:
             # os.open/os.write may have crossed the mutation boundary. Never
             # replay after an ambiguous exception; only marker reconciliation
@@ -10838,12 +11059,12 @@ class WrapperMachine:
             try:
                 await asyncio.to_thread(
                     self._codex_forks.reject, cmd.request_id,
-                    f"Codex 会话派生失败: {exc}")
+                    "Codex 会话派生未完成，请稍后重试。")
             except ForkJournalError as journal_exc:
                 log.warning("codex fork rejection journal failed",
                             error=str(journal_exc))
             return await self._send_session_fork_error(
-                cmd, ERR_INTERNAL, f"Codex 会话派生失败: {exc}")
+                cmd, ERR_INTERNAL, "Codex 会话派生未完成，请稍后重试。")
         except CodexRpcOutcomeUnknown as exc:
             # A timeout may happen after app-server committed the fork. Its
             # session_meta marker is the durable authority across processes.
@@ -10995,8 +11216,12 @@ class WrapperMachine:
                 self.cfg.state_dir,
             )
         except WorktreeError as exc:
+            log.warning(
+                "Git worktree preparation rejected",
+                error_type=type(exc).__name__,
+            )
             return await self._send_worktree_fork_error(
-                cmd, ERR_INTERNAL, f"创建 Git 工作树失败: {exc}")
+                cmd, ERR_INTERNAL, "Git 工作树创建未完成，请稍后重试。")
 
         existing: Optional[dict] = None
         try:
@@ -11032,6 +11257,12 @@ class WrapperMachine:
                     "thread/fork", params, cwd=spec.cwd)
                 fork_result = raw_result if isinstance(raw_result, dict) else None
             except Exception as exc:
+                log.warning(
+                    "Codex worktree fork RPC did not complete",
+                    parent=sid,
+                    cwd=spec.cwd,
+                    error_type=type(exc).__name__,
+                )
                 recovered: Optional[dict] = None
                 recovery_failed = False
                 try:
@@ -11049,7 +11280,7 @@ class WrapperMachine:
                     detail = (
                         "派生结果暂时无法确认，工作树已保留；请稍后重试"
                         if recovery_failed
-                        else f"Codex 会话派生失败: {exc}"
+                        else "Codex 会话派生未完成，请稍后重试。"
                     )
                     return await self._send_worktree_fork_error(
                         cmd, ERR_INTERNAL, detail)
@@ -11129,7 +11360,7 @@ class WrapperMachine:
             log.exception("list_dir failed", path=getattr(cmd, "path", None), error=str(e))
             error = Error(
                 code=ERR_INTERNAL,
-                message=f"list_dir failed: {e}",
+                message="目录暂不可用，请重新选择或稍后重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -11273,7 +11504,7 @@ class WrapperMachine:
                 log.warning("Claude preflight failed; engine unavailable",
                             error=str(exc))
                 await reject(
-                    ERR_CC_CRASH, f"Claude 引擎不可用: {exc}",
+                    ERR_CC_CRASH, "Claude 暂时不可用，请稍后重试。",
                     route="sid", sid=resume_id)
                 return None
 
@@ -11532,11 +11763,11 @@ class WrapperMachine:
                     await ctx.sdk.connect(resume_id=None, cwd=target_cwd)
                 except Exception as e2:
                     log.exception("fresh connect also failed", error=str(e2))
-                    await reject(ERR_CC_CRASH, f"connect failed: {e2}")
+                    await reject(ERR_CC_CRASH, "会话连接未完成，请稍后重试。")
                     return None
             else:
                 log.exception("connect failed", error=str(e))
-                await reject(ERR_CC_CRASH, f"connect failed: {e}")
+                await reject(ERR_CC_CRASH, "会话连接未完成，请稍后重试。")
                 return None
 
         if (ctx.space == "work" and ctx.work_context_baseline_pending
@@ -11685,7 +11916,7 @@ class WrapperMachine:
         if (len(self._private_btw_sessions) + pending_private_forks
                 >= self.PRIVATE_BTW_CAP):
             raise _BtwSpawnFailure(
-                ERR_BUSY, "btw 隐私清理队列已满，请先检查 wrapper 日志")
+                ERR_BUSY, "临时侧边会话已满，请稍后重试。")
         parent_id = parent.session_id
         if not parent_id:
             raise _BtwSpawnFailure(
@@ -11697,7 +11928,7 @@ class WrapperMachine:
             except Exception as exc:
                 log.warning("Claude preflight failed for btw", error=str(exc))
                 raise _BtwSpawnFailure(
-                    ERR_CC_CRASH, f"Claude 引擎不可用: {exc}") from exc
+                    ERR_CC_CRASH, "Claude 暂时不可用，请稍后重试。") from exc
         # btw counts toward the cap; evict an idle, non-focused, non-btw victim.
         if len(self.sessions) >= self.cfg.max_concurrent_sessions:
             victim = next((k for k, c in self.sessions.items()
@@ -11750,7 +11981,9 @@ class WrapperMachine:
             await ctx.sdk.connect(resume_id=parent_id, cwd=parent.cwd, fork=True)
         except Exception as e:
             log.exception("btw fork connect failed", error=str(e))
-            raise _BtwSpawnFailure(ERR_CC_CRASH, f"btw fork 失败: {e}") from e
+            raise _BtwSpawnFailure(
+                ERR_CC_CRASH, "临时侧边会话暂时无法打开，请稍后重试。"
+            ) from e
         key = f"btw-{uuid4().hex}"
         self.sessions[key] = ctx
         ctx.key = key
@@ -12138,7 +12371,7 @@ class WrapperMachine:
                 code=(ERR_BUSY if exc.code in {
                     "input_busy", "input_read_only", "stale_generation"
                 } else ERR_CC_CRASH),
-                message=f"Claude broker 回合失败: {exc}",
+                message="Claude 本次回复未完成，请稍后重试。",
                 msg_id=ctx.active_msg_id,
             ))
             await close_turn(error=True, subtype="error_during_execution")
@@ -12150,7 +12383,7 @@ class WrapperMachine:
             log.exception("Claude broker turn failed", error=str(exc))
             await self._emit(ctx, Error(
                 code=ERR_CC_CRASH,
-                message="Claude broker 回合失败，请查看 wrapper 日志",
+                message="Claude 本次回复未完成，请稍后重试。",
                 msg_id=ctx.active_msg_id,
             ))
             await close_turn(error=True, subtype="error_during_execution")
@@ -12193,6 +12426,7 @@ class WrapperMachine:
         notice_active = False
         claude_turn_completed = False
         codex_overflowed = False
+        codex_overflow_repair_turn_id: Optional[str] = None
 
         async def reader() -> None:
             cancelled = False
@@ -12616,21 +12850,17 @@ class WrapperMachine:
                 if is_codex:
                     if isinstance(msg, CodexManagedOverflow):
                         codex_overflowed = True
-                        if ctx.state == "running":
-                            await self._emit(ctx, StateEvent(
-                                state="running",
-                                phase="waiting",
-                                detail=("部分实时过程因本机积压未展示；"
-                                        "回合结束后可刷新历史。"),
-                                msg_id=ctx.active_msg_id,
-                            ))
                         continue
                     sid = codex_session_id(msg)
                     if sid and not ctx.session_id:
                         await self._capture_session_id(ctx, sid)
                     terminal = is_turn_terminal(msg)
                     events = ctx.translator.feed(msg)
-                    if codex_overflowed and terminal:
+                    completed_after_overflow = (
+                        codex_overflowed and terminal
+                        and _codex_terminal_status(msg) == "completed"
+                    )
+                    if completed_after_overflow:
                         events = [event for event in events
                                   if not isinstance(event, (Error, TurnEnd))]
                     for ev in events:
@@ -12639,24 +12869,11 @@ class WrapperMachine:
                         if ctx.work_context_baseline_pending:
                             await self._persist_fresh_work_context_baseline(
                                 ctx, await ctx.sdk.get_context_usage())
-                        if codex_overflowed:
-                            await self._emit(ctx, Error(
-                                code=ERR_CC_CRASH,
-                                message=("Codex 实时事件积压，部分过程未能同步；"
-                                         "请刷新会话以从历史恢复。"),
-                                msg_id=ctx.active_msg_id,
-                            ))
-                            await self._emit(ctx, TurnEnd(
-                                result=TurnResult(
-                                    subtype=("error_during_execution"
-                                             if ctx.state == "interrupting"
-                                             else "error"),
-                                    duration_ms=0,
-                                    is_error=True,
-                                ),
-                                turn_id=((msg.get("params") or {}).get("turn")
-                                         or {}).get("id"),
-                            ))
+                        if completed_after_overflow:
+                            success = _codex_success_terminal(
+                                msg, native_turn_id or ctx.active_msg_id or ctx.key)
+                            await self._emit(ctx, success)
+                            codex_overflow_repair_turn_id = success.turn_id
                         break
                     continue
 
@@ -12717,6 +12934,9 @@ class WrapperMachine:
                     release_background()
 
             await self._set_idle_after_managed_turn(ctx)
+            if codex_overflow_repair_turn_id is not None:
+                await self._repair_codex_projection_after_overflow(
+                    ctx, codex_overflow_repair_turn_id)
         except asyncio.TimeoutError:
             log.error("drain timeout — interrupt did not yield a ResultMessage",
                       prompt_length=len(prompt))
@@ -12731,7 +12951,7 @@ class WrapperMachine:
                 log.exception("force reconnect failed", error=str(e))
                 await self._emit(ctx, Error(
                     code=ERR_CC_CRASH,
-                    message="agent reconnect failed; see wrapper logs",
+                    message="会话恢复未完成，请重新进入后重试。",
                     msg_id=ctx.active_msg_id))
             # Reconnect terminates the old app-server turn. Preserve only a
             # different id delivered by the new generation while it connected.
@@ -12742,7 +12962,7 @@ class WrapperMachine:
             log.exception("turn failed", error=str(e))
             await self._emit(ctx, Error(
                 code=ERR_CC_CRASH,
-                message="agent turn failed; see wrapper logs",
+                message="本次回复未完成，请重试。",
                 msg_id=ctx.active_msg_id))
             await self._set_idle_after_managed_turn(ctx)
         finally:

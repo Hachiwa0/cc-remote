@@ -113,13 +113,17 @@ def test_codex_errors_surface():
     # terminal error -> Error
     evs = tr.feed({"method": "error", "params": {"willRetry": False,
         "error": {"message": "unexpected status 401 Unauthorized", "additionalDetails": "Incorrect API key"}}})
-    assert len(evs) == 1 and isinstance(evs[0], Error) and "401" in evs[0].message and "codex" in evs[0].message
-    # failed turn/completed -> surfaces turn.error, then a TurnEnd(is_error)
+    assert len(evs) == 1 and isinstance(evs[0], Error)
+    assert evs[0].message == "Codex 本次回复未完成，请重试。"
+    assert "401" not in evs[0].message and "API key" not in evs[0].message
+    # failed turn/completed -> a safe Error, then a TurnEnd(is_error)
     tr2 = CodexStreamTranslator(8000)
     out = tr2.feed({"method": "turn/completed", "params": {"turn": {"status": "failed", "error": {"message": "request timed out"}}}})
-    assert any(isinstance(e, Error) and "request timed out" in e.message for e in out), out
+    assert any(isinstance(e, Error)
+               and e.message == "Codex 本次回复未完成，请重试。"
+               for e in out), out
     assert out[-1].result.is_error is True and out[-1].result.subtype == "error"
-    print("  codex errors surface: retry visible, 401 + failed-turn -> Error  OK")
+    print("  codex errors surface: retry visible, terminal details sanitized  OK")
 
 
 def test_codex_empty_completed_is_an_error_but_tool_activity_is_not():

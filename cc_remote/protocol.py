@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 18
+PROTOCOL_VERSION = 19
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -180,6 +180,17 @@ class QueryImage(TypedDict):
     __pydantic_config__ = ConfigDict(extra="forbid")
     media_type: Literal["image/png", "image/jpeg", "image/jpg", "image/webp"]
     data: AttachmentData
+
+
+class ConversationImageRef(TypedDict):
+    """Payload-free locator for one user image in materialized history."""
+
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    image_id: WireId
+    media_type: Literal["image/png", "image/jpeg", "image/jpg", "image/webp"]
+    width: int
+    height: int
+    byte_size: int
 
 
 class QueryFile(TypedDict):
@@ -1593,6 +1604,8 @@ class ConversationTurn(BaseModel):
     error: Optional[str] = Field(default=None, max_length=64 * 1024)
     images: Optional[list[QueryImage]] = Field(
         default=None, max_length=MAX_ATTACHMENT_COUNT)
+    imageRefs: Optional[list[ConversationImageRef]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
     files: Optional[list[UserFileMeta]] = Field(
         default=None, max_length=MAX_ATTACHMENT_COUNT)
     ts: Optional[int] = Field(default=None, ge=0)
@@ -1680,6 +1693,36 @@ class TurnDetail(_Base):
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
     events: list[dict[str, Any]] = []
+
+
+class GetHistoryImage(_Command):
+    """client -> wrapper: fetch one indexed historical user image."""
+    type: Literal["get_history_image"] = "get_history_image"
+    session_id: WireId
+    turn_id: WireId
+    image_id: WireId
+    variant: Literal["thumbnail", "full"]
+    request_id: WireId
+    client_id: Optional[WireId] = None
+    revision: Optional[WireId] = None
+
+
+class HistoryImage(_Base):
+    """wrapper -> requester: correlated thumbnail or full historical image."""
+    type: Literal["history_image"] = "history_image"
+    session_id: WireId
+    turn_id: WireId
+    image_id: WireId
+    variant: Literal["thumbnail", "full"]
+    request_id: WireId
+    revision: WireId
+    media_type: Optional[Literal[
+        "image/png", "image/jpeg", "image/jpg", "image/webp",
+    ]] = None
+    width: Optional[int] = Field(default=None, ge=1, le=8192)
+    height: Optional[int] = Field(default=None, ge=1, le=8192)
+    data: Optional[AttachmentData] = None
+    error: Optional[str] = Field(default=None, max_length=512)
 
 
 class HistoryInvalidated(_Base):
@@ -1790,8 +1833,8 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
     SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
@@ -1835,6 +1878,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_preview_asset": GetPreviewAsset,
     "get_history": GetHistory,
     "get_turn_detail": GetTurnDetail,
+    "get_history_image": GetHistoryImage,
     "get_models": GetModels,
     "models": Models,
     "get_engine_capabilities": GetEngineCapabilities,
@@ -1892,6 +1936,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "work_artifacts": WorkArtifacts,
     "history": History,
     "turn_detail": TurnDetail,
+    "history_image": HistoryImage,
     "history_invalidated": HistoryInvalidated,
     "artifact_invalidated": ArtifactInvalidated,
     "ask_user": AskUser,

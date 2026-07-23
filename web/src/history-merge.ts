@@ -146,6 +146,7 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     error: live.error ?? history.error,
     progress: preserveLiveOpen ? live.progress : undefined,
     images: live.images ?? history.images,
+    imageRefs: live.imageRefs ?? history.imageRefs,
     files: live.files ?? history.files,
     ts: Math.min(history.ts ?? Number.MAX_SAFE_INTEGER,
       live.ts ?? Number.MAX_SAFE_INTEGER) === Number.MAX_SAFE_INTEGER

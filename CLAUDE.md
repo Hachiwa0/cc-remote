@@ -64,7 +64,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   the temp key. Emitting SessionFocus on id-capture = focus-steal by background
   sessions.
 - **History = local projection + materialized summary pages; reconnect = live-tail replay**
-  (protocol v18): IndexedDB paints the browser's last projection before network
+  (protocol v19): IndexedDB paints the browser's last projection before network
   validation. `GetHistory(detail="summary")` returns a small canonical turn page
   (newest four, then `before`/`limit` pagination), while the wrapper's rebuildable
   SQLite index avoids retranslating unchanged transcript/rollout bytes. Heavy

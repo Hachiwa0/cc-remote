@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { Block, ProcessBlock, TextBlock, ToolBlock } from "../reducer";
 import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
 import { hasActiveProcess, processBlocks } from "../process-blocks";
 import { filePathsFromInput } from "../file-changes";
+import type { InlineImageAsset } from "../inline-image-assets";
+import { PointerTapGuard } from "../pointer-tap";
 
 function durationLabel(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -114,9 +116,12 @@ function ProcessActivity({ block, onOpenFile }: {
   );
 }
 
-function TimelineItem({ block, onOpenFile }: {
+function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewImage }: {
   block: Block;
   onOpenFile?: (path: string, line?: number) => void;
+  imageAssets?: Record<string, InlineImageAsset>;
+  onLoadImage?: (path: string) => boolean;
+  onPreviewImage?: (src: string, alt: string) => void;
 }) {
   if (block.kind === "process") return <ProcessActivity
     block={block as ProcessBlock} onOpenFile={onOpenFile} />;
@@ -126,12 +131,14 @@ function TimelineItem({ block, onOpenFile }: {
       <details className="process-reasoning">
         <summary><Icon name="spark" size={14} /><span>思考</span><Icon name="chev" size={13} /></summary>
         <div className="process-reasoning-body"><MessageBlock text={text.text}
-          done={text.done} onOpenFile={onOpenFile} /></div>
+          done={text.done} onOpenFile={onOpenFile} imageAssets={imageAssets}
+          onLoadImage={onLoadImage} onPreviewImage={onPreviewImage} /></div>
       </details>
     );
   }
   return <div className="process-commentary"><MessageBlock text={text.text}
-    done={text.done} onOpenFile={onOpenFile} /></div>;
+    done={text.done} onOpenFile={onOpenFile} imageAssets={imageAssets}
+    onLoadImage={onLoadImage} onPreviewImage={onPreviewImage} /></div>;
 }
 
 type TimelineRow =
@@ -165,12 +172,19 @@ function isCodexPresentationNoise(block: Block): boolean {
 }
 
 export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
-  engine = "claude" }: {
+  deferredCount = 0, detailLoading = false, onLoadDetail,
+  imageAssets, onLoadImage, onPreviewImage, engine = "claude" }: {
   blocks: Block[];
   done: boolean;
   durationMs?: number;
   startTs?: number;
   onOpenFile?: (path: string, line?: number) => void;
+  deferredCount?: number;
+  detailLoading?: boolean;
+  onLoadDetail?: () => void;
+  imageAssets?: Record<string, InlineImageAsset>;
+  onLoadImage?: (path: string) => boolean;
+  onPreviewImage?: (src: string, alt: string) => void;
   engine?: "claude" | "codex";
 }) {
   // Codex does not expose its private chain of thought in official clients.
@@ -184,6 +198,7 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
   const [open, setOpen] = useState(!complete);
   const [now, setNow] = useState(Date.now());
   const manuallyToggled = useRef(false);
+  const tapGuard = useRef(new PointerTapGuard());
 
   useEffect(() => {
     if (!manuallyToggled.current) setOpen(!complete);
@@ -194,32 +209,69 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
     return () => window.clearInterval(timer);
   }, [complete]);
 
-  if (!items.length) return null;
+  const hasDeferredDetail = items.length === 0 && deferredCount > 0;
+  if (!items.length && !hasDeferredDetail) return null;
   // A completed timeline is collapsed. Do not allocate/group hundreds of
   // historical rows until the user actually opens it.
   const rows = open ? groupTimelineRows(items) : [];
   const toolCount = items.reduce((count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
-  const countLabel = engine === "codex" && toolCount === items.length
-    ? `${toolCount} 个工具调用`
-    : `${items.length} 项`;
+  const countLabel = hasDeferredDetail
+    ? `${deferredCount} 项`
+    : engine === "codex" && toolCount === items.length
+      ? `${toolCount} 个工具调用`
+      : `${items.length} 项`;
   const elapsed = complete ? (durationMs ?? 0) : Math.max(0, now - (startTs ?? now));
+  const toggle = () => {
+    manuallyToggled.current = true;
+    if (hasDeferredDetail) {
+      if (!detailLoading) onLoadDetail?.();
+      setOpen(true);
+      return;
+    }
+    setOpen((value) => !value);
+  };
+  const pointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    tapGuard.current.pointerDown(event.pointerId, event.clientX, event.clientY);
+  };
+  const pointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    tapGuard.current.pointerMove(event.pointerId, event.clientX, event.clientY);
+  };
+  const pointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    tapGuard.current.pointerUp(event.pointerId);
+  };
+  const pointerCancel = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    tapGuard.current.pointerCancel(event.pointerId);
+  };
   return (
-    <section className={`turn-process${open ? " open" : ""}`}>
-      <button type="button" className="turn-process-head" aria-expanded={open}
-        onClick={() => { manuallyToggled.current = true; setOpen((value) => !value); }}>
+    <section className={`turn-process${open && !hasDeferredDetail ? " open" : ""}`}>
+      <button type="button" className="turn-process-head"
+        aria-expanded={open && !hasDeferredDetail} aria-busy={detailLoading}
+        onPointerDown={pointerDown} onPointerMove={pointerMove}
+        onPointerUp={pointerUp} onPointerCancel={pointerCancel}
+        onClick={(event) => {
+          if (!tapGuard.current.consumeClick(event.detail)) {
+            event.preventDefault();
+            return;
+          }
+          toggle();
+        }}>
         <span className={`turn-process-state${complete ? " done" : " running"}`}>
-          {complete ? <Icon name="verify" size={14} /> : <span className="process-spin" />}
+          {detailLoading || !complete
+            ? <span className="process-spin" />
+            : <Icon name="verify" size={14} />}
         </span>
         <span>{complete ? "已处理" : "正在处理"} {durationLabel(elapsed)}</span>
         <span className="turn-process-count">{countLabel}</span>
         <Icon name="chev" size={15} />
       </button>
-      {open && <div className="process-timeline">{rows.map((row) => (
+      {open && !hasDeferredDetail && <div className="process-timeline">{rows.map((row) => (
         row.kind === "tools"
           ? <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools} />
           : <TimelineItem key={row.block.kind === "text"
               ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}
-              block={row.block} onOpenFile={onOpenFile} />
+              block={row.block} onOpenFile={onOpenFile}
+              imageAssets={imageAssets} onLoadImage={onLoadImage}
+              onPreviewImage={onPreviewImage} />
       ))}</div>}
     </section>
   );

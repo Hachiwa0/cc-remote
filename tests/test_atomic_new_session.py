@@ -22,8 +22,8 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
-def test_protocol_v18_new_session_query_and_turn_binding_roundtrip():
-    assert PROTOCOL_VERSION == 18
+def test_protocol_v19_new_session_query_and_turn_binding_roundtrip():
+    assert PROTOCOL_VERSION == 19
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",
@@ -212,6 +212,9 @@ def test_new_session_sync_failures_never_emit_to_focused_session(
         assert error.request_id == f"req-{failure}"
         assert error.to == "browser-one"
         assert error.sid is None
+        assert "connect exploded" not in error.message
+        assert "missing claude" not in error.message
+        assert "connect failed" not in error.message
         assert old_ctx.buffer.tail_seq == 0
 
     asyncio.run(run())

@@ -568,7 +568,8 @@ def test_codex_worktree_fork_rolls_back_fresh_worktree_on_confirmed_failure(monk
 
         assert result.type == "error"
         assert result.request_id == "request-1"
-        assert "派生失败" in result.message
+        assert result.message == "Codex 会话派生未完成，请稍后重试。"
+        assert "fork rejected" not in result.message
         assert rolled_back == [_spec()]
         assert transport.sent[-1] is result
 

@@ -7,6 +7,7 @@ import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { NoticeStack } from "./components/NoticeStack";
+import { presentCommandProblem } from "./problem-presentation";
 import { LoginForm } from "./components/LoginForm";
 import { SessionsSidebar } from "./components/SessionsSidebar";
 import { DirPicker } from "./components/DirPicker";
@@ -52,6 +53,9 @@ import {
 import { disableRemotePush, enableRemotePush } from "./push";
 import { turnNotificationBody, turnNotificationTag } from "./turn-notification";
 import { HistoryRequestCoordinator } from "./history-requests";
+import { RecoverableReadCoordinator } from "./recoverable-read";
+import { InlineImageAssetCache } from "./inline-image-assets";
+import { HistoryImageAssetCache } from "./history-image-assets";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -116,6 +120,13 @@ export default function App() {
   const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
   const [state, dispatch] = useReducer(reduce, initialState);
+  const inlineImageAssetsRef = useRef(new InlineImageAssetCache());
+  const [, bumpInlineImageRevision] = useReducer((value: number) => value + 1, 0);
+  const historyImageAssetsRef = useRef(new HistoryImageAssetCache());
+  const [, bumpHistoryImageRevision] = useReducer((value: number) => value + 1, 0);
+  const dismissBanner = useCallback((banner: string) => {
+    dispatch({ type: "dismiss_banner", banner });
+  }, []);
   const remotePushActiveRef = useRef(false);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -208,6 +219,10 @@ export default function App() {
     prefetchedSurfacesRef.current.clear();
     historyInvalidationsRef.current.clear();
     historyCacheEpochRef.current.clear();
+    inlineImageAssetsRef.current.clear();
+    historyImageAssetsRef.current.clear();
+    bumpInlineImageRevision();
+    bumpHistoryImageRevision();
     dispatch({ type: "reset" });
     void import("./cache").then((module) => module.clearCache());
   }, [machineId]);
@@ -220,11 +235,58 @@ export default function App() {
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const focusedEngine = (state.sessions.find(
     (session) => session.session_id === focusedSid)?.engine ?? engine) as "claude" | "codex";
+  const inlineImageAssets = focusedSid
+    ? inlineImageAssetsRef.current.forSession(focusedSid) : {};
+  const historyImageAssets = focusedSid
+    ? historyImageAssetsRef.current.forSession(focusedSid) : {};
   const currentWorkArtifacts = focusedSid ? (workArtifactsBySid[focusedSid] ?? []) : [];
   const allQueued = collectWaitingQueries(state.runtimes);
   const replaceableQueued = collectWaitingQueries(state.runtimes, focusedSid);
 
   const goalUi = focusedSid ? goalUiBySid[focusedSid] : undefined;
+  const loadMessageImage = useCallback((sid: string, path: string): boolean => {
+    const ws = wsRef.current;
+    if (!ws || stateRef.current.focusedSid !== sid) return false;
+    const cache = inlineImageAssetsRef.current;
+    if (cache.has(sid, path)) return true;
+    const previewId = uuid();
+    const requestId = uuid();
+    if (!cache.begin({ sid, path, previewId, requestId })) return false;
+    if (!ws.sendGetPreviewAsset(path, previewId, requestId)) {
+      cache.cancel(requestId);
+      return false;
+    }
+    bumpInlineImageRevision();
+    return true;
+  }, []);
+  const loadFocusedMessageImage = useCallback((path: string) => (
+    focusedSid ? loadMessageImage(focusedSid, path) : false
+  ), [focusedSid, loadMessageImage]);
+  const loadHistoryImage = useCallback((
+    turnId: string,
+    imageId: string,
+    variant: "thumbnail" | "full",
+  ): boolean => {
+    const sid = stateRef.current.focusedSid;
+    const ws = wsRef.current;
+    if (!sid || !ws) return false;
+    const revision = stateRef.current.runtimes[sid]?.historyRevision;
+    if (!revision) return false;
+    const cache = historyImageAssetsRef.current;
+    if (cache.has(sid, turnId, imageId, variant)) return true;
+    const requestId = uuid();
+    if (!cache.begin({
+      sid, turnId, imageId, variant, requestId, revision,
+    })) return false;
+    if (!ws.sendGetHistoryImage(
+      sid, turnId, imageId, variant, requestId, revision,
+    )) {
+      cache.cancel(requestId);
+      return false;
+    }
+    bumpHistoryImageRevision();
+    return true;
+  }, []);
 
   // HttpOnly cookies can't be inspected from JS. Ask the relay whether this
   // browser session is still registered before opening a WebSocket; this also
@@ -407,6 +469,10 @@ export default function App() {
     authoritativeSurfaceListsRef.current.delete(`${spaceRef.current}:${engineRef.current}`);
 
     let cancelled = false;
+    const recoverableReads = new RecoverableReadCoordinator(
+      (callback, delayMs) => window.setTimeout(callback, delayMs),
+      (timer) => window.clearTimeout(timer),
+    );
 
     // A snapshot announces a session (cc_session_id/state/cwd). We do NOT reset
     // the cursor here anymore — cursors are seeded from the IndexedDB cache before
@@ -424,6 +490,14 @@ export default function App() {
       if (cancelled) return;
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
+          if (msg.type === "preview_asset"
+              && inlineImageAssetsRef.current.accept(msg)) {
+            bumpInlineImageRevision();
+          }
+          if (msg.type === "history_image"
+              && historyImageAssetsRef.current.accept(msg)) {
+            bumpHistoryImageRevision();
+          }
           if ((msg.type === "user_msg" || msg.type === "turn_end") && msg.sid) {
             const activityMs = Math.round(msg.ts * 1000);
             let changed = false;
@@ -441,6 +515,12 @@ export default function App() {
           }
           if (msg.type === "history_invalidated") {
             const sid = msg.session_id;
+            if (inlineImageAssetsRef.current.dropSession(sid)) {
+              bumpInlineImageRevision();
+            }
+            if (historyImageAssetsRef.current.dropSession(sid)) {
+              bumpHistoryImageRevision();
+            }
             if (historyInvalidationsRef.current.get(sid) !== msg.revision) {
               historyInvalidationsRef.current.set(sid, msg.revision);
               historyCacheEpochRef.current.set(
@@ -509,6 +589,43 @@ export default function App() {
           }
           if (msg.type === "history") {
             historyRequestsRef.current.complete(msg);
+            const retryKey = ["history", msg.session_id, msg.before ?? "",
+              msg.revision ?? ""].join("\u0000");
+            if (msg.authoritative === false) {
+              recoverableReads.retry(retryKey, () => {
+                if (cancelled) return;
+                if (stateRef.current.focusedSid !== msg.session_id) return;
+                requestHistory(
+                  msg.session_id, msg.before,
+                  msg.before ? HISTORY_MORE_PAGE : HISTORY_INITIAL_PAGE,
+                  msg.generation, msg.revision,
+                );
+              });
+            } else {
+              recoverableReads.complete(retryKey);
+            }
+          }
+          if (msg.type === "turn_detail") {
+            const retryKey = ["detail", msg.session_id, msg.turn_id].join("\u0000");
+            if (msg.authoritative === false) {
+              recoverableReads.retry(retryKey, () => {
+                if (cancelled) return;
+                if (stateRef.current.focusedSid !== msg.session_id) return;
+                const current = stateRef.current.runtimes[msg.session_id];
+                const turn = current?.turns.find((item) => item.id === msg.turn_id);
+                if (!turn || turn.detailLoaded) return;
+                const sent = ws.sendGetTurnDetail(
+                  msg.session_id, msg.turn_id,
+                  current.historyRevision ?? msg.revision,
+                );
+                if (sent) dispatch({
+                  type: "turn_detail_requested", sid: msg.session_id,
+                  turnId: msg.turn_id,
+                });
+              });
+            } else {
+              recoverableReads.complete(retryKey);
+            }
           }
           if (msg.type === "rollback_result" && msg.files === "succeeded"
               && stateRef.current.artifact?.sid === msg.session_id) {
@@ -585,6 +702,8 @@ export default function App() {
             ws.setSessionEngines([{ session_id: msg.session_id, engine: targetEngine, space: "code" }]);
             ws.setFocusedSid(msg.session_id, targetEngine, "code");
             ws.sendListSessions(targetEngine, "code");
+            requestHistory(
+              msg.session_id, undefined, HISTORY_INITIAL_PAGE);
             ws.sendSwitchSession(msg.session_id, targetEngine, "code");
             if (isMobile()) setSidebarOpen(false);
             return;
@@ -594,7 +713,7 @@ export default function App() {
                 pendingSessionForkRef.current, msg.request_id)) {
             pendingSessionForkRef.current = null;
             setForkingPointId(null);
-            dispatch({ type: "command_error", detail: `${msg.code}: ${msg.message}` });
+            dispatch({ type: "command_error", detail: presentCommandProblem(msg) });
             return;
           }
           if (msg.type === "error" && isTerminalWorktreeForkError(msg.code)
@@ -602,7 +721,7 @@ export default function App() {
               pendingWorktreeForkRef.current, msg.request_id)) {
             pendingWorktreeForkRef.current = null;
             setForkWorktreeCreating(false);
-            setForkWorktreeError(msg.message);
+            setForkWorktreeError(presentCommandProblem(msg));
             return;
           }
           const createResponseRequestId = (msg.type === "session_focus"
@@ -633,7 +752,7 @@ export default function App() {
                   cwdSource: "default",
                 });
               }
-              setCreateError(msg.message);
+              setCreateError(presentCommandProblem(msg));
               return;
             }
           }
@@ -785,6 +904,7 @@ export default function App() {
         onConnState: (s, detail) => {
           dispatch({ type: "conn", connState: s, detail });
           if (s === "connected") {
+            recoverableReads.clear();
             historyRequestsRef.current.beginConnection();
             ws.sendListSessions(engineRef.current, spaceRef.current);
             if (spaceRef.current === "work") {
@@ -811,6 +931,10 @@ export default function App() {
           discardedBtwSidsRef.current.clear();
           historyInvalidationsRef.current.clear();
           historyCacheEpochRef.current.clear();
+          inlineImageAssetsRef.current.clear();
+          historyImageAssetsRef.current.clear();
+          bumpInlineImageRevision();
+          bumpHistoryImageRevision();
           historyRequestsRef.current.clear();
           setBtwOpening(false);
           setForkingPointId(null);
@@ -834,6 +958,10 @@ export default function App() {
           dispatch({ type: "prune_runtimes", protectedSids });
         },
         onWrapperGenerationChanged: () => {
+          inlineImageAssetsRef.current.clear();
+          historyImageAssetsRef.current.clear();
+          bumpInlineImageRevision();
+          bumpHistoryImageRevision();
           discardedBtwSidsRef.current.clear();
           if (stateRef.current.btwSid || pendingBtwRef.current
               || activeBtwRef.current) {
@@ -842,7 +970,7 @@ export default function App() {
             setBtwOpening(false);
             if (stateRef.current.btwSid) dispatch({ type: "clear_btw" });
             dispatch({ type: "command_error",
-              detail: "wrapper 已重启，临时 /btw 会话已关闭，请重新打开。" });
+              detail: "服务已重新连接，临时 /btw 会话已关闭，请重新打开。" });
           }
         },
       }, machineId);
@@ -866,6 +994,7 @@ export default function App() {
       wsRef.current?.stop();
       wsRef.current = null;
       historyRequests.clear();
+      recoverableReads.clear();
       draining.clear();
     };
   }, [authed, machineId, requestHistory]);
@@ -899,9 +1028,11 @@ export default function App() {
       dispatch({ type: "focus_session", sid: latest.session_id });
       const latestEngine = (latest.engine as "claude" | "codex") || engineRef.current;
       wsRef.current.setFocusedSid(latest.session_id, latestEngine, spaceRef.current);
+      requestHistory(
+        latest.session_id, undefined, HISTORY_INITIAL_PAGE);
       wsRef.current.sendSwitchSession(latest.session_id, latestEngine, spaceRef.current);
     }
-  }, [state.sessions, state.focusedSid]);
+  }, [state.sessions, state.focusedSid, requestHistory]);
 
   // Direct sidebar selection and newly-created sessions both update the
   // per-surface bookmark. A later Work/Code or engine toggle can therefore
@@ -1390,7 +1521,25 @@ export default function App() {
           ) ?? "idle"];
         }))}
         activeSessionId={focusedSid}
-        onSelect={(id) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setWorkArtifactsOpen(false); const selected = state.sessions.find((s) => s.session_id === id); const selectedEngine = (selected?.engine as "claude" | "codex") || engine; const selectedSpace = selected?.space === "work" ? "work" : space; dispatch({ type: "exit_new_chat" }); dispatch({ type: "focus_session", sid: id }); wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace); wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace); if (selectedSpace === "work") wsRef.current?.sendGetWorkArtifacts(selectedEngine, id); if (isMobile()) setSidebarOpen(false); }}
+        onSelect={(id) => {
+          if (!confirmArtifactDiscard()) return;
+          pendingCreateRef.current = null;
+          setCreateError(null);
+          setStatusOpenSid(null);
+          setWorkArtifactsOpen(false);
+          const selected = state.sessions.find((s) => s.session_id === id);
+          const selectedEngine = (selected?.engine as "claude" | "codex") || engine;
+          const selectedSpace = selected?.space === "work" ? "work" : space;
+          dispatch({ type: "exit_new_chat" });
+          dispatch({ type: "focus_session", sid: id });
+          wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
+          requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
+          wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
+          if (selectedSpace === "work") {
+            wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
+          }
+          if (isMobile()) setSidebarOpen(false);
+        }}
         onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" }); if (isMobile()) setSidebarOpen(false); }}
         onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit" }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
@@ -1487,7 +1636,8 @@ export default function App() {
 
         <ReconnectBanner banner={state.banner} replaying={rt.replaying}
           truncated={rt.truncated}
-          busy={state.connState !== "connected" || !state.wrapperOnline || rt.replaying} />
+          busy={state.connState !== "connected" || !state.wrapperOnline || rt.replaying}
+          onDismiss={dismissBanner} />
         <NoticeStack notices={rt.notices}
           onDismiss={(noticeId) => {
             if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
@@ -1510,8 +1660,8 @@ export default function App() {
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={!!rt.hasMore}
-              onLoadMore={() => { if (focusedSid) requestHistory(
-                focusedSid, rt.oldestId, HISTORY_MORE_PAGE); }}
+              onLoadMore={() => focusedSid ? requestHistory(
+                focusedSid, rt.oldestId, HISTORY_MORE_PAGE) : false}
               onLoadDetail={(turnId) => {
                 if (!focusedSid) return;
                 const sent = wsRef.current?.sendGetTurnDetail(
@@ -1530,6 +1680,10 @@ export default function App() {
                 }
                 setWorkArtifactsOpen(true);
               }}
+              imageAssets={inlineImageAssets}
+              onLoadImage={loadFocusedMessageImage}
+              historyImageAssets={historyImageAssets}
+              onLoadHistoryImage={loadHistoryImage}
               onFork={space === "code" ? forkFromTurn : undefined} />
 
             <GoalPanel engine={engine} goal={rt.goal}
@@ -1651,9 +1805,13 @@ export default function App() {
         />
       )}
       <StatusSheet open={shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)} report={rt.statusReport}
+        notices={rt.notices}
         error={rt.statusError}
         onClose={() => setStatusOpenSid(null)}
-        onRefresh={openStatus} />
+        onRefresh={openStatus}
+        onDismissNotice={(noticeId) => {
+          if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
+        }} />
       <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
         creating={forkWorktreeCreating} error={forkWorktreeError}
         onConfirm={submitForkWorktree} onClose={closeForkWorktree} />

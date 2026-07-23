@@ -762,6 +762,133 @@ def test_codex_review_interrupt_timeout_reconnects_and_unlocks():
     asyncio.run(run())
 
 
+def test_codex_review_overflow_preserves_authoritative_success_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("review-overflow", "review-overflow")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "review-overflow-turn"
+        ctx.turn_task = asyncio.current_task()
+
+        class OverflowSdk:
+            async def receive_response(self):
+                yield CodexManagedOverflow("review-overflow-turn")
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "review-overflow-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = OverflowSdk()
+        await machine._run_codex_review_turn(ctx, "review-overflow-turn")
+
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].turn_id == "review-overflow-turn"
+        assert terminal[0].result.subtype == "success"
+        assert terminal[0].result.is_error is False
+
+    asyncio.run(run())
+
+
+def test_managed_codex_overflow_preserves_authoritative_success_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("managed-overflow", "managed-overflow")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-overflow-message"
+        ctx.turn_task = asyncio.current_task()
+
+        class OverflowSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(self, _prompt, images=None):
+                return "managed-overflow-turn"
+
+            async def receive_response(self):
+                yield CodexManagedOverflow("managed-overflow-turn")
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "managed-overflow-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = OverflowSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].turn_id == "managed-overflow-turn"
+        assert terminal[0].result.subtype == "success"
+        assert terminal[0].result.is_error is False
+
+    asyncio.run(run())
+
+
+def test_managed_codex_overflow_keeps_authoritative_failure_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("managed-overflow-failed", "managed-overflow-failed")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-overflow-failed"
+        ctx.turn_task = asyncio.current_task()
+
+        class OverflowSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(self, _prompt, images=None):
+                return "managed-overflow-failed-turn"
+
+            async def receive_response(self):
+                yield CodexManagedOverflow("managed-overflow-failed-turn")
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "managed-overflow-failed-turn",
+                        "status": "failed",
+                        "error": {"message": "PRIVATE_PROVIDER_DIAGNOSTIC"},
+                    }},
+                }
+
+        ctx.sdk = OverflowSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        errors = [event for event in transport.sent if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].message == "Codex 本次回复未完成，请重试。"
+        assert "PRIVATE_PROVIDER_DIAGNOSTIC" not in errors[0].message
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.subtype == "error"
+        assert terminal[0].result.is_error is True
+
+    asyncio.run(run())
+
+
 def test_codex_turn_started_notification_tracks_automatic_turn_id():
     async def run():
         handle = CodexHandle(_Cfg())
@@ -2898,7 +3025,7 @@ def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
         assert transport.started is True and transport.stopped is True
         assert machine.sessions == {} and machine.focused_sid is None
         assert any(message.type == "hello" for message in transport.sent)
-        assert any(message.type == "error" and "Claude 引擎不可用" in message.message
+        assert any(message.type == "error" and "Claude 暂时不可用" in message.message
                    for message in transport.sent)
 
     asyncio.run(run())

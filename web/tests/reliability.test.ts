@@ -61,6 +61,12 @@ import {
 } from "../src/composer-submit.ts";
 import { workContextMetrics } from "../src/work-context.ts";
 import { processBlocks } from "../src/process-blocks.ts";
+import { PointerTapGuard } from "../src/pointer-tap.ts";
+import {
+  constrainImageTransform,
+  panImageTransform,
+  pinchImageTransform,
+} from "../src/image-gesture.ts";
 import {
   bumpSessionActivity,
   compareSessionsByActivity,
@@ -76,6 +82,48 @@ assert.equal(sessionActivityTime("2026-07-17T10:00:00Z"),
   Date.parse("2026-07-17T10:00:00Z"), "ISO Claude activity timestamps must sort correctly");
 assert.ok(sessionActivityTime("1752746400000") > sessionActivityTime("1752746399"),
   "millisecond and second timestamps must share one ordering scale");
+
+const processTap = new PointerTapGuard(8);
+processTap.pointerDown(1, 20, 20);
+processTap.pointerMove(1, 22, 24);
+processTap.pointerUp(1);
+assert.equal(processTap.consumeClick(1), true,
+  "a stationary touch remains a real process-header tap");
+processTap.pointerDown(2, 20, 20);
+processTap.pointerMove(2, 20, 36);
+processTap.pointerUp(2);
+assert.equal(processTap.consumeClick(1), false,
+  "vertical history scrolling must not toggle the process header");
+processTap.pointerDown(3, 20, 20);
+processTap.pointerDown(4, 30, 20);
+processTap.pointerUp(3);
+processTap.pointerUp(4);
+assert.equal(processTap.consumeClick(1), false,
+  "multi-touch must not synthesize a process-header activation");
+processTap.pointerDown(5, 20, 20);
+processTap.pointerCancel(5);
+assert.equal(processTap.consumeClick(1), false,
+  "a cancelled touch must not toggle the process header");
+assert.equal(processTap.consumeClick(0), true,
+  "keyboard-generated clicks must remain accessible");
+
+assert.deepEqual(pinchImageTransform(
+  { scale: 1, x: 0, y: 0 },
+  { x: 100, y: 150 }, { x: 200, y: 150 },
+  { x: 70, y: 160 }, { x: 270, y: 160 },
+  { width: 300, height: 300 }, { width: 300, height: 300 },
+), { scale: 2, x: 20, y: 10 },
+"pinch zoom follows the two-finger midpoint instead of the image center");
+assert.deepEqual(panImageTransform(
+  { scale: 2, x: 0, y: 0 }, 500, -500,
+  { width: 300, height: 200 }, { width: 300, height: 300 },
+), { scale: 2, x: 150, y: -50 },
+"zoomed image panning stays inside the visible bounds");
+assert.deepEqual(constrainImageTransform(
+  { scale: 0.5, x: 99, y: 99 },
+  { width: 300, height: 200 }, { width: 300, height: 300 },
+), { scale: 1, x: 0, y: 0 },
+"returning to fit scale resets stale translation");
 assert.equal(mergeSessionActivityState("running", "idle"), "running",
   "catalog-native activity must not be overwritten by an idle resident runtime");
 assert.equal(mergeSessionActivityState("idle", "running"), "running",
@@ -164,7 +212,7 @@ assert.deepEqual(visibleAgentTimeline.map((block) => block.kind), ["process"],
   "a dedicated live agent row must replace the duplicate generic ToolUse row");
 
 const legacyWorkContext = workContextMetrics({
-  v: 18, ts: 0, type: "context_report",
+  v: 19, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, categories: [],
 });
@@ -174,7 +222,7 @@ assert.equal(legacyWorkContext.sessionTokens, 25_572,
 assert.equal(legacyWorkContext.sessionPercentage, 2.5572);
 
 const freshWorkContext = workContextMetrics({
-  v: 18, ts: 0, type: "context_report",
+  v: 19, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, session_tokens: 72, fixed_tokens: 25_500,
   session_percentage: 0.0072, categories: [],
@@ -186,7 +234,7 @@ assert.equal(freshWorkContext.sessionPercentage, 0.0072);
 assert.equal(freshWorkContext.totalPercentage, 2.5572);
 
 const derivedWorkContext = workContextMetrics({
-  v: 18, ts: 0, type: "context_report",
+  v: 19, ts: 0, type: "context_report",
   total_tokens: 11_194, max_tokens: 353_400,
   percentage: 3.1675, fixed_tokens: 11_000, categories: [],
 });
@@ -256,6 +304,11 @@ assert.match(historyAppSource, /HISTORY_INITIAL_PAGE\s*=\s*4/,
   "the newest history page must stay small enough for an immediate first paint");
 assert.match(historyAppSource, /HISTORY_MORE_PAGE\s*=\s*12/,
   "older history must be delivered in bounded follow-up pages");
+const historyBeforeResume = historyAppSource.match(
+  /requestHistory\([\s\S]{0,160}?HISTORY_INITIAL_PAGE\);\s*(?:ws\.|wsRef\.current(?:\?\.|\.))sendSwitchSession/g,
+) ?? [];
+assert.equal(historyBeforeResume.length, 3,
+  "every existing-session activation must request first paint before engine resume");
 assert.match(historyAppSource, /history_invalidated[\s\S]*invalidateSessionCache/,
   "history invalidation must evict the matching IndexedDB row");
 assert.match(historyAppSource, /historyCacheEpochRef[\s\S]*loadSession/,
@@ -787,8 +840,30 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 18, ts: 10, ...body,
+    v: 19, ts: 10, ...body,
   } as ServerEvent);
+  const problemSid = "safe-problem-presentation";
+  let problemState = reduce({
+    ...initialState, focusedSid: problemSid,
+    runtimes: { [problemSid]: createRuntime() },
+  }, {
+    type: "query_sent", sid: problemSid, msg_id: "problem-turn",
+    prompt: "hello", ts: 1,
+  });
+  problemState = reduce(problemState, { type: "event", event: event({
+    type: "error", sid: problemSid, msg_id: "problem-turn",
+    code: "cc_crash",
+    message: "provider crash at /private/token; see wrapper logs",
+  }) });
+  assert.equal(problemState.runtimes[problemSid].turns[0].error,
+    "本次回复未完成，请重试。");
+  assert.doesNotMatch(problemState.runtimes[problemSid].turns[0].error ?? "",
+    /cc_crash|provider|private|wrapper/i);
+  const commandProblem = reduce(problemState, { type: "event", event: event({
+    type: "error", sid: problemSid, code: "internal",
+    message: "Traceback: secret path /private/token",
+  }) });
+  assert.equal(commandProblem.banner, "操作未完成，请稍后重试。");
   // Work/Code and engine switches restore the target surface's last accepted
   // list immediately. The authoritative refresh may take ~1s for Codex because
   // app-server is started on demand, but it must not blank the sidebar meanwhile.
@@ -950,6 +1025,8 @@ try {
     }],
   }) });
   assert.equal(summaryState.runtimes[summarySid].turns.length, 1);
+  assert.equal(summaryState.runtimes[summarySid].ccSessionId, summarySid,
+    "authoritative history must become cacheable before a slow resume snapshot");
   assert.equal(summaryState.runtimes[summarySid].turns[0].blocks[0].kind, "text");
   assert.equal(summaryState.runtimes[summarySid].turns[0].detailEventCount, 74);
   assert.equal(summaryState.runtimes[summarySid].model, "gpt-summary");
@@ -1111,7 +1188,8 @@ try {
     request_id: "context-request",
   }) });
   assert.equal(controlRequestState.runtimes[sid].contextRequestId, null);
-  assert.equal(controlRequestState.runtimes[sid].contextError, "会话已离线",
+  assert.equal(controlRequestState.runtimes[sid].contextError,
+    "当前会话暂时不可用，请重新进入后重试。",
     "a targeted context failure must replace the infinite loading state");
   controlRequestState = reduce(controlRequestState, {
     type: "begin_status_request", sid, requestId: "status-request",
@@ -1121,7 +1199,8 @@ try {
     request_id: "status-request",
   }) });
   assert.equal(controlRequestState.runtimes[sid].statusRequestId, null);
-  assert.equal(controlRequestState.runtimes[sid].statusError, "状态不可用",
+  assert.equal(controlRequestState.runtimes[sid].statusError,
+    "当前会话暂时不可用，请重新进入后重试。",
     "a targeted status failure must close its loading state");
   let diffRequestState = reduce(controlRequestState, {
     type: "open_artifact_loading", sid, file: "src/app.ts", requestId: "diff-request",
@@ -1137,7 +1216,8 @@ try {
     request_id: "diff-request",
   }) });
   assert.equal(diffRequestState.artifact?.loading, false);
-  assert.equal(diffRequestState.artifact?.error, "差异不可用",
+  assert.equal(diffRequestState.artifact?.error,
+    "当前会话暂时不可用，请重新进入后重试。",
     "a correlated diff failure must close its loading state");
   const untouched = {
     id: "b-turn", prompt: "other", done: true, blocks: [], ts: 1000,
@@ -1816,7 +1896,8 @@ try {
     "known-good");
   assert.equal(failedHistory.runtimes[failedHistorySid].historyBuildSeq, 9);
   assert.equal(failedHistory.runtimes[failedHistorySid].loading, false);
-  assert.equal(failedHistory.banner, "历史暂时不可用，请稍后重试");
+  assert.equal(failedHistory.banner, undefined,
+    "a recoverable history read must stay silent while preserving the projection");
 
   // Even when the revision is unchanged, a first page is authoritative for
   // completed rows. This prevents generic stale-cache resurrection, not only
@@ -2374,8 +2455,12 @@ try {
     engine: "codex", onEdit: () => {}, onGetDiff: () => {},
     onLoadDetail: () => {},
   }));
-  assert.match(summaryMarkup, /展开完整过程（12 项）/,
-    "summary history must expose deferred tool and reasoning detail");
+  assert.match(summaryMarkup, /已处理/,
+    "summary history must reuse the existing collapsed process affordance");
+  assert.match(summaryMarkup, /12 项/,
+    "the collapsed process affordance keeps the deferred detail count");
+  assert.doesNotMatch(summaryMarkup, /展开完整过程/,
+    "deferred detail must not add a second standalone UI control");
   const loadedDetailMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "summary-session",
     turns: [{
@@ -2392,8 +2477,10 @@ try {
   }));
   assert.match(richMarkup, /已处理 3s/);
   assert.match(richMarkup, /已经完成/);
-  assert.match(richMarkup, /aria-label="复制回复"/,
-    "a long answer needs a copy action before its body, not only at the bottom");
+  assert.doesNotMatch(richMarkup, /复制回复/,
+    "reply copy keeps the original compact icon instead of adding a text action");
+  assert.match(richMarkup, /class="ubub-meta ai-meta"[\s\S]*aria-label="复制"/,
+    "the original reply copy icon remains in the completed-turn metadata row");
   assert.doesNotMatch(richMarkup, /先检查代码/);
   assert.doesNotMatch(richMarkup, /class="turn-working"/);
 
@@ -2550,12 +2637,15 @@ try {
     sid, turns: [forkableTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
   }));
-  assert.match(codexMarkup, /aria-label="复制回复"/);
+  assert.doesNotMatch(codexMarkup, /复制回复/);
+  assert.match(codexMarkup, /class="ubub-meta ai-meta"[\s\S]*aria-label="复制"/);
   assert.match(codexMarkup, /aria-label="派生"/);
   assert.match(codexMarkup, /data-tooltip="从此回复派生新会话"/);
   assert.doesNotMatch(codexMarkup, /title="从此回复派生/);
-  assert.ok(codexMarkup.indexOf('aria-label="派生"')
-    > codexMarkup.indexOf('aria-label="复制回复"'));
+  const assistantMeta = codexMarkup.slice(codexMarkup.indexOf('class="ubub-meta ai-meta"'));
+  assert.ok(assistantMeta.indexOf('aria-label="派生"')
+    > assistantMeta.indexOf('aria-label="复制"'),
+  "the reply copy icon stays immediately before the fork action");
   const claudeMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid, turns: [forkableTurn], engine: "claude",
     onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
@@ -2975,7 +3065,8 @@ try {
   }) });
   assert.equal(state.runtimes[progressSid].turns[0].done, true);
   assert.equal(state.runtimes[progressSid].turns[0].progress, undefined);
-  assert.match(state.runtimes[progressSid].turns[0].error ?? "", /没有返回任何内容/);
+  assert.equal(state.runtimes[progressSid].turns[0].error,
+    "本次回复未完成，请重试。");
   state = reduce(state, { type: "event", event: event({
     type: "turn_end", sid: progressSid, ts: 21,
     result: { subtype: "error", duration_ms: 237252, is_error: true },
@@ -3153,7 +3244,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 18, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 19, ts: 1, ...frame }) });
   }
 }
 
@@ -3397,7 +3488,7 @@ assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\
   "the mobile sheet height accounts for the virtual keyboard inset");
 
 const successfulTurn = {
-  v: 18, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
+  v: 19, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
   result: { subtype: "success", duration_ms: 1, is_error: false },
 };
 const interruptedTurn = {
@@ -3538,7 +3629,7 @@ controlSocket.onopen?.();
 const wireControlSid = "wire-control-revision";
 controlRelay.seedReplayState({}, {}, {
   [wireControlSid]: {
-    v: 18, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 19, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation", revision: 10,
   },
@@ -3556,7 +3647,7 @@ controlSocket.receive({
   revision: "wire-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 18, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 19, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 9,
   },
@@ -3570,7 +3661,7 @@ controlSocket.receive({
   revision: "wire-cross-session-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 18, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 19, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -3584,7 +3675,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation",
   control: {
-    v: 18, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 19, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -3613,7 +3704,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation-next",
   control: {
-    v: 18, ts: 2, type: "session_control", sid: wireControlSid,
+    v: 19, ts: 2, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation-next", revision: 0,
   },
@@ -3647,12 +3738,12 @@ controlRelay.seedReplayState(
   { [aliasOld]: "wire-alias-live", [aliasReal]: "wire-alias-cache" },
   {
     [aliasOld]: {
-      v: 18, ts: 3, type: "session_control", sid: aliasOld,
+      v: 19, ts: 3, type: "session_control", sid: aliasOld,
       control_mode: "remote", write_state: "writable",
       terminal_attached: false, generation: "wire-alias-live", revision: 2,
     },
     [aliasReal]: {
-      v: 18, ts: 2, type: "session_control", sid: aliasReal,
+      v: 19, ts: 2, type: "session_control", sid: aliasReal,
       control_mode: "desktop", write_state: "read_only",
       terminal_attached: true, generation: "wire-alias-cache", revision: 50,
     },

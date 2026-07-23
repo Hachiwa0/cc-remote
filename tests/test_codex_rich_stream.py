@@ -13,6 +13,7 @@ from cc_remote.protocol import (
     ToolResult,
     ToolUse,
     TurnDiff,
+    TurnEnd,
     TurnPlan,
 )
 from cc_remote.wrapper.codex_handle import CodexHandle
@@ -964,9 +965,14 @@ def test_codex_history_preserves_steered_user_message_image_and_page_boundary(
 
     full, _ = codex_translate_history(str(rollout), 8_000)
     users = [event for event in full if event.type == "user_msg"]
+    terminals = [event for event in full if isinstance(event, TurnEnd)]
     assert [event.prompt for event in users] == ["first", "second"]
     assert users[0].msg_id != users[1].msg_id
     assert users[1].images and users[1].images[0]["media_type"] == "image/png"
+    assert [event.result.subtype for event in terminals] == [
+        "steered", "success",
+    ]
+    assert all(not event.result.is_error for event in terminals)
 
     start, end, has_more, forced, forced_offset = codex_history_window(
         str(rollout), before=None, limit=1, max_bytes=1024 * 1024)

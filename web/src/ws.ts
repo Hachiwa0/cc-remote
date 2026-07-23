@@ -556,6 +556,23 @@ export class RelayWs {
     return this.send(frame);
   }
 
+  sendGetHistoryImage(
+    sessionId: string,
+    turnId: string,
+    imageId: string,
+    variant: "thumbnail" | "full",
+    requestId: string,
+    revision?: string | null,
+  ): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_history_image",
+      session_id: sessionId, turn_id: turnId, image_id: imageId,
+      variant, request_id: requestId, client_id: this.clientId, ts: nowTs(),
+    };
+    if (revision) frame.revision = revision;
+    return this.send(frame);
+  }
+
   /** Ask the engine for its catalog and explicit new-session defaults. Claude
    *  needs cwd because project/local settings can change the selected model. */
   sendGetModels(engine: "cc" | "claude" | "codex", cwd?: string | null): void {
@@ -926,9 +943,10 @@ export class RelayWs {
   ): string | null {
     const result = this.outbox.enqueue(obj, this.clientId, commandId);
     if (!result.ok) {
-      const detail = `命令未发送：${result.reason}。请等待连接恢复后重试。`;
-      console.error(detail);
-      this.cb.onCommandError?.(detail);
+      console.error("command not queued", result.reason);
+      this.cb.onCommandError?.(result.reason.startsWith("command too large")
+        ? "内容过大，暂时无法发送，请缩减附件或内容后重试。"
+        : "操作暂未发送，请等待连接恢复后重试。");
       return null;
     }
     this.sendRaw(result.raw);

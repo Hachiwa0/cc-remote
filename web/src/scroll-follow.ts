@@ -17,6 +17,7 @@ export interface BottomMeasurement {
 
 export const NEAR_BOTTOM_PX = 80;
 export const AT_BOTTOM_PX = 2;
+export const AUTO_LOAD_HISTORY_TOP_PX = 72;
 
 const SCROLL_DIRECTION_EPSILON_PX = 0.5;
 
@@ -41,6 +42,62 @@ export function anchoredScrollTop(
     0,
     previousScrollTop + nextScrollHeight - previousScrollHeight,
   );
+}
+
+/** Preserve the exact content point the user was reading when older DOM rows
+ * are prepended. Element geometry is stable even when images/fonts above the
+ * viewport finish laying out during the same update. */
+export function anchoredElementScrollTop(
+  previousScrollTop: number,
+  previousAnchorTop: number,
+  nextAnchorTop: number,
+): number {
+  return Math.max(
+    0,
+    previousScrollTop + nextAnchorTop - previousAnchorTop,
+  );
+}
+
+/** A pull gesture may request at most one older page. Network completion while
+ * the finger is still down must not cascade through the entire history. */
+export class OlderHistoryLoadGate {
+  private gestureActive = false;
+  private usedInGesture = false;
+  private pending = false;
+
+  beginGesture(): void {
+    if (this.gestureActive) return;
+    this.gestureActive = true;
+    this.usedInGesture = false;
+  }
+
+  acquire(): boolean {
+    if (!this.gestureActive || this.usedInGesture || this.pending) return false;
+    this.usedInGesture = true;
+    this.pending = true;
+    return true;
+  }
+
+  complete(): void {
+    this.pending = false;
+  }
+
+  endGesture(): void {
+    this.gestureActive = false;
+  }
+}
+
+/** Auto-pagination is gesture-driven, never a side effect of merely painting a
+ * short session at scrollTop=0. The threshold hides the network round trip
+ * behind the final few pixels of the user's upward scroll. */
+export function shouldAutoLoadOlderHistory(
+  metrics: ScrollMetrics,
+  movingTowardHistory: boolean,
+  canLoadOlder: boolean,
+): boolean {
+  return canLoadOlder
+    && movingTowardHistory
+    && metrics.scrollTop <= AUTO_LOAD_HISTORY_TOP_PX;
 }
 
 /**

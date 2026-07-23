@@ -118,7 +118,7 @@ export function CapabilitiesSheet({
         {loading && !report && <div className="capabilities-empty">正在读取扩展目录…</div>}
         {report?.notes?.map((note) => <div className="capabilities-note" key={note}>{note}</div>)}
         {report?.errors?.length ? <div className="capabilities-errors">
-          <b>部分目录暂不可用</b>{report.errors.map((error) => <span key={error}>{error}</span>)}
+          <b>部分目录暂不可用</b><span>稍后刷新即可，不影响当前会话。</span>
         </div> : null}
 
         {!readOnly && activeKind === "skill" && <div className="capabilities-create">

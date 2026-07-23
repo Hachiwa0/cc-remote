@@ -7,6 +7,10 @@ import { createServer } from "vite";
 
 import { classifyPreviewTarget, isMarkdownPath } from "../src/preview-path.ts";
 import { parseLocalFileTarget } from "../src/file-link.ts";
+import {
+  InlineImageAssetCache,
+  classifyMessageImageTarget,
+} from "../src/inline-image-assets.ts";
 import { collectTurnFileChanges, filePathsFromInput, mutatedFilePaths } from "../src/file-changes.ts";
 import type { ServerEvent } from "../src/protocol.ts";
 
@@ -40,6 +44,44 @@ assert.deepEqual(parseLocalFileTarget("file:///tmp/a%20b.py:9"), {
 });
 assert.equal(parseLocalFileTarget("https://example.com/a.py:9"), null);
 assert.equal(parseLocalFileTarget("#L9"), null);
+assert.deepEqual(classifyMessageImageTarget(
+  "/Volumes/MuggleSSD/workspace/project/tmp-auth.png"), {
+  kind: "local", value: "/Volumes/MuggleSSD/workspace/project/tmp-auth.png",
+});
+assert.deepEqual(classifyMessageImageTarget("screenshots/result.webp?raw=1"), {
+  kind: "local", value: "screenshots/result.webp",
+});
+assert.deepEqual(classifyMessageImageTarget("https://example.com/result.png"), {
+  kind: "external", value: "https://example.com/result.png",
+});
+assert.equal(classifyMessageImageTarget("data:image/png;base64,cG5n").kind, "blocked");
+assert.equal(classifyMessageImageTarget("/etc/password.txt").kind, "blocked");
+
+const inlineAssets = new InlineImageAssetCache(2);
+assert.equal(inlineAssets.begin({
+  sid: "session-1", path: "qr.png", previewId: "preview-1", requestId: "request-1",
+}), true);
+assert.equal(inlineAssets.begin({
+  sid: "session-1", path: "qr.png", previewId: "preview-2", requestId: "request-2",
+}), false, "one visible local image must have at most one in-flight request");
+assert.equal(inlineAssets.accept({
+  v: 19, type: "preview_asset", ts: 1, sid: "other-session",
+  path: "qr.png", preview_id: "preview-1", request_id: "request-1",
+  media_type: "image/png", data: "cG5n",
+}), false, "a response from another session must not satisfy the request");
+assert.equal(inlineAssets.accept({
+  v: 19, type: "preview_asset", ts: 2, sid: "session-1",
+  path: "qr.png", preview_id: "preview-1", request_id: "request-1",
+  media_type: "image/png", data: "cG5n",
+}), true);
+assert.deepEqual(inlineAssets.forSession("session-1")["qr.png"], {
+  status: "ready", mediaType: "image/png", data: "cG5n",
+});
+assert.equal(inlineAssets.forSession("other-session")["qr.png"], undefined,
+  "a background response must never populate the focused session's asset view");
+assert.equal(inlineAssets.dropSession("session-1"), true);
+assert.equal(inlineAssets.forSession("session-1")["qr.png"], undefined,
+  "a destructive history invalidation must evict the session's rendered assets");
 assert.deepEqual(mutatedFilePaths("Write", {
   file_path: "/tmp/claude.txt",
 }), ["/tmp/claude.txt"]);
@@ -89,6 +131,29 @@ try {
   assert.match(codeCopyMarkup, /aria-label="复制代码"/,
     "fenced commands need a local copy action without scrolling to turn end");
   assert.match(codeCopyMarkup, /echo ready/);
+  const localQrMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "![飞书授权二维码](/Volumes/MuggleSSD/workspace/project/tmp-auth.png)",
+    done: true,
+    imageAssets: {},
+    onLoadImage: () => true,
+    onPreviewImage: () => {},
+  }));
+  assert.match(localQrMarkup, /message-image-loading/);
+  assert.doesNotMatch(localQrMarkup, /src="\/Volumes\//,
+    "a local assistant image path must never become a public HTTP request");
+  const loadedQrMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "![飞书授权二维码](/Volumes/MuggleSSD/workspace/project/tmp-auth.png)",
+    done: true,
+    imageAssets: {
+      "/Volumes/MuggleSSD/workspace/project/tmp-auth.png": {
+        status: "ready", mediaType: "image/png", data: "cG5n",
+      },
+    },
+    onPreviewImage: () => {},
+  }));
+  assert.match(loadedQrMarkup, /class="message-image-trigger"/);
+  assert.match(loadedQrMarkup, /src="data:image\/png;base64,cG5n"/);
+  assert.match(loadedQrMarkup, /aria-label="预览图片：飞书授权二维码"/);
   let state = reduce(initialState, {
     type: "open_file_loading",
     file: "README.md",
@@ -308,7 +373,7 @@ try {
     kind: "file",
   });
   state = reduce(state, { type: "event", event: {
-    v: 18,
+    v: 19,
     type: "file_preview",
     ts: 6,
     sid: "session-1",

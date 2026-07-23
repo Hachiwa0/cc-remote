@@ -272,12 +272,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v16**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v19**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v18 relay 和
-> v18 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v19 relay 和
+> v19 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
 
 ### 3）上传 staging，由原子 release 安装器发布
 
@@ -315,7 +315,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v18 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v19 wrapper。
 
 验证：
 

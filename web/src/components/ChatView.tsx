@@ -16,9 +16,19 @@ import { ProcessTimeline } from "./ProcessTimeline";
 import { finalTextBlocks, hasActiveProcess } from "../process-blocks";
 import { isMarkdownPath } from "../preview-path";
 import { collectTurnFileChanges } from "../file-changes";
+import type { InlineImageAsset } from "../inline-image-assets";
 import {
-  anchoredScrollTop,
+  historyImageAssetKey,
+  type HistoryImageAsset,
+  type HistoryImageVariant,
+} from "../history-image-assets";
+import { ImageLightbox } from "./ImageLightbox";
+import { presentHistoricalTurnProblem } from "../problem-presentation";
+import {
+  anchoredElementScrollTop,
   createFrameCoalescer,
+  OlderHistoryLoadGate,
+  shouldAutoLoadOlderHistory,
   ScrollFollowController,
   type FrameCoalescer,
   type ScrollFollowSnapshot,
@@ -27,8 +37,8 @@ import {
 
 interface HistoryAnchor {
   sid: string | null;
-  firstTurnId: string | null;
-  scrollHeight: number;
+  anchorTurnId: string;
+  anchorTop: number;
   scrollTop: number;
 }
 
@@ -49,16 +59,61 @@ function formatTime(ts: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+function HistoryUserImage({ turnId, imageId, width, height, asset, onLoad,
+  onPreview }: {
+  turnId: string;
+  imageId: string;
+  width: number;
+  height: number;
+  asset?: HistoryImageAsset;
+  onLoad?: (turnId: string, imageId: string, variant: HistoryImageVariant) => boolean;
+  onPreview: () => void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (asset || !onLoad) return;
+    const node = triggerRef.current;
+    if (!node || typeof IntersectionObserver === "undefined") {
+      onLoad(turnId, imageId, "thumbnail");
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      onLoad(turnId, imageId, "thumbnail");
+      observer.disconnect();
+    }, { rootMargin: "500px 0px" });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [asset, imageId, onLoad, turnId]);
+
+  const src = asset?.status === "ready" && asset.data && asset.mediaType
+    ? `data:${asset.mediaType};base64,${asset.data}` : null;
+  return (
+    <button ref={triggerRef} type="button"
+      className="ubub-image-trigger history-image-trigger"
+      style={{ aspectRatio: `${width} / ${height}` }}
+      aria-label="预览用户发送的图片"
+      disabled={!src}
+      onClick={onPreview}>
+      {src
+        ? <img src={src} className="ubub-img" alt="用户发送的图片" />
+        : <span className="history-image-placeholder" aria-hidden="true" />}
+    </button>
+  );
+}
+
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onLoadMore, onLoadDetail, onEdit, onGetDiff, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
-  onOpenArtifacts, onFork, forkingPointId, surface = "code" }: {
+  onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
+  historyImageAssets, onLoadHistoryImage,
+  surface = "code" }: {
   sid: string | null;
   turns: Turn[];
   surface?: Space;
   engine?: "claude" | "codex";
   loading?: boolean;
   hasMore?: boolean;
-  onLoadMore?: () => void;
+  onLoadMore?: () => boolean;
   onLoadDetail?: (turnId: string) => void;
   onEdit: (prompt: string) => void;
   onGetDiff: (file: string) => void;
@@ -68,6 +123,12 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onOpenArtifacts?: () => void;
   onFork?: (forkPointId: string) => void;
   forkingPointId?: string | null;
+  imageAssets?: Record<string, InlineImageAsset>;
+  onLoadImage?: (path: string) => boolean;
+  historyImageAssets?: Record<string, HistoryImageAsset>;
+  onLoadHistoryImage?: (
+    turnId: string, imageId: string, variant: HistoryImageVariant,
+  ) => boolean;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const threadInRef = useRef<HTMLDivElement>(null);
@@ -82,10 +143,16 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   }
   const [scrollState, setScrollState] = useState<ScrollFollowSnapshot>(() =>
     controllerRef.current!.snapshot());
-  const [zoom, setZoom] = useState<string | null>(null);   // lightbox image src
-  const [zoomBig, setZoomBig] = useState(false);           // fit-to-screen vs actual size
+  const [zoom, setZoom] = useState<
+    | { kind: "data"; src: string; alt: string }
+    | { kind: "history"; turnId: string; imageId: string; alt: string }
+    | null
+  >(null);
   const anchorRef = useRef<HistoryAnchor | null>(null);
+  const historyLoadGateRef = useRef(new OlderHistoryLoadGate());
   const requestedOlderRef = useRef<{ sid: string | null; length: number } | null>(null);
+  const autoLoadedBoundaryRef = useRef<string | null>(null);
+  const lastScrollTopRef = useRef(0);
   const renderedSidRef = useRef<string | null | undefined>(undefined);
   const touchYRef = useRef<number | null>(null);
   const [renderWindow, setRenderWindow] = useState({
@@ -94,6 +161,24 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   const renderLimit = renderWindow.sid === sid
     ? renderWindow.limit : INITIAL_RENDER_TURNS;
   const visibleTurns = turns.slice(-renderLimit);
+  const canLoadOlder = turns.length > visibleTurns.length || !!hasMore;
+
+  const captureHistoryAnchor = (el: HTMLDivElement): HistoryAnchor | null => {
+    const viewportTop = el.getBoundingClientRect().top;
+    for (const node of el.querySelectorAll<HTMLElement>("[data-turn-id]")) {
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom < viewportTop) continue;
+      const anchorTurnId = node.dataset.turnId;
+      if (!anchorTurnId) continue;
+      return {
+        sid,
+        anchorTurnId,
+        anchorTop: rect.top,
+        scrollTop: el.scrollTop,
+      };
+    }
+    return null;
+  };
 
   const syncScrollState = useCallback((next: ScrollFollowSnapshot) => {
     setScrollState((previous) =>
@@ -114,6 +199,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       // Streaming writes are immediate and coalesced once per frame. Smooth
       // scrolling is reserved for the user's explicit "bottom" button.
       el.scrollTop = el.scrollHeight;
+      lastScrollTopRef.current = el.scrollTop;
       syncScrollState(controller.recordProgrammaticScroll(readScrollMetrics(el)));
     });
   }, [syncScrollState]);
@@ -128,15 +214,11 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   // Capture both dimensions and the first id. A streaming delta can arrive
   // while history is in flight; only an actual prepend should consume this
   // anchor and shift the viewport.
-  const doLoadMore = () => {
+  const doLoadMore = (): boolean => {
+    if (requestedOlderRef.current?.sid === sid) return false;
     const el = scrollRef.current;
     if (el) {
-      anchorRef.current = {
-        sid,
-        firstTurnId: visibleTurns[0]?.id ?? null,
-        scrollHeight: el.scrollHeight,
-        scrollTop: el.scrollTop,
-      };
+      anchorRef.current = captureHistoryAnchor(el);
       pauseOutputFollow();
     }
     if (turns.length > renderLimit) {
@@ -144,10 +226,39 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         sid,
         limit: Math.min(turns.length, renderLimit + RENDER_TURN_BATCH),
       });
-      return;
+      return true;
     }
     requestedOlderRef.current = { sid, length: turns.length };
-    onLoadMore?.();
+    if (!onLoadMore?.()) {
+      requestedOlderRef.current = null;
+      anchorRef.current = null;
+      return false;
+    }
+    return true;
+  };
+
+  // Scroll/touch events can repeat many times while a finger or wheel remains
+  // pinned at the top. Trigger once for each visible oldest boundary; a newly
+  // revealed local batch or server page changes the boundary and re-arms it.
+  const maybeAutoLoadOlder = (
+    movingTowardHistory: boolean,
+    source: "touch" | "other",
+  ) => {
+    const el = scrollRef.current;
+    if (!el || !shouldAutoLoadOlderHistory(
+      readScrollMetrics(el), movingTowardHistory, canLoadOlder,
+    )) return;
+    const boundary = [
+      sid ?? "", visibleTurns[0]?.id ?? "", renderLimit,
+      turns.length, hasMore ? 1 : 0,
+    ].join("\u0000");
+    if (autoLoadedBoundaryRef.current === boundary) return;
+    if (source === "touch" && !historyLoadGateRef.current.acquire()) return;
+    if (doLoadMore()) {
+      autoLoadedBoundaryRef.current = boundary;
+    } else if (source === "touch") {
+      historyLoadGateRef.current.complete();
+    }
   };
 
   useLayoutEffect(() => {
@@ -165,8 +276,12 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
           (current.sid === sid ? current.limit : INITIAL_RENDER_TURNS) + added,
         ),
       }));
+    } else if (requested?.sid === sid && !hasMore) {
+      requestedOlderRef.current = null;
+      anchorRef.current = null;
     }
-  }, [renderWindow.sid, sid, turns.length]);
+    historyLoadGateRef.current.complete();
+  }, [hasMore, renderWindow.sid, sid, turns.length]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -181,6 +296,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       touchYRef.current = null;
       frameRef.current?.cancel();
       el.scrollTop = el.scrollHeight;
+      lastScrollTopRef.current = el.scrollTop;
       syncScrollState(controller.reset(readScrollMetrics(el)));
       return;
     }
@@ -188,13 +304,17 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     const anchor = anchorRef.current;
     const prepended = anchor
       && anchor.sid === sid
-      && anchor.firstTurnId !== (visibleTurns[0]?.id ?? null);
+      && anchor.anchorTurnId !== (visibleTurns[0]?.id ?? null);
     if (prepended) {
-      el.scrollTop = anchoredScrollTop(
-        anchor.scrollTop,
-        anchor.scrollHeight,
-        el.scrollHeight,
-      );
+      const node = Array.from(
+        el.querySelectorAll<HTMLElement>("[data-turn-id]"),
+      ).find((candidate) => candidate.dataset.turnId === anchor.anchorTurnId);
+      if (node) {
+        el.scrollTop = anchoredElementScrollTop(
+          anchor.scrollTop, anchor.anchorTop, node.getBoundingClientRect().top,
+        );
+      }
+      lastScrollTopRef.current = el.scrollTop;
       anchorRef.current = null;
       syncScrollState(controller.recordProgrammaticScroll(readScrollMetrics(el)));
     } else if (!controller.isFollowing()) {
@@ -224,18 +344,31 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     return () => frameRef.current?.cancel();
   }, []);
 
+  useEffect(() => setZoom(null), [sid]);
+
   const onScroll = () => {
     const el = scrollRef.current;
     const controller = controllerRef.current;
     if (!el || !controller) return;
-    syncScrollState(controller.observeScroll(readScrollMetrics(el)));
+    const metrics = readScrollMetrics(el);
+    const movingTowardHistory = metrics.scrollTop < lastScrollTopRef.current - 0.5;
+    lastScrollTopRef.current = metrics.scrollTop;
+    syncScrollState(controller.observeScroll(metrics));
+    maybeAutoLoadOlder(
+      movingTowardHistory,
+      touchYRef.current == null ? "other" : "touch",
+    );
   };
 
   const onWheel = (event: WheelEvent<HTMLDivElement>) => {
-    if (event.deltaY < 0) pauseOutputFollow();
+    if (event.deltaY < 0) {
+      pauseOutputFollow();
+      maybeAutoLoadOlder(true, "other");
+    }
   };
 
   const onTouchStart = (event: TouchEvent<HTMLDivElement>) => {
+    historyLoadGateRef.current.beginGesture();
     touchYRef.current = event.touches[0]?.clientY ?? null;
   };
 
@@ -244,11 +377,17 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     const previousY = touchYRef.current;
     if (currentY == null || previousY == null) return;
     // A finger moving down scrolls the viewport toward earlier messages.
-    if (currentY > previousY) pauseOutputFollow();
+    if (currentY > previousY) {
+      pauseOutputFollow();
+      maybeAutoLoadOlder(true, "touch");
+    }
     touchYRef.current = currentY;
   };
 
-  const clearTouch = () => { touchYRef.current = null; };
+  const clearTouch = () => {
+    touchYRef.current = null;
+    historyLoadGateRef.current.endGesture();
+  };
 
   const scrollToBottom = () => {
     const el = scrollRef.current;
@@ -339,7 +478,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         onTouchStart={onTouchStart} onTouchMove={onTouchMove}
         onTouchEnd={clearTouch} onTouchCancel={clearTouch}>
         <div className="thread-in" ref={threadInRef}>
-          {(turns.length > visibleTurns.length || hasMore) && (
+          {canLoadOlder && (
             <div className="load-more-wrap">
               <button className="load-more-btn" onClick={doLoadMore}>{
                 turns.length > visibleTurns.length
@@ -355,16 +494,39 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
               ?? (activeProcess ? "处理中"
                 : finalBlocks.length > 0 ? "回答中" : "思考中");
             return (
-            <div className="turn" key={t.id}>
-            {(t.prompt || (t.images && t.images.length) || (t.files && t.files.length)) && (
+            <div className="turn" key={t.id} data-turn-id={t.id}>
+            {(t.prompt || (t.images && t.images.length) || (t.imageRefs && t.imageRefs.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
                 {t.prompt && <div className="ubub">{t.prompt}</div>}
                 {t.images && t.images.length > 0 && (
                   <div className="ubub-imgs">
                     {t.images.map((img, i) => {
                       const src = `data:${img.media_type};base64,${img.data}`;
-                      return <img key={i} src={src} className="ubub-img" alt="" title="点击放大"
-                        onClick={() => setZoom(src)} />;
+                      return <button key={i} type="button" className="ubub-image-trigger"
+                        aria-label="预览用户发送的图片"
+                        onClick={() => setZoom({ kind: "data", src, alt: "用户发送的图片" })}>
+                        <img src={src} className="ubub-img" alt="用户发送的图片" />
+                      </button>;
+                    })}
+                  </div>
+                )}
+                {t.imageRefs && t.imageRefs.length > 0 && (
+                  <div className="ubub-imgs">
+                    {t.imageRefs.map((image) => {
+                      const thumbnail = historyImageAssets?.[
+                        historyImageAssetKey(t.id, image.image_id, "thumbnail")
+                      ];
+                      return <HistoryUserImage key={image.image_id}
+                        turnId={t.id} imageId={image.image_id}
+                        width={image.width} height={image.height}
+                        asset={thumbnail} onLoad={onLoadHistoryImage}
+                        onPreview={() => {
+                          onLoadHistoryImage?.(t.id, image.image_id, "full");
+                          setZoom({
+                            kind: "history", turnId: t.id,
+                            imageId: image.image_id, alt: "用户发送的图片",
+                          });
+                        }} />;
                     })}
                   </div>
                 )}
@@ -382,41 +544,32 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                 </div>
               </div>
             )}
-            {!!t.detailEventCount && !t.detailLoaded && (
-              <button type="button" className="turn-detail-btn"
-                aria-busy={!!t.detailLoading}
-                disabled={!!t.detailLoading || !onLoadDetail}
-                onClick={() => onLoadDetail?.(t.id)}>
-                {t.detailLoading
-                  ? "正在加载完整过程…"
-                  : `展开完整过程（${t.detailEventCount} 项）`}
-                <Icon name="chev" size={14} />
-              </button>
-            )}
             {t.blocks.length > 0 ? (
               <>
                 <ProcessTimeline blocks={t.blocks} done={t.done} engine={engine}
                   durationMs={t.durationMs} startTs={t.ts}
-                  onOpenFile={onOpenFile} />
-                {t.done && finalBlocks.length > 0 && (
-                  <div className="assistant-actions">
-                    <button type="button"
-                      className={"assistant-copy" + (copiedId === t.id + "-ai" ? " copied" : "")}
-                      onClick={() => copyText(t.id + "-ai", aiText(t))}
-                      aria-label="复制回复">
-                      <Icon name={copiedId === t.id + "-ai" ? "check" : "copy"} size={13} />
-                      <span>{copiedId === t.id + "-ai" ? "已复制" : "复制回复"}</span>
-                    </button>
-                  </div>
-                )}
+                  deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
+                  detailLoading={t.detailLoading}
+                  onLoadDetail={onLoadDetail ? () => onLoadDetail(t.id) : undefined}
+                  onOpenFile={onOpenFile} imageAssets={imageAssets}
+                  onLoadImage={onLoadImage}
+                  onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
                 {finalBlocks.map((block) => (
                   <MessageBlock key={block.message_id} text={block.text}
-                    done={block.done} onOpenFile={onOpenFile} />
+                    done={block.done} onOpenFile={onOpenFile}
+                    imageAssets={imageAssets} onLoadImage={onLoadImage}
+                    onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
                 ))}
                 {t.done && (
                   <>
                     <div className="ubub-meta ai-meta">
                       {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
+                      {finalBlocks.length > 0 && <button
+                        className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")}
+                        onClick={() => copyText(t.id + "-ai", aiText(t))}
+                        aria-label="复制">
+                        <Icon name="check" size={13} />
+                      </button>}
                       {onFork && canForkTurn(engine, t) && (
                         <button className="ubub-act" aria-label="派生"
                           data-tooltip="从此回复派生新会话"
@@ -432,6 +585,15 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                   </>
                 )}
               </>
+            ) : (!!t.detailEventCount && !t.detailLoaded) ? (
+              <ProcessTimeline blocks={[]} done={t.done} engine={engine}
+                durationMs={t.durationMs} startTs={t.ts}
+                deferredCount={t.detailEventCount}
+                detailLoading={t.detailLoading}
+                onLoadDetail={onLoadDetail ? () => onLoadDetail(t.id) : undefined}
+                onOpenFile={onOpenFile} imageAssets={imageAssets}
+                onLoadImage={onLoadImage}
+                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
             ) : null}
               {working && (
                 <div className="turn-working" role="status" aria-live="polite">
@@ -441,7 +603,9 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
               )}
               {fileChips(t)}
               {t.interrupted && <div className="note interrupted">— 已打断 —</div>}
-              {t.error && <div className="note interrupted">{t.error}</div>}
+              {t.error && <div className="note interrupted">{
+                presentHistoricalTurnProblem(t.error)
+              }</div>}
             </div>
             );
           })}
@@ -454,14 +618,20 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
           </button>
         </div>
       )}
-      {zoom && (
-        <div className="lightbox" onClick={() => { setZoom(null); setZoomBig(false); }} role="dialog" aria-label="图片预览">
-          <img src={zoom} className={"lightbox-img" + (zoomBig ? " big" : "")} alt=""
-            title={zoomBig ? "点击缩小 · 点背景关闭" : "点击放大 · 点背景关闭"}
-            onClick={(e) => { e.stopPropagation(); setZoomBig((b) => !b); }} />
-          <button className="lightbox-close" onClick={() => { setZoom(null); setZoomBig(false); }} aria-label="关闭"><Icon name="close" size={22} /></button>
-        </div>
-      )}
+      {zoom && (() => {
+        const asset = zoom.kind === "history" ? historyImageAssets?.[
+          historyImageAssetKey(zoom.turnId, zoom.imageId, "full")
+        ] ?? historyImageAssets?.[
+          historyImageAssetKey(zoom.turnId, zoom.imageId, "thumbnail")
+        ] : null;
+        const src = zoom.kind === "data" ? zoom.src
+          : asset?.status === "ready" && asset.data && asset.mediaType
+            ? `data:${asset.mediaType};base64,${asset.data}` : null;
+        return src ? (
+        <ImageLightbox key={sid ?? ""} src={src} alt={zoom.alt}
+          onClose={() => setZoom(null)} />
+        ) : null;
+      })()}
     </div>
   );
 }

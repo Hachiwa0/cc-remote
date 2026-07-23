@@ -17,8 +17,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cc_remote.attachments import (
+    ALLOWED_IMAGE_TYPES,
+    MAX_IMAGE_DIMENSION,
+    MAX_IMAGE_PIXELS,
+    MAX_SINGLE_ATTACHMENT_BYTES,
+    decode_attachment,
+    image_dimensions,
+)
 
-_SCHEMA_VERSION = 3
+
+_SCHEMA_VERSION = 4
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -185,6 +194,70 @@ def _turn_id(group: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def history_image_id(turn_id: str, index: int) -> str:
+    digest = hashlib.sha256(
+        f"{turn_id}\0{index}".encode("utf-8", "surrogatepass")
+    ).hexdigest()[:24]
+    return f"img-{digest}"
+
+
+def _history_image_refs(turn_id: str, raw_images: Any) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    if not isinstance(raw_images, list):
+        return refs
+    for index, image in enumerate(raw_images):
+        if not isinstance(image, dict):
+            continue
+        media_type = image.get("media_type")
+        data = image.get("data")
+        if not isinstance(media_type, str) or not isinstance(data, str):
+            continue
+        if media_type not in ALLOWED_IMAGE_TYPES:
+            continue
+        try:
+            decoded = decode_attachment(data)
+        except ValueError:
+            continue
+        if len(decoded) > MAX_SINGLE_ATTACHMENT_BYTES:
+            continue
+        dimensions = image_dimensions(decoded, media_type)
+        if dimensions is None:
+            continue
+        width, height = dimensions
+        if (
+            width <= 0 or height <= 0
+            or width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION
+            or width * height > MAX_IMAGE_PIXELS
+        ):
+            continue
+        refs.append({
+            "image_id": history_image_id(turn_id, index),
+            "media_type": media_type,
+            "width": width,
+            "height": height,
+            "byte_size": len(decoded),
+        })
+    return refs
+
+
+def history_image_from_events(
+    events: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    turn_id: str,
+    image_id: str,
+) -> dict[str, Any] | None:
+    """Resolve an opaque history image id inside one indexed turn group."""
+    for event in events:
+        if event.get("type") != "user_msg" or event.get("msg_id") != turn_id:
+            continue
+        images = event.get("images")
+        if not isinstance(images, list):
+            return None
+        for index, image in enumerate(images):
+            if history_image_id(turn_id, index) == image_id and isinstance(image, dict):
+                return image
+    return None
+
+
 def materialize_history_turns(
     events: list[dict[str, Any]] | tuple[dict[str, Any], ...],
 ) -> tuple[dict[str, Any], ...]:
@@ -201,7 +274,7 @@ def materialize_history_turns(
             continue
         prompt = ""
         prompt_truncated = False
-        images = None
+        image_refs: list[dict[str, Any]] = []
         deferred_image_count = 0
         files = None
         started_ms = None
@@ -229,8 +302,10 @@ def materialize_history_turns(
                         prompt = prompt[:keep] + suffix
                         prompt_truncated = True
                 raw_images = event.get("images")
+                image_refs = _history_image_refs(turn_id, raw_images)
                 if isinstance(raw_images, list):
-                    deferred_image_count = len(raw_images)
+                    deferred_image_count = max(
+                        0, len(raw_images) - len(image_refs))
                 files = event.get("files")
             elif event_type == "assistant_msg_start":
                 message_id = event.get("message_id")
@@ -267,10 +342,18 @@ def materialize_history_turns(
                         "interrupted", "error_during_execution", "aborted",
                     }
                     if bool(result.get("is_error")) and not interrupted:
-                        error = subtype or "error"
+                        error = (
+                            "该轮未正常结束"
+                            if not subtype or subtype == "error"
+                            else subtype
+                        )
             elif event_type == "error":
                 if isinstance(event.get("message"), str):
-                    error = event["message"]
+                    error = (
+                        "该轮未正常结束"
+                        if event["message"].strip().lower() == "error"
+                        else event["message"]
+                    )
             if event_type in {"tool_use", "process", "turn_plan", "turn_diff"}:
                 detail_id = event.get("tool_use_id") or event.get("item_id")
                 if isinstance(detail_id, str):
@@ -321,16 +404,16 @@ def materialize_history_turns(
             "done": done,
             "detailEventCount": (
                 len(detail_items)
-                + deferred_image_count
                 + int(prompt_truncated)
                 + int(summary_truncated)
+                + deferred_image_count
             ),
             "detailLoaded": False,
         }
         optional = {
             "forkPointId": fork_point,
             "checkpointId": checkpoint_id,
-            "images": images,
+            "imageRefs": image_refs or None,
             "files": files,
             "ts": started_ms,
             "doneTs": done_ms,
@@ -385,6 +468,7 @@ class HistoryIndexStore:
                 # projections across wire-shape changes.
                 connection.execute("DROP TABLE IF EXISTS history_pages")
                 connection.execute("DROP TABLE IF EXISTS history_turn_details")
+                connection.execute("DROP TABLE IF EXISTS history_image_assets")
                 current = 0
             connection.execute(
                 """
@@ -434,6 +518,39 @@ class HistoryIndexStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_turn_details_lru "
                 "ON history_turn_details(accessed_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS history_image_assets (
+                    session_id TEXT NOT NULL,
+                    engine TEXT NOT NULL,
+                    source_token TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    image_id TEXT NOT NULL,
+                    variant TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    data BLOB NOT NULL,
+                    payload_bytes INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    accessed_at REAL NOT NULL,
+                    PRIMARY KEY (
+                        session_id, engine, source_token,
+                        turn_id, image_id, variant
+                    )
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS history_image_assets_lookup "
+                "ON history_image_assets(session_id, engine, source_path, "
+                "turn_id, image_id, variant, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS history_image_assets_lru "
+                "ON history_image_assets(accessed_at)"
             )
             if current == 0:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
@@ -610,6 +727,85 @@ class HistoryIndexStore:
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
             return None
 
+    def get_image_asset(
+        self,
+        session_id: str,
+        engine: str,
+        source: HistorySourceFingerprint,
+        turn_id: str,
+        image_id: str,
+        variant: str,
+    ) -> tuple[str, int, int, bytes] | None:
+        now = time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT source_token, media_type, width, height, data
+                FROM history_image_assets
+                WHERE session_id=? AND engine=? AND source_path=?
+                  AND turn_id=? AND image_id=? AND variant=?
+                ORDER BY (source_token = ?) DESC, created_at DESC
+                LIMIT 1
+                """,
+                (session_id, engine, source.path, turn_id, image_id,
+                 variant, source.token),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE history_image_assets SET accessed_at=?
+                WHERE session_id=? AND engine=? AND source_token=?
+                  AND turn_id=? AND image_id=? AND variant=?
+                """,
+                (now, session_id, engine, row["source_token"], turn_id,
+                 image_id, variant),
+            )
+        return (
+            str(row["media_type"]), int(row["width"]), int(row["height"]),
+            bytes(row["data"]),
+        )
+
+    def put_image_asset(
+        self,
+        session_id: str,
+        engine: str,
+        source: HistorySourceFingerprint,
+        turn_id: str,
+        image_id: str,
+        variant: str,
+        media_type: str,
+        width: int,
+        height: int,
+        data: bytes,
+    ) -> None:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO history_image_assets (
+                    session_id, engine, source_token, source_path,
+                    turn_id, image_id, variant, media_type, width, height,
+                    data, payload_bytes, created_at, accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (
+                    session_id, engine, source_token,
+                    turn_id, image_id, variant
+                ) DO UPDATE SET
+                    media_type=excluded.media_type,
+                    width=excluded.width,
+                    height=excluded.height,
+                    data=excluded.data,
+                    payload_bytes=excluded.payload_bytes,
+                    created_at=excluded.created_at,
+                    accessed_at=excluded.accessed_at
+                """,
+                (session_id, engine, source.token, source.path, turn_id,
+                 image_id, variant, media_type, width, height, data,
+                 len(data), now, now),
+            )
+            self._prune_image_assets(connection)
+
     def _prune(self, connection: sqlite3.Connection) -> None:
         row = connection.execute(
             "SELECT COUNT(*) AS entries, COALESCE(SUM(payload_bytes), 0) AS bytes "
@@ -668,12 +864,48 @@ class HistoryIndexStore:
             entries -= 1
             total_bytes -= int(victim["payload_bytes"])
 
+    def _prune_image_assets(self, connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT COUNT(*) AS entries, COALESCE(SUM(payload_bytes), 0) AS bytes "
+            "FROM history_image_assets"
+        ).fetchone()
+        entries = int(row["entries"])
+        total_bytes = int(row["bytes"])
+        max_entries = self.max_entries * 8
+        max_bytes = max(1024 * 1024, self.max_bytes // 2)
+        while entries > max_entries or total_bytes > max_bytes:
+            victim = connection.execute(
+                """
+                SELECT session_id, engine, source_token, turn_id,
+                       image_id, variant, payload_bytes
+                FROM history_image_assets ORDER BY accessed_at ASC LIMIT 1
+                """
+            ).fetchone()
+            if victim is None:
+                break
+            connection.execute(
+                """
+                DELETE FROM history_image_assets
+                WHERE session_id=? AND engine=? AND source_token=?
+                  AND turn_id=? AND image_id=? AND variant=?
+                """,
+                tuple(victim[key] for key in (
+                    "session_id", "engine", "source_token", "turn_id",
+                    "image_id", "variant")),
+            )
+            entries -= 1
+            total_bytes -= int(victim["payload_bytes"])
+
     def invalidate_session(self, session_id: str) -> None:
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM history_pages WHERE session_id=?", (session_id,))
             connection.execute(
                 "DELETE FROM history_turn_details WHERE session_id=?",
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM history_image_assets WHERE session_id=?",
                 (session_id,),
             )
 
