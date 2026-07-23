@@ -192,6 +192,144 @@ def test_materialized_turn_keeps_final_answer_and_defers_process_detail():
     },)
 
 
+def test_materialized_live_projection_keeps_commentary_tools_and_compaction():
+    events = [
+        {"type": "user_msg", "msg_id": "first-prompt", "prompt": "first"},
+        {"type": "assistant_msg_start", "message_id": "commentary-1",
+         "channel": "commentary"},
+        {"type": "delta", "message_id": "commentary-1",
+         "channel": "commentary", "text": "first progress"},
+        {"type": "assistant_msg_end", "message_id": "commentary-1",
+         "channel": "commentary"},
+        {"type": "tool_use", "message_id": "tool-message-1",
+         "tool_use_id": "tool-1", "tool": "exec_command",
+         "category": "command", "title": "运行命令",
+         "input": {"command": "secret large input"}},
+        {"type": "tool_result", "tool_use_id": "tool-1",
+         "content": "large output must stay deferred", "is_error": False,
+         "status": "succeeded", "summary": "命令完成"},
+        {"type": "turn_end",
+         "result": {"subtype": "steered", "duration_ms": 0,
+                    "is_error": False}},
+        {"type": "user_msg", "msg_id": "second-prompt", "prompt": "second"},
+        {"type": "assistant_msg_start", "message_id": "commentary-2",
+         "channel": "commentary"},
+        {"type": "delta", "message_id": "commentary-2",
+         "channel": "commentary", "text": "second progress"},
+        {"type": "assistant_msg_end", "message_id": "commentary-2",
+         "channel": "commentary"},
+        {"type": "process", "item_id": "compact-1", "kind": "compaction",
+         "phase": "end", "status": "succeeded", "title": "压缩上下文"},
+    ]
+
+    turns = materialize_history_turns(events, include_live_detail=True)
+
+    assert [(turn["prompt"], turn["done"]) for turn in turns] == [
+        ("first", True), ("second", False),
+    ]
+    assert turns[0]["blocks"] == [
+        {
+            "kind": "text", "message_id": "commentary-1",
+            "text": "first progress", "done": True,
+            "channel": "commentary",
+        },
+        {
+            "kind": "tool", "message_id": "tool-message-1",
+            "tool_use_id": "tool-1", "tool": "exec_command",
+            "input": {}, "category": "command", "title": "运行命令",
+            "parent_id": None, "server": None, "done": True,
+            "result": {
+                "content": "", "is_error": False,
+                "status": "succeeded", "summary": "命令完成",
+            },
+        },
+    ]
+    assert turns[1]["blocks"] == [
+        {
+            "kind": "text", "message_id": "commentary-2",
+            "text": "second progress", "done": True,
+            "channel": "commentary",
+        },
+        {
+            "kind": "process", "item_id": "compact-1",
+            "processKind": "compaction", "phase": "end",
+            "status": "succeeded", "turn_id": None,
+            "parent_id": None, "title": "压缩上下文",
+            "done": True,
+        },
+    ]
+    encoded = str(turns)
+    assert "secret large input" not in encoded
+    assert "large output must stay deferred" not in encoded
+
+
+def test_materialized_live_projection_bounds_long_tool_tail_but_keeps_status():
+    events = [
+        {"type": "user_msg", "msg_id": "prompt", "prompt": "work"},
+        {"type": "assistant_msg_start", "message_id": "commentary-first",
+         "channel": "commentary"},
+        {"type": "delta", "message_id": "commentary-first",
+         "channel": "commentary", "text": "starting"},
+        {"type": "assistant_msg_end", "message_id": "commentary-first",
+         "channel": "commentary"},
+    ]
+    for index in range(40):
+        events.extend([
+            {"type": "tool_use", "message_id": f"tool-message-{index}",
+             "tool_use_id": f"tool-{index}", "tool": "exec_command",
+             "input": {"command": "x" * 1000}},
+            {"type": "tool_result", "tool_use_id": f"tool-{index}",
+             "content": "y" * 1000, "is_error": False,
+             "status": "succeeded"},
+        ])
+    events.extend([
+        {"type": "process", "item_id": "compact-late",
+         "kind": "compaction", "phase": "end", "status": "succeeded",
+         "title": "压缩上下文"},
+        {"type": "assistant_msg_start", "message_id": "commentary-latest",
+         "channel": "commentary"},
+        {"type": "delta", "message_id": "commentary-latest",
+         "channel": "commentary", "text": "continuing after compact"},
+        {"type": "assistant_msg_end", "message_id": "commentary-latest",
+         "channel": "commentary"},
+    ])
+
+    turn = materialize_history_turns(
+        events, include_live_detail=True)[0]
+
+    assert len(turn["blocks"]) <= 24
+    assert any(block.get("text") == "starting" for block in turn["blocks"])
+    assert any(
+        block.get("text") == "continuing after compact"
+        for block in turn["blocks"]
+    )
+    assert any(
+        block.get("processKind") == "compaction"
+        for block in turn["blocks"]
+    )
+
+
+def test_materialized_assistant_only_turn_rejects_replay_time_after_terminal():
+    turns = materialize_history_turns([
+        # Codex history reconstructs process/text envelopes while parsing. Those
+        # synthetic events can carry the parse time rather than the rollout
+        # time, but they must never move an already-completed continuation past
+        # later user turns.
+        {"type": "process", "item_id": "turn-1", "ts": 100.0},
+        {"type": "assistant_msg_start", "message_id": "final-1",
+         "channel": "final", "ts": 100.0},
+        {"type": "delta", "message_id": "final-1", "channel": "final",
+         "text": "done", "ts": 100.0},
+        {"type": "turn_end", "turn_id": "turn-1", "ts": 50.0,
+         "result": {"subtype": "success", "duration_ms": 2000,
+                    "is_error": False}},
+    ])
+
+    assert turns[0]["prompt"] == ""
+    assert turns[0]["ts"] == 48_000
+    assert turns[0]["doneTs"] == 50_000
+
+
 def test_materialized_turn_bounds_initial_final_text_and_advertises_detail():
     huge = "x" * (300 * 1024)
     turns = materialize_history_turns([

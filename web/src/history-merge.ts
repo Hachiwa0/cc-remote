@@ -160,6 +160,38 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
   };
 }
 
+/** Merge previously-loaded heavyweight detail into a newer summary without
+ * allowing stale detail lifecycle fields to reopen a steered/completed turn. */
+export function mergeAuthoritativeTurnDetail(
+  summary: Turn,
+  detail: Turn,
+): Turn {
+  const merged = mergeTurn(summary, detail, false);
+  return {
+    ...merged,
+    id: summary.id,
+    done: summary.done,
+    doneTs: summary.doneTs,
+    durationMs: summary.durationMs,
+    interrupted: summary.interrupted,
+    error: summary.error,
+    progress: summary.progress,
+    detailEventCount: summary.detailEventCount,
+    detailLoaded: true,
+    detailLoading: false,
+  };
+}
+
+function chronologicalTurnTime(turn: Turn): number | undefined {
+  if (turn.prompt || turn.doneTs == null) return turn.ts;
+  const terminalStart = Math.max(0, turn.doneTs - (turn.durationMs ?? 0));
+  // Older caches and mixed-version wrappers may contain replay-generated
+  // assistant-only starts stamped after their authoritative terminal. Use the
+  // terminal-derived time for ordering without mutating the rendered payload.
+  if (turn.ts == null || turn.ts > turn.doneTs) return terminalStart;
+  return turn.ts;
+}
+
 /** Merge transcript history with cache/live state without deleting a just-finished
  * turn that hasn't flushed yet or duplicating the same prompt under engine ids. */
 export function mergeInitialHistory(
@@ -207,6 +239,10 @@ export function mergeInitialHistory(
     if (index >= 0) {
       const isOpenLiveTail = !!options.preserveLiveTailOpen
         && liveTurn === live[live.length - 1]
+        // A newer authoritative history turn proves this local placeholder is
+        // no longer the active tail (for example, same-task steering). Only the
+        // matching newest history row may inherit an unfinished live state.
+        && index === merged.length - 1
         && !liveTurn.done;
       merged[index] = mergeTurn(merged[index], liveTurn, isOpenLiveTail);
       used.add(index);
@@ -217,8 +253,10 @@ export function mergeInitialHistory(
 
   const rows = [...merged, ...unmatched].map((turn, order) => ({ turn, order }));
   rows.sort((a, b) => {
-    if (a.turn.ts != null && b.turn.ts != null && a.turn.ts !== b.turn.ts) {
-      return a.turn.ts - b.turn.ts;
+    const aTime = chronologicalTurnTime(a.turn);
+    const bTime = chronologicalTurnTime(b.turn);
+    if (aTime != null && bTime != null && aTime !== bTime) {
+      return aTime - bTime;
     }
     return a.order - b.order;
   });

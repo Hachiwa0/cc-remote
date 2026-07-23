@@ -9,6 +9,59 @@ import {
   type InlineImageAsset,
 } from "../inline-image-assets";
 
+const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
+  "git-stage": "Git 变更已暂存",
+  "git-commit": "Git 提交已创建",
+  "git-create-branch": "Git 分支已创建",
+  "git-push": "Git 分支已推送",
+  "git-create-pr": "Pull Request 已创建",
+  "created-thread": "Codex 任务已创建",
+};
+
+type MessagePart =
+  | { kind: "markdown"; text: string }
+  | { kind: "directive"; name: string; label: string };
+
+function splitCodexDirectives(text: string): MessagePart[] {
+  const parts: MessagePart[] = [];
+  let markdown = "";
+  let fence: "`" | "~" | null = null;
+  const lines = text.split("\n");
+  const flushMarkdown = () => {
+    if (!markdown) return;
+    parts.push({ kind: "markdown", text: markdown });
+    markdown = "";
+  };
+
+  lines.forEach((line, index) => {
+    const suffix = index < lines.length - 1 ? "\n" : "";
+    const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/);
+    if (!fence) {
+      const directive = line.match(
+        /^::(git-stage|git-commit|git-create-branch|git-push|git-create-pr|created-thread)\{[^\n]*\}\s*$/,
+      );
+      if (directive) {
+        flushMarkdown();
+        const name = directive[1];
+        parts.push({
+          kind: "directive",
+          name,
+          label: CODEX_DIRECTIVE_LABELS[name],
+        });
+        return;
+      }
+    }
+    markdown += line + suffix;
+    if (!fence && fenceMatch) {
+      fence = fenceMatch[1][0] as "`" | "~";
+    } else if (fence && fenceMatch?.[1][0] === fence) {
+      fence = null;
+    }
+  });
+  flushMarkdown();
+  return parts;
+}
+
 function nodeText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(nodeText).join("");
@@ -144,11 +197,19 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
         title="该链接无法在当前会话中打开">{children}</span>;
     },
   }), [imageAssets, onLoadImage, onOpenFile, onPreviewImage]);
+  const parts = useMemo(() => splitCodexDirectives(shown), [shown]);
 
   if (!shown) return null;
   return (
     <div className="prose">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>{shown}</ReactMarkdown>
+      {parts.map((part, index) => part.kind === "markdown"
+        ? <ReactMarkdown key={`markdown-${index}`} remarkPlugins={[remarkGfm]}
+            components={components}>{part.text}</ReactMarkdown>
+        : <div key={`directive-${index}`} className="codex-directive-status"
+            data-directive={part.name}>
+            <Icon name="verify" size={14} />
+            <span>{part.label}</span>
+          </div>)}
       {!done && <span className="cursor" />}
     </div>
   );

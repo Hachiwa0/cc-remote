@@ -196,6 +196,49 @@ def test_shared_code_distinguishes_private_app_turn_from_shared_cli(tmp_path):
     asyncio.run(go())
 
 
+def test_shared_context_attach_preserves_running_private_app_turn(tmp_path):
+    """Opening Remote mid-App turn must not manufacture an idle/writable state."""
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(_event("task_started", "app-turn"))
+        watch = _watch(path)
+        watch.update({
+            "external": True,
+            "desktop_active": True,
+            "active_external_turns": {"app-turn": 1000.0},
+        })
+        machine._watch["sid"] = watch
+
+        # The sidebar watcher discovered the native App turn before Remote
+        # focused the session. Focusing creates a shared-daemon context, but
+        # that new passive connection does not own or finish the App turn.
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        machine.sessions[ctx.key] = ctx
+        private = ProcessIdentity(109, 1009)
+
+        await machine._poll_codex_watch(
+            "sid",
+            watch,
+            set(),
+            1001.0,
+            writers={private},
+            private_holders={private},
+        )
+
+        assert watch["active_external_turns"] == {"app-turn": 1000.0}
+        assert watch["desktop_active"] is True
+        assert watch["external"] is True
+        assert ctx.control_mode == "desktop"
+        assert ctx.write_state == "read_only"
+        assert ctx.terminal_attached is True
+
+    asyncio.run(go())
+
+
 def test_shared_cli_user_message_refreshes_after_earlier_task_start(tmp_path):
     async def go() -> None:
         machine, _transport = _mk_machine()

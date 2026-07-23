@@ -24,7 +24,9 @@ import type { DiffLine, GitDiffSection } from "./diff";
 import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
 import { canEnqueueQuery, collectWaitingQueries, reduceTargetedRuntime } from "./runtime-drain";
-import { mergeInitialHistory } from "./history-merge";
+import {
+  mergeAuthoritativeTurnDetail, mergeInitialHistory,
+} from "./history-merge";
 import { boundRuntimeTurns, pruneRuntimeMap } from "./runtime-bounds";
 import { bumpSessionActivity, setSessionPinned } from "./session-order";
 import { presentCommandProblem, presentTurnProblem } from "./problem-presentation";
@@ -1402,7 +1404,17 @@ function reduceEvent(
         const loadedDetail = new Map(base.turns
           .filter((turn) => turn.detailLoaded)
           .map((turn) => [turn.id, turn]));
-        turns = turns.map((turn) => loadedDetail.get(turn.id) ?? turn);
+        turns = turns.map((turn) => {
+          const detail = loadedDetail.get(turn.id);
+          if (!detail) return turn;
+          const merged = mergeAuthoritativeTurnDetail(turn, detail);
+          if (turn.done) {
+            const status = turn.interrupted
+              ? "interrupted" : turn.error ? "failed" : "succeeded";
+            finishOpenBlocks(merged, status, status !== "succeeded");
+          }
+          return merged;
+        });
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);

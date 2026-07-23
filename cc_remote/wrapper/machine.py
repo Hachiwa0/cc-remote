@@ -491,6 +491,10 @@ class WrapperMachine:
         self._history_page_tasks: dict[
             tuple[str, str, int, str], asyncio.Task
         ] = {}
+        self._history_refresh_tasks: dict[
+            tuple[str, str, int, str], asyncio.Task
+        ] = {}
+        self._history_refresh_dirty: set[tuple[str, str, int, str]] = set()
         # Rebuildable local projection of already-translated transcript pages.
         # Raw transcripts remain authoritative; exact source fingerprints make
         # the derived SQLite row a safe fast path rather than another history.
@@ -1876,6 +1880,13 @@ class WrapperMachine:
             if page_tasks:
                 await asyncio.gather(*page_tasks, return_exceptions=True)
             self._history_page_tasks.clear()
+            refresh_tasks = list(self._history_refresh_tasks.values())
+            for task in refresh_tasks:
+                task.cancel()
+            if refresh_tasks:
+                await asyncio.gather(*refresh_tasks, return_exceptions=True)
+            self._history_refresh_tasks.clear()
+            self._history_refresh_dirty.clear()
             if self._codex_session_list_refresh_task is not None:
                 self._codex_session_list_refresh_task.cancel()
                 await asyncio.gather(
@@ -3269,7 +3280,7 @@ class WrapperMachine:
         # megabytes to every browser. Keep the same authoritative replacement
         # semantics with the lightweight projection; detail remains on demand.
         hist = await self._build_history(
-            sid, limit=self.MIRROR_LIMIT, detail="summary")
+            sid, limit=self.MIRROR_LIMIT, detail="summary", allow_stale=True)
         hist.sid = sid
         await self.transport.send(hist)
         return hist
@@ -3380,10 +3391,13 @@ class WrapperMachine:
         if shared_affinity and not w.get("shared_activity_initialized"):
             # Retire ownership debris produced by the old shared-daemon branch,
             # but preserve a genuine active tail seeded when this watch opened.
+            # Focusing a session while a private Codex App turn is already
+            # running creates this shared context mid-turn; that passive attach
+            # must not erase the App's authoritative task_started marker.
             seeded = set(w.get("seeded_external_turns", ()))
             active = w.setdefault("active_external_turns", {})
             for turn_id in list(active):
-                if turn_id not in seeded:
+                if turn_id not in seeded and not private_holders:
                     active.pop(turn_id, None)
             w.setdefault("pending_wrapper_turns", {}).clear()
             w["takeover_pending"] = None
@@ -3865,6 +3879,7 @@ class WrapperMachine:
     async def _build_history(
         self, sid: str, before=None, limit=None, cwd_hint=None,
         detail: str = "full",
+        *, allow_stale: bool = False,
     ) -> History:
         """Read a session's transcript and assemble ONE History frame. Shared by
         GetHistory (routed to the requester) and the watcher (broadcast on external
@@ -3898,36 +3913,19 @@ class WrapperMachine:
         source_path = None
         source_fingerprint = None
         indexed_page = None
+        stale_indexed_page = False
+        source_too_large = False
         source_window_has_more = False
         source_window_oldest_cursor = None
         source_window_boundary_offset = None
         try:
             source_path = await asyncio.to_thread(
                 codex_rollout_path if is_codex_hist else transcript_path, sid)
-            if (source_path and not is_codex_hist
-                    and await asyncio.to_thread(os.path.getsize, source_path)
-                    > self.cfg.history_source_max_bytes):
-                notice = Error(
-                    code=ERR_INTERNAL,
-                    message=("历史文件超过安全读取上限；请调大 "
-                             "HISTORY_SOURCE_MAX_BYTES 或在终端中查看"),
-                    sid=sid,
-                )
-                return History(
-                    session_id=sid,
-                    revision=revision,
-                    generation=self.instance_id,
-                    build_seq=build_seq,
-                    live_seq=live_seq,
-                    events=[notice.model_dump(mode="json")],
-                    has_more=False,
-                    before=before,
-                    external=self._is_external(sid),
-                    control=control,
-                    takeover_pending=bool(
-                        (self._watch.get(sid) or {}).get("takeover_pending")),
-                    in_progress=in_progress,
-                )
+            source_too_large = bool(
+                source_path and not is_codex_hist
+                and await asyncio.to_thread(os.path.getsize, source_path)
+                > self.cfg.history_source_max_bytes
+            )
         except OSError:
             source_path = None
         if source_path and self._history_index is not None:
@@ -3942,6 +3940,17 @@ class WrapperMachine:
                     before=before,
                     limit=int(limit) if isinstance(limit, int) else 0,
                 )
+                if (indexed_page is None and allow_stale
+                        and not is_codex_hist and before is None):
+                    indexed_page = await asyncio.to_thread(
+                        self._history_index.get_append_page,
+                        sid,
+                        "claude",
+                        source_fingerprint,
+                        before=None,
+                        limit=int(limit) if isinstance(limit, int) else 0,
+                    )
+                    stale_indexed_page = indexed_page is not None
             except OSError:
                 source_fingerprint = None
             except Exception as exc:
@@ -3991,6 +4000,7 @@ class WrapperMachine:
                 "history index hit", session_id=sid,
                 events=len(cached_events), before=bool(before), limit=limit,
                 source_bytes=source_fingerprint.size,
+                stale=stale_indexed_page,
             )
             cached_history = History(
                 session_id=sid,
@@ -4019,7 +4029,37 @@ class WrapperMachine:
                     row for row in cached_events
                     if row.get("type") in {"model", "effort"}
                 ]
+            if stale_indexed_page and not source_too_large:
+                self._schedule_history_refresh(
+                    sid,
+                    before=before,
+                    limit=limit,
+                    cwd=cwd_hint,
+                    detail=detail,
+                )
             return cached_history
+        if source_too_large:
+            notice = Error(
+                code=ERR_INTERNAL,
+                message=("历史文件超过安全读取上限；请调大 "
+                         "HISTORY_SOURCE_MAX_BYTES 或在终端中查看"),
+                sid=sid,
+            )
+            return History(
+                session_id=sid,
+                revision=revision,
+                generation=self.instance_id,
+                build_seq=build_seq,
+                live_seq=live_seq,
+                events=[notice.model_dump(mode="json")],
+                has_more=False,
+                before=before,
+                external=self._is_external(sid),
+                control=control,
+                takeover_pending=bool(
+                    (self._watch.get(sid) or {}).get("takeover_pending")),
+                in_progress=in_progress,
+            )
         history_error = None
         if is_codex_hist:
             # Codex history lives in ~/.codex/sessions rollout files, not the
@@ -4318,7 +4358,11 @@ class WrapperMachine:
             has_more=history.has_more,
             oldest_id=history.oldest_id,
             newest_id=history.newest_id,
-            turns=materialize_history_turns(history.events),
+            turns=materialize_history_turns(
+                history.events,
+                include_live_detail=bool(
+                    is_codex_hist and in_progress and before is None),
+            ),
         )
         if source_fingerprint is not None and self._history_index is not None:
             if (indexed_page is not None
@@ -4364,6 +4408,67 @@ class WrapperMachine:
             ]
         return history
 
+    def _schedule_history_refresh(
+        self,
+        sid: str,
+        *,
+        before: str | None,
+        limit: int | None,
+        cwd: str | None,
+        detail: str,
+    ) -> None:
+        """Refresh one append-stale Claude page without delaying first paint."""
+        key = (sid, before or "", limit or 0, f"{cwd or ''}\0{detail}")
+        current = self._history_refresh_tasks.get(key)
+        if current is not None and not current.done():
+            self._history_refresh_dirty.add(key)
+            return
+
+        async def refresh() -> None:
+            try:
+                while True:
+                    self._history_refresh_dirty.discard(key)
+                    history = await self._build_history(
+                        sid,
+                        before=before,
+                        limit=limit,
+                        cwd_hint=cwd,
+                        detail=detail,
+                        allow_stale=False,
+                    )
+                    if history.authoritative is not False:
+                        history.sid = sid
+                        await self.transport.send(history)
+                        log.info(
+                            "stale Claude history refreshed",
+                            session_id=sid,
+                            turns=len(history.turns),
+                            before=bool(before),
+                        )
+                    # Coalesce every append observed during the scan into one
+                    # final exact rebuild. This converges at turn completion
+                    # without launching one full Claude parse per tool delta.
+                    if key not in self._history_refresh_dirty:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "stale Claude history refresh failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+
+        task = asyncio.create_task(refresh())
+        self._history_refresh_tasks[key] = task
+
+        def forget(done: asyncio.Task) -> None:
+            if self._history_refresh_tasks.get(key) is done:
+                self._history_refresh_tasks.pop(key, None)
+            self._history_refresh_dirty.discard(key)
+
+        task.add_done_callback(forget)
+
     async def _build_requested_history(
         self,
         sid: str,
@@ -4380,7 +4485,8 @@ class WrapperMachine:
         # first paint. The watch loop and switch/query safety paths refresh
         # SessionControl separately; history uses the last known control value.
         return await self._build_history(
-            sid, before=before, limit=limit, cwd_hint=cwd, detail=detail)
+            sid, before=before, limit=limit, cwd_hint=cwd, detail=detail,
+            allow_stale=True)
 
     async def _history_page_singleflight(self, cmd, sid: str) -> History:
         before = getattr(cmd, "before", None)

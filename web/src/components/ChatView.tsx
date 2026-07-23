@@ -490,6 +490,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
             const activeProcess = hasActiveProcess(t.blocks);
             const finalBlocks = finalTextBlocks(t.blocks);
             const working = !t.done || activeProcess;
+            const showProcessTimeline = t.blocks.length > 0
+              || (!!t.detailEventCount && !t.detailLoaded);
             const workingLabel = t.progress
               ?? (activeProcess ? "处理中"
                 : finalBlocks.length > 0 ? "回答中" : "思考中");
@@ -544,16 +546,18 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                 </div>
               </div>
             )}
-            {t.blocks.length > 0 ? (
+            {showProcessTimeline && (
+              <ProcessTimeline blocks={t.blocks} done={t.done} engine={engine}
+                durationMs={t.durationMs} startTs={t.ts}
+                deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
+                detailLoading={t.detailLoading}
+                onLoadDetail={onLoadDetail ? () => onLoadDetail(t.id) : undefined}
+                onOpenFile={onOpenFile} imageAssets={imageAssets}
+                onLoadImage={onLoadImage}
+                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
+            )}
+            {t.blocks.length > 0 && (
               <>
-                <ProcessTimeline blocks={t.blocks} done={t.done} engine={engine}
-                  durationMs={t.durationMs} startTs={t.ts}
-                  deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
-                  detailLoading={t.detailLoading}
-                  onLoadDetail={onLoadDetail ? () => onLoadDetail(t.id) : undefined}
-                  onOpenFile={onOpenFile} imageAssets={imageAssets}
-                  onLoadImage={onLoadImage}
-                  onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
                 {finalBlocks.map((block) => (
                   <MessageBlock key={block.message_id} text={block.text}
                     done={block.done} onOpenFile={onOpenFile}
@@ -585,16 +589,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                   </>
                 )}
               </>
-            ) : (!!t.detailEventCount && !t.detailLoaded) ? (
-              <ProcessTimeline blocks={[]} done={t.done} engine={engine}
-                durationMs={t.durationMs} startTs={t.ts}
-                deferredCount={t.detailEventCount}
-                detailLoading={t.detailLoading}
-                onLoadDetail={onLoadDetail ? () => onLoadDetail(t.id) : undefined}
-                onOpenFile={onOpenFile} imageAssets={imageAssets}
-                onLoadImage={onLoadImage}
-                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
-            ) : null}
+            )}
               {working && (
                 <div className="turn-working" role="status" aria-live="polite">
                   <ClaudeWorking size={24} />

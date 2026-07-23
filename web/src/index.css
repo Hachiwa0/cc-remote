@@ -354,6 +354,11 @@ body{
   padding:7px 9px; border:1px solid var(--border); border-radius:8px; font-size:12px; }
 .message-image-loading{ color:var(--dim); background:var(--raised); }
 .message-image-error{ color:var(--danger); background:var(--danger-weak); }
+.codex-directive-status{ display:flex; align-items:center; gap:7px; width:max-content;
+  max-width:100%; margin:7px 0; padding:5px 9px; border:1px solid var(--border);
+  border-radius:8px; color:var(--dim); background:var(--raised); font-size:12.5px;
+  line-height:1.35; }
+.codex-directive-status svg{ flex:0 0 auto; color:var(--ok); }
 .prose table{ display:table; width:100%; border-collapse:collapse; margin:10px 0; font-size:13.5px; }
 .prose th,.prose td{ border:1px solid var(--border); padding:6px 10px; text-align:left; word-break:break-word; }
 .prose th{ background:var(--raised); font-weight:600; }

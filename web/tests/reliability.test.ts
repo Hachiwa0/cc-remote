@@ -825,6 +825,29 @@ assert.equal(assistantOnlyMerged.length, 1);
 assert.equal(assistantOnlyMerged[0].id, "goal-turn-1");
 assert.equal(assistantOnlyMerged[0].blocks.filter((block) => block.kind === "text").length, 1);
 
+// A bounded head refresh merges against rows retained from earlier pages.
+// Replayed assistant-only continuations can come from legacy/cache projections
+// whose synthetic start time is newer than their authoritative terminal time.
+// That impossible timestamp must not append old history after the active tail.
+const impossibleReplayTime = {
+  id: "old-assistant-only", prompt: "", done: true,
+  ts: 20_000, doneTs: 8_000, durationMs: 1_000, blocks: [],
+};
+const currentHistoryTurn = {
+  id: "current-history", prompt: "current", done: true,
+  ts: 10_000, doneTs: 11_000, blocks: [],
+};
+const currentLiveTurn = {
+  ...currentHistoryTurn, done: false, doneTs: undefined,
+};
+assert.deepEqual(mergeInitialHistory(
+  [currentHistoryTurn],
+  [impossibleReplayTime, currentLiveTurn],
+  { preserveLiveTailOpen: true },
+).map((turn) => turn.id), [
+  "old-assistant-only", "current-history",
+]);
+
 // Exercise the real reducer through Vite's zero-network SSR loader. The plain
 // Node test output cannot import reducer.js directly because the browser build
 // intentionally uses extensionless module specifiers.
@@ -1625,6 +1648,125 @@ try {
   }) });
   assert.equal(mirroredState.runtimes[mirroredSid].state, "idle");
   assert.equal(mirroredState.runtimes[mirroredSid].mirroredRunning, false);
+
+  // A native Codex task can accept another user message while still running.
+  // The next authoritative head must close the old placeholder as `steered`
+  // and leave exactly the latest prompt open instead of stacking "thinking".
+  const steeredSid = "external-steering-replaces-thinking";
+  let steeredState = {
+    ...initialState, focusedSid: steeredSid,
+    runtimes: { [steeredSid]: createRuntime() },
+  };
+  steeredState = reduce(steeredState, { type: "event", event: event({
+    type: "history", sid: steeredSid, session_id: steeredSid,
+    revision: "steered-rev", build_seq: 1,
+    external: true, in_progress: true, has_more: true,
+    events: [event({ type: "user_msg", sid: steeredSid,
+      msg_id: "first-prompt", prompt: "first" })],
+  }) });
+  steeredState = reduce(steeredState, { type: "event", event: event({
+    type: "history", sid: steeredSid, session_id: steeredSid,
+    revision: "steered-rev", build_seq: 2,
+    external: true, in_progress: true, has_more: true,
+    events: [
+      event({ type: "user_msg", sid: steeredSid,
+        msg_id: "first-prompt", prompt: "first" }),
+      event({ type: "turn_end", sid: steeredSid,
+        result: { subtype: "steered", duration_ms: 0, is_error: false } }),
+      event({ type: "user_msg", sid: steeredSid,
+        msg_id: "second-prompt", prompt: "second" }),
+    ],
+  }) });
+  assert.deepEqual(steeredState.runtimes[steeredSid].turns.map(
+    (turn: { prompt: string; done: boolean }) => [turn.prompt, turn.done]), [
+      ["first", true], ["second", false],
+    ]);
+
+  // Expanding detail before a native steer must not pin the old lifecycle.
+  // The next summary is authoritative for done/error/timestamps, while its
+  // lightweight commentary/compaction blocks merge with already-loaded detail.
+  const detailedSteerSid = "external-steering-after-detail";
+  let detailedSteerState = {
+    ...initialState, focusedSid: detailedSteerSid,
+    runtimes: { [detailedSteerSid]: createRuntime() },
+  };
+  detailedSteerState = reduce(detailedSteerState, {
+    type: "event", event: event({
+      type: "history", sid: detailedSteerSid,
+      session_id: detailedSteerSid, revision: "detail-steer-rev",
+      build_seq: 1, detail: "summary", external: true, in_progress: true,
+      has_more: true, events: [], turns: [{
+        id: "first-prompt", prompt: "first", done: false,
+        detailEventCount: 2, detailLoaded: false, blocks: [],
+      }],
+    }),
+  });
+  detailedSteerState = reduce(detailedSteerState, {
+    type: "event", event: event({
+      type: "turn_detail", sid: detailedSteerSid,
+      session_id: detailedSteerSid, revision: "detail-steer-rev",
+      turn_id: "first-prompt", authoritative: true, events: [
+        event({ type: "user_msg", sid: detailedSteerSid,
+          msg_id: "first-prompt", prompt: "first" }),
+        event({ type: "assistant_msg_start", sid: detailedSteerSid,
+          message_id: "commentary-first", channel: "commentary" }),
+        event({ type: "delta", sid: detailedSteerSid,
+          message_id: "commentary-first", channel: "commentary",
+          text: "first progress" }),
+        event({ type: "assistant_msg_end", sid: detailedSteerSid,
+          message_id: "commentary-first", channel: "commentary" }),
+        event({ type: "tool_use", sid: detailedSteerSid,
+          message_id: "tool-message", tool_use_id: "tool-open",
+          tool: "exec_command", input: {} }),
+      ],
+    }),
+  });
+  detailedSteerState = reduce(detailedSteerState, {
+    type: "event", event: event({
+      type: "history", sid: detailedSteerSid,
+      session_id: detailedSteerSid, revision: "detail-steer-rev",
+      build_seq: 2, detail: "summary", external: true, in_progress: true,
+      has_more: true, events: [], turns: [
+        {
+          id: "first-prompt", prompt: "first", done: true,
+          doneTs: 2_000, durationMs: 0,
+          detailEventCount: 2, detailLoaded: false, blocks: [{
+            kind: "text", message_id: "commentary-first",
+            text: "first progress", done: true, channel: "commentary",
+          }],
+        },
+        {
+          id: "second-prompt", prompt: "second", done: false,
+          detailEventCount: 2, detailLoaded: false, blocks: [
+            {
+              kind: "text", message_id: "commentary-second",
+              text: "second progress", done: true, channel: "commentary",
+            },
+            {
+              kind: "process", item_id: "compact-second",
+              processKind: "compaction", phase: "end",
+              status: "succeeded", title: "压缩上下文", done: true,
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  const detailedSteerTurns = detailedSteerState.runtimes[
+    detailedSteerSid
+  ].turns;
+  assert.deepEqual(detailedSteerTurns.map(
+    (turn: { prompt: string; done: boolean }) => [turn.prompt, turn.done]), [
+      ["first", true], ["second", false],
+    ]);
+  assert.equal(detailedSteerTurns[0].blocks.some(
+    (block: { done: boolean }) => !block.done), false);
+  assert.equal(detailedSteerTurns[1].blocks.some(
+    (block: { kind: string; text?: string }) =>
+      block.kind === "text" && block.text === "second progress"), true);
+  assert.equal(detailedSteerTurns[1].blocks.some(
+    (block: { kind: string; processKind?: string }) =>
+      block.kind === "process" && block.processKind === "compaction"), true);
 
   const fallbackHistory = reduce({
     ...liveHistory,

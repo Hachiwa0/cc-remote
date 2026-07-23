@@ -21,6 +21,7 @@ from cc_remote.protocol import (
     ProcessEvent, TurnPlan, TurnDiff, TurnEnd, TurnResult, UserMsg, Error,
     StateEvent, ERR_CC_CRASH,
 )
+from cc_remote.wrapper.codex_external import visible_codex_user_message
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
 
 _TOOL_TYPES = {
@@ -228,8 +229,7 @@ def _history_user_cursor(
     if (row.get("type") != "event_msg" or not isinstance(payload, dict)
             or payload.get("type") != "user_message"):
         return None
-    message = payload.get("message") or ""
-    if not message or str(message).lstrip().startswith("<"):
+    if not visible_codex_user_message(payload.get("message")):
         return None
     turn_id = payload.get("turn_id")
     if (prefer_turn_id and isinstance(turn_id, str)
@@ -466,9 +466,8 @@ def codex_history_boundary_user(
                 continue
             if row_type != "event_msg" or payload_type != "user_message":
                 continue
-            prompt = payload.get("message") or ""
-            if not isinstance(prompt, str) or not prompt \
-                    or prompt.lstrip().startswith("<"):
+            prompt = visible_codex_user_message(payload.get("message"))
+            if not prompt:
                 return None
             event = UserMsg(msg_id=cursor, prompt=prompt)
             if pending_images:
@@ -2163,8 +2162,8 @@ def codex_translate_history(
                     pending_turn_id = next_turn_id
                 task_has_user = False
             elif t == "event_msg" and payload_type == "user_message":
-                msg = p.get("message") or ""
-                if msg and not msg.lstrip().startswith("<"):
+                msg = visible_codex_user_message(p.get("message"))
+                if msg:
                     next_turn_id = p.get("turn_id") or pending_turn_id
                     if turn_open:
                         # Codex accepts another user message while the same

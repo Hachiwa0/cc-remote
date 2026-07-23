@@ -684,8 +684,7 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
         kind = payload.get("type")
         if kind == "user_message":
             message = payload.get("message")
-            if (isinstance(message, str) and message
-                    and not message.lstrip().startswith("<")):
+            if visible_codex_user_message(message):
                 has_visible_user_message = True
         turn_id = payload.get("turn_id")
         if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
@@ -700,3 +699,37 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
         frozenset(started), frozenset(finished), carry, tuple(ordered),
         has_visible_user_message,
     )
+
+
+_CODEX_REQUEST_MARKER = "## My request for Codex:"
+_INTERNAL_CODEX_USER_PREFIXES = (
+    "<app-context",
+    "<collaboration_mode",
+    "<environment_context",
+    "<in-app-browser-context",
+    "<permissions",
+    "<turn_aborted",
+)
+
+
+def visible_codex_user_message(message: object) -> str | None:
+    """Return the human prompt from a Codex App ``user_message`` record.
+
+    Desktop can prepend ambient UI state and attachment metadata before the
+    explicit request marker.  Treating every XML-looking row as internal drops
+    the real prompt as well, which leaves interrupted turns with no user anchor.
+    Unknown XML remains visible: a user is allowed to ask about literal markup.
+    """
+    if not isinstance(message, str):
+        return None
+    text = message.strip()
+    if not text:
+        return None
+    marker = text.rfind(_CODEX_REQUEST_MARKER)
+    if marker >= 0:
+        request = text[marker + len(_CODEX_REQUEST_MARKER):].strip()
+        return request or None
+    lowered = text.lower()
+    if lowered.startswith(_INTERNAL_CODEX_USER_PREFIXES):
+        return None
+    return text

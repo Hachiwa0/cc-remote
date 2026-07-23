@@ -995,6 +995,42 @@ def test_codex_history_preserves_steered_user_message_image_and_page_boundary(
     assert older_more is False
 
 
+def test_codex_history_keeps_ambient_wrapped_prompt_when_turn_is_aborted(
+        tmp_path):
+    rollout = tmp_path / "rollout-ambient-abort.jsonl"
+    prompt = """
+<in-app-browser-context source="ambient-ui-state">
+# In app browser:
+- Current URL: http://localhost:4173/
+</in-app-browser-context>
+
+## My request for Codex:
+开始研究
+"""
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-ambient"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-aborted"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": prompt}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "turn_aborted", "turn_id": "turn-aborted",
+                     "reason": "interrupted", "duration_ms": 2}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 8_000)
+
+    users = [event for event in events if event.type == "user_msg"]
+    terminals = [event for event in events if isinstance(event, TurnEnd)]
+    assert [event.prompt for event in users] == ["开始研究"]
+    assert [event.result.subtype for event in terminals] == [
+        "error_during_execution"
+    ]
+    assert terminals[0].turn_id == "turn-aborted"
+
+
 def test_codex_history_content_only_add_has_paths_and_diff(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rows = [

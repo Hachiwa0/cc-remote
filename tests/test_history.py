@@ -486,6 +486,188 @@ def test_history_build_materializes_source_bound_shadow_page(
     asyncio.run(go())
 
 
+def test_running_codex_summary_keeps_bounded_live_projection(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "rollout-live-summary.jsonl"
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-live"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-live"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "inspect"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "commentary",
+                     "message": "working now"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+    ]))
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-live", "session-live")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_history(
+            "session-live", limit=4, detail="summary")
+
+        assert history.detail == "summary"
+        assert len(history.turns) == 1
+        blocks = history.turns[0].blocks
+        assert any(
+            block.get("kind") == "text"
+            and block.get("channel") == "commentary"
+            and block.get("text") == "working now"
+            for block in blocks
+        )
+        assert any(
+            block.get("kind") == "process"
+            and block.get("processKind") == "compaction"
+            for block in blocks
+        )
+        assert all(row["type"] in {"model", "effort"}
+                   for row in history.events)
+
+    asyncio.run(go())
+
+
+def test_history_index_reuses_only_verified_append_prefix(tmp_path):
+    transcript = tmp_path / "claude.jsonl"
+    transcript.write_bytes(b'{"type":"user","value":"old"}\n')
+    store = HistoryIndexStore(tmp_path / "state-append")
+    old_source = HistorySourceFingerprint.capture(transcript)
+    page = MaterializedHistoryPage(
+        events=({"type": "user_msg", "msg_id": "old", "prompt": "old"},),
+        has_more=False,
+        oldest_id="old",
+        newest_id="old",
+        turns=(),
+    )
+    store.put_page(
+        "session-append", "claude", old_source,
+        before=None, limit=4, page=page,
+    )
+
+    with transcript.open("ab") as stream:
+        stream.write(b'{"type":"assistant","value":"new"}\n')
+    appended = HistorySourceFingerprint.capture(transcript)
+    reused = store.get_append_page(
+        "session-append", "claude", appended, before=None, limit=4)
+    assert reused is not None and reused.newest_id == "old"
+
+    # Same path/inode and a larger size are insufficient: an in-place rewrite
+    # is a destructive source change, not a safe stale-while-revalidate prefix.
+    transcript.write_bytes(
+        b'{"type":"user","value":"rewritten"}\n'
+        b'{"type":"assistant","value":"more"}\n')
+    rewritten = HistorySourceFingerprint.capture(transcript)
+    assert store.get_append_page(
+        "session-append", "claude", rewritten, before=None, limit=4,
+    ) is None
+
+
+def test_claude_history_append_paints_cached_page_before_revalidation(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "claude.jsonl"
+    transcript.write_bytes(b'{"type":"user","value":"old"}\n')
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        mm,
+        "get_session_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("append-stale first paint performed a full scan")),
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-fast")
+        ctx = _mk_ctx("claude-fast", "claude-fast")
+        ctx.engine = "claude"
+        machine.sessions[ctx.key] = ctx
+        old_source = HistorySourceFingerprint.capture(transcript)
+        events = (
+            {"type": "user_msg", "sid": "claude-fast",
+             "msg_id": "old", "prompt": "old"},
+            {"type": "turn_end", "sid": "claude-fast",
+             "result": {"subtype": "success", "duration_ms": 1,
+                        "is_error": False}},
+        )
+        page = MaterializedHistoryPage(
+            events=events,
+            has_more=False,
+            oldest_id="old",
+            newest_id="old",
+            turns=materialize_history_turns(events),
+        )
+        machine._history_index.put_page(
+            "claude-fast", "claude", old_source,
+            before=None, limit=4, page=page,
+        )
+        with transcript.open("ab") as stream:
+            stream.write(b'{"type":"assistant","value":"new"}\n')
+        refreshes = []
+        monkeypatch.setattr(
+            machine,
+            "_schedule_history_refresh",
+            lambda sid, **kwargs: refreshes.append((sid, kwargs)),
+        )
+
+        history = await machine._build_requested_history(
+            "claude-fast", before=None, limit=4, cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert [turn.prompt for turn in history.turns] == ["old"]
+        assert refreshes and refreshes[0][0] == "claude-fast"
+
+    asyncio.run(go())
+
+
+def test_claude_history_refresh_coalesces_appends_during_full_scan(monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        builds = 0
+
+        async def build(sid, **_kwargs):
+            nonlocal builds
+            builds += 1
+            if builds == 1:
+                entered.set()
+                await release.wait()
+            return History(
+                session_id=sid,
+                revision="refresh-rev",
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=False,
+            )
+
+        monkeypatch.setattr(machine, "_build_history", build)
+        args = {
+            "before": None, "limit": 4, "cwd": "/repo", "detail": "summary",
+        }
+        machine._schedule_history_refresh("claude-refresh", **args)
+        await entered.wait()
+        machine._schedule_history_refresh("claude-refresh", **args)
+        machine._schedule_history_refresh("claude-refresh", **args)
+        release.set()
+        await asyncio.gather(*list(machine._history_refresh_tasks.values()))
+
+        assert builds == 2
+        assert len([row for row in transport.sent
+                    if isinstance(row, History)]) == 2
+
+    asyncio.run(go())
+
+
 def test_external_codex_turn_is_history_activity_not_resident_state(monkeypatch):
     """A mirrored native turn marks History active without owning Stop."""
     monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: None)

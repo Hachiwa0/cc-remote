@@ -131,6 +131,20 @@ try {
   assert.match(codeCopyMarkup, /aria-label="复制代码"/,
     "fenced commands need a local copy action without scrolling to turn end");
   assert.match(codeCopyMarkup, /echo ready/);
+  const codexDirectiveMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "提交完成。\n\n::git-commit{cwd=\"/tmp/private-project\"}",
+    done: true,
+  }));
+  assert.match(codexDirectiveMarkup, /Git 提交已创建/,
+    "Codex App git directives need a native status instead of leaking wire text");
+  assert.doesNotMatch(codexDirectiveMarkup, /::git-commit|private-project/,
+    "directive attributes are local UI metadata and must not render as prose");
+  const fencedDirectiveMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "```text\n::git-commit{cwd=\"/tmp/example\"}\n```",
+    done: true,
+  }));
+  assert.match(fencedDirectiveMarkup, /::git-commit/,
+    "a directive-shaped line inside a code fence remains literal code");
   const localQrMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "![飞书授权二维码](/Volumes/MuggleSSD/workspace/project/tmp-auth.png)",
     done: true,

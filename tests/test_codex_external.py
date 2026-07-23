@@ -534,9 +534,17 @@ def test_turn_marker_parser_reports_visible_user_message_without_turn_id():
         "type": "event_msg",
         "payload": {"type": "user_message", "message": "<environment_context>"},
     }) + "\n").encode()
+    ambient_request = (json.dumps({
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": (
+            "<in-app-browser-context>ambient</in-app-browser-context>\n\n"
+            "## My request for Codex:\n继续修复"
+        )},
+    }) + "\n").encode()
 
     assert parse_turn_markers(visible).has_visible_user_message is True
     assert parse_turn_markers(envelope).has_visible_user_message is False
+    assert parse_turn_markers(ambient_request).has_visible_user_message is True
 
 
 def test_codex_own_delayed_flush_does_not_mirror_or_lock(tmp_path):
