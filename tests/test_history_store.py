@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
@@ -80,6 +81,46 @@ def test_turn_detail_survives_append_but_not_destructive_invalidation(tmp_path):
     store.invalidate_session("session-1")
     assert store.get_turn_detail(
         "session-1", "codex", changed, "message-1") is None
+
+
+def test_turn_detail_recovers_from_retained_page_after_detail_lru_eviction(
+    tmp_path,
+):
+    source_path = tmp_path / "rollout.jsonl"
+    source_path.write_text('{"type":"first"}\n')
+    source = HistorySourceFingerprint.capture(source_path)
+    store = HistoryIndexStore(tmp_path / "state")
+    events = (
+        {"type": "user_msg", "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "tool_use", "tool_use_id": "tool-1", "tool": "Read",
+         "input": {"file_path": "/tmp/example"}},
+        {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok",
+         "is_error": False},
+        {"type": "turn_end", "turn_id": "turn-1",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    )
+    page = MaterializedHistoryPage(
+        events=events, has_more=False,
+        oldest_id="message-1", newest_id="message-1",
+        turns=materialize_history_turns(events),
+    )
+    assert store.put_page(
+        "session-1", "codex", source, before=None, limit=4, page=page)
+
+    # Detail rows have a tighter independent LRU than retained pages.  A summary
+    # must not advertise an expandable turn that can no longer be recovered
+    # while the containing canonical page is still present.
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "DELETE FROM history_turn_details WHERE session_id=?",
+            ("session-1",),
+        )
+
+    assert store.get_page(
+        "session-1", "codex", source, before=None, limit=4) == page
+    assert store.get_turn_detail(
+        "session-1", "codex", source, "message-1") == events
 
 
 def test_history_index_separates_cursor_limit_engine_and_session(tmp_path):

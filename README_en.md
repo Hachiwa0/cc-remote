@@ -1,13 +1,16 @@
 # cc-remote
 
-<p align="center"><strong>Bring Claude Code / Codex on your machine to your phone and any browser.</strong></p>
-<p align="center">Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web</p>
-<p align="center">
-  <a href="README.md">中文</a> ·
-  <a href="#quick-start-local-one-machine-5-min">5-minute quick start</a> ·
-  <a href="#production-deploy-public-vps-relay--wrapper-on-your-machine">Production deploy</a> ·
-  <a href="#security-please-read">Security</a>
-</p>
+**Bring Claude Code / Codex on your machine to your phone and any browser.**
+
+Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web
+
+**Current release: v3.0.0** · Wire protocol v19
+
+[中文](README.md) ·
+[5-minute quick start](#quick-start-local-one-machine-5-min) ·
+[Production deploy](#production-deploy-public-vps-relay--wrapper-on-your-machine) ·
+[Security](#security-please-read) ·
+[Changelog](CHANGELOG.md)
 
 cc-remote is an open-source remote control plane. A local `wrapper` drives the
 already installed and authenticated `claude` / `codex` CLI, while browsers view
@@ -15,14 +18,19 @@ and control its sessions through your self-hosted WebSocket relay. Models,
 authentication, and tool execution remain under the local CLI; cc-remote does
 not proxy model APIs or bake API keys into the web client.
 
-<p align="center">
-  <img src="assets/readme-claude-multisession.jpg" alt="cc-remote Claude sessions and multi-session workspace" width="960">
-</p>
+v3.0.0 is not a visual rebrand. It keeps the existing two-engine, Code / Work,
+multi-session, and remote-control capabilities while redesigning history
+projection, native-client coordination, multi-device routing, and release
+boundaries. The work targets real failures seen with very long sessions, stale
+App/CLI state, mobile history jumps, and cross-machine leakage.
+
+![cc-remote Claude sessions and multi-session workspace](assets/readme-claude-multisession.jpg)
 
 ---
 
 ## Table of contents
 
+- [What changed in v3](#what-changed-in-v3)
 - [Core capabilities](#core-capabilities)
 - [Architecture](#architecture)
 - [Real interface and practical features](#real-interface-and-practical-features)
@@ -38,6 +46,30 @@ not proxy model APIs or bake API keys into the web client.
 - [License](#license)
 
 ---
+
+## What changed in v3
+
+v3 advances cc-remote from “control a CLI in a browser” into a local-first,
+recoverable control plane that can safely connect multiple machines. Compared
+with the previous public release, the major changes are:
+
+| Area | v3.0.0 |
+|---|---|
+| **History startup and very long sessions** | The browser first paints its last validated IndexedDB projection. A source-fingerprinted SQLite index on the wrapper serves recent turn summaries first, while tool output, reasoning, process logs, and oversized text load per turn. Short sessions no longer wait for a full source scan; long sessions page backward without losing the reader's viewport. |
+| **Large Codex rollouts** | Codex history is read backward by turn while preserving app-server-native resume and compaction state; cc-remote never re-uploads the entire rollout to the model. A tightly guarded official HTTP compatibility path is used only for a specific oversized Codex Desktop + OpenAI resume case. |
+| **Native App / CLI coordination** | Claude CLI/Desktop/Agent View and Codex shared daemon/App/CLI retain engine-specific ownership models. v3 reconciles running, read-only, interrupt, steer, compact, turn binding, and terminal state so sibling sessions do not lock each other, old turns do not move to the tail, and interrupted work does not leave ghost activity. |
+| **Multi-device isolation** | Device Center adds single-use pairing, independently revocable machine credentials, and presence. The relay routes only an account's allowed `machine_id` values. Device, Code / Work, engine, connection generation, and session ownership are isolated so delayed frames cannot mutate the active view. |
+| **Mobile and artifact UX** | Loading older history preserves the scroll anchor. Images load on demand and support a lightbox, tap-to-close, and pinch zoom. Markdown, source, HTML, PDF, and Office previews remain within the local security boundary. PWA icons, narrow-screen sheets, error presentation, and process timelines are also aligned. |
+| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v19. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
+
+> **The trust boundary has not changed:** model accounts, API keys, session
+> sources, and tool execution stay on the wrapper machine. The VPS relay stores
+> no conversations or artifacts. Browsing history reads only local transcripts,
+> rollouts, and rebuildable projections; it never resumes an engine or creates a
+> model turn.
+
+See [CHANGELOG.md](CHANGELOG.md) for the complete release notes and upgrade
+requirements.
 
 ## Core capabilities
 
@@ -146,9 +178,7 @@ still working in the background, then return to its complete live progress.
 Claude Code and Codex share the same workspace while retaining independent
 context, models, permissions, and runtime state.
 
-<p align="center">
-  <img src="assets/readme-multi-session.jpg" alt="Multi-session workspace grouped by project with search and switching" width="960">
-</p>
+![Multi-session workspace grouped by project with search and switching](assets/readme-multi-session.jpg)
 
 ### Claude Code: see reasoning, tool calls, and Hooks
 
@@ -158,9 +188,7 @@ events exposed by the Claude Code SDK and presents them as a collapsible timelin
 The composer also shows the session's current model, reasoning effort, permission
 mode, and context usage.
 
-<p align="center">
-  <img src="assets/readme-claude-session.jpg" alt="Claude Code reasoning, command calls, and Hook events" width="960">
-</p>
+![Claude Code reasoning, command calls, and Hook events](assets/readme-claude-session.jpg)
 
 ### New sessions: choose the engine and working directory first
 
@@ -169,9 +197,7 @@ working directory, and attach images or files to the first message. Once the
 session exists, adjust its model, permissions, or Plan mode only when needed
 instead of filling in a row of defaults up front.
 
-<p align="center">
-  <img src="assets/readme-new-session.jpg" alt="Create a new session by choosing its engine and working directory" width="960">
-</p>
+![Create a new session by choosing its engine and working directory](assets/readme-new-session.jpg)
 
 ### Codex: preserve plans and the complete process
 
@@ -181,9 +207,7 @@ timeline. Expand it while a turn is running to follow the details, then collapse
 the completed work into a concise summary; the final response always remains
 separate.
 
-<p align="center">
-  <img src="assets/readme-process-timeline.jpg" alt="Collapsible Codex plan, Hook, and tool-call timeline" width="960">
-</p>
+![Collapsible Codex plan, Hook, and tool-call timeline](assets/readme-process-timeline.jpg)
 
 ### Per-session Codex controls: model, reasoning, permissions, and status
 
@@ -192,9 +216,7 @@ session, so you can change the next turn without editing the machine's global
 configuration. The composer also provides attachments, queue/interrupt controls,
 context usage, and command entry points such as `/goal` and `/status`.
 
-<p align="center">
-  <img src="assets/readme-model-controls.jpg" alt="Codex model selection and per-session controls" width="960">
-</p>
+![Codex model selection and per-session controls](assets/readme-model-controls.jpg)
 
 ### Common operations at a glance
 
@@ -485,7 +507,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `CODEX_HISTORY_WINDOW_MAX_BYTES` | `33554432` | Maximum Codex rollout source window parsed per page. Long histories stream backwards by turn; an oversized single turn keeps its recent tail plus a stable cursor for loading older history. |
 | `WRAPPER_INBOX_CAP` / `WRAPPER_SEND_QUEUE_CAP` | `1024` / `8192` | Hard item-count bounds for the wrapper's inbound and outbound queues. |
 | `WRAPPER_INBOX_BYTES` / `WRAPPER_SEND_QUEUE_BYTES` | `33554432` / `33554432` | Hard serialized-byte bounds for the wrapper's inbound and outbound queues. |
-| `TURN_READER_QUEUE_CAP` | `4` | Per-turn SDK/app-server reader queue; a full queue backpressures the model stream. |
+| `TURN_READER_QUEUE_CAP` | `4` | Per-turn engine-event consumer queue. Codex app-server stdout has a separate byte-bounded burst buffer so slow relay I/O cannot block RPCs or terminal events. |
 
 Each message accepts at most 8 attachments, at most 6 MiB each and 8 MiB decoded in total; oversized input is rejected before a model turn starts.
 

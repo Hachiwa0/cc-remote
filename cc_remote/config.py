@@ -209,6 +209,8 @@ class WrapperConfig:
         default_factory=lambda: _int("WRAPPER_SEND_QUEUE_BYTES", 32 * 1024 * 1024)
     )
     ws_max_size_bytes: int = field(default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 16 * 1024 * 1024))
+    # Consumer-facing per-turn queue. CodexHandle derives a separate bounded
+    # burst window from this value so app-server stdout never waits on relay I/O.
     turn_reader_queue_cap: int = field(
         default_factory=lambda: _int("TURN_READER_QUEUE_CAP", 4)
     )

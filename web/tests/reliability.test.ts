@@ -3213,7 +3213,21 @@ try {
     type: "turn_end", sid: progressSid, ts: 21,
     result: { subtype: "error", duration_ms: 237252, is_error: true },
   }) });
-  assert.equal(state.runtimes[progressSid].state, "idle");
+  assert.equal(state.runtimes[progressSid].state, "running",
+    "TurnEnd closes presentation only; it must not unlock before State(idle)");
+  state = reduce(state, {
+    type: "set_pending", query: { prompt: "send after interrupt drain" },
+  });
+  assert.deepEqual(selectDrainCandidates(
+    state.runtimes, new Set(), true, true), [],
+  "pending work must stay blocked while the wrapper is still settling");
+  state = reduce(state, { type: "event", event: event({
+    type: "state", sid: progressSid, state: "idle",
+  }) });
+  assert.deepEqual(selectDrainCandidates(
+    state.runtimes, new Set(), true, true).map(({ sid, source }) => ({ sid, source })),
+  [{ sid: progressSid, source: "pending" }],
+  "the authoritative idle lifecycle frame releases the pending replacement");
 
   const { CommandSheet } = await reducerHarness.ssrLoadModule(
     "/src/components/CommandSheet.tsx");

@@ -119,13 +119,14 @@ flock -n 9 || die "another cc-remote deployment is already running"
 [ -d "$SOURCE_DIR/web/dist" ] || die "$SOURCE_DIR/web/dist missing (run 'npm --prefix web run build' before uploading)"
 [ -s "$SOURCE_DIR/web/dist/index.html" ] || die "$SOURCE_DIR/web/dist/index.html missing or empty"
 [ -s "$SOURCE_DIR/web/dist/cc-remote-build.json" ] || die "$SOURCE_DIR/web/dist/cc-remote-build.json missing"
+[ -s "$SOURCE_DIR/cc_remote/__init__.py" ] || die "$SOURCE_DIR/cc_remote/__init__.py missing"
 [ -s "$SOURCE_DIR/cc_remote/protocol.py" ] || die "$SOURCE_DIR/cc_remote/protocol.py missing"
 [ -s "$SOURCE_DIR/deploy/validate_protocol_bundle.py" ] || \
   die "$SOURCE_DIR/deploy/validate_protocol_bundle.py missing"
 python3 "$SOURCE_DIR/deploy/validate_protocol_bundle.py" \
   "$SOURCE_DIR/cc_remote/protocol.py" \
   "$SOURCE_DIR/web/dist/cc-remote-build.json" >/dev/null || \
-  die "web build protocol does not match backend"
+  die "web build metadata does not match backend"
 [ -f "$SOURCE_DIR/requirements.lock" ] || die "$SOURCE_DIR/requirements.lock missing"
 [ -f "$SOURCE_DIR/deploy/Caddyfile" ] || die "$SOURCE_DIR/deploy/Caddyfile missing"
 [ -f "$SOURCE_DIR/deploy/caddy_managed_block.py" ] || die "$SOURCE_DIR/deploy/caddy_managed_block.py missing"
@@ -236,7 +237,7 @@ tar -C "$SOURCE_DIR" \
 python3 "$NEW_RELEASE_DIR/deploy/validate_protocol_bundle.py" \
   "$NEW_RELEASE_DIR/cc_remote/protocol.py" \
   "$NEW_RELEASE_DIR/web/dist/cc-remote-build.json" >/dev/null || \
-  die "staged web build protocol does not match backend"
+  die "staged web build metadata does not match backend"
 
 echo "==> release-local python venv + deps"
 python3 -m venv "$NEW_RELEASE_DIR/.venv"

@@ -477,23 +477,34 @@ false
 def test_web_build_manifest_matches_both_protocol_implementations():
     manifest = json.loads(
         (ROOT / "web" / "public" / "cc-remote-build.json").read_text())
+    from cc_remote import __version__
     from cc_remote.protocol import PROTOCOL_VERSION
 
     ts = (ROOT / "web" / "src" / "protocol.ts").read_text()
     match = re.search(r"PROTOCOL_VERSION\s*=\s*(\d+)", ts)
     assert match
     assert manifest["protocol"] == PROTOCOL_VERSION == int(match.group(1))
+    assert manifest["version"] == __version__
 
 
 def test_deploy_protocol_validation_reads_backend_and_manifest(tmp_path):
+    product = tmp_path / "__init__.py"
     backend = tmp_path / "protocol.py"
     manifest = tmp_path / "cc-remote-build.json"
+    product.write_text('__version__ = "3.0.0"\n')
     backend.write_text("PROTOCOL_VERSION = 37\n")
-    manifest.write_text('{"protocol":37}\n')
+    manifest.write_text('{"version":"3.0.0","protocol":37}\n')
     assert validate_protocol_bundle(backend, manifest) == 37
 
-    manifest.write_text('{"protocol":36}\n')
+    manifest.write_text('{"version":"3.0.0","protocol":36}\n')
     with pytest.raises(ProtocolBundleError, match="backend v37, web v36"):
+        validate_protocol_bundle(backend, manifest)
+
+    manifest.write_text('{"version":"2.9.0","protocol":37}\n')
+    with pytest.raises(
+        ProtocolBundleError,
+        match="backend v3.0.0, web v2.9.0",
+    ):
         validate_protocol_bundle(backend, manifest)
 
 

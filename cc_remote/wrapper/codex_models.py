@@ -23,6 +23,7 @@ import os
 import time
 from typing import Optional
 
+from cc_remote import __version__
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_handle import _codex_env, _resolve_codex_bin
 
@@ -81,7 +82,9 @@ async def _rpc_model_list() -> list[dict]:
 
     try:
         await send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                    "params": {"clientInfo": {"name": "cc-remote", "version": "0.1.0"}}})
+                    "params": {"clientInfo": {
+                        "name": "cc-remote", "version": __version__,
+                    }}})
         await asyncio.wait_for(await_result(1), _RPC_TIMEOUT)
         await send({"jsonrpc": "2.0", "method": "initialized"})
         await send({"jsonrpc": "2.0", "id": 2, "method": "model/list", "params": {}})

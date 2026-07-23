@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from typing import Any, Awaitable, Callable, Optional
 
+from cc_remote import __version__
 from cc_remote.log import logger
 from cc_remote.protocol import Notice, RateLimitUpdate, ThreadGoal
 from cc_remote.wrapper.codex_daemon import (
@@ -78,6 +79,9 @@ _NOTICE_MESSAGE_MAX = 2 * 1024
 _NOTICE_DETAIL_MAX = 4 * 1024
 _NOTICE_PATH_MAX = 1024
 _NOTICE_PATH_SAMPLE_MAX = 3
+_MANAGED_QUEUE_MIN_ITEMS = 64
+_MANAGED_QUEUE_MAX_ITEMS = 256
+_MANAGED_QUEUE_MIN_BYTES = 4 * 1024 * 1024
 _SPONTANEOUS_QUEUE_MIN_ITEMS = 64
 _SPONTANEOUS_QUEUE_MAX_ITEMS = 256
 _SPONTANEOUS_QUEUE_MIN_BYTES = 4 * 1024 * 1024
@@ -599,7 +603,7 @@ def _codex_runtime_tmp() -> str:
 def _initialize_params() -> dict[str, Any]:
     """Declare the capability required by collaborationMode/list and turn/start."""
     return {
-        "clientInfo": {"name": "cc-remote", "version": "0.1.0"},
+        "clientInfo": {"name": "cc-remote", "version": __version__},
         "capabilities": {"experimentalApi": True},
     }
 
@@ -1417,7 +1421,10 @@ class CodexHandle:
     ) -> tuple[int, int]:
         reader_cap = max(1, int(getattr(self.cfg, "turn_reader_queue_cap", 4)))
         item_cap = (
-            max(2, reader_cap)
+            min(
+                _MANAGED_QUEUE_MAX_ITEMS,
+                max(_MANAGED_QUEUE_MIN_ITEMS, reader_cap * 16),
+            )
             if managed
             else min(
                 _SPONTANEOUS_QUEUE_MAX_ITEMS,
@@ -1429,7 +1436,11 @@ class CodexHandle:
         tool_cap = max(1024, int(getattr(self.cfg, "tool_result_max", 65536)))
         byte_cap = min(
             ws_cap,
-            max(_SPONTANEOUS_QUEUE_MIN_BYTES, tool_cap * 16),
+            max(
+                (_MANAGED_QUEUE_MIN_BYTES if managed
+                 else _SPONTANEOUS_QUEUE_MIN_BYTES),
+                tool_cap * 16,
+            ),
         )
         return item_cap, byte_cap
 

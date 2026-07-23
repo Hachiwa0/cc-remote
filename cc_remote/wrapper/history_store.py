@@ -1041,25 +1041,71 @@ class HistoryIndexStore:
                 """,
                 (session_id, engine, source.path, turn_id, source.token),
             ).fetchone()
-            if row is None:
-                return None
-            connection.execute(
+            if row is not None:
+                try:
+                    payload = json.loads(
+                        bytes(row["payload_json"]).decode("utf-8"))
+                    if (isinstance(payload, list)
+                            and all(isinstance(event, dict) for event in payload)
+                            and _turn_id(payload) == turn_id):
+                        connection.execute(
+                            """
+                            UPDATE history_turn_details SET accessed_at=?
+                            WHERE session_id=? AND engine=?
+                              AND source_token=? AND turn_id=?
+                            """,
+                            (now, session_id, engine,
+                             row["source_token"], turn_id),
+                        )
+                        return tuple(payload)
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                    pass
+
+                # A malformed derived row must not mask the canonical page
+                # fallback below.
+                connection.execute(
+                    """
+                    DELETE FROM history_turn_details
+                    WHERE session_id=? AND engine=?
+                      AND source_token=? AND turn_id=?
+                    """,
+                    (session_id, engine, row["source_token"], turn_id),
+                )
+
+            # Detail has a deliberately tighter LRU than complete pages.  A
+            # browser may still be displaying a retained summary after its
+            # standalone detail row was evicted, so recover the group from the
+            # canonical page instead of returning a permanently retryable miss.
+            pages = connection.execute(
                 """
-                UPDATE history_turn_details SET accessed_at=?
-                WHERE session_id=? AND engine=? AND source_token=? AND turn_id=?
+                SELECT rowid, payload_json FROM history_pages
+                WHERE session_id=? AND engine=? AND source_path=?
+                ORDER BY (source_token = ?) DESC,
+                         accessed_at DESC, created_at DESC
                 """,
-                (now, session_id, engine, row["source_token"], turn_id),
+                (session_id, engine, source.path, source.token),
             )
-        try:
-            payload = json.loads(bytes(row["payload_json"]).decode("utf-8"))
-            if not isinstance(payload, list) or not all(
-                    isinstance(event, dict) for event in payload):
-                return None
-            if _turn_id(payload) != turn_id:
-                return None
-            return tuple(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-            return None
+            for page_row in pages:
+                try:
+                    page_payload = json.loads(
+                        bytes(page_row["payload_json"]).decode("utf-8"))
+                    page = MaterializedHistoryPage.from_payload(page_payload)
+                except (UnicodeDecodeError, json.JSONDecodeError,
+                        ValueError, TypeError):
+                    connection.execute(
+                        "DELETE FROM history_pages WHERE rowid=?",
+                        (page_row["rowid"],),
+                    )
+                    continue
+                for group in group_history_events(page.events):
+                    if _turn_id(group) != turn_id:
+                        continue
+                    connection.execute(
+                        "UPDATE history_pages SET accessed_at=? WHERE rowid=?",
+                        (now, page_row["rowid"]),
+                    )
+                    return tuple(group)
+        return None
 
     def get_image_asset(
         self,

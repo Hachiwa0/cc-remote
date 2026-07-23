@@ -11,6 +11,7 @@ import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from pydantic import ValidationError
 
+from cc_remote import __version__
 from cc_remote.protocol import (
     CollaborationMode, Error, GoalState, Model, NewSession, PinSession, StateEvent,
     ThreadGoal, TurnBinding, TurnEnd, UserMsg,
@@ -59,7 +60,7 @@ def test_provider_error_diagnostic_keeps_only_safe_classification():
 
 def test_codex_initialize_declares_experimental_api_for_collaboration_mode():
     assert codex_handle_module._initialize_params() == {
-        "clientInfo": {"name": "cc-remote", "version": "0.1.0"},
+        "clientInfo": {"name": "cc-remote", "version": __version__},
         "capabilities": {"experimentalApi": True},
     }
 
@@ -499,7 +500,8 @@ def test_codex_review_pre_response_burst_never_blocks_rpc_reader():
             # More events than the configured managed bridge can retain arrive
             # before the response. The sole stdout reader must never await a
             # consumer which cannot start until this RPC returns.
-            for index in range(3):
+            assert handle._turn_q is not None
+            for index in range(handle._turn_q.max_items + 1):
                 await handle._dispatch({
                     "method": "item/started",
                     "params": {
@@ -535,6 +537,53 @@ def test_codex_review_pre_response_burst_never_blocks_rpc_reader():
         assert len(frames) == 2
         assert isinstance(frames[0], CodexManagedOverflow)
         assert frames[1]["method"] == "turn/completed"
+
+    asyncio.run(run())
+
+
+def test_codex_managed_bridge_absorbs_normal_burst_before_consumer_runs():
+    class BurstCfg(_Cfg):
+        turn_reader_queue_cap = 4
+        ws_max_size_bytes = 1024 * 1024
+
+    async def run():
+        handle = CodexHandle(BurstCfg())
+        handle.thread_id = "normal-burst"
+        handle.turn_id = "normal-burst-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+
+        # A tool/reasoning burst can outrun the relay-facing consumer for a few
+        # event-loop turns. Four frames is a backpressure setting for Machine's
+        # reader, not a safe app-server notification window.
+        for index in range(32):
+            await handle._dispatch({
+                "method": "item/started",
+                "params": {
+                    "threadId": "normal-burst",
+                    "turnId": "normal-burst-turn",
+                    "item": {
+                        "id": f"burst-{index}",
+                        "type": "reasoning",
+                    },
+                },
+            })
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "normal-burst",
+                "turn": {
+                    "id": "normal-burst-turn",
+                    "status": "completed",
+                },
+            },
+        })
+
+        frames = [frame async for frame in handle.receive_response()]
+        assert len(frames) == 33
+        assert not any(
+            isinstance(frame, CodexManagedOverflow) for frame in frames)
+        assert frames[-1]["method"] == "turn/completed"
 
     asyncio.run(run())
 
@@ -837,6 +886,81 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
         assert terminal[0].turn_id == "managed-overflow-turn"
         assert terminal[0].result.subtype == "success"
         assert terminal[0].result.is_error is False
+
+    asyncio.run(run())
+
+
+def test_managed_codex_overflow_reports_live_delay_without_idle_warning():
+    async def run():
+        machine, transport = _mk_machine()
+        machine.cfg.codex_turn_idle_warn_seconds = 0.02
+        ctx = _mk_ctx("managed-overflow-wait", "managed-overflow-wait")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-overflow-wait"
+        overflow_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        class OverflowSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(self, _prompt, images=None):
+                return "managed-overflow-wait-turn"
+
+            async def receive_response(self):
+                yield CodexManagedOverflow("managed-overflow-wait-turn")
+                overflow_seen.set()
+                await release.wait()
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "managed-overflow-wait-turn",
+                        "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = OverflowSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+
+        await asyncio.wait_for(overflow_seen.wait(), timeout=0.2)
+        for _ in range(20):
+            if any(
+                isinstance(event, StateEvent)
+                and event.msg_id == "browser-overflow-wait"
+                and event.detail
+                for event in transport.sent
+            ):
+                break
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.04)
+
+        notices = [
+            event for event in transport.sent
+            if isinstance(event, StateEvent)
+            and event.msg_id == "browser-overflow-wait"
+            and event.detail
+        ]
+        assert len(notices) == 1
+        assert "实时过程暂时延迟" in notices[0].detail
+        assert "没有收到新进展" not in notices[0].detail
+        assert ctx.state == "running"
+
+        release.set()
+        await asyncio.wait_for(turn, timeout=0.5)
+
+        assert ctx.state == "idle"
+        assert any(
+            isinstance(event, StateEvent)
+            and event.msg_id == "browser-overflow-wait"
+            and event.detail is None
+            for event in transport.sent
+        )
 
     asyncio.run(run())
 

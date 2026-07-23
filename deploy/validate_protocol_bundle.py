@@ -5,12 +5,38 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 
 class ProtocolBundleError(ValueError):
     pass
+
+
+_PRODUCT_VERSION_RE = re.compile(
+    r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+def backend_product_version(path: Path) -> str:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        raise ProtocolBundleError(
+            f"cannot read backend product version from {path}"
+        ) from exc
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if isinstance(target, ast.Name) and target.id == "__version__":
+            value = ast.literal_eval(statement.value)
+            if isinstance(value, str) and _PRODUCT_VERSION_RE.fullmatch(value):
+                return value
+            break
+    raise ProtocolBundleError(f"valid __version__ not found in {path}")
 
 
 def backend_protocol(path: Path) -> int:
@@ -41,12 +67,37 @@ def web_protocol(path: Path) -> int:
     return value
 
 
-def validate_protocol_bundle(backend: Path, manifest: Path) -> int:
+def web_product_version(path: Path) -> str:
+    try:
+        manifest: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ProtocolBundleError(
+            f"cannot read web product version from {path}"
+        ) from exc
+    value = manifest.get("version") if isinstance(manifest, dict) else None
+    if not isinstance(value, str) or not _PRODUCT_VERSION_RE.fullmatch(value):
+        raise ProtocolBundleError(f"valid product version not found in {path}")
+    return value
+
+
+def validate_protocol_bundle(
+    backend: Path,
+    manifest: Path,
+    product: Path | None = None,
+) -> int:
     backend_value = backend_protocol(backend)
     web_value = web_protocol(manifest)
     if backend_value != web_value:
         raise ProtocolBundleError(
             f"protocol mismatch: backend v{backend_value}, web v{web_value}"
+        )
+    product_path = product or backend.with_name("__init__.py")
+    backend_product = backend_product_version(product_path)
+    web_product = web_product_version(manifest)
+    if backend_product != web_product:
+        raise ProtocolBundleError(
+            "product version mismatch: "
+            f"backend v{backend_product}, web v{web_product}"
         )
     return backend_value
 

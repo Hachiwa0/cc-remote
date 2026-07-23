@@ -2193,7 +2193,10 @@ function reduceEvent(
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
-        rt.state = "idle";
+        // TurnEnd closes the visible turn, but the wrapper may still be
+        // draining an interrupt, finishing a checkpoint, or releasing its
+        // app-server consumer. Only the following authoritative State(idle)
+        // unlocks the composer and queued/pending sends.
         rt.pendingQuestion = null;
       });
     case "pong":

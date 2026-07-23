@@ -12555,9 +12555,14 @@ class WrapperMachine:
             This is deliberately not a hard timeout: ultra reasoning and long
             tools can be valid. A real interrupt still uses the existing bounded
             drain path, and any raw app-server event rearms the warning timer on
-            the next loop iteration.
+            the next loop iteration. A managed bridge overflow has already
+            explained why live detail is delayed, so it must not be overwritten
+            later by the generic no-progress warning.
             """
-            warn = (self.cfg.codex_turn_idle_warn_seconds if is_codex else 0)
+            warn = (
+                self.cfg.codex_turn_idle_warn_seconds
+                if is_codex and not codex_overflowed else 0
+            )
             if warn <= 0 or ctx.state == "interrupting":
                 return await self._next_from_queue(ctx, queue)
             wait_task = asyncio.create_task(self._next_from_queue(ctx, queue))
@@ -12956,6 +12961,15 @@ class WrapperMachine:
                 if is_codex:
                     if isinstance(msg, CodexManagedOverflow):
                         codex_overflowed = True
+                        await emit_codex_event(StateEvent(
+                            state="running",
+                            phase="waiting",
+                            detail=(
+                                "Codex 仍在执行；实时过程暂时延迟，"
+                                "完成后会自动同步。"
+                            ),
+                            msg_id=ctx.active_msg_id,
+                        ))
                         continue
                     sid = codex_session_id(msg)
                     if sid and not ctx.session_id:

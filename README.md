@@ -1,27 +1,33 @@
 # cc-remote
 
-<p align="center"><strong>把你机器上的 Claude Code / Codex，带到手机和任意浏览器。</strong></p>
-<p align="center">自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web</p>
-<p align="center">
-  <a href="README_en.md">English</a> ·
-  <a href="#本地快速开始一台机器5-分钟">5 分钟上手</a> ·
-  <a href="#生产部署公网-vps-中继--你机器上的-wrapper">生产部署</a> ·
-  <a href="#安全须知务必读">安全须知</a>
-</p>
+**把你机器上的 Claude Code / Codex，带到手机和任意浏览器。**
+
+自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web
+
+**当前版本：v3.0.0** · Wire protocol v19
+
+[English](README_en.md) ·
+[5 分钟上手](#本地快速开始一台机器5-分钟) ·
+[生产部署](#生产部署公网-vps-中继--你机器上的-wrapper) ·
+[安全须知](#安全须知务必读) ·
+[更新记录](CHANGELOG.md)
 
 cc-remote 是一个开源的远程控制面：本机 `wrapper` 驱动已经安装并登录的
 `claude` / `codex`，浏览器通过你自托管的 WebSocket 中继查看和控制会话。
 模型、认证与工具执行仍由本地 CLI 决定；cc-remote 不代理模型 API，也不会把
 API key 烤进网页。
 
-<p align="center">
-  <img src="assets/readme-claude-multisession.jpg" alt="cc-remote 的 Claude 会话与多会话工作台" width="960">
-</p>
+v3.0.0 不是一次换皮升级。它保留原有双引擎、Code / Work、多会话和远程控制
+能力，重新设计了历史投影、原生客户端协同、多设备路由和发布边界，重点解决
+超长会话打开慢、App/CLI 状态不同步、移动端历史跳动和多机器串台等真实问题。
+
+![cc-remote 的 Claude 会话与多会话工作台](assets/readme-claude-multisession.jpg)
 
 ---
 
 ## 目录
 
+- [v3 架构升级](#v3-架构升级)
 - [核心能力](#核心能力)
 - [架构](#架构)
 - [真实界面与实用功能](#真实界面与实用功能)
@@ -37,6 +43,26 @@ API key 烤进网页。
 - [许可](#许可)
 
 ---
+
+## v3 架构升级
+
+v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、可恢复、可同时连接
+多台机器的完整控制面。相比此前公开版本，主要变化是：
+
+| 升级方向 | v3.0.0 |
+|---|---|
+| **历史打开与超长会话** | 浏览器先绘制 IndexedDB 中最近一次验证的本地投影；wrapper 使用与源文件指纹绑定的 SQLite 摘要页，只先返回最新回合，工具输出、reasoning、进程日志和超长正文按回合展开。短会话不再等待全量扫描，长会话可继续向前分页且保持当前阅读位置。 |
+| **Codex 大 rollout** | Codex 历史按回合从文件尾部向前读取，保留 app-server 的原生 resume / compact 状态，不把整个 rollout 重新上传给模型。对特定超大 Codex Desktop + OpenAI 恢复场景，才启用严格限定的官方 HTTP 兼容路径。 |
+| **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
+| **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
+| **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
+| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v19。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
+
+> **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在
+> wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
+> transcript / rollout 和可重建投影，不会 resume 引擎，也不会创建模型回合。
+
+完整发布记录和升级注意事项见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 核心能力
 
@@ -125,41 +151,31 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
 
 左侧会话池按工作目录分组，可以搜索、切换、重命名和归档会话；一个会话在后台处理时，仍可进入另一个会话继续工作，切回来即可看到完整实时进度。Claude Code 与 Codex 会话共用同一套工作台，但各自保留独立的上下文、模型、权限和运行状态。
 
-<p align="center">
-  <img src="assets/readme-multi-session.jpg" alt="按项目分组并可搜索切换的多会话工作台" width="960">
-</p>
+![按项目分组并可搜索切换的多会话工作台](assets/readme-multi-session.jpg)
 
 ### Claude Code：思考、工具调用和 Hook 都能看见
 
 Claude 会话不是一个只显示最终文字的简化聊天框。Remote 会接收 Claude Code SDK 暴露的思考、命令调用、工具结果和 Hook 生命周期，按发生顺序折叠展示；底部同时显示 Claude 当前模型、思考强度、权限模式和上下文占用。
 
-<p align="center">
-  <img src="assets/readme-claude-session.jpg" alt="Claude Code 的思考、命令调用和 Hook 处理过程" width="960">
-</p>
+![Claude Code 的思考、命令调用和 Hook 处理过程](assets/readme-claude-session.jpg)
 
 ### 新会话：先选引擎和工作目录
 
 一个入口创建 Claude Code 或 Codex 会话；工作目录可浏览选择，第一条消息可直接带图片或文件。会话建立后再按需要调整模型、权限和 Plan 模式，不用先填写一排默认参数。
 
-<p align="center">
-  <img src="assets/readme-new-session.jpg" alt="选择引擎和工作目录并创建新会话" width="960">
-</p>
+![选择引擎和工作目录并创建新会话](assets/readme-new-session.jpg)
 
 ### Codex：计划与处理过程完整保留
 
 Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff、MCP、协作代理与 Hook 组织成可折叠时间线。运行中可以展开追踪细节，完成后收起为一行摘要；最终答复始终独立显示。
 
-<p align="center">
-  <img src="assets/readme-process-timeline.jpg" alt="可折叠的计划、Hook 和工具调用处理过程" width="960">
-</p>
+![可折叠的计划、Hook 和工具调用处理过程](assets/readme-process-timeline.jpg)
 
 ### Codex 会话级控制：模型、思考、权限与状态
 
 模型、思考强度、服务档位和权限都绑定当前会话；可以在不改本机全局配置的情况下调整下一回合。输入区同时提供附件、排队/打断、上下文占用以及 `/goal`、`/status` 等命令入口。
 
-<p align="center">
-  <img src="assets/readme-model-controls.jpg" alt="Codex 模型选择和会话控制" width="960">
-</p>
+![Codex 模型选择和会话控制](assets/readme-model-controls.jpg)
 
 ### 常用操作速查
 
@@ -439,7 +455,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `CODEX_HISTORY_WINDOW_MAX_BYTES` | `33554432` | Codex 超长 rollout 每页最多解析的源窗口；历史按轮次从文件尾流式分页，单轮超限时保留最近窗口和可继续加载的稳定游标。 |
 | `WRAPPER_INBOX_CAP` / `WRAPPER_SEND_QUEUE_CAP` | `1024` / `8192` | wrapper 入站/出站内存队列条数硬上限。 |
 | `WRAPPER_INBOX_BYTES` / `WRAPPER_SEND_QUEUE_BYTES` | `33554432` / `33554432` | wrapper 入站/出站队列序列化字节硬上限。 |
-| `TURN_READER_QUEUE_CAP` | `4` | 单回合 SDK/app-server 读取队列上限；满时向模型流施加背压。 |
+| `TURN_READER_QUEUE_CAP` | `4` | 单回合引擎事件消费队列；Codex app-server stdout 另有独立、有字节上限的突发缓冲，避免 Relay 变慢时阻塞 RPC 和终态。 |
 
 单次消息最多 8 个附件，单个最多 6 MiB，解码后合计最多 8 MiB；超限会在启动模型前拒绝。
 
