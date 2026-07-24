@@ -406,6 +406,15 @@ def test_role_installers_keep_credentials_out_of_service_definitions():
     assert "PAIR" not in plist_source
 
 
+@pytest.mark.parametrize("name", ["install-relay.sh", "install-wrapper.sh"])
+def test_role_installers_avoid_ambiguous_and_or_guards(name: str):
+    source = (ROOT / "deploy" / name).read_text(encoding="utf-8")
+    ambiguous_guard = re.compile(
+        r"\[[^\n]+\]\s*&&\s*\[[^\n]+\]\s*\|\|"
+    )
+    assert ambiguous_guard.search(source) is None
+
+
 def test_role_locks_and_release_workflow_are_versioned_inputs():
     relay_lock = ROOT / "requirements-relay.lock"
     wrapper_lock = ROOT / "requirements-wrapper.lock"

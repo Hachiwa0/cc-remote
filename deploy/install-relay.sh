@@ -82,8 +82,9 @@ if [ ! -e "$env_file" ]; then
   password=""
   if [ -n "${CC_REMOTE_LOGIN_PASSWORD_FILE:-}" ]; then
     password_file="$CC_REMOTE_LOGIN_PASSWORD_FILE"
-    [ -f "$password_file" ] && [ ! -L "$password_file" ] || \
+    if [ ! -f "$password_file" ] || [ -L "$password_file" ]; then
       die "CC_REMOTE_LOGIN_PASSWORD_FILE must be a regular file"
+    fi
     IFS= read -r password < "$password_file" || true
   else
     [ -t 0 ] || die \
@@ -131,8 +132,9 @@ if [ ! -e "$env_file" ]; then
   unset password password_repeat session_secret wrapper_token
   echo "==> created root-only relay configuration"
 else
-  [ -f "$env_file" ] && [ ! -L "$env_file" ] || \
+  if [ ! -f "$env_file" ] || [ -L "$env_file" ]; then
     die "$env_file must be a regular file"
+  fi
   echo "==> preserving existing relay configuration"
 fi
 

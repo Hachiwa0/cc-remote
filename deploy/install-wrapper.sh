@@ -60,8 +60,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -n "$relay" ] || [ -n "$pair_code" ]; then
-  [ -n "$relay" ] && [ -n "$pair_code" ] || \
+  if [ -z "$relay" ] || [ -z "$pair_code" ]; then
     die "--relay and --pair must be provided together"
+  fi
 elif [ -n "$device_name" ] || [ "$replace_pair" -eq 1 ]; then
   die "--name and --replace-pair require --relay and --pair"
 fi
@@ -120,7 +121,9 @@ if [ "$system" = darwin ]; then
     die "macOS wrapper installation must run as the logged-in user, not root"
   target_user="$(id -un)"
   target_home="${HOME:-}"
-  [ -n "$target_home" ] && [ -d "$target_home" ] || die "HOME is invalid"
+  if [ -z "$target_home" ] || [ ! -d "$target_home" ]; then
+    die "HOME is invalid"
+  fi
   appdir="$target_home/Library/Application Support/cc-remote"
   config_dir="$target_home/.cc-remote"
   device_file="$config_dir/device.json"
@@ -134,15 +137,17 @@ else
   if [ -z "$target_user" ] || [ "$target_user" = root ]; then
     target_user="${SUDO_USER:-}"
   fi
-  [ -n "$target_user" ] && [ "$target_user" != root ] || \
+  if [ -z "$target_user" ] || [ "$target_user" = root ]; then
     die "Linux wrapper installation needs --user USER"
+  fi
   case "$target_user" in
     *[!A-Za-z0-9_.-]*|"") die "Linux service user has an invalid name" ;;
   esac
   id "$target_user" >/dev/null 2>&1 || die "Linux service user does not exist"
   target_home="$(getent passwd "$target_user" | awk -F: '{print $6}')"
-  [ -n "$target_home" ] && [ -d "$target_home" ] || \
+  if [ -z "$target_home" ] || [ ! -d "$target_home" ]; then
     die "Linux service user has no usable home directory"
+  fi
   case "$target_home" in
     *["	 \"'\\"]*) die "Linux service user home contains unsupported characters" ;;
   esac
@@ -249,15 +254,17 @@ trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
 if [ -e "$service_file" ]; then
-  [ -f "$service_file" ] && [ ! -L "$service_file" ] || \
+  if [ ! -f "$service_file" ] || [ -L "$service_file" ]; then
     die "$service_file must be a regular file"
+  fi
   service_had_file=1
   service_backup="$(mktemp "${TMPDIR:-/tmp}/cc-remote-service.XXXXXX")"
   cp -p "$service_file" "$service_backup"
 fi
 if [ -e "$device_file" ]; then
-  [ -f "$device_file" ] && [ ! -L "$device_file" ] || \
+  if [ ! -f "$device_file" ] || [ -L "$device_file" ]; then
     die "$device_file must be a regular file"
+  fi
   device_had_file=1
   if [ -n "$pair_code" ] && [ "$replace_pair" -ne 1 ]; then
     die "$device_file already exists; pass --replace-pair to replace it"
@@ -330,8 +337,9 @@ if [ -n "$pair_code" ]; then
   device_changed=1
 fi
 
-[ -f "$device_file" ] && [ ! -L "$device_file" ] || \
+if [ ! -f "$device_file" ] || [ -L "$device_file" ]; then
   die "device credential is missing; provide --relay and --pair"
+fi
 chmod 0600 "$device_file"
 
 if [ "$system" = darwin ]; then
@@ -377,8 +385,10 @@ else
     install -o root -g root -m 0600 "$env_stage" "$config_dir/wrapper.env"
     rm -f -- "$env_stage"
   else
-    [ -f "$config_dir/wrapper.env" ] && [ ! -L "$config_dir/wrapper.env" ] || \
+    if [ ! -f "$config_dir/wrapper.env" ] || \
+        [ -L "$config_dir/wrapper.env" ]; then
       die "$config_dir/wrapper.env must be a regular file"
+    fi
     chmod 0600 "$config_dir/wrapper.env"
   fi
   "$target/.venv/bin/python" - \
