@@ -17,6 +17,13 @@ function textChannel(block: TextBlock): string {
   return block.channel ?? "final";
 }
 
+function canFuzzyMatchText(block: TextBlock): boolean {
+  // A completed assistant envelope without a delta is tool scaffolding, not a
+  // semantic text position. Open empty blocks remain eligible so a
+  // focus-triggered History merge can retain the id targeted by future deltas.
+  return block.text.length > 0 || !block.done;
+}
+
 function textAffinity(first: string, second: string): number {
   if (first === second) return Number.MAX_SAFE_INTEGER;
   if (first.includes(second) || second.includes(first)) {
@@ -84,11 +91,12 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
       const candidate = out[index] as TextBlock;
       return !matchedTextIndexes.has(index) && candidate.message_id === block.message_id;
     });
-    if (existingIndex == null) {
+    if (existingIndex == null && canFuzzyMatchText(block)) {
       const candidates = historyTextIndexes.filter((index) => {
         const candidate = out[index] as TextBlock;
         return !matchedTextIndexes.has(index)
-          && textChannel(candidate) === textChannel(block);
+          && textChannel(candidate) === textChannel(block)
+          && canFuzzyMatchText(candidate);
       });
       let bestScore = 0;
       for (const index of candidates) {

@@ -781,6 +781,54 @@ const multiCommentMerged = mergeInitialHistory(
 assert.deepEqual(multiCommentMerged[0].blocks.filter(
   (block) => block.kind === "text").map((block) => block.text), ["A", "B"]);
 
+// Tool-only assistant envelopes have a start/end but no text delta. Summary
+// history omits those invisible shells while loaded detail retains them. A
+// completed empty shell must not consume the next same-channel summary block:
+// doing so shifts every later commentary match and duplicates the final one
+// after a focus-triggered History reconciliation.
+const toolOnlyShellSummary = {
+  id: "tool-shell-turn", prompt: "modify code", done: true, ts: 32_000,
+  blocks: [
+    { kind: "text" as const, message_id: "comment-a", text: "A", done: true,
+      channel: "commentary" as const },
+    { kind: "text" as const, message_id: "comment-b", text: "B", done: true,
+      channel: "commentary" as const },
+    { kind: "text" as const, message_id: "comment-c", text: "C", done: true,
+      channel: "commentary" as const },
+  ],
+};
+const toolOnlyShellDetail = {
+  ...toolOnlyShellSummary,
+  blocks: [
+    toolOnlyShellSummary.blocks[0],
+    { kind: "text" as const, message_id: "tool-envelope-a", text: "",
+      done: true, channel: "commentary" as const },
+    { kind: "tool" as const, message_id: "tool-envelope-a",
+      tool_use_id: "edit-a", tool: "apply_patch", input: {}, done: true,
+      result: { content: "updated", is_error: false } },
+    toolOnlyShellSummary.blocks[1],
+    { kind: "text" as const, message_id: "tool-envelope-b", text: "",
+      done: true, channel: "commentary" as const },
+    { kind: "tool" as const, message_id: "tool-envelope-b",
+      tool_use_id: "edit-b", tool: "shell", input: {}, done: true,
+      result: { content: "verified", is_error: false } },
+    toolOnlyShellSummary.blocks[2],
+  ],
+};
+let toolOnlyShellMerged = mergeInitialHistory(
+  [toolOnlyShellSummary], [toolOnlyShellDetail]);
+toolOnlyShellMerged = mergeInitialHistory(
+  [toolOnlyShellSummary], toolOnlyShellMerged);
+assert.deepEqual(toolOnlyShellMerged[0].blocks.flatMap(
+  (block) => block.kind === "text" && block.text.length > 0
+    ? [{ id: block.message_id, text: block.text }]
+    : []),
+[
+  { id: "comment-a", text: "A" },
+  { id: "comment-b", text: "B" },
+  { id: "comment-c", text: "C" },
+], "completed empty tool envelopes must not shift or duplicate commentary");
+
 // Rollout history and the live app-server now share the authoritative
 // response_item id. The live delta may still arrive before item/started and
 // temporarily carry channel=unknown; identity, not text guessing, must merge it
@@ -812,6 +860,30 @@ assert.deepEqual(stableMessageMerged[0].blocks.filter(
   })), [{
   id: "msg-stable", text: "same item", channel: "commentary",
 }]);
+
+const openEmptyMessageMerged = mergeInitialHistory(
+  [{
+    ...stableMessageHistory,
+    blocks: [{
+      kind: "text" as const, message_id: "history-before-delta",
+      text: "history prefix", done: true, channel: "commentary" as const,
+    }],
+  }],
+  [{
+    ...stableMessageLive,
+    blocks: [{
+      kind: "text" as const, message_id: "live-before-delta",
+      text: "", done: false, channel: "commentary" as const,
+    }],
+  }],
+  { preserveLiveTailOpen: true },
+);
+assert.deepEqual(openEmptyMessageMerged[0].blocks.flatMap(
+  (block) => block.kind === "text"
+    ? [{ id: block.message_id, text: block.text }]
+    : []),
+[{ id: "live-before-delta", text: "history prefix" }],
+"an open empty placeholder must retain the id targeted by future deltas");
 
 // A focus-triggered History page can use a regenerated response_item id while
 // the app-server keeps streaming deltas to the live id. Reconciliation must
