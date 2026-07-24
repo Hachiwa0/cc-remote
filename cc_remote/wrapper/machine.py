@@ -4088,6 +4088,9 @@ class WrapperMachine:
                             and source_window_boundary_offset is not None
                             else None
                         ),
+                        snapshot_in_progress=(
+                            in_progress and before is None
+                        ),
                     )
                     if (source_window_oldest_cursor is not None
                             and source_window_boundary_offset is not None

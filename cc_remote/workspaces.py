@@ -13,6 +13,8 @@ import sqlite3
 import stat
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal, cast
@@ -1219,11 +1221,16 @@ class WorkRegistry:
                 (value, time.time(), session_id, self.engine),
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.db_path, timeout=5.0)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys=ON")
-        return db
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     @staticmethod
     def _record(row: sqlite3.Row | None) -> WorkSessionRecord | None:

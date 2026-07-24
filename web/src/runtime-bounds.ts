@@ -7,7 +7,11 @@
  */
 
 export const MAX_RUNTIME_SESSIONS = 64;
-export const MAX_RUNTIME_TURNS = 200;
+// The DOM is independently virtualized, so this is now a browser-data bound,
+// not a rendering bound. Keep enough canonical summary turns for deep history
+// browsing while the byte budget below still prevents heavyweight detail from
+// growing a resident session without limit.
+export const MAX_RUNTIME_TURNS = 2048;
 export const MAX_RUNTIME_COMPLETED_UNITS = 16 * 1024 * 1024;
 
 interface SizedImage { media_type?: string; data?: string }

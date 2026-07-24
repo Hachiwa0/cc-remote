@@ -11,7 +11,14 @@ import type {
   DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, SessionControl, Space,
 } from "./protocol.ts";
 import { compareSessionControl, makeForkSessionCommand, makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION, sessionControlTargetsSid } from "./protocol.ts";
-import { CommandOutbox, planRecoveryReplay } from "./outbox.ts";
+import {
+  CommandOutbox,
+  QueryAcceptanceLatch,
+  planRecoveryReplay,
+  queryAcceptanceDescriptor,
+  queryAcceptanceHistoryHead,
+  type QueryAcceptanceHistoryHead,
+} from "./outbox.ts";
 import { probeSession, shouldReconnectAfterSessionProbe } from "./session-auth.ts";
 import { uuid } from "./util.ts";
 
@@ -82,6 +89,10 @@ export class RelayWs {
   private readonly pendingListOwnership: Record<string, EventOwnership[]> = {};
   private readonly outbox = new CommandOutbox(
     OUTBOX_MAX_COMMANDS, OUTBOX_MAX_BYTES, OUTBOX_MAX_FRAME_BYTES);
+  private readonly queryAcceptance = new QueryAcceptanceLatch();
+  private readonly historyHeadBySession: Record<
+    string, QueryAcceptanceHistoryHead
+  > = {};
   private readonly clientId: string;
   private readonly url: string;
   private backoff = 1;
@@ -157,7 +168,14 @@ export class RelayWs {
 
   /** Runtime ids that must survive client-side reclamation while commands await ACK. */
   pendingSessionIds(): string[] {
-    return this.outbox.pendingSessionIds();
+    return [...new Set([
+      ...this.outbox.pendingSessionIds(),
+      ...this.queryAcceptance.pendingSessionIds(),
+    ])];
+  }
+
+  pendingQueryFor(sid: string): string | null {
+    return this.queryAcceptance.pendingMessageId(sid);
   }
 
   private touchReplay(sid: string): void {
@@ -171,6 +189,7 @@ export class RelayWs {
       delete this.controlBySession[expired];
       delete this.engineBySession[expired];
       delete this.spaceBySession[expired];
+      delete this.historyHeadBySession[expired];
       this.rebuildingSessions.delete(expired);
     }
   }
@@ -183,6 +202,7 @@ export class RelayWs {
       delete this.lastSeqBySession[knownSid];
       delete this.engineBySession[knownSid];
       delete this.spaceBySession[knownSid];
+      delete this.historyHeadBySession[knownSid];
       this.rebuildingSessions.delete(knownSid);
       this.replayOrder = this.replayOrder.filter((item) => item !== knownSid);
     }
@@ -406,10 +426,26 @@ export class RelayWs {
   }
 
   sendQuery(prompt: string, msg_id: string, images?: QueryImg[], files?: QueryFile[]): boolean {
-    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "query", prompt, msg_id, ts: nowTs(), ...this.sidObj() };
+    const sid = this.focusedSid;
+    if (!sid || this.queryAcceptance.pendingMessageId(sid)) return false;
+    const sentAt = nowTs();
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: sentAt,
+    };
     if (images && images.length) obj.images = images;
     if (files && files.length) obj.files = files;
-    return this.send(obj);
+    if (!this.send(obj)) return false;
+    const historyHead = this.historyHeadBySession[sid];
+    const baseline = historyHead ? {
+      ...historyHead,
+      liveSeq: Math.max(
+        historyHead.liveSeq, this.lastSeqBySession[sid] ?? 0),
+    } : null;
+    return this.queryAcceptance.begin(
+      sid, msg_id,
+      queryAcceptanceDescriptor(msg_id, prompt, images, files),
+      baseline,
+    );
   }
 
   // ---- /btw ephemeral side-fork ----
@@ -443,12 +479,25 @@ export class RelayWs {
   // a turn targeted at an explicit sid (the btw fork), NOT the focused session.
   sendQueryTo(sid: string, prompt: string, msg_id: string,
               images?: QueryImg[], files?: QueryFile[]): boolean {
+    if (this.queryAcceptance.pendingMessageId(sid)) return false;
+    const sentAt = nowTs();
     const obj: Record<string, unknown> = {
-      v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: nowTs(),
+      v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: sentAt,
     };
     if (images && images.length) obj.images = images;
     if (files && files.length) obj.files = files;
-    return this.send(obj);
+    if (!this.send(obj)) return false;
+    const historyHead = this.historyHeadBySession[sid];
+    const baseline = historyHead ? {
+      ...historyHead,
+      liveSeq: Math.max(
+        historyHead.liveSeq, this.lastSeqBySession[sid] ?? 0),
+    } : null;
+    return this.queryAcceptance.begin(
+      sid, msg_id,
+      queryAcceptanceDescriptor(msg_id, prompt, images, files),
+      baseline,
+    );
   }
 
   sendInterrupt(): void {
@@ -986,6 +1035,49 @@ export class RelayWs {
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
+        if ((msg.type === "user_msg" || msg.type === "turn_binding"
+              || msg.type === "error")
+            && this.queryAcceptance.accept(msg)) {
+          // Keep a runtime protected after command ACK until its narrative
+          // acceptance/error is visible, then allow normal pruning again.
+          this.cb.onOutboxChanged?.(this.pendingSessionIds());
+        }
+        if (msg.type === "history") {
+          let acceptedFromHistory = false;
+          for (const historyEvent of msg.events) {
+            if (historyEvent.type !== "user_msg"
+                && historyEvent.type !== "turn_binding"
+                && historyEvent.type !== "error") continue;
+            acceptedFromHistory = this.queryAcceptance.accept({
+              ...historyEvent,
+              sid: historyEvent.sid ?? msg.session_id,
+            }) || acceptedFromHistory;
+          }
+          const pending = this.queryAcceptance.pendingMessageId(msg.session_id);
+          if (pending && msg.turns?.some((turn) => turn.id === pending)) {
+            acceptedFromHistory =
+              this.queryAcceptance.completeSession(msg.session_id)
+              || acceptedFromHistory;
+          }
+          acceptedFromHistory =
+            this.queryAcceptance.acceptHistory(msg) || acceptedFromHistory;
+          const historyHead = queryAcceptanceHistoryHead(msg);
+          if (historyHead) {
+            const previous = this.historyHeadBySession[msg.session_id];
+            const isOlderSameEpoch = !!previous
+              && previous.generation === historyHead.generation
+              && previous.revision === historyHead.revision
+              && historyHead.buildSeq < previous.buildSeq;
+            if (!isOlderSameEpoch) {
+              this.historyHeadBySession[msg.session_id] = historyHead;
+            }
+          }
+          if (acceptedFromHistory) {
+            // A reconnect may recover the accepted query only through a
+            // materialized page after its live echo fell outside replay.
+            this.cb.onOutboxChanged?.(this.pendingSessionIds());
+          }
+        }
         if (msg.type === "command_ack") {
           if (this.outbox.ack(msg.client_id, msg.cmd_id)) {
             this.cb.onOutboxChanged?.(this.pendingSessionIds());
@@ -1090,11 +1182,18 @@ export class RelayWs {
               this.spaceBySession[session_id] = this.spaceBySession[old_key];
             }
             delete this.spaceBySession[old_key];
+            if (this.historyHeadBySession[old_key]
+                && !this.historyHeadBySession[session_id]) {
+              this.historyHeadBySession[session_id] =
+                this.historyHeadBySession[old_key];
+            }
+            delete this.historyHeadBySession[old_key];
             if (ownership) {
               this.ownershipBySession[session_id] = ownership;
               delete this.ownershipBySession[old_key];
             }
             this.outbox.rekeySession(old_key, session_id);
+            this.queryAcceptance.rekeySession(old_key, session_id);
             this.replayOrder = this.replayOrder.filter((sid) => sid !== old_key);
             this.touchReplay(session_id);
             if (this.focusedSid === old_key) this.focusedSid = session_id;
@@ -1114,6 +1213,9 @@ export class RelayWs {
           }
           // Snapshots announce background runtimes. Only an explicit switch or
           // correlated create response may move focus across product surfaces.
+        }
+        if (msg.type === "history_invalidated") {
+          delete this.historyHeadBySession[msg.session_id];
         }
         if (msg.type === "replay_start" && msg.sid && msg.generation) {
           this.noteGeneration(msg.sid, msg.generation);

@@ -1,4 +1,12 @@
-import { useEffect, useRef, useState, type ClipboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type SetStateAction,
+} from "react";
 import type { State, QueryImg, QueryFile, ContextReport, CollaborationModeName, SessionControl, EngineCapabilityKind } from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
@@ -16,8 +24,11 @@ import {
   isSettlingStopDisabled,
 } from "../composer-submit";
 import { workContextMetrics } from "../work-context";
+import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
 
 interface Props {
+  draftKey: string;
+  draftStore: ComposerDraftStore;
   surface?: "code" | "work";
   state: State;
   connState: ConnState;
@@ -74,7 +85,37 @@ interface Props {
 export function Composer(p: Props) {
   const editPrompt = p.editPrompt;
   const onEditConsumed = p.onEditConsumed;
-  const [input, setInput] = useState("");
+  const draftKeyRef = useRef(p.draftKey);
+  const [draft, setDraft] = useState<ComposerDraft>(
+    () => p.draftStore.get(p.draftKey));
+  const input = draft.input;
+  const images = draft.images;
+  const files = draft.files;
+  const updateDraft = useCallback((
+    update: (current: ComposerDraft) => ComposerDraft,
+  ) => {
+    const key = draftKeyRef.current;
+    setDraft((current) => {
+      const next = update(current);
+      p.draftStore.set(key, next);
+      return next;
+    });
+  }, [p.draftStore]);
+  const setInput = useCallback((next: SetStateAction<string>) => updateDraft((current) => ({
+    ...current,
+    input: typeof next === "function" ? next(current.input) : next,
+  })), [updateDraft]);
+  const setImages = useCallback((next: SetStateAction<QueryImg[]>) => updateDraft((current) => ({
+    ...current,
+    images: typeof next === "function" ? next(current.images) : next,
+  })), [updateDraft]);
+  const setFiles = useCallback((next: SetStateAction<QueryFile[]>) => updateDraft((current) => ({
+    ...current,
+    files: typeof next === "function" ? next(current.files) : next,
+  })), [updateDraft]);
+  const clearDraft = useCallback(() => updateDraft(() => ({
+    input: "", images: [], files: [],
+  })), [updateDraft]);
   // Only the modal pickers live in state now; the "/" command palette is a live
   // popover DERIVED from the composer text (no second input box).
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
@@ -83,17 +124,30 @@ export function Composer(p: Props) {
   const workSettingsRef = useRef<HTMLDetailsElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<number | null>(null);
-  const [images, setImages] = useState<QueryImg[]>([]);
-  const [files, setFiles] = useState<QueryFile[]>([]);
   const [importing, setImporting] = useState(false);
   const [dragDepth, setDragDepth] = useState(0);
   const dragOver = dragDepth > 0;
   const taRef = useRef<HTMLTextAreaElement>(null);
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
+  const photoRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const pickFilesRef = useRef<(files: FileList | File[] | null) => Promise<void>>(
     async () => {});
+
+  useLayoutEffect(() => {
+    if (draftKeyRef.current === p.draftKey) return;
+    draftKeyRef.current = p.draftKey;
+    setDraft(p.draftStore.get(p.draftKey));
+    setSheetKind(null);
+    setCtxOpen(false);
+    setNotice(null);
+    if (noticeTimer.current !== null) {
+      window.clearTimeout(noticeTimer.current);
+      noticeTimer.current = null;
+    }
+    if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
+  }, [p.draftKey, p.draftStore]);
 
   // context popover: close on outside click
   useEffect(() => {
@@ -178,7 +232,7 @@ export function Composer(p: Props) {
         taRef.current.style.height = Math.min(taRef.current.scrollHeight, 132) + "px";
       }
     }
-  }, [editPrompt, onEditConsumed]);
+  }, [editPrompt, onEditConsumed, setInput]);
 
   const resetTaHeight = () => { if (taRef.current) taRef.current.style.height = "auto"; };
   const growTa = () => {
@@ -187,6 +241,9 @@ export function Composer(p: Props) {
       taRef.current.style.height = Math.min(taRef.current.scrollHeight, 132) + "px";
     }
   };
+  useLayoutEffect(() => {
+    growTa();
+  }, [input, p.draftKey]);
   const focusTa = () => setTimeout(() => taRef.current?.focus(), 0);
   const flash = (msg: string) => {
     setNotice(msg);
@@ -210,12 +267,26 @@ export function Composer(p: Props) {
 
   const onPickFiles = async (fl: FileList | File[] | null) => {
     if (importing) { flash("附件正在导入，请稍候"); return; }
+    const targetDraftKey = draftKeyRef.current;
     setImporting(true);
     try {
       const batch = await pickFiles(
         fl, images.length + files.length, attachmentBytes(images, files));
-      if (batch.images.length) setImages((previous) => [...previous, ...batch.images]);
-      if (batch.files.length) setFiles((previous) => [...previous, ...batch.files]);
+      if (draftKeyRef.current === targetDraftKey) {
+        if (batch.images.length) {
+          setImages((previous) => [...previous, ...batch.images]);
+        }
+        if (batch.files.length) {
+          setFiles((previous) => [...previous, ...batch.files]);
+        }
+      } else if (batch.images.length || batch.files.length) {
+        const prior = p.draftStore.get(targetDraftKey);
+        p.draftStore.set(targetDraftKey, {
+          ...prior,
+          images: [...prior.images, ...batch.images],
+          files: [...prior.files, ...batch.files],
+        });
+      }
       if (batch.errors.length) flash(batch.errors.join("；"));
     } finally {
       setImporting(false);
@@ -276,7 +347,6 @@ export function Composer(p: Props) {
       const action = classifyBusySubmit(
         p.state, p.sendMode, !!prompt || hasAttachments);
       if (action === "noop") return;
-      if (action === "interrupt") { p.onInterrupt(); return; }
       const existing = p.sendMode === "queue" ? p.allQueued : p.replaceableQueued;
       if (!canEnqueueQuery(existing, query)) {
         flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
@@ -284,18 +354,18 @@ export function Composer(p: Props) {
       }
       if (action === "enqueue") {
         p.onEnqueue(query);
-        setInput(""); setImages([]); setFiles([]); resetTaHeight();
+        clearDraft(); resetTaHeight();
         return;
       }
       if (action === "interrupt-and-replace") p.onInterrupt();
       p.onSetPending(query);
-      setInput(""); setImages([]); setFiles([]); resetTaHeight();
+      clearDraft(); resetTaHeight();
       return;
     }
     if (!prompt && !hasAttachments) return;
     if (p.onSendQuery(
         prompt, images.length ? images : undefined, files.length ? files : undefined)) {
-      setInput(""); setImages([]); setFiles([]); resetTaHeight();
+      clearDraft(); resetTaHeight();
     }
   };
 
@@ -426,7 +496,12 @@ export function Composer(p: Props) {
     if (buttonSendTimerRef.current !== null) return;
     buttonSendTimerRef.current = window.setTimeout(() => {
       buttonSendTimerRef.current = null;
-      send();
+      const buttonPrompt = taRef.current?.value ?? input;
+      if (busy && !buttonPrompt.trim() && !hasAttachments) {
+        if (p.state === "running") p.onInterrupt();
+        return;
+      }
+      send(buttonPrompt);
     }, 0);
   };
 
@@ -570,7 +645,10 @@ export function Composer(p: Props) {
           </div>
         )}
 
-        <input ref={fileRef} type="file" multiple hidden
+        <input ref={photoRef} type="file" accept="image/*" multiple hidden
+          aria-label="添加照片"
+          onChange={(e) => { void onPickFiles(e.target.files); e.target.value = ""; }} />
+        <input ref={fileRef} type="file" multiple hidden aria-label="添加文件"
           onChange={(e) => { void onPickFiles(e.target.files); e.target.value = ""; }} />
 
         {workSurface ? (
@@ -649,7 +727,9 @@ export function Composer(p: Props) {
           </div>
         ) : (<>
           <div className="inrow">
-            <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="附件" disabled={locked || importing}><Icon name="plus" size={19} /></button>
+            <button className="cmdbtn" onClick={() => photoRef.current?.click()}
+              aria-label="添加照片" title="添加照片"
+              disabled={locked || importing}><Icon name="plus" size={19} /></button>
             {inputControl("发消息…  输入 / 唤起命令")}
             {sendControl}
           </div>

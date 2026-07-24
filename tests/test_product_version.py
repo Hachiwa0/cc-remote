@@ -30,6 +30,8 @@ def test_v3_product_version_is_consistent_across_runtime_and_web_metadata():
         "protocol": PROTOCOL_VERSION,
     }
     assert _initialize_params()["clientInfo"]["version"] == __version__
+    installer = (ROOT / "deploy/install.sh").read_text()
+    assert f'VERSION="${{CC_REMOTE_VERSION:-{__version__}}}"' in installer
 
 
 def test_release_docs_distinguish_product_and_wire_protocol_versions():

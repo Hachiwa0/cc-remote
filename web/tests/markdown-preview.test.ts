@@ -11,6 +11,7 @@ import {
   InlineImageAssetCache,
   classifyMessageImageTarget,
 } from "../src/inline-image-assets.ts";
+import { imageDimensionsFromBase64, queryImageDimensions } from "../src/img.ts";
 import { collectTurnFileChanges, filePathsFromInput, mutatedFilePaths } from "../src/file-changes.ts";
 import type { ServerEvent } from "../src/protocol.ts";
 
@@ -82,6 +83,40 @@ assert.equal(inlineAssets.forSession("other-session")["qr.png"], undefined,
 assert.equal(inlineAssets.dropSession("session-1"), true);
 assert.equal(inlineAssets.forSession("session-1")["qr.png"], undefined,
   "a destructive history invalidation must evict the session's rendered assets");
+
+const pngHeader = new Uint8Array(24);
+pngHeader.set([0x89, ...new TextEncoder().encode("PNG\r\n\x1a\n")], 0);
+pngHeader.set(new TextEncoder().encode("IHDR"), 12);
+new DataView(pngHeader.buffer).setUint32(16, 640);
+new DataView(pngHeader.buffer).setUint32(20, 480);
+const pngHeaderBase64 = Buffer.from(pngHeader).toString("base64");
+assert.deepEqual(imageDimensionsFromBase64(pngHeaderBase64, "image/png"), [640, 480],
+  "base64 chat images expose dimensions without decoding a DOM image");
+assert.deepEqual(queryImageDimensions({
+  media_type: "image/png", data: pngHeaderBase64,
+}), [640, 480], "wire-compatible QueryImg objects can provide local layout metadata");
+new DataView(pngHeader.buffer).setUint32(16, 8192);
+new DataView(pngHeader.buffer).setUint32(20, 8192);
+assert.equal(imageDimensionsFromBase64(
+  Buffer.from(pngHeader).toString("base64"), "image/png",
+), null, "untrusted image headers cannot reserve an unbounded layout box");
+new DataView(pngHeader.buffer).setUint32(16, 640);
+new DataView(pngHeader.buffer).setUint32(20, 480);
+
+const sizedInlineAssets = new InlineImageAssetCache(2);
+assert.equal(sizedInlineAssets.begin({
+  sid: "session-1", path: "sized-qr.png",
+  previewId: "preview-sized", requestId: "request-sized",
+}), true);
+assert.equal(sizedInlineAssets.accept({
+  v: 19, type: "preview_asset", ts: 3, sid: "session-1",
+  path: "sized-qr.png", preview_id: "preview-sized",
+  request_id: "request-sized", media_type: "image/png", data: pngHeaderBase64,
+}), true);
+assert.deepEqual(sizedInlineAssets.forSession("session-1")["sized-qr.png"], {
+  status: "ready", mediaType: "image/png", data: pngHeaderBase64,
+  width: 640, height: 480,
+}, "local Markdown images keep an intrinsic first-frame aspect ratio");
 assert.deepEqual(mutatedFilePaths("Write", {
   file_path: "/tmp/claude.txt",
 }), ["/tmp/claude.txt"]);
@@ -160,14 +195,33 @@ try {
     done: true,
     imageAssets: {
       "/Volumes/MuggleSSD/workspace/project/tmp-auth.png": {
-        status: "ready", mediaType: "image/png", data: "cG5n",
+        status: "ready", mediaType: "image/png", data: pngHeaderBase64,
+        width: 640, height: 480,
       },
     },
     onPreviewImage: () => {},
   }));
   assert.match(loadedQrMarkup, /class="message-image-trigger"/);
-  assert.match(loadedQrMarkup, /src="data:image\/png;base64,cG5n"/);
+  assert.match(loadedQrMarkup, /src="data:image\/png;base64,/);
+  assert.match(loadedQrMarkup, /width="640"/);
+  assert.match(loadedQrMarkup, /height="480"/);
   assert.match(loadedQrMarkup, /aria-label="预览图片：飞书授权二维码"/);
+
+  const { NewChatView } = await harness.ssrLoadModule(
+    "/src/components/NewChatView.tsx");
+  const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
+    cwd: "/tmp/project",
+    onPickCwd: () => {},
+    onSend: () => true,
+  }));
+  assert.match(newChatMarkup, /aria-label="添加照片"/);
+  assert.match(newChatMarkup, /aria-label="添加文件"/);
+  assert.equal(
+    (newChatMarkup.match(/<button[^>]+aria-label="添加照片"/g) ?? []).length, 1);
+  assert.equal(
+    (newChatMarkup.match(/<button[^>]+aria-label="添加文件"/g) ?? []).length, 0);
+  assert.match(newChatMarkup, /type="file"[^>]*accept="image\/\*"[^>]*multiple/,
+    "iPhone photo selection needs a dedicated multi-select image input");
   let state = reduce(initialState, {
     type: "open_file_loading",
     file: "README.md",

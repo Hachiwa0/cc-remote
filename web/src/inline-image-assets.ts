@@ -1,5 +1,6 @@
 import type { PreviewAsset } from "./protocol.ts";
 import { parseLocalFileTarget } from "./file-link.ts";
+import { imageDimensionsFromBase64 } from "./img.ts";
 
 export type MessageImageTarget =
   | { kind: "local"; value: string }
@@ -30,6 +31,8 @@ export interface InlineImageAsset {
   status: "loading" | "ready" | "error";
   mediaType?: string;
   data?: string;
+  width?: number;
+  height?: number;
 }
 
 interface AssetEntry extends InlineImageAsset {
@@ -119,12 +122,16 @@ export class InlineImageAssetCache {
         || event.preview_id !== request.previewId) return false;
     this.pending.delete(event.request_id);
     const ready = !!event.data && !!event.media_type && !event.error;
+    const dimensions = ready
+      ? imageDimensionsFromBase64(event.data ?? "", event.media_type ?? "")
+      : null;
     this.entries.set(request.key, {
       sid: request.sid,
       path: request.path,
       status: ready ? "ready" : "error",
       mediaType: ready ? event.media_type ?? undefined : undefined,
       data: ready ? event.data ?? undefined : undefined,
+      ...(dimensions ? { width: dimensions[0], height: dimensions[1] } : {}),
       lastUsed: ++this.tick,
     });
     return true;
@@ -139,6 +146,9 @@ export class InlineImageAssetCache {
         status: entry.status,
         mediaType: entry.mediaType,
         data: entry.data,
+        ...(entry.width && entry.height
+          ? { width: entry.width, height: entry.height }
+          : {}),
       };
     }
     return assets;

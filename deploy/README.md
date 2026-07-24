@@ -4,6 +4,24 @@ Reference files for the production deploy (public VPS relay + wrapper on your
 machine). The **full step-by-step guide is in the main [README](../README.md#生产部署公网-vps-中继--你机器上的-wrapper)**
 ([English](../README_en.md#production-deploy-public-vps-relay--wrapper-on-your-machine)).
 
+- `install.sh` — versioned GitHub Release bootstrap. It requires an explicit
+  `relay` or `wrapper` role, detects OS/CPU, downloads that one role archive,
+  verifies its `SHA256SUMS` entry before extraction, rejects unsafe archive
+  paths, and then invokes the in-bundle installer. It never pipes a network
+  response into a shell.
+- `build_release.py` / `release_manifest.py` — reproducible role-bundle builder
+  and fail-closed manifest validator. Relay artifacts contain `web/dist` and
+  `requirements-relay.lock`; Wrapper artifacts contain no Web tree and use
+  `requirements-wrapper.lock`. Each artifact carries the product version,
+  protocol, full Git SHA, OS, architecture, and Python runtime contract.
+- `install-relay.sh` — first-install/upgrade entry for a published Relay
+  bundle. It creates secrets only when `/opt/cc-remote/.env` does not exist,
+  then delegates to the existing transactional VPS installer.
+- `install-wrapper.sh` — first-install/upgrade entry for published macOS and
+  Linux Wrapper bundles. It builds the immutable release before pairing and
+  activation, stores device authority outside the release, atomically switches
+  `current`, installs a per-user LaunchAgent or root-managed systemd unit, and
+  restores the previous release/service definition on failure.
 - `setup-vps.sh` — atomic VPS release installer. It validates a user-owned
   upload, copies it to a new root-owned
   `/opt/cc-remote/releases/release-*` directory, builds that release's own
@@ -27,12 +45,15 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   `.env` from model descendants, and disables core dumps.
 - `env.relay.example` / `env.wrapper.example` — environment templates for each
   side. Install the wrapper template as root:root mode 0600 at the path above.
+- `com.muggle.cc-remote.wrapper.plist.in` — secret-free macOS LaunchAgent
+  template. The runtime reads the current user's mode-0600 device JSON instead
+  of embedding control credentials in the plist.
 
-Protocol v19 is a coordinated upgrade: publish the Python package and freshly
-built `web/dist` as one release, then restart relay and wrapper. The strict
-protocol gate is intentional and mixed protocol versions will not communicate.
-`setup-vps.sh` rejects a missing or mismatched web build manifest. Stop the
-wrapper first; activate the v19 relay/web release; then start the v19 wrapper.
+Protocol v19 is a coordinated upgrade: publish freshly built Relay/Web and
+Wrapper artifacts from the same tagged commit. The strict protocol gate is
+intentional and mixed protocol versions will not communicate. `setup-vps.sh`
+rejects a missing or mismatched web build manifest. Stop the wrapper first;
+activate the v19 relay/web release; then start the v19 wrapper.
 
 ## Native terminal coordination
 

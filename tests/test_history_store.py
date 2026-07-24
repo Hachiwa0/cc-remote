@@ -171,6 +171,68 @@ def test_history_index_is_bounded_and_invalidatable(tmp_path):
     assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
 
 
+def test_v6_migration_invalidates_only_codex_derived_rows(tmp_path):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id, engine, source, before=None, limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id, engine, source, session_id, f"{engine}-image",
+            "thumbnail", "image/png", 1, 1, engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA user_version=6")
+        for table in (
+            "history_pages",
+            "history_turn_details",
+            "history_image_assets",
+        ):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 1
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 1
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        for table in (
+            "history_pages",
+            "history_turn_details",
+            "history_image_assets",
+        ):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 1
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) == _page("claude-session")
+    assert migrated.get_turn_detail(
+        "claude-session", "claude", source, "claude-session",
+    ) is not None
+    assert migrated.get_image_asset(
+        "claude-session", "claude", source, "claude-session",
+        "claude-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"claude")
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) is None
+
+
 def test_history_index_rejects_one_page_larger_than_total_budget(tmp_path):
     source_path = tmp_path / "transcript.jsonl"
     source_path.write_text("{}\n")

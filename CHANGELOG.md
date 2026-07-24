@@ -59,6 +59,12 @@ client coexistence, multiple wrapper machines, and reliable mobile use.
 - Align Python, Codex `clientInfo`, Web package metadata, and the public build
   manifest on product version `3.0.0`.
 - Upgrade the strict wire gate to protocol v19.
+- Publish reproducible, checksummed Relay/Wrapper archives for Linux x86_64,
+  Linux arm64, macOS Intel, and macOS Apple Silicon, with GitHub artifact
+  attestations.
+- Add a verified role bootstrap, managed Python 3.13 environments, a macOS
+  LaunchAgent installer, and a Linux Wrapper systemd installer. Device
+  credentials remain outside immutable releases and service definitions.
 - Validate product and protocol versions together before staging or activating
   a release.
 - Use immutable VPS releases, release-local virtual environments, atomic

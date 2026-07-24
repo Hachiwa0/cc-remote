@@ -28,7 +28,11 @@ import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
 import { shouldAcceptSessionList } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
-import { collectWaitingQueries, selectDrainCandidates } from "./runtime-drain";
+import {
+  canEnqueueQuery,
+  collectWaitingQueries,
+  selectDrainCandidates,
+} from "./runtime-drain";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
 import { isTerminalWorktreeForkError, matchesSessionForkRequest,
   matchesWorktreeForkRequest, type PendingSessionFork,
@@ -56,6 +60,7 @@ import { HistoryRequestCoordinator } from "./history-requests";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
 import { HistoryImageAssetCache } from "./history-image-assets";
+import { ComposerDraftStore, composerDraftKey } from "./composer-drafts";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -123,6 +128,7 @@ export default function App() {
   const inlineImageAssetsRef = useRef(new InlineImageAssetCache());
   const [, bumpInlineImageRevision] = useReducer((value: number) => value + 1, 0);
   const historyImageAssetsRef = useRef(new HistoryImageAssetCache());
+  const composerDraftsRef = useRef(new ComposerDraftStore());
   const [, bumpHistoryImageRevision] = useReducer((value: number) => value + 1, 0);
   const dismissBanner = useCallback((banner: string) => {
     dispatch({ type: "dismiss_banner", banner });
@@ -235,6 +241,9 @@ export default function App() {
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const focusedEngine = (state.sessions.find(
     (session) => session.session_id === focusedSid)?.engine ?? engine) as "claude" | "codex";
+  const focusedComposerDraftKey = composerDraftKey(
+    machineId, space, focusedEngine, focusedSid ?? "",
+  );
   const inlineImageAssets = focusedSid
     ? inlineImageAssetsRef.current.forSession(focusedSid) : {};
   const historyImageAssets = focusedSid
@@ -762,6 +771,18 @@ export default function App() {
             return;
           }
           if (msg.type === "session_rekey") {
+            if (ownership) {
+              composerDraftsRef.current.rekey(
+                composerDraftKey(
+                  ownership.machineId, ownership.space, ownership.engine,
+                  msg.old_key,
+                ),
+                composerDraftKey(
+                  ownership.machineId, ownership.space, ownership.engine,
+                  msg.session_id,
+                ),
+              );
+            }
             setWorkArtifactsBySid((current) => {
               const prior = current[msg.old_key];
               if (!prior) return current;
@@ -1234,9 +1255,31 @@ export default function App() {
   }
 
   const sendQuery = (prompt: string, images?: QueryImg[], files?: QueryFile[]): boolean => {
-    if (!wsRef.current || !focusedSid) return false;
+    const ws = wsRef.current;
+    if (!ws || !focusedSid) return false;
+    const query = { prompt, images, files };
+    const currentState = stateRef.current;
+    if (ws.pendingQueryFor(focusedSid)
+        || currentState.runtimes[focusedSid]?.acceptancePending) {
+      const waiting = collectWaitingQueries(
+        currentState.runtimes,
+        currentState.sendMode === "interrupt" ? focusedSid : undefined,
+      );
+      if (!canEnqueueQuery(waiting, query)) {
+        dispatch({
+          type: "command_error",
+          detail: "排队已满（最多 32 条 / 64 MiB），请先等待发送。",
+        });
+        return false;
+      }
+      dispatch(currentState.sendMode === "queue"
+        ? { type: "enqueue", sid: focusedSid, query }
+        : { type: "set_pending", sid: focusedSid, query });
+      return true;
+    }
     const msg_id = uuid();
-    if (!wsRef.current.sendQuery(prompt, msg_id, images, files)) return false;
+    if (!ws.sendQueryTo(focusedSid, prompt, msg_id, images, files)) return false;
+    drainingRef.current.add(focusedSid);
     const activityMs = Date.now();
     const surfaceKey = `${space}:${engine}`;
     const cached = sessionListsBySurfaceRef.current[surfaceKey];
@@ -1481,6 +1524,7 @@ export default function App() {
       discardedBtwSidsRef.current.clear();
       historyInvalidationsRef.current.clear();
       historyCacheEpochRef.current.clear();
+      composerDraftsRef.current.clear();
       setCreateError(null);
       setForkingPointId(null);
       setForkWorktreeSession(null);
@@ -1562,6 +1606,14 @@ export default function App() {
             ? "删除后将永久移除这项工作及其私有文件，确定继续吗？"
             : "删除后将永久移除这条会话历史；代码文件不会被删除，确定继续吗？";
           if (!window.confirm(warning)) return;
+          const deleted = state.sessions.find(
+            (session) => session.session_id === id);
+          const target = deleted
+            ? sessionCommandTarget(deleted, engine, space)
+            : { engine, space };
+          composerDraftsRef.current.delete(composerDraftKey(
+            machineId, target.space, target.engine, id,
+          ));
           if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
           wsRef.current?.sendDeleteSession(id, engine, space);
         }}
@@ -1660,6 +1712,8 @@ export default function App() {
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={!!rt.hasMore}
+              historyRevision={rt.historyRevision}
+              historyCursor={rt.oldestId}
               onLoadMore={() => focusedSid ? requestHistory(
                 focusedSid, rt.oldestId, HISTORY_MORE_PAGE) : false}
               onLoadDetail={(turnId) => {
@@ -1701,6 +1755,8 @@ export default function App() {
               }} />
 
             <Composer
+          draftKey={focusedComposerDraftKey}
+          draftStore={composerDraftsRef.current}
           surface={space}
           state={rt.state}
           catalog={state.catalog}

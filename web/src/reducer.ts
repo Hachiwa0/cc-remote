@@ -30,6 +30,11 @@ import {
 import { boundRuntimeTurns, pruneRuntimeMap } from "./runtime-bounds";
 import { bumpSessionActivity, setSessionPinned } from "./session-order";
 import { presentCommandProblem, presentTurnProblem } from "./problem-presentation";
+import {
+  matchQueryAcceptanceHistory,
+  queryAcceptanceDescriptor,
+  type QueryAcceptanceHistoryHead,
+} from "./outbox";
 
 export interface TextBlock {
   kind: "text";
@@ -105,6 +110,10 @@ export const MAX_SESSION_NOTICES = 8;
 
 export interface Turn {
   id: string;
+  // A just-sent browser turn keeps its optimistic id so live deltas do not
+  // remount. Canonical history images are addressed by the transcript's native
+  // user id, which can differ until the next cold history rebuild.
+  historyTurnId?: string;
   // Engine-specific authoritative branch point: a Codex app-server turn id or
   // a Claude transcript assistant UUID. The wire keeps the legacy `turn_id`
   // name so already-deployed protocol-v5 peers remain compatible.
@@ -198,6 +207,7 @@ export interface SessionRuntime {
   // generation. Pagination never advances it.
   historyGeneration: string | null;
   historyBuildSeq: number;
+  historyLiveSeq: number;
   // A browser-triggered older-page response has been installed for the current
   // history revision/generation. Subsequent newest-page refreshes are only a
   // moving head window and must not discard those already-loaded older pages.
@@ -211,6 +221,10 @@ export interface SessionRuntime {
   // not a genuine live tail, even when an old cache row happens to be marked
   // unfinished (for example a tab closed halfway through streaming).
   hydratedCacheTurnIds: string[];
+  // Native newest turn id from the last authoritative first History page. A
+  // query freezes this together with revision/build/live watermarks so a later
+  // materialized page can prove acceptance even when its UserMsg id is native.
+  historyNewestId: string | null;
   // true while we've switched to a session but its history hasn't arrived yet
   // (no cache hit + waiting on the wrapper's cold spawn/replay) — drives a spinner.
   loading?: boolean;
@@ -245,6 +259,10 @@ export interface SessionRuntime {
   notices: Notice[];
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
+  // Browser query accepted into the reliable outbox but not yet confirmed by
+  // its exact user echo / native turn binding / correlated terminal Error.
+  acceptancePending: string | null;
+  acceptanceHistoryBaseline: QueryAcceptanceHistoryHead | null;
 }
 
 export interface AppState {
@@ -299,14 +317,17 @@ export function createRuntime(): SessionRuntime {
     replaying: false, syncReady: false, truncated: false,
     historyInvalidated: false,
     historyRevision: null, pendingHistoryRevision: null,
-    historyGeneration: null, historyBuildSeq: 0, lastLiveSeq: 0,
+    historyGeneration: null, historyBuildSeq: 0, historyLiveSeq: 0,
+    lastLiveSeq: 0,
     hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
+    historyNewestId: null,
     pendingQuestion: null, contextReport: null,
     contextRequestId: null, contextError: null, goal: null,
     statusReport: null, statusRequestId: null, statusError: null,
     notices: [],
-    queue: [], pendingSend: null,
+    queue: [], pendingSend: null, acceptancePending: null,
+    acceptanceHistoryBaseline: null,
   };
 }
 
@@ -317,10 +338,10 @@ export type Action =
   | { type: "conn"; connState: ConnState; detail?: string }
   | { type: "command_error"; detail: string }
   | { type: "dismiss_banner"; banner: string }
-  | { type: "enqueue"; query: PendingQuery }
+  | { type: "enqueue"; sid?: string; query: PendingQuery }
   | { type: "dequeue_at"; sid: string; i: number }
   | { type: "set_send_mode"; mode: "interrupt" | "queue" }
-  | { type: "set_pending"; query: PendingQuery }
+  | { type: "set_pending"; sid?: string; query: PendingQuery }
   | { type: "clear_pending"; sid: string }
   | { type: "set_model"; model: string }
   | { type: "set_effort"; effort: string }
@@ -389,7 +410,9 @@ function openTurn(turns: Turn[], fallbackId: string): Turn {
 function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn | undefined {
   if (!id) return undefined;
   return [...turns].reverse().find((turn) =>
-    turn.id === id || turn.forkPointId === id || turn.codexTurnId === id);
+    turn.id === id || turn.forkPointId === id || turn.codexTurnId === id
+    || turn.blocks.some((block) => block.kind === "process"
+      && block.turn_id === id));
 }
 
 function findTurnOwningItem(turns: Turn[], id: string | null | undefined): Turn | undefined {
@@ -843,14 +866,37 @@ export function reduce(state: AppState, action: Action): AppState {
         ? { ...state, banner: undefined }
         : state;
     case "query_sent": {
+      const current = state.runtimes[action.sid];
+      if (!current || (current.acceptancePending
+          && current.acceptancePending !== action.msg_id)) return state;
+      const acceptanceHistoryBaseline = current.historyRevision
+          && current.historyBuildSeq > 0
+        ? {
+          revision: current.historyRevision,
+          generation: current.historyGeneration,
+          buildSeq: current.historyBuildSeq,
+          liveSeq: Math.max(current.historyLiveSeq, current.lastLiveSeq),
+          newestId: current.historyNewestId,
+        }
+        : null;
       const turn: Turn = {
         id: action.msg_id, prompt: action.prompt, blocks: [], done: false,
         images: action.images,
         files: action.files?.map((file) => ({ filename: file.filename, data: "" })),
         ts: action.ts,
       };
-      const runtimes = reduceTargetedRuntime(
+      let runtimes = reduceTargetedRuntime(
         state.runtimes, action.sid, { type: "query_sent", turn });
+      if (runtimes[action.sid]?.acceptancePending !== action.msg_id) {
+        runtimes = {
+          ...runtimes,
+          [action.sid]: {
+            ...runtimes[action.sid],
+            acceptancePending: action.msg_id,
+            acceptanceHistoryBaseline,
+          },
+        };
+      }
       const sessions = bumpSessionActivity(state.sessions, action.sid, action.ts);
       if (runtimes === state.runtimes && sessions === state.sessions) return state;
       return { ...state, runtimes, sessions };
@@ -858,7 +904,7 @@ export function reduce(state: AppState, action: Action): AppState {
     case "enqueue": {
       const allQueued = collectWaitingQueries(state.runtimes);
       if (!canEnqueueQuery(allQueued, action.query)) return state;
-      return patch(state, state.focusedSid, (rt) => {
+      return patch(state, action.sid ?? state.focusedSid, (rt) => {
         rt.queue = [...rt.queue, action.query];
       });
     }
@@ -870,9 +916,10 @@ export function reduce(state: AppState, action: Action): AppState {
     case "set_send_mode":
       return { ...state, sendMode: action.mode };
     case "set_pending": {
-      const waiting = collectWaitingQueries(state.runtimes, state.focusedSid);
+      const targetSid = action.sid ?? state.focusedSid;
+      const waiting = collectWaitingQueries(state.runtimes, targetSid);
       if (!canEnqueueQuery(waiting, action.query)) return state;
-      return patch(state, state.focusedSid, (rt) => { rt.pendingSend = action.query; });
+      return patch(state, targetSid, (rt) => { rt.pendingSend = action.query; });
     }
     case "clear_pending": {
       const runtimes = reduceTargetedRuntime(
@@ -1150,8 +1197,15 @@ function reduceEvent(
               : source.historyRevision === target.historyRevision
                 ? Math.max(source.historyBuildSeq, target.historyBuildSeq)
                 : source.historyBuildSeq,
+            historyLiveSeq: source.historyRevision == null
+              ? target.historyLiveSeq
+              : source.historyRevision === target.historyRevision
+                ? Math.max(source.historyLiveSeq, target.historyLiveSeq)
+                : source.historyLiveSeq,
             historyGeneration: source.historyRevision == null
               ? target.historyGeneration : source.historyGeneration,
+            historyNewestId: source.historyRevision == null
+              ? target.historyNewestId : source.historyNewestId,
             lastLiveSeq: Math.max(source.lastLiveSeq, target.lastLiveSeq),
             hydratedCacheTurnIds: Array.from(new Set([
               ...target.hydratedCacheTurnIds,
@@ -1161,6 +1215,11 @@ function reduceEvent(
             turns: mergedTurns,
             queue: [...source.queue, ...target.queue],
             pendingSend: source.pendingSend ?? target.pendingSend,
+            acceptancePending:
+              source.acceptancePending ?? target.acceptancePending,
+            acceptanceHistoryBaseline: source.acceptancePending
+              ? source.acceptanceHistoryBaseline
+              : target.acceptanceHistoryBaseline,
             notices: mergeNotices(target.notices, source.notices),
           };
           switchControlGeneration(mergedRuntime, mergedControlGeneration);
@@ -1254,9 +1313,11 @@ function reduceEvent(
         rt.truncated = false;
         rt.historyInvalidated = true;
         rt.pendingHistoryRevision = e.revision;
+        rt.historyNewestId = null;
         // Keep the accepted generation until replacement arrives: a slow
         // pre-rollback build from that same generation must remain rejectable.
         rt.historyBuildSeq = 0;
+        rt.historyLiveSeq = 0;
         rt.hasLoadedOlderHistory = false;
         rt.hydratedCacheTurnIds = [];
         rt.loading = true;
@@ -1344,6 +1405,36 @@ function reduceEvent(
           || !base.historyRevision || e.revision !== base.historyRevision)) {
         return state;
       }
+      const pendingAcceptanceTurn = base.acceptancePending
+        ? base.turns.find((turn) => turn.id === base.acceptancePending)
+        : undefined;
+      const acceptedNativeTurnId = pendingAcceptanceTurn
+          && base.acceptanceHistoryBaseline
+        ? matchQueryAcceptanceHistory(
+          queryAcceptanceDescriptor(
+            pendingAcceptanceTurn.id,
+            pendingAcceptanceTurn.prompt,
+            pendingAcceptanceTurn.images,
+            pendingAcceptanceTurn.files,
+          ),
+          base.acceptanceHistoryBaseline,
+          e,
+        )
+        : null;
+      if (acceptedNativeTurnId && base.acceptancePending
+          && acceptedNativeTurnId !== base.acceptancePending) {
+        // The materialized transcript owns a native user id while live UI owns
+        // the browser msg_id. The frozen-head proof above is the missing
+        // TurnBinding: normalize only that exact newest row so normal history
+        // merging preserves the optimistic identity and never renders twice.
+        built.turns = built.turns.map((turn) => turn.id === acceptedNativeTurnId
+          ? {
+              ...turn,
+              id: base.acceptancePending!,
+              historyTurnId: acceptedNativeTurnId,
+            }
+          : turn);
+      }
       const racedLiveEvent = !e.before && e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
       const preserveStableHeadHistory = !e.before
@@ -1425,6 +1516,15 @@ function reduceEvent(
         && !base.hasRevisionedControl;
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
+      const acceptanceConfirmed = !!base.acceptancePending && (
+        !!acceptedNativeTurnId
+        || built.turns.some((turn) => turn.id === base.acceptancePending)
+        || e.events.some((ev) => (
+          (ev.type === "user_msg" || ev.type === "turn_binding"
+            || (ev.type === "error" && ev.code !== "wrapper_offline"))
+          && ev.msg_id === base.acceptancePending
+        ))
+      );
       return {
         ...state,
         // History can contain legacy Error rows.  They may reconstruct a
@@ -1457,6 +1557,14 @@ function reduceEvent(
             historyBuildSeq: acceptsControlState
               ? (e.build_seq ?? base.historyBuildSeq)
               : base.historyBuildSeq,
+            historyLiveSeq: acceptsControlState
+              ? (e.live_seq ?? base.historyLiveSeq)
+              : base.historyLiveSeq,
+            historyNewestId: acceptsControlState
+              ? (Object.prototype.hasOwnProperty.call(e, "newest_id")
+                  ? (e.newest_id ?? null)
+                  : base.historyNewestId)
+              : base.historyNewestId,
             hasLoadedOlderHistory: e.before
               ? true
               : preserveStableHeadHistory
@@ -1491,6 +1599,10 @@ function reduceEvent(
             takeoverMessage: acceptsOwnershipState
               ? (e.takeover_pending ? base.takeoverMessage : null)
               : base.takeoverMessage,
+            acceptancePending: acceptanceConfirmed
+              ? null : base.acceptancePending,
+            acceptanceHistoryBaseline: acceptanceConfirmed
+              ? null : base.acceptanceHistoryBaseline,
           },
         },
       };
@@ -1813,7 +1925,9 @@ function reduceEvent(
             // The wrapper generation (and every SessionContext seq) restarted.
             // Never compare the new generation against old live/build watermarks.
             rt.historyBuildSeq = 0;
+            rt.historyLiveSeq = 0;
             rt.historyGeneration = null;
+            rt.historyNewestId = null;
             rt.lastLiveSeq = 0;
           }
           rt.loading = true;
@@ -1874,6 +1988,10 @@ function reduceEvent(
       }
       return patch(state, e.sid, (rt) => {
         rt.loading = false; // never leave a spinner spinning behind an error
+        if (rt.acceptancePending === e.msg_id) {
+          rt.acceptancePending = null;
+          rt.acceptanceHistoryBaseline = null;
+        }
         markTurnAsLive(rt, e.msg_id!, boundCompletedTurns, e.seq);
         const turns = cloneTurns(rt.turns);
         const t = turns.find((turn) => turn.id === e.msg_id);
@@ -1893,6 +2011,10 @@ function reduceEvent(
     }
     case "user_msg": {
       const next = patch(state, e.sid, (rt) => {
+        if (rt.acceptancePending === e.msg_id) {
+          rt.acceptancePending = null;
+          rt.acceptanceHistoryBaseline = null;
+        }
         markTurnAsLive(rt, e.msg_id, boundCompletedTurns, e.seq);
         const turns = cloneTurns(rt.turns);
         const existing = turns.find((t) => t.id === e.msg_id);
@@ -2149,6 +2271,10 @@ function reduceEvent(
       });
     case "turn_binding":
       return patch(state, e.sid, (rt) => {
+        if (rt.acceptancePending === e.msg_id) {
+          rt.acceptancePending = null;
+          rt.acceptanceHistoryBaseline = null;
+        }
         const turns = cloneTurns(rt.turns);
         const optimisticIndex = turns.findIndex((turn) => turn.id === e.msg_id);
         if (optimisticIndex < 0) return;
@@ -2173,9 +2299,20 @@ function reduceEvent(
     case "turn_end":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = turns[turns.length - 1];
+        let t = findTurnByEngineId(turns, e.turn_id);
+        if (!t) {
+          const openTurns = turns.filter((turn) => !turn.done);
+          // Claude and older producers may reveal the native id only at the
+          // terminal boundary. Preserve that legacy path when there is exactly
+          // one unclosed owner, while never closing an unrelated completed row.
+          if (openTurns.length === 1) t = openTurns[0];
+        }
         if (t) {
           markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+          if (rt.acceptancePending === t.id) {
+            rt.acceptancePending = null;
+            rt.acceptanceHistoryBaseline = null;
+          }
           t.done = true;
           t.durationMs = e.result.duration_ms;
           if (e.turn_id) t.forkPointId = e.turn_id;

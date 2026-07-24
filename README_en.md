@@ -300,9 +300,95 @@ Browse to **http://127.0.0.1:8765** → log in with `LOGIN_PASSWORD` → send a 
 
 > To hack on the UI use dev mode: `npm --prefix web run dev` (Vite). For running/testing, the `build` + relay-served approach above is simpler (same origin).
 
+## One-command GitHub Release install (recommended for production)
+
+Published releases split Relay and Wrapper into system/architecture-specific
+artifacts. Relay contains only the backend and prebuilt Web client; Wrapper
+contains only the local control plane. Both bundle `uv` and create a managed
+Python 3.13 environment during installation. Users do not need to clone the
+repository, install Node, or paste tokens into service definitions.
+
+| Role | System | Architectures | Service |
+|---|---|---|---|
+| Relay | Ubuntu 22.04+ / Debian 12+ | x86_64, arm64 | systemd + Caddy |
+| Wrapper | macOS | Intel, Apple Silicon | per-user LaunchAgent |
+| Wrapper | glibc Linux with systemd (Ubuntu 22.04+ / Debian 12+ recommended) | x86_64, arm64 | systemd under a chosen ordinary user |
+
+### 1) Download and verify the bootstrap
+
+Confirm the version and release attestation on GitHub, then download
+`install.sh` and `SHA256SUMS` from that same release:
+
+```bash
+release=https://github.com/muggle-stack/cc-remote/releases/download/v3.0.0
+curl -fLO "$release/install.sh"
+curl -fLO "$release/SHA256SUMS"
+
+# Linux
+grep ' install.sh$' SHA256SUMS | sha256sum -c -
+# On macOS use:
+# grep ' install.sh$' SHA256SUMS | shasum -a 256 -c -
+chmod +x install.sh
+```
+
+The bootstrap detects OS/CPU, downloads only the selected role artifact, and
+checks its SHA-256 before extraction or execution.
+
+### 2) Install Relay on the VPS
+
+Point the domain's A/AAAA record at the VPS, open ports 80/443, then run:
+
+```bash
+./install.sh relay --domain remote.example.com
+```
+
+On Linux the script requests `sudo` itself. A first install asks interactively
+for a web password of at least 16 characters, generates Relay secrets, installs
+Caddy/systemd, and performs immutable staging, atomic `current` activation, and
+rollback under `/opt/cc-remote/releases/`. An existing
+`/opt/cc-remote/.env` is preserved.
+
+Open `https://remote.example.com/`, sign in, choose **Allow adding devices** in
+Device Center, and copy the one-time pair code.
+
+### 3) Install Wrapper where Claude / Codex runs
+
+First ensure the native `claude` or `codex` CLI is signed in and works on that
+machine, then run:
+
+```bash
+./install.sh wrapper \
+  --relay https://remote.example.com \
+  --pair XXXXX-XXXXX-XXXXX-XXXXX \
+  --name "MacBook Pro"
+```
+
+Run the macOS installer as the logged-in desktop user; it creates a per-user
+LaunchAgent. Linux requests `sudo`, while Wrapper and all model/tool descendants
+still run as the ordinary user who started installation. The long-lived device
+credential is stored only in a mode-`0600` private config:
+`~/.cc-remote/device.json` on macOS or `/etc/cc-remote/device.env` on Linux. It
+is never embedded in a plist, systemd unit, or release directory.
+
+For an upgrade, download the new version's `install.sh` and rerun it. Relay
+still needs `--domain`; a previously paired Wrapper needs only:
+
+```bash
+./install.sh wrapper
+```
+
+Complete protocol upgrades for Relay, Web, and every Wrapper in one maintenance
+window, then hard-refresh open browser tabs. The installers retain the previous
+release and restore both `current` and the service definition if activation
+does not become healthy.
+
 ## Production deploy (public VPS relay + wrapper on your machine)
 
-Move the relay to the public internet; the wrapper dials it **outbound** over `wss://`, and phones hit the same domain. The model link is untouched.
+The source-staging/manual path below remains available for development, custom
+deployments, and recovery. Normal production installs should prefer the GitHub
+Release path above. Move the relay to the public internet; the wrapper dials it
+**outbound** over `wss://`, and phones hit the same domain. The model link is
+untouched.
 
 ```
 your machine wrapper ──wss:443──▶ Caddy(VPS, auto HTTPS) ──▶ relay(127.0.0.1:8765) ◀──wss:443── phone browser

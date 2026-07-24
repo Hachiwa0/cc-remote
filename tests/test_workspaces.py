@@ -21,6 +21,27 @@ class WorkRegistryTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_repeated_registry_reads_close_every_sqlite_connection(self):
+        opened: list[sqlite3.Connection] = []
+        real_connect = sqlite3.connect
+
+        def tracked_connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            opened.append(connection)
+            return connection
+
+        with patch(
+            "cc_remote.workspaces.sqlite3.connect", side_effect=tracked_connect,
+        ):
+            for _ in range(10):
+                self.store.records_by_session()
+                self.store.dashboard()
+
+        self.assertGreater(len(opened), 0)
+        for connection in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+
     def test_legacy_schema_migration_is_safe_under_concurrent_initialize(self):
         self.root.mkdir(parents=True)
         with sqlite3.connect(self.store.db_path) as db:

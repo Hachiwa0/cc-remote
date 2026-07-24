@@ -1,7 +1,6 @@
 import type { State } from "./protocol";
 
 export type BusySubmitAction =
-  | "interrupt"
   | "interrupt-and-replace"
   | "replace"
   | "enqueue"
@@ -9,8 +8,9 @@ export type BusySubmitAction =
 
 /** Decide how a submit should behave while the runtime is not idle.
  *
- * An interrupt is edge-triggered: only `running -> interrupting` may send one.
- * Once the wrapper reports interrupting/draining, another click may update the
+ * A payload-less submit is always a no-op.  Stopping a running turn is an
+ * explicit button action and must never be inferred from an empty Enter press.
+ * Once the wrapper reports interrupting/draining, a payload may update the
  * pending message, but must not enqueue a second interrupt command.
  */
 export function classifyBusySubmit(
@@ -19,7 +19,7 @@ export function classifyBusySubmit(
   hasPayload: boolean,
 ): BusySubmitAction {
   if (state === "idle") return "noop";
-  if (!hasPayload) return state === "running" ? "interrupt" : "noop";
+  if (!hasPayload) return "noop";
   if (mode === "queue") return "enqueue";
   return state === "running" ? "interrupt-and-replace" : "replace";
 }

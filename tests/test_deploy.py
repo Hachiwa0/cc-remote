@@ -142,6 +142,7 @@ def test_setup_script_is_valid_shell_and_keeps_safe_install_order():
     assert "flock -n 9" in source
     assert 'RELEASES_DIR="$APPDIR/releases"' in source
     assert 'STATE_DIR="$APPDIR/state"' in source
+    assert 'RUNTIMES_DIR="$APPDIR/runtimes"' in source
     assert 'mkdir -p "$RELEASES_DIR" "$STATE_DIR"' in source
     assert 'chown ccremote:ccremote "$STATE_DIR"' in source
     assert 'CURRENT_LINK="$APPDIR/current"' in source
@@ -196,6 +197,10 @@ def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     assert 'python3 -m venv "$NEW_RELEASE_DIR/.venv"' in source
     assert "VENV_STAGE" not in source
     assert "VENV_BACKUP" not in source
+    assert 'UV_PYTHON_INSTALL_DIR="$RUNTIMES_DIR"' in source
+    assert '--python "$PYTHON_RUNTIME"' in source
+    assert "--exclude='./runtimes'" in source
+    assert "--exclude='./state'" in source
     transaction_source = (ROOT / "deploy" / "setup_transaction.sh").read_text()
     assert "rollback_release" in transaction_source
     assert "rollback_deployment" in transaction_source
@@ -208,10 +213,10 @@ def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     # pywebpush's pure-Python http-ece dependency publishes no wheel. Keep the
     # hash-locked exception narrow instead of disabling the wheel-only policy.
     assert "--no-binary=http-ece" in source
-    assert 'requirements.lock' in source
+    assert 'requirements-relay.lock' in source
     assert "apt-get install -y" in source and "gnupg" in source
     assert "command -v gpg" in source
-    lock = (ROOT / "requirements.lock").read_text()
+    lock = (ROOT / "requirements-relay.lock").read_text()
     assert "--hash=sha256:" in lock
     assert "cryptography==" in lock
     assert "Python 3.10 or newer is required" in source

@@ -12,6 +12,8 @@ export const MAX_IMAGE_PIXELS = 16_000_000;
 export const MAX_FILENAME_BYTES = 240;
 
 const ALLOWED_IMAGES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp"]);
+const BASE64_DIMENSION_SCAN_BYTES = 256 * 1024;
+const queryImageDimensionCache = new WeakMap<QueryImg, readonly [number, number]>();
 
 export const decodedSize = (base64: string): number => {
   const clean = base64.replace(/\s/g, "");
@@ -87,6 +89,56 @@ export function imageDimensions(bytes: Uint8Array, mediaType: string): [number, 
   return null;
 }
 
+/** Read enough decoded bytes to determine the intrinsic size without creating
+ * an Image element. QueryImg stays wire-compatible; the dimensions are a local
+ * projection used to reserve layout before the browser decodes the image. */
+export function imageDimensionsFromBase64(
+  base64: string,
+  mediaType: string,
+): [number, number] | null {
+  const scanChars = Math.ceil(BASE64_DIMENSION_SCAN_BYTES / 3) * 4;
+  // Preview assets can be several MiB. Only normalize a bounded prefix; image
+  // headers do not justify copying the complete base64 payload on the UI turn.
+  let encoded = base64.slice(0, scanChars + 1024).replace(/\s/g, "");
+  encoded = encoded.slice(0, scanChars);
+  encoded = encoded.slice(0, encoded.length - (encoded.length % 4));
+  if (!encoded) return null;
+  try {
+    const decoded = atob(encoded);
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index++) {
+      bytes[index] = decoded.charCodeAt(index);
+    }
+    const dimensions = imageDimensions(bytes, mediaType);
+    if (!dimensions) return null;
+    const [width, height] = dimensions;
+    if (width <= 0 || height <= 0 || width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION || width * height > MAX_IMAGE_PIXELS) {
+      return null;
+    }
+    return dimensions;
+  } catch {
+    return null;
+  }
+}
+
+function rememberQueryImageDimensions(
+  image: QueryImg,
+  dimensions: readonly [number, number],
+): QueryImg {
+  queryImageDimensionCache.set(image, dimensions);
+  return image;
+}
+
+export function queryImageDimensions(image: QueryImg): [number, number] | null {
+  const cached = queryImageDimensionCache.get(image);
+  if (cached) return [cached[0], cached[1]];
+  const dimensions = imageDimensionsFromBase64(image.data, image.media_type);
+  if (!dimensions) return null;
+  queryImageDimensionCache.set(image, dimensions);
+  return dimensions;
+}
+
 function readDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -109,12 +161,12 @@ export async function downscaleImage(file: File): Promise<QueryImg> {
   }
 
   const dataUrl = await readDataUrl(file);
-  const raw = (): QueryImg => ({
+  const raw = (): QueryImg => rememberQueryImageDimensions({
     // The allow-list check above narrows the runtime value; File.type itself is
     // declared as a broad string by lib.dom.d.ts.
     media_type: (file.type === "image/jpg" ? "image/jpeg" : file.type) as QueryImg["media_type"],
     data: dataUrl.split(",", 2)[1] || "",
-  });
+  }, dimensions);
   if (Math.max(sourceWidth, sourceHeight) <= IMG_MAX_EDGE) return raw();
 
   return await new Promise((resolve, reject) => {
@@ -130,7 +182,9 @@ export async function downscaleImage(file: File): Promise<QueryImg> {
       const mediaType = file.type === "image/png" ? "image/png" : "image/jpeg";
       try {
         const output = canvas.toDataURL(mediaType, 0.85);
-        resolve({ media_type: mediaType, data: output.split(",", 2)[1] || "" });
+        resolve(rememberQueryImageDimensions({
+          media_type: mediaType, data: output.split(",", 2)[1] || "",
+        }, [canvas.width, canvas.height]));
       } catch {
         reject(new Error("图片压缩失败"));
       }

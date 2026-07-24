@@ -19,8 +19,16 @@ import {
 } from "../src/runtime-drain.ts";
 import { mergeInitialHistory } from "../src/history-merge.ts";
 import { imageDimensions } from "../src/img.ts";
+import {
+  historyImageDisplaySource,
+  TurnImagePreviewCache,
+} from "../src/turn-image-previews.ts";
 import { boundCachedTurns, controlForCachedSession } from "../src/cache.ts";
-import { boundRuntimeTurns, pruneRuntimeMap } from "../src/runtime-bounds.ts";
+import {
+  boundRuntimeTurns,
+  MAX_RUNTIME_TURNS,
+  pruneRuntimeMap,
+} from "../src/runtime-bounds.ts";
 import { ImeSubmitGuard, shouldSubmitTextKey } from "../src/ime-submit.ts";
 import {
   classifyBtwOpened,
@@ -77,6 +85,47 @@ import {
   sessionActivityTime,
   visibleDirectorySessions,
 } from "../src/session-order.ts";
+import {
+  ComposerDraftStore,
+  composerDraftKey,
+} from "../src/composer-drafts.ts";
+
+const composerDrafts = new ComposerDraftStore();
+const draftA = composerDraftKey("machine-a", "code", "codex", "session-a");
+const draftB = composerDraftKey("machine-a", "code", "codex", "session-b");
+const draftOtherSurface = composerDraftKey(
+  "machine-a", "work", "codex", "session-a",
+);
+composerDrafts.set(draftA, {
+  input: "session A unfinished",
+  images: [{ media_type: "image/png", data: "draft-image" }],
+  files: [{ filename: "notes.txt", data: "draft-file" }],
+});
+assert.equal(composerDrafts.get(draftB).input, "",
+  "switching sessions must not carry the previous composer text");
+assert.equal(composerDrafts.get(draftOtherSurface).input, "",
+  "the same sid on another surface must have an independent draft");
+composerDrafts.set(draftB, {
+  input: "session B unfinished",
+  images: [],
+  files: [],
+});
+assert.equal(composerDrafts.get(draftA).input, "session A unfinished",
+  "returning to a session restores only that session's draft");
+assert.equal(composerDrafts.get(draftA).images[0]?.data, "draft-image");
+assert.equal(composerDrafts.get(draftA).files[0]?.filename, "notes.txt");
+const tempDraft = composerDraftKey("machine-a", "code", "codex", "tmp-new");
+const realDraft = composerDraftKey("machine-a", "code", "codex", "real-session");
+composerDrafts.set(tempDraft, {
+  input: "typed while the first turn was running",
+  images: [],
+  files: [],
+});
+composerDrafts.rekey(tempDraft, realDraft);
+assert.equal(composerDrafts.get(realDraft).input,
+  "typed while the first turn was running",
+  "session id capture must move a temp session draft atomically");
+assert.equal(composerDrafts.get(tempDraft).input, "");
 
 assert.equal(sessionActivityTime("2026-07-17T10:00:00Z"),
   Date.parse("2026-07-17T10:00:00Z"), "ISO Claude activity timestamps must sort correctly");
@@ -262,7 +311,8 @@ assert.equal(isSettlingStopDisabled("running", false), false);
 assert.equal(isSettlingStopDisabled("interrupting", false), true);
 assert.equal(isSettlingStopDisabled("draining", false), true);
 assert.equal(isSettlingStopDisabled("interrupting", true), false);
-assert.equal(classifyBusySubmit("running", "interrupt", false), "interrupt");
+assert.equal(classifyBusySubmit("running", "interrupt", false), "noop",
+  "empty Enter must not implicitly interrupt a running turn");
 assert.equal(classifyBusySubmit("interrupting", "interrupt", false), "noop");
 assert.equal(classifyBusySubmit("draining", "interrupt", false), "noop");
 assert.equal(classifyBusySubmit(
@@ -376,8 +426,8 @@ assert.match(historyAppSource, /replay_start[\s\S]*requestHistory/,
   "a replay gap must request authoritative history instead of ending on an empty view");
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
   "a replay gap must discard a possibly stale Work artifact inventory");
-assert.match(cacheSource, /const CACHE_VER = 8/,
-  "history revision support must invalidate pre-revision IndexedDB rows");
+assert.match(cacheSource, /const CACHE_VER = 9/,
+  "open-turn merge repair must invalidate duplicate IndexedDB projections");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
@@ -731,6 +781,132 @@ const multiCommentMerged = mergeInitialHistory(
 assert.deepEqual(multiCommentMerged[0].blocks.filter(
   (block) => block.kind === "text").map((block) => block.text), ["A", "B"]);
 
+// Rollout history and the live app-server now share the authoritative
+// response_item id. The live delta may still arrive before item/started and
+// temporarily carry channel=unknown; identity, not text guessing, must merge it
+// into the canonical commentary block.
+const stableMessageHistory = {
+  id: "stable-history", forkPointId: "stable-turn", prompt: "inspect",
+  done: true, ts: 35_000,
+  blocks: [{
+    kind: "text" as const, message_id: "msg-stable",
+    text: "same item", done: true, channel: "commentary" as const,
+  }],
+};
+const stableMessageLive = {
+  id: "stable-turn", forkPointId: "stable-turn", prompt: "inspect",
+  done: false, ts: 35_100,
+  blocks: [{
+    kind: "text" as const, message_id: "msg-stable",
+    text: "same item", done: false, channel: "unknown" as const,
+  }],
+};
+const stableMessageMerged = mergeInitialHistory(
+  [stableMessageHistory], [stableMessageLive],
+  { preserveLiveTailOpen: true },
+);
+assert.equal(stableMessageMerged.length, 1);
+assert.deepEqual(stableMessageMerged[0].blocks.filter(
+  (block) => block.kind === "text").map((block) => ({
+    id: block.message_id, text: block.text, channel: block.channel,
+  })), [{
+  id: "msg-stable", text: "same item", channel: "commentary",
+}]);
+
+// A focus-triggered History page can use a regenerated response_item id while
+// the app-server keeps streaming deltas to the live id. Reconciliation must
+// retain that live binding; otherwise the next delta creates a second text
+// block, and every Codex -> Claude -> Codex switch paints another copy.
+const regeneratedMessageHistory = {
+  id: "regenerated-history", forkPointId: "regenerated-turn",
+  prompt: "inspect", done: true, ts: 35_500,
+  blocks: [{
+    kind: "text" as const, message_id: "history-commentary",
+    text: "first half", done: true, channel: "commentary" as const,
+  }],
+};
+const regeneratedMessageLive = {
+  id: "regenerated-turn", forkPointId: "regenerated-turn",
+  prompt: "inspect", done: false, ts: 35_600,
+  blocks: [{
+    kind: "text" as const, message_id: "live-commentary",
+    text: "first half", done: false, channel: "commentary" as const,
+  }],
+};
+let regeneratedMessageMerged = mergeInitialHistory(
+  [regeneratedMessageHistory], [regeneratedMessageLive],
+  { preserveLiveTailOpen: true },
+);
+assert.equal(
+  regeneratedMessageMerged[0].blocks[0]?.kind === "text"
+    && regeneratedMessageMerged[0].blocks[0].message_id,
+  "live-commentary",
+  "an open history merge must keep the id targeted by future live deltas",
+);
+for (const suffix of [" plus tools", " and answer"]) {
+  regeneratedMessageMerged = regeneratedMessageMerged.map((turn) => ({
+    ...turn,
+    blocks: turn.blocks.map((block) => block.kind === "text"
+      ? { ...block, text: block.text + suffix } : block),
+  }));
+  regeneratedMessageMerged = mergeInitialHistory(
+    [regeneratedMessageHistory], regeneratedMessageMerged,
+    { preserveLiveTailOpen: true },
+  );
+  assert.equal(
+    regeneratedMessageMerged[0].blocks.filter(
+      (block) => block.kind === "text").length,
+    1,
+    "repeated focus History merges remain idempotent while the turn runs",
+  );
+  assert.equal(
+    regeneratedMessageMerged[0].blocks[0]?.kind === "text"
+      && regeneratedMessageMerged[0].blocks[0].message_id,
+    "live-commentary",
+  );
+}
+
+// Once summary history exposes payload-free image references, it replaces the
+// optimistic inline bodies. Keeping both representations renders two image
+// rows and leaves a large blank placeholder below the visible thumbnail.
+const imageHistory = {
+  id: "image-history", prompt: "看图", done: true, ts: 36_000,
+  imageRefs: [{
+    image_id: "image-1", media_type: "image/png" as const,
+    width: 1200, height: 600, byte_size: 1024,
+  }],
+  blocks: [],
+};
+const imageLive = {
+  id: "image-live", prompt: "看图", done: false, ts: 36_100,
+  images: [{ media_type: "image/png" as const, data: "inline-body" }],
+  blocks: [],
+};
+const imageMerged = mergeInitialHistory([imageHistory], [imageLive]);
+assert.equal(imageMerged.length, 1);
+assert.equal(imageMerged[0].images, undefined);
+assert.deepEqual(imageMerged[0].imageRefs, imageHistory.imageRefs);
+const turnImagePreviews = new TurnImagePreviewCache();
+turnImagePreviews.update("image-session", [imageLive]);
+turnImagePreviews.update("image-session", [imageMerged[0]]);
+const retainedImagePreview = turnImagePreviews.get(imageMerged[0].id, 0);
+assert.deepEqual(retainedImagePreview, imageLive.images[0],
+  "a canonical History swap retains the already-painted optimistic preview");
+assert.equal(
+  historyImageDisplaySource({ status: "loading" }, retainedImagePreview),
+  "data:image/png;base64,inline-body",
+  "the loading thumbnail cannot blank the image during the thinking transition",
+);
+assert.equal(
+  historyImageDisplaySource({
+    status: "ready", mediaType: "image/webp", data: "canonical-thumbnail",
+  }, retainedImagePreview),
+  "data:image/webp;base64,canonical-thumbnail",
+  "the canonical thumbnail replaces the fallback without a placeholder frame",
+);
+turnImagePreviews.release(imageMerged[0].id);
+assert.equal(turnImagePreviews.get(imageMerged[0].id, 0), undefined);
+
 // A complete transcript must not be reopened forever by stale cache state.
 const terminalHistory = {
   id: "terminal-history", prompt: "run", done: true, ts: 40_000,
@@ -986,6 +1162,242 @@ try {
     }),
   });
   assert.equal(authoritativeCreated.sessions[0].summary, "authoritative title");
+
+  const acceptanceSid = "query-acceptance";
+  const acceptanceOtherSid = "query-acceptance-other";
+  let acceptanceState = {
+    ...initialState,
+    focusedSid: acceptanceSid,
+    runtimes: {
+      [acceptanceSid]: { ...createRuntime(), syncReady: true },
+      [acceptanceOtherSid]: { ...createRuntime(), syncReady: true },
+    },
+  };
+  acceptanceState = reduce(acceptanceState, {
+    type: "query_sent", sid: acceptanceSid, prompt: "first",
+    msg_id: "acceptance-first", ts: 900,
+  });
+  assert.equal(
+    acceptanceState.runtimes[acceptanceSid].acceptancePending,
+    "acceptance-first",
+  );
+  acceptanceState = reduce(acceptanceState, {
+    type: "query_sent", sid: acceptanceSid, prompt: "must be deferred",
+    msg_id: "acceptance-second", ts: 901,
+  });
+  assert.deepEqual(
+    acceptanceState.runtimes[acceptanceSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["acceptance-first"],
+    "a second idle submit cannot create another optimistic turn before acceptance",
+  );
+  acceptanceState = reduce(acceptanceState, {
+    type: "set_pending", sid: acceptanceSid,
+    query: { prompt: "must be deferred" },
+  });
+  acceptanceState = reduce(acceptanceState, {
+    type: "set_pending", sid: acceptanceOtherSid,
+    query: { prompt: "other session" },
+  });
+  assert.equal(
+    acceptanceState.runtimes[acceptanceSid].pendingSend?.prompt,
+    "must be deferred",
+  );
+  assert.equal(
+    acceptanceState.runtimes[acceptanceOtherSid].pendingSend?.prompt,
+    "other session",
+    "deferred queries are targeted by sid rather than current focus",
+  );
+  acceptanceState = reduce(acceptanceState, { type: "event", event: event({
+    type: "command_ack", client_id: "browser", cmd_id: "acceptance-command",
+  }) });
+  assert.equal(
+    acceptanceState.runtimes[acceptanceSid].acceptancePending,
+    "acceptance-first",
+    "command ACK must not unlock a direct query",
+  );
+  acceptanceState = reduce(acceptanceState, { type: "event", event: event({
+    type: "error", sid: acceptanceOtherSid, msg_id: "unrelated",
+    code: "busy", message: "other",
+  }) });
+  assert.equal(
+    acceptanceState.runtimes[acceptanceSid].acceptancePending,
+    "acceptance-first",
+    "another session's error cannot release this query",
+  );
+  acceptanceState = reduce(acceptanceState, { type: "event", event: event({
+    type: "error", sid: acceptanceSid, msg_id: "acceptance-first",
+    code: "busy", message: "rejected",
+  }) });
+  assert.equal(
+    acceptanceState.runtimes[acceptanceSid].acceptancePending,
+    null,
+    "the exact correlated Error releases query acceptance",
+  );
+  acceptanceState = reduce(acceptanceState, {
+    type: "query_sent", sid: acceptanceSid, prompt: "offline",
+    msg_id: "acceptance-offline", ts: 902,
+  });
+  acceptanceState = reduce(acceptanceState, { type: "event", event: event({
+    type: "error", sid: acceptanceSid, msg_id: "acceptance-offline",
+    code: "wrapper_offline", message: "offline",
+  }) });
+  assert.equal(
+    acceptanceState.runtimes[acceptanceSid].acceptancePending,
+    "acceptance-offline",
+    "offline/reconnect keeps the unaccepted query latched for outbox replay",
+  );
+  acceptanceState = reduce(acceptanceState, { type: "event", event: event({
+    type: "user_msg", sid: acceptanceSid, msg_id: "acceptance-offline",
+    prompt: "offline",
+  }) });
+  assert.equal(
+    acceptanceState.runtimes[acceptanceSid].acceptancePending,
+    null,
+    "the authoritative user echo releases acceptance after reconnect",
+  );
+
+  // A materialized History uses transcript/native ids, not the browser msg_id.
+  // Freeze the pre-send authoritative head so a genuinely appended newest turn
+  // can recover a live UserMsg/TurnBinding which fell outside replay. Repeated
+  // old prompts and a different newly-appended prompt are not acceptance proof.
+  const nativeAcceptanceSid = "native-history-acceptance";
+  const nativeOldTurn = {
+    id: "native-old", prompt: "继续", blocks: [], done: true,
+    ts: 1_000, doneTs: 1_100, detailEventCount: 0, detailLoaded: false,
+  };
+  let nativeAcceptanceState = reduce({
+    ...initialState,
+    focusedSid: nativeAcceptanceSid,
+    runtimes: { [nativeAcceptanceSid]: createRuntime() },
+  }, { type: "event", event: event({
+    type: "history", sid: nativeAcceptanceSid,
+    session_id: nativeAcceptanceSid, revision: "native-r1",
+    generation: "native-g1", build_seq: 1, live_seq: 10,
+    detail: "summary", events: [], turns: [nativeOldTurn],
+    has_more: false, newest_id: "native-old", oldest_id: "native-old",
+  }) });
+  nativeAcceptanceState = reduce(nativeAcceptanceState, {
+    type: "query_sent", sid: nativeAcceptanceSid, prompt: "继续",
+    msg_id: "browser-native-pending", ts: 900_000,
+    images: [{ media_type: "image/png", data: "optimistic-image" }],
+  });
+  nativeAcceptanceState = reduce(nativeAcceptanceState, {
+    type: "event", event: event({
+      type: "history", sid: nativeAcceptanceSid,
+      session_id: nativeAcceptanceSid, revision: "native-r1",
+      generation: "native-g1", build_seq: 1, live_seq: 10,
+      detail: "summary", events: [], turns: [nativeOldTurn],
+      has_more: false, newest_id: "native-old", oldest_id: "native-old",
+    }),
+  });
+  assert.equal(
+    nativeAcceptanceState.runtimes[nativeAcceptanceSid].acceptancePending,
+    "browser-native-pending",
+    "an old materialized row with the same prompt cannot release acceptance",
+  );
+  const unrelatedNativeTurn = {
+    id: "native-unrelated", prompt: "another writer", blocks: [], done: true,
+    ts: 2_000, doneTs: 2_100, detailEventCount: 0, detailLoaded: false,
+  };
+  nativeAcceptanceState = reduce(nativeAcceptanceState, {
+    type: "event", event: event({
+      type: "history", sid: nativeAcceptanceSid,
+      session_id: nativeAcceptanceSid, revision: "native-r1",
+      generation: "native-g1", build_seq: 2, live_seq: 11,
+      detail: "summary", events: [],
+      turns: [nativeOldTurn, unrelatedNativeTurn],
+      has_more: false, newest_id: "native-unrelated", oldest_id: "native-old",
+    }),
+  });
+  assert.equal(
+    nativeAcceptanceState.runtimes[nativeAcceptanceSid].acceptancePending,
+    "browser-native-pending",
+    "a different newly-materialized prompt cannot release acceptance",
+  );
+  const acceptedNativeTurn = {
+    id: "native-accepted", prompt: "继续", blocks: [], done: true,
+    imageRefs: [{
+      image_id: "native-accepted-image", media_type: "image/png" as const,
+      width: 1200, height: 800, byte_size: 1024,
+    }],
+    // Deliberately far from the browser clock: the missing live echo never
+    // replaced the optimistic timestamp with authoritative server time.
+    ts: 3_000, doneTs: 3_100, detailEventCount: 0, detailLoaded: false,
+  };
+  nativeAcceptanceState = reduce(nativeAcceptanceState, {
+    type: "event", event: event({
+      type: "history", sid: nativeAcceptanceSid,
+      session_id: nativeAcceptanceSid, revision: "native-r1",
+      generation: "native-g1", build_seq: 3, live_seq: 12,
+      detail: "summary", events: [],
+      turns: [nativeOldTurn, unrelatedNativeTurn, acceptedNativeTurn],
+      has_more: false, newest_id: "native-accepted", oldest_id: "native-old",
+    }),
+  });
+  assert.equal(
+    nativeAcceptanceState.runtimes[nativeAcceptanceSid].acceptancePending,
+    null,
+    "a matching appended native History head releases the browser acceptance",
+  );
+  assert.deepEqual(
+    nativeAcceptanceState.runtimes[nativeAcceptanceSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["native-old", "native-unrelated", "browser-native-pending"],
+    "native History binds into the optimistic row even when client/server clocks differ",
+  );
+  const acceptedImageTurn =
+    nativeAcceptanceState.runtimes[nativeAcceptanceSid].turns.at(-1)!;
+  assert.equal(acceptedImageTurn.historyTurnId, "native-accepted",
+    "canonical image requests must retain the native transcript turn id");
+  assert.equal(acceptedImageTurn.images, undefined,
+    "the accepted history image reference replaces its optimistic inline body");
+  assert.equal(
+    acceptedImageTurn.imageRefs?.[0]?.image_id,
+    "native-accepted-image",
+  );
+
+  const exactEndSid = "exact-turn-end-owner";
+  let exactEndState = {
+    ...acceptanceState,
+    focusedSid: exactEndSid,
+    runtimes: {
+      ...acceptanceState.runtimes,
+      [exactEndSid]: {
+        ...createRuntime(),
+        acceptancePending: "promptless-tail",
+        turns: [{
+          id: "older-browser", forkPointId: "older-native",
+          prompt: "older", blocks: [], done: false,
+        }, {
+          id: "promptless-tail", prompt: "", blocks: [], done: false,
+        }],
+      },
+    },
+  };
+  exactEndState = reduce(exactEndState, { type: "event", event: event({
+    type: "turn_end", sid: exactEndSid, turn_id: "older-native",
+    result: { subtype: "success", duration_ms: 10, is_error: false },
+  }) });
+  assert.equal(exactEndState.runtimes[exactEndSid].turns[0].done, true);
+  assert.equal(exactEndState.runtimes[exactEndSid].turns[1].done, false,
+    "a delayed TurnEnd closes its exact owner, not the promptless live tail");
+  assert.equal(
+    exactEndState.runtimes[exactEndSid].acceptancePending,
+    "promptless-tail",
+    "a delayed older TurnEnd cannot unlock a newer query acceptance latch",
+  );
+  exactEndState = reduce(exactEndState, { type: "event", event: event({
+    type: "turn_end", sid: exactEndSid, turn_id: "new-native",
+    result: { subtype: "success", duration_ms: 11, is_error: false },
+  }) });
+  assert.equal(exactEndState.runtimes[exactEndSid].turns[1].done, true,
+    "an unbound promptless tail retains the safe legacy TurnEnd fallback");
+  assert.equal(
+    exactEndState.runtimes[exactEndSid].turns[1].forkPointId,
+    "new-native",
+  );
+  assert.equal(exactEndState.runtimes[exactEndSid].acceptancePending, null);
 
   const duplicateSid = "duplicate-first-message";
   let duplicateState = reduce({
@@ -1992,11 +2404,12 @@ try {
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
     (turn: { id: string }) => turn.id), ["after-restart"]);
 
-  // Browser retention must not erase the backend's pagination cursor. A long
-  // newest page can be locally bounded to 200 completed turns while the server
-  // still has older transcript windows available.
+  // Browser retention must not erase the backend's pagination cursor. A
+  // pathological newest page can still exceed the canonical data window while
+  // the server has older transcript windows available.
   const boundedCursorSid = "bounded-history-keeps-server-cursor";
-  const manyHistoryEvents = Array.from({ length: 240 }, (_, index) => [
+  const manyHistoryEvents = Array.from(
+    { length: MAX_RUNTIME_TURNS + 40 }, (_, index) => [
     event({ type: "user_msg", sid: boundedCursorSid,
       msg_id: `bounded-${index}`, prompt: `question ${index}` }),
     event({ type: "turn_end", sid: boundedCursorSid,
@@ -2010,7 +2423,9 @@ try {
     build_seq: 1, has_more: true, oldest_id: "server-byte-cursor",
     events: manyHistoryEvents,
   }) });
-  assert.equal(boundedCursorState.runtimes[boundedCursorSid].turns.length, 200);
+  assert.equal(
+    boundedCursorState.runtimes[boundedCursorSid].turns.length,
+    MAX_RUNTIME_TURNS);
   assert.equal(boundedCursorState.runtimes[boundedCursorSid].hasMore, true);
   assert.equal(boundedCursorState.runtimes[boundedCursorSid].oldestId,
     "server-byte-cursor");
@@ -2140,7 +2555,14 @@ try {
     onSend: () => true,
   }));
   for (const markup of [newChatMarkup, codexNewChatMarkup]) {
-    assert.match(markup, /添加图片或文件/);
+    assert.match(markup, /aria-label="添加照片"/);
+    assert.match(markup, /aria-label="添加文件"/);
+    assert.match(markup, /accept="image\/\*"/);
+    assert.match(markup, /multiple=""/);
+    assert.equal(
+      (markup.match(/<button[^>]+aria-label="添加照片"/g) ?? []).length, 1);
+    assert.equal(
+      (markup.match(/<button[^>]+aria-label="添加文件"/g) ?? []).length, 0);
     assert.match(markup, />开始</);
     assert.doesNotMatch(markup, /本机默认|默认 ·|选择模型|思考强度/);
   }
@@ -2587,7 +3009,8 @@ try {
   assert.doesNotMatch(boundedInitialMarkup, /prompt-0</,
     "switching to a long session must not synchronously render its full DOM");
   assert.match(boundedInitialMarkup, /prompt-29</);
-  assert.match(boundedInitialMarkup, /显示更早的已加载消息/);
+  assert.match(boundedInitialMarkup, /virtual-thread-in/,
+    "the first paint keeps only a small latest fallback before DOM measurement");
   const summaryMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "summary-session",
     turns: [{
@@ -3322,6 +3745,28 @@ const boundedRuntimeTurns = boundRuntimeTurns(Array.from(
   { length: 5 }, (_, id) => ({ id: `turn-${id}`, prompt: "x", blocks: [], done: true })),
 3, 10_000);
 assert.deepEqual(boundedRuntimeTurns.map((turn) => turn.id), ["turn-2", "turn-3", "turn-4"]);
+const retainedHistoryPrepend = boundRuntimeTurns([
+  ...Array.from({ length: 12 }, (_, id) => ({
+    id: `older-${id}`, prompt: "older", blocks: [], done: true,
+  })),
+  ...Array.from({ length: 200 }, (_, id) => ({
+    id: `current-${id}`, prompt: "current", blocks: [], done: true,
+  })),
+]);
+assert.equal(retainedHistoryPrepend[0]?.id, "older-0");
+assert.equal(retainedHistoryPrepend.length, 212,
+  "the former 200-turn DOM limit must not discard an accepted history page");
+const cappedHistoryPrepend = boundRuntimeTurns([
+  ...Array.from({ length: 12 }, (_, id) => ({
+    id: `older-${id}`, prompt: "older", blocks: [], done: true,
+  })),
+  ...Array.from({ length: MAX_RUNTIME_TURNS }, (_, id) => ({
+    id: `current-${id}`, prompt: "current", blocks: [], done: true,
+  })),
+]);
+assert.equal(cappedHistoryPrepend[0]?.id, "current-0");
+assert.equal(cappedHistoryPrepend.some((turn) => turn.id.startsWith("older-")), false,
+  "the canonical data window remains bounded independently from the virtual DOM");
 const activeTurn = { id: "active", prompt: "running", blocks: [], done: false };
 const keepsActiveRuntimeTurns = boundRuntimeTurns([
   { id: "old", prompt: "old", blocks: [], done: true },
@@ -3519,6 +3964,9 @@ for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_coll
 assert.match(appSource, /const \{ cwd, cwdSource, model, effort \} = state\.newChat/);
 assert.match(appSource, /data-lock-horizontal-swipe/);
 assert.match(appSource, /surface=\{space\}/);
+assert.match(appSource, /draftKey=\{focusedComposerDraftKey\}/);
+assert.match(appSource, /composerDraftsRef\.current\.rekey/,
+  "temp session id capture must retain the focused composer draft");
 assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
 assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
 assert.match(appSource, /setNewChatAutoFocus\(false\)/,
@@ -3549,6 +3997,10 @@ assert.match(newChatSource, /autoFocus=\{autoFocus\}/,
 const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
 assert.match(composerSource, /workSurface \? \(/);
+assert.match(composerSource, /p\.draftStore\.get\(p\.draftKey\)/);
+assert.match(composerSource, /accept="image\/\*" multiple/);
+assert.match(composerSource, /aria-label="添加照片"/);
+assert.match(composerSource, /aria-label="添加文件"/);
 assert.match(composerSource, /className="work-compose-card"/);
 assert.match(composerSource, /Artifacts · \{p\.workArtifactCount\}/);
 assert.doesNotMatch(composerSource, /交付物/);
@@ -3979,5 +4431,144 @@ scopedSocket.receive({
 assert.equal(scopedObserved.length, beforeReconnectFrame,
   "a delayed frame from an older underlying WebSocket generation is dropped");
 scopedRelay.stop();
+
+// Query acceptance is a per-session lifecycle barrier, not an outbox ACK bit.
+// It survives this RelayWs instance's automatic reconnect and only correlated
+// authoritative narrative proof may release it.
+const acceptanceRelay = new RelayWs({
+  onEvent: () => {},
+  onConnState: () => {},
+});
+acceptanceRelay.start();
+const acceptanceSocket = FakeWebSocket.instances.at(-1);
+assert.ok(acceptanceSocket);
+acceptanceSocket.onopen?.();
+acceptanceRelay.setFocusedSid("accept-wire-a", "claude", "code");
+assert.equal(acceptanceRelay.sendQuery(
+  "first", "accept-wire-message-a"), true);
+const acceptanceFrameA = JSON.parse(acceptanceSocket.sent.at(-1) ?? "{}");
+assert.equal(acceptanceRelay.sendQuery(
+  "must defer", "accept-wire-message-a2"), false,
+  "a second direct query to one sid is rejected before it enters the outbox");
+acceptanceRelay.setFocusedSid("accept-wire-b", "claude", "code");
+acceptanceSocket.receive({
+  type: "history", sid: "accept-wire-b", session_id: "accept-wire-b",
+  revision: "accept-wire-history", generation: "accept-wire-generation",
+  build_seq: 1, live_seq: 20, detail: "summary", events: [],
+  turns: [{
+    id: "accept-wire-native-old", prompt: "other session", blocks: [],
+    done: true, detailEventCount: 0, detailLoaded: false,
+  }],
+  has_more: false, oldest_id: "accept-wire-native-old",
+  newest_id: "accept-wire-native-old",
+});
+assert.equal(acceptanceRelay.sendQuery(
+  "other session", "accept-wire-message-b"), true);
+acceptanceSocket.receive({
+  type: "command_ack",
+  client_id: acceptanceFrameA.client_id,
+  cmd_id: acceptanceFrameA.cmd_id,
+});
+assert.equal(
+  acceptanceRelay.pendingQueryFor("accept-wire-a"),
+  "accept-wire-message-a",
+  "command ACK alone cannot release query acceptance",
+);
+
+(acceptanceRelay as unknown as { connect: () => void }).connect();
+const acceptanceReconnectSocket = FakeWebSocket.instances.at(-1);
+assert.ok(acceptanceReconnectSocket
+  && acceptanceReconnectSocket !== acceptanceSocket);
+acceptanceReconnectSocket.onopen?.();
+assert.equal(
+  acceptanceRelay.pendingQueryFor("accept-wire-a"),
+  "accept-wire-message-a",
+  "the ACKed latch survives automatic WebSocket reconnect",
+);
+assert.ok(acceptanceReconnectSocket.sent.some((raw) => {
+  const frame = JSON.parse(raw);
+  return frame.type === "query" && frame.msg_id === "accept-wire-message-b";
+}), "the unacknowledged session-B query is replayed after reconnect");
+
+acceptanceReconnectSocket.receive({
+  type: "error", sid: "accept-wire-a", msg_id: "wrong-message",
+  code: "busy", message: "wrong",
+});
+assert.equal(
+  acceptanceRelay.pendingQueryFor("accept-wire-a"),
+  "accept-wire-message-a",
+);
+acceptanceReconnectSocket.receive({
+  type: "error", sid: "accept-wire-a", msg_id: "accept-wire-message-a",
+  code: "busy", message: "rejected",
+});
+assert.equal(acceptanceRelay.pendingQueryFor("accept-wire-a"), null);
+assert.equal(
+  acceptanceRelay.pendingQueryFor("accept-wire-b"),
+  "accept-wire-message-b",
+  "session-A correlation cannot release session B",
+);
+acceptanceReconnectSocket.receive({
+  type: "history", sid: "accept-wire-b", session_id: "accept-wire-b",
+  revision: "accept-wire-history", generation: "accept-wire-generation",
+  build_seq: 1, live_seq: 20, detail: "summary", events: [],
+  turns: [{
+    id: "accept-wire-native-old", prompt: "other session", blocks: [],
+    done: true, detailEventCount: 0, detailLoaded: false,
+  }],
+  has_more: false, oldest_id: "accept-wire-native-old",
+  newest_id: "accept-wire-native-old",
+});
+assert.equal(
+  acceptanceRelay.pendingQueryFor("accept-wire-b"),
+  "accept-wire-message-b",
+  "a delayed old History with the same prompt is not query acceptance",
+);
+acceptanceReconnectSocket.receive({
+  type: "history", sid: "accept-wire-b", session_id: "accept-wire-b",
+  revision: "accept-wire-history", generation: "accept-wire-generation",
+  build_seq: 2, live_seq: 21, detail: "summary", events: [],
+  turns: [{
+    id: "accept-wire-native-page", prompt: "other session", blocks: [],
+    done: true, detailEventCount: 0, detailLoaded: false,
+  }],
+  before: "accept-wire-native-old", has_more: true,
+  oldest_id: "accept-wire-native-page", newest_id: "accept-wire-native-page",
+});
+assert.equal(
+  acceptanceRelay.pendingQueryFor("accept-wire-b"),
+  "accept-wire-message-b",
+  "an older pagination page cannot release query acceptance",
+);
+acceptanceReconnectSocket.receive({
+  type: "history", sid: "accept-wire-b", session_id: "accept-wire-b",
+  revision: "accept-wire-history", generation: "accept-wire-generation",
+  build_seq: 2, live_seq: 21, detail: "summary", events: [],
+  turns: [{
+    id: "accept-wire-native-wrong", prompt: "unrelated", blocks: [],
+    done: true, detailEventCount: 0, detailLoaded: false,
+  }],
+  has_more: false, oldest_id: "accept-wire-native-wrong",
+  newest_id: "accept-wire-native-wrong",
+});
+assert.equal(
+  acceptanceRelay.pendingQueryFor("accept-wire-b"),
+  "accept-wire-message-b",
+  "a different appended native turn cannot release query acceptance",
+);
+acceptanceReconnectSocket.receive({
+  type: "history", sid: "accept-wire-b", session_id: "accept-wire-b",
+  revision: "accept-wire-history", generation: "accept-wire-generation",
+  build_seq: 3, live_seq: 22, detail: "summary", events: [],
+  turns: [{
+    id: "accept-wire-native-new", prompt: "other session", blocks: [],
+    done: true, detailEventCount: 0, detailLoaded: false,
+  }],
+  has_more: false, oldest_id: "accept-wire-native-new",
+  newest_id: "accept-wire-native-new",
+});
+assert.equal(acceptanceRelay.pendingQueryFor("accept-wire-b"), null,
+  "a matching appended native History head recovers an echo missed during reconnect");
+acceptanceRelay.stop();
 
 console.log("web reliability tests passed");

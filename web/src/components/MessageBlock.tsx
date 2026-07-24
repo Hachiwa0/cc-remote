@@ -1,5 +1,5 @@
-import { isValidElement, useEffect, useMemo, useRef, useState,
-  type ReactNode } from "react";
+import { createContext, isValidElement, useContext, useEffect, useMemo, useRef,
+  useState, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { parseLocalFileTarget } from "../file-link";
@@ -90,6 +90,31 @@ function CopyableCodeBlock({ children }: { children?: ReactNode }) {
   );
 }
 
+interface MessageMarkdownContextValue {
+  imageAssets?: Record<string, InlineImageAsset>;
+  onLoadImage?: (path: string) => boolean;
+  onOpenFile?: (path: string, line?: number) => void;
+  onPreviewImage?: (src: string, alt: string) => void;
+}
+
+const MessageMarkdownContext = createContext<MessageMarkdownContextValue>({});
+const externalImageDimensions = new Map<string, readonly [number, number]>();
+const MAX_EXTERNAL_IMAGE_DIMENSIONS = 128;
+
+function rememberExternalImageDimensions(
+  src: string,
+  dimensions: readonly [number, number],
+): void {
+  if (!/^https?:\/\//i.test(src)) return;
+  externalImageDimensions.delete(src);
+  externalImageDimensions.set(src, dimensions);
+  while (externalImageDimensions.size > MAX_EXTERNAL_IMAGE_DIMENSIONS) {
+    const oldest = externalImageDimensions.keys().next().value;
+    if (typeof oldest !== "string") break;
+    externalImageDimensions.delete(oldest);
+  }
+}
+
 function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
   src: string;
   alt?: string;
@@ -100,6 +125,11 @@ function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
 }) {
   const target = useMemo(() => classifyMessageImageTarget(src), [src]);
   const [blocked, setBlocked] = useState(false);
+  const [naturalSize, setNaturalSize] = useState<{
+    src: string;
+    width: number;
+    height: number;
+  } | null>(null);
 
   useEffect(() => {
     setBlocked(false);
@@ -129,13 +159,70 @@ function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
     </span>;
   }
 
+  const cachedSize = externalImageDimensions.get(resolved);
+  const dimensions = asset?.width && asset.height
+    ? [asset.width, asset.height] as const
+    : naturalSize?.src === resolved
+      ? [naturalSize.width, naturalSize.height] as const
+      : cachedSize;
   const image = <img className="message-inline-image" src={resolved}
-    alt={alt || ""} title={title} loading="lazy" referrerPolicy="no-referrer" />;
+    alt={alt || ""} title={title} loading="lazy" decoding="async"
+    width={dimensions?.[0]} height={dimensions?.[1]}
+    referrerPolicy="no-referrer"
+    onLoad={(event) => {
+      const width = event.currentTarget.naturalWidth;
+      const height = event.currentTarget.naturalHeight;
+      if (width <= 0 || height <= 0) return;
+      rememberExternalImageDimensions(resolved, [width, height]);
+      if (dimensions?.[0] === width && dimensions[1] === height) return;
+      setNaturalSize({ src: resolved, width, height });
+    }} />;
   if (!onPreviewImage) return image;
   return <button type="button" className="message-image-trigger"
     aria-label={`预览图片${alt ? `：${alt}` : ""}`}
     onClick={() => onPreviewImage(resolved, alt || "图片预览")}>{image}</button>;
 }
+
+function MarkdownImage({ src, alt, title }: ComponentPropsWithoutRef<"img">) {
+  const {
+    imageAssets, onLoadImage, onPreviewImage,
+  } = useContext(MessageMarkdownContext);
+  const source = typeof src === "string" ? src : "";
+  const target = classifyMessageImageTarget(source);
+  const asset = target.kind === "local" ? imageAssets?.[target.value] : undefined;
+  return <MessageImage src={source} alt={alt} title={title} asset={asset}
+    onLoadImage={onLoadImage} onPreviewImage={onPreviewImage} />;
+}
+
+function MarkdownLink({
+  href = "", children, title,
+}: ComponentPropsWithoutRef<"a">) {
+  const { onOpenFile } = useContext(MessageMarkdownContext);
+  const file = parseLocalFileTarget(href);
+  if (file && onOpenFile) {
+    const location = file.line ? `${file.path}:${file.line}` : file.path;
+    return <button type="button" className="message-file-link"
+      title={`在 Remote 中打开 ${location}`}
+      onClick={() => onOpenFile(file.path, file.line)}>{children}</button>;
+  }
+  if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) {
+    return <a href={href} target="_blank" rel="noopener noreferrer"
+      title={title}>{children}</a>;
+  }
+  if (href.startsWith("#")) return <a href={href} title={title}>{children}</a>;
+  return <span className="message-link-disabled"
+    title="该链接无法在当前会话中打开">{children}</span>;
+}
+
+/** Module-stable renderer identities keep React from remounting decoded images
+ * whenever a streaming block receives a new asset snapshot. */
+const MESSAGE_MARKDOWN_COMPONENTS: Components = Object.freeze({
+  pre: ({ children }: ComponentPropsWithoutRef<"pre">) =>
+    <CopyableCodeBlock>{children}</CopyableCodeBlock>,
+  img: MarkdownImage,
+  a: MarkdownLink,
+});
+const MESSAGE_REMARK_PLUGINS = [remarkGfm];
 
 // Streams markdown with a ~50ms throttle: re-parsing react-markdown on every
 // token delta is wasteful, so we hold a "shown" buffer that catches up on a
@@ -171,46 +258,26 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
     if (timer.current) clearTimeout(timer.current);
   }, []);
 
-  const components = useMemo<Components>(() => ({
-    pre: ({ children }) => <CopyableCodeBlock>{children}</CopyableCodeBlock>,
-    img: ({ src, alt, title }) => {
-      const source = typeof src === "string" ? src : "";
-      const target = classifyMessageImageTarget(source);
-      const asset = target.kind === "local" ? imageAssets?.[target.value] : undefined;
-      return <MessageImage src={source} alt={alt} title={title} asset={asset}
-        onLoadImage={onLoadImage} onPreviewImage={onPreviewImage} />;
-    },
-    a: ({ href = "", children, title }) => {
-      const file = parseLocalFileTarget(href);
-      if (file && onOpenFile) {
-        const location = file.line ? `${file.path}:${file.line}` : file.path;
-        return <button type="button" className="message-file-link"
-          title={`在 Remote 中打开 ${location}`}
-          onClick={() => onOpenFile(file.path, file.line)}>{children}</button>;
-      }
-      if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) {
-        return <a href={href} target="_blank" rel="noopener noreferrer"
-          title={title}>{children}</a>;
-      }
-      if (href.startsWith("#")) return <a href={href} title={title}>{children}</a>;
-      return <span className="message-link-disabled"
-        title="该链接无法在当前会话中打开">{children}</span>;
-    },
+  const markdownContext = useMemo<MessageMarkdownContextValue>(() => ({
+    imageAssets, onLoadImage, onOpenFile, onPreviewImage,
   }), [imageAssets, onLoadImage, onOpenFile, onPreviewImage]);
   const parts = useMemo(() => splitCodexDirectives(shown), [shown]);
 
   if (!shown) return null;
   return (
-    <div className="prose">
-      {parts.map((part, index) => part.kind === "markdown"
-        ? <ReactMarkdown key={`markdown-${index}`} remarkPlugins={[remarkGfm]}
-            components={components}>{part.text}</ReactMarkdown>
-        : <div key={`directive-${index}`} className="codex-directive-status"
-            data-directive={part.name}>
-            <Icon name="verify" size={14} />
-            <span>{part.label}</span>
-          </div>)}
-      {!done && <span className="cursor" />}
-    </div>
+    <MessageMarkdownContext.Provider value={markdownContext}>
+      <div className="prose">
+        {parts.map((part, index) => part.kind === "markdown"
+          ? <ReactMarkdown key={`markdown-${index}`}
+              remarkPlugins={MESSAGE_REMARK_PLUGINS}
+              components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</ReactMarkdown>
+          : <div key={`directive-${index}`} className="codex-directive-status"
+              data-directive={part.name}>
+              <Icon name="verify" size={14} />
+              <span>{part.label}</span>
+            </div>)}
+        {!done && <span className="cursor" />}
+      </div>
+    </MessageMarkdownContext.Provider>
   );
 }

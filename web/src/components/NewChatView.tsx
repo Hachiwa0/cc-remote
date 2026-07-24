@@ -33,6 +33,7 @@ export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus 
   const [files, setFiles] = useState<QueryFile[]>([]);
   const [importing, setImporting] = useState(false);
   const [creating, setCreating] = useState(false);
+  const photoRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const imeSubmitRef = useRef(new ImeSubmitGuard());
@@ -187,10 +188,19 @@ export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus 
 
         <div className="newchat-foot">
           <div className="newchat-ctls">
-            <button className="cmdbtn" onClick={() => fileRef.current?.click()} aria-label="添加图片或文件" title="添加图片或文件" disabled={creating || importing}>
+            <button type="button" className="cmdbtn"
+              onClick={() => (space === "work"
+                ? fileRef.current : photoRef.current)?.click()}
+              aria-label={space === "work" ? "添加资料" : "添加照片"}
+              title={space === "work" ? "添加资料" : "添加照片"}
+              disabled={creating || importing}>
               <Icon name="plus" size={18} />
             </button>
-            <input ref={fileRef} type="file" multiple hidden onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
+            <input ref={photoRef} type="file" accept="image/*" multiple
+              aria-label="添加照片" hidden
+              onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
+            <input ref={fileRef} type="file" multiple aria-label="添加文件" hidden
+              onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
           </div>
           <div className="newchat-foot-right">
             <span className="newchat-hint">{createError

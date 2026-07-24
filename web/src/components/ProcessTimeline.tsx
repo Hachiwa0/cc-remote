@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
 import type { Block, ProcessBlock, TextBlock, ToolBlock } from "../reducer";
 import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
@@ -29,6 +35,81 @@ function statusIcon(status: ProcessBlock["status"], done: boolean) {
   return <Icon name="verify" size={14} />;
 }
 
+function ProcessDisclosure({ className, summary, children, openOverride,
+  onOpenChange, onInteractionStart, onInteractionEnd }: {
+  className: string;
+  summary: ReactNode;
+  children: ReactNode;
+  openOverride?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  onInteractionStart?: () => number;
+  onInteractionEnd?: (token: number) => void;
+}) {
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const open = openOverride ?? uncontrolledOpen;
+  const tapGuard = useRef(new PointerTapGuard());
+  const interactionTokens = useRef(new Map<number, number>());
+  const releaseInteractionFrame = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (releaseInteractionFrame.current !== null) {
+      window.cancelAnimationFrame(releaseInteractionFrame.current);
+    }
+    for (const token of interactionTokens.current.values()) {
+      onInteractionEnd?.(token);
+    }
+    interactionTokens.current.clear();
+  }, [onInteractionEnd]);
+  const setOpen = (next: boolean) => {
+    setUncontrolledOpen(next);
+    onOpenChange?.(next);
+  };
+  const releaseInteractions = () => {
+    if (releaseInteractionFrame.current !== null) {
+      window.cancelAnimationFrame(releaseInteractionFrame.current);
+    }
+    releaseInteractionFrame.current = window.requestAnimationFrame(() => {
+      releaseInteractionFrame.current = window.requestAnimationFrame(() => {
+        releaseInteractionFrame.current = null;
+        for (const token of interactionTokens.current.values()) {
+          onInteractionEnd?.(token);
+        }
+        interactionTokens.current.clear();
+      });
+    });
+  };
+  return (
+    <details className={className} open={open}>
+      <summary
+        onPointerDown={(event) => {
+          tapGuard.current.pointerDown(
+            event.pointerId, event.clientX, event.clientY,
+          );
+          event.currentTarget.setPointerCapture?.(event.pointerId);
+          const token = onInteractionStart?.();
+          if (token != null) interactionTokens.current.set(event.pointerId, token);
+        }}
+        onPointerMove={(event) => tapGuard.current.pointerMove(
+          event.pointerId, event.clientX, event.clientY,
+        )}
+        onPointerUp={(event) => {
+          tapGuard.current.pointerUp(event.pointerId);
+          releaseInteractions();
+        }}
+        onPointerCancel={(event) => {
+          tapGuard.current.pointerCancel(event.pointerId);
+          releaseInteractions();
+        }}
+        onClick={(event) => {
+          event.preventDefault();
+          if (tapGuard.current.consumeClick(event.detail)) setOpen(!open);
+        }}>
+        {summary}
+      </summary>
+      {children}
+    </details>
+  );
+}
+
 const PROCESS_IC: Record<ProcessBlock["processKind"], string> = {
   reasoning: "spark",
   plan: "plan",
@@ -47,9 +128,14 @@ const PROCESS_IC: Record<ProcessBlock["processKind"], string> = {
   compaction: "simplify",
 };
 
-function ProcessActivity({ block, onOpenFile }: {
+function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
+  onInteractionStart, onInteractionEnd }: {
   block: ProcessBlock;
   onOpenFile?: (path: string, line?: number) => void;
+  openOverride?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  onInteractionStart?: () => number;
+  onInteractionEnd?: (token: number) => void;
 }) {
   const filePaths = block.processKind === "file_change"
     ? filePathsFromInput(block.input) : [];
@@ -104,36 +190,59 @@ function ProcessActivity({ block, onOpenFile }: {
     );
   }
   return (
-    <details className={`process-activity process-${block.status}`}>
-      <summary>
+    <ProcessDisclosure className={`process-activity process-${block.status}`}
+      openOverride={openOverride} onOpenChange={onOpenChange}
+      onInteractionStart={onInteractionStart}
+      onInteractionEnd={onInteractionEnd}
+      summary={
+        <>
         <span className="process-item-ic"><Icon name={PROCESS_IC[block.processKind]} size={15} /></span>
         <span className="process-item-title">{block.title}</span>
         <span className="process-item-status">{statusIcon(block.status, block.done)}</span>
         <span className="process-item-chev"><Icon name="chev" size={14} /></span>
-      </summary>
-      <div className="process-item-body">{body}</div>
-    </details>
+        </>
+      }>
+        <div className="process-item-body">{body}</div>
+    </ProcessDisclosure>
   );
 }
 
-function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewImage }: {
+function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewImage,
+  itemOpen, onItemOpenChange, onInteractionStart, onInteractionEnd }: {
   block: Block;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
+  itemOpen?: (key: string) => boolean | undefined;
+  onItemOpenChange?: (key: string, open: boolean) => void;
+  onInteractionStart?: () => number;
+  onInteractionEnd?: (token: number) => void;
 }) {
-  if (block.kind === "process") return <ProcessActivity
-    block={block as ProcessBlock} onOpenFile={onOpenFile} />;
+  if (block.kind === "process") {
+    const key = `process:${block.item_id}`;
+    return <ProcessActivity
+      block={block as ProcessBlock} onOpenFile={onOpenFile}
+      openOverride={itemOpen?.(key)}
+      onOpenChange={(open) => onItemOpenChange?.(key, open)}
+      onInteractionStart={onInteractionStart}
+      onInteractionEnd={onInteractionEnd} />;
+  }
   const text = block as TextBlock;
   if (text.channel === "thinking") {
+    const key = `reasoning:${text.message_id}`;
     return (
-      <details className="process-reasoning">
-        <summary><Icon name="spark" size={14} /><span>思考</span><Icon name="chev" size={13} /></summary>
+      <ProcessDisclosure className="process-reasoning"
+        openOverride={itemOpen?.(key)}
+        onOpenChange={(open) => onItemOpenChange?.(key, open)}
+        onInteractionStart={onInteractionStart}
+        onInteractionEnd={onInteractionEnd}
+        summary={<><Icon name="spark" size={14} /><span>思考</span>
+          <Icon name="chev" size={13} /></>}>
         <div className="process-reasoning-body"><MessageBlock text={text.text}
           done={text.done} onOpenFile={onOpenFile} imageAssets={imageAssets}
           onLoadImage={onLoadImage} onPreviewImage={onPreviewImage} /></div>
-      </details>
+      </ProcessDisclosure>
     );
   }
   return <div className="process-commentary"><MessageBlock text={text.text}
@@ -173,7 +282,9 @@ function isCodexPresentationNoise(block: Block): boolean {
 
 export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
   deferredCount = 0, detailLoading = false, onLoadDetail,
-  imageAssets, onLoadImage, onPreviewImage, engine = "claude" }: {
+  imageAssets, onLoadImage, onPreviewImage, engine = "claude",
+  openOverride, onOpenChange, itemOpen, onItemOpenChange,
+  onInteractionStart, onInteractionEnd }: {
   blocks: Block[];
   done: boolean;
   durationMs?: number;
@@ -186,6 +297,12 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
   onLoadImage?: (path: string) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
   engine?: "claude" | "codex";
+  openOverride?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  itemOpen?: (key: string) => boolean | undefined;
+  onItemOpenChange?: (key: string, open: boolean) => void;
+  onInteractionStart?: () => number;
+  onInteractionEnd?: (token: number) => void;
 }) {
   // Codex does not expose its private chain of thought in official clients.
   // Keep actionable commentary, plans, hook failures and tools, but suppress
@@ -195,19 +312,32 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
     isCodexPresentationNoise(block)
   ));
   const complete = done && !hasActiveProcess(items);
-  const [open, setOpen] = useState(!complete);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(!complete);
+  const open = openOverride ?? uncontrolledOpen;
   const [now, setNow] = useState(Date.now());
   const manuallyToggled = useRef(false);
   const tapGuard = useRef(new PointerTapGuard());
+  const interactionTokens = useRef(new Map<number, number>());
+  const releaseInteractionFrame = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!manuallyToggled.current) setOpen(!complete);
+    if (!manuallyToggled.current) setUncontrolledOpen(!complete);
   }, [complete]);
   useEffect(() => {
     if (complete) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [complete]);
+  useEffect(() => () => {
+    if (releaseInteractionFrame.current !== null) {
+      window.cancelAnimationFrame(releaseInteractionFrame.current);
+      releaseInteractionFrame.current = null;
+    }
+    for (const token of interactionTokens.current.values()) {
+      onInteractionEnd?.(token);
+    }
+    interactionTokens.current.clear();
+  }, [onInteractionEnd]);
 
   const hasDeferredDetail = items.length === 0 && deferredCount > 0;
   if (!items.length && !hasDeferredDetail) return null;
@@ -225,22 +355,46 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
     manuallyToggled.current = true;
     if (hasDeferredDetail) {
       if (!detailLoading) onLoadDetail?.();
-      setOpen(true);
+      setUncontrolledOpen(true);
+      onOpenChange?.(true);
       return;
     }
-    setOpen((value) => !value);
+    const next = !open;
+    setUncontrolledOpen(next);
+    onOpenChange?.(next);
   };
   const pointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
     tapGuard.current.pointerDown(event.pointerId, event.clientX, event.clientY);
+    const token = onInteractionStart?.();
+    if (token != null) interactionTokens.current.set(event.pointerId, token);
   };
   const pointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
     tapGuard.current.pointerMove(event.pointerId, event.clientX, event.clientY);
   };
   const pointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
     tapGuard.current.pointerUp(event.pointerId);
+    releaseInteractions();
   };
   const pointerCancel = (event: ReactPointerEvent<HTMLButtonElement>) => {
     tapGuard.current.pointerCancel(event.pointerId);
+    releaseInteractions();
+  };
+  const releaseInteractions = () => {
+    if (releaseInteractionFrame.current !== null) {
+      window.cancelAnimationFrame(releaseInteractionFrame.current);
+    }
+    // Native click is dispatched after pointerup in the same task. Keep the
+    // viewport frozen through the following ResizeObserver frame as well, so
+    // the clicked disclosure can settle before output following resumes.
+    releaseInteractionFrame.current = window.requestAnimationFrame(() => {
+      releaseInteractionFrame.current = window.requestAnimationFrame(() => {
+        releaseInteractionFrame.current = null;
+        for (const token of interactionTokens.current.values()) {
+          onInteractionEnd?.(token);
+        }
+        interactionTokens.current.clear();
+      });
+    });
   };
   return (
     <section className={`turn-process${open && !hasDeferredDetail ? " open" : ""}`}>
@@ -271,7 +425,10 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
               ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}
               block={row.block} onOpenFile={onOpenFile}
               imageAssets={imageAssets} onLoadImage={onLoadImage}
-              onPreviewImage={onPreviewImage} />
+              onPreviewImage={onPreviewImage}
+              itemOpen={itemOpen} onItemOpenChange={onItemOpenChange}
+              onInteractionStart={onInteractionStart}
+              onInteractionEnd={onInteractionEnd} />
       ))}</div>}
     </section>
   );

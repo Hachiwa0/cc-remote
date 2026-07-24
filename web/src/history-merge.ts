@@ -107,6 +107,11 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
       existing.text = combineText(existing.text, block.text);
       existing.done = existing.done || block.done;
       if (block.channel !== "unknown") existing.channel = block.channel;
+      // History parsers can regenerate an assistant item id. While this turn
+      // is still open, future deltas continue targeting the live app-server id.
+      // Keeping the history id here makes the next delta create a second block,
+      // which then survives every focus-triggered History reconciliation.
+      if (preserveLiveOpen) existing.message_id = block.message_id;
     } else {
       out.push({ ...block });
     }
@@ -131,9 +136,15 @@ function sameTurn(history: Turn, live: Turn): boolean {
 }
 
 function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
+  const historyImageRefs = history.imageRefs?.length
+    ? history.imageRefs : undefined;
+  const historyTurnId = historyImageRefs
+    ? (history.historyTurnId ?? history.id)
+    : (history.historyTurnId ?? live.historyTurnId);
   return {
     ...history,
     id: live.id,
+    historyTurnId,
     forkPointId: history.forkPointId ?? live.forkPointId,
     checkpointId: history.checkpointId ?? live.checkpointId,
     prompt: history.prompt || live.prompt,
@@ -145,8 +156,11 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     interrupted: history.interrupted || live.interrupted,
     error: live.error ?? history.error,
     progress: preserveLiveOpen ? live.progress : undefined,
-    images: live.images ?? history.images,
-    imageRefs: live.imageRefs ?? history.imageRefs,
+    // A summary page replaces optimistic inline image bodies with canonical,
+    // payload-free references. Retaining both makes ChatView lay out the same
+    // attachment twice and leaves a large placeholder below the visible image.
+    images: historyImageRefs ? undefined : live.images ?? history.images,
+    imageRefs: historyImageRefs ?? live.imageRefs ?? history.imageRefs,
     files: live.files ?? history.files,
     ts: Math.min(history.ts ?? Number.MAX_SAFE_INTEGER,
       live.ts ?? Number.MAX_SAFE_INTEGER) === Number.MAX_SAFE_INTEGER

@@ -21,8 +21,10 @@ const SCHEMA = 1;
 // turns to the backend's authoritative history revision so a destructive
 // rewind or wrapper restart can never merge removed completed turns back in.
 // v8 persists the revisioned v15 SessionControl snapshot so instant hydration
-// cannot fall back to an unrevisioned terminal lock.
-const CACHE_VER = 8;
+// cannot fall back to an unrevisioned terminal lock. v9 discards projections
+// written by the old open-turn History merge, which could persist duplicate
+// assistant blocks after switching away from and back to a running session.
+const CACHE_VER = 9;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

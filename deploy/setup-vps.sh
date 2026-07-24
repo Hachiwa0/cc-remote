@@ -17,6 +17,7 @@ APPDIR=/opt/cc-remote
 ENV_FILE="$APPDIR/.env"
 RELEASES_DIR="$APPDIR/releases"
 STATE_DIR="$APPDIR/state"
+RUNTIMES_DIR="$APPDIR/runtimes"
 CURRENT_LINK="$APPDIR/current"
 NEW_RELEASE_DIR=""
 PREVIOUS_RELEASE=""
@@ -123,11 +124,17 @@ flock -n 9 || die "another cc-remote deployment is already running"
 [ -s "$SOURCE_DIR/cc_remote/protocol.py" ] || die "$SOURCE_DIR/cc_remote/protocol.py missing"
 [ -s "$SOURCE_DIR/deploy/validate_protocol_bundle.py" ] || \
   die "$SOURCE_DIR/deploy/validate_protocol_bundle.py missing"
+[ -s "$SOURCE_DIR/deploy/python-version.txt" ] || \
+  die "$SOURCE_DIR/deploy/python-version.txt missing"
+PYTHON_RUNTIME="$(tr -d '[:space:]' < "$SOURCE_DIR/deploy/python-version.txt")"
+[[ "$PYTHON_RUNTIME" =~ ^3\.13\.[0-9]+$ ]] || \
+  die "deploy/python-version.txt must pin a Python 3.13 patch"
 python3 "$SOURCE_DIR/deploy/validate_protocol_bundle.py" \
   "$SOURCE_DIR/cc_remote/protocol.py" \
   "$SOURCE_DIR/web/dist/cc-remote-build.json" >/dev/null || \
   die "web build metadata does not match backend"
-[ -f "$SOURCE_DIR/requirements.lock" ] || die "$SOURCE_DIR/requirements.lock missing"
+[ -f "$SOURCE_DIR/requirements-relay.lock" ] || \
+  die "$SOURCE_DIR/requirements-relay.lock missing"
 [ -f "$SOURCE_DIR/deploy/Caddyfile" ] || die "$SOURCE_DIR/deploy/Caddyfile missing"
 [ -f "$SOURCE_DIR/deploy/caddy_managed_block.py" ] || die "$SOURCE_DIR/deploy/caddy_managed_block.py missing"
 [ -f "$SOURCE_DIR/deploy/cc-remote-relay.service" ] || die "$SOURCE_DIR/deploy/cc-remote-relay.service missing"
@@ -178,10 +185,11 @@ id -u ccremote >/dev/null 2>&1 || \
   useradd --system --gid ccremote --no-create-home --home-dir /nonexistent \
     --shell /usr/sbin/nologin ccremote
 
-mkdir -p "$RELEASES_DIR" "$STATE_DIR"
+mkdir -p "$RELEASES_DIR" "$STATE_DIR" "$RUNTIMES_DIR"
 chown root:ccremote "$APPDIR" "$RELEASES_DIR"
 chown ccremote:ccremote "$STATE_DIR"
-chmod 0750 "$APPDIR" "$RELEASES_DIR" "$STATE_DIR"
+chown root:ccremote "$RUNTIMES_DIR"
+chmod 0750 "$APPDIR" "$RELEASES_DIR" "$STATE_DIR" "$RUNTIMES_DIR"
 chown root:ccremote "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
 
@@ -200,7 +208,7 @@ elif [ -d "$APPDIR/cc_remote" ] && [ -d "$APPDIR/.venv" ]; then
   PREVIOUS_RELEASE="$(mktemp -d "$RELEASES_DIR/legacy-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
   while IFS= read -r -d '' item; do
     case "$(basename "$item")" in
-      .env|current|releases) continue ;;
+      .env|current|releases|runtimes|state) continue ;;
     esac
     cp -a "$item" "$PREVIOUS_RELEASE/"
   done < <(find "$APPDIR" -mindepth 1 -maxdepth 1 -print0)
@@ -230,6 +238,7 @@ NEW_RELEASE_DIR="$(mktemp -d "$RELEASES_DIR/release-$(date -u +%Y%m%dT%H%M%SZ).X
 tar -C "$SOURCE_DIR" \
   --exclude='./.git' --exclude='./.env' --exclude='./.venv' \
   --exclude='./current' --exclude='./releases' \
+  --exclude='./runtimes' --exclude='./state' \
   --exclude='./web/node_modules' -cf - . | tar -C "$NEW_RELEASE_DIR" -xf -
 
 [ -s "$NEW_RELEASE_DIR/cc_remote/protocol.py" ] || die "staged backend missing"
@@ -240,10 +249,23 @@ python3 "$NEW_RELEASE_DIR/deploy/validate_protocol_bundle.py" \
   die "staged web build metadata does not match backend"
 
 echo "==> release-local python venv + deps"
-python3 -m venv "$NEW_RELEASE_DIR/.venv"
-"$NEW_RELEASE_DIR/.venv/bin/python" -m pip install \
-  --require-hashes --only-binary=:all: --no-binary=http-ece \
-  -r "$NEW_RELEASE_DIR/requirements.lock"
+if [ -x "$NEW_RELEASE_DIR/bin/uv" ]; then
+  UV_PYTHON_INSTALL_DIR="$RUNTIMES_DIR" \
+    "$NEW_RELEASE_DIR/bin/uv" venv \
+    --no-project --managed-python --python "$PYTHON_RUNTIME" \
+    "$NEW_RELEASE_DIR/.venv"
+  "$NEW_RELEASE_DIR/bin/uv" pip sync \
+    --python "$NEW_RELEASE_DIR/.venv/bin/python" \
+    --require-hashes --only-binary=:all: --no-binary=http-ece \
+    "$NEW_RELEASE_DIR/requirements-relay.lock"
+else
+  # Manual source deployments retain the Python 3.10+ path documented before
+  # v3 release bundles. Published assets always take the managed-Python branch.
+  python3 -m venv "$NEW_RELEASE_DIR/.venv"
+  "$NEW_RELEASE_DIR/.venv/bin/python" -m pip install \
+    --require-hashes --only-binary=:all: --no-binary=http-ece \
+    -r "$NEW_RELEASE_DIR/requirements-relay.lock"
+fi
 (
   cd "$NEW_RELEASE_DIR"
   CC_REMOTE_ENV_FILE="$ENV_FILE" \
@@ -253,6 +275,8 @@ python3 -m venv "$NEW_RELEASE_DIR/.venv"
 )
 chown -R root:ccremote "$NEW_RELEASE_DIR"
 harden_release_permissions "$NEW_RELEASE_DIR"
+chown -R root:ccremote "$RUNTIMES_DIR"
+harden_release_permissions "$RUNTIMES_DIR"
 
 echo "==> Caddy config (domain: $DOMAIN)"
 CADDY_SITE="$(mktemp /etc/caddy/cc-remote-site.XXXXXX)"

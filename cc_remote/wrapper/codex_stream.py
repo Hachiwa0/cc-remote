@@ -73,6 +73,7 @@ _REVERSE_HISTORY_CHUNK_BYTES = 1024 * 1024
 _MAX_HISTORY_REVERSE_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_FORWARD_BYTES = 64 * 1024 * 1024
+_MAX_PENDING_HISTORY_COMPACTIONS = 32
 
 
 def _bounded_jsonl_records(file, *, end_offset: int | None = None):
@@ -1897,6 +1898,7 @@ def codex_translate_history(
     start_offset: int = 0,
     end_offset: int | None = None,
     source_continuation: str | None = None,
+    snapshot_in_progress: bool = False,
 ) -> tuple[list, str | None]:
     """Translate a Codex rollout .jsonl into wire events (same vocabulary as the
     live stream) + the model used. Codex analog of stream.translate_history.
@@ -1923,6 +1925,10 @@ def codex_translate_history(
     cur_channel = "unknown"
     last_ts = None
     pending_images: list = []   # input_image blocks seen before the next user_message
+    pending_compactions: list[
+        tuple[str, float | None, str | None]
+    ] = []
+    pending_agent_message: tuple[dict, int, str] | None = None
     task_has_user = False
     seen_tool_uses: set[str] = set()
     seen_tool_results: set[str] = set()
@@ -1995,6 +2001,42 @@ def codex_translate_history(
         cur_mid = None
         cur_channel = "unknown"
 
+    def append_compaction(
+        marker: tuple[str, float | None, str | None],
+    ) -> None:
+        nonlocal turn_visible
+        item_id, stamp, owner = marker
+        event = ProcessEvent(
+            item_id=item_id,
+            kind="compaction",
+            phase="end",
+            status="succeeded",
+            turn_id=owner,
+            title="压缩上下文",
+        )
+        if stamp is not None:
+            event.ts = stamp
+        events.append(event)
+        turn_visible = True
+
+    def flush_pending_compactions(target_owner: str | None) -> None:
+        """Materialize only markers compatible with the now-visible owner.
+
+        The marker freezes the task id visible when context_compacted arrived.
+        A later task_started must never relabel it onto a new user turn.
+        """
+        if not pending_compactions:
+            return
+        normalized_target = _history_optional_turn_id(target_owner)
+        markers = list(pending_compactions)
+        pending_compactions.clear()
+        for marker in markers:
+            owner = marker[2]
+            if (owner is not None and normalized_target is not None
+                    and owner != normalized_target):
+                continue
+            append_compaction(marker)
+
     def upsert_tool_use(
         tool_id: str,
         tool: str,
@@ -2045,7 +2087,10 @@ def codex_translate_history(
         seen_tool_results.add(result.tool_use_id)
         turn_visible = True
 
-    def open_assistant_only_turn(reason: str | None = None):
+    def open_assistant_only_turn(
+        reason: str | None = None,
+        turn_id: str | None = None,
+    ):
         """Start a visible continuation that has no user_message record.
 
         Goal/background continuations can begin with task_started after the
@@ -2060,19 +2105,99 @@ def codex_translate_history(
             if (not turn_has_user and reason is not None
                     and turn_continuation_reason is None):
                 turn_continuation_reason = reason
+            flush_pending_compactions(active_turn_id)
             return
+        pending_owner = (
+            pending_compactions[0][2] if pending_compactions else None
+        )
         turn_open = True
-        active_turn_id = pending_turn_id
+        active_turn_id = turn_id or pending_owner or pending_turn_id
         active_msg_id = None
         turn_visible = False
         turn_text_visible = False
         turn_final_visible = False
         turn_has_user = False
-        turn_continuation_reason = reason
+        turn_continuation_reason = (
+            reason or ("context_compacted" if pending_compactions else None)
+        )
         if (turn_continuation_reason is None
                 and source_continuation_available):
             turn_continuation_reason = "authoritative_page"
         source_continuation_available = False
+        flush_pending_compactions(active_turn_id)
+
+    def materialize_pending_terminal(value) -> None:
+        if not pending_compactions or turn_open:
+            return
+        terminal_owner = _history_optional_turn_id(value)
+        marker_owner = pending_compactions[0][2]
+        if (terminal_owner is not None and marker_owner is not None
+                and terminal_owner != marker_owner):
+            pending_compactions.clear()
+            return
+        open_assistant_only_turn(
+            "context_compacted", marker_owner or terminal_owner)
+
+    def emit_agent_message(
+        payload: dict,
+        line_no: int,
+        raw_ts: str,
+        item_id=None,
+    ) -> None:
+        nonlocal turn_visible, turn_text_visible, turn_final_visible
+        open_assistant_only_turn()
+        text = payload.get("message") or ""
+        channel = _assistant_channel(payload.get("phase"))
+        key = (
+            str(active_turn_id or pending_turn_id or ""),
+            channel,
+            text,
+        )
+        if not text or key in seen_agent_messages:
+            return
+        seen_agent_messages.add(key)
+        close_assistant()
+        ensure_assistant(
+            line_no,
+            raw_ts,
+            item_id or payload.get("id") or payload.get("message_id"),
+            channel=channel,
+        )
+        turn_visible = True
+        turn_text_visible = True
+        if channel == "final":
+            turn_final_visible = True
+        events.append(Delta(
+            message_id=cur_mid, text=text, channel=channel))
+        close_assistant()
+
+    def paired_agent_item_id(
+        payload: dict,
+        pending: tuple[dict, int, str],
+    ) -> str | None:
+        pending_payload, _line_no, _raw_ts = pending
+        if (payload.get("type") != "message"
+                or payload.get("role") != "assistant"
+                or _assistant_channel(payload.get("phase"))
+                != _assistant_channel(pending_payload.get("phase"))):
+            return None
+        response_text = "".join(
+            item.get("text", "")
+            for item in (payload.get("content") or [])
+            if (isinstance(item, dict)
+                and item.get("type") in {"output_text", "text"}
+                and isinstance(item.get("text"), str))
+        )
+        clean_text = pending_payload.get("message")
+        if (not isinstance(clean_text, str) or not clean_text
+                or not response_text.startswith(clean_text)):
+            return None
+        item_id = payload.get("id")
+        return (
+            item_id
+            if isinstance(item_id, str) and _SAFE_WIRE_ID.fullmatch(item_id)
+            else None
+        )
 
     def close_turn(
         subtype: str,
@@ -2115,6 +2240,7 @@ def codex_translate_history(
         turn_final_visible = False
         turn_has_user = False
         turn_continuation_reason = None
+        pending_compactions.clear()
 
     try:
         f = open(path, "rb")
@@ -2127,12 +2253,33 @@ def codex_translate_history(
             try:
                 d = json.loads(line)
             except Exception:
+                if pending_agent_message is not None:
+                    payload, pending_line, pending_ts = pending_agent_message
+                    emit_agent_message(
+                        payload, pending_line, pending_ts)
+                    pending_agent_message = None
                 continue
             t = d.get("type")
             p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
             raw_ts = d.get("timestamp", "")
             ts = _ts(raw_ts)
             payload_type = p.get("type")
+
+            consumed_paired_agent = False
+            if pending_agent_message is not None:
+                paired_id = (
+                    paired_agent_item_id(p, pending_agent_message)
+                    if t == "response_item" else None
+                )
+                payload, pending_line, pending_ts = pending_agent_message
+                emit_agent_message(
+                    payload, pending_line, pending_ts, paired_id)
+                pending_agent_message = None
+                consumed_paired_agent = paired_id is not None
+            if consumed_paired_agent:
+                if ts is not None:
+                    last_ts = ts
+                continue
 
             if t == "session_meta":
                 continue
@@ -2159,6 +2306,14 @@ def codex_translate_history(
                 next_turn_id = p.get("turn_id")
                 if next_turn_id:
                     next_turn_id = str(next_turn_id)
+                    marker_owner = (
+                        pending_compactions[0][2]
+                        if pending_compactions else None
+                    )
+                    if (pending_compactions
+                            and marker_owner != _history_optional_turn_id(
+                                next_turn_id)):
+                        pending_compactions.clear()
                     pending_turn_id = next_turn_id
                 task_has_user = False
             elif t == "event_msg" and payload_type == "user_message":
@@ -2223,6 +2378,7 @@ def codex_translate_history(
                     turn_has_user = True
                     turn_continuation_reason = None
                     source_continuation_available = False
+                    flush_pending_compactions(active_turn_id)
                     task_has_user = True
                 pending_images = []   # consume (per user turn)
             elif (t == "response_item"
@@ -2436,25 +2592,7 @@ def codex_translate_history(
                         summary=summary,
                     ))
             elif t == "event_msg" and payload_type == "agent_message":
-                open_assistant_only_turn()
-                txt = p.get("message") or ""
-                channel = _assistant_channel(p.get("phase"))
-                key = (str(active_turn_id or pending_turn_id or ""), channel, txt)
-                if txt and key not in seen_agent_messages:
-                    seen_agent_messages.add(key)
-                    close_assistant()
-                    ensure_assistant(
-                        line_no, raw_ts,
-                        p.get("id") or p.get("message_id"),
-                        channel=channel,
-                    )
-                    turn_visible = True
-                    turn_text_visible = True
-                    if channel == "final":
-                        turn_final_visible = True
-                    events.append(Delta(
-                        message_id=cur_mid, text=txt, channel=channel))
-                    close_assistant()
+                pending_agent_message = (p, line_no, raw_ts)
             elif t == "event_msg" and payload_type == "patch_apply_end":
                 open_assistant_only_turn()
                 ensure_assistant(line_no, raw_ts)
@@ -2539,18 +2677,23 @@ def codex_translate_history(
                 ))
                 turn_visible = True
             elif t == "event_msg" and payload_type == "context_compacted":
-                open_assistant_only_turn("context_compacted")
-                events.append(ProcessEvent(
-                    item_id=_history_id(
+                marker = (
+                    _history_id(
                         p.get("id"), "compaction", line_no, raw_ts),
-                    kind="compaction",
-                    phase="end",
-                    status="succeeded",
-                    turn_id=_history_optional_turn_id(
+                    ts,
+                    _history_optional_turn_id(
                         active_turn_id or pending_turn_id),
-                    title="压缩上下文",
-                ))
+                )
+                if turn_open:
+                    open_assistant_only_turn("context_compacted")
+                    append_compaction(marker)
+                else:
+                    pending_compactions.append(marker)
+                    if (len(pending_compactions)
+                            > _MAX_PENDING_HISTORY_COMPACTIONS):
+                        del pending_compactions[0]
             elif t == "event_msg" and payload_type == "task_complete":
+                materialize_pending_terminal(p.get("turn_id"))
                 last = p.get("last_agent_message")
                 if (not turn_open and isinstance(last, str) and last):
                     open_assistant_only_turn()
@@ -2583,6 +2726,7 @@ def codex_translate_history(
                         close_turn("error", _duration(p), True,
                                    _completed_ts(p, ts), p.get("turn_id"))
             elif t == "event_msg" and payload_type == "turn_aborted":
+                materialize_pending_terminal(p.get("turn_id"))
                 if turn_open:
                     # Current Codex rollouts can omit ``reason`` for an
                     # intentional interrupt. Explicit failure reasons remain
@@ -2595,12 +2739,16 @@ def codex_translate_history(
                         p.get("turn_id"))
             elif t == "event_msg" and payload_type in {
                     "task_failed", "turn_failed", "task_error"}:
+                materialize_pending_terminal(p.get("turn_id"))
                 if turn_open:
                     close_turn("error", _duration(p), True,
                                _completed_ts(p, ts), p.get("turn_id"))
             # session_meta / world_state / token_count / private reasoning : skipped
             if ts is not None:
                 last_ts = ts
+    if pending_agent_message is not None and not snapshot_in_progress:
+        payload, pending_line, pending_ts = pending_agent_message
+        emit_agent_message(payload, pending_line, pending_ts)
     # A file can be read while Codex is still appending the current turn. Close
     # only its current text block; deliberately omit TurnEnd so the reducer keeps
     # the turn not-done instead of fabricating a completed status.

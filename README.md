@@ -256,9 +256,86 @@ python -m cc_remote.wrapper
 
 > 想改网页代码时用开发模式：`npm --prefix web run dev`（Vite）。生产/联调直接用上面的 `build` + 中继同源托管更简单。
 
+## GitHub Release 一键安装（生产推荐）
+
+正式版把 Relay 和 Wrapper 拆成按系统/架构构建的独立包。Relay 包只含后端和已构建
+Web，Wrapper 包只含本机控制端；两者都自带 `uv`，安装时创建托管的 Python 3.13
+环境。用户不需要 clone 仓库、安装 Node 或在服务文件里粘贴 token。
+
+支持矩阵：
+
+| 角色 | 系统 | 架构 | 常驻方式 |
+|---|---|---|---|
+| Relay | Ubuntu 22.04+ / Debian 12+ | x86_64、arm64 | systemd + Caddy |
+| Wrapper | macOS | Intel、Apple Silicon | 当前用户 LaunchAgent |
+| Wrapper | glibc Linux + systemd（推荐 Ubuntu 22.04+ / Debian 12+） | x86_64、arm64 | 指定普通用户的 systemd 服务 |
+
+### 1）下载并校验引导脚本
+
+在 GitHub Release 页面确认版本与 release attestation，再在待安装机器下载同一版本的
+`install.sh` 和 `SHA256SUMS`：
+
+```bash
+release=https://github.com/muggle-stack/cc-remote/releases/download/v3.0.0
+curl -fLO "$release/install.sh"
+curl -fLO "$release/SHA256SUMS"
+
+# Linux
+grep ' install.sh$' SHA256SUMS | sha256sum -c -
+# macOS 改用：
+# grep ' install.sh$' SHA256SUMS | shasum -a 256 -c -
+chmod +x install.sh
+```
+
+引导脚本检测 OS/CPU，只下载对应角色包，并在解压和执行前校验该包的 SHA-256。
+
+### 2）VPS 安装 Relay
+
+先把域名 A/AAAA 记录指向 VPS，并放行 80/443，然后运行：
+
+```bash
+./install.sh relay --domain remote.example.com
+```
+
+Linux 上脚本会自行请求 `sudo`。首次安装会交互要求一个至少 16 字符的网页登录口令，
+自动生成 Relay 密钥，安装 Caddy/systemd，并在 `/opt/cc-remote/releases/` 中完成
+不可变 staging、原子 `current` 切换和失败回滚。已有
+`/opt/cc-remote/.env` 会原样保留。
+
+打开 `https://remote.example.com/` 登录，在顶部设备中心选择“允许添加设备”，复制
+一次性配对码。
+
+### 3）在 Claude / Codex 所在机器安装 Wrapper
+
+确保这台机器上的官方 `claude` 或 `codex` 已登录且本身能正常工作，然后执行：
+
+```bash
+./install.sh wrapper \
+  --relay https://remote.example.com \
+  --pair XXXXX-XXXXX-XXXXX-XXXXX \
+  --name "MacBook Pro"
+```
+
+macOS 必须以当前桌面用户运行，安装器创建用户 LaunchAgent；Linux 会请求 `sudo`，
+但 Wrapper 和所有模型/工具子进程仍以发起安装的普通用户运行。设备长凭据只写入
+`0600` 私有配置：macOS 为 `~/.cc-remote/device.json`，Linux 为
+`/etc/cc-remote/device.env`；不会进入 plist、systemd unit 或 release 目录。
+
+升级同一台机器时下载新版本 `install.sh` 后重新执行即可。Relay 仍传 `--domain`；
+Wrapper 已有设备凭据时只需：
+
+```bash
+./install.sh wrapper
+```
+
+协议大版本升级仍应在同一维护窗口完成 Relay、Web 和所有 Wrapper；已经打开的页面要
+硬刷新。安装器保留上一 release，服务验活失败会把 `current` 和服务定义恢复到旧版。
+
 ## 生产部署（公网 VPS 中继 + 你机器上的 wrapper）
 
-把中继搬到公网，wrapper 从你的机器**出站** `wss://` 连它，手机浏览器连同一个域名。模型链路完全不动。
+以下保留源码 staging / 手工配置路径，适合开发、自定义部署和故障恢复。普通正式安装
+优先使用上面的 GitHub Release。把中继搬到公网后，wrapper 从你的机器**出站**
+`wss://` 连它，手机浏览器连同一个域名。模型链路完全不动。
 
 ```
 你的机器 wrapper ──wss:443──▶ Caddy(VPS, 自动 HTTPS) ──▶ relay(127.0.0.1:8765) ◀──wss:443── 手机浏览器

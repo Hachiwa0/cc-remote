@@ -27,7 +27,8 @@ from cc_remote.attachments import (
 )
 
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
+_CODEX_ONLY_MIGRATION_VERSION = 6
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -723,7 +724,9 @@ class HistoryIndexStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if current not in (0, _SCHEMA_VERSION):
+            migrate_codex_only = current == _CODEX_ONLY_MIGRATION_VERSION
+            if current not in (
+                    0, _CODEX_ONLY_MIGRATION_VERSION, _SCHEMA_VERSION):
                 # This database is derived exclusively from engine transcripts.
                 # Rebuilding is safer than carrying migrations for stale cached
                 # projections across wire-shape changes.
@@ -818,7 +821,20 @@ class HistoryIndexStore:
                 "CREATE INDEX IF NOT EXISTS history_image_assets_lru "
                 "ON history_image_assets(accessed_at)"
             )
-            if current == 0:
+            if migrate_codex_only:
+                # Translator v7 changes Codex turn ownership and assistant
+                # message identities. Claude projections are unaffected and
+                # remain safe to serve, so avoid making every Claude session
+                # pay an unnecessary cold rebuild after this upgrade.
+                for table in (
+                    "history_pages",
+                    "history_turn_details",
+                    "history_image_assets",
+                ):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
+                connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+            elif current == 0:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
         try:
             os.chmod(self.path, 0o600)

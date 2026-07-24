@@ -26,8 +26,8 @@ from cc_remote.protocol import (
     serialize, deserialize,
     GetHistory, GetHistoryImage, GetTurnDetail, History, HistoryImage,
     TurnDetail, HistoryInvalidated,
-    UserMsg, AssistantMsgStart, Delta,
-    TurnEnd, TurnResult, is_downstream,
+    UserMsg, AssistantMsgStart, AssistantMsgEnd, Delta, ProcessEvent,
+    TurnEnd, TurnResult, Error, is_downstream,
 )
 from cc_remote.wrapper import machine as mm
 from cc_remote.wrapper.history_store import (
@@ -694,6 +694,44 @@ def test_external_codex_turn_is_history_activity_not_resident_state(monkeypatch)
     asyncio.run(go())
 
 
+def test_active_external_codex_history_marks_growing_snapshot(monkeypatch, tmp_path):
+    rollout = tmp_path / "active-external.jsonl"
+    rollout.write_text(json.dumps({
+        "timestamp": "2026-01-01T00:00:00Z",
+        "type": "session_meta",
+        "payload": {"id": "external-codex"},
+    }) + "\n")
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    translate_kwargs = []
+
+    def translate(*_args, **kwargs):
+        translate_kwargs.append(kwargs)
+        return [], None
+
+    monkeypatch.setattr(mm, "codex_translate_history", translate)
+
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("external-codex", "external-codex")
+        ctx.engine = "codex"
+        ctx.state = "idle"
+        machine.sessions[ctx.key] = ctx
+        machine._watch["external-codex"] = {
+            "engine": "codex",
+            "external": True,
+            "active_external_turns": {"native-turn": 1.0},
+            "takeover_pending": None,
+        }
+
+        await machine._build_history("external-codex", limit=20)
+
+        assert translate_kwargs
+        assert translate_kwargs[0]["snapshot_in_progress"] is True
+
+    asyncio.run(go())
+
+
 def test_inflight_history_keeps_pre_rollback_revision(monkeypatch):
     entered = threading.Event()
     release = threading.Event()
@@ -1114,6 +1152,328 @@ def test_compact_continuation_split_from_terminal_is_not_an_error_turn(
     assert [e.result.subtype for e in turn_ends] == [
         "success", "success", "success"]
     assert [e.result.is_error for e in turn_ends] == [False, False, False]
+
+
+def test_context_compacted_before_user_belongs_to_that_user_turn(tmp_path):
+    """A task can compact before Codex records its clean user_message.
+
+    The compact marker is process metadata for the upcoming user turn, not an
+    empty assistant-only turn that should be closed as a synthetic error.
+    """
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "compact-before-user.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "s"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-1"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "compacted",
+         "payload": {"replacement_history": []}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "turn_context",
+         "payload": {"turn_id": "turn-1"}},
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "continue"}},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "done"}},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "response_item",
+         "payload": {"type": "message", "id": "message-1",
+                     "role": "assistant", "phase": "final_answer",
+                     "content": [{"type": "output_text", "text": "done"}]}},
+        {"timestamp": "2026-01-01T00:00:07Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-1",
+                     "last_agent_message": "done"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    user_index = next(
+        index for index, event in enumerate(events)
+        if isinstance(event, UserMsg)
+    )
+    compact_index = next(
+        index for index, event in enumerate(events)
+        if isinstance(event, ProcessEvent) and event.kind == "compaction"
+    )
+    assert compact_index > user_index
+    assert events[compact_index].turn_id == "turn-1"
+    assert events[compact_index].ts == 1767225603.0
+    assert len([event for event in events if isinstance(event, TurnEnd)]) == 1
+    assert not any(isinstance(event, Error) for event in events)
+
+    turns = materialize_history_turns([
+        event.model_dump(mode="json") for event in events
+    ], include_live_detail=True)
+    assert [(turn["prompt"], turn["done"], turn.get("error"))
+            for turn in turns] == [("continue", True, None)]
+    assert any(
+        block.get("processKind") == "compaction"
+        for block in turns[0]["blocks"]
+    )
+
+
+def test_pending_compaction_does_not_cross_a_new_task_owner(tmp_path):
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "compact-owner.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "old-turn"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+        # No visible output or terminal ever materialized old-turn. Its marker
+        # must not leak into the next authoritative task.
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "new-turn"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "new prompt"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "new answer"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+         "payload": {"type": "message", "id": "new-message",
+                     "role": "assistant", "phase": "final_answer",
+                     "content": [{
+                         "type": "output_text", "text": "new answer",
+                     }]}},
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "new-turn",
+                     "last_agent_message": "new answer"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    assert not any(
+        isinstance(event, ProcessEvent) and event.kind == "compaction"
+        for event in events
+    )
+    assert [event.turn_id for event in events if isinstance(event, TurnEnd)] == [
+        "new-turn"
+    ]
+
+
+def test_pending_compaction_keeps_authoritative_abort_terminal(tmp_path):
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "compact-aborted.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-aborted"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "turn_aborted", "turn_id": "turn-aborted"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    compactions = [
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.kind == "compaction"
+    ]
+    terminals = [event for event in events if isinstance(event, TurnEnd)]
+    assert len(compactions) == 1
+    assert compactions[0].turn_id == "turn-aborted"
+    assert len(terminals) == 1
+    assert terminals[0].turn_id == "turn-aborted"
+    assert terminals[0].result.subtype == "error_during_execution"
+    assert terminals[0].result.is_error is True
+
+
+def test_pending_compaction_keeps_authoritative_failure_terminal(tmp_path):
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "compact-failed.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-failed"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "task_failed", "turn_id": "turn-failed"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    compactions = [
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.kind == "compaction"
+    ]
+    terminals = [event for event in events if isinstance(event, TurnEnd)]
+    assert len(compactions) == 1
+    assert compactions[0].turn_id == "turn-failed"
+    assert len(terminals) == 1
+    assert terminals[0].turn_id == "turn-failed"
+    assert terminals[0].result.subtype == "error"
+    assert terminals[0].result.is_error is True
+
+
+def test_compaction_owner_comparison_uses_protocol_safe_turn_id(tmp_path):
+    """Provider ids are normalized before ownership comparisons.
+
+    An unsafe raw id must not make a valid marker look as though it belongs to
+    another turn and disappear from the materialized history.
+    """
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "compact-normalized-owner.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "unsafe turn id"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "turn_context",
+         "payload": {"turn_id": "unsafe turn id"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "continue"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "unsafe turn id",
+                     "last_agent_message": "done"}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    compaction = next(
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.kind == "compaction"
+    )
+    terminal = next(event for event in events if isinstance(event, TurnEnd))
+    assert compaction.turn_id is not None
+    # A hashed display identity must never be exposed as a resumable fork point.
+    assert terminal.turn_id is None
+
+
+def test_compact_only_eof_does_not_materialize_an_empty_turn(tmp_path):
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "compact-eof.jsonl"
+    source.write_text("".join(json.dumps(row) + "\n" for row in [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-open"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "context_compacted"}},
+    ]))
+
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    assert not any(isinstance(event, ProcessEvent) for event in events)
+    assert not any(isinstance(event, TurnEnd) for event in events)
+
+
+def test_history_agent_message_borrows_paired_live_item_id(tmp_path):
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "paired-agent-message.jsonl"
+    clean = "working"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-1"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "inspect"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "commentary",
+                     "message": clean}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+         "payload": {"type": "message", "id": "msg-stable",
+                     "role": "assistant", "phase": "commentary",
+                     "content": [{
+                         "type": "output_text",
+                         "text": clean + "\n\n<internal metadata>",
+                     }]}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-1",
+                     "last_agent_message": clean}},
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(source), tool_result_max=4096)
+    starts = [event for event in events if isinstance(event, AssistantMsgStart)]
+    deltas = [event for event in events if isinstance(event, Delta)]
+    ends = [event for event in events if isinstance(event, AssistantMsgEnd)]
+    assert [event.message_id for event in starts] == ["msg-stable"]
+    assert [(event.message_id, event.text) for event in deltas] == [
+        ("msg-stable", clean)
+    ]
+    assert [event.message_id for event in ends] == ["msg-stable"]
+
+
+def test_unpaired_history_agent_message_is_not_lost_at_snapshot_eof(tmp_path):
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "unpaired-agent-message.jsonl"
+    prefix = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-1"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "inspect"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "commentary",
+                     "message": "visible before pair"}},
+    ]
+    suffix = {
+        "timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+        "payload": {"type": "message", "id": "msg-after-snapshot",
+                    "role": "assistant", "phase": "commentary",
+                    "content": [{
+                        "type": "output_text", "text": "visible before pair",
+                    }]},
+    }
+    encoded_prefix = "".join(json.dumps(row) + "\n" for row in prefix)
+    source.write_text(encoded_prefix + json.dumps(suffix) + "\n")
+
+    events, _ = codex_translate_history(
+        str(source), tool_result_max=4096,
+        end_offset=len(encoded_prefix.encode()),
+    )
+    deltas = [event for event in events if isinstance(event, Delta)]
+    assert [event.text for event in deltas] == ["visible before pair"]
+    assert deltas[0].message_id != "msg-after-snapshot"
+
+
+def test_active_snapshot_defers_unpaired_agent_message_until_canonical_item(
+        tmp_path):
+    """A growing rollout must not publish a temporary id at the mirror seam."""
+    from cc_remote.wrapper.codex_stream import codex_translate_history
+
+    source = tmp_path / "growing-agent-message.jsonl"
+    prefix = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-1"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "inspect"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "commentary",
+                     "message": "one logical update"}},
+    ]
+    paired = {
+        "timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+        "payload": {"type": "message", "id": "msg-canonical",
+                    "role": "assistant", "phase": "commentary",
+                    "content": [{
+                        "type": "output_text", "text": "one logical update",
+                    }]},
+    }
+    encoded_prefix = "".join(json.dumps(row) + "\n" for row in prefix)
+    source.write_text(encoded_prefix + json.dumps(paired) + "\n")
+
+    partial, _ = codex_translate_history(
+        str(source), tool_result_max=4096,
+        end_offset=len(encoded_prefix.encode()),
+        snapshot_in_progress=True,
+    )
+    assert not any(isinstance(event, Delta) for event in partial)
+
+    complete, _ = codex_translate_history(
+        str(source), tool_result_max=4096,
+        end_offset=source.stat().st_size,
+        snapshot_in_progress=True,
+    )
+    deltas = [event for event in complete if isinstance(event, Delta)]
+    assert [(event.message_id, event.text) for event in deltas] == [
+        ("msg-canonical", "one logical update"),
+    ]
 
 
 def test_authoritative_page_continuation_can_close_without_terminal(tmp_path):
