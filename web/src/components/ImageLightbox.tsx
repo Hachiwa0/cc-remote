@@ -21,10 +21,15 @@ interface GestureStart {
   points: Array<{ id: number; point: ImagePoint }>;
 }
 
-export function ImageLightbox({ src, alt, onClose }: {
+export function ImageLightbox({ src, alt, onClose,
+  dialogLabel = "图片预览",
+  closeLabel = "关闭图片预览",
+}: {
   src: string;
   alt: string;
   onClose: () => void;
+  dialogLabel?: string;
+  closeLabel?: string;
 }) {
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -139,7 +144,7 @@ export function ImageLightbox({ src, alt, onClose }: {
 
   return <div ref={stageRef}
     className={`image-lightbox${entered ? " entered" : ""}${interacting ? " interacting" : ""}`}
-    role="dialog" aria-modal="true" aria-label="图片预览"
+    role="dialog" aria-modal="true" aria-label={dialogLabel}
     onPointerDown={onPointerDown} onPointerMove={onPointerMove}
     onPointerUp={(event) => finishPointer(event, false)}
     onPointerCancel={(event) => finishPointer(event, true)}
@@ -157,7 +162,7 @@ export function ImageLightbox({ src, alt, onClose }: {
         onDragStart={(event) => event.preventDefault()} />
     </div>
     <button ref={closeRef} type="button" className="image-lightbox-close"
-      aria-label="关闭图片预览"
+      aria-label={closeLabel}
       onPointerDown={(event) => event.stopPropagation()}
       onClick={(event) => { event.stopPropagation(); requestClose(); }}>
       <Icon name="close" size={22} />

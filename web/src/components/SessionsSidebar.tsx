@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type TouchEvent } from "react";
 import type { SessionInfo, Space, State } from "../protocol";
+import type { CompletionBadgeKind } from "../completion-badges";
 import { Icon, ClaudeMark } from "../icons";
 import {
   compareSessionsByActivity,
@@ -17,6 +18,7 @@ interface Props {
   // Live state per resident session (from the client's runtimes), overriding the
   // list_sessions snapshot so a background session's dot updates in real time.
   liveStates?: Record<string, State>;
+  completionBadges?: Record<string, CompletionBadgeKind>;
   activeSessionId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
@@ -52,8 +54,8 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 }
 
 export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStates,
-  activeSessionId, onSelect, onNew, onNewInDir, onClose, onRename, onArchive,
-  onPin, onDelete, onForkWorktree }: Props) {
+  completionBadges, activeSessionId, onSelect, onNew, onNewInDir, onClose,
+  onRename, onArchive, onPin, onDelete, onForkWorktree }: Props) {
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
@@ -210,6 +212,10 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
     };
     // Prefer live runtime state (resident session) over the list snapshot.
     const st = liveStates?.[s.session_id] ?? s.state;
+    const completion = completionBadges?.[s.session_id];
+    const completionLabel = completion === "btw" ? "BTW 完成"
+      : completion === "both" ? "2 项完成"
+      : completion ? "已完成" : null;
     const forkBlocked = isWorktreeForkBlockedByState(st);
     return (
       <div
@@ -227,6 +233,9 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
           {isActive && <span className="pill idle"><span className="sd" />当前</span>}
           {(st === "running" || st === "interrupting") && (
             <span className={"pill " + st}><span className="sd" />{st === "running" ? "运行" : "中断"}</span>
+          )}
+          {completionLabel && st !== "running" && st !== "interrupting" && (
+            <span className="pill completed"><span className="sd" />{completionLabel}</span>
           )}
         </div>
         {showLocation && s.cwd && (

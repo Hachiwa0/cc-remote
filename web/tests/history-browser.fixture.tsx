@@ -153,6 +153,37 @@ function compactToolsTurn(): Turn {
   };
 }
 
+function mermaidTurn(invalid = false): Turn {
+  const text = invalid
+    ? "```mermaid\nthis is not a supported diagram\n```"
+    : [
+        "```mermaid",
+        "flowchart LR",
+        "  A[Start] --> B[Done]",
+        "  click A \"https://example.com\"",
+        "```",
+        "",
+        "```mermaid",
+        "sequenceDiagram",
+        "  Alice->>Bob: Hello",
+        "```",
+      ].join("\n");
+  return {
+    id: invalid ? "invalid-mermaid" : "mermaid",
+    prompt: "渲染 Mermaid 图表",
+    blocks: [{
+      kind: "text",
+      message_id: invalid ? "invalid-mermaid-message" : "mermaid-message",
+      channel: "final",
+      text,
+      done: true,
+    }],
+    done: true,
+    ts: Date.now(),
+    doneTs: Date.now(),
+  };
+}
+
 interface FixtureSession {
   turns: Turn[];
   cursor: string;
@@ -172,6 +203,9 @@ export function HistoryBrowserFixture() {
   const interactiveTimeline = params.has("interactive-timeline");
   const dualImage = params.has("dual-image");
   const compactTools = params.has("compact-tools");
+  const mermaid = params.has("mermaid");
+  const invalidMermaid = params.has("invalid-mermaid");
+  const mermaidHistory = params.has("mermaid-history");
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
@@ -182,6 +216,16 @@ export function HistoryBrowserFixture() {
     }
     if (compactTools) {
       return [compactToolsTurn()];
+    }
+    if (mermaid || invalidMermaid) {
+      return [mermaidTurn(invalidMermaid)];
+    }
+    if (mermaidHistory) {
+      return [
+        mermaidTurn(),
+        ...Array.from({ length: 40 }, (_, index) =>
+          finalTurn(`after-mermaid-${index + 1}`, 3)),
+      ];
     }
     if (large) {
       return Array.from({ length: largeCount }, (_, index) =>
@@ -202,14 +246,16 @@ export function HistoryBrowserFixture() {
     }
     return INITIAL;
   }, [
-    compactTools, dualImage, interactiveTimeline, large, largeCount, timeline,
+    compactTools, dualImage, interactiveTimeline, invalidMermaid, large,
+    largeCount, mermaid, mermaidHistory, timeline,
   ]);
   const [sid, setSid] = useState("history-browser-session-a");
   const [sessions, setSessions] = useState<Record<string, FixtureSession>>({
     "history-browser-session-a": {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
-      hasMore: !compactTools && !large && !timeline,
+      hasMore: !compactTools && !invalidMermaid && !large && !mermaid
+        && !mermaidHistory && !timeline,
       pagesLoaded: 0,
     },
     "history-browser-session-b": {

@@ -241,6 +241,152 @@ test("expanded tool batches use dense rows instead of individual cards", async (
   }
 });
 
+test("completed Mermaid fences render isolated sanitized SVGs", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?mermaid=1");
+  const diagrams = page.locator(".mermaid-block");
+  await expect(diagrams).toHaveCount(2);
+  await expect(page.locator(".mermaid-svg")).toHaveCount(2);
+  await expect(diagrams.nth(0)).toHaveAttribute("data-mermaid-state", "ready");
+  await expect(diagrams.nth(1)).toHaveAttribute("data-mermaid-state", "ready");
+
+  const rootIds = await page.locator(".mermaid-svg > svg").evaluateAll(
+    (nodes) => nodes.map((node) => node.id),
+  );
+  expect(rootIds.every(Boolean)).toBe(true);
+  expect(new Set(rootIds).size).toBe(rootIds.length);
+  await expect(page.locator(
+    ".mermaid-svg script, .mermaid-svg foreignObject, .mermaid-svg image, "
+      + ".mermaid-svg a",
+  )).toHaveCount(0);
+  const unsafeReferences = await page.locator(".mermaid-svg svg").evaluateAll(
+    (nodes) => nodes.flatMap((node) =>
+      [...node.querySelectorAll("*")].flatMap((element) =>
+        [...element.attributes]
+          .filter((attribute) => ["href", "xlink:href", "src"].includes(
+            attribute.name.toLowerCase(),
+          ))
+          .map((attribute) => attribute.value)
+          .filter((value) => !value.startsWith("#")))),
+  );
+  expect(unsafeReferences).toEqual([]);
+  const clippedNodes = await diagrams.nth(0).evaluate((node) => {
+    const svg = node.querySelector("svg");
+    if (!svg) throw new Error("flowchart SVG is missing");
+    const bounds = svg.getBoundingClientRect();
+    return [...svg.querySelectorAll<SVGGraphicsElement>(".node")].filter((item) => {
+      const rect = item.getBoundingClientRect();
+      return rect.left < bounds.left - 1 || rect.right > bounds.right + 1
+        || rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1;
+    }).length;
+  });
+  expect(clippedNodes).toBe(0);
+
+  for (const diagram of await diagrams.all()) {
+    const sizes = await diagram.evaluate((node) => {
+      const svg = node.querySelector("svg");
+      if (!svg) throw new Error("rendered Mermaid is missing its SVG");
+      return {
+        container: node.getBoundingClientRect().width,
+        svg: svg.getBoundingClientRect().width,
+      };
+    });
+    expect(sizes.svg).toBeLessThanOrEqual(sizes.container + 1);
+  }
+
+  const lightId = await page.locator(".mermaid-svg > svg").first().getAttribute("id");
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = "dark";
+  });
+  await expect.poll(async () =>
+    page.locator(".mermaid-svg > svg").first().getAttribute("id"),
+  ).not.toBe(lightId);
+  await expect(diagrams.nth(0)).toHaveAttribute("data-mermaid-state", "ready");
+});
+
+test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?mermaid=1");
+  const diagram = page.locator(".mermaid-block").first();
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+
+  await diagram.getByRole("button", { name: "放大 Mermaid 图表" }).click();
+  const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
+  await expect(preview).toBeVisible();
+  const image = preview.locator("img");
+  await expect(image).toBeVisible();
+  await expect(image).toHaveAttribute("src", /^blob:/);
+
+  await page.getByRole("button", { name: "关闭 Mermaid 图表预览" }).click();
+  await expect(preview).toHaveCount(0);
+
+  await diagram.locator(".mermaid-svg").click();
+  await expect(page.getByRole("dialog", { name: "Mermaid 图表预览" }))
+    .toBeVisible();
+  await page.evaluate(() => {
+    document.querySelector<HTMLButtonElement>('[data-testid="switch-session"]')
+      ?.click();
+  });
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+});
+
+test("invalid Mermaid falls back to copyable source", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?invalid-mermaid=1");
+  const diagram = page.locator(".mermaid-block");
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "error");
+  await expect(diagram.locator(".mermaid-source")).toContainText(
+    "this is not a supported diagram",
+  );
+  await expect(diagram.getByRole("button", {
+    name: "复制 Mermaid 源码",
+  })).toBeVisible();
+  await expect(diagram.locator(".mermaid-svg")).toHaveCount(0);
+});
+
+test("offscreen historical Mermaid does not load until its row is mounted", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?mermaid-history=1");
+  await expect(page.locator('[data-turn-id="after-mermaid-40"]')).toBeVisible();
+  await expect(page.locator(".mermaid-block")).toHaveCount(0);
+  const before = await page.evaluate(() => performance.getEntriesByType("resource")
+    .map((entry) => entry.name));
+  expect(before.some((url) =>
+    /\/node_modules\/\.vite\/deps\/mermaid(?:\.js|-)/i.test(url),
+  )).toBe(false);
+
+  await page.locator(".thread").evaluate((node) => { node.scrollTop = 0; });
+  const diagramTurn = page.locator('[data-turn-id="mermaid"]');
+  await expect(diagramTurn).toBeVisible();
+  await expect(diagramTurn.locator(".mermaid-block")).toHaveCount(2);
+  await expect(diagramTurn.locator(".mermaid-svg")).toHaveCount(2);
+});
+
+test("switching sessions discards an in-flight Mermaid render", async ({
+  page,
+}) => {
+  await page.route(/\/node_modules\/\.vite\/deps\/mermaid(?:\.js|-)/i, async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await route.continue();
+  });
+  await page.goto("/tests/history-browser.html?mermaid=1");
+  await expect(page.locator(".mermaid-block")).toHaveCount(2);
+  await page.getByTestId("switch-session").click();
+  await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
+  await page.waitForTimeout(400);
+  await expect(page.locator(".mermaid-block")).toHaveCount(0);
+  await expect(page.locator(
+    "body > svg, body > div[id*='cc-remote-mermaid']",
+  )).toHaveCount(0);
+
+  await page.getByTestId("switch-session").click();
+  await expect(page.locator(
+    '[data-turn-id="mermaid"] .mermaid-svg',
+  )).toHaveCount(2);
+});
+
 test("a pending composer image previews without triggering removal", async ({
   page,
 }) => {

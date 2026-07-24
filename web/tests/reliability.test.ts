@@ -18,6 +18,13 @@ import {
   selectDrainCandidates,
 } from "../src/runtime-drain.ts";
 import { mergeInitialHistory } from "../src/history-merge.ts";
+import {
+  acknowledgeCompletion,
+  completionBadgeKind,
+  discardBtwCompletionReceipts,
+  markCompletionUnread,
+  rekeyCompletionReceipts,
+} from "../src/completion-badges.ts";
 import { imageDimensions } from "../src/img.ts";
 import {
   historyImageDisplaySource,
@@ -126,11 +133,59 @@ assert.equal(composerDrafts.get(realDraft).input,
   "typed while the first turn was running",
   "session id capture must move a temp session draft atomically");
 assert.equal(composerDrafts.get(tempDraft).input, "");
+const btwDraftA = composerDraftKey(
+  "machine-a", "code", "codex", "btw:btw-a");
+const btwDraftB = composerDraftKey(
+  "machine-a", "code", "codex", "btw:btw-b");
+composerDrafts.set(btwDraftA, {
+  input: "unfinished side question",
+  images: [],
+  files: [],
+});
+assert.equal(composerDrafts.get(btwDraftB).input, "",
+  "BTW drafts must not follow another fork");
+assert.equal(composerDrafts.get(btwDraftA).input,
+  "unfinished side question",
+  "returning to the same BTW restores only its draft");
+composerDrafts.delete(btwDraftA);
+assert.equal(composerDrafts.get(btwDraftA).input, "",
+  "explicit BTW close discards its private draft");
 
 assert.equal(sessionActivityTime("2026-07-17T10:00:00Z"),
   Date.parse("2026-07-17T10:00:00Z"), "ISO Claude activity timestamps must sort correctly");
 assert.ok(sessionActivityTime("1752746400000") > sessionActivityTime("1752746399"),
   "millisecond and second timestamps must share one ordering scale");
+
+let completionReceipts = markCompletionUnread(
+  {}, "parent-a", "parent-a", "main");
+completionReceipts = markCompletionUnread(
+  completionReceipts, "parent-a", "btw-a", "btw");
+completionReceipts = markCompletionUnread(
+  completionReceipts, "parent-b", "btw-b", "btw");
+assert.equal(completionBadgeKind(completionReceipts["parent-a"]), "both");
+assert.equal(completionBadgeKind(completionReceipts["parent-b"]), "btw");
+completionReceipts = acknowledgeCompletion(
+  completionReceipts, "parent-a", { main: true });
+assert.equal(completionBadgeKind(completionReceipts["parent-a"]), "btw",
+  "opening the main session must not acknowledge an unseen BTW result");
+completionReceipts = acknowledgeCompletion(
+  completionReceipts, "parent-a", { btwSid: "btw-a" });
+assert.equal(completionReceipts["parent-a"], undefined,
+  "opening the matching BTW clears the final completion receipt");
+completionReceipts = rekeyCompletionReceipts(
+  completionReceipts, "parent-b", "parent-real");
+assert.equal(completionReceipts["parent-b"], undefined);
+assert.deepEqual(completionReceipts["parent-real"], {
+  main: false, btwSids: ["btw-b"],
+});
+completionReceipts = markCompletionUnread(
+  completionReceipts, "parent-main", "parent-main", "main");
+completionReceipts = discardBtwCompletionReceipts(completionReceipts);
+assert.equal(completionReceipts["parent-real"], undefined,
+  "a wrapper restart removes receipts for destroyed ephemeral BTW forks");
+assert.deepEqual(completionReceipts["parent-main"], {
+  main: true, btwSids: [],
+}, "main-session completion receipts survive a wrapper restart");
 
 const processTap = new PointerTapGuard(8);
 processTap.pointerDown(1, 20, 20);
@@ -2853,6 +2908,10 @@ try {
     "/src/components/NewChatView.tsx");
   const { WorkArtifactsSheet } = await reducerHarness.ssrLoadModule(
     "/src/components/WorkArtifactsSheet.tsx");
+  const { SessionsSidebar } = await reducerHarness.ssrLoadModule(
+    "/src/components/SessionsSidebar.tsx");
+  const { BtwPanel } = await reducerHarness.ssrLoadModule(
+    "/src/components/BtwPanel.tsx");
   const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
     cwd: "~", engine: "claude",
     onPickCwd: () => {},
@@ -2889,6 +2948,81 @@ try {
   assert.match(artifactsMarkup, /report\.md/);
   assert.match(artifactsMarkup, /slides\/deck\.pptx/);
   assert.doesNotMatch(artifactsMarkup, /暂不可预览|disabled=""/);
+  const sidebarProps = {
+    open: true,
+    space: "code" as const,
+    onSpaceChange: () => {},
+    sessions: [
+      { session_id: "done-main", summary: "Main", state: "idle" },
+      { session_id: "done-btw", summary: "BTW", state: "idle" },
+      { session_id: "running", summary: "Running", state: "running" },
+    ],
+    liveStates: { running: "running" as const },
+    completionBadges: {
+      "done-main": "main" as const,
+      "done-btw": "btw" as const,
+      running: "main" as const,
+    },
+    activeSessionId: null,
+    onSelect: () => {},
+    onNew: () => {},
+    onNewInDir: () => {},
+    onClose: () => {},
+    onRename: () => {},
+    onArchive: () => {},
+    onPin: () => {},
+    onDelete: () => {},
+    onForkWorktree: () => {},
+  };
+  const completionSidebarMarkup = renderToStaticMarkup(createElement(
+    SessionsSidebar, sidebarProps));
+  assert.match(completionSidebarMarkup, />已完成</);
+  assert.match(completionSidebarMarkup, />BTW 完成</);
+  assert.equal(
+    (completionSidebarMarkup.match(/class="pill completed"/g) ?? []).length,
+    2,
+    "a newly running turn must hide an older completion label",
+  );
+  const btwDraftStore = new ComposerDraftStore();
+  const btwPanelMarkup = renderToStaticMarkup(createElement(BtwPanel, {
+    sid: "btw-render",
+    rt: {
+      ...createRuntime(),
+      state: "running",
+      syncReady: true,
+      model: "gpt-5.6-terra",
+      effort: "high",
+      queue: [{ prompt: "queued follow-up" }],
+    },
+    engine: "codex",
+    opening: false,
+    active: "btw",
+    hasArtifact: false,
+    catalog: {},
+    draftKey: "btw-render-draft",
+    draftStore: btwDraftStore,
+    sendMode: "interrupt",
+    allQueued: [{ prompt: "queued follow-up" }],
+    replaceableQueued: [{ prompt: "queued follow-up" }],
+    onTab: () => {},
+    onSend: () => true,
+    onInterrupt: () => {},
+    onSetSendMode: () => {},
+    onEnqueue: () => {},
+    onSetPending: () => {},
+    onDequeue: () => {},
+    onSetModel: () => {},
+    onSetEffort: () => {},
+    onOpenFile: () => {},
+    onClose: () => {},
+    onDismissNotice: () => {},
+  }));
+  assert.match(btwPanelMarkup, /GPT-5\.6 Terra/);
+  assert.match(btwPanelMarkup, />high</);
+  assert.match(btwPanelMarkup, /queued follow-up/);
+  assert.match(btwPanelMarkup, /打断并发送/);
+  assert.match(btwPanelMarkup, />排队</);
+  assert.match(btwPanelMarkup, /aria-label="停止"/);
   state = { ...state,
     newChat: { cwd: "/other", model: null, effort: null } };
   state = reduce(state, { type: "event", event: event({
@@ -3992,6 +4126,128 @@ try {
   [{ sid: progressSid, source: "pending" }],
   "the authoritative idle lifecycle frame releases the pending replacement");
 
+  const pinnedBtwSid = "btw-pinned";
+  const pinnedBtwTurn = {
+    id: "btw-turn", prompt: "侧边问题", blocks: [], done: true, ts: 1,
+  };
+  let pinnedBtwState = {
+    ...initialState,
+    focusedSid: "parent-a",
+    btwByParentSid: {
+      "parent-a": { sid: pinnedBtwSid, engine: "codex" },
+    },
+    runtimes: {
+      "parent-a": createRuntime(),
+      "parent-b": createRuntime(),
+      [pinnedBtwSid]: {
+        ...createRuntime(),
+        turns: [pinnedBtwTurn],
+      },
+    },
+  };
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "focus_session", sid: "parent-b",
+  });
+  assert.equal(pinnedBtwState.btwByParentSid["parent-b"], undefined,
+    "a session without its own BTW must not show another session's fork");
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "event", event: event({
+      type: "btw_opened",
+      sid: "btw-parent-b",
+      request_id: "request-parent-b",
+      btw_sid: "btw-parent-b",
+      parent_sid: "parent-b",
+      engine: "claude",
+    }),
+  });
+  assert.deepEqual(pinnedBtwState.btwByParentSid["parent-b"], {
+    sid: "btw-parent-b", engine: "claude",
+  }, "each parent session keeps an independent BTW binding");
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "restore_session_list",
+    sessions: [{ session_id: "claude-session", engine: "claude" }],
+  });
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "enter_new_chat", cwd: "~", cwdSource: "default",
+  });
+  assert.deepEqual(pinnedBtwState.btwByParentSid["parent-a"], {
+    sid: pinnedBtwSid, engine: "codex",
+  });
+  assert.deepEqual(
+    pinnedBtwState.runtimes[pinnedBtwSid]?.turns,
+    [pinnedBtwTurn],
+    "session and harness navigation must retain the pinned btw transcript",
+  );
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "enqueue",
+    sid: pinnedBtwSid,
+    query: { prompt: "queued in btw" },
+  });
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "set_pending",
+    sid: pinnedBtwSid,
+    query: { prompt: "replace after interrupt" },
+  });
+  assert.deepEqual(
+    pinnedBtwState.runtimes[pinnedBtwSid]?.queue.map(
+      (query: { prompt: string }) => query.prompt),
+    ["queued in btw"],
+  );
+  assert.equal(
+    pinnedBtwState.runtimes[pinnedBtwSid]?.pendingSend?.prompt,
+    "replace after interrupt",
+  );
+  assert.deepEqual(pinnedBtwState.runtimes["parent-a"]?.queue, [],
+    "BTW queue updates must not mutate the parent runtime");
+  const btwDrainState = {
+    ...pinnedBtwState,
+    runtimes: {
+      ...pinnedBtwState.runtimes,
+      [pinnedBtwSid]: {
+        ...pinnedBtwState.runtimes[pinnedBtwSid],
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  };
+  assert.deepEqual(selectDrainCandidates<{ prompt: string }>(
+    btwDrainState.runtimes, new Set(), true, true,
+  ).filter((candidate) => candidate.sid === pinnedBtwSid)
+    .map(({ sid, source, query }) => ({ sid, source, prompt: query.prompt })),
+  [{
+    sid: pinnedBtwSid,
+    source: "pending",
+    prompt: "replace after interrupt",
+  }], "the BTW pending replacement wins only within its own runtime");
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "clear_btw", parentSid: "parent-a",
+  });
+  assert.equal(pinnedBtwState.btwByParentSid["parent-a"], undefined);
+  assert.equal(pinnedBtwSid in pinnedBtwState.runtimes, false,
+    "explicit close discards only that parent's ephemeral BTW runtime");
+  assert.deepEqual(pinnedBtwState.btwByParentSid["parent-b"], {
+    sid: "btw-parent-b", engine: "claude",
+  }, "closing one session's BTW must not close a sibling session's BTW");
+  assert.equal("btw-parent-b" in pinnedBtwState.runtimes, true);
+
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "event", event: event({
+      type: "session_rekey",
+      sid: "parent-real",
+      old_key: "parent-b",
+      session_id: "parent-real",
+    }),
+  });
+  assert.equal(pinnedBtwState.btwByParentSid["parent-b"], undefined);
+  assert.deepEqual(pinnedBtwState.btwByParentSid["parent-real"], {
+    sid: "btw-parent-b", engine: "claude",
+  }, "a parent id capture must carry its BTW binding to the real session id");
+
+  pinnedBtwState = reduce(pinnedBtwState, { type: "clear_all_btw" });
+  assert.deepEqual(pinnedBtwState.btwByParentSid, {});
+  assert.equal("btw-parent-b" in pinnedBtwState.runtimes, false,
+    "wrapper lifecycle reset must discard every ephemeral BTW runtime");
+
   const { CommandSheet } = await reducerHarness.ssrLoadModule(
     "/src/components/CommandSheet.tsx");
   const picked: string[] = [];
@@ -4240,6 +4496,44 @@ assert.equal(artifactsFrame.engine, "claude");
 assert.equal(artifactsFrame.session_id, "surface-work");
 assert.equal(typeof artifactsFrame.client_id, "string");
 
+relay.setFocusedSid("main-after-navigation", "claude", "code");
+relay.sendGetFilePreview(
+  "notes.md", "btw-preview-request", "btw-pinned",
+);
+const btwPreviewFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwPreviewFrame.type, "get_file_preview");
+assert.equal(btwPreviewFrame.sid, "btw-pinned",
+  "a pinned BTW file preview must not follow the newly focused main session");
+relay.sendSaveMarkdown(
+  "notes.md", "updated", 7, "8", "revision",
+  "btw-save-request", "btw-pinned",
+);
+const btwSaveFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwSaveFrame.type, "save_markdown");
+assert.equal(btwSaveFrame.sid, "btw-pinned");
+relay.sendGetPreviewAsset(
+  "image.png", "btw-preview-request",
+  "btw-asset-request", "btw-pinned",
+);
+const btwAssetFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwAssetFrame.type, "get_preview_asset");
+assert.equal(btwAssetFrame.sid, "btw-pinned");
+relay.sendInterruptTo("btw-pinned");
+const btwInterruptFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwInterruptFrame.type, "interrupt");
+assert.equal(btwInterruptFrame.sid, "btw-pinned");
+assert.equal(typeof btwInterruptFrame.client_id, "string");
+relay.sendSetModelTo("btw-pinned", "gpt-5.6-terra");
+const btwModelFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwModelFrame.type, "set_model");
+assert.equal(btwModelFrame.sid, "btw-pinned");
+assert.equal(btwModelFrame.model, "gpt-5.6-terra");
+relay.sendSetEffortTo("btw-pinned", "high");
+const btwEffortFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwEffortFrame.type, "set_effort");
+assert.equal(btwEffortFrame.sid, "btw-pinned");
+assert.equal(btwEffortFrame.effort, "high");
+
 const codexModels = modelsFor("codex");
 assert.equal(clientSlashesFor("codex").has("plan"), true);
 assert.equal(clientSlashesFor("codex").has("normal"), true);
@@ -4315,6 +4609,26 @@ assert.match(appSource, /prepareSurfaceSwitch\(nextEngine, space\)/,
   "engine switches must restore their own remembered surface session");
 assert.match(appSource, /prepareSurfaceSwitch\(engine, next\)/,
   "Work/Code switches must share the remembered-session restoration path");
+assert.doesNotMatch(appSource,
+  /sendCloseBtw\(s\); dispatch\(\{ type: "clear_btw" \}\); \}\s*[\s\S]{0,120}\}, \[focusedSid, engine\]\)/,
+  "session and harness navigation must retain a session-scoped BTW");
+assert.match(appSource,
+  /const activeBtw = visibleParentSid \? state\.btwByParentSid\[visibleParentSid\] : undefined/,
+  "only the focused parent session may expose its BTW binding");
+assert.match(appSource,
+  /const closeBtw = \(\) => \{[\s\S]*?sendCloseBtw\(activeBtw\.sid\)/,
+  "the explicit close action must target only the visible session's BTW");
+assert.match(appSource,
+  /const previewBtwFile = [\s\S]{0,120}previewFileForSid\(activeBtwSid/,
+  "BTW file actions must stay bound to the visible session's fork");
+assert.match(appSource, /sendInterruptTo\(sid\)/,
+  "BTW stop must target the captured fork sid");
+assert.match(appSource, /sendSetModelTo\(sid, model\)/,
+  "BTW model changes must never follow focusedSid");
+assert.match(appSource, /sendSetEffortTo\(sid, effort\)/,
+  "BTW effort changes must never follow focusedSid");
+assert.match(appSource, /btwSendModeBySid/,
+  "BTW send mode must not reuse the main composer's global mode");
 assert.match(appSource, /if \(latest && latest\.session_id !== state\.focusedSid\) \{\s*dispatch\(\{ type: "exit_new_chat" \}\)/,
   "restored focus must replace the temporary new-session page");
 assert.match(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/);

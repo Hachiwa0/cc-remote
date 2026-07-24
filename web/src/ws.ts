@@ -421,8 +421,9 @@ export class RelayWs {
     return ownership;
   }
 
-  private sidObj(): Record<string, unknown> {
-    return this.focusedSid ? { sid: this.focusedSid } : {};
+  private sidObj(targetSid?: string | null): Record<string, unknown> {
+    const sid = targetSid ?? this.focusedSid;
+    return sid ? { sid } : {};
   }
 
   sendQuery(prompt: string, msg_id: string, images?: QueryImg[], files?: QueryFile[]): boolean {
@@ -504,6 +505,10 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs(), ...this.sidObj() });
   }
 
+  sendInterruptTo(sid: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "interrupt", sid, ts: nowTs() });
+  }
+
   sendTakeover(sid: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "takeover", sid, ts: nowTs() });
   }
@@ -512,8 +517,16 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_model", model, ts: nowTs(), ...this.sidObj() });
   }
 
+  sendSetModelTo(sid: string, model: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_model", sid, model, ts: nowTs() });
+  }
+
   sendSetEffort(effort: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", effort, ts: nowTs(), ...this.sidObj() });
+  }
+
+  sendSetEffortTo(sid: string, effort: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_effort", sid, effort, ts: nowTs() });
   }
 
   sendSetServiceTier(service_tier: string): void {
@@ -545,17 +558,22 @@ export class RelayWs {
     });
   }
 
-  sendGetFilePreview(path: string, requestId = uuid()): string | null {
+  sendGetFilePreview(
+    path: string,
+    requestId = uuid(),
+    targetSid?: string | null,
+  ): string | null {
     const queued = this.send({
       v: PROTOCOL_VERSION, type: "get_file_preview", path, request_id: requestId,
-      ts: nowTs(), ...this.sidObj(),
+      ts: nowTs(), ...this.sidObj(targetSid),
     });
     return queued ? requestId : null;
   }
 
   sendSaveMarkdown(path: string, content: string, expectedSize: number,
                    expectedMtimeNs: string, expectedRevision: string,
-                   requestId = uuid()): string | null {
+                   requestId = uuid(),
+                   targetSid?: string | null): string | null {
     const queued = this.send({
       v: PROTOCOL_VERSION,
       type: "save_markdown",
@@ -566,17 +584,18 @@ export class RelayWs {
       expected_revision: expectedRevision,
       request_id: requestId,
       ts: nowTs(),
-      ...this.sidObj(),
+      ...this.sidObj(targetSid),
     });
     return queued ? requestId : null;
   }
 
   sendGetPreviewAsset(path: string, previewId: string,
-                      requestId = uuid()): string | null {
+                      requestId = uuid(),
+                      targetSid?: string | null): string | null {
     const queued = this.send({
       v: PROTOCOL_VERSION, type: "get_preview_asset", path,
       preview_id: previewId, request_id: requestId,
-      ts: nowTs(), ...this.sidObj(),
+      ts: nowTs(), ...this.sidObj(targetSid),
     });
     return queued ? requestId : null;
   }

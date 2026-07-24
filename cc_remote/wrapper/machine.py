@@ -5914,6 +5914,18 @@ class WrapperMachine:
         if cid:
             snap.to = cid
         await self.transport.send(snap)
+        # Model and effort are mutable fork settings. Publish their current
+        # authoritative values through the normal owner-only sequenced ring so
+        # reconnect replay can recover them without freezing an initial value
+        # into OpenBtw's static command-response cache.
+        model = _session_model(btw)
+        if model:
+            btw.announced_model = model
+            await self._emit(btw, Model(model=model))
+        effort = _session_effort(btw)
+        if effort:
+            btw.announced_effort = effort
+            await self._emit(btw, Effort(effort=effort))
         permission_mode = _session_permission_mode(btw)
         btw.announced_perm = permission_mode
         permission = Perm(mode=permission_mode, sid=btw.key, to=cid)

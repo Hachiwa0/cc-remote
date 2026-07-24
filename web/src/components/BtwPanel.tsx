@@ -1,110 +1,348 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type SetStateAction,
+} from "react";
 import { ChatView } from "./ChatView";
+import { CommandSheet } from "./CommandSheet";
 import { Icon } from "../icons";
 import { PanelTabs } from "./PanelTabs";
 import { NoticeStack } from "./NoticeStack";
-import type { Artifact, SessionRuntime } from "../reducer";
+import type { Artifact, PendingQuery, SessionRuntime } from "../reducer";
+import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
 import { ImeSubmitGuard } from "../ime-submit";
+import {
+  classifyBusySubmit,
+  isComposerBusy,
+  isInterruptSettling,
+  isSettlingStopDisabled,
+} from "../composer-submit";
+import { canEnqueueQuery } from "../runtime-drain";
+import { effortsFor, modelsFor, type Catalog } from "../data";
 
-/** /btw side panel: a mini chat over an ephemeral fork of the current session.
- * Reuses ChatView for the transcript; a minimal textarea for input. Closing
- * discards the fork (the main thread never sees any of this). */
-export function BtwPanel({ sid, rt, engine, opening, active, hasArtifact,
-  artifactKind, onTab, onSend, onOpenFile, onClose, onDismissNotice }: {
+interface Props {
   sid?: string;
   rt: SessionRuntime | undefined;
   engine?: string;
-  opening?: boolean;   // fork still spawning (no sid yet) — show a spinner
+  opening?: boolean;
   active: "diff" | "btw";
   hasArtifact: boolean;
   artifactKind?: Artifact["kind"];
+  catalog: Catalog;
+  draftKey: string;
+  draftStore: ComposerDraftStore;
+  sendMode: "interrupt" | "queue";
+  allQueued: PendingQuery[];
+  replaceableQueued: PendingQuery[];
   onTab: (v: "diff" | "btw") => void;
-  onSend: (prompt: string) => void;
+  onSend: (prompt: string) => boolean;
+  onInterrupt: () => void;
+  onSetSendMode: (mode: "interrupt" | "queue") => void;
+  onEnqueue: (query: PendingQuery) => void;
+  onSetPending: (query: PendingQuery) => void;
+  onDequeue: (index: number) => void;
+  onSetModel: (model: string) => void;
+  onSetEffort: (effort: string) => void;
   onOpenFile?: (path: string, line?: number) => void;
   onClose: () => void;
   onDismissNotice: (noticeId: string) => void;
-}) {
-  const [text, setText] = useState("");
+}
+
+/** /btw side panel: a private mini-chat over an ephemeral session fork.
+ *
+ * Its draft, busy-send intent, queue and controls are all keyed by the explicit
+ * fork sid supplied by App. Nothing here is allowed to follow the main
+ * session's current focus.
+ */
+export function BtwPanel(p: Props) {
+  const draftKeyRef = useRef(p.draftKey);
+  const [draft, setDraft] = useState<ComposerDraft>(
+    () => p.draftStore.get(p.draftKey));
+  const [sheetKind, setSheetKind] =
+    useState<"models" | "efforts" | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
-  const turns = rt?.turns ?? [];
-  const busy = !!opening || rt?.state === "running";
+  const input = draft.input;
+  const turns = p.rt?.turns ?? [];
+  const runtimeState = p.rt?.state ?? "idle";
+  // The query outbox can be awaiting its first authoritative echo while the
+  // last lifecycle frame still says idle. Treat that short acceptance window
+  // as settling-busy so a second submit becomes pending/queued instead of
+  // racing another Query against the same fork.
+  const acceptancePending = !!p.rt?.acceptancePending;
+  const submitState = runtimeState === "idle" && acceptancePending
+    ? "draining" : runtimeState;
+  const runtimeBusy = isComposerBusy(submitState);
+  const busy = !!p.opening || runtimeBusy;
+  const hasText = input.trim().length > 0;
+
+  const updateDraft = useCallback((
+    update: (current: ComposerDraft) => ComposerDraft,
+  ) => {
+    const key = draftKeyRef.current;
+    setDraft((current) => {
+      const next = update(current);
+      p.draftStore.set(key, next);
+      return next;
+    });
+  }, [p.draftStore]);
+  const setInput = useCallback((next: SetStateAction<string>) => {
+    updateDraft((current) => ({
+      ...current,
+      input: typeof next === "function" ? next(current.input) : next,
+    }));
+  }, [updateDraft]);
+  const clearDraft = useCallback(() => {
+    updateDraft(() => ({ input: "", images: [], files: [] }));
+  }, [updateDraft]);
+
+  useLayoutEffect(() => {
+    if (draftKeyRef.current === p.draftKey) return;
+    draftKeyRef.current = p.draftKey;
+    setDraft(p.draftStore.get(p.draftKey));
+    setSheetKind(null);
+    setNotice(null);
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+      noticeTimerRef.current = null;
+    }
+  }, [p.draftKey, p.draftStore]);
+
+  useEffect(() => {
+    if (busy) setSheetKind(null);
+  }, [busy]);
 
   useEffect(() => () => {
     if (buttonSendTimerRef.current !== null) {
       window.clearTimeout(buttonSendTimerRef.current);
     }
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
   }, []);
 
-  const send = (value = taRef.current?.value ?? text) => {
-    const t = value.trim();
-    if (!t || busy) return;
-    onSend(t);
-    setText("");
+  const flash = (message: string) => {
+    setNotice(message);
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
+    noticeTimerRef.current = window.setTimeout(() => {
+      noticeTimerRef.current = null;
+      setNotice(null);
+    }, 2200);
+  };
+  const resetTaHeight = () => {
     if (taRef.current) taRef.current.style.height = "auto";
   };
-  const requestButtonSend = () => {
+  const grow = (element: HTMLTextAreaElement) => {
+    element.style.height = "auto";
+    element.style.height = Math.min(element.scrollHeight, 120) + "px";
+  };
+  useLayoutEffect(() => {
+    if (taRef.current) grow(taRef.current);
+  }, [input, p.draftKey]);
+
+  const submit = (value = taRef.current?.value ?? input) => {
+    if (p.opening || !p.sid) return;
+    const prompt = value.trim();
+    const query: PendingQuery = { prompt };
+    if (runtimeBusy) {
+      const action = classifyBusySubmit(
+        submitState, p.sendMode, prompt.length > 0);
+      if (action === "noop") return;
+      const existing = p.sendMode === "queue"
+        ? p.allQueued : p.replaceableQueued;
+      if (!canEnqueueQuery(existing, query)) {
+        flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
+        return;
+      }
+      if (action === "enqueue") {
+        p.onEnqueue(query);
+      } else {
+        if (action === "interrupt-and-replace") p.onInterrupt();
+        p.onSetPending(query);
+      }
+      clearDraft();
+      resetTaHeight();
+      return;
+    }
+    if (!prompt) return;
+    if (p.onSend(prompt)) {
+      clearDraft();
+      resetTaHeight();
+    }
+  };
+  const requestButtonAction = () => {
     if (buttonSendTimerRef.current !== null) return;
     buttonSendTimerRef.current = window.setTimeout(() => {
       buttonSendTimerRef.current = null;
-      send();
+      const value = taRef.current?.value ?? input;
+      // Stopping is an explicit button action. Empty Enter goes through submit
+      // and remains a no-op.
+      if (runtimeBusy && !value.trim()) {
+        if (runtimeState === "running") p.onInterrupt();
+        return;
+      }
+      submit(value);
     }, 0);
   };
-  const grow = (el: HTMLTextAreaElement) => { el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight, 120) + "px"; };
+
+  const modelList = modelsFor(p.engine, p.catalog);
+  const model = p.rt?.model
+    ? (modelList.find((candidate) => candidate.id === p.rt?.model)
+      ?? { id: p.rt.model, name: p.rt.model, ds: "", ic: "cpu" })
+    : null;
+  const effortList = effortsFor(p.engine, model?.id, p.catalog);
+  const effort = p.rt?.effort
+    ? (effortList.find((candidate) => candidate.id === p.rt?.effort)
+      ?? { id: p.rt.effort, name: p.rt.effort, ds: "", ic: "gauge3" })
+    : null;
+  const stopping = runtimeBusy && !hasText;
+  const interruptSettling = isInterruptSettling(submitState);
+  const sendIcon = !runtimeBusy ? "send"
+    : stopping ? "stop" : p.sendMode === "interrupt" ? "bolt" : "queue";
+  const sendClass = "btw-send"
+    + ((stopping || (runtimeBusy && p.sendMode === "interrupt" && hasText))
+      ? " interrupt" : "");
+  const sendDisabled = !!p.opening || !p.sid
+    || (!runtimeBusy && !hasText)
+    || isSettlingStopDisabled(submitState, hasText);
 
   return (
     <div className="btw-panel">
       <div className="btw-head">
-        {hasArtifact
-          ? <PanelTabs active={active} artifactKind={artifactKind} onTab={onTab} />
+        {p.hasArtifact
+          ? <PanelTabs active={p.active} artifactKind={p.artifactKind}
+              onTab={p.onTab} />
           : <div className="btw-titles">
-              <span className="btw-title">btw · 侧边对话{engine === "codex" ? " · Codex" : ""}</span>
+              <span className="btw-title">
+                btw · 侧边对话{p.engine === "codex" ? " · Codex" : ""}
+              </span>
               <span className="btw-sub">基于当前会话上下文,不写回主线</span>
             </div>}
-        <button className="iconbtn" onClick={onClose} aria-label="关闭 btw" title="关闭并丢弃这个侧边对话">
+        <button className="iconbtn" onClick={p.onClose}
+          aria-label="关闭 btw" title="关闭并丢弃这个侧边对话">
           <Icon name="chevrons-right" />
         </button>
       </div>
-      <NoticeStack notices={rt?.notices ?? []} onDismiss={onDismissNotice} />
+      <NoticeStack notices={p.rt?.notices ?? []}
+        onDismiss={p.onDismissNotice} />
       <div className="btw-body">
-        {opening
-          ? <div className="btw-empty"><span className="thinking"><span/><span/><span/></span> 正在打开侧边对话…</div>
+        {p.opening
+          ? <div className="btw-empty">
+              <span className="thinking"><span/><span/><span/></span>
+              {" "}正在打开侧边对话…
+            </div>
           : turns.length === 0
-            ? <div className="btw-empty">问一个基于当前会话的侧边问题 —— 回答不会写进主线,关闭即丢弃。</div>
-            : <ChatView sid={sid ?? null} turns={turns} onEdit={() => {}}
-                onGetDiff={() => {}} onOpenFile={onOpenFile} />}
+            ? <div className="btw-empty">
+                问一个基于当前会话的侧边问题 —— 回答不会写进主线,关闭即丢弃。
+              </div>
+            : <ChatView sid={p.sid ?? null} turns={turns}
+                onEdit={() => {}} onGetDiff={() => {}}
+                onOpenFile={p.onOpenFile} />}
       </div>
-      <div className="btw-input">
-        <textarea
-          ref={taRef}
-          value={text}
-          placeholder={opening ? "正在打开…" : rt?.state === "running" ? "回答中…" : "问点什么(Enter 发送 · Shift+Enter 换行)"}
-          rows={1}
-          onChange={(e) => { setText(e.target.value); grow(e.target); }}
-          onCompositionStart={() => imeSubmitRef.current.startComposition()}
-          onCompositionEnd={(e) => {
-            imeSubmitRef.current.endComposition();
-            setText(e.currentTarget.value);
-          }}
-          onKeyDown={(e) => {
-            if (!imeSubmitRef.current.shouldSubmitKey({
-              key: e.key, shiftKey: e.shiftKey,
-              isComposing: e.nativeEvent.isComposing, keyCode: e.nativeEvent.keyCode,
-            })) return;
-            e.preventDefault();
-            send(e.currentTarget.value);
-          }}
-        />
-        <button className="btw-send"
-          onPointerDown={() => {
-            if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
-          }}
-          onClick={requestButtonSend}
-          disabled={busy || !text.trim()} aria-label="发送">
-          <Icon name="send" size={18} />
-        </button>
+      <div className="btw-composer">
+        {notice && <div className="btw-composer-notice">{notice}</div>}
+        {(p.rt?.queue.length ?? 0) > 0 && (
+          <div className="btw-queued">
+            {p.rt!.queue.map((query, index) => (
+              <span className="qchip" key={index}>
+                <span className="qbadge">排队</span>
+                <span className="qt">{query.prompt}</span>
+                <button className="qx" onClick={() => p.onDequeue(index)}
+                  aria-label="移出队列">
+                  <Icon name="close" size={12} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        {runtimeBusy && (
+          <div className="btw-runbar">
+            <div className="seg">
+              <button className={p.sendMode === "interrupt" ? "on" : ""}
+                onClick={() => p.onSetSendMode("interrupt")}>
+                <Icon name="bolt" size={14} />打断并发送
+              </button>
+              <button className={p.sendMode === "queue" ? "on" : ""}
+                onClick={() => p.onSetSendMode("queue")}>
+                <Icon name="queue" size={14} />排队
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="btw-input">
+          <textarea
+            ref={taRef}
+            value={input}
+            placeholder={p.opening ? "正在打开…"
+              : runtimeBusy ? "可输入后打断并发送或排队…" : "问点什么"}
+            rows={1}
+            disabled={!!p.opening || !p.sid}
+            onChange={(event) => {
+              setInput(event.target.value);
+              grow(event.target);
+            }}
+            onCompositionStart={() => imeSubmitRef.current.startComposition()}
+            onCompositionEnd={(event) => {
+              imeSubmitRef.current.endComposition();
+              setInput(event.currentTarget.value);
+            }}
+            onKeyDown={(event) => {
+              if (!imeSubmitRef.current.shouldSubmitKey({
+                key: event.key,
+                shiftKey: event.shiftKey,
+                isComposing: event.nativeEvent.isComposing,
+                keyCode: event.nativeEvent.keyCode,
+              })) return;
+              event.preventDefault();
+              submit(event.currentTarget.value);
+            }}
+          />
+          <button className={sendClass}
+            onPointerDown={() => {
+              if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) {
+                taRef.current?.blur();
+              }
+            }}
+            onClick={requestButtonAction}
+            disabled={sendDisabled}
+            aria-label={interruptSettling && stopping
+              ? "正在停止" : stopping ? "停止" : "发送"}>
+            <Icon name={sendIcon} size={18} />
+          </button>
+        </div>
+        <div className="btw-controls">
+          <span>BTW 设置</span>
+          <button className="hint-ctl" onClick={() => setSheetKind("models")}
+            disabled={busy}>{model?.name ?? "模型读取中"}</button>
+          <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
+            disabled={busy}>{effort?.name ?? "强度读取中"}</button>
+        </div>
       </div>
+      <CommandSheet
+        open={sheetKind !== null}
+        kind={sheetKind ?? "models"}
+        engine={p.engine === "codex" ? "codex" : "claude"}
+        catalog={p.catalog}
+        currentModel={p.rt?.model}
+        currentEffort={p.rt?.effort}
+        onClose={() => setSheetKind(null)}
+        onPickModel={(nextModel) => {
+          if (!busy) p.onSetModel(nextModel);
+          setSheetKind(null);
+        }}
+        onPickEffort={(nextEffort) => {
+          if (!busy) p.onSetEffort(nextEffort);
+          setSheetKind(null);
+        }}
+      />
     </div>
   );
 }

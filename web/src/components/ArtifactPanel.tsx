@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type PointerEvent as ReactPointerEvent } from "react";
+import { isValidElement, useCallback, useEffect, useMemo, useRef, useState,
+  type ComponentPropsWithoutRef, type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Artifact, PreviewAssetState } from "../reducer";
@@ -11,6 +11,8 @@ import { classifyPreviewTarget } from "../preview-path";
 import { parseLocalFileTarget } from "../file-link";
 import { buildSandboxDocument } from "../html-preview";
 import { clampPanelWidth } from "../responsive-layout";
+import { isMermaidFenceClass } from "../mermaid";
+import { MermaidBlock } from "./MermaidBlock";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
@@ -18,6 +20,37 @@ const SOURCE_PAGE_LINES = 500;
 const PANEL_WIDTH_KEY = "cc_remote_artifact_panel_width";
 const URL_ATTRIBUTES = new Set(["src", "href", "xlink:href", "poster", "action", "formaction"]);
 const UNSAFE_CSS = /(?:url\s*\(|@import|expression\s*\()/i;
+
+function markdownNodeText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(markdownNodeText).join("");
+  if (isValidElement<{ children?: ReactNode }>(node)) {
+    return markdownNodeText(node.props.children);
+  }
+  return "";
+}
+
+function markdownFenceClassName(children: ReactNode): string | undefined {
+  const items = Array.isArray(children) ? children : [children];
+  const code = items.find((child) => isValidElement<{ className?: string }>(child));
+  return isValidElement<{ className?: string }>(code)
+    ? code.props.className
+    : undefined;
+}
+
+function MarkdownPreviewPre({ children }: ComponentPropsWithoutRef<"pre">) {
+  if (isMermaidFenceClass(markdownFenceClassName(children))) return <>{children}</>;
+  return <pre>{children}</pre>;
+}
+
+function MarkdownPreviewCode({
+  className, children,
+}: ComponentPropsWithoutRef<"code">) {
+  if (isMermaidFenceClass(className)) {
+    return <MermaidBlock source={markdownNodeText(children).replace(/\n$/, "")} />;
+  }
+  return <code className={className}>{children}</code>;
+}
 
 function HtmlArtifactPreview({ content }: { content: string }) {
   const [document, setDocument] = useState<string | null>(null);
@@ -422,6 +455,8 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   }, [artifact.requestId, artifactKey, onLoadPreviewAsset, sendNextAsset]);
 
   const markdownComponents = useMemo<Components>(() => ({
+    pre: MarkdownPreviewPre,
+    code: MarkdownPreviewCode,
     img: ({ src, alt, title }) => {
       const source = typeof src === "string" ? src : "";
       const target = classifyPreviewTarget(artifact.file, source);

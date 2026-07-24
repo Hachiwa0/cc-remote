@@ -290,10 +290,10 @@ export interface AppState {
   sessions: SessionInfo[];
   focusedSid: string | null;
   runtimes: Record<string, SessionRuntime>;
-  // /btw ephemeral side-fork: the fork's routing key (its runtime lives in
-  // `runtimes[btwSid]`) + engine, or null when no side panel is open.
-  btwSid: string | null;
-  btwEngine?: string;
+  // /btw ephemeral side-forks are owned by their parent sessions. Their
+  // runtimes live under each binding's `sid`; navigation only changes which
+  // binding is visible and never reassigns a fork to another parent.
+  btwByParentSid: Record<string, { sid: string; engine: string }>;
   // Model catalogs the engine reported (currently Codex only). Claude still sends
   // an empty catalog plus its cwd-aware defaults; data.ts keeps the static list.
   catalog: Catalog;
@@ -361,7 +361,8 @@ export type Action =
   | { type: "open_file_loading"; file: string; sid: string | null; requestId: string; kind: "md" | "file"; line?: number }
   | { type: "start_file_save"; requestId: string; content: string }
   | { type: "clear_artifact" }
-  | { type: "clear_btw" }
+  | { type: "clear_btw"; parentSid: string }
+  | { type: "clear_all_btw" }
   | { type: "clear_session_list" }
   | { type: "restore_session_list"; sessions: SessionInfo[] }
   | { type: "set_session_pinned"; sid: string; pinned: boolean }
@@ -391,7 +392,7 @@ export const initialState: AppState = {
   sessions: [],
   focusedSid: null,
   runtimes: {},
-  btwSid: null,
+  btwByParentSid: {},
   catalog: {},
   catalogDefault: {},
   catalogDefaultEffort: {},
@@ -843,7 +844,7 @@ export function reduce(state: AppState, action: Action): AppState {
       return {
         ...initialState,
         sessions: [], runtimes: {}, artifact: null, dirPicker: null,
-        newChat: null, btwSid: null, catalog: {}, catalogDefault: {},
+        newChat: null, btwByParentSid: {}, catalog: {}, catalogDefault: {},
         catalogDefaultEffort: {}, catalogDefaultCwd: {},
       };
     case "conn": {
@@ -989,10 +990,20 @@ export function reduce(state: AppState, action: Action): AppState {
     case "clear_artifact":
       return { ...state, artifact: null };
     case "clear_btw": {
-      if (!state.btwSid) return state;
+      const binding = state.btwByParentSid[action.parentSid];
+      if (!binding) return state;
       const runtimes = { ...state.runtimes };
-      delete runtimes[state.btwSid];   // ephemeral: drop the fork's runtime
-      return { ...state, btwSid: null, btwEngine: undefined, runtimes };
+      delete runtimes[binding.sid];
+      const btwByParentSid = { ...state.btwByParentSid };
+      delete btwByParentSid[action.parentSid];
+      return { ...state, btwByParentSid, runtimes };
+    }
+    case "clear_all_btw": {
+      const bindings = Object.values(state.btwByParentSid);
+      if (bindings.length === 0) return state;
+      const runtimes = { ...state.runtimes };
+      for (const binding of bindings) delete runtimes[binding.sid];
+      return { ...state, btwByParentSid: {}, runtimes };
     }
     case "clear_session_list":
       return { ...state, sessions: [], focusedSid: null };
@@ -1048,7 +1059,9 @@ export function reduce(state: AppState, action: Action): AppState {
     case "prune_runtimes": {
       const protectedSids = new Set(action.protectedSids);
       if (state.focusedSid) protectedSids.add(state.focusedSid);
-      if (state.btwSid) protectedSids.add(state.btwSid);
+      for (const binding of Object.values(state.btwByParentSid)) {
+        protectedSids.add(binding.sid);
+      }
       if (state.artifact?.sid) protectedSids.add(state.artifact.sid);
       const runtimes = pruneRuntimeMap(state.runtimes, protectedSids);
       return runtimes === state.runtimes ? state : { ...state, runtimes };
@@ -1265,10 +1278,20 @@ function reduceEvent(
       const cwdByScope = ownership && e.cwd
         ? { ...state.cwdByScope, [ownership.scopeKey]: e.cwd }
         : state.cwdByScope;
+      let btwByParentSid = state.btwByParentSid;
+      const parentBtw = btwByParentSid[old_key];
+      if (parentBtw) {
+        const targetBtw = btwByParentSid[session_id];
+        btwByParentSid = { ...btwByParentSid };
+        if (!targetBtw) btwByParentSid[session_id] = parentBtw;
+        else if (targetBtw.sid !== parentBtw.sid) delete runtimes[parentBtw.sid];
+        delete btwByParentSid[old_key];
+      }
       return {
         ...state,
         runtimes, sessions,
         focusedSid: wasFocused ? session_id : state.focusedSid,
+        btwByParentSid,
         cwdByScope,
       };
     }
@@ -1874,10 +1897,20 @@ function reduceEvent(
         rt.collaborationMode = e.mode;
       });
     case "btw_opened": {
-      // open the side panel + ensure a runtime for the fork; do NOT change focus
-      // (the main view stays put — the fork lives only in the panel).
+      // Bind the fork to its authoritative parent without changing focus. A
+      // response may arrive after the user navigates; it must remain hidden
+      // until that exact parent is viewed again.
       const runtimes = { ...state.runtimes, [e.btw_sid]: state.runtimes[e.btw_sid] ?? createRuntime() };
-      return { ...state, btwSid: e.btw_sid, btwEngine: e.engine, runtimes };
+      const previous = state.btwByParentSid[e.parent_sid];
+      if (previous && previous.sid !== e.btw_sid) delete runtimes[previous.sid];
+      return {
+        ...state,
+        btwByParentSid: {
+          ...state.btwByParentSid,
+          [e.parent_sid]: { sid: e.btw_sid, engine: e.engine },
+        },
+        runtimes,
+      };
     }
     case "perm":
       return patch(state, e.sid, (rt) => { rt.perm = e.mode; });
