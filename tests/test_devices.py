@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from argparse import Namespace
 
 import pytest
@@ -30,6 +31,34 @@ def _cfg(tmp_path, **overrides) -> RelayConfig:
     }
     values.update(overrides)
     return RelayConfig(**values)
+
+
+def _wait_for_device_online(
+    client: TestClient,
+    machine_id: str,
+    *,
+    timeout: float = 1.0,
+) -> None:
+    """Wait for the server task to consume the wrapper hello.
+
+    ``send_text`` only hands the frame to TestClient's in-memory transport; it
+    does not acknowledge that ``serve_wrapper`` has registered the route yet.
+    Keep the assertion on the public device-list contract, but make that
+    asynchronous boundary explicit and bounded.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        devices = client.get("/api/devices").json()["devices"]
+        device = next(
+            item for item in devices if item["machine_id"] == machine_id
+        )
+        if device["online"]:
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"device {machine_id!r} did not become online within {timeout}s"
+            )
+        time.sleep(0.01)
 
 
 def test_pairing_code_is_single_use_and_plaintext_credential_is_not_stored(tmp_path):
@@ -106,7 +135,7 @@ def test_browser_pairs_lists_renames_and_revokes_dynamic_wrapper(tmp_path):
                 role="wrapper", machine_id=machine_id,
                 wrapper_generation="test-generation", state="idle",
             )))
-            assert client.get("/api/devices").json()["devices"][0]["online"] is True
+            _wait_for_device_online(client, machine_id)
             renamed = client.patch(
                 f"/api/devices/{machine_id}", json={"label": "nono"})
             assert renamed.status_code == 200
