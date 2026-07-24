@@ -26,6 +26,18 @@ ROOT = Path(__file__).resolve().parents[1]
 FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
+def test_release_workflow_materializes_web_before_python_bundle_tests():
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    verify_job = workflow.split("\n  build:\n", 1)[0]
+
+    install = verify_job.index("npm --prefix web ci")
+    build = verify_job.index("npm --prefix web run build")
+    python_tests = verify_job.index(".venv/bin/python -m pytest")
+
+    assert install < build < python_tests
+    assert verify_job.count("npm --prefix web run build") == 1
+
+
 def _fake_uv(tmp_path: Path) -> Path:
     uv = tmp_path / "uv"
     version = (ROOT / "deploy" / "uv-version.txt").read_text().strip()
