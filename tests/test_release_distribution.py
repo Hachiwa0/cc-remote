@@ -444,3 +444,14 @@ def test_role_locks_and_release_workflow_are_versioned_inputs():
     ).read_text().strip()
     assert re.fullmatch(r"3\.13\.\d+", python_version)
     assert "cat deploy/python-version.txt" in workflow
+
+
+def test_release_locks_keep_intel_macos_cryptography_wheel():
+    compatible_pin = "cryptography==48.0.0"
+    assert compatible_pin in (ROOT / "requirements.txt").read_text()
+    for name in (
+        "requirements.lock",
+        "requirements-relay.lock",
+        "requirements-wrapper.lock",
+    ):
+        assert compatible_pin in (ROOT / name).read_text()
