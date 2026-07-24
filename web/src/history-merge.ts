@@ -135,6 +135,10 @@ function sameTurn(history: Turn, live: Turn): boolean {
   return Math.abs(history.ts - live.ts) <= 3000;
 }
 
+export function historyContainsTurn(history: Turn[], live: Turn): boolean {
+  return history.some((turn) => sameTurn(turn, live));
+}
+
 function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
   const historyImageRefs = history.imageRefs?.length
     ? history.imageRefs : undefined;
@@ -213,34 +217,8 @@ export function mergeInitialHistory(
   live: Turn[],
   options: {
     preserveLiveTailOpen?: boolean;
-    attachAssistantOnlySuffix?: boolean;
   } = {},
 ): Turn[] {
-  // A compact/head rebuild may start inside the current turn: the bounded
-  // transcript window then contains assistant rows but no preceding user_msg.
-  // It is a suffix of the already-painted unfinished turn, not a new goal turn.
-  // Keep this opt-in because a genuine prompt-less goal/background turn must
-  // remain independent in ordinary history reconciliation.
-  if (options.attachAssistantOnlySuffix
-      && history.length > 0
-      && history.every((turn) => !turn.prompt)
-      && live.length > 0
-      && !live[live.length - 1].done) {
-    const prefix = live.slice(0, -1).map((turn) => ({
-      ...turn, blocks: turn.blocks.map((block) => ({ ...block })),
-    }));
-    const liveTail = live[live.length - 1];
-    let stitched = {
-      ...liveTail,
-      blocks: liveTail.blocks.map((block) => ({ ...block })),
-    };
-    for (const suffix of history) {
-      const stableId = stitched.id;
-      stitched = mergeTurn(stitched, suffix, false);
-      stitched.id = stableId;
-    }
-    return [...prefix, stitched];
-  }
   const merged = history.map((turn) => ({ ...turn, blocks: turn.blocks.map((b) => ({ ...b })) }));
   const used = new Set<number>();
   const unmatched: Turn[] = [];

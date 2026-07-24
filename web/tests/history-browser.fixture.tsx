@@ -130,6 +130,7 @@ export function HistoryBrowserFixture() {
   const timeline = params.has("timeline");
   const interactiveTimeline = params.has("interactive-timeline");
   const dualImage = params.has("dual-image");
+  const composerResize = params.has("composer-resize");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
   const emptyFinalPage = params.has("empty-final");
   const initialA = useMemo(() => {
@@ -172,6 +173,7 @@ export function HistoryBrowserFixture() {
   });
   const [loads, setLoads] = useState(0);
   const [historyRevision, setHistoryRevision] = useState("revision-1");
+  const [composerExpanded, setComposerExpanded] = useState(false);
   const active = sessions[sid];
   const growOlderRow = useCallback((targetSid: string) => {
     setSessions((current) => ({
@@ -328,6 +330,18 @@ export function HistoryBrowserFixture() {
         onEdit={() => {}}
         onGetDiff={() => {}}
       />
+      {composerResize && (
+        <div data-testid="fixture-composer" style={{
+          flex: "none",
+          height: composerExpanded ? 132 : 48,
+          borderTop: "1px solid #ddd",
+        }}>
+          <button data-testid="toggle-composer" type="button"
+            onClick={() => setComposerExpanded((current) => !current)}>
+            toggle composer actions
+          </button>
+        </div>
+      )}
     </main>
   );
 }

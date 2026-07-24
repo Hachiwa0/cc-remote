@@ -2389,6 +2389,68 @@ try {
   assert.equal(compactHead.runtimes[compactHeadSid].oldestId,
     "original-cursor");
 
+  // A newest page made entirely of genuine prompt-less background turns is
+  // not evidence that the page is a byte-window suffix of the current user
+  // turn. Repeated focus/history refreshes must keep those turns independent.
+  const assistantPageSid = "assistant-page-does-not-attach-to-current";
+  const assistantPageTurns = [
+    {
+      id: "background-one", prompt: "", done: true,
+      blocks: [{
+        kind: "text", message_id: "background-one-answer",
+        text: "older background answer one", done: true, channel: "final",
+      }],
+      detailEventCount: 0, detailLoaded: false,
+      ts: 4_000, doneTs: 5_000,
+    },
+    {
+      id: "background-two", prompt: "", done: true,
+      blocks: [{
+        kind: "text", message_id: "background-two-answer",
+        text: "older background answer two", done: true, channel: "final",
+      }],
+      detailEventCount: 0, detailLoaded: false,
+      ts: 6_000, doneTs: 7_000,
+    },
+  ];
+  let assistantPageState = reduce({
+    ...initialState, focusedSid: assistantPageSid,
+  }, { type: "event", event: event({
+    type: "history", sid: assistantPageSid, session_id: assistantPageSid,
+    revision: "assistant-page-rev", generation: "wrapper-one",
+    build_seq: 1, live_seq: 0, has_more: true,
+    oldest_id: "background-one", detail: "summary", events: [],
+    turns: assistantPageTurns,
+  }) });
+  assistantPageState = reduce(assistantPageState, {
+    type: "event", event: event({
+      type: "user_msg", sid: assistantPageSid, seq: 1, ts: 9,
+      msg_id: "current-user-turn", prompt: "current question",
+    }),
+  });
+  assistantPageState = reduce(assistantPageState, {
+    type: "event", event: event({
+      type: "history", sid: assistantPageSid, session_id: assistantPageSid,
+      revision: "assistant-page-rev", generation: "wrapper-one",
+      build_seq: 2, live_seq: 1, has_more: true, in_progress: true,
+      oldest_id: "background-one", detail: "summary", events: [],
+      turns: assistantPageTurns,
+    }),
+  });
+  assert.deepEqual(
+    assistantPageState.runtimes[assistantPageSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["background-one", "background-two", "current-user-turn"],
+  );
+  const currentAssistantPageTurn =
+    assistantPageState.runtimes[assistantPageSid].turns.at(-1);
+  assert.equal(currentAssistantPageTurn?.blocks.length, 0);
+  assert.doesNotMatch(
+    JSON.stringify(currentAssistantPageTurn),
+    /older background answer/,
+    "prompt-less history rows must never be stitched into a user turn",
+  );
+
   // A real wrapper restart owns a new generation, so its build counter may
   // legitimately start from one even when the previous generation reached two.
   orderedHistory = reduce(orderedHistory, { type: "event", event: event({
@@ -2515,6 +2577,136 @@ try {
   }) });
   assert.equal(gapState.runtimes[gapSid].historyInvalidated, false);
   assert.equal(gapState.runtimes[gapSid].loading, false);
+
+  // A truncated live-tail replay can begin in the middle of an older turn.
+  // Without its UserMsg/TurnEnd, that fragment looks like a new unfinished
+  // assistant-only turn. The following authoritative History must discard the
+  // unmatched fragment instead of sorting it after the real current turn.
+  const replayFragmentSid = "replay-fragment-does-not-cross-history";
+  let replayFragmentState = reduce({
+    ...initialState, focusedSid: replayFragmentSid,
+  }, { type: "event", event: event({
+    type: "replay_start", sid: replayFragmentSid, from_seq: 70, to_seq: 74,
+    truncated: true, rebuild: false,
+  }) });
+  replayFragmentState = reduce(replayFragmentState, {
+    type: "event", event: event({
+      type: "assistant_msg_start", sid: replayFragmentSid, seq: 71, ts: 7,
+      message_id: "orphaned-old-commentary", channel: "commentary",
+    }),
+  });
+  replayFragmentState = reduce(replayFragmentState, {
+    type: "event", event: event({
+      type: "delta", sid: replayFragmentSid, seq: 72, ts: 7.1,
+      message_id: "orphaned-old-commentary",
+      text: "older reasoning replayed without its user boundary",
+      channel: "commentary",
+    }),
+  });
+  replayFragmentState = reduce(replayFragmentState, {
+    type: "event", event: event({
+      type: "user_msg", sid: replayFragmentSid, seq: 73, ts: 9,
+      msg_id: "current-turn", prompt: "current question",
+    }),
+  });
+  replayFragmentState = reduce(replayFragmentState, {
+    type: "event", event: event({
+      type: "assistant_msg_start", sid: replayFragmentSid, seq: 74, ts: 9.1,
+      message_id: "current-commentary", channel: "commentary",
+    }),
+  });
+  replayFragmentState = reduce(replayFragmentState, {
+    type: "event", event: event({
+      type: "replay_end", sid: replayFragmentSid, to_seq: 74,
+      truncated: true,
+    }),
+  });
+  replayFragmentState = reduce(replayFragmentState, {
+    type: "event", event: event({
+      type: "history", sid: replayFragmentSid,
+      session_id: replayFragmentSid, revision: "fragment-rev",
+      generation: "wrapper-one", build_seq: 1, live_seq: 74,
+      has_more: true, oldest_id: "authoritative-old",
+      in_progress: true, detail: "summary", events: [],
+      turns: [
+        {
+          id: "authoritative-old", prompt: "real older question",
+          blocks: [], done: true, detailEventCount: 0,
+          detailLoaded: false, ts: 5_000, doneTs: 6_000,
+        },
+        {
+          id: "current-turn", prompt: "current question",
+          blocks: [{
+            kind: "text", message_id: "current-commentary",
+            text: "current work", done: false, channel: "commentary",
+          }],
+          done: false, detailEventCount: 1,
+          detailLoaded: false, ts: 9_000,
+        },
+      ],
+    }),
+  });
+  assert.deepEqual(
+    replayFragmentState.runtimes[replayFragmentSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["authoritative-old", "current-turn"],
+    "an unmatched replay prefix must not become the newest visible history",
+  );
+  assert.doesNotMatch(
+    JSON.stringify(replayFragmentState.runtimes[replayFragmentSid].turns),
+    /older reasoning replayed without its user boundary/,
+  );
+
+  // The inverse race is valid: the newest running UserMsg may have replayed
+  // before its transcript row was flushed into History. Keep exactly that
+  // newest unfinished tail while still removing an older orphaned prefix.
+  const unflushedTailSid = "replay-gap-keeps-current-unflushed-tail";
+  let unflushedTailState = reduce({
+    ...initialState, focusedSid: unflushedTailSid,
+  }, { type: "event", event: event({
+    type: "replay_start", sid: unflushedTailSid, from_seq: 80, to_seq: 83,
+    truncated: true, rebuild: false,
+  }) });
+  for (const replayEvent of [
+    event({
+      type: "assistant_msg_start", sid: unflushedTailSid, seq: 81, ts: 7,
+      message_id: "unflushed-orphan", channel: "commentary",
+    }),
+    event({
+      type: "user_msg", sid: unflushedTailSid, seq: 82, ts: 10,
+      msg_id: "unflushed-current", prompt: "just accepted",
+    }),
+    event({
+      type: "assistant_msg_start", sid: unflushedTailSid, seq: 83, ts: 10.1,
+      message_id: "unflushed-current-commentary", channel: "commentary",
+    }),
+  ]) {
+    unflushedTailState = reduce(unflushedTailState, {
+      type: "event", event: replayEvent,
+    });
+  }
+  unflushedTailState = reduce(unflushedTailState, {
+    type: "event", event: event({
+      type: "history", sid: unflushedTailSid,
+      session_id: unflushedTailSid, revision: "unflushed-rev",
+      generation: "wrapper-one", build_seq: 1, live_seq: 83,
+      has_more: true, in_progress: true, detail: "summary", events: [],
+      turns: [{
+        id: "last-flushed", prompt: "last flushed question",
+        blocks: [], done: true, detailEventCount: 0,
+        detailLoaded: false, ts: 5_000, doneTs: 6_000,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    unflushedTailState.runtimes[unflushedTailSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["last-flushed", "unflushed-current"],
+  );
+  assert.doesNotMatch(
+    JSON.stringify(unflushedTailState.runtimes[unflushedTailSid].turns),
+    /unflushed-orphan/,
+  );
 
   const rebuildSeqSid = "wrapper-generation-rebuild";
   let rebuildSeqState = {

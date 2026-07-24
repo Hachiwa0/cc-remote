@@ -519,3 +519,36 @@ test("live append follows at the bottom but not while reading history", async ({
   await expect(page.locator('[data-turn-id="live-42"]')).toHaveCount(0);
   expect(await page.locator(".turn").count()).toBeLessThan(40);
 });
+
+test("composer action growth keeps the live tail visible without stealing history", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?large=40&composer-resize=1");
+  const viewport = page.locator(".thread");
+  await expect(page.locator('[data-turn-id="m40"]')).toBeVisible();
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await expect.poll(async () => viewport.evaluate((node) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight,
+  )).toBeLessThan(2);
+
+  await page.getByTestId("toggle-composer").click();
+  await expect.poll(async () => viewport.evaluate((node) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight,
+  )).toBeLessThan(2);
+  const spark = page.locator('[data-turn-id="m40"] .turn-done-mark');
+  await expect(spark).toBeVisible();
+  expect(await spark.evaluate((node) => {
+    const viewportNode = document.querySelector<HTMLElement>(".thread");
+    if (!viewportNode) throw new Error("thread viewport is missing");
+    return node.getBoundingClientRect().bottom
+      <= viewportNode.getBoundingClientRect().bottom + 1;
+  })).toBe(true);
+
+  await wheelUntilTurn(page, "m1", -2_000, testInfo.project.name);
+  const before = await readingAnchor(page);
+  await page.getByTestId("toggle-composer").click();
+  await page.waitForTimeout(200);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+});

@@ -359,6 +359,38 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     syncScrollState(controller.recordProgrammaticScroll(readScrollMetrics(el)));
   }, [syncScrollState, virtualizer]);
 
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let previousHeight = el.clientHeight;
+    let frame: number | null = null;
+    const observer = new ResizeObserver(() => {
+      const nextHeight = el.clientHeight;
+      if (Math.abs(nextHeight - previousHeight) < 0.5) return;
+      previousHeight = nextHeight;
+      if (!controllerRef.current?.isFollowing()) return;
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      // Composer actions and the mobile keyboard resize the thread from
+      // outside the virtual list. Let both ResizeObservers commit the new
+      // viewport size, then restore the live-tail intent through TanStack's
+      // sole scroll writer. Reading-history state never enters this branch.
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        if (!controllerRef.current?.isFollowing()
+            || userScrollIntentRef.current
+            || touchYRef.current !== null) return;
+        applyScrollCommand(
+          scrollCoordinatorRef.current.requestBottom("auto"),
+        );
+      });
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      if (frame !== null) window.cancelAnimationFrame(frame);
+    };
+  }, [applyScrollCommand, scrollScope]);
+
   const pauseOutputFollow = useCallback(() => {
     const el = scrollRef.current;
     const controller = controllerRef.current;

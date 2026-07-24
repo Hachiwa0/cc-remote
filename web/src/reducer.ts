@@ -25,7 +25,7 @@ import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
 import { canEnqueueQuery, collectWaitingQueries, reduceTargetedRuntime } from "./runtime-drain";
 import {
-  mergeAuthoritativeTurnDetail, mergeInitialHistory,
+  historyContainsTurn, mergeAuthoritativeTurnDetail, mergeInitialHistory,
 } from "./history-merge";
 import { boundRuntimeTurns, pruneRuntimeMap } from "./runtime-bounds";
 import { bumpSessionActivity, setSessionPinned } from "./session-order";
@@ -398,13 +398,17 @@ function cloneTurns(turns: Turn[]): Turn[] {
   return turns.map((t) => ({ ...t, blocks: t.blocks.map((b) => ({ ...b })) }));
 }
 
-function openTurn(turns: Turn[], fallbackId: string): Turn {
+function openTurn(turns: Turn[], fallbackId: string, ts?: number): Turn {
   let turn = turns[turns.length - 1];
   if (!turn || turn.done) {
-    turn = { id: fallbackId, prompt: "", blocks: [], done: false };
+    turn = { id: fallbackId, prompt: "", blocks: [], done: false, ts };
     turns.push(turn);
   }
   return turn;
+}
+
+function eventTimestampMs(ts: number | null | undefined): number | undefined {
+  return typeof ts === "number" ? Math.round(ts * 1000) : undefined;
 }
 
 function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn | undefined {
@@ -1456,6 +1460,10 @@ function reduceEvent(
         // genuinely unfinished local tail; arbitrary completed cache rows may
         // have been removed by rollback while this browser was offline.
         const cached = new Set(base.hydratedCacheTurnIds);
+        const unfinished = unfinishedLiveTail(
+          base.turns, base.hydratedCacheTurnIds);
+        const newestUnfinished = [...unfinished].reverse().find(
+          (turn) => turnHasUnfinishedWork(turn));
         const liveTail = preserveStableHeadHistory
           // A bounded newest page is a moving head window, not the whole
           // conversation. Keep rows already painted from live traffic or from
@@ -1467,11 +1475,23 @@ function reduceEvent(
           // browser. Keep every non-cache local row (including a just-completed
           // TurnEnd); the stale frame may add history but cannot delete it.
           ? base.turns.filter((turn) => !cached.has(turn.id))
-          : unfinishedLiveTail(base.turns, base.hydratedCacheTurnIds);
+          : base.historyInvalidated
+          // Replay gaps begin at an arbitrary ring position and can therefore
+          // synthesize a prompt-less "turn" from the middle of old output.
+          // Current authoritative History validates real replay tails by turn
+          // identity; unmatched fragments must not survive at the newest edge.
+          // Keep an optimistic query which has not yet received its UserMsg
+          // echo so a History read cannot erase an in-flight send. Likewise,
+          // an explicitly running snapshot may precede the transcript flush;
+          // only its newest unfinished row can be the active unflushed tail.
+          ? unfinished.filter((turn) =>
+              turn.id === base.acceptancePending
+              || historyContainsTurn(built.turns, turn)
+              || (e.in_progress === true && turn === newestUnfinished))
+          : unfinished;
         turns = mergeInitialHistory(
           built.turns,
           liveTail, {
-          attachAssistantOnlySuffix: preserveStableHeadHistory,
           // History's final TurnEnd is synthetic: Claude transcripts do not
           // contain ResultMessage. A newer live event always wins; otherwise an
           // explicit in_progress value is authoritative, and only an older
@@ -2046,7 +2066,7 @@ function reduceEvent(
     case "assistant_msg_start":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = openTurn(turns, e.message_id);
+        const t = openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const block = t.blocks.find((b) => b.kind === "text"
@@ -2062,7 +2082,7 @@ function reduceEvent(
     case "delta":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = openTurn(turns, e.message_id);
+        const t = openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         let block = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
@@ -2080,7 +2100,7 @@ function reduceEvent(
     case "tool_use":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = openTurn(turns, e.message_id);
+        const t = openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const existing = t.blocks.find((b) => b.kind === "tool"
@@ -2175,7 +2195,10 @@ function reduceEvent(
         // wrong conversation.
         if (!owner) owner = findTurnOwningItem(turns, e.parent_id);
         if (!owner) owner = findTurnByEngineId(turns, e.turn_id);
-        if (!owner) owner = openTurn(turns, e.turn_id || e.item_id);
+        if (!owner) {
+          owner = openTurn(
+            turns, e.turn_id || e.item_id, eventTimestampMs(e.ts));
+        }
         markTurnAsLive(rt, owner.id, boundCompletedTurns, e.seq);
         if (!block) {
           block = { kind: "process", item_id: e.item_id, processKind: e.kind,
@@ -2229,7 +2252,10 @@ function reduceEvent(
         const turns = cloneTurns(rt.turns);
         let t = findTurnOwningItem(turns, e.item_id)
           ?? findTurnByEngineId(turns, e.turn_id);
-        if (!t) t = openTurn(turns, e.turn_id || e.item_id);
+        if (!t) {
+          t = openTurn(
+            turns, e.turn_id || e.item_id, eventTimestampMs(e.ts));
+        }
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         let block = t.blocks.find((b) => b.kind === "process"
           && b.item_id === e.item_id) as ProcessBlock | undefined;
@@ -2253,7 +2279,10 @@ function reduceEvent(
         const turns = cloneTurns(rt.turns);
         let t = findTurnOwningItem(turns, e.item_id)
           ?? findTurnByEngineId(turns, e.turn_id);
-        if (!t) t = openTurn(turns, e.turn_id || e.item_id);
+        if (!t) {
+          t = openTurn(
+            turns, e.turn_id || e.item_id, eventTimestampMs(e.ts));
+        }
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         let block = t.blocks.find((b) => b.kind === "process"
           && b.item_id === e.item_id) as ProcessBlock | undefined;
