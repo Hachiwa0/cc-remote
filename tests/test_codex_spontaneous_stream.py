@@ -6,8 +6,8 @@ import json
 from types import SimpleNamespace
 
 from cc_remote.protocol import (
-    Delta, ProcessEvent, StateEvent, ToolDelta, ToolResult, ToolUse, TurnDiff,
-    TurnEnd, TurnPlan, UserMsg,
+    Delta, Error, ProcessEvent, StateEvent, ToolDelta, ToolResult, ToolUse,
+    TurnDiff, TurnEnd, TurnPlan, UserMsg,
 )
 from cc_remote.wrapper.codex_handle import (
     CodexHandle, CodexSpontaneousClosed, CodexSpontaneousOverflow,
@@ -275,5 +275,48 @@ def test_machine_streams_rich_spontaneous_turn_and_unlocks_on_matching_terminal(
         assert len(terminal) == 1
         assert terminal[0].turn_id == turn_id
         assert terminal[0].result.subtype == "success"
+
+    asyncio.run(run())
+
+
+def test_spontaneous_overflow_preserves_authoritative_success_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-overflow", "thread-overflow")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        turn_id = "auto-overflow-success"
+        ctx.codex_spontaneous_turn_id = turn_id
+
+        class OverflowSdk:
+            async def receive_spontaneous_response(self, requested_turn_id):
+                assert requested_turn_id == turn_id
+                yield CodexSpontaneousOverflow(turn_id)
+                yield _notification(
+                    "turn/completed", turn_id,
+                    turn={"id": turn_id, "status": "completed"},
+                )
+
+        ctx.sdk = OverflowSdk()
+        machine.sessions[ctx.key] = ctx
+        repairs = []
+
+        async def failed_repair(_sid):
+            repairs.append(_sid)
+            raise RuntimeError("projection unavailable")
+
+        machine._push_mirrored_history = failed_repair
+        await machine._run_codex_spontaneous_turn(
+            ctx, turn_id, announce_running=False)
+
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].turn_id == turn_id
+        assert terminal[0].result.subtype == "success"
+        assert terminal[0].result.is_error is False
+        assert repairs == [ctx.session_id]
 
     asyncio.run(run())

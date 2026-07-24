@@ -7,8 +7,10 @@ marker is still forwarded so the remote timeline does not silently omit the step
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
+import os
 import re
 import shlex
 from datetime import datetime
@@ -19,6 +21,7 @@ from cc_remote.protocol import (
     ProcessEvent, TurnPlan, TurnDiff, TurnEnd, TurnResult, UserMsg, Error,
     StateEvent, ERR_CC_CRASH,
 )
+from cc_remote.wrapper.codex_external import visible_codex_user_message
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
 
 _TOOL_TYPES = {
@@ -27,7 +30,8 @@ _TOOL_TYPES = {
 }
 _PROCESS_ITEM_TYPES = {
     "plan", "reasoning", "collabAgentToolCall", "subAgentActivity",
-    "contextCompaction",
+    "contextCompaction", "imageView", "sleep", "imageGeneration",
+    "enteredReviewMode", "exitedReviewMode",
 }
 _MAX_HISTORY_RECORD_CHARS = 16 * 1024 * 1024
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -64,22 +68,420 @@ _MODEL_NAME_MAX_CHARS = 256
 _MODEL_ENUM_MAX_CHARS = 256
 _MODEL_LIST_MAX_ITEMS = 32
 _MODEL_DETAIL_MAX_CHARS = 16 * 1024
+_DEFAULT_HISTORY_WINDOW_MAX_BYTES = 32 * 1024 * 1024
+_REVERSE_HISTORY_CHUNK_BYTES = 1024 * 1024
+_MAX_HISTORY_REVERSE_RECORD_BYTES = 1024 * 1024
+_MAX_HISTORY_BOUNDARY_RECORD_BYTES = 1024 * 1024
+_MAX_HISTORY_BOUNDARY_FORWARD_BYTES = 64 * 1024 * 1024
+_MAX_PENDING_HISTORY_COMPACTIONS = 32
 
 
-def _bounded_jsonl_records(file):
-    """Yield bounded complete records; skip one pathological oversized line."""
-    line_no = 0
+def _bounded_jsonl_records(file, *, end_offset: int | None = None):
+    """Yield bounded complete records with stable absolute byte offsets.
+
+    ``end_offset`` freezes a growing rollout at the snapshot selected by the
+    history pager.  Byte offsets, unlike window-local line numbers, remain
+    stable when a large file is read through different pages.
+    """
     while True:
-        line = file.readline(_MAX_HISTORY_RECORD_CHARS + 1)
+        record_offset = file.tell()
+        if end_offset is not None and record_offset >= end_offset:
+            return
+        read_limit = _MAX_HISTORY_RECORD_CHARS + 1
+        if end_offset is not None:
+            read_limit = min(read_limit, end_offset - record_offset)
+        line = file.readline(read_limit)
         if not line:
             return
-        line_no += 1
-        complete = line.endswith("\n") or len(line) < _MAX_HISTORY_RECORD_CHARS + 1
+        complete = (
+            line.endswith(b"\n")
+            or len(line) < _MAX_HISTORY_RECORD_CHARS + 1
+            or (end_offset is not None and file.tell() >= end_offset)
+        )
         if complete:
-            yield line_no, line
+            yield record_offset, line.decode("utf-8", "replace")
             continue
-        while line and not line.endswith("\n"):
-            line = file.readline(_MAX_HISTORY_RECORD_CHARS + 1)
+        while line and not line.endswith(b"\n"):
+            if end_offset is not None and file.tell() >= end_offset:
+                return
+            read_limit = _MAX_HISTORY_RECORD_CHARS + 1
+            if end_offset is not None:
+                read_limit = min(read_limit, end_offset - file.tell())
+            line = file.readline(read_limit)
+
+
+def _reverse_jsonl_records(path: str):
+    """Yield ``(byte_offset, line)`` from newest to oldest without buffering.
+
+    Fixed-size reverse reads avoid mmap implementations faulting a large part
+    of a multi-gigabyte rollout into RSS. Individual pathological records and
+    the cross-chunk carry remain bounded.
+    """
+    with open(path, "rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        if size <= 0:
+            return
+        position = size
+        carry = b""
+        dropping_oversized = False
+        while position > 0:
+            read_size = min(_REVERSE_HISTORY_CHUNK_BYTES, position)
+            position -= read_size
+            source.seek(position)
+            chunk = source.read(read_size)
+            data = chunk if dropping_oversized else chunk + carry
+            parts = data.split(b"\n")
+            if len(parts) == 1:
+                if (dropping_oversized
+                        or len(data) > _MAX_HISTORY_REVERSE_RECORD_BYTES):
+                    carry = b""
+                    dropping_oversized = True
+                else:
+                    carry = data
+                continue
+
+            starts = [position]
+            for part in parts[:-1]:
+                starts.append(starts[-1] + len(part) + 1)
+            for index in range(len(parts) - 1, 0, -1):
+                # The newest fragment still belongs to a record whose newer
+                # suffix was discarded after it exceeded the per-record cap.
+                if dropping_oversized and index == len(parts) - 1:
+                    continue
+                line = parts[index]
+                if line and len(line) <= _MAX_HISTORY_REVERSE_RECORD_BYTES:
+                    yield starts[index], line
+            carry = parts[0]
+            dropping_oversized = len(carry) > _MAX_HISTORY_REVERSE_RECORD_BYTES
+            if dropping_oversized:
+                carry = b""
+
+        if (not dropping_oversized and carry
+                and len(carry) <= _MAX_HISTORY_REVERSE_RECORD_BYTES):
+            yield 0, carry
+
+
+def _next_jsonl_offset(path: str, offset: int, end_offset: int) -> int:
+    """Move a byte budget boundary to the next complete JSONL record."""
+    if offset <= 0:
+        return 0
+    with open(path, "rb") as source:
+        source.seek(offset - 1)
+        if source.read(1) == b"\n":
+            return offset
+        source.seek(offset)
+        while source.tell() < end_offset:
+            chunk = source.readline(
+                min(_MAX_HISTORY_RECORD_CHARS + 1,
+                    end_offset - source.tell()))
+            if not chunk:
+                return end_offset
+            if chunk.endswith(b"\n"):
+                return source.tell()
+        return end_offset
+
+
+def _previous_jsonl_record_offset(path: str, offset: int) -> int:
+    """Return the start of the complete record immediately before ``offset``.
+
+    A persisted user ``response_item`` can contain a large inline image and is
+    therefore intentionally skipped by the bounded reverse JSON decoder.  The
+    following small ``event_msg/user_message`` remains a useful page boundary,
+    but its page must start one record earlier so history replay still sees the
+    image.  Locate that record by newlines without buffering or decoding it.
+    """
+    if offset <= 0:
+        return 0
+    with open(path, "rb") as source:
+        position = offset - 1  # exclude the newline immediately before offset
+        while position > 0:
+            start = max(0, position - _REVERSE_HISTORY_CHUNK_BYTES)
+            source.seek(start)
+            chunk = source.read(position - start)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                return start + newline + 1
+            position = start
+    return 0
+
+
+def _fallback_history_id(path: str, kind: str, offset: int, raw_ts: str,
+                         identity: str) -> str:
+    seed = "\0".join((path, kind, identity, str(offset), raw_ts))
+    return hashlib.sha256(seed.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def _history_user_cursor(
+    path: str,
+    offset: int,
+    line: bytes,
+    *,
+    prefer_turn_id: bool = True,
+) -> str | None:
+    if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+            or (b'"type":"user_message"' not in line
+                and b'"type": "user_message"' not in line)):
+        return None
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    payload = row.get("payload") if isinstance(row, dict) else None
+    if (row.get("type") != "event_msg" or not isinstance(payload, dict)
+            or payload.get("type") != "user_message"):
+        return None
+    if not visible_codex_user_message(payload.get("message")):
+        return None
+    turn_id = payload.get("turn_id")
+    if (prefer_turn_id and isinstance(turn_id, str)
+            and _SAFE_WIRE_ID.fullmatch(turn_id)):
+        return turn_id
+    raw_ts = row.get("timestamp", "")
+    return _fallback_history_id(
+        path, "user", offset, str(raw_ts), type(turn_id).__name__)
+
+
+def _history_turn_cursor(line: bytes) -> str | None:
+    if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+            or (b'"type":"task_started"' not in line
+                and b'"type": "task_started"' not in line)):
+        return None
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    payload = row.get("payload") if isinstance(row, dict) else None
+    if (row.get("type") != "event_msg" or not isinstance(payload, dict)
+            or payload.get("type") != "task_started"):
+        return None
+    turn_id = payload.get("turn_id")
+    if isinstance(turn_id, str) and _SAFE_WIRE_ID.fullmatch(turn_id):
+        return turn_id
+    return None
+
+
+_HISTORY_TERMINAL_TYPES = frozenset({
+    "task_complete",
+    "turn_aborted",
+    "task_failed",
+    "turn_failed",
+    "task_error",
+    "task_cancelled",
+})
+
+
+def _history_terminal_marker(line: bytes) -> bool:
+    if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+            or not any(marker.encode() in line
+                       for marker in _HISTORY_TERMINAL_TYPES)):
+        return False
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    payload = row.get("payload") if isinstance(row, dict) else None
+    return bool(
+        row.get("type") == "event_msg"
+        and isinstance(payload, dict)
+        and payload.get("type") in _HISTORY_TERMINAL_TYPES
+    )
+
+
+def _history_boundaries(path: str, *, use_turns: bool):
+    if not use_turns:
+        for offset, line in _reverse_jsonl_records(path):
+            cursor = _history_user_cursor(path, offset, line)
+            if cursor is not None:
+                yield offset, cursor
+        return
+
+    # A task_started without a user_message is ambiguous. It is an independent
+    # goal/background turn only when the preceding visible turn had already
+    # reached a terminal record; otherwise it is an automatic continuation of
+    # the same visible reply. Resolve that relationship while walking backwards
+    # so pagination counts visible chat turns, not internal app-server turns.
+    # Multiple user messages may be steered into one still-running Codex task.
+    # The oldest message keeps the authoritative task cursor; every newer
+    # message is an independent visible chat boundary with its own fallback id.
+    # Delaying emission until task_started preserves reverse chronological order
+    # while retaining the long-standing task cursor for ordinary one-user turns.
+    segment_users: list[tuple[int, str, str]] = []
+    pending_assistant_only: tuple[int, str] | None = None
+    for offset, line in _reverse_jsonl_records(path):
+        user_cursor = _history_user_cursor(path, offset, line)
+        if user_cursor is not None:
+            fallback_cursor = _history_user_cursor(
+                path, offset, line, prefer_turn_id=False)
+            if fallback_cursor is None:
+                continue
+            segment_users.append((
+                _previous_jsonl_record_offset(path, offset),
+                user_cursor,
+                fallback_cursor,
+            ))
+            continue
+
+        turn_cursor = _history_turn_cursor(line)
+        if turn_cursor is not None:
+            # An unresolved newer no-user start had no terminal boundary
+            # between it and this older start, so it merely continued this turn.
+            pending_assistant_only = None
+            if segment_users:
+                # Reverse scan order is newest -> oldest. Extra steered messages
+                # need stable per-record cursors; the oldest message keeps the
+                # task id so existing pagination cursors remain compatible.
+                for boundary, _cursor, extra_cursor in segment_users[:-1]:
+                    yield boundary, extra_cursor
+                yield offset, turn_cursor
+            else:
+                pending_assistant_only = (offset, turn_cursor)
+            segment_users = []
+            continue
+
+        if (pending_assistant_only is not None
+                and _history_terminal_marker(line)):
+            yield pending_assistant_only
+            pending_assistant_only = None
+
+
+def codex_history_window(
+    path: str, *, before: str | None, limit: int | None,
+    max_bytes: int = _DEFAULT_HISTORY_WINDOW_MAX_BYTES,
+) -> tuple[int, int, bool, str | None, int | None]:
+    """Select a bounded Codex history page by scanning user turns backwards.
+
+    Returns ``(start_offset, end_offset, has_older, forced_oldest_cursor,
+    forced_boundary_offset)``.
+    The rollout can be many gigabytes: only boundary records are decoded while
+    locating the latest page, and the forward translator sees at most the
+    configured source window.  ``forced_oldest_cursor`` preserves pagination
+    when one visible turn alone is larger than the byte budget and its prefix
+    must be omitted. ``forced_boundary_offset`` lets the caller recover the
+    omitted user boundary without parsing or retaining that entire turn.
+    """
+    size = os.path.getsize(path)
+    if size <= 0 or not isinstance(limit, int) or limit <= 0:
+        return 0, size, False, None, None
+    byte_budget = max(1024 * 1024, int(max_bytes))
+
+    # Current app-server rollouts have an authoritative task_started boundary
+    # for user and assistant-only continuation turns.  Fall back to historical
+    # user_message boundaries only for older rollout shapes.
+    for use_turns in (True, False):
+        end_offset = size
+        target_found = before is None
+        boundaries: list[tuple[int, str]] = []
+        saw_boundary = False
+        for offset, cursor in _history_boundaries(path, use_turns=use_turns):
+            saw_boundary = True
+            if not target_found:
+                if cursor == before:
+                    target_found = True
+                    end_offset = offset
+                continue
+            boundaries.append((offset, cursor))
+            if end_offset - offset > byte_budget:
+                if len(boundaries) > 1:
+                    start_offset, _ = boundaries[-2]
+                    return start_offset, end_offset, True, None, None
+                # Preserve the recent tail of a pathological single turn. The
+                # true task cursor remains the paging cursor for older history.
+                start_offset = _next_jsonl_offset(
+                    path, max(0, end_offset - byte_budget), end_offset)
+                return start_offset, end_offset, True, cursor, offset
+            if len(boundaries) > limit:
+                start_offset, _ = boundaries[limit - 1]
+                return start_offset, end_offset, True, None, None
+        if saw_boundary:
+            if before is not None and not target_found:
+                return 0, 0, False, None, None
+            return 0, end_offset, False, None, None
+    if size > byte_budget:
+        start_offset = _next_jsonl_offset(
+            path, size - byte_budget, size)
+        return start_offset, size, True, None, None
+    return 0, size, False, None, None
+
+
+def codex_history_boundary_user(
+    path: str,
+    boundary_offset: int,
+    cursor: str,
+    *,
+    max_scan_bytes: int = _MAX_HISTORY_BOUNDARY_FORWARD_BYTES,
+) -> UserMsg | None:
+    """Recover the user row omitted from a bounded single-turn tail.
+
+    A single Codex turn can grow far beyond the history byte window, especially
+    after one or more ``compacted`` records.  Reading only its recent tail keeps
+    memory bounded but otherwise leaves the browser with tool/assistant events
+    that have no prompt.  Scan forward from the already-discovered turn boundary
+    only until the first visible user record and reuse the paging cursor as its
+    stable id.  Oversized JSONL records are skipped by ``_bounded_jsonl_records``
+    rather than materialized.
+    """
+    if (not isinstance(boundary_offset, int) or boundary_offset < 0
+            or not isinstance(cursor, str)
+            or not _SAFE_WIRE_ID.fullmatch(cursor)):
+        return None
+    try:
+        size = os.path.getsize(path)
+        end_offset = min(
+            size,
+            boundary_offset + max(
+                1024 * 1024, int(max_scan_bytes)),
+        )
+        source = open(path, "rb")
+    except (OSError, TypeError, ValueError):
+        return None
+
+    saw_task_start = False
+    pending_images: list = []
+    with source:
+        source.seek(boundary_offset)
+        for _offset, line in _bounded_jsonl_records(
+                source, end_offset=end_offset):
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            row_type = row.get("type")
+            payload_type = payload.get("type")
+            if row_type == "event_msg" and payload_type == "task_started":
+                if saw_task_start:
+                    return None
+                saw_task_start = True
+                continue
+            if (row_type == "response_item"
+                    and payload_type == "message"
+                    and payload.get("role") == "user"):
+                for item in payload.get("content") or []:
+                    if (isinstance(item, dict)
+                            and item.get("type") == "input_image"):
+                        image = _data_uri_to_img(item.get("image_url"))
+                        if image:
+                            pending_images.append(image)
+                continue
+            if row_type != "event_msg" or payload_type != "user_message":
+                continue
+            prompt = visible_codex_user_message(payload.get("message"))
+            if not prompt:
+                return None
+            event = UserMsg(msg_id=cursor, prompt=prompt)
+            if pending_images:
+                event.images = pending_images
+            raw_ts = row.get("timestamp")
+            if isinstance(raw_ts, str):
+                try:
+                    event.ts = datetime.fromisoformat(
+                        raw_ts.replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError):
+                    pass
+            return event
+    return None
 
 
 class CodexStreamTranslator:
@@ -89,6 +491,7 @@ class CodexStreamTranslator:
         self._text_seen: set[str] = set()
         self._message_channels: dict[str, str] = {}
         self._tools_started: set[str] = set()
+        self._tool_message_ids: dict[str, str] = {}
         self._reasoning_started: set[str] = set()
         self._file_diffs: dict[str, str] = {}
         self._open_msg: str | None = None
@@ -201,6 +604,8 @@ class CodexStreamTranslator:
                     return out
                 if iid not in self._tools_started:
                     out.extend(self._tool_use(item))
+                elif t == "fileChange":
+                    out.append(self._tool_update(item))
                 out.append(self._tool_result(item))
             elif t in _PROCESS_ITEM_TYPES:
                 iid = _live_id(item.get("id"), str(t or "process"))
@@ -331,6 +736,13 @@ class CodexStreamTranslator:
             iid = _live_id(p.get("itemId"), "fileChange-tool")
             if not self._admit_live_item(iid, out):
                 return out
+            if iid in self._tools_started:
+                out.append(self._tool_update({
+                    "type": "fileChange",
+                    "id": p.get("itemId"),
+                    "status": "inProgress",
+                    "changes": p.get("changes"),
+                }))
             latest, _ = bounded_text(_changes_diff(p.get("changes")), 2 * 1024 * 1024)
             previous = self._file_diffs.get(iid, "")
             self._file_diffs[iid] = latest
@@ -484,6 +896,36 @@ class CodexStreamTranslator:
                     summary=summary,
                 ))
 
+        elif method in {
+            "item/autoApprovalReview/started",
+            "item/autoApprovalReview/completed",
+        }:
+            event = _auto_approval_review_event(
+                p, completed=method.endswith("/completed"))
+            if event is not None and self._admit_live_item(event.item_id, out):
+                self._visible_output = True
+                out.append(event)
+
+        elif method == "turn/moderationMetadata":
+            # ``metadata`` is deliberately untyped in the public schema and may
+            # contain provider-internal data. Preserve the lifecycle marker but
+            # never forward the opaque payload across the remote boundary.
+            turn_id = _optional_wire_id(p.get("turnId"), "turn")
+            if turn_id and p.get("metadata") is not None:
+                iid = _live_id(f"moderation:{turn_id}", "moderation")
+                if not self._admit_live_item(iid, out):
+                    return out
+                self._visible_output = True
+                out.append(ProcessEvent(
+                    item_id=iid,
+                    kind="safety",
+                    phase="snapshot",
+                    status="succeeded",
+                    turn_id=turn_id,
+                    title="内容安全检查",
+                    summary="已完成（详细元数据未在远程端展示）",
+                ))
+
         elif method in {"hook/started", "hook/completed"}:
             event = _hook_event(p, completed=(method == "hook/completed"))
             if event is not None and self._admit_live_item(event.item_id, out):
@@ -523,36 +965,24 @@ class CodexStreamTranslator:
                     detail=_retry_detail(err),
                 ))
             else:
-                msg = err.get("message") or "codex 出错"
-                det = err.get("additionalDetails")
-                message_text, _ = bounded_text(msg, 24 * 1024)
-                details_text, _ = bounded_text(det, 8 * 1024)
-                detail = "codex: " + message_text
-                if details_text:
-                    detail += " — " + details_text
                 self._terminal_error = True
-                out.append(Error(code=ERR_CC_CRASH, message=detail))
+                out.append(Error(
+                    code=ERR_CC_CRASH,
+                    message="Codex 本次回复未完成，请重试。",
+                ))
 
         elif method == "turn/completed":
             self._close_open(out)
             turn = p.get("turn") or {}
             st = turn.get("status") or "completed"
-            # a failed turn carries its reason in turn.error — surface it (the
-            # error notifications above may not have fired for every failure mode).
+            # A failed turn may carry provider diagnostics in turn.error. Keep
+            # those on the local engine boundary and emit only stable product
+            # copy (the error notification above may not fire for every mode).
             if st == "failed":
-                te = turn.get("error")
-                emsg = te.get("message") if isinstance(te, dict) else (te if isinstance(te, str) else None)
-                if emsg and not self._terminal_error:
-                    message_text, _ = bounded_text(emsg, 32 * 1024)
+                if not self._terminal_error:
                     out.append(Error(
                         code=ERR_CC_CRASH,
-                        message="codex 回合失败: " + message_text,
-                    ))
-                    self._terminal_error = True
-                elif not self._terminal_error:
-                    out.append(Error(
-                        code=ERR_CC_CRASH,
-                        message="Codex 回合失败，但没有返回错误详情。",
+                        message="Codex 本次回复未完成，请重试。",
                     ))
                     self._terminal_error = True
             # Codex 0.144.1 can record an upstream 503 as completed/error=null with
@@ -696,6 +1126,7 @@ class CodexStreamTranslator:
         self._tools_started.add(iid)
         mid = self._open_msg or iid
         self._ensure_block(mid, out)
+        self._tool_message_ids[iid] = self._open_msg or mid
         inp = _tool_input(item)
         tool, category, title, server = _tool_presentation(item)
         out.append(ToolUse(
@@ -708,6 +1139,21 @@ class CodexStreamTranslator:
             server=server,
         ))
         return out
+
+    def _tool_update(self, item: dict) -> ToolUse:
+        item_type = str(item.get("type") or "tool")
+        iid = _live_id(item.get("id"), f"{item_type}-tool")
+        tool, category, title, server = _tool_presentation(item)
+        return ToolUse(
+            message_id=self._tool_message_ids.get(iid, iid),
+            tool_use_id=iid,
+            tool=tool,
+            input=bounded_tool_input(
+                _tool_input(item), self.tool_result_max),
+            category=category,
+            title=title,
+            server=server,
+        )
 
     def _tool_result(self, item: dict) -> ToolResult:
         item_type = item.get("type")
@@ -809,7 +1255,110 @@ class CodexStreamTranslator:
             return ProcessEvent(
                 item_id=iid, kind="compaction", phase=phase, status=status,
                 turn_id=turn_id, title="压缩上下文")
+        if item_type == "imageView":
+            path, _ = bounded_text(item.get("path"), 16 * 1024)
+            return ProcessEvent(
+                item_id=iid, kind="server_tool", phase=phase, status=status,
+                turn_id=turn_id, title="查看图片",
+                summary=path or None,
+                input={"file_path": path} if path else None,
+            )
+        if item_type == "sleep":
+            duration = _duration_ms(item.get("durationMs"))
+            return ProcessEvent(
+                item_id=iid, kind="task", phase=phase, status=status,
+                turn_id=turn_id, title="等待",
+                summary=_human_duration(duration) if duration is not None else None,
+                duration_ms=duration,
+            )
+        if item_type == "imageGeneration":
+            generated_status = _process_status(item.get("status"))
+            if completed and generated_status in {"unknown", "running", "pending"}:
+                generated_status = "succeeded"
+            prompt, prompt_truncated = bounded_text(
+                item.get("revisedPrompt"), 64 * 1024)
+            path, _ = bounded_text(item.get("savedPath"), 16 * 1024)
+            # `result` may be a full base64 image. The saved file is previewable
+            # through the existing authenticated artifact route; never duplicate
+            # the binary payload into replay history or relay buffers.
+            return ProcessEvent(
+                item_id=iid, kind="server_tool", phase=phase,
+                status=generated_status, turn_id=turn_id, title="生成图片",
+                summary=prompt or (path if path else None),
+                input={"file_path": path} if path else None,
+                truncated=True if prompt_truncated else None,
+            )
+        if item_type in {"enteredReviewMode", "exitedReviewMode"}:
+            review, review_truncated = bounded_text(
+                item.get("review"), 256 * 1024)
+            return ProcessEvent(
+                item_id=iid, kind="safety", phase=phase, status=status,
+                turn_id=turn_id,
+                title=("进入 Review" if item_type == "enteredReviewMode"
+                       else "退出 Review"),
+                detail=review or None,
+                truncated=True if review_truncated else None,
+            )
         return None
+
+
+def _human_duration(duration_ms: int) -> str:
+    seconds = duration_ms / 1000
+    if seconds < 60:
+        return f"{seconds:g} 秒"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:g} 分钟"
+    return f"{minutes / 60:g} 小时"
+
+
+def _auto_approval_review_event(params: dict, *, completed: bool):
+    review_id = params.get("reviewId")
+    if not isinstance(review_id, str) or not review_id:
+        return None
+    review = params.get("review") if isinstance(params.get("review"), dict) else {}
+    action = params.get("action") if isinstance(params.get("action"), dict) else {}
+    action_type = str(action.get("type") or "")
+    action_labels = {
+        "command": "命令",
+        "execve": "程序执行",
+        "applyPatch": "文件修改",
+        "networkAccess": "网络访问",
+        "mcpToolCall": "MCP 工具",
+        "requestPermissions": "权限请求",
+    }
+    review_status = _process_status(review.get("status"))
+    if not completed:
+        review_status = "running"
+    elif review_status in {"unknown", "running", "pending"}:
+        review_status = "succeeded"
+    risk = str(review.get("riskLevel") or "")
+    authorization = str(review.get("userAuthorization") or "")
+    summary_parts = [action_labels.get(action_type, "工具操作")]
+    if risk in {"low", "medium", "high", "critical"}:
+        summary_parts.append(f"风险 {risk}")
+    if authorization in {"unknown", "low", "medium", "high"}:
+        summary_parts.append(f"用户授权 {authorization}")
+    rationale, rationale_truncated = bounded_text(
+        review.get("rationale"), 64 * 1024)
+    started_at = _nonnegative_or_signed_int(params.get("startedAtMs"))
+    completed_at = _nonnegative_or_signed_int(params.get("completedAtMs"))
+    duration = None
+    if started_at is not None and completed_at is not None and completed_at >= started_at:
+        duration = completed_at - started_at
+    return ProcessEvent(
+        item_id=_live_id(review_id, "auto-approval-review"),
+        kind="safety",
+        phase="end" if completed else "start",
+        status=review_status,
+        turn_id=_optional_wire_id(params.get("turnId"), "turn"),
+        parent_id=_optional_wire_id(params.get("targetItemId"), "item"),
+        title="自动审批审查",
+        summary=" · ".join(summary_parts),
+        detail=rationale or None,
+        duration_ms=duration,
+        truncated=True if rationale_truncated else None,
+    )
 
 
 def _retry_detail(error: dict) -> str:
@@ -900,9 +1449,9 @@ def _process_status(value) -> str:
         return "pending"
     if key in {"inprogress", "running", "started"}:
         return "running"
-    if key in {"completed", "complete", "succeeded", "success"}:
+    if key in {"completed", "complete", "succeeded", "success", "approved"}:
         return "succeeded"
-    if key in {"failed", "failure", "error"}:
+    if key in {"failed", "failure", "error", "timedout", "timeout"}:
         return "failed"
     if key in {"declined", "denied", "blocked"}:
         return "declined"
@@ -1030,7 +1579,11 @@ def _tool_input(item: dict) -> dict:
             out["process_id"] = item.get("processId")
         return {key: value for key, value in out.items() if value is not None}
     if item_type == "fileChange":
-        return {"changes": _change_descriptors(item.get("changes"))}
+        changes = _change_descriptors(item.get("changes"))
+        return {
+            "changes": changes,
+            "file_paths": _descriptor_paths(changes),
+        }
     if item_type == "mcpToolCall":
         arguments = item.get("arguments")
         if isinstance(arguments, dict):
@@ -1100,23 +1653,44 @@ def _change_descriptors(changes) -> list[dict]:
             kind = entry.get("kind")
             if isinstance(kind, dict):
                 kind = kind.get("type")
-            descriptors.append({
+            descriptor = {
                 "path": str(entry.get("path") or "")[:16 * 1024],
                 "kind": str(kind or "update")[:128],
-            })
+            }
+            move_path = (entry.get("move_path")
+                         or entry.get("destination_path") or entry.get("to"))
+            if isinstance(move_path, str) and move_path:
+                descriptor["move_path"] = move_path[:16 * 1024]
+            descriptors.append(descriptor)
     elif isinstance(changes, dict):
         for path, change in list(changes.items())[:64]:
             kind = change.get("type") if isinstance(change, dict) else "update"
-            descriptors.append({
+            descriptor = {
                 "path": str(path)[:16 * 1024],
                 "kind": str(kind or "update")[:128],
-            })
+            }
+            move_path = (change.get("move_path") if isinstance(change, dict)
+                         else None)
+            if isinstance(move_path, str) and move_path:
+                descriptor["move_path"] = move_path[:16 * 1024]
+            descriptors.append(descriptor)
     return descriptors
 
 
 def _change_paths(changes) -> list[str]:
-    return [entry["path"] for entry in _change_descriptors(changes)
-            if entry.get("path")]
+    return _descriptor_paths(_change_descriptors(changes))
+
+
+def _descriptor_paths(descriptors: list[dict]) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for entry in descriptors:
+        for key in ("path", "move_path"):
+            path = entry.get(key)
+            if isinstance(path, str) and path and path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths
 
 
 def _changes_diff(changes) -> str:
@@ -1126,17 +1700,45 @@ def _changes_diff(changes) -> str:
         for entry in changes[:64]:
             if not isinstance(entry, dict):
                 continue
-            diff = entry.get("diff")
+            diff = _change_diff(str(entry.get("path") or "file"), entry)
             if isinstance(diff, str) and diff:
                 parts.append(diff)
     elif isinstance(changes, dict):
-        for _path, entry in list(changes.items())[:64]:
+        for path, entry in list(changes.items())[:64]:
             if not isinstance(entry, dict):
                 continue
-            diff = entry.get("unified_diff") or entry.get("diff")
+            diff = _change_diff(str(path), entry)
             if isinstance(diff, str) and diff:
                 parts.append(diff)
     return "\n".join(parts)
+
+
+def _change_diff(path: str, entry: dict) -> str:
+    explicit = entry.get("unified_diff") or entry.get("diff")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+
+    kind = entry.get("kind") or entry.get("type") or "update"
+    if isinstance(kind, dict):
+        kind = kind.get("type") or "update"
+    old_content = entry.get("old_content")
+    new_content = entry.get("content")
+    if str(kind).lower() in {"add", "create", "added"}:
+        old_content = ""
+    elif str(kind).lower() in {"delete", "remove", "deleted"}:
+        old_content = (entry.get("content") if old_content is None
+                       else old_content)
+        new_content = ""
+    if not isinstance(old_content, str) or not isinstance(new_content, str):
+        return ""
+    from_file = "/dev/null" if not old_content else path
+    to_file = "/dev/null" if not new_content else path
+    return "".join(difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=from_file,
+        tofile=to_file,
+    ))
 
 
 def _file_summary(paths: list[str], status: str) -> str:
@@ -1271,8 +1873,11 @@ def _hook_event(params: dict, *, completed: bool):
 # ---- helpers the machine loop needs (codex analogs of stream.extract_*) ----
 
 def codex_session_id(msg: dict) -> str | None:
-    """Thread id from any notification that carries the thread object."""
+    """Thread id from either current app-server notification shape."""
     p = msg.get("params") or {}
+    thread_id = p.get("threadId")
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
     th = p.get("thread")
     if isinstance(th, dict):
         return th.get("id") or th.get("sessionId")
@@ -1286,7 +1891,15 @@ def is_turn_terminal(msg: dict) -> bool:
 
 # ---- on-disk Codex rollout -> wire events (session history) ----
 
-def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str | None]:
+def codex_translate_history(
+    path: str,
+    tool_result_max: int,
+    *,
+    start_offset: int = 0,
+    end_offset: int | None = None,
+    source_continuation: str | None = None,
+    snapshot_in_progress: bool = False,
+) -> tuple[list, str | None]:
     """Translate a Codex rollout .jsonl into wire events (same vocabulary as the
     live stream) + the model used. Codex analog of stream.translate_history.
 
@@ -1296,7 +1909,6 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
     (events, model)."""
     events: list = []
     model: str | None = None
-    session_id: str | None = None
     turn_open = False
     active_turn_id: str | None = None
     active_msg_id: str | None = None
@@ -1304,11 +1916,20 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
     turn_visible = False
     turn_text_visible = False
     turn_final_visible = False
+    turn_has_user = False
+    turn_continuation_reason: str | None = None
+    source_continuation_available = (
+        source_continuation == "authoritative_page")
     assistant_open = False
     cur_mid: str | None = None
     cur_channel = "unknown"
     last_ts = None
     pending_images: list = []   # input_image blocks seen before the next user_message
+    pending_compactions: list[
+        tuple[str, float | None, str | None]
+    ] = []
+    pending_agent_message: tuple[dict, int, str] | None = None
+    task_has_user = False
     seen_tool_uses: set[str] = set()
     seen_tool_results: set[str] = set()
     seen_authoritative_results: set[str] = set()
@@ -1326,14 +1947,9 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
 
     def _stable_id(kind: str, line_no: int, raw_ts: str = "", identity=None) -> str:
         """Deterministic fallback for rollout records that carry no item id."""
-        seed = "\0".join((
-            session_id or path,
-            kind,
-            str(identity or active_turn_id or ""),
-            str(line_no),
-            raw_ts,
-        ))
-        return hashlib.sha256(seed.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+        stable_identity = str(identity or active_turn_id or "")
+        return _fallback_history_id(
+            path, kind, line_no, raw_ts, stable_identity)
 
     def _history_id(value, kind: str, line_no: int, raw_ts: str = "") -> str:
         if isinstance(value, str) and _SAFE_WIRE_ID.fullmatch(value):
@@ -1385,6 +2001,42 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         cur_mid = None
         cur_channel = "unknown"
 
+    def append_compaction(
+        marker: tuple[str, float | None, str | None],
+    ) -> None:
+        nonlocal turn_visible
+        item_id, stamp, owner = marker
+        event = ProcessEvent(
+            item_id=item_id,
+            kind="compaction",
+            phase="end",
+            status="succeeded",
+            turn_id=owner,
+            title="压缩上下文",
+        )
+        if stamp is not None:
+            event.ts = stamp
+        events.append(event)
+        turn_visible = True
+
+    def flush_pending_compactions(target_owner: str | None) -> None:
+        """Materialize only markers compatible with the now-visible owner.
+
+        The marker freezes the task id visible when context_compacted arrived.
+        A later task_started must never relabel it onto a new user turn.
+        """
+        if not pending_compactions:
+            return
+        normalized_target = _history_optional_turn_id(target_owner)
+        markers = list(pending_compactions)
+        pending_compactions.clear()
+        for marker in markers:
+            owner = marker[2]
+            if (owner is not None and normalized_target is not None
+                    and owner != normalized_target):
+                continue
+            append_compaction(marker)
+
     def upsert_tool_use(
         tool_id: str,
         tool: str,
@@ -1435,7 +2087,10 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         seen_tool_results.add(result.tool_use_id)
         turn_visible = True
 
-    def open_assistant_only_turn():
+    def open_assistant_only_turn(
+        reason: str | None = None,
+        turn_id: str | None = None,
+    ):
         """Start a visible continuation that has no user_message record.
 
         Goal/background continuations can begin with task_started after the
@@ -1444,14 +2099,105 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         """
         nonlocal turn_open, active_turn_id, active_msg_id
         nonlocal turn_visible, turn_text_visible, turn_final_visible
+        nonlocal turn_has_user, turn_continuation_reason
+        nonlocal source_continuation_available
         if turn_open:
+            if (not turn_has_user and reason is not None
+                    and turn_continuation_reason is None):
+                turn_continuation_reason = reason
+            flush_pending_compactions(active_turn_id)
             return
+        pending_owner = (
+            pending_compactions[0][2] if pending_compactions else None
+        )
         turn_open = True
-        active_turn_id = pending_turn_id
+        active_turn_id = turn_id or pending_owner or pending_turn_id
         active_msg_id = None
         turn_visible = False
         turn_text_visible = False
         turn_final_visible = False
+        turn_has_user = False
+        turn_continuation_reason = (
+            reason or ("context_compacted" if pending_compactions else None)
+        )
+        if (turn_continuation_reason is None
+                and source_continuation_available):
+            turn_continuation_reason = "authoritative_page"
+        source_continuation_available = False
+        flush_pending_compactions(active_turn_id)
+
+    def materialize_pending_terminal(value) -> None:
+        if not pending_compactions or turn_open:
+            return
+        terminal_owner = _history_optional_turn_id(value)
+        marker_owner = pending_compactions[0][2]
+        if (terminal_owner is not None and marker_owner is not None
+                and terminal_owner != marker_owner):
+            pending_compactions.clear()
+            return
+        open_assistant_only_turn(
+            "context_compacted", marker_owner or terminal_owner)
+
+    def emit_agent_message(
+        payload: dict,
+        line_no: int,
+        raw_ts: str,
+        item_id=None,
+    ) -> None:
+        nonlocal turn_visible, turn_text_visible, turn_final_visible
+        open_assistant_only_turn()
+        text = payload.get("message") or ""
+        channel = _assistant_channel(payload.get("phase"))
+        key = (
+            str(active_turn_id or pending_turn_id or ""),
+            channel,
+            text,
+        )
+        if not text or key in seen_agent_messages:
+            return
+        seen_agent_messages.add(key)
+        close_assistant()
+        ensure_assistant(
+            line_no,
+            raw_ts,
+            item_id or payload.get("id") or payload.get("message_id"),
+            channel=channel,
+        )
+        turn_visible = True
+        turn_text_visible = True
+        if channel == "final":
+            turn_final_visible = True
+        events.append(Delta(
+            message_id=cur_mid, text=text, channel=channel))
+        close_assistant()
+
+    def paired_agent_item_id(
+        payload: dict,
+        pending: tuple[dict, int, str],
+    ) -> str | None:
+        pending_payload, _line_no, _raw_ts = pending
+        if (payload.get("type") != "message"
+                or payload.get("role") != "assistant"
+                or _assistant_channel(payload.get("phase"))
+                != _assistant_channel(pending_payload.get("phase"))):
+            return None
+        response_text = "".join(
+            item.get("text", "")
+            for item in (payload.get("content") or [])
+            if (isinstance(item, dict)
+                and item.get("type") in {"output_text", "text"}
+                and isinstance(item.get("text"), str))
+        )
+        clean_text = pending_payload.get("message")
+        if (not isinstance(clean_text, str) or not clean_text
+                or not response_text.startswith(clean_text)):
+            return None
+        item_id = payload.get("id")
+        return (
+            item_id
+            if isinstance(item_id, str) and _SAFE_WIRE_ID.fullmatch(item_id)
+            else None
+        )
 
     def close_turn(
         subtype: str,
@@ -1463,7 +2209,7 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
     ):
         nonlocal turn_open, active_turn_id, active_msg_id, pending_turn_id
         nonlocal assistant_open, cur_mid, turn_visible, turn_text_visible
-        nonlocal turn_final_visible
+        nonlocal turn_final_visible, turn_has_user, turn_continuation_reason
         if not turn_open:
             return
         close_assistant()
@@ -1492,16 +2238,26 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
         turn_visible = False
         turn_text_visible = False
         turn_final_visible = False
+        turn_has_user = False
+        turn_continuation_reason = None
+        pending_compactions.clear()
 
     try:
-        f = open(path)
+        f = open(path, "rb")
     except Exception:
         return [], None
     with f:
-        for line_no, line in _bounded_jsonl_records(f):
+        if start_offset > 0:
+            f.seek(start_offset)
+        for line_no, line in _bounded_jsonl_records(f, end_offset=end_offset):
             try:
                 d = json.loads(line)
             except Exception:
+                if pending_agent_message is not None:
+                    payload, pending_line, pending_ts = pending_agent_message
+                    emit_agent_message(
+                        payload, pending_line, pending_ts)
+                    pending_agent_message = None
                 continue
             t = d.get("type")
             p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
@@ -1509,8 +2265,24 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
             ts = _ts(raw_ts)
             payload_type = p.get("type")
 
-            if t == "session_meta" and p.get("id"):
-                session_id = str(p["id"])
+            consumed_paired_agent = False
+            if pending_agent_message is not None:
+                paired_id = (
+                    paired_agent_item_id(p, pending_agent_message)
+                    if t == "response_item" else None
+                )
+                payload, pending_line, pending_ts = pending_agent_message
+                emit_agent_message(
+                    payload, pending_line, pending_ts, paired_id)
+                pending_agent_message = None
+                consumed_paired_agent = paired_id is not None
+            if consumed_paired_agent:
+                if ts is not None:
+                    last_ts = ts
+                continue
+
+            if t == "session_meta":
+                continue
             elif t == "turn_context":
                 if p.get("model"):
                     model = p["model"]
@@ -1534,22 +2306,67 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                 next_turn_id = p.get("turn_id")
                 if next_turn_id:
                     next_turn_id = str(next_turn_id)
+                    marker_owner = (
+                        pending_compactions[0][2]
+                        if pending_compactions else None
+                    )
+                    if (pending_compactions
+                            and marker_owner != _history_optional_turn_id(
+                                next_turn_id)):
+                        pending_compactions.clear()
                     pending_turn_id = next_turn_id
+                task_has_user = False
             elif t == "event_msg" and payload_type == "user_message":
-                msg = p.get("message") or ""
-                if msg and not msg.lstrip().startswith("<"):
+                msg = visible_codex_user_message(p.get("message"))
+                if msg:
                     next_turn_id = p.get("turn_id") or pending_turn_id
                     if turn_open:
+                        # Codex accepts another user message while the same
+                        # app-server task is still running.  That is steering,
+                        # not evidence that the preceding visible segment
+                        # crashed.  We still need a synthetic boundary because
+                        # the Web projection stores one user prompt per turn,
+                        # but it must be a neutral non-error boundary.
+                        steered_same_task = task_has_user and turn_has_user
                         # No terminal record proved where the previous visible
                         # reply ended. In particular, pending_turn_id now often
                         # belongs to this NEW user turn; never attach it to the
-                        # synthetic error boundary.
-                        close_turn(
-                            "error", 0, True,
-                            authoritative_boundary=False)
+                        # synthetic boundary. Visible output is not completion
+                        # evidence: only an assistant-only continuation carrying
+                        # an authoritative compact/page reason may close cleanly.
+                        proven_continuation = bool(
+                            not turn_has_user
+                            and turn_visible
+                            and turn_continuation_reason in {
+                                "context_compacted",
+                                "authoritative_page",
+                            }
+                        )
+                        if steered_same_task:
+                            close_turn(
+                                "steered", 0, False,
+                                authoritative_boundary=False)
+                        else:
+                            close_turn(
+                                "success" if proven_continuation else "error",
+                                0, not proven_continuation,
+                                authoritative_boundary=False)
                     active_turn_id = str(next_turn_id) if next_turn_id else None
                     pending_turn_id = active_turn_id
-                    uid = _history_id(active_turn_id, "user", line_no, raw_ts)
+                    if task_has_user:
+                        # A steered message inside the same app-server task has
+                        # no fresh turn id. Reusing active_turn_id would make the
+                        # reducer drop it as a duplicate of the first user row.
+                        uid = _fallback_history_id(
+                            path,
+                            "user",
+                            line_no,
+                            raw_ts,
+                            type(p.get("turn_id")).__name__,
+                        )
+                    else:
+                        uid = _history_id(
+                            active_turn_id, "user", line_no, raw_ts)
                     active_msg_id = uid
                     um = UserMsg(msg_id=uid, prompt=msg)
                     if pending_images:
@@ -1558,6 +2375,11 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                         um.ts = ts
                     events.append(um)
                     turn_open = True
+                    turn_has_user = True
+                    turn_continuation_reason = None
+                    source_continuation_available = False
+                    flush_pending_compactions(active_turn_id)
+                    task_has_user = True
                 pending_images = []   # consume (per user turn)
             elif (t == "response_item"
                   and payload_type in {"function_call", "custom_tool_call"}):
@@ -1770,31 +2592,14 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                         summary=summary,
                     ))
             elif t == "event_msg" and payload_type == "agent_message":
-                open_assistant_only_turn()
-                txt = p.get("message") or ""
-                channel = _assistant_channel(p.get("phase"))
-                key = (str(active_turn_id or pending_turn_id or ""), channel, txt)
-                if txt and key not in seen_agent_messages:
-                    seen_agent_messages.add(key)
-                    close_assistant()
-                    ensure_assistant(
-                        line_no, raw_ts,
-                        p.get("id") or p.get("message_id"),
-                        channel=channel,
-                    )
-                    turn_visible = True
-                    turn_text_visible = True
-                    if channel == "final":
-                        turn_final_visible = True
-                    events.append(Delta(
-                        message_id=cur_mid, text=txt, channel=channel))
-                    close_assistant()
+                pending_agent_message = (p, line_no, raw_ts)
             elif t == "event_msg" and payload_type == "patch_apply_end":
                 open_assistant_only_turn()
                 ensure_assistant(line_no, raw_ts)
                 tool_id = _history_id(
                     p.get("call_id"), "tool", line_no, raw_ts)
-                paths = _change_paths(p.get("changes"))
+                descriptors = _change_descriptors(p.get("changes"))
+                paths = _descriptor_paths(descriptors)
                 if tool_id not in seen_tool_uses:
                     seen_tool_uses.add(tool_id)
                     turn_visible = True
@@ -1803,7 +2608,8 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                         tool_use_id=tool_id,
                         tool="apply_patch",
                         input=bounded_tool_input({
-                            "changes": _change_descriptors(p.get("changes")),
+                            "changes": descriptors,
+                            "file_paths": paths,
                         }, 64 * 1024),
                         category="file",
                         title=_file_summary(paths, "running"),
@@ -1871,18 +2677,23 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                 ))
                 turn_visible = True
             elif t == "event_msg" and payload_type == "context_compacted":
-                open_assistant_only_turn()
-                events.append(ProcessEvent(
-                    item_id=_history_id(
+                marker = (
+                    _history_id(
                         p.get("id"), "compaction", line_no, raw_ts),
-                    kind="compaction",
-                    phase="end",
-                    status="succeeded",
-                    turn_id=_history_optional_turn_id(
+                    ts,
+                    _history_optional_turn_id(
                         active_turn_id or pending_turn_id),
-                    title="压缩上下文",
-                ))
+                )
+                if turn_open:
+                    open_assistant_only_turn("context_compacted")
+                    append_compaction(marker)
+                else:
+                    pending_compactions.append(marker)
+                    if (len(pending_compactions)
+                            > _MAX_PENDING_HISTORY_COMPACTIONS):
+                        del pending_compactions[0]
             elif t == "event_msg" and payload_type == "task_complete":
+                materialize_pending_terminal(p.get("turn_id"))
                 last = p.get("last_agent_message")
                 if (not turn_open and isinstance(last, str) and last):
                     open_assistant_only_turn()
@@ -1915,20 +2726,29 @@ def codex_translate_history(path: str, tool_result_max: int) -> tuple[list, str 
                         close_turn("error", _duration(p), True,
                                    _completed_ts(p, ts), p.get("turn_id"))
             elif t == "event_msg" and payload_type == "turn_aborted":
+                materialize_pending_terminal(p.get("turn_id"))
                 if turn_open:
-                    interrupted = p.get("reason") == "interrupted"
+                    # Current Codex rollouts can omit ``reason`` for an
+                    # intentional interrupt. Explicit failure reasons remain
+                    # errors; a bare turn_aborted is an interruption.
+                    reason = str(p.get("reason") or "").lower()
+                    interrupted = reason not in {"error", "failed", "crash"}
                     close_turn(
                         "error_during_execution" if interrupted else "error",
                         _duration(p), True, _completed_ts(p, ts),
                         p.get("turn_id"))
             elif t == "event_msg" and payload_type in {
                     "task_failed", "turn_failed", "task_error"}:
+                materialize_pending_terminal(p.get("turn_id"))
                 if turn_open:
                     close_turn("error", _duration(p), True,
                                _completed_ts(p, ts), p.get("turn_id"))
             # session_meta / world_state / token_count / private reasoning : skipped
             if ts is not None:
                 last_ts = ts
+    if pending_agent_message is not None and not snapshot_in_progress:
+        payload, pending_line, pending_ts = pending_agent_message
+        emit_agent_message(payload, pending_line, pending_ts)
     # A file can be read while Codex is still appending the current turn. Close
     # only its current text block; deliberately omit TurnEnd so the reducer keeps
     # the turn not-done instead of fabricating a completed status.

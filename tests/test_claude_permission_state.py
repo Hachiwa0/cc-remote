@@ -11,6 +11,7 @@ from cc_remote.protocol import GetModels, Hello, NewSession, OpenBtw
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper import sdk as sdk_module
 from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.claude_controls import ClaudeControls
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -80,6 +81,8 @@ def test_claude_control_state_survives_sdk_reconnect_and_failed_set(
         assert [client.options.permission_mode
                 for client in _FakeClaudeClient.created] == [
                     "bypassPermissions", "plan"]
+        assert "allow-dangerously-skip-permissions" in (
+            _FakeClaudeClient.created[-1].options.extra_args or {})
         assert [client.options.model for client in _FakeClaudeClient.created] == [
             None, "claude-opus-4-8"]
 
@@ -111,6 +114,54 @@ def test_claude_model_probe_failure_does_not_fail_connect(monkeypatch):
         assert handle.client is not None
         assert handle.model is None
         await handle.disconnect()
+
+    asyncio.run(go())
+
+
+def test_claude_work_captures_pre_turn_context_baseline_only_once(
+    monkeypatch,
+):
+    class ContextClient(_FakeClaudeClient):
+        totals = iter((1_234, 9_999, 8_888, 777))
+
+        async def get_context_usage(self):
+            return {
+                "model": self.options.model or "claude-mythos-5",
+                "totalTokens": next(self.totals),
+            }
+
+    async def go():
+        ContextClient.created = []
+        ContextClient.totals = iter((1_234, 9_999, 8_888, 777))
+        monkeypatch.setattr(sdk_module, "ClaudeSDKClient", ContextClient)
+        handle = SdkHandle(WrapperConfig())
+        handle.work_mode = True
+        handle.work_settings_path = "/tmp/cc-remote-work-policy.json"
+
+        await handle.connect(cwd="/tmp")
+        assert handle.work_context_baseline_tokens == 1_234
+
+        # Runtime reconnects must not redefine the fixed engine baseline from a
+        # later conversation state.
+        await handle.force_reconnect(None, "/tmp", reason="baseline regression")
+        assert handle.work_context_baseline_tokens == 1_234
+        assert len(ContextClient.created) == 2
+        await handle.disconnect()
+
+        # A migrated Work session has no trustworthy pre-history baseline.
+        # Resume must not relabel its entire existing conversation as fixed
+        # engine overhead.
+        resumed = SdkHandle(WrapperConfig())
+        resumed.work_mode = True
+        resumed.work_settings_path = "/tmp/cc-remote-work-policy.json"
+        await resumed.connect(resume_id="existing-session", cwd="/tmp")
+        assert resumed.work_context_baseline_tokens is None
+        await resumed.disconnect()
+
+        code = SdkHandle(WrapperConfig())
+        await code.connect(cwd="/tmp")
+        assert code.work_context_baseline_tokens is None
+        await code.disconnect()
 
     asyncio.run(go())
 
@@ -215,6 +266,58 @@ def test_claude_default_resolution_does_not_block_serial_commands():
     asyncio.run(go())
 
 
+def test_cold_claude_resume_restores_private_remote_controls(
+    monkeypatch, tmp_path,
+):
+    session_id = "11111111-1111-4111-8111-111111111111"
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setattr(
+            SdkHandle, "refresh_goal", lambda *_args: asyncio.sleep(0))
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=str(tmp_path)))
+        monkeypatch.setattr(
+            machine_module, "save_session_id", lambda *_args: None)
+
+        machine, _ = _mk_machine()
+        machine._claude_controls.update(
+            session_id,
+            model="claude-opus-4-6[1m]",
+            effort="high",
+            permission_mode="plan",
+        )
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            session_id, engine="claude", space="code")
+
+        assert ctx is not None
+        assert ctx.sdk.model == "claude-opus-4-6[1m]"
+        assert ctx.sdk.effort == "high"
+        assert ctx.sdk.applied_effort == "high"
+        assert ctx.sdk.permission_mode == "plan"
+        client = _FakeClaudeClient.created[-1]
+        assert client.options.permission_mode == "plan"
+        assert client.options.effort == "high"
+        assert client.model_calls == ["claude-opus-4-6[1m]"]
+        assert machine._claude_controls.get(session_id) == ClaudeControls(
+            model="claude-opus-4-6[1m]",
+            effort="high",
+            permission_mode="plan",
+        )
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
 def test_new_claude_session_emits_authoritative_permission():
     async def go():
         machine, transport = _mk_machine()
@@ -286,10 +389,10 @@ def test_switching_to_resident_claude_reseeds_its_actual_permission():
             session_id="claude-1", engine="claude"))
 
         assert [event.type for event in result] == [
-            "session_focus", "perm", "model", "effort"]
-        assert result[1].mode == "default"
-        assert result[2].model == "claude-sonnet-5"
-        assert result[3].effort == "high"
+            "session_focus", "session_control", "perm", "model", "effort"]
+        assert result[2].mode == "default"
+        assert result[3].model == "claude-sonnet-5"
+        assert result[4].effort == "high"
 
     asyncio.run(go())
 

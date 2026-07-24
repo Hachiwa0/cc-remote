@@ -9,27 +9,41 @@ from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from cc_remote.protocol import (
+    AnswerQuestion,
+    AskUser,
     BtwOpened,
     CloseBtw,
     CommandAck,
+    Effort,
     Error,
+    GetContext,
+    GetDiff,
     GetHistory,
+    History,
     Hello,
+    Interrupt,
     ListSessions,
+    Model,
     OpenBtw,
     Perm,
     Ping,
     Query,
     Snapshot,
+    SetEffort,
+    SetModel,
+    SetPerm,
+    SessionControl,
     SessionList,
     SwitchSession,
     Takeover,
     TakeoverState,
     UserMsg,
     deserialize,
+    is_downstream,
     serialize,
 )
 from cc_remote.wrapper import machine as machine_module
+from cc_remote.claude_broker.client import BrokerClientError
 from cc_remote.relay.pairing import RelayHub
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -62,6 +76,48 @@ def test_command_envelope_and_routed_ack_roundtrip():
         Hello(role="client", client_id="client-1", cmd_id="not-reliable")
     with pytest.raises(ValidationError):
         Ping(n=1, cmd_id="not-reliable")
+
+
+def test_v15_session_control_roundtrip_and_snapshot_carriers():
+    control = SessionControl(
+        sid="session-1",
+        control_mode="external_cli",
+        write_state="read_only",
+        terminal_attached=True,
+        reason="外部 CLI 正在控制",
+        generation="wrapper-generation-1",
+        revision=7,
+        can_takeover=True,
+    )
+    assert deserialize(serialize(control)) == control
+    assert is_downstream(control) is True
+
+    snapshot = Snapshot(
+        sid="session-1", cc_session_id="session-1", state="idle",
+        control=control,
+    )
+    assert deserialize(serialize(snapshot)).control == control
+    history = History(
+        session_id="session-1", revision="history-revision",
+        events=[], control=control,
+    )
+    assert deserialize(serialize(history)).control == control
+
+    with pytest.raises(ValidationError):
+        SessionControl(
+            control_mode="terminal", write_state="read_only",
+            terminal_attached=True, revision=8,
+        )
+    with pytest.raises(ValidationError):
+        SessionControl(
+            control_mode="remote", write_state="writable",
+            terminal_attached=False, revision=-1,
+        )
+    with pytest.raises(ValidationError):
+        SessionControl(
+            control_mode="remote", write_state="writable",
+            terminal_attached=False, generation="bad generation", revision=0,
+        )
 
 
 def test_open_btw_request_id_roundtrip_is_required_on_both_frames():
@@ -187,6 +243,124 @@ def test_wrapper_does_not_ack_or_remember_a_crashed_handler():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        SetModel(
+            sid="missing-session", model="claude-sonnet-4-5",
+            cmd_id="missing-model", client_id="client-1",
+        ),
+        GetContext(
+            sid="missing-session",
+            cmd_id="missing-context", client_id="client-1",
+        ),
+    ],
+)
+def test_reliable_controls_reject_missing_session_before_ack(command):
+    async def run():
+        machine, transport = _mk_machine()
+
+        await machine._process_command(command)
+
+        assert [event.type for event in transport.sent] == [
+            "error", "command_ack"]
+        error = transport.sent[0]
+        assert error.sid == "missing-session"
+        assert error.request_id == command.cmd_id
+        assert error.to == "client-1"
+
+    asyncio.run(run())
+
+
+def test_interrupt_missing_target_never_leaks_error_to_focused_session():
+    async def run():
+        machine, transport = _mk_machine()
+        visible = _mk_ctx("visible-session", "visible-session")
+        machine.sessions[visible.key] = visible
+        machine.focused_sid = visible.key
+        command = Interrupt(
+            sid="missing-session",
+            cmd_id="missing-interrupt", client_id="client-1",
+        )
+
+        await machine._process_command(command)
+
+        assert [event.type for event in transport.sent] == [
+            "error", "command_ack"]
+        error = transport.sent[0]
+        assert error.sid == "missing-session"
+        assert error.request_id == command.cmd_id
+        assert error.to == "client-1"
+        assert visible.buffer.tail_seq == 0
+
+    asyncio.run(run())
+
+
+def test_non_running_interrupt_returns_correlated_failure_before_ack():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("idle-session", "idle-session")
+        ctx.state = "idle"
+        machine.sessions[ctx.key] = ctx
+        command = Interrupt(
+            sid=ctx.key, cmd_id="idle-interrupt", client_id="client-1",
+        )
+
+        await machine._process_command(command)
+
+        errors = [event for event in transport.sent if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].request_id == command.cmd_id
+        assert errors[0].to == command.client_id
+        assert isinstance(transport.sent[-1], CommandAck)
+
+    asyncio.run(run())
+
+
+def test_get_diff_missing_target_returns_targeted_correlated_failure():
+    async def run():
+        machine, transport = _mk_machine()
+        command = GetDiff(
+            sid="missing-diff", file="README.md",
+            cmd_id="diff-command", client_id="client-1",
+        )
+
+        await machine._process_command(command)
+
+        assert [event.type for event in transport.sent] == [
+            "error", "command_ack"]
+        error = transport.sent[0]
+        assert error.sid == command.sid
+        assert error.request_id == command.cmd_id
+        assert error.to == command.client_id
+
+    asyncio.run(run())
+
+
+def test_unknown_interaction_answer_returns_correlated_failure():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        machine.sessions[ctx.key] = ctx
+        command = AnswerQuestion(
+            sid=ctx.key,
+            ask_id="expired-question",
+            answer="允许一次",
+            cmd_id="answer-command",
+            client_id="client-1",
+        )
+
+        await machine._process_command(command)
+
+        error = next(event for event in transport.sent
+                     if isinstance(event, Error))
+        assert error.request_id == command.cmd_id
+        assert error.to == command.client_id
+        assert isinstance(transport.sent[-1], CommandAck)
+
+    asyncio.run(run())
+
+
 def test_wrapper_dedupe_cache_is_bounded_per_client():
     async def run():
         machine, _ = _mk_machine()
@@ -209,6 +383,148 @@ def test_wrapper_dedupe_cache_is_bounded_per_client():
         # itself remains at the configured hard bound.
         assert handled == ["one", "two", "three", "one"]
         assert len(machine._processed_commands["client-1"]) == 2
+
+    asyncio.run(run())
+
+
+def test_duplicate_claude_broker_model_and_permission_controls_replay_without_reexecution():
+    class BrokerControls:
+        is_claude_broker = True
+        model = "old-model"
+        effort = "high"
+        permission_mode = "bypassPermissions"
+
+        def __init__(self):
+            self.model_calls = 0
+            self.effort_calls = 0
+            self.permission_calls = 0
+
+        async def set_model(self, model):
+            self.model_calls += 1
+            self.model = model
+
+        async def set_permission_mode(self, mode):
+            self.permission_calls += 1
+            self.permission_mode = mode
+
+        async def set_effort(self, effort):
+            self.effort_calls += 1
+            self.effort = effort
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "claude"
+        ctx.space = "code"
+        ctx.sdk = BrokerControls()
+        ctx.announced_model = "old-model"
+        ctx.announced_perm = "bypassPermissions"
+        machine.sessions["session-1"] = ctx
+
+        model = SetModel(
+            sid="session-1", model="claude-opus-4-1",
+            cmd_id="model-1", client_id="client-1",
+        )
+        permission = SetPerm(
+            sid="session-1", mode="default",
+            cmd_id="perm-1", client_id="client-1",
+        )
+        effort = SetEffort(
+            sid="session-1", effort="max",
+            cmd_id="effort-1", client_id="client-1",
+        )
+        model_task = asyncio.create_task(machine._process_command(model))
+        async with asyncio.timeout(1.0):
+            while True:
+                question = next(
+                    (event for event in reversed(transport.sent)
+                     if isinstance(event, AskUser)), None)
+                if question is not None:
+                    break
+                await asyncio.sleep(0.01)
+        await machine._process_command(AnswerQuestion(
+            sid="session-1",
+            ask_id=question.ask_id,
+            answer=question.options[0]["label"],
+        ))
+        await model_task
+        await machine._process_command(model)
+        await machine._process_command(effort)
+        await machine._process_command(effort)
+        await machine._process_command(permission)
+        await machine._process_command(permission)
+
+        assert ctx.sdk.model_calls == 1
+        assert ctx.sdk.effort_calls == 1
+        assert ctx.sdk.permission_calls == 1
+        models = [event for event in transport.sent if isinstance(event, Model)]
+        efforts = [event for event in transport.sent if isinstance(event, Effort)]
+        perms = [event for event in transport.sent if isinstance(event, Perm)]
+        assert [event.model for event in models] == [
+            "claude-opus-4-1", "claude-opus-4-1"]
+        assert [event.mode for event in perms] == ["default", "default"]
+        assert [event.effort for event in efforts] == ["max", "max"]
+        assert models[-1].to == "client-1"
+        assert efforts[-1].to == "client-1"
+        assert perms[-1].to == "client-1"
+        assert len([event for event in transport.sent
+                    if isinstance(event, CommandAck)]) == 6
+
+    asyncio.run(run())
+
+
+def test_duplicate_failed_claude_broker_controls_replay_error_without_retrying_tui():
+    class RejectingBroker:
+        is_claude_broker = True
+        model = "claude-sonnet-4-5"
+        effort = "high"
+        permission_mode = "bypassPermissions"
+
+        def __init__(self):
+            self.calls = 0
+            self.effort_calls = 0
+
+        async def set_permission_mode(self, _mode):
+            self.calls += 1
+            raise BrokerClientError(
+                "control_unconfirmed", "no durable permission record")
+
+        async def set_effort(self, _effort):
+            self.effort_calls += 1
+            raise BrokerClientError(
+                "control_unconfirmed", "no durable effort record")
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "claude"
+        ctx.space = "code"
+        ctx.sdk = RejectingBroker()
+        ctx.announced_perm = "bypassPermissions"
+        machine.sessions["session-1"] = ctx
+        command = SetPerm(
+            sid="session-1", mode="default",
+            cmd_id="perm-failed", client_id="client-1",
+        )
+        effort = SetEffort(
+            sid="session-1", effort="max",
+            cmd_id="effort-failed", client_id="client-1",
+        )
+
+        await machine._process_command(command)
+        await machine._process_command(command)
+        await machine._process_command(effort)
+        await machine._process_command(effort)
+
+        assert ctx.sdk.calls == 1
+        assert ctx.sdk.effort_calls == 1
+        errors = [event for event in transport.sent if isinstance(event, Error)]
+        assert len(errors) == 4
+        assert all("持久确认" in event.message for event in errors)
+        assert errors[-1].to == "client-1"
+        assert ctx.announced_perm == "bypassPermissions"
+        assert not [event for event in transport.sent if isinstance(event, Perm)]
+        assert not [event for event in transport.sent if isinstance(event, Effort)]
 
     asyncio.run(run())
 

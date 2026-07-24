@@ -39,9 +39,15 @@ class _StubTransport:
 
 def _mk_machine():
     cfg = WrapperConfig()
-    cfg.state_dir = Path(tempfile.mkdtemp(prefix="cc-remote-test-"))  # don't touch real state
+    state_tmp = tempfile.TemporaryDirectory(prefix="cc-remote-test-")
+    cfg.state_dir = Path(state_tmp.name)  # don't touch real state
     tr = _StubTransport()
-    return WrapperMachine(cfg, tr), tr
+    machine = WrapperMachine(cfg, tr)
+    # Keep the auto-cleanup owner alive exactly as long as the test machine.
+    # TemporaryDirectory's finalizer also runs at interpreter shutdown, so a
+    # full pytest pass cannot leave thousands of cc-remote-test-* directories.
+    machine._test_state_tmp = state_tmp
+    return machine, tr
 
 
 def _mk_ctx(key: str, session_id=None) -> SessionContext:
@@ -222,7 +228,8 @@ def test_lost_rekey_is_replayed_before_cursor_catchup():
             generations={"tmp-lost": machine.instance_id}))
 
         assert [message.type for message in transport.sent] == [
-            "session_rekey", "replay_start", "state", "replay_end", "perm"]
+            "session_rekey", "replay_start", "state", "replay_end",
+            "session_control", "perm"]
         assert transport.sent[0].old_key == "tmp-lost"
         assert transport.sent[0].session_id == "real-1"
         assert all(message.to == "client-1" for message in transport.sent)

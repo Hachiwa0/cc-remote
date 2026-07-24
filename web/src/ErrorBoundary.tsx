@@ -3,8 +3,8 @@ import { Component, type ErrorInfo, type ReactNode } from "react";
 interface Props { children: ReactNode }
 interface State { error: Error | null }
 
-// Catches render-time errors so a crash shows a message instead of a black
-// screen (useful over HTTP LAN where the browser console isn't handy).
+// Keep render failures recoverable without exposing stack traces or internal
+// paths on a remotely accessible screen.
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
 
@@ -19,13 +19,16 @@ export class ErrorBoundary extends Component<Props, State> {
   render(): ReactNode {
     if (this.state.error) {
       return (
-        <pre style={{
-          whiteSpace: "pre-wrap", wordBreak: "break-word", padding: 16, margin: 0,
-          color: "#f87171", background: "#0e0f13", height: "100%",
-          fontFamily: "ui-monospace, Consolas, monospace", fontSize: 13,
+        <main style={{
+          display: "grid", placeItems: "center", alignContent: "center", gap: 12,
+          padding: 24, minHeight: "100%", textAlign: "center",
         }}>
-          {"应用崩溃:\n\n" + (this.state.error.stack || this.state.error.message)}
-        </pre>
+          <strong>页面需要重新载入</strong>
+          <span>会话记录已保存在本机，重新载入后会自动恢复。</span>
+          <button type="button" onClick={() => window.location.reload()}>
+            重新载入
+          </button>
+        </main>
       );
     }
     return this.props.children;

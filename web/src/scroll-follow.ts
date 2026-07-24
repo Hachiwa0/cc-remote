@@ -17,6 +17,9 @@ export interface BottomMeasurement {
 
 export const NEAR_BOTTOM_PX = 80;
 export const AT_BOTTOM_PX = 2;
+export const AUTO_LOAD_HISTORY_TOP_PX = 72;
+export const HISTORY_EDGE_PX = 1;
+export const HISTORY_ANCHOR_EPSILON_PX = 0.5;
 
 const SCROLL_DIRECTION_EPSILON_PX = 0.5;
 
@@ -32,15 +35,148 @@ export function measureBottom(metrics: ScrollMetrics): BottomMeasurement {
   };
 }
 
-export function anchoredScrollTop(
-  previousScrollTop: number,
-  previousScrollHeight: number,
-  nextScrollHeight: number,
-): number {
-  return Math.max(
-    0,
-    previousScrollTop + nextScrollHeight - previousScrollHeight,
-  );
+export interface HistoryAnchorPoint {
+  anchorTurnId: string;
+  oldestTurnId: string | null;
+  anchorOffset: number;
+}
+
+export interface HistoryAnchorTransaction extends HistoryAnchorPoint {
+  sid: string | null;
+  revision: string | null;
+  before: string | null;
+  source: "local" | "server";
+  generation: number;
+  phase: "pending" | "rendering" | "applied";
+}
+
+export interface HistoryPageBoundary {
+  sid: string | null;
+  revision: string | null;
+  cursor: string | null;
+  hasMore: boolean;
+}
+
+export type HistoryPageStatus = "pending" | "complete" | "stale";
+
+/** Compare an older-page request with the authoritative boundary installed by
+ * the reducer. Runtime turn count is intentionally absent: bounded projection
+ * can replace rows while retaining the same length. */
+export function historyPageStatus(
+  transaction: HistoryAnchorTransaction,
+  boundary: HistoryPageBoundary,
+): HistoryPageStatus {
+  if (transaction.sid !== boundary.sid
+      || transaction.revision !== boundary.revision) return "stale";
+  if (transaction.source !== "server") return "complete";
+  return transaction.before !== boundary.cursor || !boundary.hasMore
+    ? "complete" : "pending";
+}
+
+/** Owns the short-lived viewport transaction across an async history prepend.
+ * The old/new boundary is frozen when the request starts. Rubber-banding at
+ * the history edge keeps the request alive, but leaving that edge before the
+ * response cancels it so a delayed page cannot move the user's viewport. */
+export class HistoryAnchorController {
+  private nextGeneration = 1;
+  private transaction: HistoryAnchorTransaction | null = null;
+
+  begin(input: Omit<HistoryAnchorTransaction, "generation" | "phase">): number {
+    const generation = this.nextGeneration++;
+    this.transaction = { ...input, generation, phase: "pending" };
+    return generation;
+  }
+
+  current(): HistoryAnchorTransaction | null {
+    return this.transaction ? { ...this.transaction } : null;
+  }
+
+  observeUserScroll(stillAtHistoryEdge: boolean): void {
+    if (!this.transaction) return;
+    if (this.transaction.phase === "pending" && stillAtHistoryEdge) return;
+    this.transaction = null;
+  }
+
+  markRendering(generation: number): boolean {
+    if (!this.transaction || this.transaction.generation !== generation
+        || this.transaction.phase !== "pending") return false;
+    this.transaction = { ...this.transaction, phase: "rendering" };
+    return true;
+  }
+
+  markApplied(generation: number): boolean {
+    if (!this.transaction || this.transaction.generation !== generation) return false;
+    this.transaction = { ...this.transaction, phase: "applied" };
+    return true;
+  }
+
+  /** Preserve the user's new reading row after an installed page while the
+   * original touch is still active. The transaction stays alive so a deferred
+   * virtualizer measurement can still be corrected against this newer row. */
+  rebase(generation: number, point: HistoryAnchorPoint): boolean {
+    if (!this.transaction || this.transaction.generation !== generation
+        || this.transaction.phase !== "applied") return false;
+    this.transaction = { ...this.transaction, ...point };
+    return true;
+  }
+
+  cancel(generation?: number): boolean {
+    if (!this.transaction
+        || (generation != null && this.transaction.generation !== generation)) {
+      return false;
+    }
+    this.transaction = null;
+    return true;
+  }
+}
+
+/** A pull gesture may request at most one older page. Network completion while
+ * the finger is still down must not cascade through the entire history. */
+export class OlderHistoryLoadGate {
+  private gestureActive = false;
+  private usedInGesture = false;
+  private pending = false;
+
+  beginGesture(): void {
+    if (this.gestureActive) return;
+    this.gestureActive = true;
+    this.usedInGesture = false;
+  }
+
+  acquire(): boolean {
+    if (!this.gestureActive || this.usedInGesture || this.pending) return false;
+    this.usedInGesture = true;
+    this.pending = true;
+    return true;
+  }
+
+  complete(): void {
+    this.pending = false;
+  }
+
+  endGesture(): void {
+    this.gestureActive = false;
+  }
+}
+
+/** Auto-pagination is gesture-driven, never a side effect of merely painting a
+ * short session at scrollTop=0. The threshold hides the network round trip
+ * behind the final few pixels of the user's upward scroll. */
+export function shouldAutoLoadOlderHistory(
+  metrics: ScrollMetrics,
+  movingTowardHistory: boolean,
+  canLoadOlder: boolean,
+): boolean {
+  return canLoadOlder
+    && movingTowardHistory
+    && metrics.scrollTop <= AUTO_LOAD_HISTORY_TOP_PX;
+}
+
+/** Wheel/touch handlers use this only when the viewport cannot scroll farther.
+ * Movement before the edge is handled by the later scroll event, after the
+ * browser has established the position that history prepending must preserve. */
+export function isAtHistoryEdge(metrics: ScrollMetrics): boolean {
+  return metrics.scrollTop <= HISTORY_EDGE_PX;
 }
 
 /**

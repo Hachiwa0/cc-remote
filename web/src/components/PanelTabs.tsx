@@ -8,7 +8,7 @@ export function PanelTabs({ active, artifactKind = "gitdiff", onTab }: {
   onTab: (v: "diff" | "btw") => void;
 }) {
   const markdown = artifactKind === "md";
-  const file = artifactKind === "file";
+  const file = ["file", "html", "image", "pdf"].includes(artifactKind);
   return (
     <div className="panel-tabs" role="tablist">
       <button className={"ptab" + (active === "diff" ? " on" : "")} role="tab" aria-selected={active === "diff"}

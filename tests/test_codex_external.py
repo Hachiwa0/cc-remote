@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import sqlite3
 from pathlib import Path
-from types import SimpleNamespace
-
-from cc_remote.protocol import History, Query, Takeover
+from cc_remote.protocol import History, Query, SessionActivity, Takeover
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_external import (
-    HolderScan, ProcessIdentity, parse_turn_markers, writable_rollout_holders,
+    CodexTuiLogTracker, HolderScan, ProcessIdentity, parse_turn_markers,
+    writable_rollout_holders,
 )
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -23,7 +24,7 @@ def _event(kind: str, turn_id: str) -> bytes:
 
 
 def _fake_process(root: Path, pid: int, start: int, *, tty: int = 0,
-                  cmdline: tuple[str, ...] = ()) -> Path:
+                  cmdline: tuple[str, ...] = (), cwd: Path | None = None) -> Path:
     proc = root / str(pid)
     (proc / "fd").mkdir(parents=True)
     (proc / "fdinfo").mkdir()
@@ -34,12 +35,34 @@ def _fake_process(root: Path, pid: int, start: int, *, tty: int = 0,
     if cmdline:
         (proc / "cmdline").write_bytes(
             b"\0".join(arg.encode() for arg in cmdline) + b"\0")
+    if cwd is not None:
+        (proc / "cwd").symlink_to(cwd)
     return proc
 
 
 def _fake_fd(proc: Path, fd: int, target: Path, flags: int) -> None:
     (proc / "fd" / str(fd)).symlink_to(target)
     (proc / "fdinfo" / str(fd)).write_text(f"flags:\t0{flags:o}\n")
+
+
+def _codex_log_db(path: Path) -> sqlite3.Connection:
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE logs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, "
+        "feedback_log_body TEXT, process_uuid TEXT, thread_id TEXT)"
+    )
+    return db
+
+
+def _log(db: sqlite3.Connection, target: str, body: str,
+         *, process_uuid: str = "host-1") -> None:
+    db.execute(
+        "INSERT INTO logs(target, feedback_log_body, process_uuid, thread_id) "
+        "VALUES (?, ?, ?, NULL)",
+        (target, body, process_uuid),
+    )
+    db.commit()
 
 
 def _watch(path: Path) -> dict:
@@ -59,12 +82,17 @@ class _CodexSdk:
     def __init__(self, owned=()):
         self._owned = set(owned)
         self.turn_start_pending = False
+        self.review_attribution_pending = False
         self.turn_active = False
         self.proc = None
 
     @property
     def owned_turn_ids(self):
         return frozenset(self._owned)
+
+    @property
+    def turn_attribution_pending(self):
+        return self.turn_start_pending or self.review_attribution_pending
 
     def remember_owned_turn_id(self, turn_id):
         self._owned.add(turn_id)
@@ -126,6 +154,153 @@ def test_headless_app_server_holder_is_classified_passive(tmp_path):
     assert scan.holders["sid"] == {
         ProcessIdentity(211, 2101), ProcessIdentity(212, 2102)}
     assert scan.passive_holders["sid"] == {ProcessIdentity(211, 2101)}
+    assert scan.private_holders["sid"] == {ProcessIdentity(211, 2101)}
+
+
+def test_headless_daemon_and_stdio_proxy_are_both_passive(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    daemon = _fake_process(
+        proc_root, 213, 2103,
+        cmdline=("codex", "-c", "features.code_mode_host=true",
+                 "app-server", "--remote-control", "--listen", "unix://"),
+    )
+    proxy = _fake_process(
+        proc_root, 214, 2104,
+        cmdline=("codex", "app-server", "--stdio"),
+    )
+    _fake_fd(daemon, 4, rollout, os.O_WRONLY | os.O_APPEND)
+    _fake_fd(proxy, 5, rollout, os.O_WRONLY | os.O_APPEND)
+
+    scan = writable_rollout_holders(
+        {"sid": str(rollout)}, proc_root=str(proc_root))
+
+    expected = {ProcessIdentity(213, 2103), ProcessIdentity(214, 2104)}
+    assert scan.complete is True
+    assert scan.holders["sid"] == expected
+    assert scan.passive_holders["sid"] == expected
+    assert scan.private_holders["sid"] == {ProcessIdentity(214, 2104)}
+
+
+def test_headless_external_proxy_is_reported_for_connection_binding(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    proxy = _fake_process(
+        proc_root, 215, 2105,
+        cmdline=("codex", "app-server", "proxy"),
+    )
+    identity = ProcessIdentity(215, 2105)
+
+    scan = writable_rollout_holders(
+        {"sid": str(rollout)}, proc_root=str(proc_root))
+
+    assert scan.complete is True
+    assert scan.holders["sid"] == set()
+    assert set(scan.client_proxies) == {identity}
+    assert scan.client_proxies[identity] > 0
+    assert proxy.exists()
+
+
+def test_tui_log_tracker_binds_only_exact_resumed_thread(tmp_path):
+    first = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    second = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    proxy = ProcessIdentity(216, 2106)
+    log_path = tmp_path / "logs.sqlite"
+    db = _codex_log_db(log_path)
+    _log(
+        db,
+        "codex_app_server::message_processor",
+        "app-server request: initialize connection_id=ConnectionId(7)",
+    )
+    _log(
+        db,
+        "codex_rollout::recorder",
+        "app_server.request{otel.name=\"thread/resume\" "
+        "rpc.transport=\"unix_socket\" app_server.connection_id=7 "
+        "app_server.client_name=\"codex-tui\"}:"
+        "resume_running_thread: Resumed rollout with 1 items, thread ID: "
+        f"Some(ThreadId {{ uuid: {first} }}), parse errors: 0",
+    )
+    db.close()
+    tracker = CodexTuiLogTracker(str(log_path))
+
+    bindings, complete = tracker.bindings(
+        {first, second}, {proxy: 1_000_000_000})
+
+    assert complete is True
+    assert bindings == {first: {proxy}, second: set()}
+
+
+def test_tui_log_tracker_clears_binding_on_unsubscribe(tmp_path):
+    sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    proxy = ProcessIdentity(217, 2107)
+    log_path = tmp_path / "logs.sqlite"
+    db = _codex_log_db(log_path)
+    _log(
+        db,
+        "codex_app_server::message_processor",
+        "app-server request: initialize connection_id=ConnectionId(8)",
+    )
+    _log(
+        db,
+        "codex_rollout::recorder",
+        "app_server.request{otel.name=\"thread/resume\" "
+        "rpc.transport=\"unix_socket\" app_server.connection_id=8 "
+        "app_server.client_name=\"codex-tui\"}:"
+        f"resume_running_thread: Resuming rollout from /tmp/rollout-x-{sid}.jsonl",
+    )
+    tracker = CodexTuiLogTracker(str(log_path))
+    first, complete = tracker.bindings({sid}, {proxy: 1_000_000_000})
+    assert complete is True and first[sid] == {proxy}
+
+    _log(
+        db,
+        "codex_app_server::message_processor",
+        "app-server request: thread/unsubscribe "
+        "connection_id=ConnectionId(8) request_id=Integer(9)",
+    )
+    db.close()
+    second, complete = tracker.bindings({sid}, {proxy: 1_000_000_000})
+
+    assert complete is True
+    assert second == {sid: set()}
+
+
+def test_machine_merges_exact_tui_proxy_binding(monkeypatch):
+    async def go():
+        machine, _transport = _mk_machine()
+        proxy = ProcessIdentity(218, 2108)
+
+        class Tracker:
+            @staticmethod
+            def bindings(paths, proxies):
+                assert set(paths) == {"target", "sibling"}
+                assert set(proxies) == {proxy}
+                return {"target": {proxy}, "sibling": set()}, True
+
+        machine._codex_tui_log_tracker = Tracker()
+        monkeypatch.setattr(
+            machine_module,
+            "writable_rollout_holders",
+            lambda _paths, _own: HolderScan(
+                {"target": set(), "sibling": set()},
+                True,
+                {"target": set(), "sibling": set()},
+                {proxy: 1_000_000_000},
+            ),
+        )
+
+        scan = await machine._probe_codex_holders({
+            "target": "/tmp/target.jsonl",
+            "sibling": "/tmp/sibling.jsonl",
+        })
+
+        assert scan.complete is True
+        assert scan.holders == {"target": {proxy}, "sibling": set()}
+
+    asyncio.run(go())
 
 
 def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
@@ -154,6 +329,176 @@ def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
     assert tui.exists()
 
 
+def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
+    target = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    sibling = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    target_rollout = tmp_path / "target.jsonl"
+    sibling_rollout = tmp_path / "sibling.jsonl"
+    target_rollout.write_bytes(b"")
+    sibling_rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    identity = ProcessIdentity(223, 2203)
+    _fake_process(
+        proc_root, identity.pid, identity.start_ticks, tty=34819,
+        # The second UUID is the optional PROMPT. It must not make a sibling
+        # session appear terminal-attached merely because its text is a SID.
+        cmdline=(
+            "codex", "resume", "--no-alt-screen", "-C", "/repo",
+            target, sibling,
+        ),
+    )
+
+    scan = writable_rollout_holders(
+        {target: str(target_rollout), sibling: str(sibling_rollout)},
+        proc_root=str(proc_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[target] == {identity}
+    assert scan.holders[sibling] == set()
+    assert scan.passive_holders[target] == set()
+    assert scan.passive_holders[sibling] == set()
+
+
+def test_codex_resume_last_does_not_treat_uuid_prompt_as_target(tmp_path):
+    prompt_sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root, 225, 2205, tty=34821,
+        cmdline=("codex", "resume", "--last", prompt_sid),
+    )
+
+    scan = writable_rollout_holders(
+        {prompt_sid: str(rollout)}, proc_root=str(proc_root))
+
+    assert scan.complete is True
+    assert scan.holders[prompt_sid] == set()
+    assert scan.passive_holders[prompt_sid] == set()
+
+
+def test_codex_resume_skips_repeated_image_values_before_target(tmp_path):
+    image_named_like_sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    target = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    image_rollout = tmp_path / "image-name.jsonl"
+    target_rollout = tmp_path / "target.jsonl"
+    image_rollout.write_bytes(b"")
+    target_rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    identity = ProcessIdentity(226, 2206)
+    _fake_process(
+        proc_root, identity.pid, identity.start_ticks, tty=34822,
+        cmdline=(
+            "codex", "resume",
+            "-i", image_named_like_sid,
+            "--image", "/tmp/second.png",
+            target,
+        ),
+    )
+
+    scan = writable_rollout_holders(
+        {
+            image_named_like_sid: str(image_rollout),
+            target: str(target_rollout),
+        },
+        proc_root=str(proc_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[image_named_like_sid] == set()
+    assert scan.holders[target] == {identity}
+
+
+def test_codex_resume_logical_holder_clears_when_process_exits(tmp_path):
+    sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b"")
+    proc_root = tmp_path / "proc"
+    tui = _fake_process(
+        proc_root, 224, 2204, tty=34820,
+        cmdline=("codex", "resume", sid),
+    )
+
+    first = writable_rollout_holders(
+        {sid: str(rollout)}, proc_root=str(proc_root))
+    assert first.holders[sid] == {ProcessIdentity(224, 2204)}
+
+    shutil.rmtree(tui)
+    second = writable_rollout_holders(
+        {sid: str(rollout)}, proc_root=str(proc_root))
+    assert second.complete is True
+    assert second.holders[sid] == set()
+    assert second.passive_holders[sid] == set()
+
+
+def test_plain_codex_tui_uses_exact_startup_shell_snapshot(tmp_path):
+    target = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    sibling = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    target_rollout = tmp_path / "target.jsonl"
+    sibling_rollout = tmp_path / "sibling.jsonl"
+    def meta(sid: str) -> bytes:
+        return (json.dumps({
+            "type": "session_meta",
+            "payload": {"id": sid, "session_id": sid, "cwd": str(cwd)},
+        }) + "\n").encode()
+    target_rollout.write_bytes(meta(target))
+    sibling_rollout.write_bytes(meta(sibling))
+    proc_root = tmp_path / "proc"
+    identity = ProcessIdentity(227, 2207)
+    _fake_process(
+        proc_root, identity.pid, identity.start_ticks, tty=34823,
+        cmdline=("/opt/codex", "--no-alt-screen"), cwd=cwd,
+    )
+    snapshots = tmp_path / "shell_snapshots"
+    snapshots.mkdir()
+    (snapshots / f"{target}.123456789.sh").write_text("snapshot")
+
+    scan = writable_rollout_holders(
+        {target: str(target_rollout), sibling: str(sibling_rollout)},
+        proc_root=str(proc_root), shell_snapshot_root=str(snapshots),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[target] == {identity}
+    assert scan.holders[sibling] == set()
+    assert scan.passive_holders[target] == set()
+
+
+def test_plain_codex_tui_snapshot_binding_fails_closed_when_ambiguous(tmp_path):
+    first = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
+    second = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    paths = {}
+    for sid in (first, second):
+        rollout = tmp_path / f"{sid}.jsonl"
+        rollout.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {"id": sid, "session_id": sid, "cwd": str(cwd)},
+        }) + "\n")
+        paths[sid] = str(rollout)
+    proc_root = tmp_path / "proc"
+    for pid, start in ((228, 2208), (229, 2209)):
+        _fake_process(
+            proc_root, pid, start, tty=34824,
+            cmdline=("codex", "--no-alt-screen"), cwd=cwd,
+        )
+    snapshots = tmp_path / "shell_snapshots"
+    snapshots.mkdir()
+    for sid in (first, second):
+        (snapshots / f"{sid}.123456789.sh").write_text("snapshot")
+
+    scan = writable_rollout_holders(
+        paths, proc_root=str(proc_root), shell_snapshot_root=str(snapshots),
+    )
+
+    assert scan.complete is True
+    assert scan.holders == {first: set(), second: set()}
+
+
 def test_holder_scan_reports_missing_proc_as_incomplete(tmp_path):
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_bytes(b"")
@@ -178,6 +523,28 @@ def test_turn_marker_parser_preserves_partial_and_skips_malformed():
         ("task_started", "external-1"),
         ("task_complete", "external-1"),
     )
+
+
+def test_turn_marker_parser_reports_visible_user_message_without_turn_id():
+    visible = (json.dumps({
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "CLI prompt"},
+    }) + "\n").encode()
+    envelope = (json.dumps({
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "<environment_context>"},
+    }) + "\n").encode()
+    ambient_request = (json.dumps({
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": (
+            "<in-app-browser-context>ambient</in-app-browser-context>\n\n"
+            "## My request for Codex:\n继续修复"
+        )},
+    }) + "\n").encode()
+
+    assert parse_turn_markers(visible).has_visible_user_message is True
+    assert parse_turn_markers(envelope).has_visible_user_message is False
+    assert parse_turn_markers(ambient_request).has_visible_user_message is True
 
 
 def test_codex_own_delayed_flush_does_not_mirror_or_lock(tmp_path):
@@ -275,7 +642,8 @@ def test_passive_app_server_locks_only_for_active_external_turn(tmp_path):
         async def push(sid):
             pushed.append(machine._is_external(sid))
             return History(
-                session_id=sid, sid=sid, events=[], has_more=False,
+                session_id=sid, revision=machine._history_revision(sid),
+                sid=sid, events=[], has_more=False,
                 external=machine._is_external(sid))
 
         machine._push_mirrored_history = push
@@ -416,6 +784,51 @@ def test_turn_start_race_is_attributed_to_wrapper(tmp_path):
         assert sdk.owned_turn_ids == {"racing-own"}
         assert watch["pending_wrapper_turns"] == {}
         assert pushed == [] and ctx.needs_reload is False
+
+    asyncio.run(go())
+
+
+def test_review_nested_rollout_waits_for_execution_id_attribution(tmp_path):
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("review-sid", "review-sid")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        sdk = _CodexSdk({"review-outer"})
+        sdk.turn_active = True
+        sdk.review_attribution_pending = True
+        ctx.sdk = sdk
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[ctx.session_id] = watch
+
+        # The rollout writer can flush task_started after review/start returned
+        # the outer id but before stdout announces the nested execution id.
+        path.write_bytes(_event("task_started", "review-inner"))
+        await machine._poll_codex_watch(
+            ctx.session_id, watch, set(), 1000.0)
+        assert "review-inner" in watch["pending_wrapper_turns"]
+        assert watch["active_external_turns"] == {}
+        assert machine._is_external(ctx.session_id) is False
+
+        # Even beyond the ordinary continuation grace, Review's explicit nested
+        # attribution window prevents a fake terminal owner/read-only mirror.
+        await machine._poll_codex_watch(
+            ctx.session_id, watch, set(),
+            1000.0 + machine.CODEX_TURN_ATTRIBUTION_GRACE + 0.01,
+        )
+        assert "review-inner" in watch["pending_wrapper_turns"]
+        assert machine._is_external(ctx.session_id) is False
+
+        sdk.remember_owned_turn_id("review-inner")
+        sdk.review_attribution_pending = False
+        await machine._poll_codex_watch(
+            ctx.session_id, watch, set(), 1004.0)
+        assert watch["pending_wrapper_turns"] == {}
+        assert watch["active_external_turns"] == {}
+        assert machine._is_external(ctx.session_id) is False
 
     asyncio.run(go())
 
@@ -675,7 +1088,8 @@ def test_codex_takeover_ignores_exact_current_holder_and_unlocks(tmp_path, monke
         async def push(sid):
             pushed.append(machine._is_external(sid))
             return History(
-                session_id=sid, sid=sid, events=[], has_more=False,
+                session_id=sid, revision=machine._history_revision(sid),
+                sid=sid, events=[], has_more=False,
                 external=machine._is_external(sid))
 
         machine._push_mirrored_history = push
@@ -1077,6 +1491,14 @@ def test_prime_publishes_holder_edges_and_marks_context_stale(tmp_path, monkeypa
 
 
 def test_prime_consumes_short_lived_external_growth_before_query(tmp_path, monkeypatch):
+    class Journal:
+        def __init__(self):
+            self.cleaned = False
+
+        def cleanup(self, *, force=False):
+            assert force is True
+            self.cleaned = True
+
     async def go():
         machine, _ = _mk_machine()
         path = tmp_path / "rollout.jsonl"
@@ -1084,6 +1506,8 @@ def test_prime_consumes_short_lived_external_growth_before_query(tmp_path, monke
         ctx = _mk_ctx("sid", "sid")
         ctx.engine = "codex"
         ctx.sdk = _CodexSdk()
+        journal = Journal()
+        ctx.codex_checkpoint = journal
         machine.sessions["sid"] = ctx
         watch = _watch(path)
         machine._watch["sid"] = watch
@@ -1098,6 +1522,8 @@ def test_prime_consumes_short_lived_external_growth_before_query(tmp_path, monke
         machine._push_mirrored_history = lambda sid: _record_async(pushed, sid)
         assert await machine._prime_codex_ownership("sid") is False
         assert ctx.needs_reload is True and pushed == ["sid"]
+        assert journal.cleaned is True
+        assert ctx.codex_checkpoint is None
         assert watch["size"] == path.stat().st_size
 
     asyncio.run(go())
@@ -1198,6 +1624,65 @@ def test_cold_codex_watcher_seeds_unfinished_external_turn(tmp_path, monkeypatch
     watch = machine._watch["cold-active"]
     assert set(watch["active_external_turns"]) == {"still-running"}
     assert watch["external"] is True
+
+
+def test_sidebar_watch_preserves_private_app_seed_without_stable_writer(
+        tmp_path, monkeypatch):
+    async def go():
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(_event("task_started", "private-app-turn"))
+        machine, _ = _mk_machine()
+        monkeypatch.setattr(
+            machine_module, "codex_rollout_path",
+            lambda sid: str(path) if sid == "private-app" else None)
+        monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
+
+        machine._watch_session("private-app", sidebar=True)
+        watch = machine._watch["private-app"]
+        scan = HolderScan({"private-app": set()}, True)
+        holders, writers, private_holders = machine._codex_holder_sets(
+            watch, scan, "private-app")
+        machine._push_mirrored_history = lambda sid: _record_async([], sid)
+        await machine._poll_codex_watch(
+            "private-app", watch, holders, 1000.0, writers=writers)
+
+        assert private_holders == set()
+        assert set(watch["active_external_turns"]) == {"private-app-turn"}
+        assert machine._codex_sidebar_watch_state(watch) == "running"
+
+    asyncio.run(go())
+
+
+def test_sidebar_watch_emits_running_and_idle_lifecycle(tmp_path, monkeypatch):
+    async def go():
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        monkeypatch.setattr(
+            machine_module, "codex_rollout_path",
+            lambda sid: str(path) if sid == "private-app" else None)
+        monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
+        machine._watch_session("private-app", sidebar=True)
+        watch = machine._watch["private-app"]
+        machine._push_mirrored_history = lambda sid: _record_async([], sid)
+
+        with path.open("ab") as stream:
+            stream.write(_event("task_started", "private-app-turn"))
+        await machine._poll_codex_watch(
+            "private-app", watch, set(), 1000.0, writers=set())
+        with path.open("ab") as stream:
+            stream.write(_event("task_complete", "private-app-turn"))
+        await machine._poll_codex_watch(
+            "private-app", watch, set(), 1001.0, writers=set())
+
+        activity = [message for message in transport.sent
+                    if isinstance(message, SessionActivity)]
+        assert [(message.session_id, message.state) for message in activity] == [
+            ("private-app", "running"),
+            ("private-app", "idle"),
+        ]
+
+    asyncio.run(go())
 
 
 def test_cold_orphan_seed_unlocks_on_first_complete_empty_holder_scan(

@@ -7,7 +7,9 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.protocol import (
+    ListSessions,
     NewSession,
     Notice,
     RateLimitUpdate,
@@ -15,6 +17,7 @@ from cc_remote.protocol import (
     is_downstream,
     serialize,
 )
+from cc_remote.workspaces import WorkStores
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_handle import (
     CodexHandle,
@@ -259,7 +262,16 @@ def test_runtime_callback_failure_logs_no_notice_or_exception_body(caplog):
             "params": {"message": "SECRET_NOTICE_BODY"},
         })
 
-    asyncio.run(run())
+    # Production JSON loggers intentionally do not propagate to a root logger.
+    # Temporarily expose this logger to caplog so the test can inspect the raw
+    # LogRecord while leaving the production logging topology unchanged.
+    raw_logger = codex_handle_module.log._raw
+    original_propagate = raw_logger.propagate
+    raw_logger.propagate = True
+    try:
+        asyncio.run(run())
+    finally:
+        raw_logger.propagate = original_propagate
     logged = "\n".join(
         record.getMessage() + repr(getattr(record, "extra_data", {}))
         for record in caplog.records
@@ -295,8 +307,11 @@ def test_machine_never_broadcasts_runtime_event_without_session_route():
 def test_new_session_flushes_pending_notice_after_client_runtime_exists(
         monkeypatch):
     class FakeCodexHandle:
-        def __init__(self, _cfg, cwd=None):
+        def __init__(self, _cfg, cwd=None, daemon_mode=None,
+                     daemon_manager=None):
             self.cwd = cwd
+            self.daemon_mode = daemon_mode
+            self.daemon_manager = daemon_manager
             self.thread_id = None
             self.model = None
             self.effort = None
@@ -307,7 +322,7 @@ def test_new_session_flushes_pending_notice_after_client_runtime_exists(
             self.runtime_event_callback = None
 
         async def connect(self, **_kwargs):
-            return None
+            self.thread_id = "new-thread"
 
         async def activate_runtime_events(self):
             assert self.runtime_event_callback is not None
@@ -333,6 +348,115 @@ def test_new_session_flushes_pending_notice_after_client_runtime_exists(
         assert types.index("session_focus") < types.index("notice")
         notice = next(message for message in transport.sent
                       if message.type == "notice")
-        assert notice.sid and notice.sid.startswith("tmp-")
+        assert notice.sid == "new-thread"
+
+    asyncio.run(run())
+
+
+def test_new_codex_work_session_binds_native_id_and_refreshes_sidebar(
+        monkeypatch, tmp_path):
+    created = {}
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, cwd=None, work_mode=False,
+                     daemon_mode=None, daemon_manager=None):
+            assert work_mode is True
+            assert daemon_mode == "off"
+            self.cwd = cwd
+            self.daemon_manager = daemon_manager
+            self.thread_id = None
+            self.model = "gpt-test"
+            self.effort = "high"
+            self.applied_effort = "high"
+            self.approval = "never"
+            self.collaboration_mode = "default"
+            self.service_tier = None
+            self.runtime_event_callback = None
+            created["handle"] = self
+
+        async def connect(self, **_kwargs):
+            self.thread_id = "work-thread-1"
+
+        async def activate_runtime_events(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    async def list_threads(_limit):
+        handle = created["handle"]
+        return [{
+            "session_id": handle.thread_id,
+            "cwd": handle.cwd,
+            "summary": None,
+            "first_prompt": None,
+            "last_modified": "2026-07-14T22:00:00Z",
+            "git_branch": None,
+            "tag": None,
+            "status": "idle",
+            "forked_from_id": None,
+        }]
+
+    async def run():
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        monkeypatch.setattr(machine_module, "list_codex_sessions", list_threads)
+        machine, transport = _mk_machine()
+        machine._work = WorkStores(
+            tmp_path / "claude-work", tmp_path / "codex-work")
+
+        await machine._handle_new_session(NewSession(
+            engine="codex", space="work", request_id="create-work",
+            client_id="client-1"))
+
+        assert machine.focused_sid == "work-thread-1"
+        assert machine.sessions["work-thread-1"].session_id == "work-thread-1"
+        assert created["handle"].approval == "never"
+        record = machine._work.for_engine("codex").get_by_session(
+            "work-thread-1")
+        assert record is not None
+        focus = next(message for message in transport.sent
+                     if message.type == "session_focus")
+        assert focus.session_id == "work-thread-1"
+        listing = next(message for message in transport.sent
+                       if message.type == "session_list")
+        assert listing.space == "work"
+        assert [item.session_id for item in listing.sessions] == ["work-thread-1"]
+        assert not [message for message in transport.sent
+                    if message.type == "error"]
+
+    asyncio.run(run())
+
+
+def test_codex_work_list_recovers_one_unbound_exact_cwd_match(
+        monkeypatch, tmp_path):
+    async def run():
+        machine, transport = _mk_machine()
+        machine._work = WorkStores(
+            tmp_path / "claude-work", tmp_path / "codex-work")
+        store = machine._work.for_engine("codex")
+        record = store.create_session()
+
+        async def list_threads(_limit):
+            return [{
+                "session_id": "recovered-thread",
+                "cwd": record.cwd,
+                "summary": None,
+                "first_prompt": "hello",
+                "last_modified": "2026-07-14T22:00:00Z",
+                "git_branch": None,
+                "tag": None,
+                "status": "idle",
+                "forked_from_id": None,
+            }]
+
+        monkeypatch.setattr(machine_module, "list_codex_sessions", list_threads)
+        await machine._handle_list_sessions(ListSessions(
+            engine="codex", space="work", client_id="client-1"))
+
+        assert store.get_by_session("recovered-thread") is not None
+        listing = next(message for message in transport.sent
+                       if message.type == "session_list")
+        assert [item.session_id for item in listing.sessions] == [
+            "recovered-thread"]
 
     asyncio.run(run())

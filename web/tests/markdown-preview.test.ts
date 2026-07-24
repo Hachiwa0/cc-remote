@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 import { classifyPreviewTarget, isMarkdownPath } from "../src/preview-path.ts";
 import { parseLocalFileTarget } from "../src/file-link.ts";
+import {
+  InlineImageAssetCache,
+  classifyMessageImageTarget,
+} from "../src/inline-image-assets.ts";
+import { imageDimensionsFromBase64, queryImageDimensions } from "../src/img.ts";
+import { collectTurnFileChanges, filePathsFromInput, mutatedFilePaths } from "../src/file-changes.ts";
 import type { ServerEvent } from "../src/protocol.ts";
 
 assert.deepEqual(classifyPreviewTarget("docs/README.md", "./img/a.png"), {
@@ -37,6 +45,105 @@ assert.deepEqual(parseLocalFileTarget("file:///tmp/a%20b.py:9"), {
 });
 assert.equal(parseLocalFileTarget("https://example.com/a.py:9"), null);
 assert.equal(parseLocalFileTarget("#L9"), null);
+assert.deepEqual(classifyMessageImageTarget(
+  "/Volumes/MuggleSSD/workspace/project/tmp-auth.png"), {
+  kind: "local", value: "/Volumes/MuggleSSD/workspace/project/tmp-auth.png",
+});
+assert.deepEqual(classifyMessageImageTarget("screenshots/result.webp?raw=1"), {
+  kind: "local", value: "screenshots/result.webp",
+});
+assert.deepEqual(classifyMessageImageTarget("https://example.com/result.png"), {
+  kind: "external", value: "https://example.com/result.png",
+});
+assert.equal(classifyMessageImageTarget("data:image/png;base64,cG5n").kind, "blocked");
+assert.equal(classifyMessageImageTarget("/etc/password.txt").kind, "blocked");
+
+const inlineAssets = new InlineImageAssetCache(2);
+assert.equal(inlineAssets.begin({
+  sid: "session-1", path: "qr.png", previewId: "preview-1", requestId: "request-1",
+}), true);
+assert.equal(inlineAssets.begin({
+  sid: "session-1", path: "qr.png", previewId: "preview-2", requestId: "request-2",
+}), false, "one visible local image must have at most one in-flight request");
+assert.equal(inlineAssets.accept({
+  v: 19, type: "preview_asset", ts: 1, sid: "other-session",
+  path: "qr.png", preview_id: "preview-1", request_id: "request-1",
+  media_type: "image/png", data: "cG5n",
+}), false, "a response from another session must not satisfy the request");
+assert.equal(inlineAssets.accept({
+  v: 19, type: "preview_asset", ts: 2, sid: "session-1",
+  path: "qr.png", preview_id: "preview-1", request_id: "request-1",
+  media_type: "image/png", data: "cG5n",
+}), true);
+assert.deepEqual(inlineAssets.forSession("session-1")["qr.png"], {
+  status: "ready", mediaType: "image/png", data: "cG5n",
+});
+assert.equal(inlineAssets.forSession("other-session")["qr.png"], undefined,
+  "a background response must never populate the focused session's asset view");
+assert.equal(inlineAssets.dropSession("session-1"), true);
+assert.equal(inlineAssets.forSession("session-1")["qr.png"], undefined,
+  "a destructive history invalidation must evict the session's rendered assets");
+
+const pngHeader = new Uint8Array(24);
+pngHeader.set([0x89, ...new TextEncoder().encode("PNG\r\n\x1a\n")], 0);
+pngHeader.set(new TextEncoder().encode("IHDR"), 12);
+new DataView(pngHeader.buffer).setUint32(16, 640);
+new DataView(pngHeader.buffer).setUint32(20, 480);
+const pngHeaderBase64 = Buffer.from(pngHeader).toString("base64");
+assert.deepEqual(imageDimensionsFromBase64(pngHeaderBase64, "image/png"), [640, 480],
+  "base64 chat images expose dimensions without decoding a DOM image");
+assert.deepEqual(queryImageDimensions({
+  media_type: "image/png", data: pngHeaderBase64,
+}), [640, 480], "wire-compatible QueryImg objects can provide local layout metadata");
+new DataView(pngHeader.buffer).setUint32(16, 8192);
+new DataView(pngHeader.buffer).setUint32(20, 8192);
+assert.equal(imageDimensionsFromBase64(
+  Buffer.from(pngHeader).toString("base64"), "image/png",
+), null, "untrusted image headers cannot reserve an unbounded layout box");
+new DataView(pngHeader.buffer).setUint32(16, 640);
+new DataView(pngHeader.buffer).setUint32(20, 480);
+
+const sizedInlineAssets = new InlineImageAssetCache(2);
+assert.equal(sizedInlineAssets.begin({
+  sid: "session-1", path: "sized-qr.png",
+  previewId: "preview-sized", requestId: "request-sized",
+}), true);
+assert.equal(sizedInlineAssets.accept({
+  v: 19, type: "preview_asset", ts: 3, sid: "session-1",
+  path: "sized-qr.png", preview_id: "preview-sized",
+  request_id: "request-sized", media_type: "image/png", data: pngHeaderBase64,
+}), true);
+assert.deepEqual(sizedInlineAssets.forSession("session-1")["sized-qr.png"], {
+  status: "ready", mediaType: "image/png", data: pngHeaderBase64,
+  width: 640, height: 480,
+}, "local Markdown images keep an intrinsic first-frame aspect ratio");
+assert.deepEqual(mutatedFilePaths("Write", {
+  file_path: "/tmp/claude.txt",
+}), ["/tmp/claude.txt"]);
+assert.deepEqual(mutatedFilePaths("apply_patch", {
+  changes: [
+    { path: "/tmp/codex.txt", kind: "add" },
+    { path: "/tmp/old.txt", move_path: "/tmp/new.txt", kind: "move" },
+  ],
+}), ["/tmp/codex.txt", "/tmp/old.txt", "/tmp/new.txt"]);
+assert.deepEqual(filePathsFromInput({
+  file_paths: ["/tmp/a", "/tmp/a"],
+  changes: { "/tmp/b": { type: "add" } },
+}), ["/tmp/a", "/tmp/b"]);
+assert.deepEqual(mutatedFilePaths("Read", {
+  file_path: "/tmp/secret.txt",
+}), [], "read-only tools must never be treated as mutations");
+assert.deepEqual(collectTurnFileChanges([
+  { kind: "tool", tool: "apply_patch", input: {
+    file_paths: ["/tmp/current-turn.md"],
+  }, result: { diff: "--- /dev/null\n+++ /tmp/current-turn.md\n@@ -0,0 +1 @@\n+1\n" } },
+  { kind: "tool", tool: "Read", input: {
+    file_path: "/home/nancy/project/unrelated.py",
+  }, result: { diff: "--- a/unrelated.py\n+++ b/unrelated.py\n" } },
+]), {
+  paths: ["/tmp/current-turn.md"],
+  diff: "--- /dev/null\n+++ /tmp/current-turn.md\n@@ -0,0 +1 @@\n+1",
+}, "a turn summary must use only its mutation events, never the worktree diff");
 
 const harness = await createServer({
   root: process.cwd(),
@@ -48,8 +155,73 @@ try {
   const { initialState, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
   const { ArtifactPanel } = await harness.ssrLoadModule(
     "/src/components/ArtifactPanel.tsx");
+  const { buildSandboxDocument } = await harness.ssrLoadModule(
+    "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
+  const codeCopyMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "请执行：\n\n```sh\necho ready\n```",
+    done: true,
+  }));
+  assert.match(codeCopyMarkup, /aria-label="复制代码"/,
+    "fenced commands need a local copy action without scrolling to turn end");
+  assert.match(codeCopyMarkup, /echo ready/);
+  const codexDirectiveMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "提交完成。\n\n::git-commit{cwd=\"/tmp/private-project\"}",
+    done: true,
+  }));
+  assert.match(codexDirectiveMarkup, /Git 提交已创建/,
+    "Codex App git directives need a native status instead of leaking wire text");
+  assert.doesNotMatch(codexDirectiveMarkup, /::git-commit|private-project/,
+    "directive attributes are local UI metadata and must not render as prose");
+  const fencedDirectiveMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "```text\n::git-commit{cwd=\"/tmp/example\"}\n```",
+    done: true,
+  }));
+  assert.match(fencedDirectiveMarkup, /::git-commit/,
+    "a directive-shaped line inside a code fence remains literal code");
+  const localQrMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "![飞书授权二维码](/Volumes/MuggleSSD/workspace/project/tmp-auth.png)",
+    done: true,
+    imageAssets: {},
+    onLoadImage: () => true,
+    onPreviewImage: () => {},
+  }));
+  assert.match(localQrMarkup, /message-image-loading/);
+  assert.doesNotMatch(localQrMarkup, /src="\/Volumes\//,
+    "a local assistant image path must never become a public HTTP request");
+  const loadedQrMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "![飞书授权二维码](/Volumes/MuggleSSD/workspace/project/tmp-auth.png)",
+    done: true,
+    imageAssets: {
+      "/Volumes/MuggleSSD/workspace/project/tmp-auth.png": {
+        status: "ready", mediaType: "image/png", data: pngHeaderBase64,
+        width: 640, height: 480,
+      },
+    },
+    onPreviewImage: () => {},
+  }));
+  assert.match(loadedQrMarkup, /class="message-image-trigger"/);
+  assert.match(loadedQrMarkup, /src="data:image\/png;base64,/);
+  assert.match(loadedQrMarkup, /width="640"/);
+  assert.match(loadedQrMarkup, /height="480"/);
+  assert.match(loadedQrMarkup, /aria-label="预览图片：飞书授权二维码"/);
+
+  const { NewChatView } = await harness.ssrLoadModule(
+    "/src/components/NewChatView.tsx");
+  const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
+    cwd: "/tmp/project",
+    onPickCwd: () => {},
+    onSend: () => true,
+  }));
+  assert.match(newChatMarkup, /aria-label="添加照片"/);
+  assert.match(newChatMarkup, /aria-label="添加文件"/);
+  assert.equal(
+    (newChatMarkup.match(/<button[^>]+aria-label="添加照片"/g) ?? []).length, 1);
+  assert.equal(
+    (newChatMarkup.match(/<button[^>]+aria-label="添加文件"/g) ?? []).length, 0);
+  assert.match(newChatMarkup, /type="file"[^>]*accept="image\/\*"[^>]*multiple/,
+    "iPhone photo selection needs a dedicated multi-select image input");
   let state = reduce(initialState, {
     type: "open_file_loading",
     file: "README.md",
@@ -260,6 +432,58 @@ try {
   assert.match(sourceMarkup, /source-line focused/);
   assert.match(sourceMarkup, />731<\/span><code>line 731<\/code>/);
   assert.match(sourceMarkup, /501–740 \/ 740 行/);
+
+  state = reduce(state, {
+    type: "open_file_loading",
+    file: "report.pdf",
+    sid: "session-1",
+    requestId: "binary-1",
+    kind: "file",
+  });
+  state = reduce(state, { type: "event", event: {
+    v: 19,
+    type: "file_preview",
+    ts: 6,
+    sid: "session-1",
+    path: "report.pptx",
+    request_id: "binary-1",
+    format: "pdf",
+    content: "",
+    media_type: "application/pdf",
+    data: "JVBERi0xLjcK",
+    converted_from: "pptx",
+    size: 8192,
+    truncated: false,
+    mtime_ns: "4",
+  } as ServerEvent });
+  assert.equal(state.artifact?.kind, "pdf");
+  assert.equal(state.artifact?.mediaType, "application/pdf");
+  assert.equal(state.artifact?.convertedFrom, "pptx");
+
+  const pdfMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: state.artifact!,
+    active: "diff",
+    hasBtw: false,
+    onTab: () => {},
+    onClose: () => {},
+  }));
+  assert.match(pdfMarkup, /rendered-artifact-body/);
+  assert.match(pdfMarkup, /PPTX → PDF/);
+  assert.match(pdfMarkup, /正在准备预览/);
+
+  const sandbox = buildSandboxDocument("<h1>safe</h1>");
+  assert.match(sandbox, /Content-Security-Policy/);
+  assert.match(sandbox, /default-src &#39;none&#39;|default-src 'none'/);
+  assert.match(sandbox, /<body><h1>safe<\/h1><\/body>/);
+
+  const artifactPanelSource = readFileSync(
+    resolve(process.cwd(), "src/components/ArtifactPanel.tsx"), "utf8");
+  assert.match(artifactPanelSource, /DOMPurify\.sanitize/);
+  assert.match(artifactPanelSource, /sandbox=""/);
+  assert.match(artifactPanelSource, /FORBID_TAGS/);
+  assert.match(artifactPanelSource, /\["md", "html"\]\.includes\(artifact\.kind\)/);
+  assert.match(artifactPanelSource, /artifact\.kind === "html" && mode === "preview"/);
+  assert.match(artifactPanelSource, /mode === "source"[\s\S]*?<SourceFile content=\{artifact\.content/);
 } finally {
   await harness.close();
 }

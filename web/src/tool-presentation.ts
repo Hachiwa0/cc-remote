@@ -1,4 +1,5 @@
 import type { ToolBlock } from "./reducer";
+import { mutatedFilePaths } from "./file-changes";
 
 function value(input: Record<string, unknown>, ...keys: string[]): string {
   for (const key of keys) {
@@ -34,7 +35,8 @@ export function isToolFailure(block: ToolBlock): boolean {
 /** Convert engine-specific tool names into short, stable activity labels. */
 export function presentTool(block: ToolBlock): ToolPresentation {
   const input = block.input;
-  const file = value(input, "file_path", "path");
+  const file = mutatedFilePaths(block.tool, input)[0]
+    || value(input, "file_path", "path");
   const command = value(input, "command", "cmd");
   const pattern = value(input, "pattern", "query");
   const url = value(input, "url");

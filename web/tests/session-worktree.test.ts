@@ -21,11 +21,13 @@ assert.deepEqual(sessionMenuCapabilities(codex), {
   rename: true,
   archive: true,
   forkWorktree: true,
+  delete: true,
 });
 assert.deepEqual(sessionMenuCapabilities(claude), {
   rename: true,
   archive: true,
   forkWorktree: false,
+  delete: true,
 });
 assert.equal(sessionMenuCapabilities(archivedCodex).forkWorktree, false);
 assert.equal(isWorktreeForkBlockedByState("running"), true);
@@ -41,7 +43,7 @@ assert.equal(isWorktreeForkNameValid("x".repeat(WORKTREE_FORK_NAME_MAX + 1)), fa
 assert.deepEqual(
   makeForkSessionCommand("codex-parent", "turn-7", "request-message", 122),
   {
-    v: 10,
+    v: 19,
     type: "fork_session",
     session_id: "codex-parent",
     request_id: "request-message",
@@ -53,7 +55,7 @@ assert.deepEqual(
 assert.deepEqual(
   makeForkSessionWorktreeCommand("codex-parent", "fix-login", "request-1", 123),
   {
-    v: 10,
+    v: 19,
     type: "fork_session_worktree",
     session_id: "codex-parent",
     name: "fix-login",

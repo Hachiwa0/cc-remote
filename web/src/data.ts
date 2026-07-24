@@ -1,4 +1,6 @@
-// Slash commands, models, permission modes. Slash commands split into
+// Slash commands, models, permission modes. Slash commands split by surface:
+// Work exposes only generic conversation/workspace controls; Code additionally
+// exposes engine-specific coding commands. Commands then split into
 // client-side ones (CLIENT_SLASHES: model/plan/normal/permissions/clear/context,
 // handled in Composer.send) and cc skills (forwarded verbatim to cc). Model/perm
 // chips drive set_model / set_permission_mode on the wrapper.
@@ -16,6 +18,13 @@ export const COMMANDS: Command[] = [
   { slash: "permissions", name: "权限模式", ds: "选择 cc 的权限模式", ic: "shield" },
   { g: "模型" },
   { slash: "model", name: "切换模型", ds: "/model <id> 切到指定模型(支持隐藏模型),无参数则打开选择器", ic: "cpu" },
+  { g: "扩展" },
+  { slash: "extensions", name: "扩展管理", ds: "Skills、Plugins、Apps、MCP 与 Hooks", ic: "spark" },
+  { slash: "skills", name: "Skills", ds: "查看和管理当前引擎 Skills", ic: "read" },
+  { slash: "plugins", name: "Plugins", ds: "查看和管理当前引擎 Plugins", ic: "spark" },
+  { slash: "apps", name: "Apps", ds: "查看当前引擎 Apps", ic: "run" },
+  { slash: "mcp", name: "MCP", ds: "查看当前引擎 MCP Servers", ic: "cpu" },
+  { slash: "hooks", name: "Hooks", ds: "查看当前引擎 Hooks（与 Claude 原生 /hook 区分）", ic: "shield" },
   { g: "审查" },
   { slash: "code-review", name: "代码审查", ds: "审当前 diff 的正确性与可简化项", ic: "review" },
   { slash: "security-review", name: "安全审查", ds: "扫描分支改动的安全隐患", ic: "shield" },
@@ -33,9 +42,35 @@ export const COMMANDS: Command[] = [
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
 ];
 
+// Work is a separate product surface, not a differently styled Code session.
+// Keep its palette limited to controls that are meaningful for a private work
+// conversation. Engine/user-provided slash skills may still be typed manually;
+// known Code commands are rejected by the composer instead of leaking through.
+export const WORK_COMMANDS: Command[] = [
+  { g: "设置" },
+  { slash: "model", name: "切换模型", ds: "选择本次工作的模型与思考强度", ic: "cpu" },
+  { g: "扩展" },
+  { slash: "extensions", name: "扩展目录", ds: "只读查看当前 Work 可用扩展", ic: "spark" },
+  { slash: "skills", name: "Skills", ds: "只读查看当前 Work Skills", ic: "read" },
+  { slash: "plugins", name: "Plugins", ds: "只读查看当前 Work Plugins", ic: "spark" },
+  { slash: "apps", name: "Apps", ds: "只读查看当前 Work Apps", ic: "run" },
+  { slash: "mcp", name: "MCP", ds: "只读查看当前 Work MCP Servers", ic: "cpu" },
+  { slash: "hooks", name: "Hooks", ds: "只读查看当前 Work Hooks", ic: "shield" },
+  { g: "工作" },
+  { slash: "goal", name: "工作目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
+  { slash: "btw", name: "侧边对话 (btw)", ds: "临时侧聊，不影响当前工作主线", ic: "spark" },
+  { slash: "preview", name: "预览 Artifacts", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
+  { slash: "context", name: "上下文用量", ds: "查看本次工作的 token 占用", ic: "cpu" },
+  { slash: "clear", name: "新工作", ds: "开始一项独立的新工作", ic: "close" },
+];
+
 // `efforts` overrides the engine's baseline effort list for THIS model — reasoning
 // levels are per-model, not per-engine.
 export interface Model { id: string; name: string; ds: string; ic: string; efforts?: Effort[] }
+// Claude Code exposes the active/default model but no supported model catalog.
+// These are presentation-only common aliases, never a capability claim. An
+// advanced user may still type `/model <id>` for a hidden/provider model; the
+// ordinary model sheet stays limited to curated choices.
 export const MODELS: Model[] = [
   { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "crown" },
   { id: "claude-opus-4-8", name: "Opus 4.8", ds: "最强推理", ic: "gem" },
@@ -84,9 +119,9 @@ export const CODEX_MODELS: Model[] = [
   { id: "gpt-5.4", name: "GPT-5.4", ds: "更早 · 旧会话兼容", ic: "cpu" },
 ];
 export const CODEX_PERMS: Perm[] = [
-  { id: "never", name: "不询问", short: "不询问", ds: "不询问 · 需要审批时拒绝", ic: "shield" },
-  { id: "on-request", name: "按需", short: "按需", ds: "需要时才询问", ic: "shield" },
-  { id: "untrusted", name: "严格", short: "严格", ds: "每步都先询问", ic: "shield" },
+  { id: "never", name: "Never", short: "Never", ds: "不询问 · 需要审批时拒绝", ic: "shield" },
+  { id: "on-request", name: "On Request", short: "On Request", ds: "需要时才询问", ic: "shield" },
+  { id: "untrusted", name: "Untrusted", short: "Untrusted", ds: "每步都先询问", ic: "shield" },
 ];
 
 /** Live catalogs by engine, as reported by the wrapper (`models` frame). */
@@ -127,8 +162,8 @@ export const defaultModelFor = (engine?: string, catalog?: Catalog,
   const list = modelsFor(engine, catalog);
   const want = engine ? defaults?.[engine] : undefined;
   // Codex defaults are accepted only when app-server's live catalog contains
-  // them. Claude may legitimately use a custom/hidden alias absent from our
-  // static presentation table, so preserve its wrapper-resolved id.
+  // them. Claude may legitimately use a custom/provider alias absent from the
+  // common suggestions above, so preserve its wrapper-resolved id.
   return want && (engine !== "codex" || list.some((m) => m.id === want))
     ? want : list[0].id;
 };
@@ -162,11 +197,11 @@ export function matchModelId(m: string, engine?: string): string {
 
 export interface Perm { id: string; name: string; short: string; ds: string; ic: string; danger?: boolean }
 export const PERMS: Perm[] = [
-  { id: "default", name: "默认", short: "询问", ds: "每次动作前询问", ic: "shield" },
-  { id: "acceptEdits", name: "自动接受编辑", short: "编辑", ds: "文件编辑免询问，命令仍询问", ic: "edit" },
-  { id: "plan", name: "Plan 模式", short: "Plan", ds: "只读 · 先出方案再执行", ic: "plan" },
-  { id: "auto", name: "自动", short: "自动", ds: "自动执行常规操作", ic: "run" },
-  { id: "bypassPermissions", name: "危险模式", short: "危险", ds: "危险 · 不询问直接执行 · --dangerously-skip-permissions", ic: "bolt", danger: true },
+  { id: "default", name: "Default", short: "Default", ds: "每次动作前询问", ic: "shield" },
+  { id: "acceptEdits", name: "Accept Edits", short: "Accept Edits", ds: "文件编辑免询问，命令仍询问", ic: "edit" },
+  { id: "plan", name: "Plan", short: "Plan", ds: "只读 · 先出方案再执行", ic: "plan" },
+  { id: "auto", name: "Auto", short: "Auto", ds: "自动执行常规操作", ic: "run" },
+  { id: "bypassPermissions", name: "Bypass Permissions", short: "Bypass Permissions", ds: "危险 · 不询问直接执行 · --dangerously-skip-permissions", ic: "bolt", danger: true },
 ];
 
 export function isCmd(c: Command): c is Cmd {
@@ -178,20 +213,22 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // Slashes handled locally by the web client (never forwarded to cc as a prompt).
 // Everything else (code-review, verify, run, deep-research, …) is a cc skill and
 // is forwarded verbatim so cc's own slash-command layer runs it.
-export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "btw", "preview"]);
+// /rewind stays reserved locally while its UI is hidden so manually typing it
+// cannot fall through to Claude's interactive-only slash layer.
+const EXTENSION_SLASHES = ["extensions", "skills", "plugins", "apps", "mcp", "hooks"];
+export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "preview", ...EXTENSION_SLASHES]);
 
-// Codex engine command palette — its REAL slash commands (verified against the
-// codex binary's own "get started" hint: /init /status /permissions /model /review).
-// Client-handled: model/clear/context/status/permissions. /context is the focused
+// Codex engine command palette. Native app-server controls are handled locally
+// and never expanded into natural-language lookalikes. /context is the focused
 // thread's token window; /status is a separate app-server snapshot (thread,
-// config, account and rate limits). Forwarded
-// ones (review/init) expand to a prompt codex handles agentically — the app-server
-// has no TUI slash layer. /fast maps to app-server's per-thread service tier,
+// config, account and rate limits). /review maps to review/start, /compact maps
+// to thread/compact/start. /init remains
+// an explicit compatibility prompt because app-server has no init RPC. /fast maps to app-server's per-thread service tier,
 // and /hook is Claude-only. /plan and /normal are handled locally by the web
 // client and mapped to app-server collaborationMode, not sent as prompt text.
 export const CODEX_COMMANDS: Command[] = [
   { g: "审查" },
-  { slash: "review", name: "代码审查", ds: "审当前 git 改动的 bug 与改进", ic: "review" },
+  { slash: "review", name: "代码审查", ds: "/review [base 分支 | commit SHA | custom 要求]", ic: "review" },
   { g: "项目" },
   { slash: "init", name: "初始化 AGENTS.md", ds: "生成/更新代码库说明", ic: "init" },
   { g: "模式" },
@@ -200,21 +237,43 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "model", name: "切换模型", ds: "选择模型与思考强度", ic: "cpu" },
   { slash: "permissions", name: "权限模式", ds: "选择 Codex 的审批策略(自动/按需/严格)", ic: "shield" },
   { slash: "fast", name: "Fast 模式", ds: "开/关 Fast 服务档位(更快响应),下条消息生效", ic: "bolt" },
+  { g: "扩展" },
+  { slash: "extensions", name: "扩展管理", ds: "Skills、Plugins、Apps、MCP 与 Hooks", ic: "spark" },
+  { slash: "skills", name: "Skills", ds: "查看和管理 Codex Skills", ic: "read" },
+  { slash: "plugins", name: "Plugins", ds: "查看和管理 Codex Plugins", ic: "spark" },
+  { slash: "apps", name: "Apps", ds: "查看 Codex Apps", ic: "run" },
+  { slash: "mcp", name: "MCP", ds: "查看 Codex MCP Servers", ic: "cpu" },
+  { slash: "hooks", name: "Hooks", ds: "查看 Codex app-server Hooks", ic: "shield" },
   { g: "会话" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "status", name: "完整状态", ds: "线程 · 配置 · 账户 · 限额 · token", ic: "cpu" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用与容量", ic: "cpu" },
+  { slash: "compact", name: "压缩上下文", ds: "调用 Codex 原生 compact", ic: "simplify" },
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
-export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview"]);
-export const commandsFor = (engine?: string): Command[] => (engine === "codex" ? CODEX_COMMANDS : COMMANDS);
+const WORK_CMD_LIST: Cmd[] = WORK_COMMANDS.filter(isCmd) as Cmd[];
+export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
+const HIDDEN_CODE_ONLY_SLASHES = new Set(["rollback"]);
+export type CommandSurface = "code" | "work";
+export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (
+  surface === "work" ? WORK_COMMANDS : engine === "codex" ? CODEX_COMMANDS : COMMANDS
+);
 export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
+
+/** A built-in command intentionally available on Code but absent from Work.
+ * Unknown slashes return false so user-installed Claude skills remain usable. */
+export function isKnownCodeOnlySlash(slash: string, engine?: string): boolean {
+  const normalized = slash.toLowerCase();
+  return (engine === "codex" && HIDDEN_CODE_ONLY_SLASHES.has(normalized)) || ((
+    engine === "codex" ? CODEX_CMD_LIST : CMD_LIST).some(
+    (command) => command.slash === normalized,
+  ) && !WORK_CMD_LIST.some((command) => command.slash === normalized));
+}
 // codex slash -> the prompt actually sent to codex (agentic; no TUI slash layer).
 export const CODEX_PROMPTS: Record<string, string> = {
-  review: "Review the current git changes (the diff) for correctness bugs, risks, and simplifications. Be concise.",
   init: "Create or update AGENTS.md at the repo root: a concise overview of this codebase, how to build/test/run it, and key conventions.",
 };
 
@@ -229,9 +288,11 @@ export function slashToken(input: string): string | null {
 }
 
 // Commands whose slash starts with `token` (case-insensitive, prefix match).
-export function matchCommands(token: string, engine?: string): Cmd[] {
+export function matchCommands(token: string, engine?: string,
+                              surface: CommandSurface = "code"): Cmd[] {
   const t = token.toLowerCase();
-  const list = engine === "codex" ? CODEX_CMD_LIST : CMD_LIST;
+  const list = surface === "work"
+    ? WORK_CMD_LIST : engine === "codex" ? CODEX_CMD_LIST : CMD_LIST;
   return list.filter((c) => c.slash.toLowerCase().startsWith(t));
 }
 

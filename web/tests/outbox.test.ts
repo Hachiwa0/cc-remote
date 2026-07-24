@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 
-import { CommandOutbox, planRecoveryReplay } from "../src/outbox.ts";
+import {
+  CommandOutbox,
+  QueryAcceptanceLatch,
+  planRecoveryReplay,
+} from "../src/outbox.ts";
 import { shouldAcceptSessionList } from "../src/session-list.ts";
 
 const outbox = new CommandOutbox(2, 4096);
@@ -71,6 +75,66 @@ assert.equal(protectedTargets.enqueue(
   "c", "switch-cmd").ok, true);
 assert.deepEqual(protectedTargets.pendingSessionIds(), ["query-target", "switch-target"]);
 
+const acceptance = new QueryAcceptanceLatch();
+assert.equal(acceptance.begin("session-a", "message-a"), true);
+assert.equal(acceptance.begin("session-a", "message-a-duplicate"), false,
+  "one session cannot have two direct queries awaiting acceptance");
+assert.equal(acceptance.begin("session-b", "message-b"), true,
+  "another session has an independent acceptance lane");
+assert.equal(acceptance.pendingMessageId("session-a"), "message-a");
+
+const acceptanceOutbox = new CommandOutbox(10, 4096);
+assert.equal(acceptanceOutbox.enqueue({
+  v: 10, type: "query", sid: "session-a", prompt: "one",
+  msg_id: "message-a", ts: 1,
+}, "client", "query-command").ok, true);
+assert.equal(acceptanceOutbox.ack("client", "query-command"), true);
+assert.equal(acceptance.pendingMessageId("session-a"), "message-a",
+  "transport ACK is not authoritative query acceptance");
+
+assert.equal(acceptance.accept({
+  type: "error", sid: "session-a", msg_id: "other-message",
+  code: "busy",
+}), false);
+assert.equal(acceptance.pendingMessageId("session-a"), "message-a",
+  "an unrelated correlated error cannot release the session latch");
+assert.equal(acceptance.accept({
+  type: "error", sid: "session-a", msg_id: "message-a",
+  code: "wrapper_offline",
+}), false);
+assert.equal(acceptance.pendingMessageId("session-a"), "message-a",
+  "relay offline is retryable and must preserve acceptance through reconnect");
+
+const offlineReplay = new CommandOutbox(10, 4096);
+assert.equal(offlineReplay.enqueue({
+  v: 10, type: "query", sid: "offline-session", prompt: "retry",
+  msg_id: "offline-message", ts: 2,
+}, "client", "offline-command").ok, true);
+assert.equal(acceptance.begin("offline-session", "offline-message"), true);
+assert.deepEqual(planRecoveryReplay(
+  offlineReplay.pendingFramesWithSessionIds(), "session-b"), [
+  { type: "switch", sid: "offline-session" },
+  { type: "command", raw: offlineReplay.pendingFrames()[0] },
+  { type: "switch", sid: "session-b" },
+]);
+assert.equal(acceptance.pendingMessageId("offline-session"), "offline-message");
+assert.equal(acceptance.accept({
+  type: "user_msg", sid: "offline-session", msg_id: "offline-message",
+}), true);
+assert.equal(acceptance.pendingMessageId("offline-session"), null);
+
+assert.equal(acceptance.accept({
+  type: "turn_binding", sid: "session-a", msg_id: "message-a",
+}), true);
+assert.equal(acceptance.pendingMessageId("session-a"), null);
+assert.equal(acceptance.pendingMessageId("session-b"), "message-b",
+  "accepting session A cannot unlock session B");
+acceptance.rekeySession("session-b", "session-b-real");
+assert.equal(acceptance.pendingMessageId("session-b"), null);
+assert.equal(acceptance.pendingMessageId("session-b-real"), "message-b",
+  "temp-session capture preserves the pending query identity");
+assert.deepEqual(acceptance.pendingSessionIds(), ["session-b-real"]);
+
 assert.deepEqual(planRecoveryReplay([
   { raw: "command-a", sid: "session-a" },
   { raw: "command-global" },
@@ -86,10 +150,10 @@ assert.deepEqual(planRecoveryReplay([
   { type: "switch", sid: "focused" },
 ]);
 
-assert.equal(shouldAcceptSessionList("claude", {
+assert.equal(shouldAcceptSessionList("claude", "code", {
   v: 10, type: "session_list", ts: 1, engine: "claude", sessions: [],
 }), true);
-assert.equal(shouldAcceptSessionList("codex", {
+assert.equal(shouldAcceptSessionList("codex", "code", {
   v: 10, type: "session_list", ts: 1, engine: "claude", sessions: [],
 }), false);
 

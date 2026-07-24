@@ -2,13 +2,21 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  AUTO_LOAD_HISTORY_TOP_PX,
   AT_BOTTOM_PX,
-  anchoredScrollTop,
   createFrameCoalescer,
+  HISTORY_ANCHOR_EPSILON_PX,
+  HistoryAnchorController,
+  historyPageStatus,
+  isAtHistoryEdge,
+  OlderHistoryLoadGate,
   measureBottom,
   NEAR_BOTTOM_PX,
+  shouldAutoLoadOlderHistory,
   ScrollFollowController,
 } from "../src/scroll-follow.ts";
+import { ScrollCoordinator } from "../src/scroll-coordinator.ts";
+import { updateTurnKeySnapshot } from "../src/virtual-turn-keys.ts";
 
 assert.deepEqual(measureBottom({
   scrollHeight: 1_000,
@@ -25,8 +33,218 @@ assert.equal(measureBottom({
   clientHeight: 600,
 }).atBottom, true);
 assert.equal(AT_BOTTOM_PX, 2);
-assert.equal(anchoredScrollTop(170, 1_000, 1_700), 870);
-assert.equal(anchoredScrollTop(0, 1_000, 800), 0);
+assert.equal(HISTORY_ANCHOR_EPSILON_PX, 0.5);
+assert.equal(isAtHistoryEdge({ scrollHeight: 1_200, scrollTop: 0, clientHeight: 600}), true);
+assert.equal(isAtHistoryEdge({ scrollHeight: 1_200, scrollTop: 2, clientHeight: 600}), false,
+  "wheel/touch preflight must wait for the browser to reach the real top");
+
+const firstTurnKeySnapshot = updateTurnKeySnapshot(null, [
+  { id: "old-1" },
+  { id: "old-2" },
+], "session-a");
+const streamedTurns = [
+  { id: "old-1", text: "streamed content" },
+  { id: "old-2" },
+];
+const contentOnlyTurnKeySnapshot = updateTurnKeySnapshot(
+  firstTurnKeySnapshot,
+  streamedTurns,
+  "session-a",
+);
+assert.equal(contentOnlyTurnKeySnapshot, firstTurnKeySnapshot,
+  "streaming content with unchanged turn ids must keep the virtualizer key extractor stable");
+const prependedTurnKeySnapshot = updateTurnKeySnapshot(firstTurnKeySnapshot, [
+  { id: "new-1" },
+  { id: "new-2" },
+  { id: "old-1" },
+  { id: "old-2" },
+], "session-a");
+assert.notEqual(prependedTurnKeySnapshot, firstTurnKeySnapshot);
+assert.equal(firstTurnKeySnapshot.getItemKey(0), "session-a\u0000old-1",
+  "the previous virtualizer options must retain their old key snapshot");
+assert.equal(prependedTurnKeySnapshot.getItemKey(0), "session-a\u0000new-1");
+assert.equal(prependedTurnKeySnapshot.getItemKey(2), "session-a\u0000old-1");
+const switchedTurnKeySnapshot = updateTurnKeySnapshot(
+  prependedTurnKeySnapshot,
+  [{ id: "new-1" }, { id: "new-2" }, { id: "old-1" }, { id: "old-2" }],
+  "session-b",
+);
+assert.notEqual(switchedTurnKeySnapshot, prependedTurnKeySnapshot);
+assert.equal(switchedTurnKeySnapshot.getItemKey(0), "session-b\u0000new-1",
+  "the same turn id in another session must never reuse a measured height");
+
+const scrollCoordinator = new ScrollCoordinator();
+assert.deepEqual(scrollCoordinator.policy(true), {
+  anchorTo: "end",
+  followOnAppend: "auto",
+  allowResizeAdjustment: true,
+});
+const processInteraction = scrollCoordinator.beginInteraction(true);
+assert.deepEqual(scrollCoordinator.policy(true), {
+  anchorTo: "start",
+  followOnAppend: false,
+  allowResizeAdjustment: false,
+});
+assert.equal(scrollCoordinator.requestBottom("auto"), null,
+  "automatic bottom writes are queued while a press is active");
+assert.deepEqual(scrollCoordinator.endInteraction(processInteraction, true), {
+  kind: "bottom",
+  behavior: "auto",
+});
+const historyInteraction = scrollCoordinator.beginInteraction(false);
+assert.equal(scrollCoordinator.endInteraction(historyInteraction, true), null,
+  "a process tap while reading history must not jump back to the bottom");
+assert.deepEqual(scrollCoordinator.policy(false), {
+  anchorTo: "end",
+  followOnAppend: false,
+  allowResizeAdjustment: true,
+});
+assert.deepEqual(scrollCoordinator.requestOffset(120.5), {
+  kind: "offset",
+  offset: 120.5,
+});
+
+const historyGate = new OlderHistoryLoadGate();
+historyGate.beginGesture();
+assert.equal(historyGate.acquire(), true);
+assert.equal(historyGate.acquire(), false, "one gesture can start only one prepend");
+historyGate.complete();
+assert.equal(historyGate.acquire(), false,
+  "finishing a page while the same finger is down must not chain another page");
+historyGate.endGesture();
+historyGate.beginGesture();
+assert.equal(historyGate.acquire(), true, "a new pull gesture may load the next page");
+historyGate.complete();
+historyGate.endGesture();
+
+// Merely painting at the top (short history, session switch, or layout clamp)
+// must not start pagination. A real gesture toward older content does, within
+// a small top threshold, and only while another local/server page exists.
+assert.equal(shouldAutoLoadOlderHistory({
+  scrollHeight: 1_200,
+  scrollTop: AUTO_LOAD_HISTORY_TOP_PX,
+  clientHeight: 600,
+}, true, true), true);
+assert.equal(shouldAutoLoadOlderHistory({
+  scrollHeight: 1_200,
+  scrollTop: AUTO_LOAD_HISTORY_TOP_PX + 1,
+  clientHeight: 600,
+}, true, true), false);
+assert.equal(shouldAutoLoadOlderHistory({
+  scrollHeight: 1_200,
+  scrollTop: 0,
+  clientHeight: 600,
+}, false, true), false);
+assert.equal(shouldAutoLoadOlderHistory({
+  scrollHeight: 1_200,
+  scrollTop: 0,
+  clientHeight: 600,
+}, true, false), false);
+
+const historyAnchor = new HistoryAnchorController();
+const firstAnchorGeneration = historyAnchor.begin({
+  sid: "session-a",
+  revision: "revision-a",
+  before: "cursor-a",
+  source: "server",
+  anchorTurnId: "turn-10",
+  oldestTurnId: "turn-10",
+  anchorOffset: 18,
+});
+assert.equal(historyAnchor.current()?.phase, "pending");
+historyAnchor.observeUserScroll(true);
+assert.deepEqual(historyAnchor.current()?.anchorTurnId, "turn-10",
+  "rubber-banding at the history edge keeps the frozen page boundary");
+assert.equal(historyAnchor.markApplied(firstAnchorGeneration), true);
+assert.equal(historyAnchor.current()?.phase, "applied");
+assert.equal(historyAnchor.rebase(firstAnchorGeneration, {
+  anchorTurnId: "turn-12",
+  oldestTurnId: "turn-1",
+  anchorOffset: 31,
+}), true);
+assert.deepEqual(historyAnchor.current(), {
+  sid: "session-a",
+  revision: "revision-a",
+  before: "cursor-a",
+  source: "server",
+  generation: firstAnchorGeneration,
+  phase: "applied",
+  anchorTurnId: "turn-12",
+  oldestTurnId: "turn-1",
+  anchorOffset: 31,
+}, "a user scroll after the page attaches rebases the residual correction");
+assert.equal(historyAnchor.rebase(firstAnchorGeneration + 1, {
+  anchorTurnId: "turn-13",
+  oldestTurnId: "turn-1",
+  anchorOffset: 12,
+}), false, "a stale gesture cannot rebase a newer transaction");
+historyAnchor.cancel();
+
+const abandonedAnchorGeneration = historyAnchor.begin({
+  sid: "session-a",
+  revision: "revision-a",
+  before: "cursor-a",
+  source: "server",
+  anchorTurnId: "turn-10",
+  oldestTurnId: "turn-10",
+  anchorOffset: 18,
+});
+historyAnchor.observeUserScroll(false);
+assert.equal(historyAnchor.current(), null,
+  "leaving the history edge while a page is pending prevents a delayed jump");
+assert.equal(historyAnchor.markApplied(abandonedAnchorGeneration), false);
+
+const staleAnchorGeneration = historyAnchor.begin({
+  sid: "session-a",
+  revision: "revision-a",
+  before: "cursor-a",
+  source: "server",
+  anchorTurnId: "turn-10",
+  oldestTurnId: "turn-10",
+  anchorOffset: 18,
+});
+const currentAnchorGeneration = historyAnchor.begin({
+  sid: "session-a",
+  revision: "revision-a",
+  before: "cursor-b",
+  source: "server",
+  anchorTurnId: "turn-5",
+  oldestTurnId: "turn-5",
+  anchorOffset: 24,
+});
+assert.equal(historyAnchor.markApplied(staleAnchorGeneration), false,
+  "a stale layout effect cannot complete a newer history request");
+assert.equal(historyAnchor.current()?.generation, currentAnchorGeneration);
+const pendingPage = historyAnchor.current()!;
+assert.equal(historyPageStatus(pendingPage, {
+  sid: "session-a", revision: "revision-a",
+  cursor: "cursor-b", hasMore: true,
+}), "pending");
+assert.equal(historyPageStatus(pendingPage, {
+  sid: "session-a", revision: "revision-a",
+  cursor: "cursor-c", hasMore: true,
+}), "complete",
+  "cursor movement completes a page even when runtime turn length stays capped");
+assert.equal(historyPageStatus(pendingPage, {
+  sid: "session-a", revision: "revision-a",
+  cursor: "cursor-b", hasMore: false,
+}), "complete");
+assert.equal(historyPageStatus(pendingPage, {
+  sid: "session-a", revision: "revision-b",
+  cursor: "cursor-c", hasMore: true,
+}), "stale",
+  "a destructive history revision cannot reuse the old viewport anchor");
+assert.equal(historyPageStatus(pendingPage, {
+  sid: "session-b", revision: "revision-a",
+  cursor: "cursor-c", hasMore: true,
+}), "stale",
+  "a delayed page from another session cannot move this viewport");
+assert.equal(historyAnchor.markRendering(currentAnchorGeneration), true);
+assert.equal(historyAnchor.current()?.phase, "rendering",
+  "an accepted page may expand the render window only once before anchoring");
+assert.equal(historyAnchor.markRendering(currentAnchorGeneration), false,
+  "a synchronous layout re-render cannot reveal a second batch");
+historyAnchor.cancel();
 
 const controller = new ScrollFollowController();
 assert.deepEqual(controller.reset({
@@ -189,9 +407,39 @@ const chatViewSource = readFileSync(
   new URL("../../../../src/components/ChatView.tsx", import.meta.url),
   "utf8",
 );
-assert.match(chatViewSource, /className="thread-shell"/);
+const appSource = readFileSync(
+  new URL("../../../../src/App.tsx", import.meta.url),
+  "utf8",
+);
+assert.match(chatViewSource, /"thread-shell work-thread-shell"/);
+assert.match(chatViewSource, /onScroll[\s\S]*maybeAutoLoadOlder/,
+  "scrollbar and keyboard movement at the top must auto-load older history");
+assert.match(chatViewSource, /onWheel[\s\S]*maybeAutoLoadOlder/,
+  "an upward wheel gesture at the top must auto-load older history");
+assert.match(chatViewSource, /onTouchMove[\s\S]*maybeAutoLoadOlder/,
+  "a continued pull gesture at the top must auto-load older history");
+assert.match(chatViewSource, /useVirtualizer/);
+assert.match(chatViewSource, /measureElement/);
+assert.match(chatViewSource, /updateTurnKeySnapshot/);
+assert.doesNotMatch(chatViewSource, /turnsRef\.current/,
+  "old and new virtualizer options must not share a mutable turn-key source");
+assert.match(chatViewSource, /shouldAdjustScrollPositionOnItemSizeChange/,
+  "late virtual-row measurements must preserve the keyed history boundary");
+assert.doesNotMatch(chatViewSource, /HISTORY_ANCHOR_SETTLE_MS/,
+  "history anchoring must not expire on a guessed layout timer");
+assert.doesNotMatch(css, /content-visibility:auto/,
+  "freshly prepended rows must not use speculative intrinsic heights");
+assert.doesNotMatch(chatViewSource, /requestedOlderRef.*length/,
+  "page completion must use revision/cursor identity, never runtime length");
+assert.match(appSource, /historyRevision=\{rt\.historyRevision\}/);
+assert.match(appSource, /historyCursor=\{rt\.oldestId\}/);
+assert.match(chatViewSource, /turnNodeRefs/,
+  "history placement must use the retained keyed turn node instead of scanning the DOM");
 const threadShellRule = css.match(/\.thread-shell\{[^}]+\}/)?.[0] ?? "";
 assert.match(threadShellRule, /position:relative/);
+const threadRule = css.match(/\.thread\{[^}]+\}/)?.[0] ?? "";
+assert.match(threadRule, /overflow-anchor:none/,
+  "JS owns prepend anchoring; browser anchoring must be disabled");
 const scrollBottomRule = css.match(/\.scroll-bottom-wrap\{[^}]+\}/)?.[0] ?? "";
 assert.match(scrollBottomRule, /position:absolute/);
 assert.doesNotMatch(scrollBottomRule, /position:sticky/);

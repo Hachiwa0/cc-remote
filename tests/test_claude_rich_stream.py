@@ -500,6 +500,65 @@ def test_task_updates_keep_origin_turn_across_translator_instances():
     assert "must-not-forward" not in wire and "/private/task-output" not in wire
 
 
+def test_live_agent_tool_has_dedicated_realtime_lifecycle():
+    translator = StreamTranslator(10_000, turn_id="user-turn")
+    started = translator.feed(_assistant([
+        ToolUseBlock(
+            id="agent-tool", name="Agent",
+            input={
+                "description": "审查后端并报告风险",
+                "subagent_type": "code-reviewer",
+                "prompt": "private delegated prompt",
+            },
+        ),
+    ], stop_reason="tool_use"))
+    tool = next(event for event in started if isinstance(event, ToolUse))
+    agent = next(event for event in started if isinstance(event, ProcessEvent))
+    assert tool.category == "agent"
+    assert agent.item_id == "agent:agent-tool"
+    assert agent.parent_id == "agent-tool"
+    assert agent.kind == "agent" and agent.status == "running"
+    assert agent.title == "审查后端并报告风险"
+    assert agent.summary == "类型：code-reviewer"
+    assert agent.input is None and agent.output is None
+
+    progress = translator.feed(SystemMessage(
+        subtype="tool_progress",
+        data={"tool_use_id": "agent-tool", "message": "正在读取测试"},
+    ))
+    agent_progress = next(
+        event for event in progress if isinstance(event, ProcessEvent))
+    assert agent_progress.item_id == agent.item_id
+    assert agent_progress.phase == "update"
+    assert agent_progress.progress == "正在读取测试"
+
+    # A CLI task lifecycle for the same Agent tool must update the existing
+    # row rather than creating a second parallel-looking subagent.
+    task_started = translator.feed(TaskStartedMessage(
+        subtype="task_started", data={}, task_id="task-1",
+        description="审查后端并报告风险", uuid="u1", session_id="s1",
+        tool_use_id="agent-tool", task_type="agent",
+    ))
+    assert task_started[0].item_id == agent.item_id
+
+    ended = translator.feed(UserMessage(
+        content=[ToolResultBlock(
+            tool_use_id="agent-tool", content="review complete",
+            is_error=False,
+        )],
+        tool_use_result={
+            "agentType": "code-reviewer", "status": "completed",
+            "totalToolUseCount": 3, "totalDurationMs": 2500,
+        },
+    ))
+    completed = next(
+        event for event in ended
+        if isinstance(event, ProcessEvent) and event.phase == "end")
+    assert completed.item_id == agent.item_id
+    assert completed.status == "succeeded" and completed.duration_ms == 2500
+    assert "工具调用：3" in (completed.summary or "")
+
+
 def test_hook_lifecycle_forwards_only_safe_metadata():
     translator = StreamTranslator(4096, turn_id="turn-1")
     common = {

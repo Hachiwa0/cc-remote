@@ -28,10 +28,13 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 19
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
+Space = Literal["code", "work"]
+RestoreMode = Literal["conversation", "files", "both"]
+RestoreOutcome = Literal["succeeded", "failed", "skipped"]
 AssistantChannel = Literal["unknown", "thinking", "commentary", "final"]
 ToolCategory = Literal[
     "tool", "command", "file", "mcp", "agent", "server_tool", "web_search",
@@ -56,6 +59,13 @@ PermissionMode = Literal[
     "never", "on-request", "untrusted",
 ]
 CollaborationModeName = Literal["default", "plan"]
+ControlMode = Literal[
+    "remote", "codex_shared", "claude_broker", "external_cli",
+    "agent_view", "desktop",
+]
+WriteState = Literal[
+    "writable", "read_only", "takeover_pending", "input_busy",
+]
 ModelName = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 WireId = Annotated[
     str,
@@ -76,6 +86,8 @@ ASK_OPTION_MAX_COUNT = 5
 FILE_PREVIEW_MAX_BYTES = 512 * 1024
 PREVIEW_ASSET_MAX_BYTES = 4 * 1024 * 1024
 MAX_ENCODED_PREVIEW_ASSET_CHARS = ((PREVIEW_ASSET_MAX_BYTES + 2) // 3) * 4
+ARTIFACT_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
+MAX_ENCODED_ARTIFACT_PREVIEW_CHARS = ((ARTIFACT_PREVIEW_MAX_BYTES + 2) // 3) * 4
 
 
 def _valid_attachment_filename(value: str) -> str:
@@ -138,6 +150,9 @@ FileMtimeNs = Annotated[
 PreviewAssetData = Annotated[
     str, StringConstraints(min_length=1, max_length=MAX_ENCODED_PREVIEW_ASSET_CHARS),
 ]
+ArtifactPreviewData = Annotated[
+    str, StringConstraints(min_length=1, max_length=MAX_ENCODED_ARTIFACT_PREVIEW_CHARS),
+]
 StatusErrorText = Annotated[
     str, StringConstraints(min_length=1, max_length=384),
 ]
@@ -165,6 +180,17 @@ class QueryImage(TypedDict):
     __pydantic_config__ = ConfigDict(extra="forbid")
     media_type: Literal["image/png", "image/jpeg", "image/jpg", "image/webp"]
     data: AttachmentData
+
+
+class ConversationImageRef(TypedDict):
+    """Payload-free locator for one user image in materialized history."""
+
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    image_id: WireId
+    media_type: Literal["image/png", "image/jpeg", "image/jpg", "image/webp"]
+    width: int
+    height: int
+    byte_size: int
 
 
 class QueryFile(TypedDict):
@@ -203,6 +229,7 @@ ERR_CC_CRASH = "cc_crash"
 ERR_BAD_PROMPT = "bad_prompt"
 ERR_PROTOCOL = "protocol"
 ERR_INTERNAL = "internal"
+ERR_INVALID_CWD = "invalid_cwd"
 ERR_WRAPPER_OFFLINE = "wrapper_offline"
 ERR_WRAPPER_ALREADY_CONNECTED = "wrapper_already_connected"
 ERR_AUTH = "auth"
@@ -248,6 +275,7 @@ class Hello(_Base):
     type: Literal["hello"] = "hello"
     role: Literal["client", "wrapper"]
     client_id: Optional[WireId] = None  # client
+    machine_id: Optional[WireId] = None  # relay route; wrapper identity
     last_seq: Optional[int] = None  # client (legacy: focused session only)
     cursors: Optional[dict[WireId, int]] = None  # client: per-session last_seq for multi-session catch-up
     generations: Optional[dict[WireId, WireId]] = None  # client: wrapper generation paired with each cursor
@@ -307,6 +335,32 @@ class TakeoverState(_Base):
     type: Literal["takeover_state"] = "takeover_state"
     pending: bool
     message: Optional[str] = Field(default=None, max_length=4096)
+
+
+class SessionControl(_Base):
+    """Authoritative, revisioned control state for one session.
+
+    ``control_mode`` says which surface currently coordinates the session;
+    ``write_state`` independently says whether the Web composer may write.
+    Consumers must accept only increasing revisions. An equal revision is
+    idempotent only when every control field is unchanged.
+
+    ``can_takeover`` advertises that a migration action can be shown. It is a
+    capability hint, not proof that a takeover command has already been
+    authorized or completed.
+    """
+
+    type: Literal["session_control"] = "session_control"
+    control_mode: ControlMode
+    write_state: WriteState
+    terminal_attached: bool
+    reason: Optional[str] = Field(default=None, max_length=4096)
+    # Wrapper lifetime that owns the numeric revision. A new generation starts
+    # a fresh revision epoch; generation-less values exist only for the short
+    # v15 migration window and never overwrite generation-bound control.
+    generation: Optional[WireId] = None
+    revision: int = Field(ge=0, le=9_007_199_254_740_991)
+    can_takeover: Optional[bool] = None
 
 
 class SetModel(_Command):
@@ -412,6 +466,10 @@ class Snapshot(_Base):
     tail_text: str = ""
     cwd: Optional[str] = None  # active cc cwd, so the client knows the current project
     generation: Optional[WireId] = None
+    # Latest authoritative control value. It is intentionally also available as
+    # a live SessionControl event; embedding it here closes reconnect races when
+    # the corresponding control event has already fallen out of the ring.
+    control: Optional[SessionControl] = None
 
 
 class StateEvent(_Base):
@@ -580,6 +638,18 @@ class TurnDiff(_Base):
     truncated: Optional[bool] = None
 
 
+class TurnBinding(_Base):
+    """Bind one browser optimistic message id to Codex's native turn id.
+
+    Codex persists the native id in rollout history, while the browser creates
+    ``msg_id`` before ``turn/start``.  The mapping is authoritative and lets a
+    history refresh reconcile the same turn without timestamp heuristics.
+    """
+    type: Literal["turn_binding"] = "turn_binding"
+    msg_id: WireId
+    turn_id: WireId
+
+
 class TurnResult(BaseModel):
     """Subset of ResultMessage forwarded to clients."""
     model_config = ConfigDict(extra="allow")
@@ -598,6 +668,9 @@ class TurnEnd(_Base):
     # Synthetic/legacy boundaries without a real engine id leave it unset.
     # The legacy wire name stays stable for protocol-v5 browser compatibility.
     turn_id: Optional[WireId] = None
+    # Claude's file-checkpoint API targets the top-level user transcript UUID,
+    # not the assistant UUID above or the browser's optimistic message id.
+    checkpoint_id: Optional[WireId] = None
 
 
 class Error(_Base):
@@ -636,10 +709,13 @@ class SessionInfo(BaseModel):
     git_branch: Optional[str] = None
     cwd: Optional[str] = None
     tag: Optional[str] = None  # SDK session tag; "archived" hides the card in the sidebar
+    pinned: bool = False  # cc-remote sidebar preference; engine transcripts stay untouched
     state: Optional[State] = None  # if resident: this session's idle/running/... (sidebar status dot)
     engine: Optional[str] = None  # "claude" | "codex"; None = claude (legacy sidebar badge)
     forked_from_id: Optional[WireId] = None  # Codex thread/fork parent, when present
     codex_status: Optional[CodexThreadStatus] = None  # authoritative app-server status
+    space: Space = "code"
+    work_id: Optional[WireId] = None
 
 
 class ListSessions(_Command):
@@ -648,13 +724,30 @@ class ListSessions(_Command):
     optional, default claude."""
     type: Literal["list_sessions"] = "list_sessions"
     engine: Literal["claude", "codex"] = "claude"
+    space: Space = "code"
 
 
 class SessionList(_Base):
     """wrapper -> client: the sessions (downstream so a reconnect restores it)."""
     type: Literal["session_list"] = "session_list"
     engine: Literal["claude", "codex"]
+    space: Space = "code"
     sessions: list[SessionInfo]
+
+
+class SessionActivity(_Base):
+    """Lightweight sidebar lifecycle for a session that need not be resident.
+
+    Native Codex App turns can update a rollout owned by another app-server, so
+    the wrapper may know that a cold session is running without having a live
+    conversation runtime for it.  Keep this separate from ``StateEvent``: the
+    latter controls the composer/runtime, while this event only updates catalog
+    presentation.
+    """
+    type: Literal["session_activity"] = "session_activity"
+    engine: Literal["claude", "codex"]
+    session_id: WireId
+    state: State
 
 
 class SwitchSession(_Command):
@@ -663,6 +756,7 @@ class SwitchSession(_Command):
     type: Literal["switch_session"] = "switch_session"
     session_id: WireId
     engine: Optional[Engine] = None
+    space: Space = "code"
 
 
 class NewSession(_Command):
@@ -680,6 +774,8 @@ class NewSession(_Command):
     request_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
     engine: Engine = "claude"
+    space: Space = "code"
+    project_id: Optional[WireId] = None
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
     effort: Optional[EffortLevel] = None  # None -> engine default
     collaboration_mode: Optional[CollaborationModeName] = None  # Codex only; first turn included
@@ -709,7 +805,251 @@ class NewSession(_Command):
         if invalid:
             raise ValueError(
                 f"{', '.join(invalid)} only supported for Codex sessions")
+        if self.space == "work" and self.cwd is not None:
+            raise ValueError("Work session cwd is assigned by the wrapper")
+        if self.space == "code" and self.project_id is not None:
+            raise ValueError("project_id is only supported for Work sessions")
         return self
+
+
+class DeleteWorkSession(_Command):
+    """Permanently delete one registered Work chat and its owned files."""
+    type: Literal["delete_work_session"] = "delete_work_session"
+    session_id: WireId
+    engine: Engine
+    space: Literal["work"] = "work"
+
+
+class DeleteSession(_Command):
+    """Permanently delete a native Code session or a registered Work session."""
+    type: Literal["delete_session"] = "delete_session"
+    session_id: WireId
+    engine: Engine
+    space: Space = "code"
+
+
+class RollbackSession(_Command):
+    """Restore conversation state, files, or both for one Code session.
+
+    Claude targets an authoritative user-message checkpoint. Codex targets the
+    latest ``num_turns`` because app-server's rollback RPC is count-based.
+    Conversation and file restore deliberately report separate outcomes: the
+    two engines do not expose an atomic transaction spanning both operations.
+    """
+    type: Literal["rollback_session"] = "rollback_session"
+    session_id: WireId
+    engine: Engine
+    space: Literal["code"] = "code"
+    restore: RestoreMode = "conversation"
+    num_turns: int = Field(default=1, ge=1, le=1000)
+    checkpoint_id: Optional[WireId] = None
+
+    @model_validator(mode="after")
+    def target_matches_engine(self):
+        if self.engine == "claude" and self.checkpoint_id is None:
+            raise ValueError("Claude rewind requires checkpoint_id")
+        if self.engine == "codex" and self.checkpoint_id is not None:
+            raise ValueError("Codex rollback is count-based")
+        return self
+
+
+class RollbackResult(_Base):
+    """Structured, non-atomic restore result for the confirmation UI."""
+    type: Literal["rollback_result"] = "rollback_result"
+    session_id: WireId
+    engine: Engine
+    restore: RestoreMode
+    conversation: RestoreOutcome
+    files: RestoreOutcome
+    restored_turns: int = Field(default=0, ge=0, le=1000)
+    conflicts: list[str] = Field(default_factory=list, max_length=128)
+    prefill_text: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
+    detail: Optional[str] = Field(default=None, max_length=4 * 1024)
+
+
+class CompactSession(_Command):
+    type: Literal["compact_session"] = "compact_session"
+    session_id: WireId
+    engine: Literal["codex"] = "codex"
+    space: Literal["code"] = "code"
+
+
+class StartReview(_Command):
+    type: Literal["start_review"] = "start_review"
+    session_id: WireId
+    engine: Literal["codex"] = "codex"
+    space: Literal["code"] = "code"
+    target: Literal["uncommittedChanges", "baseBranch", "commit", "custom"]
+    value: Optional[str] = Field(default=None, max_length=16 * 1024)
+
+    @model_validator(mode="after")
+    def target_value_matches(self):
+        value = (self.value or "").strip()
+        if self.target == "uncommittedChanges":
+            if value:
+                raise ValueError("uncommittedChanges does not accept a value")
+            self.value = None
+        elif not value:
+            raise ValueError(f"{self.target} requires a value")
+        else:
+            self.value = value
+        return self
+
+
+class WorkProjectInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_id: WireId
+    name: str = Field(max_length=200)
+    description: str = Field(max_length=16 * 1024)
+    created_at: float = Field(ge=0)
+    updated_at: float = Field(ge=0)
+
+
+class WorkSourceInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: WireId
+    project_id: WireId
+    kind: Literal["file", "link", "note"]
+    title: str = Field(max_length=500)
+    uri: Optional[str] = Field(default=None, max_length=16 * 1024)
+    created_at: float = Field(ge=0)
+
+
+class WorkPluginInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    plugin_id: WireId
+    project_id: Optional[WireId] = None
+    name: str = Field(max_length=200)
+    instructions: str = Field(max_length=64 * 1024)
+    enabled: bool
+    created_at: float = Field(ge=0)
+    updated_at: float = Field(ge=0)
+
+
+class WorkScheduleInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schedule_id: WireId
+    project_id: Optional[WireId] = None
+    title: str = Field(max_length=200)
+    prompt: str = Field(max_length=64 * 1024)
+    next_run_at: float = Field(ge=0)
+    repeat_seconds: Optional[int] = Field(default=None, ge=60, le=31_536_000)
+    enabled: bool
+    last_run_at: Optional[float] = Field(default=None, ge=0)
+    last_session_id: Optional[WireId] = None
+    last_error: Optional[str] = Field(default=None, max_length=2000)
+    last_run_id: Optional[WireId] = None
+    last_run_status: Optional[
+        Literal["queued", "claimed", "running", "succeeded", "failed"]
+    ] = None
+    last_run_attempt: Optional[int] = Field(default=None, ge=0, le=100)
+    created_at: float = Field(ge=0)
+    updated_at: float = Field(ge=0)
+
+
+class WorkDashboard(_Base):
+    type: Literal["work_dashboard"] = "work_dashboard"
+    engine: Engine
+    projects: list[WorkProjectInfo] = Field(max_length=500)
+    sources: list[WorkSourceInfo] = Field(max_length=5000)
+    plugins: list[WorkPluginInfo] = Field(max_length=500)
+    schedules: list[WorkScheduleInfo] = Field(max_length=500)
+
+
+class GetWorkDashboard(_Command):
+    type: Literal["get_work_dashboard"] = "get_work_dashboard"
+    engine: Engine = "claude"
+
+
+class CreateWorkProject(_Command):
+    type: Literal["create_work_project"] = "create_work_project"
+    engine: Engine = "claude"
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=16 * 1024)
+
+
+class DeleteWorkProject(_Command):
+    type: Literal["delete_work_project"] = "delete_work_project"
+    engine: Engine = "claude"
+    project_id: WireId
+
+
+class AddWorkSource(_Command):
+    type: Literal["add_work_source"] = "add_work_source"
+    engine: Engine = "claude"
+    project_id: WireId
+    kind: Literal["file", "link", "note"]
+    title: str = Field(min_length=1, max_length=500)
+    uri: Optional[str] = Field(default=None, max_length=16 * 1024)
+    file: Optional[QueryFile] = None
+
+    @model_validator(mode="after")
+    def source_payload_matches_kind(self):
+        if self.kind == "file" and self.file is None:
+            raise ValueError("file Work source requires file")
+        if self.kind != "file" and self.file is not None:
+            raise ValueError("non-file Work source cannot contain file")
+        if self.kind in {"link", "note"} and not (self.uri or "").strip():
+            raise ValueError("Work source requires uri or note content")
+        return self
+
+
+class DeleteWorkSource(_Command):
+    type: Literal["delete_work_source"] = "delete_work_source"
+    engine: Engine = "claude"
+    source_id: WireId
+
+
+class CreateWorkPlugin(_Command):
+    type: Literal["create_work_plugin"] = "create_work_plugin"
+    engine: Engine = "claude"
+    project_id: Optional[WireId] = None
+    name: str = Field(min_length=1, max_length=200)
+    instructions: str = Field(min_length=1, max_length=64 * 1024)
+
+
+class DeleteWorkPlugin(_Command):
+    type: Literal["delete_work_plugin"] = "delete_work_plugin"
+    engine: Engine = "claude"
+    plugin_id: WireId
+
+
+class CreateWorkSchedule(_Command):
+    type: Literal["create_work_schedule"] = "create_work_schedule"
+    engine: Engine = "claude"
+    project_id: Optional[WireId] = None
+    title: str = Field(min_length=1, max_length=200)
+    prompt: str = Field(min_length=1, max_length=64 * 1024)
+    next_run_at: float = Field(ge=0)
+    repeat_seconds: Optional[int] = Field(default=None, ge=60, le=31_536_000)
+
+
+class DeleteWorkSchedule(_Command):
+    type: Literal["delete_work_schedule"] = "delete_work_schedule"
+    engine: Engine = "claude"
+    schedule_id: WireId
+
+
+class GetWorkArtifacts(_Command):
+    type: Literal["get_work_artifacts"] = "get_work_artifacts"
+    engine: Engine = "claude"
+    session_id: WireId
+
+
+class WorkArtifactInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: PreviewPath
+    size: int = Field(ge=0)
+    modified_at: float = Field(ge=0)
+    kind: Literal["document", "spreadsheet", "presentation", "image", "pdf", "file"]
+    previewable: bool = False
+
+
+class WorkArtifacts(_Base):
+    type: Literal["work_artifacts"] = "work_artifacts"
+    engine: Engine
+    session_id: WireId
+    artifacts: list[WorkArtifactInfo] = Field(max_length=200)
 
 
 class SessionFocus(_Base):
@@ -749,6 +1089,8 @@ class RenameSession(_Command):
     type: Literal["rename_session"] = "rename_session"
     session_id: WireId
     title: str = Field(min_length=1, max_length=200)
+    engine: Optional[Engine] = None
+    space: Space = "code"
 
 
 class ArchiveSession(_Command):
@@ -756,6 +1098,17 @@ class ArchiveSession(_Command):
     type: Literal["archive_session"] = "archive_session"
     session_id: WireId
     archived: bool
+    engine: Optional[Engine] = None
+    space: Space = "code"
+
+
+class PinSession(_Command):
+    """client -> wrapper: persist a cross-client sidebar pin preference."""
+    type: Literal["pin_session"] = "pin_session"
+    session_id: WireId
+    pinned: bool
+    engine: Optional[Engine] = None
+    space: Space = "code"
 
 
 class ForkSession(_Command):
@@ -857,6 +1210,88 @@ class Models(_Base):
     cwd: Optional[str] = Field(default=None, max_length=4096)
 
 
+class GetEngineCapabilities(_Command):
+    """Read the engine's real skill/plugin/app/MCP inventory on demand."""
+    type: Literal["get_engine_capabilities"] = "get_engine_capabilities"
+    engine: Engine
+    space: Space = "code"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class ManageEnginePlugin(_Command):
+    """Install or uninstall one plugin through the engine's native manager."""
+    type: Literal["manage_engine_plugin"] = "manage_engine_plugin"
+    engine: Engine
+    action: Literal["install", "uninstall"]
+    plugin_id: str = Field(min_length=1, max_length=512)
+    space: Space = "code"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class ManageEngineSkill(_Command):
+    """Create/remove a local skill, or toggle it through a native engine API."""
+    type: Literal["manage_engine_skill"] = "manage_engine_skill"
+    engine: Engine
+    action: Literal["create", "remove", "enable", "disable"]
+    skill_id: Optional[str] = Field(default=None, min_length=1, max_length=512)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=4096)
+    instructions: Optional[str] = Field(default=None, max_length=128 * 1024)
+    scope: Literal["user", "project"] = "user"
+    space: Space = "code"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class ManageEngineHook(_Command):
+    """Create/remove a Claude command hook. Codex hooks are read-only today."""
+    type: Literal["manage_engine_hook"] = "manage_engine_hook"
+    engine: Engine
+    action: Literal["create", "remove"]
+    hook_id: Optional[str] = Field(default=None, min_length=1, max_length=512)
+    event: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    matcher: Optional[str] = Field(default=None, max_length=2048)
+    command: Optional[str] = Field(default=None, max_length=16 * 1024)
+    timeout: Optional[int] = Field(default=None, ge=1, le=3600)
+    scope: Literal["user", "project"] = "user"
+    space: Space = "code"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class EngineCapabilityItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["skill", "plugin", "app", "mcp", "hook"]
+    id: str = Field(max_length=512)
+    name: str = Field(max_length=512)
+    description: Optional[str] = Field(default=None, max_length=16 * 1024)
+    enabled: Optional[bool] = None
+    installed: Optional[bool] = None
+    status: Optional[str] = Field(default=None, max_length=256)
+    scope: Optional[str] = Field(default=None, max_length=256)
+    source: Optional[str] = Field(default=None, max_length=256)
+    tool_count: Optional[int] = Field(default=None, ge=0, le=100_000)
+    resource_count: Optional[int] = Field(default=None, ge=0, le=100_000)
+    install_url: Optional[str] = Field(default=None, max_length=4096)
+    actions: list[Literal["install", "uninstall", "enable", "disable", "remove"]] = Field(
+        default_factory=list, max_length=8)
+    event: Optional[str] = Field(default=None, max_length=128)
+    matcher: Optional[str] = Field(default=None, max_length=2048)
+    handler_type: Optional[str] = Field(default=None, max_length=128)
+    detail: Optional[str] = Field(default=None, max_length=4096)
+
+
+class EngineCapabilities(_Base):
+    type: Literal["engine_capabilities"] = "engine_capabilities"
+    engine: Engine
+    space: Space
+    items: list[EngineCapabilityItem] = Field(max_length=2000)
+    errors: list[str] = Field(default_factory=list, max_length=32)
+    notes: list[str] = Field(default_factory=list, max_length=32)
+
+
 class SetPerm(_Command):
     """client -> wrapper: switch the cc session's permission mode (runtime, no reconnect)."""
     type: Literal["set_perm"] = "set_perm"
@@ -882,6 +1317,18 @@ class ContextReport(_Base):
     total_tokens: int
     max_tokens: int
     percentage: float
+    # Codex does not expose tokenUsage immediately after an excludeTurns resume.
+    # Keep the numeric fields for wire compatibility, but mark the reading as
+    # unavailable instead of presenting a fabricated 0% to the user.  ``None``
+    # is omitted so older Code reports retain their exact historical shape.
+    available: Optional[bool] = None
+    # Work reports keep the engine's real context usage above for honest
+    # remaining-capacity calculations, while exposing the fresh-session startup
+    # zero point separately so Work shows later conversation growth.
+    # Code omits these fields and retains the historical wire contract.
+    session_tokens: Optional[int] = None
+    fixed_tokens: Optional[int] = None
+    session_percentage: Optional[float] = None
     model: Optional[str] = None
     is_auto_compact_enabled: Optional[bool] = None
     categories: list[dict[str, Any]] = []
@@ -1042,6 +1489,7 @@ class DiffReport(_Base):
     type: Literal["diff_report"] = "diff_report"
     file: str
     diff: str
+    request_id: Optional[WireId] = None
 
 
 class GetFilePreview(_Command):
@@ -1052,12 +1500,23 @@ class GetFilePreview(_Command):
 
 
 class FilePreview(_Base):
-    """wrapper -> requesting client: bounded text source or a safe error."""
+    """wrapper -> requesting client: bounded source or locally-rendered artifact.
+
+    Binary previews are transported directly through the authenticated relay;
+    the relay never writes them to disk. Office files are converted by the
+    wrapper host and report their original extension in ``converted_from``.
+    """
     type: Literal["file_preview"] = "file_preview"
     path: PreviewPath
     request_id: WireId
-    format: Literal["markdown", "text"] = "text"
+    format: Literal["markdown", "text", "html", "image", "pdf"] = "text"
     content: PreviewContent = ""
+    media_type: Optional[Literal[
+        "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
+        "application/pdf",
+    ]] = None
+    data: Optional[ArtifactPreviewData] = None
+    converted_from: Optional[str] = Field(default=None, max_length=16)
     size: int = Field(default=0, ge=0)
     truncated: bool = False
     mtime_ns: FileMtimeNs = "0"
@@ -1114,11 +1573,13 @@ class PreviewAsset(_Base):
 
 
 class GetHistory(_Command):
-    """client -> wrapper: request a session's history, read ON-DEMAND from its
-    transcript (NOT the ring buffer, NOT requiring the session to be resident).
-    This replaces per-session buffer replay on hello — history is fetched once
-    when a session is opened, like a web chat's GET /conversation. `before`/
-    `limit` page older turns (load-more); omit both for the whole history."""
+    """client -> wrapper: request a source-bound materialized history page.
+
+    This never uses the live ring and never requires a resident engine. Web
+    clients request the lightweight canonical summary; compatibility clients
+    may still request the translated full event page. ``before``/``limit`` page
+    older turns.
+    """
     type: Literal["get_history"] = "get_history"
     session_id: WireId
     client_id: Optional[WireId] = None  # requester, so the wrapper routes History back to=<client_id>
@@ -1127,22 +1588,74 @@ class GetHistory(_Command):
     # authoritative engine turn_id for an assistant-only automatic continuation.
     before: Optional[WireId] = None
     limit: Optional[int] = Field(default=None, ge=1, le=200)
+    detail: Literal["summary", "full"] = "full"
+
+
+class ConversationTurn(BaseModel):
+    """Canonical lightweight turn rendered without replaying raw events."""
+    model_config = ConfigDict(extra="forbid")
+    id: WireId
+    prompt: str = Field(default="", max_length=128 * 1024)
+    blocks: list[dict[str, Any]] = Field(default_factory=list, max_length=32)
+    done: bool = False
+    forkPointId: Optional[WireId] = None
+    checkpointId: Optional[WireId] = None
+    interrupted: Optional[bool] = None
+    error: Optional[str] = Field(default=None, max_length=64 * 1024)
+    images: Optional[list[QueryImage]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+    imageRefs: Optional[list[ConversationImageRef]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+    files: Optional[list[UserFileMeta]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+    ts: Optional[int] = Field(default=None, ge=0)
+    doneTs: Optional[int] = Field(default=None, ge=0)
+    durationMs: Optional[int] = Field(default=None, ge=0)
+    detailEventCount: int = Field(default=0, ge=0)
+    detailLoaded: bool = False
 
 
 class History(_Base):
-    """wrapper -> client: a session's history as ONE bulk frame (one-shot, like
-    ContextReport/SessionList — NOT seq'd/buffered). `events` are already-
-    serialized narrative event dicts (same shape as the live stream) that the
-    client applies in a single reducer pass into runtimes[session_id], deduped
-    by msg_id/message_id against any live tail. Routed to=<client_id>, EXCEPT the
-    mirror push below, which is broadcast."""
+    """wrapper -> client: one summary or compatibility event page.
+
+    The frame is one-shot and requester-routed, not seq'd/buffered. Summary
+    pages carry canonical ``turns`` plus small control rows; full pages carry
+    translated ``events``. Live incomplete turns are reconciled client-side.
+    """
     type: Literal["history"] = "history"
     session_id: WireId
+    # Boot-scoped authoritative transcript revision.  Browsers persist this
+    # beside cached turns and must replace completed cache state whenever it
+    # changes, including after a wrapper restart or destructive rewind.
+    revision: WireId
+    # Wrapper lifetime that owns build_seq. It lets clients reject a pre-
+    # rollback response across revision epochs while still accepting build_seq
+    # restarting from one after a real wrapper restart.
+    generation: Optional[WireId] = None
+    # Monotonic per-session sequence for newest-page builds. Pagination echoes
+    # the sequence of the newest page it belongs to, so a browser can reject an
+    # older first page without rejecting a valid older page from the same view.
+    build_seq: int = Field(default=0, ge=0)
+    # Resident-session downstream sequence captured before transcript I/O.
+    # When the browser has already consumed a newer live event, this History is
+    # still useful for merging older rows but cannot delete the newer live tail.
+    live_seq: Optional[int] = Field(default=None, ge=0)
+    # A parse/read failure is not an authoritative empty transcript. Keeping the
+    # failure on the History envelope lets clients stop loading without erasing
+    # their last known good conversation.
+    authoritative: bool = True
+    error: Optional[str] = Field(default=None, max_length=4096)
     events: list[dict[str, Any]] = []
+    turns: list[ConversationTurn] = []
+    detail: Literal["summary", "full"] = "full"
     has_more: bool = False            # older turns exist beyond what's returned (pagination)
     oldest_id: Optional[str] = None   # first returned stable turn cursor
     newest_id: Optional[str] = None   # last returned stable turn cursor
     before: Optional[str] = None      # echoes the request's `before`: set => this is an OLDER page (client prepends)
+    # Control is revisioned independently from transcript history/build_seq.
+    # Browsers may accept a newer control snapshot even when this History's
+    # narrative page is stale or non-authoritative.
+    control: Optional[SessionControl] = None
     # True => this session's transcript is being appended to by an EXTERNAL process
     # (a native `claude`/`codex` in the user's terminal), not by us. The wrapper
     # mirrors those appends by broadcasting a fresh History; the client renders the
@@ -1156,6 +1669,82 @@ class History(_Base):
     # transcript has no ResultMessage, so the final History TurnEnd is synthetic;
     # clients must not let it close their matching live tail while this is true.
     in_progress: bool = False
+    # Authoritative replacement after a destructive history mutation such as
+    # Codex rollback. Ordinary loads merge with a live tail; reset loads must
+    # discard turns that the engine has just removed.
+    reset: bool = False
+
+
+class GetTurnDetail(_Command):
+    """client -> wrapper: fetch heavyweight records for one visible turn."""
+    type: Literal["get_turn_detail"] = "get_turn_detail"
+    session_id: WireId
+    turn_id: WireId
+    client_id: Optional[WireId] = None
+    revision: Optional[WireId] = None
+
+
+class TurnDetail(_Base):
+    """wrapper -> requester: full translated events for one turn."""
+    type: Literal["turn_detail"] = "turn_detail"
+    session_id: WireId
+    turn_id: WireId
+    revision: WireId
+    authoritative: bool = True
+    error: Optional[str] = Field(default=None, max_length=4096)
+    events: list[dict[str, Any]] = []
+
+
+class GetHistoryImage(_Command):
+    """client -> wrapper: fetch one indexed historical user image."""
+    type: Literal["get_history_image"] = "get_history_image"
+    session_id: WireId
+    turn_id: WireId
+    image_id: WireId
+    variant: Literal["thumbnail", "full"]
+    request_id: WireId
+    client_id: Optional[WireId] = None
+    revision: Optional[WireId] = None
+
+
+class HistoryImage(_Base):
+    """wrapper -> requester: correlated thumbnail or full historical image."""
+    type: Literal["history_image"] = "history_image"
+    session_id: WireId
+    turn_id: WireId
+    image_id: WireId
+    variant: Literal["thumbnail", "full"]
+    request_id: WireId
+    revision: WireId
+    media_type: Optional[Literal[
+        "image/png", "image/jpeg", "image/jpg", "image/webp",
+    ]] = None
+    width: Optional[int] = Field(default=None, ge=1, le=8192)
+    height: Optional[int] = Field(default=None, ge=1, le=8192)
+    data: Optional[AttachmentData] = None
+    error: Optional[str] = Field(default=None, max_length=512)
+
+
+class HistoryInvalidated(_Base):
+    """Small replayable barrier emitted before destructive history replacement.
+
+    A complete History frame can exceed the bounded ring and is intentionally
+    one-shot. This marker remains replayable, so an offline client always drops
+    turns removed by rollback before its next transcript refresh is merged.
+    """
+
+    type: Literal["history_invalidated"] = "history_invalidated"
+    session_id: WireId
+    revision: WireId
+    reason: Literal["rollback"] = "rollback"
+
+
+class ArtifactInvalidated(_Base):
+    """Replayable barrier for previews made stale by file rollback."""
+
+    type: Literal["artifact_invalidated"] = "artifact_invalidated"
+    session_id: WireId
+    reason: Literal["rollback"] = "rollback"
 
 
 class AskUser(_Base):
@@ -1244,13 +1833,13 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetModels, ListSessions, SwitchSession, NewSession, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, Models, AskUser, AnswerQuestion,
-    SessionList, SessionFocus, SessionRekey, RenameSession, ArchiveSession,
+    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
+    SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
-    AssistantMsgEnd, ProcessEvent, TurnPlan, TurnDiff,
+    AssistantMsgEnd, ProcessEvent, TurnPlan, TurnDiff, TurnBinding,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
 
@@ -1259,10 +1848,11 @@ AnyMessage = Union[
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
     "user_msg", "state", "model", "effort", "perm", "fast",
-    "collaboration_mode", "btw_opened",
+    "collaboration_mode", "session_control", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
-    "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_end",
-    "error", "ask_user",
+    "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_binding",
+    "turn_end",
+    "error", "ask_user", "history_invalidated", "artifact_invalidated",
 })
 
 _TYPE_MAP: dict[str, type[BaseModel]] = {
@@ -1271,6 +1861,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "interrupt": Interrupt,
     "takeover": Takeover,
     "takeover_state": TakeoverState,
+    "session_control": SessionControl,
     "set_model": SetModel,
     "set_effort": SetEffort,
     "set_service_tier": SetServiceTier,
@@ -1286,13 +1877,37 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "save_markdown": SaveMarkdown,
     "get_preview_asset": GetPreviewAsset,
     "get_history": GetHistory,
+    "get_turn_detail": GetTurnDetail,
+    "get_history_image": GetHistoryImage,
     "get_models": GetModels,
     "models": Models,
+    "get_engine_capabilities": GetEngineCapabilities,
+    "engine_capabilities": EngineCapabilities,
+    "manage_engine_plugin": ManageEnginePlugin,
+    "manage_engine_skill": ManageEngineSkill,
+    "manage_engine_hook": ManageEngineHook,
     "list_sessions": ListSessions,
     "switch_session": SwitchSession,
     "new_session": NewSession,
+    "delete_work_session": DeleteWorkSession,
+    "delete_session": DeleteSession,
+    "rollback_session": RollbackSession,
+    "rollback_result": RollbackResult,
+    "compact_session": CompactSession,
+    "start_review": StartReview,
+    "get_work_dashboard": GetWorkDashboard,
+    "create_work_project": CreateWorkProject,
+    "delete_work_project": DeleteWorkProject,
+    "add_work_source": AddWorkSource,
+    "delete_work_source": DeleteWorkSource,
+    "create_work_plugin": CreateWorkPlugin,
+    "delete_work_plugin": DeleteWorkPlugin,
+    "create_work_schedule": CreateWorkSchedule,
+    "delete_work_schedule": DeleteWorkSchedule,
+    "get_work_artifacts": GetWorkArtifacts,
     "rename_session": RenameSession,
     "archive_session": ArchiveSession,
+    "pin_session": PinSession,
     "fork_session": ForkSession,
     "fork_session_worktree": ForkSessionWorktree,
     "session_forked": SessionForked,
@@ -1318,7 +1933,12 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "file_preview": FilePreview,
     "file_save_result": FileSaveResult,
     "preview_asset": PreviewAsset,
+    "work_artifacts": WorkArtifacts,
     "history": History,
+    "turn_detail": TurnDetail,
+    "history_image": HistoryImage,
+    "history_invalidated": HistoryInvalidated,
+    "artifact_invalidated": ArtifactInvalidated,
     "ask_user": AskUser,
     "answer_question": AnswerQuestion,
     "get_goal": GetGoal,
@@ -1326,8 +1946,10 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "clear_goal": ClearGoal,
     "goal_state": GoalState,
     "session_list": SessionList,
+    "session_activity": SessionActivity,
     "session_focus": SessionFocus,
     "session_rekey": SessionRekey,
+    "work_dashboard": WorkDashboard,
     "user_msg": UserMsg,
     "assistant_msg_start": AssistantMsgStart,
     "delta": Delta,
@@ -1338,6 +1960,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "process": ProcessEvent,
     "turn_plan": TurnPlan,
     "turn_diff": TurnDiff,
+    "turn_binding": TurnBinding,
     "turn_end": TurnEnd,
     "error": Error,
     "wrapper_disconnected": WrapperDisconnected,
@@ -1378,6 +2001,21 @@ def deserialize(raw: str | bytes) -> AnyMessage:
 
 
 def serialize(msg: BaseModel) -> str:
+    if isinstance(msg, ContextReport):
+        exclude: set[str] = set()
+        if all(value is None for value in (
+                msg.session_tokens, msg.fixed_tokens,
+                msg.session_percentage)):
+            # Keep the existing Code wire shape byte-for-field compatible. The
+            # optional breakdown exists only on Work reports that actually have
+            # a trustworthy new-session baseline.
+            exclude.update({
+                "session_tokens", "fixed_tokens", "session_percentage",
+            })
+        if msg.available is None:
+            exclude.add("available")
+        if exclude:
+            return msg.model_dump_json(exclude=exclude)
     return msg.model_dump_json()
 
 

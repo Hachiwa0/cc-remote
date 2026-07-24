@@ -8,17 +8,39 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent,
+  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, SessionControl, Space,
 } from "./protocol.ts";
-import { makeForkSessionCommand, makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION } from "./protocol.ts";
-import { CommandOutbox, planRecoveryReplay } from "./outbox.ts";
+import { compareSessionControl, makeForkSessionCommand, makeForkSessionWorktreeCommand, makeOpenBtwCommand, PROTOCOL_VERSION, sessionControlTargetsSid } from "./protocol.ts";
+import {
+  CommandOutbox,
+  QueryAcceptanceLatch,
+  planRecoveryReplay,
+  queryAcceptanceDescriptor,
+  queryAcceptanceHistoryHead,
+  type QueryAcceptanceHistoryHead,
+} from "./outbox.ts";
 import { probeSession, shouldReconnectAfterSessionProbe } from "./session-auth.ts";
 import { uuid } from "./util.ts";
 
 export type ConnState = "connecting" | "connected" | "reconnecting" | "disconnected";
 
+export interface EventOwnership {
+  scopeKey: string;
+  machineId: string;
+  engine: "claude" | "codex";
+  space: Space;
+  surfaceEpoch: number;
+  connectionGeneration: number;
+}
+
+export function sessionScopeKey(
+  machineId: string, engine: "claude" | "codex", space: Space,
+): string {
+  return `${machineId}:${space}:${engine}`;
+}
+
 export interface WsCallbacks {
-  onEvent: (msg: ServerEvent) => void;
+  onEvent: (msg: ServerEvent, ownership?: EventOwnership) => void;
   onConnState: (s: ConnState, detail?: string) => void;
   onAuthFail?: () => void;
   onCommandError?: (detail: string) => void;
@@ -42,23 +64,42 @@ export class RelayWs {
   private ws: WebSocket | null = null;
   private lastSeqBySession: Record<string, number> = {};
   private generationBySession: Record<string, string> = {};
+  // Transport-level control watermark survives runtime pruning/reconnect. The
+  // reducer repeats this guard because cached control may hydrate independently.
+  private controlBySession: Record<string, SessionControl> = {};
   private rebuildingSessions = new Set<string>();
   private replayOrder: string[] = [];
   private engineBySession: Record<string, "claude" | "codex"> = {};
+  private spaceBySession: Record<string, Space> = {};
   private focusedSid: string | null = null;
+  private activeEngine: "claude" | "codex" = "claude";
+  private activeSpace: Space = "code";
   // Correlates a create response without using SessionFocus as a trigger for the
   // first query. A later explicit switch clears it, so late create focus cannot
   // override the user's newer navigation intent.
   private newSessionFocusRequestId: string | null = null;
   private newSessionEngine: "claude" | "codex" = "claude";
+  private newSessionSpace: Space = "code";
+  private connectionGeneration = 0;
+  private surfaceEpoch = 1;
+  private readonly surfaceEpochByScope: Record<string, number> = {};
+  private readonly ownershipBySession: Record<string, EventOwnership> = {};
+  private readonly pendingOwnershipByRequest: Record<string, EventOwnership> = {};
+  private readonly pendingSwitchOwnership: Record<string, EventOwnership[]> = {};
+  private readonly pendingListOwnership: Record<string, EventOwnership[]> = {};
   private readonly outbox = new CommandOutbox(
     OUTBOX_MAX_COMMANDS, OUTBOX_MAX_BYTES, OUTBOX_MAX_FRAME_BYTES);
+  private readonly queryAcceptance = new QueryAcceptanceLatch();
+  private readonly historyHeadBySession: Record<
+    string, QueryAcceptanceHistoryHead
+  > = {};
   private readonly clientId: string;
   private readonly url: string;
   private backoff = 1;
   private stopped = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly cb: WsCallbacks;
+  private readonly machineId: string;
   // Heartbeat: detect a HALF-OPEN link (dead TCP with no close event) and recover.
   private lastRecvAt = 0;
   private hbTimer: ReturnType<typeof setInterval> | null = null;
@@ -66,11 +107,17 @@ export class RelayWs {
   private wrapperGeneration: string | null = null;
   private lastGenerationChangeNotice: string | null = null;
 
-  constructor(cb: WsCallbacks) {
+  constructor(cb: WsCallbacks, machineId = "default") {
     this.cb = cb;
+    this.machineId = machineId;
     this.clientId = uuid();
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    this.url = new URL(`${proto}//${window.location.host}/ws`).toString();
+    const url = new URL(`${proto}//${window.location.host}/ws`);
+    if (machineId !== "default") url.searchParams.set("machine", machineId);
+    this.url = url.toString();
+    this.surfaceEpochByScope[
+      sessionScopeKey(machineId, this.activeEngine, this.activeSpace)
+    ] = this.surfaceEpoch;
   }
 
   start(): void {
@@ -121,7 +168,14 @@ export class RelayWs {
 
   /** Runtime ids that must survive client-side reclamation while commands await ACK. */
   pendingSessionIds(): string[] {
-    return this.outbox.pendingSessionIds();
+    return [...new Set([
+      ...this.outbox.pendingSessionIds(),
+      ...this.queryAcceptance.pendingSessionIds(),
+    ])];
+  }
+
+  pendingQueryFor(sid: string): string | null {
+    return this.queryAcceptance.pendingMessageId(sid);
   }
 
   private touchReplay(sid: string): void {
@@ -132,7 +186,10 @@ export class RelayWs {
       if (!expired) break;
       delete this.lastSeqBySession[expired];
       delete this.generationBySession[expired];
+      delete this.controlBySession[expired];
       delete this.engineBySession[expired];
+      delete this.spaceBySession[expired];
+      delete this.historyHeadBySession[expired];
       this.rebuildingSessions.delete(expired);
     }
   }
@@ -141,8 +198,11 @@ export class RelayWs {
     for (const knownSid of Object.keys(this.generationBySession)) {
       if (!knownSid.startsWith("btw-")) continue;
       delete this.generationBySession[knownSid];
+      delete this.controlBySession[knownSid];
       delete this.lastSeqBySession[knownSid];
       delete this.engineBySession[knownSid];
+      delete this.spaceBySession[knownSid];
+      delete this.historyHeadBySession[knownSid];
       this.rebuildingSessions.delete(knownSid);
       this.replayOrder = this.replayOrder.filter((item) => item !== knownSid);
     }
@@ -170,9 +230,50 @@ export class RelayWs {
       // first per-session proof of a restart, so reset here as well as on an
       // explicit rebuild envelope.
       this.lastSeqBySession[sid] = 0;
+      delete this.controlBySession[sid];
     }
     this.generationBySession[sid] = generation;
     this.touchReplay(sid);
+  }
+
+  private acceptControl(sid: string, incoming: SessionControl): boolean {
+    const incomingGeneration = incoming.generation ?? null;
+    const activeGeneration = this.generationBySession[sid] ?? null;
+    if (activeGeneration !== null && incomingGeneration !== activeGeneration) {
+      return false;
+    }
+    if (activeGeneration === null && incomingGeneration !== null) {
+      this.noteGeneration(sid, incomingGeneration);
+    }
+    const disposition = compareSessionControl(
+      this.controlBySession[sid], incoming);
+    if (disposition === "newer") this.controlBySession[sid] = incoming;
+    return disposition === "newer" || disposition === "same";
+  }
+
+  /** Keep narrative/snapshot envelopes while stripping only an obsolete nested
+   * control value. A direct obsolete SessionControl frame can be dropped whole. */
+  private filterControl(msg: ServerEvent): ServerEvent | null {
+    if (msg.type === "session_control") {
+      // A live control frame without a routing key must never fall through to
+      // the reducer's focused-session fallback. Embedded controls are routed by
+      // their trusted Snapshot/History envelope instead.
+      if (!msg.sid) return null;
+      return this.acceptControl(msg.sid, msg) ? msg : null;
+    }
+    if (msg.type !== "snapshot" && msg.type !== "history") return msg;
+    const control = msg.control;
+    const sid = msg.type === "history"
+      ? msg.session_id : (msg.sid ?? msg.cc_session_id);
+    // The outer snapshot/history generation is the trusted epoch switch. Move
+    // the transport watermark before comparing its embedded control revision.
+    if (sid && msg.generation) this.noteGeneration(sid, msg.generation);
+    if (!control) return msg;
+    if (sid && !sessionControlTargetsSid(control, sid)) {
+      return { ...msg, control: undefined } as ServerEvent;
+    }
+    if (!sid || this.acceptControl(sid, control)) return msg;
+    return { ...msg, control: undefined } as ServerEvent;
   }
 
   private boundedReplayState(): {
@@ -209,6 +310,7 @@ export class RelayWs {
    *  of every resident session — that flood is what wedged reconnect into a loop. */
   seedReplayState(
     cursors: Record<string, number>, generations: Record<string, string>,
+    controls: Record<string, SessionControl> = {},
   ): void {
     for (const [sid, seq] of Object.entries(cursors)) {
       if (typeof seq === "number" && seq > (this.lastSeqBySession[sid] ?? 0)) {
@@ -217,28 +319,106 @@ export class RelayWs {
       }
     }
     for (const [sid, generation] of Object.entries(generations)) {
-      if (generation && this.lastSeqBySession[sid] != null) {
-        this.generationBySession[sid] = generation;
-        this.touchReplay(sid);
+      if (generation && (this.lastSeqBySession[sid] != null
+          || controls[sid] != null)) {
+        this.noteGeneration(sid, generation);
       }
+    }
+    for (const [sid, control] of Object.entries(controls)) {
+      if (this.acceptControl(sid, control)) this.touchReplay(sid);
     }
   }
 
-  setFocusedSid(sid: string | null, engine?: "claude" | "codex"): void {
+  setFocusedSid(sid: string | null, engine?: "claude" | "codex", space?: Space): void {
     this.focusedSid = sid;
     if (sid) {
       if (engine) this.engineBySession[sid] = engine;
+      if (space) this.spaceBySession[sid] = space;
       this.touchReplay(sid);
+    }
+    if (this.newSessionFocusRequestId) {
+      delete this.pendingOwnershipByRequest[this.newSessionFocusRequestId];
     }
     this.newSessionFocusRequestId = null;
   }
 
-  setSessionEngines(sessions: Array<{ session_id: string; engine?: string | null }>): void {
+  /** Set the visible product surface and drop a focus owned by another one. */
+  setSurface(engine: "claude" | "codex", space: Space): void {
+    const changed = engine !== this.activeEngine || space !== this.activeSpace;
+    this.activeEngine = engine;
+    this.activeSpace = space;
+    if (changed) {
+      this.surfaceEpoch += 1;
+      this.surfaceEpochByScope[
+        sessionScopeKey(this.machineId, engine, space)
+      ] = this.surfaceEpoch;
+    }
+    if (this.focusedSid && !this.sessionMatchesSurface(this.focusedSid, engine, space)) {
+      this.focusedSid = null;
+    }
+    if (changed && this.newSessionFocusRequestId
+        && (this.newSessionEngine !== engine || this.newSessionSpace !== space)) {
+      delete this.pendingOwnershipByRequest[this.newSessionFocusRequestId];
+      this.newSessionFocusRequestId = null;
+    }
+  }
+
+  private sessionMatchesSurface(
+    sid: string, engine = this.activeEngine, space = this.activeSpace,
+  ): boolean {
+    return this.engineBySession[sid] === engine && this.spaceBySession[sid] === space;
+  }
+
+  setSessionEngines(sessions: Array<{ session_id: string; engine?: string | null; space?: Space | null }>): void {
     for (const session of sessions) {
       if (session.engine === "codex" || session.engine === "claude") {
         this.engineBySession[session.session_id] = session.engine;
       }
+      if (session.space === "work" || session.space === "code") {
+        this.spaceBySession[session.session_id] = session.space;
+      }
     }
+  }
+
+  private ownershipSnapshot(
+    engine = this.activeEngine, space = this.activeSpace,
+  ): EventOwnership {
+    const scopeKey = sessionScopeKey(this.machineId, engine, space);
+    return {
+      scopeKey,
+      machineId: this.machineId,
+      engine,
+      space,
+      surfaceEpoch: this.surfaceEpochByScope[scopeKey] ?? 0,
+      connectionGeneration: this.connectionGeneration,
+    };
+  }
+
+  private acceptsOwnership(
+    ownership: EventOwnership | undefined, socketGeneration: number,
+  ): ownership is EventOwnership {
+    return !!ownership
+      && ownership.connectionGeneration === socketGeneration
+      && ownership.connectionGeneration === this.connectionGeneration
+      && this.surfaceEpochByScope[ownership.scopeKey] === ownership.surfaceEpoch;
+  }
+
+  private queueOwnership(
+    target: Record<string, EventOwnership[]>, key: string,
+    ownership: EventOwnership,
+  ): void {
+    const queue = target[key] ?? [];
+    queue.push(ownership);
+    target[key] = queue.slice(-32);
+  }
+
+  private shiftOwnership(
+    target: Record<string, EventOwnership[]>, key: string,
+  ): EventOwnership | undefined {
+    const queue = target[key];
+    const ownership = queue?.shift();
+    if (queue?.length === 0) delete target[key];
+    return ownership;
   }
 
   private sidObj(): Record<string, unknown> {
@@ -246,10 +426,26 @@ export class RelayWs {
   }
 
   sendQuery(prompt: string, msg_id: string, images?: QueryImg[], files?: QueryFile[]): boolean {
-    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "query", prompt, msg_id, ts: nowTs(), ...this.sidObj() };
+    const sid = this.focusedSid;
+    if (!sid || this.queryAcceptance.pendingMessageId(sid)) return false;
+    const sentAt = nowTs();
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: sentAt,
+    };
     if (images && images.length) obj.images = images;
     if (files && files.length) obj.files = files;
-    return this.send(obj);
+    if (!this.send(obj)) return false;
+    const historyHead = this.historyHeadBySession[sid];
+    const baseline = historyHead ? {
+      ...historyHead,
+      liveSeq: Math.max(
+        historyHead.liveSeq, this.lastSeqBySession[sid] ?? 0),
+    } : null;
+    return this.queryAcceptance.begin(
+      sid, msg_id,
+      queryAcceptanceDescriptor(msg_id, prompt, images, files),
+      baseline,
+    );
   }
 
   // ---- /btw ephemeral side-fork ----
@@ -283,12 +479,25 @@ export class RelayWs {
   // a turn targeted at an explicit sid (the btw fork), NOT the focused session.
   sendQueryTo(sid: string, prompt: string, msg_id: string,
               images?: QueryImg[], files?: QueryFile[]): boolean {
+    if (this.queryAcceptance.pendingMessageId(sid)) return false;
+    const sentAt = nowTs();
     const obj: Record<string, unknown> = {
-      v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: nowTs(),
+      v: PROTOCOL_VERSION, type: "query", prompt, msg_id, sid, ts: sentAt,
     };
     if (images && images.length) obj.images = images;
     if (files && files.length) obj.files = files;
-    return this.send(obj);
+    if (!this.send(obj)) return false;
+    const historyHead = this.historyHeadBySession[sid];
+    const baseline = historyHead ? {
+      ...historyHead,
+      liveSeq: Math.max(
+        historyHead.liveSeq, this.lastSeqBySession[sid] ?? 0),
+    } : null;
+    return this.queryAcceptance.begin(
+      sid, msg_id,
+      queryAcceptanceDescriptor(msg_id, prompt, images, files),
+      baseline,
+    );
   }
 
   sendInterrupt(): void {
@@ -319,16 +528,21 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }
 
-  sendGetContext(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj() });
+  sendGetContext(): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj(),
+    });
   }
 
   sendGetContextTo(sid: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs() });
   }
 
-  sendGetDiff(file: string, theme: DiffTheme): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_diff", file, theme, ts: nowTs(), ...this.sidObj() });
+  sendGetDiff(file: string, theme: DiffTheme): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_diff", file, theme,
+      ts: nowTs(), ...this.sidObj(),
+    });
   }
 
   sendGetFilePreview(path: string, requestId = uuid()): string | null {
@@ -367,17 +581,45 @@ export class RelayWs {
     return queued ? requestId : null;
   }
 
-  /** Fetch a session's history as ONE bulk frame, read on-demand from its
-   *  transcript (like a web chat's GET /conversation). client_id lets the wrapper
-   *  route the History reply to=this client. Replaces per-hello buffer replay. */
+  /** Fetch a small canonical conversation page. Heavy per-turn detail remains
+   *  in the wrapper materialized index until the user expands it. */
   sendGetHistory(sessionId: string, before?: string | null, limit?: number | null): void {
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_history", session_id: sessionId,
-      client_id: this.clientId, ts: nowTs(),
+      client_id: this.clientId, detail: "summary", ts: nowTs(),
     };
     if (before) obj.before = before;
     if (limit) obj.limit = limit;
     this.send(obj);
+  }
+
+  sendGetTurnDetail(
+    sessionId: string, turnId: string, revision?: string | null,
+  ): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_turn_detail",
+      session_id: sessionId, turn_id: turnId,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (revision) frame.revision = revision;
+    return this.send(frame);
+  }
+
+  sendGetHistoryImage(
+    sessionId: string,
+    turnId: string,
+    imageId: string,
+    variant: "thumbnail" | "full",
+    requestId: string,
+    revision?: string | null,
+  ): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_history_image",
+      session_id: sessionId, turn_id: turnId, image_id: imageId,
+      variant, request_id: requestId, client_id: this.clientId, ts: nowTs(),
+    };
+    if (revision) frame.revision = revision;
+    return this.send(frame);
   }
 
   /** Ask the engine for its catalog and explicit new-session defaults. Claude
@@ -391,6 +633,72 @@ export class RelayWs {
     this.send(frame);
   }
 
+  sendGetEngineCapabilities(engine: "claude" | "codex", space: Space,
+                            cwd?: string | null): void {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_engine_capabilities", engine, space,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (cwd) frame.cwd = cwd;
+    this.send(frame);
+  }
+
+  sendManageEnginePlugin(engine: "claude" | "codex", space: Space,
+                         action: "install" | "uninstall", pluginId: string,
+                         cwd?: string | null): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "manage_engine_plugin", engine, space,
+      action, plugin_id: pluginId, client_id: this.clientId, ts: nowTs(),
+    };
+    if (cwd) frame.cwd = cwd;
+    return this.send(frame);
+  }
+
+  sendManageEngineSkill(
+    engine: "claude" | "codex", space: Space,
+    action: "create" | "remove" | "enable" | "disable",
+    options: {
+      skillId?: string; name?: string; description?: string;
+      instructions?: string; scope?: "user" | "project";
+    },
+    cwd?: string | null,
+  ): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "manage_engine_skill", engine, space, action,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (options.skillId) frame.skill_id = options.skillId;
+    if (options.name) frame.name = options.name;
+    if (options.description !== undefined) frame.description = options.description;
+    if (options.instructions !== undefined) frame.instructions = options.instructions;
+    if (options.scope) frame.scope = options.scope;
+    if (cwd) frame.cwd = cwd;
+    return this.send(frame);
+  }
+
+  sendManageEngineHook(
+    engine: "claude" | "codex", space: Space,
+    action: "create" | "remove",
+    options: {
+      hookId?: string; event?: string; matcher?: string; command?: string;
+      timeout?: number; scope?: "user" | "project";
+    },
+    cwd?: string | null,
+  ): boolean {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "manage_engine_hook", engine, space, action,
+      client_id: this.clientId, ts: nowTs(),
+    };
+    if (options.hookId) frame.hook_id = options.hookId;
+    if (options.event) frame.event = options.event;
+    if (options.matcher !== undefined) frame.matcher = options.matcher;
+    if (options.command !== undefined) frame.command = options.command;
+    if (options.timeout !== undefined) frame.timeout = options.timeout;
+    if (options.scope) frame.scope = options.scope;
+    if (cwd) frame.cwd = cwd;
+    return this.send(frame);
+  }
+
   sendAnswerQuestion(askId: string, answer: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
   }
@@ -399,8 +707,11 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "get_goal", ts: nowTs(), ...this.sidObj() });
   }
 
-  sendGetStatus(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_status", client_id: this.clientId, ts: nowTs(), ...this.sidObj() });
+  sendGetStatus(): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_status", client_id: this.clientId,
+      ts: nowTs(), ...this.sidObj(),
+    });
   }
 
   sendSetGoal(objective: string | null, status: GoalStatus | null, tokenBudget: number | null): void {
@@ -415,17 +726,29 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...this.sidObj() });
   }
 
-  sendListSessions(engine?: "claude" | "codex"): void {
+  sendListSessions(engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine ?? "claude";
+    const scopeKey = sessionScopeKey(this.machineId, targetEngine, space);
+    const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
-    this.send(obj);
+    if (space !== "code") obj.space = space;
+    if (this.send(obj)) {
+      this.queueOwnership(this.pendingListOwnership, scopeKey, ownership);
+    }
   }
 
-  sendSwitchSession(sessionId: string, engine?: "claude" | "codex"): void {
+  sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine ?? this.activeEngine;
     if (engine) this.engineBySession[sessionId] = engine;
+    this.spaceBySession[sessionId] = space;
+    const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
-    this.send(obj);
+    if (space !== "code") obj.space = space;
+    if (this.send(obj)) {
+      this.queueOwnership(this.pendingSwitchOwnership, sessionId, ownership);
+    }
   }
 
   sendNewSession(cwd?: string | null, engine?: "claude" | "codex",
@@ -433,15 +756,22 @@ export class RelayWs {
                  initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] },
                  collaborationMode?: "default" | "plan",
                  permissionMode?: "never" | "on-request" | "untrusted",
-                 serviceTier?: "default" | "fast"): boolean {
+                 serviceTier?: "default" | "fast",
+                 space: Space = "code", projectId?: string | null): boolean {
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
     this.newSessionEngine = engine ?? "claude";
+    this.newSessionSpace = space;
+    const ownership = this.ownershipSnapshot(
+      this.newSessionEngine, this.newSessionSpace);
+    this.pendingOwnershipByRequest[requestId] = ownership;
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "new_session", request_id: requestId, ts: nowTs(),
     };
     if (cwd) obj.cwd = cwd;
     if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    if (space === "work" && projectId) obj.project_id = projectId;
     if (model) obj.model = model;
     if (effort) obj.effort = effort;
     if (engine === "codex" && collaborationMode) {
@@ -460,16 +790,155 @@ export class RelayWs {
       if (initial.files?.length) obj.files = initial.files;
     }
     const queued = this.send(obj);
-    if (!queued) this.newSessionFocusRequestId = null;
+    if (!queued) {
+      this.newSessionFocusRequestId = null;
+      delete this.pendingOwnershipByRequest[requestId];
+    }
     return queued;
   }
 
-  sendRenameSession(sessionId: string, title: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() });
+  sendRenameSession(sessionId: string, title: string,
+                    engine?: "claude" | "codex", space: Space = "code"): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() };
+    if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    this.send(obj);
   }
 
-  sendArchiveSession(sessionId: string, archived: boolean): void {
-    this.send({ v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() });
+  sendArchiveSession(sessionId: string, archived: boolean,
+                     engine?: "claude" | "codex", space: Space = "code"): void {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() };
+    if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    this.send(obj);
+  }
+
+  sendPinSession(sessionId: string, pinned: boolean,
+                 engine?: "claude" | "codex", space: Space = "code"): void {
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "pin_session", session_id: sessionId,
+      pinned, ts: nowTs(),
+    };
+    if (engine && engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    this.send(obj);
+  }
+
+  sendDeleteWorkSession(sessionId: string, engine: "claude" | "codex"): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "delete_work_session", session_id: sessionId,
+      engine, space: "work", ts: nowTs(),
+    });
+  }
+
+  sendDeleteSession(sessionId: string, engine: "claude" | "codex",
+                    space: Space = "code"): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "delete_session", session_id: sessionId,
+      engine, space, ts: nowTs(),
+    });
+  }
+
+  sendRollbackSession(sessionId: string, engine: "claude" | "codex",
+                      restore: "conversation" | "files" | "both",
+                      numTurns = 1, checkpointId?: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "rollback_session", session_id: sessionId,
+      engine, space: "code", restore, num_turns: numTurns, ts: nowTs(),
+    };
+    if (engine === "claude" && checkpointId) command.checkpoint_id = checkpointId;
+    return this.send(command);
+  }
+
+  sendCompactSession(sessionId: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "compact_session", session_id: sessionId,
+      engine: "codex", space: "code", ts: nowTs(),
+    });
+  }
+
+  sendStartReview(sessionId: string,
+                  target: "uncommittedChanges" | "baseBranch" | "commit" | "custom",
+                  value?: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "start_review", session_id: sessionId,
+      engine: "codex", space: "code", target, ts: nowTs(),
+    };
+    if (value) command.value = value;
+    return this.send(command);
+  }
+
+  sendGetWorkDashboard(engine: "claude" | "codex"): void {
+    this.send({
+      v: PROTOCOL_VERSION, type: "get_work_dashboard", engine, ts: nowTs(),
+    });
+  }
+
+  sendGetWorkArtifacts(engine: "claude" | "codex", sessionId: string): void {
+    this.send({
+      v: PROTOCOL_VERSION, type: "get_work_artifacts", engine,
+      session_id: sessionId, client_id: this.clientId, ts: nowTs(),
+    });
+  }
+
+  sendCreateWorkProject(engine: "claude" | "codex", name: string,
+                        description: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "create_work_project", engine,
+      name, description, ts: nowTs() });
+  }
+
+  sendDeleteWorkProject(engine: "claude" | "codex", projectId: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "delete_work_project", engine,
+      project_id: projectId, ts: nowTs() });
+  }
+
+  sendAddWorkSource(engine: "claude" | "codex", projectId: string,
+                    kind: "file" | "link" | "note", title: string,
+                    uri?: string, file?: QueryFile): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "add_work_source", engine,
+      project_id: projectId, kind, title, ts: nowTs(),
+    };
+    if (uri) command.uri = uri;
+    if (file) command.file = file;
+    return this.send(command);
+  }
+
+  sendDeleteWorkSource(engine: "claude" | "codex", sourceId: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "delete_work_source", engine,
+      source_id: sourceId, ts: nowTs() });
+  }
+
+  sendCreateWorkPlugin(engine: "claude" | "codex", name: string,
+                       instructions: string, projectId?: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "create_work_plugin", engine,
+      name, instructions, ts: nowTs(),
+    };
+    if (projectId) command.project_id = projectId;
+    return this.send(command);
+  }
+
+  sendDeleteWorkPlugin(engine: "claude" | "codex", pluginId: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "delete_work_plugin", engine,
+      plugin_id: pluginId, ts: nowTs() });
+  }
+
+  sendCreateWorkSchedule(engine: "claude" | "codex", title: string,
+                         prompt: string, nextRunAt: number,
+                         repeatSeconds?: number, projectId?: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "create_work_schedule", engine,
+      title, prompt, next_run_at: nextRunAt, ts: nowTs(),
+    };
+    if (repeatSeconds) command.repeat_seconds = repeatSeconds;
+    if (projectId) command.project_id = projectId;
+    return this.send(command);
+  }
+
+  sendDeleteWorkSchedule(engine: "claude" | "codex", scheduleId: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "delete_work_schedule", engine,
+      schedule_id: scheduleId, ts: nowTs() });
   }
 
   sendListDir(path?: string | null): void {
@@ -485,7 +954,8 @@ export class RelayWs {
     const replay = this.boundedReplayState();
     this.sendUntracked({
       v: PROTOCOL_VERSION, type: "hello", role: "client", client_id: this.clientId,
-      cursors: replay.cursors, ts: nowTs(), generations: replay.generations,
+      machine_id: this.machineId, cursors: replay.cursors, ts: nowTs(),
+      generations: replay.generations,
     });
     if (flush) this.flushOutbox();
   }
@@ -509,19 +979,27 @@ export class RelayWs {
       v: PROTOCOL_VERSION, type: "switch_session", session_id: sid, ts: nowTs(),
     };
     if (this.engineBySession[sid] === "codex") frame.engine = "codex";
+    if (this.spaceBySession[sid] === "work") frame.space = "work";
     this.sendUntracked(frame);
   }
 
   private send(obj: Record<string, unknown>): boolean {
-    const result = this.outbox.enqueue(obj, this.clientId, uuid());
+    return this.sendTracked(obj) !== null;
+  }
+
+  private sendTracked(
+    obj: Record<string, unknown>, commandId = uuid(),
+  ): string | null {
+    const result = this.outbox.enqueue(obj, this.clientId, commandId);
     if (!result.ok) {
-      const detail = `命令未发送：${result.reason}。请等待连接恢复后重试。`;
-      console.error(detail);
-      this.cb.onCommandError?.(detail);
-      return false;
+      console.error("command not queued", result.reason);
+      this.cb.onCommandError?.(result.reason.startsWith("command too large")
+        ? "内容过大，暂时无法发送，请缩减附件或内容后重试。"
+        : "操作暂未发送，请等待连接恢复后重试。");
+      return null;
     }
     this.sendRaw(result.raw);
-    return true;
+    return commandId;
   }
 
   private sendUntracked(obj: Record<string, unknown>): void {
@@ -540,6 +1018,7 @@ export class RelayWs {
 
   private connect(): void {
     this.cb.onConnState("connecting");
+    const socketGeneration = ++this.connectionGeneration;
     const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
@@ -549,19 +1028,56 @@ export class RelayWs {
       this.cb.onConnState("connected");  // triggers sendListSessions
     };
     ws.onmessage = (e) => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       try {
-        const msg = JSON.parse(e.data) as ServerEvent;
-        this.lastRecvAt = Date.now();  // any frame proves the link is alive
-        // Debug hook: record inbound frames so a live-sync issue is diagnosable
-        // from the browser console. Inspect `window.__wsLog`; set
-        // `window.__CCDEBUG = true` to also console.debug each frame.
-        try {
-          const w = window as unknown as { __wsLog?: unknown[]; __CCDEBUG?: boolean };
-          (w.__wsLog ||= []).push({ t: (msg as { type: string }).type, sid: (msg as { sid?: string }).sid, seq: (msg as { seq?: number }).seq });
-          if (w.__wsLog!.length > 800) w.__wsLog!.shift();
-          if (w.__CCDEBUG) console.debug(`[ws] ${(msg as { type: string }).type} sid=${(msg as { sid?: string }).sid ?? "-"} seq=${(msg as { seq?: number }).seq ?? "-"}`);
-        } catch { /* ignore */ }
+        const decoded = JSON.parse(e.data) as ServerEvent;
+        this.lastRecvAt = Date.now();  // any valid JSON frame proves the link is alive
+        const msg = this.filterControl(decoded);
+        if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
+        if ((msg.type === "user_msg" || msg.type === "turn_binding"
+              || msg.type === "error")
+            && this.queryAcceptance.accept(msg)) {
+          // Keep a runtime protected after command ACK until its narrative
+          // acceptance/error is visible, then allow normal pruning again.
+          this.cb.onOutboxChanged?.(this.pendingSessionIds());
+        }
+        if (msg.type === "history") {
+          let acceptedFromHistory = false;
+          for (const historyEvent of msg.events) {
+            if (historyEvent.type !== "user_msg"
+                && historyEvent.type !== "turn_binding"
+                && historyEvent.type !== "error") continue;
+            acceptedFromHistory = this.queryAcceptance.accept({
+              ...historyEvent,
+              sid: historyEvent.sid ?? msg.session_id,
+            }) || acceptedFromHistory;
+          }
+          const pending = this.queryAcceptance.pendingMessageId(msg.session_id);
+          if (pending && msg.turns?.some((turn) => turn.id === pending)) {
+            acceptedFromHistory =
+              this.queryAcceptance.completeSession(msg.session_id)
+              || acceptedFromHistory;
+          }
+          acceptedFromHistory =
+            this.queryAcceptance.acceptHistory(msg) || acceptedFromHistory;
+          const historyHead = queryAcceptanceHistoryHead(msg);
+          if (historyHead) {
+            const previous = this.historyHeadBySession[msg.session_id];
+            const isOlderSameEpoch = !!previous
+              && previous.generation === historyHead.generation
+              && previous.revision === historyHead.revision
+              && historyHead.buildSeq < previous.buildSeq;
+            if (!isOlderSameEpoch) {
+              this.historyHeadBySession[msg.session_id] = historyHead;
+            }
+          }
+          if (acceptedFromHistory) {
+            // A reconnect may recover the accepted query only through a
+            // materialized page after its live echo fell outside replay.
+            this.cb.onOutboxChanged?.(this.pendingSessionIds());
+          }
+        }
         if (msg.type === "command_ack") {
           if (this.outbox.ack(msg.client_id, msg.cmd_id)) {
             this.cb.onOutboxChanged?.(this.pendingSessionIds());
@@ -575,6 +1091,22 @@ export class RelayWs {
           if (msg.generation) this.noteWrapperGeneration(msg.generation);
           this.sendRecoveryPreamble();
         }
+        let eventOwnership: EventOwnership | undefined;
+        if (msg.type === "session_list") {
+          const listedSpace = msg.space ?? "code";
+          const scopeKey = sessionScopeKey(
+            this.machineId, msg.engine, listedSpace);
+          const listedOwnership = this.shiftOwnership(
+            this.pendingListOwnership, scopeKey);
+          if (this.acceptsOwnership(listedOwnership, socketGeneration)) {
+            eventOwnership = listedOwnership;
+            for (const session of msg.sessions) {
+              this.engineBySession[session.session_id] = msg.engine;
+              this.spaceBySession[session.session_id] = listedSpace;
+              this.ownershipBySession[session.session_id] = listedOwnership;
+            }
+          }
+        }
         if (msg.type === "session_focus") {
           // Drop a STALE switch-confirmation: when you click through several
           // sessions quickly, the wrapper processes each switch in turn and emits
@@ -584,31 +1116,61 @@ export class RelayWs {
           // or the very first focus when we have none yet.
           const isCreatedFocus = !!msg.request_id
             && msg.request_id === this.newSessionFocusRequestId;
+          const pendingOwnership = isCreatedFocus && msg.request_id
+            ? this.pendingOwnershipByRequest[msg.request_id]
+            : this.shiftOwnership(
+              this.pendingSwitchOwnership, msg.session_id);
+          const ownership = pendingOwnership
+            ?? this.ownershipBySession[msg.session_id];
+          const targetEngine = ownership?.engine
+            ?? (isCreatedFocus
+              ? this.newSessionEngine : this.engineBySession[msg.session_id]);
+          const targetSpace = ownership?.space
+            ?? (isCreatedFocus
+              ? this.newSessionSpace : this.spaceBySession[msg.session_id]);
+          if (targetEngine !== this.activeEngine || targetSpace !== this.activeSpace) {
+            return; // delayed/foreign Code↔Work or Claude↔Codex focus
+          }
           if (this.focusedSid != null && msg.session_id !== this.focusedSid && !isCreatedFocus) {
             return; // superseded — ignore
           }
-          if (isCreatedFocus) this.newSessionFocusRequestId = null;
+          if (isCreatedFocus) {
+            this.newSessionFocusRequestId = null;
+            if (msg.request_id) delete this.pendingOwnershipByRequest[msg.request_id];
+          }
           this.focusedSid = msg.session_id;
           if (isCreatedFocus) this.engineBySession[msg.session_id] = this.newSessionEngine;
+          if (isCreatedFocus) this.spaceBySession[msg.session_id] = this.newSessionSpace;
+          if (ownership) this.ownershipBySession[msg.session_id] = ownership;
           this.touchReplay(msg.session_id);
-          this.cb.onEvent(msg);
+          this.cb.onEvent(
+            msg,
+            this.acceptsOwnership(ownership, socketGeneration)
+              ? ownership : undefined,
+          );
           return;
         }
         if (msg.type === "session_rekey") {
           // Runtime re-key (tmp -> real id): migrate the cursor and, ONLY if we
           // were viewing old_key, the focus. Never a focus change by itself.
           const { old_key, session_id } = msg;
+          const ownership = this.ownershipBySession[old_key];
           if (old_key !== session_id) {
             const oldSeq = this.lastSeqBySession[old_key];
             const realSeq = this.lastSeqBySession[session_id];
             if (oldSeq != null && (realSeq == null || oldSeq >= realSeq)) {
+              const oldGeneration = this.generationBySession[old_key];
+              // A live temp runtime wins the alias merge together with its
+              // revision epoch. Use the normal generation transition so a
+              // cached watermark already stored under the real id is cleared.
+              if (oldGeneration) this.noteGeneration(session_id, oldGeneration);
               this.lastSeqBySession[session_id] = oldSeq;
-              if (this.generationBySession[old_key]) {
-                this.generationBySession[session_id] = this.generationBySession[old_key];
-              }
             }
             delete this.lastSeqBySession[old_key];
             delete this.generationBySession[old_key];
+            const oldControl = this.controlBySession[old_key];
+            if (oldControl) this.acceptControl(session_id, oldControl);
+            delete this.controlBySession[old_key];
             if (this.rebuildingSessions.delete(old_key)) {
               this.rebuildingSessions.add(session_id);
             }
@@ -616,12 +1178,31 @@ export class RelayWs {
               this.engineBySession[session_id] = this.engineBySession[old_key];
             }
             delete this.engineBySession[old_key];
+            if (this.spaceBySession[old_key] && !this.spaceBySession[session_id]) {
+              this.spaceBySession[session_id] = this.spaceBySession[old_key];
+            }
+            delete this.spaceBySession[old_key];
+            if (this.historyHeadBySession[old_key]
+                && !this.historyHeadBySession[session_id]) {
+              this.historyHeadBySession[session_id] =
+                this.historyHeadBySession[old_key];
+            }
+            delete this.historyHeadBySession[old_key];
+            if (ownership) {
+              this.ownershipBySession[session_id] = ownership;
+              delete this.ownershipBySession[old_key];
+            }
             this.outbox.rekeySession(old_key, session_id);
+            this.queryAcceptance.rekeySession(old_key, session_id);
             this.replayOrder = this.replayOrder.filter((sid) => sid !== old_key);
             this.touchReplay(session_id);
             if (this.focusedSid === old_key) this.focusedSid = session_id;
           }
-          this.cb.onEvent(msg);
+          this.cb.onEvent(
+            msg,
+            this.acceptsOwnership(ownership, socketGeneration)
+              ? ownership : undefined,
+          );
           return;
         }
         if (msg.type === "snapshot") {
@@ -630,7 +1211,11 @@ export class RelayWs {
             this.noteGeneration(sid, msg.generation);
             this.rebuildingSessions.delete(sid);
           }
-          if (this.focusedSid == null && sid) this.focusedSid = sid;
+          // Snapshots announce background runtimes. Only an explicit switch or
+          // correlated create response may move focus across product surfaces.
+        }
+        if (msg.type === "history_invalidated") {
+          delete this.historyHeadBySession[msg.session_id];
         }
         if (msg.type === "replay_start" && msg.sid && msg.generation) {
           this.noteGeneration(msg.sid, msg.generation);
@@ -658,7 +1243,7 @@ export class RelayWs {
         }
         this.noteSeq(msg.sid, msg.type === "replay_end"
           ? msg.to_seq : eventSeq);
-        this.cb.onEvent(msg);
+        this.cb.onEvent(msg, eventOwnership);
         if (msg.type === "replay_end" && msg.sid) {
           this.rebuildingSessions.delete(msg.sid);
         }
@@ -667,6 +1252,7 @@ export class RelayWs {
       }
     };
     ws.onclose = (ev: CloseEvent) => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       if (this.ws === ws) this.ws = null;
       this.stopHeartbeat();
       if (ev.code === 4406) {

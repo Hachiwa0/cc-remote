@@ -18,6 +18,8 @@ from cc_remote.protocol import (
     GetFilePreview,
     GetModels,
     GetPreviewAsset,
+    ManageEngineHook,
+    ManageEngineSkill,
     FILE_PREVIEW_MAX_BYTES,
     NewSession,
     PROTOCOL_VERSION,
@@ -118,6 +120,11 @@ def test_surrogate_filename_is_a_clean_validation_error():
             ask_id="ask-1", answer="x" * (ASK_ANSWER_MAX_CHARS + 1)),
         lambda: ForkSessionWorktree(
             session_id="sid-1", request_id="request-1", name="x" * 81),
+        lambda: ManageEngineSkill(
+            engine="claude", action="create", name="x" * 129),
+        lambda: ManageEngineHook(
+            engine="claude", action="create", event="PreToolUse",
+            command="x" * (16 * 1024 + 1)),
     ],
 )
 def test_client_command_scalars_are_bounded_or_enumerated(factory):

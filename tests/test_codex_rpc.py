@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from cc_remote import __version__
 from cc_remote.wrapper import codex_rpc as codex_rpc_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 
@@ -85,7 +86,9 @@ def test_codex_rpc_initializes_sends_exact_shape_and_reaps(monkeypatch, tmp_path
         assert messages == [
             {
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"clientInfo": {"name": "cc-remote", "version": "0.1.0"}},
+                "params": {
+                    "clientInfo": {"name": "cc-remote", "version": __version__},
+                },
             },
             {"jsonrpc": "2.0", "method": "initialized"},
             {

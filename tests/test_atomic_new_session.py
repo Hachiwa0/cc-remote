@@ -6,10 +6,13 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
+from cc_remote.wrapper import machine as machine_module
 from cc_remote.protocol import (
+    ERR_INVALID_CWD,
     PROTOCOL_VERSION,
     NewSession,
     SessionFocus,
+    TurnBinding,
     UserMsg,
     deserialize,
     serialize,
@@ -19,8 +22,8 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
-def test_protocol_v10_new_session_query_roundtrip_and_validation():
-    assert PROTOCOL_VERSION == 10
+def test_protocol_v19_new_session_query_and_turn_binding_roundtrip():
+    assert PROTOCOL_VERSION == 19
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",
@@ -45,6 +48,9 @@ def test_protocol_v10_new_session_query_roundtrip_and_validation():
         NewSession(engine="claude", permission_mode="on-request")
     with pytest.raises(ValidationError):
         NewSession(engine="claude", service_tier="fast")
+
+    binding = TurnBinding(msg_id="browser-message", turn_id="native-turn")
+    assert deserialize(serialize(binding)) == binding
 
 
 def test_new_session_starts_initial_query_on_the_new_ctx():
@@ -118,10 +124,160 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             "collaboration_mode": None,
             "permission_mode": None,
             "service_tier": None,
+            "space": "code",
+            "work_id": None,
+            "raise_on_failure": True,
         }
         turn_ctx, prompt, images, files = captured["turn"]
         assert turn_ctx is ctx and prompt == "first prompt"
         assert images == cmd.images and files == cmd.files
+
+    asyncio.run(run())
+
+
+def test_invalid_new_session_cwd_is_single_correlated_error(tmp_path):
+    async def run():
+        machine, transport = _mk_machine()
+        old_ctx = _mk_ctx("old-session", "old-session")
+        machine.sessions[old_ctx.key] = old_ctx
+        machine.focused_sid = old_ctx.key
+
+        await machine._handle_new_session(NewSession(
+            request_id="req-invalid-cwd",
+            client_id="browser-one",
+            cwd=str(tmp_path / "deleted"),
+            engine="codex",
+        ))
+
+        assert len(transport.sent) == 1
+        error = transport.sent[0]
+        assert error.type == "error"
+        assert error.code == ERR_INVALID_CWD
+        assert error.request_id == "req-invalid-cwd"
+        assert error.to == "browser-one"
+        assert error.sid is None
+        assert machine.focused_sid == "old-session"
+        assert old_ctx.buffer.tail_seq == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["preflight", "cap", "connect"])
+def test_new_session_sync_failures_never_emit_to_focused_session(
+        failure, monkeypatch, tmp_path):
+    async def run():
+        machine, transport = _mk_machine()
+        old_ctx = _mk_ctx("old-session", "old-session")
+        old_ctx.state = "running"
+        machine.sessions[old_ctx.key] = old_ctx
+        machine.focused_sid = old_ctx.key
+        machine.cfg.max_concurrent_sessions = 1 if failure == "cap" else 2
+        engine = "codex"
+
+        if failure == "preflight":
+            engine = "claude"
+
+            def fail_preflight(_binary):
+                raise RuntimeError("missing claude")
+
+            monkeypatch.setattr(
+                machine_module.SdkHandle, "preflight",
+                staticmethod(fail_preflight),
+            )
+        elif failure == "connect":
+            class FailingCodex:
+                approval = "never"
+                effort = None
+                applied_effort = None
+                model = None
+                service_tier = None
+                collaboration_mode = "default"
+
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                async def connect(self, **_kwargs):
+                    raise RuntimeError("connect exploded")
+
+            monkeypatch.setattr(machine_module, "CodexHandle", FailingCodex)
+
+        await machine._handle_new_session(NewSession(
+            request_id=f"req-{failure}", client_id="browser-one",
+            cwd=str(tmp_path), engine=engine,
+        ))
+
+        assert len(transport.sent) == 1
+        error = transport.sent[0]
+        assert error.type == "error"
+        assert error.request_id == f"req-{failure}"
+        assert error.to == "browser-one"
+        assert error.sid is None
+        assert "connect exploded" not in error.message
+        assert "missing claude" not in error.message
+        assert "connect failed" not in error.message
+        assert old_ctx.buffer.tail_seq == 0
+
+    asyncio.run(run())
+
+
+def test_spawn_resume_missing_session_keeps_legacy_focused_error(
+        monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        old_ctx = _mk_ctx("old-session", "old-session")
+        machine.sessions[old_ctx.key] = old_ctx
+        machine.focused_sid = old_ctx.key
+        monkeypatch.setattr(
+            machine_module.SdkHandle, "preflight", staticmethod(lambda _bin: None))
+        monkeypatch.setattr(
+            machine_module, "get_session_info", lambda _sid: None)
+
+        ctx = await machine._spawn(
+            resume_id="missing-session", engine="claude")
+
+        assert ctx is None
+        errors = [msg for msg in transport.sent if msg.type == "error"]
+        assert len(errors) == 1
+        assert errors[0].sid == "old-session"
+        assert errors[0].request_id is None
+
+    asyncio.run(run())
+
+
+def test_spawn_bootstrap_missing_session_still_falls_back_to_fresh(
+        monkeypatch):
+    class FreshClaude:
+        permission_mode = "bypassPermissions"
+        effort = None
+        applied_effort = None
+        model = None
+
+        def __init__(self, *_args, **_kwargs):
+            self.connect_args = None
+
+        @staticmethod
+        def preflight(_binary):
+            return None
+
+        async def connect(self, **kwargs):
+            self.connect_args = kwargs
+
+        async def disconnect(self):
+            return None
+
+    async def run():
+        machine, transport = _mk_machine()
+        monkeypatch.setattr(machine_module, "SdkHandle", FreshClaude)
+        monkeypatch.setattr(
+            machine_module, "get_session_info", lambda _sid: None)
+
+        ctx = await machine._spawn(
+            resume_id="missing-bootstrap", engine="claude", bootstrap=True)
+
+        assert ctx is not None
+        assert ctx.session_id is None
+        assert ctx.sdk.connect_args["resume_id"] is None
+        assert not [msg for msg in transport.sent if msg.type == "error"]
 
     asyncio.run(run())
 

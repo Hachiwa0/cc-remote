@@ -55,6 +55,17 @@ class _StalledSdk:
         self.reconnects += 1
 
 
+def test_codex_session_id_accepts_app_server_thread_id_notifications():
+    assert codex_stream_module.codex_session_id({
+        "method": "turn/started",
+        "params": {"threadId": "thread-current", "turnId": "turn-1"},
+    }) == "thread-current"
+    assert codex_stream_module.codex_session_id({
+        "method": "thread/started",
+        "params": {"thread": {"id": "thread-object"}},
+    }) == "thread-object"
+
+
 def test_interrupt_during_preflight_reconnect_never_submits_query():
     class PreflightSdk:
         effort = "max"
@@ -210,6 +221,47 @@ def test_untracked_diff_filename_cannot_inject_git_output_option(tmp_path):
 
     asyncio.run(run())
     assert not target.exists()
+
+
+def test_all_files_diff_includes_untracked_regular_files(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("before\n")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run([
+        "git", "-C", str(repo), "-c", "user.name=Test",
+        "-c", "user.email=test@example.com", "commit", "-qm", "initial",
+    ], check=True)
+    tracked.write_text("after\n")
+    (repo / "chat.html").write_text("<h1>交付物</h1>\n")
+
+    async def run():
+        machine, _ = _mk_machine()
+        diff = await machine._git_diff(str(repo), "")
+        assert "diff --git a/tracked.txt b/tracked.txt" in diff
+        assert "+after" in diff
+        assert "diff --git a/chat.html b/chat.html" in diff
+        assert "new file mode" in diff
+        assert "+<h1>交付物</h1>" in diff
+
+    asyncio.run(run())
+
+
+def test_explicit_file_diff_works_outside_git_repository(tmp_path):
+    workspace = tmp_path / "work" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "chat.html").write_text("<h1>Work artifact</h1>\n")
+
+    async def run():
+        machine, _ = _mk_machine()
+        diff = await machine._git_diff(str(workspace), "chat.html")
+        assert "diff --git a/chat.html b/chat.html" in diff
+        assert "new file mode" in diff
+        assert "+<h1>Work artifact</h1>" in diff
+
+    asyncio.run(run())
 
 
 def test_diff_rejects_paths_outside_repository(tmp_path):
@@ -590,7 +642,7 @@ def _write_rollout(path):
          "payload": {"type": "agent_message", "message": "partial two"}},
         {"timestamp": "2026-01-01T00:01:04Z", "type": "event_msg",
          "payload": {"type": "turn_aborted", "turn_id": "turn-2",
-                     "reason": "interrupted", "duration_ms": 3000,
+                     "duration_ms": 3000,
                      "completed_at": 1767225664}},
         {"timestamp": "2026-01-01T00:02:01Z", "type": "event_msg",
          "payload": {"type": "task_started", "turn_id": "turn-3"}},
@@ -770,7 +822,10 @@ def test_codex_history_synthetic_boundary_never_steals_next_turn_id(tmp_path):
 
     terminals = [event for event in events if isinstance(event, TurnEnd)]
     assert [event.turn_id for event in terminals] == [None, "turn-next"]
+    # Visible partial output is not completion evidence. The synthetic error
+    # boundary keeps turn_id=None so it never steals turn-next's id.
     assert [event.result.subtype for event in terminals] == ["error", "success"]
+    assert [event.result.is_error for event in terminals] == [True, False]
 
 
 def test_codex_history_goal_continuation_after_completed_turn_is_own_turn(tmp_path):
@@ -976,6 +1031,76 @@ def test_codex_session_settings_restores_last_valid_collaboration_mode(
     assert codex_session_settings("session-1") == {
         "model": "gpt-new",
         "effort": "xhigh",
+        "collaboration_mode": "default",
+    }
+
+
+def test_codex_session_settings_restores_applied_update_before_next_turn(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout-session-1.jsonl"
+    rollout.write_text("\n".join(json.dumps(row) for row in [
+        {"type": "turn_context", "payload": {
+            "model": "gpt-before", "effort": "low",
+            "approval_policy": "on-request", "service_tier": "fast",
+            "collaboration_mode": {"mode": "default"},
+        }},
+        # app-server persists this immediately. There is deliberately no newer
+        # turn_context: this is the wrapper-restart window that used to restore
+        # gpt-before until the user sent another message.
+        {"type": "event_msg", "payload": {
+            "type": "thread_settings_applied",
+            "thread_settings": {
+                "model": "gpt-after",
+                "reasoning_effort": "xhigh",
+                "approval_policy": "never",
+                "service_tier": "default",
+                "collaboration_mode": {"mode": "plan", "settings": {
+                    "model": "gpt-after",
+                    "developer_instructions": "must not escape into output",
+                }},
+            },
+        }},
+    ]) + "\n")
+    monkeypatch.setattr(
+        codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
+
+    assert codex_session_settings("session-1") == {
+        "model": "gpt-after",
+        "effort": "xhigh",
+        "approval_policy": "never",
+        "service_tier": None,
+        "collaboration_mode": "plan",
+    }
+
+
+def test_codex_session_settings_last_ordered_record_wins_after_update(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout-session-1.jsonl"
+    rollout.write_text("\n".join(json.dumps(row) for row in [
+        {"type": "turn_context", "payload": {
+            "model": "gpt-first", "effort": "low",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "thread_settings_applied",
+            "thread_settings": {
+                "model": "gpt-second", "reasoning_effort": "high",
+                "service_tier": "default",
+                "collaboration_mode": {"mode": "plan"},
+            },
+        }},
+        {"type": "turn_context", "payload": {
+            "model": "gpt-third", "effort": "ultra",
+            "service_tier": "fast",
+            "collaboration_mode": {"mode": "default"},
+        }},
+    ]) + "\n")
+    monkeypatch.setattr(
+        codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
+
+    assert codex_session_settings("session-1") == {
+        "model": "gpt-third",
+        "effort": "ultra",
+        "service_tier": "fast",
         "collaboration_mode": "default",
     }
 

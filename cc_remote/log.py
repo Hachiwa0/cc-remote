@@ -19,6 +19,7 @@ _REDACT_KEYS = {
     "token", "authorization", "auth_token", "client_token", "wrapper_token",
     "api_key", "anthropic_auth_token", "anthropic_api_key", "password",
     "secret", "bearer", "prompt", "line",
+    "login_users_json", "wrapper_tokens_json",
 }
 
 _BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[^\s,;]+")

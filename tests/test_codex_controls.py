@@ -2,22 +2,34 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import time
 from types import SimpleNamespace
 
 import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from pydantic import ValidationError
 
+from cc_remote import __version__
 from cc_remote.protocol import (
-    CollaborationMode, Error, GoalState, Model, NewSession, StateEvent,
-    ThreadGoal,
+    CollaborationMode, Error, GoalState, Model, NewSession, PinSession, StateEvent,
+    ThreadGoal, TurnBinding, TurnEnd, UserMsg,
 )
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import machine as machine_module
-from cc_remote.wrapper.codex_handle import CodexHandle
+from cc_remote.wrapper.codex_handle import (
+    CodexHandle,
+    CodexManagedOverflow,
+    _provider_error_diagnostic,
+)
 from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.work_prompt import (
+    WORK_BASE_INSTRUCTIONS,
+    WORK_DEVELOPER_INSTRUCTIONS,
+)
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -26,11 +38,95 @@ class _Cfg:
     tool_result_max = 8000
 
 
+def test_provider_error_diagnostic_keeps_only_safe_classification():
+    diagnostic = _provider_error_diagnostic({
+        "willRetry": True,
+        "error": {
+            "message": "connection failed for SECRET_ENDPOINT",
+            "additionalDetails": "token=SECRET_TOKEN",
+            "codexErrorInfo": {
+                "responseStreamDisconnected": {"httpStatusCode": 503},
+            },
+        },
+    })
+
+    assert diagnostic == {
+        "will_retry": True,
+        "category": "upstream_server",
+        "http_status": 503,
+    }
+    assert "SECRET" not in repr(diagnostic)
+
+
 def test_codex_initialize_declares_experimental_api_for_collaboration_mode():
     assert codex_handle_module._initialize_params() == {
-        "clientInfo": {"name": "cc-remote", "version": "0.1.0"},
+        "clientInfo": {"name": "cc-remote", "version": __version__},
         "capabilities": {"experimentalApi": True},
     }
+
+
+@pytest.mark.parametrize("version, expected", [
+    ("0.144.5", False),
+    ("0.144.6", True),
+    ("0.145.0-alpha.1", True),
+    (None, False),
+    ("invalid", False),
+])
+def test_codex_lightweight_resume_version_gate(version, expected):
+    assert codex_handle_module._supports_lightweight_resume(version) is expected
+
+
+_WORK_SKILLS_RESPONSE = {
+    "data": [{
+        "cwd": "/tmp",
+        "skills": [
+            {"path": "/home/test/.codex/skills/private/SKILL.md", "enabled": True},
+            {"path": "/system/skills/official/SKILL.md", "enabled": True},
+            {"path": "/disabled/SKILL.md", "enabled": False},
+        ],
+    }],
+}
+_WORK_CONFIG_RESPONSE = {
+    "config": {
+        "model": "gpt-configured",
+        "model_provider": "openai",
+        "mcp_servers": {
+            "private": {"command": "private-mcp"},
+            "already-off": {"command": "unused", "enabled": False},
+        },
+    },
+}
+
+
+def _expected_work_config():
+    return codex_handle_module._work_thread_config(
+        _WORK_SKILLS_RESPONSE, _WORK_CONFIG_RESPONSE)
+
+
+def test_codex_work_thread_config_disables_context_without_model_or_auth_override():
+    config = _expected_work_config()
+
+    assert config["features"] == {
+        name: False for name in codex_handle_module._WORK_DISABLED_FEATURES
+    }
+    assert config["skills"]["config"] == [
+        {"path": "/home/test/.codex/skills/private/SKILL.md", "enabled": False},
+        {"path": "/system/skills/official/SKILL.md", "enabled": False},
+    ]
+    assert config["mcp_servers"] == {
+        "private": {"enabled": False},
+        "already-off": {"enabled": False},
+    }
+    assert config["project_doc_max_bytes"] == 0
+    assert config["web_search"] == "cached"
+    assert "goals" not in config["features"]
+    assert not ({"model", "model_provider", "auth"} & config.keys())
+
+
+@pytest.mark.parametrize("bad", [None, {}, {"data": None}, {"data": [{}]}])
+def test_codex_work_thread_config_fails_closed_on_invalid_skill_inventory(bad):
+    with pytest.raises(RuntimeError, match="skills/list"):
+        codex_handle_module._work_thread_config(bad, _WORK_CONFIG_RESPONSE)
 
 
 def test_codex_sessions_toml_loader_falls_back_on_python_310(monkeypatch):
@@ -48,6 +144,69 @@ def test_codex_sessions_toml_loader_falls_back_on_python_310(monkeypatch):
 
     assert codex_sessions_module._load_tomllib() is fallback
     assert imports == ["tomllib", "tomli"]
+
+
+def test_codex_session_list_cold_reads_are_singleflight(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        calls = 0
+
+        async def fake_list(_limit):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return [{
+                "session_id": "catalog-session", "summary": "catalog",
+                "cwd": "/tmp", "status": "idle",
+            }]
+
+        monkeypatch.setattr(machine_module, "list_codex_sessions", fake_list)
+        await asyncio.gather(*[
+            machine._handle_list_sessions(SimpleNamespace(
+                engine="codex", space="code", client_id=client))
+            for client in ("client-a", "client-b")
+        ])
+
+        assert calls == 1
+        lists = [event for event in transport.sent if event.type == "session_list"]
+        assert len(lists) == 2
+        assert {event.to for event in lists} == {"client-a", "client-b"}
+
+    asyncio.run(run())
+
+
+def test_stale_codex_session_list_paints_before_refresh_finishes(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        machine._codex_session_list_cache = (time.monotonic() - 60, [{
+            "session_id": "stale-session", "summary": "stale",
+            "cwd": "/tmp", "status": "idle",
+        }])
+        release = asyncio.Event()
+
+        async def fake_list(_limit):
+            await release.wait()
+            return [{
+                "session_id": "fresh-session", "summary": "fresh",
+                "cwd": "/tmp", "status": "idle",
+            }]
+
+        monkeypatch.setattr(machine_module, "list_codex_sessions", fake_list)
+        task = asyncio.create_task(machine._handle_list_sessions(
+            SimpleNamespace(engine="codex", space="code", client_id="client")))
+        for _ in range(100):
+            if any(event.type == "session_list" for event in transport.sent):
+                break
+            await asyncio.sleep(0.001)
+        assert [event.sessions[0].session_id for event in transport.sent
+                if event.type == "session_list"] == ["stale-session"]
+        release.set()
+        await task
+        assert [event.sessions[0].session_id for event in transport.sent
+                if event.type == "session_list"] == [
+                    "stale-session", "fresh-session"]
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-5.6-luna"])
@@ -218,6 +377,642 @@ def test_codex_turn_completion_before_start_waiter_does_not_resurrect_active():
     asyncio.run(run())
 
 
+def test_codex_review_owns_outer_lifecycle_and_nested_execution_turn():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "review-thread"
+
+        async def request(method, params=None):
+            assert method == "review/start"
+            assert params == {
+                "threadId": "review-thread",
+                "target": {"type": "uncommittedChanges"},
+                "delivery": "inline",
+            }
+            # The outer Review item can precede the RPC response. It owns the
+            # visible lifecycle, while the nested reviewer is still our actual
+            # execution/rollout turn and must not be classified as a terminal.
+            await handle._dispatch({
+                "method": "item/started",
+                "params": {
+                    "threadId": "review-thread", "turnId": "review-outer",
+                    "item": {"id": "entered", "type": "enteredReviewMode"},
+                },
+            })
+            await handle._dispatch({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "review-thread",
+                    "turn": {"id": "review-inner"},
+                },
+            })
+            await handle._dispatch({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "review-thread",
+                    "turn": {"id": "review-outer", "status": "completed"},
+                },
+            })
+            return {
+                "reviewThreadId": "review-thread",
+                "turn": {"id": "review-outer"},
+            }
+
+        handle._request = request
+        result = await handle.start_review({"type": "uncommittedChanges"})
+        frames = [frame async for frame in handle.receive_response()]
+
+        assert result == {
+            "thread_id": "review-thread", "turn_id": "review-outer"}
+        assert [frame["method"] for frame in frames] == [
+            "item/started", "turn/started", "turn/completed"]
+        assert handle.owned_turn_ids == {"review-outer", "review-inner"}
+        assert handle.turn_active is False
+        assert handle.turn_start_pending is False
+        assert handle.turn_attribution_pending is False
+        assert handle._review_active is False
+
+    asyncio.run(run())
+
+
+def test_codex_review_interrupt_retries_nested_turn_after_response_race():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "review-race"
+        interrupt_targets = []
+
+        async def request(method, params=None):
+            if method == "review/start":
+                return {
+                    "reviewThreadId": "review-race",
+                    "turn": {"id": "review-outer"},
+                }
+            assert method == "turn/interrupt"
+            interrupt_targets.append(params["turnId"])
+            if params["turnId"] == "review-outer":
+                # Official app-server ordering can answer review/start before it
+                # emits the nested turn/started frame. The first strict interrupt
+                # is rejected, then the newly attributed executor must be retried.
+                await handle._dispatch({
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "review-race",
+                        "turn": {"id": "review-inner"},
+                    },
+                })
+                raise RuntimeError("active turn id is review-inner")
+            return {}
+
+        handle._request = request
+        await handle.start_review({"type": "uncommittedChanges"})
+        assert handle.turn_attribution_pending is True
+        await handle.interrupt()
+
+        assert interrupt_targets == ["review-outer", "review-inner"]
+        assert handle.owned_turn_ids == {"review-outer", "review-inner"}
+        assert handle.turn_attribution_pending is False
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "review-race",
+                "turn": {"id": "review-outer", "status": "interrupted"},
+            },
+        })
+        assert handle._review_active is False
+
+    asyncio.run(run())
+
+
+def test_codex_review_pre_response_burst_never_blocks_rpc_reader():
+    class BurstCfg(_Cfg):
+        turn_reader_queue_cap = 1
+        ws_max_size_bytes = 1024 * 1024
+
+    async def run():
+        handle = CodexHandle(BurstCfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "review-burst"
+
+        async def request(method, _params=None):
+            assert method == "review/start"
+            # More events than the configured managed bridge can retain arrive
+            # before the response. The sole stdout reader must never await a
+            # consumer which cannot start until this RPC returns.
+            assert handle._turn_q is not None
+            for index in range(handle._turn_q.max_items + 1):
+                await handle._dispatch({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "review-burst", "turnId": "review-outer",
+                        "item": {
+                            "id": f"early-{index}",
+                            "type": "enteredReviewMode",
+                        },
+                    },
+                })
+            return {
+                "reviewThreadId": "review-burst",
+                "turn": {"id": "review-outer"},
+            }
+
+        handle._request = request
+        result = await asyncio.wait_for(
+            handle.start_review({"type": "uncommittedChanges"}),
+            timeout=0.2,
+        )
+        assert result["turn_id"] == "review-outer"
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "review-burst",
+                "turn": {"id": "review-outer", "status": "completed"},
+            },
+        })
+        # EOF/disconnect racing the consumer must not replace the already
+        # retained authoritative terminal with a bare sentinel.
+        handle._force_turn_sentinel(handle._turn_q)
+        frames = [frame async for frame in handle.receive_response()]
+        assert len(frames) == 2
+        assert isinstance(frames[0], CodexManagedOverflow)
+        assert frames[1]["method"] == "turn/completed"
+
+    asyncio.run(run())
+
+
+def test_codex_managed_bridge_absorbs_normal_burst_before_consumer_runs():
+    class BurstCfg(_Cfg):
+        turn_reader_queue_cap = 4
+        ws_max_size_bytes = 1024 * 1024
+
+    async def run():
+        handle = CodexHandle(BurstCfg())
+        handle.thread_id = "normal-burst"
+        handle.turn_id = "normal-burst-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+
+        # A tool/reasoning burst can outrun the relay-facing consumer for a few
+        # event-loop turns. Four frames is a backpressure setting for Machine's
+        # reader, not a safe app-server notification window.
+        for index in range(32):
+            await handle._dispatch({
+                "method": "item/started",
+                "params": {
+                    "threadId": "normal-burst",
+                    "turnId": "normal-burst-turn",
+                    "item": {
+                        "id": f"burst-{index}",
+                        "type": "reasoning",
+                    },
+                },
+            })
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "normal-burst",
+                "turn": {
+                    "id": "normal-burst-turn",
+                    "status": "completed",
+                },
+            },
+        })
+
+        frames = [frame async for frame in handle.receive_response()]
+        assert len(frames) == 33
+        assert not any(
+            isinstance(frame, CodexManagedOverflow) for frame in frames)
+        assert frames[-1]["method"] == "turn/completed"
+
+    asyncio.run(run())
+
+
+def test_codex_buffered_stdout_yields_to_managed_consumer_without_false_overflow():
+    class FairCfg(_Cfg):
+        turn_reader_queue_cap = 4
+        ws_max_size_bytes = 1024 * 1024
+
+    class BufferedStdout:
+        def __init__(self, messages):
+            self.lines = [
+                (json.dumps(message) + "\n").encode() for message in messages
+            ]
+
+        async def readline(self):
+            return self.lines.pop(0) if self.lines else b""
+
+    async def run():
+        handle = CodexHandle(FairCfg())
+        handle.thread_id = "fair-thread"
+        handle.turn_id = "fair-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        messages = [
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "fair-thread", "turnId": "fair-turn",
+                    "item": {"id": f"item-{index}", "type": "reasoning"},
+                },
+            }
+            for index in range(5)
+        ]
+        messages.append({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "fair-thread",
+                "turn": {"id": "fair-turn", "status": "completed"},
+            },
+        })
+        proc = SimpleNamespace(stdout=BufferedStdout(messages))
+        consumer = asyncio.create_task(
+            _collect_async(handle.receive_response()))
+        await handle._read_loop(proc, handle._generation)
+        frames = await consumer
+
+        assert len(frames) == len(messages)
+        assert not any(isinstance(frame, CodexManagedOverflow)
+                       for frame in frames)
+        assert frames[-1]["method"] == "turn/completed"
+
+    async def _collect_async(stream):
+        return [item async for item in stream]
+
+    asyncio.run(run())
+
+
+def test_codex_review_response_turn_is_interruptible_and_streamed():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("review-managed", "review-managed")
+        ctx.engine = "codex"
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = ctx.session_id
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external(_sid):
+            return False
+
+        machine._prime_codex_ownership = no_external
+        review_entered = asyncio.Event()
+        release_review = asyncio.Event()
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "review/start":
+                review_entered.set()
+                await release_review.wait()
+                return {
+                    "reviewThreadId": ctx.session_id,
+                    "turn": {"id": "review-outer"},
+                }
+            if method == "turn/interrupt":
+                return {}
+            raise AssertionError(method)
+
+        handle._request = request
+        command = SimpleNamespace(
+            session_id=ctx.session_id,
+            engine="codex",
+            space="code",
+            target="uncommittedChanges",
+            value=None,
+            client_id="client-1",
+        )
+        start_task = asyncio.create_task(
+            machine._handle_start_review(command))
+        await review_entered.wait()
+
+        # The RPC has not returned yet, but Review already owns the session.
+        assert ctx.state == "running"
+        duplicate = await machine._handle_query(SimpleNamespace(
+            sid=ctx.key, prompt="must be busy", images=None, files=None,
+            msg_id="review-race",
+        ))
+        assert isinstance(duplicate, Error) and duplicate.code == "busy"
+
+        release_review.set()
+        await start_task
+        assert ctx.turn_task is not None
+        # review/start's response names the outer UI lifecycle. The next
+        # turn/started notification is the strict app-server interrupt target.
+        await handle._dispatch({
+            "method": "turn/started",
+            "params": {
+                "threadId": ctx.session_id,
+                "turn": {"id": "review-inner"},
+            },
+        })
+        assert handle.owned_turn_ids == {"review-outer", "review-inner"}
+        await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
+        assert ctx.state == "interrupting"
+        # A repeated stop is idempotent and never produces not_running.
+        errors_before = len([item for item in transport.sent
+                             if isinstance(item, Error)])
+        await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
+        assert len([item for item in transport.sent
+                    if isinstance(item, Error)]) == errors_before
+        assert requests[-1] == (
+            "turn/interrupt",
+            {"threadId": ctx.session_id, "turnId": "review-inner"},
+        )
+
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": ctx.session_id,
+                "turn": {"id": "review-outer", "status": "interrupted"},
+            },
+        })
+        turn_task = ctx.turn_task
+        assert turn_task is not None
+        await turn_task
+
+        assert ctx.state == "idle"
+        assert [item.state for item in transport.sent
+                if isinstance(item, StateEvent)][-3:] == [
+                    "running", "interrupting", "idle"]
+        anchors = [item for item in transport.sent
+                   if isinstance(item, UserMsg)
+                   and item.msg_id == "review-outer"]
+        assert len(anchors) == 1 and anchors[0].prompt == ""
+        terminal = [item for item in transport.sent
+                    if isinstance(item, TurnEnd)][-1]
+        assert terminal.turn_id == "review-outer"
+        assert terminal.result.subtype == "error_during_execution"
+
+    asyncio.run(run())
+
+
+def test_codex_review_start_failure_clears_turn_ownership():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "review-failure"
+
+        async def request(_method, _params=None):
+            raise RuntimeError("review rejected")
+
+        handle._request = request
+        with pytest.raises(RuntimeError, match="review rejected"):
+            await handle.start_review({"type": "uncommittedChanges"})
+        assert handle.turn_active is False
+        assert handle.turn_start_pending is False
+        assert handle.turn_id is None
+        assert handle._turn_q is None
+
+        with pytest.raises(RuntimeError, match="not running"):
+            await handle.interrupt()
+
+    asyncio.run(run())
+
+
+def test_codex_review_interrupt_timeout_reconnects_and_unlocks():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("review-timeout", "review-timeout")
+        ctx.engine = "codex"
+        never = asyncio.Event()
+        reconnects = []
+
+        class StalledSdk:
+            async def receive_response(self):
+                await never.wait()
+                if False:
+                    yield None
+
+            async def force_reconnect(self, session_id, cwd):
+                reconnects.append((session_id, cwd))
+
+        ctx.sdk = StalledSdk()
+        ctx.state = "interrupting"
+        ctx.active_msg_id = "review-timeout-turn"
+        ctx.interrupt_event.set()
+        ctx.interrupt_deadline = asyncio.get_running_loop().time() + 0.01
+        ctx.turn_task = asyncio.current_task()
+
+        await machine._run_codex_review_turn(ctx, "review-timeout-turn")
+
+        assert reconnects == [(ctx.session_id, ctx.cwd)]
+        assert ctx.state == "idle"
+        assert ctx.turn_task is None
+        timeout = [item for item in transport.sent
+                   if isinstance(item, Error)
+                   and item.code == "drain_timeout"]
+        assert len(timeout) == 1
+        terminal = [item for item in transport.sent
+                    if isinstance(item, TurnEnd)][-1]
+        assert terminal.result.subtype == "error_during_execution"
+
+    asyncio.run(run())
+
+
+def test_codex_review_overflow_preserves_authoritative_success_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("review-overflow", "review-overflow")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "review-overflow-turn"
+        ctx.turn_task = asyncio.current_task()
+
+        class OverflowSdk:
+            async def receive_response(self):
+                yield CodexManagedOverflow("review-overflow-turn")
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "review-overflow-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = OverflowSdk()
+        await machine._run_codex_review_turn(ctx, "review-overflow-turn")
+
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].turn_id == "review-overflow-turn"
+        assert terminal[0].result.subtype == "success"
+        assert terminal[0].result.is_error is False
+
+    asyncio.run(run())
+
+
+def test_managed_codex_overflow_preserves_authoritative_success_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("managed-overflow", "managed-overflow")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-overflow-message"
+        ctx.turn_task = asyncio.current_task()
+
+        class OverflowSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(self, _prompt, images=None):
+                return "managed-overflow-turn"
+
+            async def receive_response(self):
+                yield CodexManagedOverflow("managed-overflow-turn")
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "managed-overflow-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = OverflowSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].turn_id == "managed-overflow-turn"
+        assert terminal[0].result.subtype == "success"
+        assert terminal[0].result.is_error is False
+
+    asyncio.run(run())
+
+
+def test_managed_codex_overflow_reports_live_delay_without_idle_warning():
+    async def run():
+        machine, transport = _mk_machine()
+        machine.cfg.codex_turn_idle_warn_seconds = 0.02
+        ctx = _mk_ctx("managed-overflow-wait", "managed-overflow-wait")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-overflow-wait"
+        overflow_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        class OverflowSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(self, _prompt, images=None):
+                return "managed-overflow-wait-turn"
+
+            async def receive_response(self):
+                yield CodexManagedOverflow("managed-overflow-wait-turn")
+                overflow_seen.set()
+                await release.wait()
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "managed-overflow-wait-turn",
+                        "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = OverflowSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+
+        await asyncio.wait_for(overflow_seen.wait(), timeout=0.2)
+        for _ in range(20):
+            if any(
+                isinstance(event, StateEvent)
+                and event.msg_id == "browser-overflow-wait"
+                and event.detail
+                for event in transport.sent
+            ):
+                break
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.04)
+
+        notices = [
+            event for event in transport.sent
+            if isinstance(event, StateEvent)
+            and event.msg_id == "browser-overflow-wait"
+            and event.detail
+        ]
+        assert len(notices) == 1
+        assert "实时过程暂时延迟" in notices[0].detail
+        assert "没有收到新进展" not in notices[0].detail
+        assert ctx.state == "running"
+
+        release.set()
+        await asyncio.wait_for(turn, timeout=0.5)
+
+        assert ctx.state == "idle"
+        assert any(
+            isinstance(event, StateEvent)
+            and event.msg_id == "browser-overflow-wait"
+            and event.detail is None
+            for event in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_managed_codex_overflow_keeps_authoritative_failure_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("managed-overflow-failed", "managed-overflow-failed")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-overflow-failed"
+        ctx.turn_task = asyncio.current_task()
+
+        class OverflowSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(self, _prompt, images=None):
+                return "managed-overflow-failed-turn"
+
+            async def receive_response(self):
+                yield CodexManagedOverflow("managed-overflow-failed-turn")
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "managed-overflow-failed-turn",
+                        "status": "failed",
+                        "error": {"message": "PRIVATE_PROVIDER_DIAGNOSTIC"},
+                    }},
+                }
+
+        ctx.sdk = OverflowSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        errors = [event for event in transport.sent if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].message == "Codex 本次回复未完成，请重试。"
+        assert "PRIVATE_PROVIDER_DIAGNOSTIC" not in errors[0].message
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.subtype == "error"
+        assert terminal[0].result.is_error is True
+
+    asyncio.run(run())
+
+
 def test_codex_turn_started_notification_tracks_automatic_turn_id():
     async def run():
         handle = CodexHandle(_Cfg())
@@ -228,6 +1023,75 @@ def test_codex_turn_started_notification_tracks_automatic_turn_id():
         assert handle.turn_id == "automatic"
         assert handle.turn_active is True
         assert handle.owned_turn_ids == {"automatic"}
+
+    asyncio.run(run())
+
+
+def test_shared_codex_drops_unattributed_provider_error_from_other_thread():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._using_daemon_proxy = True
+        handle.thread_id = "current-thread"
+        handle.turn_id = "current-turn"
+        handle.turn_active = True
+        handle._turn_q = asyncio.Queue()
+
+        await handle._dispatch({
+            "method": "error",
+            "params": {
+                "willRetry": True,
+                "error": {"message": "Reconnecting... 2/5"},
+            },
+        })
+
+        assert handle._turn_q.empty()
+        assert handle.turn_active is True
+
+    asyncio.run(run())
+
+
+def test_shared_codex_keeps_attributed_provider_error_for_current_turn():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._using_daemon_proxy = True
+        handle.thread_id = "current-thread"
+        handle.turn_id = "current-turn"
+        handle.turn_active = True
+        handle._turn_q = asyncio.Queue()
+        message = {
+            "method": "error",
+            "params": {
+                "threadId": "current-thread",
+                "turnId": "current-turn",
+                "willRetry": True,
+                "error": {"message": "Reconnecting... 2/5"},
+            },
+        }
+
+        await handle._dispatch(message)
+
+        assert await asyncio.wait_for(handle._turn_q.get(), timeout=0.1) == message
+
+    asyncio.run(run())
+
+
+def test_private_codex_keeps_legacy_unattributed_provider_error():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "current-thread"
+        handle.turn_active = True
+        handle._turn_q = asyncio.Queue()
+        message = {
+            "method": "error",
+            "params": {
+                "willRetry": True,
+                "error": {"message": "Reconnecting... 2/5"},
+            },
+        }
+
+        await handle._dispatch(message)
+
+        assert await asyncio.wait_for(handle._turn_q.get(), timeout=0.1) == message
 
     asyncio.run(run())
 
@@ -336,6 +1200,7 @@ def test_codex_catalog_normalization_is_structurally_bounded(monkeypatch):
 def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
         monkeypatch):
     monkeypatch.setattr(codex_handle_module, "_BIN_CACHE", None)
+    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE_INVENTORY", None)
     monkeypatch.delenv("CODEX_BIN", raising=False)
     monkeypatch.setattr(
         codex_handle_module, "_codex_candidates", lambda: ["old", "new", "broken"])
@@ -344,6 +1209,134 @@ def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
         codex_handle_module, "_codex_version", lambda path: versions[path])
 
     assert codex_handle_module._resolve_codex_bin() == "new"
+
+
+def test_oversized_resume_prefers_only_a_newer_official_desktop_core(
+        monkeypatch, tmp_path):
+    managed = tmp_path / "managed-codex"
+    desktop = tmp_path / "desktop-codex"
+    rollout = tmp_path / "rollout.jsonl"
+    managed.write_text("managed")
+    desktop.write_text("desktop")
+    managed.chmod(0o755)
+    desktop.chmod(0o755)
+    with rollout.open("wb") as stream:
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES)
+
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setattr(
+        codex_handle_module, "_CODEX_DESKTOP_BIN_CANDIDATES",
+        (str(desktop),),
+    )
+    monkeypatch.setattr(
+        codex_handle_module, "codex_rollout_path", lambda _sid: str(rollout))
+    versions = {
+        str(managed): (0, 144, 6),
+        str(desktop): (0, 145, 0),
+    }
+    monkeypatch.setattr(
+        codex_handle_module, "_codex_version", lambda path: versions[path])
+
+    choose = codex_handle_module._newer_private_core_for_oversized_resume
+    assert choose(str(managed), "huge-thread") == str(desktop)
+
+    with rollout.open("r+b") as stream:
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES - 1)
+    assert choose(str(managed), "small-thread") is None
+
+    with rollout.open("r+b") as stream:
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES)
+    versions[str(desktop)] = versions[str(managed)]
+    assert choose(str(managed), "same-version-thread") is None
+
+    versions[str(desktop)] = (0, 145, 0)
+    monkeypatch.setenv("CODEX_BIN", str(managed))
+    assert choose(str(managed), "explicit-bin-thread") is None
+
+
+def test_http_resume_fallback_is_bounded_to_oversized_desktop_openai_rollout(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+
+    def write_meta(**overrides):
+        payload = {
+            "id": "huge-thread",
+            "originator": "Codex Desktop",
+            "model_provider": "openai",
+        }
+        payload.update(overrides)
+        first = json.dumps({
+            "type": "session_meta", "payload": payload,
+        }).encode() + b"\n"
+        with rollout.open("wb") as stream:
+            stream.write(first)
+            stream.truncate(
+                codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES)
+
+    monkeypatch.setattr(
+        codex_handle_module, "codex_rollout_path", lambda _sid: str(rollout))
+    requires_http = (
+        codex_handle_module._oversized_desktop_openai_resume_requires_http)
+
+    write_meta()
+    assert requires_http("huge-thread") is True
+
+    write_meta(originator="codex_cli_rs")
+    assert requires_http("huge-thread") is False
+
+    write_meta(model_provider="cubence")
+    assert requires_http("huge-thread") is False
+
+    write_meta()
+    with rollout.open("r+b") as stream:
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES - 1)
+    assert requires_http("small-thread") is False
+
+    with rollout.open("wb") as stream:
+        stream.write(b"{" + b"x" * (
+            codex_handle_module._ROLLOUT_SESSION_META_MAX_BYTES + 1))
+        stream.truncate(
+            codex_handle_module._OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES)
+    assert requires_http("oversized-meta") is False
+
+
+def test_codex_binary_resolution_reprobes_after_symlink_upgrade(
+        monkeypatch, tmp_path):
+    old = tmp_path / "codex-0.144.1"
+    new = tmp_path / "codex-0.144.4"
+    old.write_text("old")
+    new.write_text("new release with a different identity")
+    old.chmod(0o755)
+    new.chmod(0o755)
+    current = tmp_path / "codex"
+    current.symlink_to(old)
+
+    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE", None)
+    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE_INVENTORY", None)
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.setattr(
+        codex_handle_module, "_codex_candidates", lambda: [str(current)])
+    probed = []
+
+    def version(path):
+        probed.append(os.path.realpath(path))
+        return ((0, 144, 4) if os.path.realpath(path) == str(new)
+                else (0, 144, 1))
+
+    monkeypatch.setattr(codex_handle_module, "_codex_version", version)
+    assert codex_handle_module._resolve_codex_bin() == str(current)
+    assert probed == [str(old)]
+    assert codex_handle_module._resolve_codex_bin() == str(current)
+    assert probed == [str(old)]
+
+    current.unlink()
+    current.symlink_to(new)
+    assert codex_handle_module._resolve_codex_bin() == str(current)
+    assert probed == [str(old), str(new)]
 
 
 def test_codex_config_defaults_use_only_top_level_toml_keys(
@@ -487,8 +1480,77 @@ def test_codex_granular_approval_survives_resume_and_turn_start():
     asyncio.run(run())
 
 
-def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
+def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
         monkeypatch):
+    async def run():
+        spawned = []
+
+        async def capture(*args, **_kwargs):
+            spawned.extend(args)
+            raise RuntimeError("captured work profile")
+
+        monkeypatch.setenv("CODEX_HOME", "/home/test/.codex-custom")
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec", capture)
+        cwd = "/home/test/.codex-custom/cc-remote/work/chats/work-1/workspace"
+        with pytest.raises(RuntimeError, match="captured work profile"):
+            await CodexHandle(_Cfg(), cwd=cwd, work_mode=True).connect()
+
+        assert spawned[:3] == ["/usr/bin/codex", "app-server", "--stdio"]
+        overrides = [
+            spawned[index + 1]
+            for index, value in enumerate(spawned[:-1])
+            if value == "-c"
+        ]
+        assert 'default_permissions="cc_remote_work"' in overrides
+        filesystem = next(
+            value for value in overrides
+            if value.startswith("permissions.cc_remote_work.filesystem="))
+        assert '":minimal" = "read"' in filesystem
+        assert '"~"' not in filesystem
+        assert '"/home/test/.codex-custom/tmp" = "read"' in filesystem
+        assert '"/usr/bin/codex" = "read"' in filesystem
+        assert f'"{cwd}" = "write"' in filesystem
+        assert "permissions.cc_remote_work.network.enabled=false" in overrides
+
+    asyncio.run(run())
+
+
+def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
+    async def run():
+        cwd = "/home/test/.codex/cc-remote/work/chats/work-1/workspace"
+        handle = CodexHandle(_Cfg(), cwd=cwd, work_mode=True)
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "work-thread"
+        handle.model = "gpt-work"
+        handle.effort = None
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            return {"turn": {"id": "work-turn"}}
+
+        handle._request = request
+        await handle.query("create a file")
+
+        method, params = requests[-1]
+        assert method == "turn/start"
+        assert params["cwd"] == cwd
+        assert params["approvalPolicy"] == "never"
+        assert "sandboxPolicy" not in params
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("work_mode,http_only", [
+    (False, False),
+    (False, True),
+    (True, False),
+])
+def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
+        monkeypatch, work_mode, http_only):
     class FakeProcess:
         pid = 424243
         returncode = None
@@ -509,11 +1571,15 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         monkeypatch.setattr(
             codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
+            codex_handle_module,
+            "_oversized_desktop_openai_resume_requires_http",
+            lambda _sid: http_only,
+        )
+        monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
-
-        handle = CodexHandle(_Cfg())
+        handle = CodexHandle(_Cfg(), work_mode=work_mode)
         calls = []
 
         async def idle(*_args):
@@ -522,7 +1588,11 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         async def request(method, params=None):
             calls.append((method, params))
             if method == "initialize":
-                return {"serverInfo": {"version": "0.144.1"}}
+                return {"userAgent": "codex_cli_rs/0.144.6 (test)"}
+            if method == "skills/list":
+                return _WORK_SKILLS_RESPONSE
+            if method == "config/read":
+                return _WORK_CONFIG_RESPONSE
             if method == "thread/resume":
                 return {
                     "thread": {"id": "resume-thread"},
@@ -539,19 +1609,95 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
         await handle.connect(resume_id="resume-thread", cwd="/tmp")
 
-        assert calls[1] == ("thread/resume", {
+        expected_resume = {
             "threadId": "resume-thread", "cwd": "/tmp",
-        })
+            "excludeTurns": True,
+        }
+        if http_only:
+            expected_resume["modelProvider"] = (
+                codex_handle_module._OPENAI_HTTP_RESUME_PROVIDER_ID)
+        if work_mode:
+            expected_resume.update({
+                "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                "personality": "none",
+                "config": _expected_work_config(),
+            })
+        resume_call = next(call for call in calls if call[0] == "thread/resume")
+        assert resume_call == ("thread/resume", expected_resume)
+        assert not ({
+            "sandbox", "sandboxPolicy", "approvalsReviewer",
+        } & resume_call[1].keys())
+        if not work_mode:
+            assert not ({"config", "personality"} & resume_call[1].keys())
         assert (handle.model, handle.effort, handle.approval,
                 handle.service_tier) == (
-            "persisted-model", "ultra", "on-request", "fast")
+            "persisted-model", "ultra",
+            "never" if work_mode else "on-request", "fast")
         await handle.disconnect()
 
     asyncio.run(run())
 
 
+def test_codex_legacy_resume_rejects_oversized_rollout_before_request(
+        monkeypatch, tmp_path):
+    class FakeProcess:
+        pid = 424245
+        returncode = None
+        stdin = stdout = stderr = SimpleNamespace()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = 0
+
+    async def run():
+        process = FakeProcess()
+        rollout = tmp_path / "large.jsonl"
+        with rollout.open("wb") as stream:
+            stream.seek(codex_handle_module._PROXY_MESSAGE_MAX)
+            stream.write(b"\n")
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module, "codex_rollout_path", lambda _sid: str(rollout))
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec",
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
+        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+
+        handle = CodexHandle(_Cfg())
+        calls = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            if method == "initialize":
+                return {"userAgent": "codex_cli_rs/0.144.5 (test)"}
+            raise AssertionError(method)
+
+        handle._read_loop = idle
+        handle._drain_stderr = idle
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="不支持超长会话的轻量恢复"):
+            await handle.connect(resume_id="large-thread", cwd="/tmp")
+        assert [method for method, _params in calls] == ["initialize"]
+        assert handle.proc is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("work_mode", [False, True])
 def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
-        monkeypatch):
+        monkeypatch, work_mode):
     class FakeProcess:
         pid = 424244
         returncode = None
@@ -576,7 +1722,7 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
 
-        handle = CodexHandle(_Cfg())
+        handle = CodexHandle(_Cfg(), work_mode=work_mode)
         handle.model = "first-model"
         handle.effort = "ultra"
         handle.applied_effort = "ultra"
@@ -591,7 +1737,11 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         async def request(method, params=None):
             calls.append((method, params))
             if method == "initialize":
-                return {"serverInfo": {"version": "0.144.1"}}
+                return {"userAgent": "codex_cli_rs/0.144.6 (test)"}
+            if method == "skills/list":
+                return _WORK_SKILLS_RESPONSE
+            if method == "config/read":
+                return _WORK_CONFIG_RESPONSE
             if method == "thread/start":
                 return {
                     "thread": {"id": "fresh-thread"},
@@ -626,19 +1776,49 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
         await handle.connect(cwd="/tmp")
 
-        assert calls[1] == ("thread/start", {
+        expected_start = {
             "cwd": "/tmp",
-            "approvalPolicy": "on-request",
+            "approvalPolicy": "never" if work_mode else "on-request",
             "serviceTier": "fast",
             "model": "first-model",
-        })
-        assert calls[2] == ("thread/settings/update", {
+        }
+        if work_mode:
+            expected_start.update({
+                "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                "personality": "none",
+                "config": _expected_work_config(),
+            })
+        start_call = next(call for call in calls if call[0] == "thread/start")
+        assert start_call == ("thread/start", expected_start)
+        discovery_methods = [
+            call for call in calls
+            if call[0] in {"skills/list", "config/read"}
+        ]
+        if work_mode:
+            assert discovery_methods == [
+                ("skills/list", {"cwds": ["/tmp"], "forceReload": True}),
+                ("config/read", {"cwd": "/tmp", "includeLayers": False}),
+            ]
+        else:
+            # Code must keep the native process/config path byte-for-byte: no
+            # Work inventory RPC and no thread-level config overlay.
+            assert discovery_methods == []
+        assert not ({
+            "sandbox", "sandboxPolicy", "approvalsReviewer",
+        } & start_call[1].keys())
+        if not work_mode:
+            assert not ({"config", "personality"} & start_call[1].keys())
+        settings_call = next(
+            call for call in calls if call[0] == "thread/settings/update")
+        assert settings_call == ("thread/settings/update", {
             "threadId": "fresh-thread",
             "collaborationMode": {
                 "mode": "plan",
                 "settings": {
                     "model": "first-model",
-                    "developer_instructions": None,
+                    "developer_instructions": (
+                        WORK_DEVELOPER_INSTRUCTIONS if work_mode else None),
                     "reasoning_effort": "ultra",
                 },
             },
@@ -646,7 +1826,81 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         })
         assert (handle.model, handle.effort, handle.approval,
                 handle.collaboration_mode, handle.service_tier) == (
-            "first-model", "ultra", "on-request", "plan", "priority")
+            "first-model", "ultra",
+            "never" if work_mode else "on-request", "plan", "priority")
+        await handle.disconnect()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("work_mode", [False, True])
+def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
+        monkeypatch, work_mode):
+    class FakeProcess:
+        pid = 424245
+        returncode = None
+        stdin = stdout = stderr = SimpleNamespace()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = 0
+
+    async def run():
+        process = FakeProcess()
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module.asyncio, "create_subprocess_exec",
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
+        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+
+        handle = CodexHandle(_Cfg(), work_mode=work_mode)
+        calls = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            if method == "initialize":
+                return {"userAgent": "codex_cli_rs/0.144.6 (test)"}
+            if method == "skills/list":
+                return _WORK_SKILLS_RESPONSE
+            if method == "config/read":
+                return _WORK_CONFIG_RESPONSE
+            if method == "thread/fork":
+                return {"thread": {"id": "forked-thread"}}
+            raise AssertionError(method)
+
+        handle._read_loop = idle
+        handle._drain_stderr = idle
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+        await handle.connect(
+            resume_id="parent-thread", cwd="/tmp", fork=True)
+
+        expected_fork = {
+            "threadId": "parent-thread",
+            "ephemeral": True,
+            "cwd": "/tmp",
+            "approvalPolicy": "never",
+            "excludeTurns": True,
+        }
+        if work_mode:
+            expected_fork.update({
+                "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                "personality": "none",
+                "config": _expected_work_config(),
+            })
+        fork_call = next(call for call in calls if call[0] == "thread/fork")
+        assert fork_call == ("thread/fork", expected_fork)
         await handle.disconnect()
 
     asyncio.run(run())
@@ -1277,6 +2531,50 @@ def test_managed_turn_exception_does_not_unlock_live_auto_turn():
     asyncio.run(run())
 
 
+def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("binding-session", "binding-session")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-message"
+        ctx.turn_task = asyncio.current_task()
+
+        class AcceptedSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(self, _prompt, images=None):
+                return "native-turn"
+
+            async def receive_response(self):
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "native-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = AcceptedSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        binding = next(
+            event for event in transport.sent if isinstance(event, TurnBinding))
+        assert binding.sid == "binding-session"
+        assert binding.msg_id == "browser-message"
+        assert binding.turn_id == "native-turn"
+        assert [event.type for event in transport.sent].index("turn_binding") < [
+            event.type for event in transport.sent
+        ].index("turn_end")
+
+    asyncio.run(run())
+
+
 def test_machine_goal_errors_are_routed_without_raw_exception_text():
     async def run():
         machine, transport = _mk_machine()
@@ -1459,6 +2757,28 @@ def test_permission_modes_are_engine_strict_and_broadcast_after_apply():
             SimpleNamespace(sid="failing", mode="on-request"))
         assert failing.announced_perm is None
         assert transport.sent[-1].type == "error"
+
+    asyncio.run(run())
+
+
+def test_codex_work_permission_cannot_escalate_outside_its_profile():
+    async def run():
+        machine, transport = _mk_machine()
+        work = _control_ctx("codex-work", "codex")
+        work.space = "work"
+        machine.sessions = {"codex-work": work}
+
+        await machine._handle_set_perm(SimpleNamespace(
+            sid="codex-work", mode="on-request"))
+        assert work.sdk.permission_calls == []
+        assert transport.sent[-1].type == "error"
+        assert transport.sent[-1].code == "auth"
+
+        await machine._handle_set_perm(SimpleNamespace(
+            sid="codex-work", mode="never"))
+        assert work.sdk.permission_calls == ["never"]
+        assert transport.sent[-1].type == "perm"
+        assert transport.sent[-1].mode == "never"
 
     asyncio.run(run())
 
@@ -1679,6 +2999,33 @@ def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sess
     asyncio.run(run())
 
 
+def test_codex_pin_is_wrapper_persistent_and_refreshes_sidebar():
+    async def run():
+        machine, transport = _mk_machine()
+        machine.sessions = {"codex-id": _control_ctx("codex-id", "codex")}
+        refreshed = []
+
+        async def refresh(cmd):
+            refreshed.append(cmd)
+
+        machine._list_codex_sessions = refresh
+        pin = PinSession(
+            session_id="codex-id", pinned=True, engine="codex",
+            client_id="client-1")
+        unpin = PinSession(
+            session_id="codex-id", pinned=False, engine="codex",
+            client_id="client-1")
+        await machine._handle_pin_session(pin)
+        assert machine._session_pins.ids("codex") == {"codex-id"}
+        await machine._handle_pin_session(unpin)
+        assert machine._session_pins.ids("codex") == set()
+        assert refreshed == [pin, unpin]
+        assert not [message for message in transport.sent
+                    if message.type == "error"]
+
+    asyncio.run(run())
+
+
 def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
     async def run():
         machine, transport = _mk_machine()
@@ -1715,6 +3062,7 @@ def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
             ]
 
         monkeypatch.setattr(machine_module, "list_codex_sessions", listed)
+        machine._session_pins.set_pinned("codex", "resident-id", True)
         await machine._list_codex_sessions(SimpleNamespace(client_id="client-1"))
 
         session_list = transport.sent[-1]
@@ -1724,6 +3072,7 @@ def test_machine_codex_list_preserves_app_server_metadata(monkeypatch):
         assert hot.summary == "resident" and hot.git_branch == "main"
         assert hot.forked_from_id == "parent-id" and hot.codex_status == "active"
         assert hot.state == "interrupting"
+        assert hot.pinned is True and cold.pinned is False
         assert cold.tag == "archived" and cold.state == "running"
         assert requested_limits == [200]
 
@@ -1800,7 +3149,7 @@ def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
         assert transport.started is True and transport.stopped is True
         assert machine.sessions == {} and machine.focused_sid is None
         assert any(message.type == "hello" for message in transport.sent)
-        assert any(message.type == "error" and "Claude 引擎不可用" in message.message
+        assert any(message.type == "error" and "Claude 暂时不可用" in message.message
                    for message in transport.sent)
 
     asyncio.run(run())
@@ -1809,8 +3158,12 @@ def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
 def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
         monkeypatch, tmp_path):
     class FakeCodexHandle:
-        def __init__(self, _cfg, cwd=None):
+        def __init__(self, _cfg, cwd=None, daemon_mode=None,
+                     daemon_manager=None):
             self.cwd = cwd
+            self.daemon_mode = daemon_mode
+            self.daemon_manager = daemon_manager
+            self.thread_id = None
             self.model = "gpt-test"
             self.effort = "high"
             self.applied_effort = "high"
@@ -1819,7 +3172,7 @@ def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
             self.disconnected = False
 
         async def connect(self, **_kwargs):
-            return None
+            self.thread_id = "fresh-codex-thread"
 
         async def activate_runtime_events(self):
             return None

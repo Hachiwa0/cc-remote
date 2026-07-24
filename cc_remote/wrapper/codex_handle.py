@@ -1,44 +1,63 @@
 """Codex app-server lifecycle: connect / query / interrupt / receive / disconnect.
 
-The Codex analog of SdkHandle (sdk.py). Drives one persistent `codex app-server`
-subprocess over newline-delimited JSON-RPC 2.0 (stdio) and presents the SAME
-async surface the machine's per-turn consumer expects:
+The Codex analog of SdkHandle (sdk.py). Drives either a private ``app-server
+--stdio`` process (Work/compatibility) or one short-lived ``app-server proxy``
+connection to the official shared Code daemon. Both present the SAME async
+JSON-RPC surface the machine's per-turn consumer expects:
 
   connect(resume_id, cwd) -> initialize/initialized handshake + thread/start|resume
   query(prompt)           -> turn/start (opens a fresh per-turn queue)
   receive_response()      -> async-gen of raw notification dicts until turn/completed
   interrupt()             -> turn/interrupt {threadId, turnId}
-  disconnect()            -> terminate the subprocess
+  disconnect()            -> terminate only the owned stdio/proxy subprocess
 
 Model-agnostic: whatever backend Codex is pointed at (user's cc-switch) is Codex's
-concern. We never set a model/provider here.
+concern. The sole exception is a process-local HTTP transport alias for an
+oversized Codex Desktop/OpenAI resume whose native WebSocket transport is known
+to fail before Codex can perform its own HTTPS fallback. It never mutates the
+user's config or changes third-party providers.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import glob
 import hashlib
+import hmac
 import json
 import os
 import re
 import signal
 import shutil
 import subprocess
+from urllib.parse import urlsplit
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from typing import Any, Awaitable, Callable, Optional
 
+from cc_remote import __version__
 from cc_remote.log import logger
 from cc_remote.protocol import Notice, RateLimitUpdate, ThreadGoal
+from cc_remote.wrapper.codex_daemon import (
+    CodexDaemonUpgradeRequired,
+    CodexDaemonManager,
+    codex_daemon_mode,
+    default_codex_daemon_manager,
+)
 from cc_remote.wrapper.codex_sessions import (
     codex_approval,
     codex_context_window,
     codex_effort,
     codex_fast_enabled,
     codex_model,
+    codex_rollout_path,
 )
 from cc_remote.wrapper.child_env import sanitized_child_env
+from cc_remote.wrapper.work_prompt import (
+    WORK_BASE_INSTRUCTIONS,
+    WORK_DEVELOPER_INSTRUCTIONS,
+)
 
 log = logger("cc_remote.wrapper.codex_handle")
 
@@ -50,6 +69,7 @@ _MAX_CODEX_CANDIDATES = 16
 _MAX_STANDALONE_CANDIDATES = 6
 _MAX_NVM_CANDIDATES = 3
 _CODEX_VERSION_TIMEOUT = 5
+_BIN_CACHE_INVENTORY: Optional[tuple[tuple[object, ...], ...]] = None
 _THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
@@ -59,9 +79,44 @@ _NOTICE_MESSAGE_MAX = 2 * 1024
 _NOTICE_DETAIL_MAX = 4 * 1024
 _NOTICE_PATH_MAX = 1024
 _NOTICE_PATH_SAMPLE_MAX = 3
+_MANAGED_QUEUE_MIN_ITEMS = 64
+_MANAGED_QUEUE_MAX_ITEMS = 256
+_MANAGED_QUEUE_MIN_BYTES = 4 * 1024 * 1024
 _SPONTANEOUS_QUEUE_MIN_ITEMS = 64
 _SPONTANEOUS_QUEUE_MAX_ITEMS = 256
 _SPONTANEOUS_QUEUE_MIN_BYTES = 4 * 1024 * 1024
+_WORK_SKILL_LIMIT = 512
+_WORK_MCP_SERVER_LIMIT = 128
+_WORK_PATH_MAX = 4096
+_WORK_NAME_MAX = 256
+_PROXY_HANDSHAKE_MAX = 16 * 1024
+_PROXY_HANDSHAKE_TIMEOUT = 5.0
+_PROXY_MESSAGE_MAX = 16 * 1024 * 1024
+_LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
+# The managed shared daemon intentionally follows Codex's standalone release
+# channel.  The desktop app can temporarily bundle a newer official app-server
+# core.  Only very large rollouts opt into that private core; normal Code
+# sessions keep the shared daemon and its CLI <-> Remote live channel.
+_OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES = 256 * 1024 * 1024
+_ROLLOUT_SESSION_META_MAX_BYTES = 1024 * 1024
+_OPENAI_HTTP_RESUME_PROVIDER_ID = "cc_remote_openai_http"
+_OPENAI_HTTP_RESUME_BASE_URL = "https://chatgpt.com/backend-api/codex"
+_CODEX_DESKTOP_BIN_CANDIDATES = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+)
+_WEBSOCKET_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_WORK_DISABLED_FEATURES = (
+    "apps",
+    "hooks",
+    "memories",
+    "multi_agent",
+    "personality",
+    "plugin_sharing",
+    "plugins",
+    "remote_plugin",
+    "tool_suggest",
+)
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
@@ -71,12 +126,51 @@ RuntimeEvent = Notice | RateLimitUpdate
 RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
 
+class CodexProxyProtocolError(RuntimeError):
+    """The local proxy stream violated its RFC 6455 boundary."""
+
+
+def _websocket_client_frame(
+    payload: bytes, *, opcode: int = 0x1, fin: bool = True,
+) -> bytes:
+    """Build one masked client frame for the local app-server proxy."""
+    if opcode not in {0x0, 0x1, 0x2, 0x8, 0x9, 0xA}:
+        raise CodexProxyProtocolError("invalid WebSocket opcode")
+    if len(payload) > _PROXY_MESSAGE_MAX:
+        raise CodexProxyProtocolError("WebSocket payload exceeds limit")
+    if opcode >= 0x8 and (not fin or len(payload) > 125):
+        raise CodexProxyProtocolError("invalid WebSocket control frame")
+    first = (0x80 if fin else 0) | opcode
+    length = len(payload)
+    if length <= 125:
+        header = bytes((first, 0x80 | length))
+    elif length <= 0xFFFF:
+        header = bytes((first, 0x80 | 126)) + length.to_bytes(2, "big")
+    else:
+        header = bytes((first, 0x80 | 127)) + length.to_bytes(8, "big")
+    mask = os.urandom(4)
+    if len(mask) != 4:
+        raise CodexProxyProtocolError("invalid WebSocket mask")
+    masked = bytes(value ^ mask[index & 3]
+                   for index, value in enumerate(payload))
+    return header + mask + masked
+
+
 class CodexSpontaneousOverflow:
     """Internal bridge signal: live detail was shed to protect stdout reading."""
 
     __slots__ = ("turn_id",)
 
     def __init__(self, turn_id: str):
+        self.turn_id = turn_id
+
+
+class CodexManagedOverflow:
+    """Internal signal: managed live detail was shed before its consumer ran."""
+
+    __slots__ = ("turn_id",)
+
+    def __init__(self, turn_id: Optional[str]):
         self.turn_id = turn_id
 
 
@@ -111,6 +205,12 @@ class _SpontaneousNotificationQueue:
 
     def qsize(self) -> int:
         return len(self._items)
+
+    def has_turn_completed(self) -> bool:
+        return any(
+            isinstance(item, dict) and item.get("method") == "turn/completed"
+            for item, _size in self._items
+        )
 
     def put_nowait(self, item: object, size: int = 0) -> bool:
         size = max(0, size)
@@ -201,6 +301,14 @@ def _notification_turn_id(message: dict) -> Optional[str]:
     return None
 
 
+def _server_request_key(value: Any) -> Optional[object]:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
 def _is_turn_notification(method: Any) -> bool:
     return (
         isinstance(method, str)
@@ -260,6 +368,153 @@ def _codex_version(path: str) -> tuple[int, ...]:
     return tuple(int(g) for g in m.groups()) if m else (-1,)
 
 
+def _newer_private_core_for_oversized_resume(
+    managed_bin: str, resume_id: Optional[str],
+) -> Optional[str]:
+    """Select a newer official desktop app-server for one oversized thread.
+
+    ``app-server daemon`` always executes the managed standalone Codex binary;
+    it cannot be pointed at the desktop app's bundled core.  During a staggered
+    rollout the desktop core may contain large-history/compaction fixes that the
+    managed daemon does not yet have.  Starting that official core over stdio is
+    therefore a narrow compatibility fallback, not a second history engine:
+    thread/resume still owns all native context and uses ``excludeTurns``.
+
+    Explicit ``CODEX_BIN`` remains authoritative.  Small/ordinary sessions stay
+    on the shared daemon so terminal CLI bidirectional updates are unaffected.
+    """
+    if (not resume_id or os.environ.get("CODEX_BIN")
+            or managed_bin in _CODEX_DESKTOP_BIN_CANDIDATES):
+        return None
+    rollout_path = codex_rollout_path(resume_id)
+    if not rollout_path:
+        return None
+    try:
+        rollout_size = os.path.getsize(rollout_path)
+    except OSError:
+        return None
+    if rollout_size < _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES:
+        return None
+
+    managed_version = _codex_version(managed_bin)
+    if managed_version == (-1,):
+        return None
+    best_path: Optional[str] = None
+    best_version = managed_version
+    for candidate in _CODEX_DESKTOP_BIN_CANDIDATES:
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        version = _codex_version(candidate)
+        if version > best_version:
+            best_path = candidate
+            best_version = version
+    if best_path is not None:
+        log.info(
+            "oversized Codex resume uses newer official private core",
+            rollout_bytes=rollout_size,
+            managed_version=".".join(map(str, managed_version)),
+            private_version=".".join(map(str, best_version)),
+        )
+    return best_path
+
+
+def _oversized_desktop_openai_resume_requires_http(
+    resume_id: Optional[str],
+) -> bool:
+    """Use Codex's official Responses HTTP path for one pathological resume.
+
+    Some very large Codex Desktop rollouts contain many compact records whose
+    effective replacement history still includes embedded images.  The native
+    OpenAI Responses WebSocket can close before ``response.completed`` for
+    these requests; Codex retries the same WebSocket five times before falling
+    back to HTTPS.  That turns a valid request into minutes of apparent Remote
+    failure.
+
+    Keep the workaround deliberately narrow: only an oversized rollout whose
+    immutable first ``session_meta`` says it was created by Codex Desktop and
+    uses the built-in ``openai`` provider.  CLI/shared-daemon sessions and every
+    custom provider retain their native transport and live-channel semantics.
+    """
+    if not resume_id:
+        return False
+    rollout_path = codex_rollout_path(resume_id)
+    if not rollout_path:
+        return False
+    try:
+        if os.path.getsize(
+                rollout_path) < _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES:
+            return False
+        with open(rollout_path, "rb") as stream:
+            first_line = stream.readline(_ROLLOUT_SESSION_META_MAX_BYTES + 1)
+    except OSError:
+        return False
+    if (not first_line or len(first_line) > _ROLLOUT_SESSION_META_MAX_BYTES
+            or not first_line.endswith(b"\n")):
+        return False
+    try:
+        record = json.loads(first_line)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return False
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("model_provider") == "openai"
+        and payload.get("originator") == "Codex Desktop"
+    )
+
+
+def _append_openai_http_resume_provider(argv: list[str]) -> None:
+    """Register a private, process-local alias for official OpenAI HTTP."""
+    provider = f"model_providers.{_OPENAI_HTTP_RESUME_PROVIDER_ID}"
+    argv.extend([
+        "-c", f'{provider}.name="cc-remote OpenAI HTTP"',
+        "-c", f'{provider}.base_url={json.dumps(_OPENAI_HTTP_RESUME_BASE_URL)}',
+        "-c", f'{provider}.wire_api="responses"',
+        "-c", f"{provider}.requires_openai_auth=true",
+        "-c", f"{provider}.supports_websockets=false",
+    ])
+
+
+def _semantic_version(value: Optional[str]) -> tuple[int, ...]:
+    """Return the numeric release prefix used for app-server feature gates."""
+    if not isinstance(value, str):
+        return (-1,)
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value.strip())
+    return tuple(int(group) for group in match.groups()) if match else (-1,)
+
+
+def _supports_lightweight_resume(value: Optional[str]) -> bool:
+    """Whether app-server supports excludeTurns on thread/resume/fork."""
+    return _semantic_version(value) >= _LIGHTWEIGHT_RESUME_MIN_VERSION
+
+
+def _codex_inventory(candidates: list[str]) -> tuple[tuple[object, ...], ...]:
+    """Fingerprint candidate identities so CLI upgrades invalidate the cache.
+
+    ``codex upgrade`` can add a standalone release or retarget a stable symlink
+    while the wrapper remains alive.  Existing app-server processes keep their
+    executable; only the next process spawn re-resolves against this inventory.
+    """
+    inventory: list[tuple[object, ...]] = []
+    for path in candidates:
+        real = os.path.realpath(path)
+        try:
+            stat = os.stat(path)
+            identity: tuple[object, ...] = (
+                path, real, stat.st_dev, stat.st_ino,
+                stat.st_size, stat.st_mtime_ns,
+            )
+        except OSError:
+            # A concurrent upgrade may replace a symlink between discovery and
+            # stat.  The missing marker forces a fresh probe on the next call.
+            identity = (path, real, None, None, None, None)
+        inventory.append(identity)
+    return tuple(inventory)
+
+
 def _resolve_codex_bin() -> str:
     """Locate the codex CLI, preferring the NEWEST install.
 
@@ -270,14 +525,17 @@ def _resolve_codex_bin() -> str:
     The app-server IS our model catalog, so serving a stale one silently corrupts
     every model/effort decision downstream. Blocking (subprocess); cached for the
     process — call via asyncio.to_thread from async code."""
-    global _BIN_CACHE
+    global _BIN_CACHE, _BIN_CACHE_INVENTORY
     override = os.environ.get("CODEX_BIN")
     if override:
         return override
-    if _BIN_CACHE:
-        return _BIN_CACHE
     cands = _codex_candidates()
+    inventory = _codex_inventory(cands)
+    if _BIN_CACHE and inventory == _BIN_CACHE_INVENTORY:
+        return _BIN_CACHE
     if not cands:
+        _BIN_CACHE = None
+        _BIN_CACHE_INVENTORY = inventory
         return "codex"  # last resort — errors clearly if truly absent
     # A broken candidate must not stall startup serially.  Keep both the list and
     # the worker pool small; each individual probe also has a hard timeout.
@@ -288,6 +546,7 @@ def _resolve_codex_bin() -> str:
     if best_v == (-1,):
         best = cands[0]
     _BIN_CACHE = best
+    _BIN_CACHE_INVENTORY = inventory
     log.info("codex bin resolved", path=best, version=".".join(map(str, best_v)),
              considered=[{"path": c, "version": ".".join(map(str, v))} for v, c in versions])
     return best
@@ -299,41 +558,188 @@ def _codex_env(bin_path: str) -> dict:
     dir that also ships node (nvm / npm-global bin), prepend that dir so the
     shebang resolves even if the wrapper's own PATH lacks it."""
     env = sanitized_child_env()
+    proxy = os.environ.get("CC_REMOTE_CODEX_PROXY", "").strip()
+    if proxy:
+        # Keep the proxy scoped to wrapper-owned Codex processes.  In
+        # particular, never export it in the parent or change the user's
+        # ordinary `codex` terminal.  Local daemon/proxy sockets must bypass it.
+        scheme = urlsplit(proxy).scheme.lower()
+        if scheme in {"http", "https"}:
+            env.update({
+                "HTTP_PROXY": proxy,
+                "HTTPS_PROXY": proxy,
+                "http_proxy": proxy,
+                "https_proxy": proxy,
+            })
+        elif scheme in {"socks5", "socks5h"}:
+            env.update({"ALL_PROXY": proxy, "all_proxy": proxy})
+        bypass = [
+            value.strip()
+            for value in (env.get("NO_PROXY") or env.get("no_proxy") or "").split(",")
+            if value.strip()
+        ]
+        for local in ("127.0.0.1", "localhost", "::1"):
+            if local not in bypass:
+                bypass.append(local)
+        env["NO_PROXY"] = env["no_proxy"] = ",".join(bypass)
     bindir = os.path.dirname(os.path.abspath(bin_path)) if os.sep in bin_path else ""
     if bindir and os.path.exists(os.path.join(bindir, "node")):
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     return env
 
 
+def _codex_runtime_tmp() -> str:
+    """Return the private runtime directory Codex uses for sandbox launchers.
+
+    Work leaves unspecified paths ungranted and opens only its own workspace.
+    Codex stages ``codex-linux-sandbox`` below ``$CODEX_HOME/tmp`` before every
+    tool call, so that narrow runtime path must remain readable as well.
+    """
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    codex_home = os.path.abspath(os.path.expanduser(codex_home))
+    return os.path.join(codex_home, "tmp")
+
+
 def _initialize_params() -> dict[str, Any]:
     """Declare the capability required by collaborationMode/list and turn/start."""
     return {
-        "clientInfo": {"name": "cc-remote", "version": "0.1.0"},
+        "clientInfo": {"name": "cc-remote", "version": __version__},
         "capabilities": {"experimentalApi": True},
+    }
+
+
+def _work_thread_config(
+    skills_response: Any,
+    config_response: Any,
+) -> dict[str, Any]:
+    """Build a fail-closed Work-only app-server config overlay.
+
+    Work intentionally keeps the user's account, provider, model catalog and
+    thread store in the normal ``CODEX_HOME``.  Passing this overlay on the
+    thread RPC is therefore narrower than creating a second home, while still
+    preventing personal Skills, plugins, MCP servers and collaboration agents
+    from being inserted into the model context.  Code threads never call this
+    helper and continue to inherit the native Codex configuration unchanged.
+    """
+    if not isinstance(skills_response, dict):
+        raise RuntimeError("codex skills/list returned an invalid response")
+    entries = skills_response.get("data")
+    if not isinstance(entries, list):
+        raise RuntimeError("codex skills/list returned an invalid response")
+
+    skill_paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("codex skills/list returned an invalid entry")
+        skills = entry.get("skills")
+        if not isinstance(skills, list):
+            raise RuntimeError("codex skills/list returned an invalid entry")
+        for skill in skills:
+            if not isinstance(skill, dict):
+                raise RuntimeError("codex skills/list returned an invalid skill")
+            # Missing ``enabled`` meant enabled in older app-server responses.
+            if skill.get("enabled") is False:
+                continue
+            path = skill.get("path")
+            if (not isinstance(path, str) or not path
+                    or len(path) > _WORK_PATH_MAX):
+                raise RuntimeError("codex skills/list returned an invalid path")
+            skill_paths.add(path)
+            if len(skill_paths) > _WORK_SKILL_LIMIT:
+                raise RuntimeError("codex Work skill inventory exceeds limit")
+
+    if not isinstance(config_response, dict):
+        raise RuntimeError("codex config/read returned an invalid response")
+    effective = config_response.get("config")
+    if not isinstance(effective, dict):
+        raise RuntimeError("codex config/read returned an invalid response")
+    raw_mcp = effective.get("mcp_servers", {})
+    if not isinstance(raw_mcp, dict):
+        raise RuntimeError("codex config/read returned invalid MCP settings")
+    if len(raw_mcp) > _WORK_MCP_SERVER_LIMIT:
+        raise RuntimeError("codex Work MCP inventory exceeds limit")
+    mcp_servers: dict[str, dict[str, bool]] = {}
+    for name in raw_mcp:
+        if (not isinstance(name, str) or not name
+                or len(name) > _WORK_NAME_MAX):
+            raise RuntimeError("codex config/read returned an invalid MCP name")
+        mcp_servers[name] = {"enabled": False}
+
+    return {
+        "features": {name: False for name in _WORK_DISABLED_FEATURES},
+        # Work artifacts may legitimately be called AGENTS.md.  They are data,
+        # not a route for re-introducing Code/project instructions.
+        "project_doc_max_bytes": 0,
+        "project_doc_fallback_filenames": [],
+        # Keep the native indexed research tool needed by general Work tasks,
+        # without inheriting a user's Code-time live-search preference.
+        "web_search": "cached",
+        "skills": {
+            "config": [
+                {"path": path, "enabled": False}
+                for path in sorted(skill_paths)
+            ],
+        },
+        "mcp_servers": mcp_servers,
     }
 
 
 class CodexHandle:
     def __init__(self, cfg, cwd: Optional[str] = None,
+                 work_mode: bool = False,
                  approval_callback: Optional[ApprovalCallback] = None,
                  interaction_callback: Optional[InteractionCallback] = None,
                  goal_callback: Optional[GoalCallback] = None,
                  turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
-                 runtime_event_callback: Optional[RuntimeEventCallback] = None):
+                 runtime_event_callback: Optional[RuntimeEventCallback] = None,
+                 daemon_mode: Optional[str] = None,
+                 daemon_manager: Optional[CodexDaemonManager] = None):
         self.cfg = cfg
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
         self.turn_id: Optional[str] = None
         self.turn_start_pending = False
         self.turn_active = False
+        # Inline Review has two different app-server turn ids.  The response and
+        # visible lifecycle use the outer id, while a nested reviewer turn is the
+        # thread's actual interrupt target.  Keep them separate: collapsing both
+        # into ``turn_id`` makes cancel target the outer id and makes the rollout
+        # watcher mistake the nested task for a native terminal turn.
+        self._review_active = False
+        self._review_outer_turn_id: Optional[str] = None
+        self._review_execution_turn_id: Optional[str] = None
+        self._review_execution_ready = asyncio.Event()
         # turn/start ids produced by this wrapper. Codex can flush a rollout for
         # tens of seconds after turn/completed; retaining ids lets the transcript
         # watcher attribute those late records to us instead of to a terminal.
         self._owned_turn_ids: OrderedDict[str, None] = OrderedDict()
         self._cwd = cwd
+        self.work_mode = work_mode
+        requested_daemon_mode = (
+            daemon_mode if daemon_mode is not None
+            else getattr(daemon_manager, "mode", None)
+        )
+        self.daemon_mode = (
+            "off" if work_mode else codex_daemon_mode(requested_daemon_mode))
+        self.daemon_manager = (
+            daemon_manager
+            if daemon_manager is not None
+            else default_codex_daemon_manager(self.daemon_mode)
+        )
+        self._using_daemon_proxy = False
+        # Once a Code session has joined the official shared app-server, a
+        # transport interruption must not silently turn it into a private stdio
+        # session.  Keep this affinity across proxy reconnects so Machine can
+        # preserve bidirectional ownership while the short-lived proxy is down.
+        self._daemon_proxy_established = False
+        self._proxy_read_buffer = bytearray()
+        self._proxy_close_sent = False
+        self._send_lock = asyncio.Lock()
+        self._work_config: Optional[dict[str, Any]] = None
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
-        self._turn_q: Optional[asyncio.Queue] = None
+        self._turn_q: Optional[Any] = None
+        self._managed_overflow = False
         self._reader: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._thread_settings_updated = asyncio.Event()
@@ -342,8 +748,10 @@ class CodexHandle:
         # Keep detached request handlers generation-owned and cancel them on
         # disconnect so an old approval cannot reply to a new app-server process.
         self._server_request_tasks: set[asyncio.Task] = set()
-        # POSIX app-server processes get their own group so disconnecting a
-        # session also terminates any shell/tool descendants it spawned.
+        self._server_request_tasks_by_id: dict[object, asyncio.Task] = {}
+        self._pending_server_request_ids: set[object] = set()
+        # POSIX transport children get their own group. For stdio this includes
+        # tool descendants; in daemon mode it contains only this proxy chain.
         self._process_group: Optional[int] = None
         self._generation = 0
         self._dead = False
@@ -384,7 +792,11 @@ class CodexHandle:
         self.model: Optional[str] = codex_model()
         self.effort: Optional[str] = codex_effort()         # low | medium | high | xhigh
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
-        self.approval: str = codex_approval()                # UI/callback projection
+        # Work is governed by its per-process named permission profile. It must
+        # never fall back to interactive escalation outside that profile, even
+        # when a resumed native thread persisted a Code-time approval policy.
+        self.approval: str = (
+            "never" if self.work_mode else codex_approval())  # UI/callback projection
         self.collaboration_mode: str = "default"            # default | plan; independent of approval
         self.service_tier: Optional[str] = (
             "fast" if codex_fast_enabled() else None
@@ -423,6 +835,31 @@ class CodexHandle:
                     event_type=event.type,
                     error_type=type(exc).__name__,
                 )
+
+    @property
+    def using_daemon_proxy(self) -> bool:
+        """Whether this live handle is attached to the shared Codex daemon."""
+        return bool(
+            self._using_daemon_proxy
+            and self.proc is not None
+            and not self._dead
+            and getattr(self.proc, "returncode", None) is None
+        )
+
+    @property
+    def shared_daemon_affinity(self) -> bool:
+        """Whether this Code session belongs to the shared app-server.
+
+        Unlike ``using_daemon_proxy``, this remains true while the per-client
+        proxy reconnects.  It is deliberately sticky for the handle lifetime:
+        falling back to a private stdio app-server after joining the shared
+        daemon would split one thread into two independently writable owners.
+        """
+        return bool(
+            not self.work_mode
+            and self.daemon_mode == "auto"
+            and (self._daemon_proxy_established or self._using_daemon_proxy)
+        )
 
     async def _publish_runtime_event(self, event: RuntimeEvent) -> None:
         key = _runtime_event_key(event)
@@ -469,27 +906,93 @@ class CodexHandle:
                 error_type=type(exc).__name__,
             )
 
-    async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
-                      fork: bool = False) -> None:
-        if self.proc is not None:
-            await self.disconnect()
-        self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
-        # version-probes subprocesses on first call; keep it off the event loop.
-        codex_bin = await asyncio.to_thread(_resolve_codex_bin)
+    async def _proxy_handshake(
+        self, proc: asyncio.subprocess.Process,
+    ) -> None:
+        """Upgrade the proxy's raw stdio stream to a local WebSocket."""
+        if proc.stdin is None or proc.stdout is None:
+            raise CodexProxyProtocolError("proxy stdio unavailable")
+        nonce_bytes = os.urandom(16)
+        if len(nonce_bytes) != 16:
+            raise CodexProxyProtocolError("invalid WebSocket nonce")
+        nonce = base64.b64encode(nonce_bytes).decode("ascii")
+        request = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {nonce}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        ).encode("ascii")
+        async with self._send_lock:
+            proc.stdin.write(request)
+            await proc.stdin.drain()
+
+        received = bytearray()
+        marker = b"\r\n\r\n"
+        while marker not in received:
+            remaining = _PROXY_HANDSHAKE_MAX - len(received)
+            if remaining <= 0:
+                raise CodexProxyProtocolError("proxy handshake exceeds limit")
+            chunk = await proc.stdout.read(min(4096, remaining))
+            if not chunk:
+                raise CodexProxyProtocolError("proxy closed during handshake")
+            received.extend(chunk)
+        boundary = received.find(marker) + len(marker)
+        if boundary > _PROXY_HANDSHAKE_MAX:
+            raise CodexProxyProtocolError("proxy handshake exceeds limit")
+        header_bytes = bytes(received[:boundary - len(marker)])
+        trailing = received[boundary:]
+        try:
+            lines = header_bytes.decode("ascii").split("\r\n")
+        except UnicodeDecodeError as exc:
+            raise CodexProxyProtocolError("non-ASCII proxy handshake") from exc
+        if not lines or re.fullmatch(r"HTTP/1\.[01] 101(?: .*)?", lines[0]) is None:
+            raise CodexProxyProtocolError("proxy handshake was not HTTP 101")
+        headers: dict[str, list[str]] = {}
+        for line in lines[1:]:
+            if not line or line[:1] in {" ", "\t"} or ":" not in line:
+                raise CodexProxyProtocolError("malformed proxy handshake header")
+            name, value = line.split(":", 1)
+            if not name or any(ord(char) <= 32 or ord(char) >= 127 for char in name):
+                raise CodexProxyProtocolError("malformed proxy handshake header")
+            headers.setdefault(name.lower(), []).append(value.strip())
+        upgrades = headers.get("upgrade", [])
+        connections = headers.get("connection", [])
+        accepts = headers.get("sec-websocket-accept", [])
+        connection_tokens = {
+            token.strip().lower()
+            for value in connections for token in value.split(",")
+        }
+        expected = base64.b64encode(hashlib.sha1(
+            nonce.encode("ascii") + _WEBSOCKET_GUID,
+        ).digest()).decode("ascii")
+        if (len(upgrades) != 1 or upgrades[0].lower() != "websocket"
+                or "upgrade" not in connection_tokens
+                or len(accepts) != 1
+                or not hmac.compare_digest(accepts[0], expected)):
+            raise CodexProxyProtocolError("proxy handshake validation failed")
+        self._proxy_read_buffer = bytearray(trailing)
+
+    async def _open_process(
+        self, argv: list[str], codex_bin: str, *, daemon_proxy: bool,
+    ) -> None:
         proc = await asyncio.create_subprocess_exec(
-            codex_bin, "app-server", "--stdio",
+            *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
             env=_codex_env(codex_bin),
-            # a single JSON-RPC line can exceed asyncio's default 64KB StreamReader
-            # cap (e.g. an image echo or a big tool output) and crash readline —
-            # raise it so the reader never dies mid-turn.
-            limit=16 * 1024 * 1024,
+            # JSONL and reassembled WebSocket messages share this hard ceiling.
+            limit=_PROXY_MESSAGE_MAX,
             start_new_session=(os.name == "posix"),
         )
         self.proc = proc
+        self._using_daemon_proxy = daemon_proxy
+        self._proxy_read_buffer.clear()
+        self._proxy_close_sent = False
         self._process_group = proc.pid if os.name == "posix" else None
         self._generation += 1
         generation = self._generation
@@ -504,30 +1007,231 @@ class CodexHandle:
         self._spontaneous_turn_id = None
         self.last_token_usage = None
         self.context_window = None
-        self._reader = asyncio.create_task(self._read_loop(proc, generation))
-        self._stderr_task = asyncio.create_task(self._drain_stderr(proc, generation))
-
+        self._stderr_task = asyncio.create_task(
+            self._drain_stderr(proc, generation))
         try:
-            initialized = await self._request(
-                "initialize", _initialize_params())
-            self.app_server_version = _app_server_version(initialized)
-            await self._notify("initialized")
+            if daemon_proxy:
+                await asyncio.wait_for(
+                    self._proxy_handshake(proc),
+                    timeout=_PROXY_HANDSHAKE_TIMEOUT,
+                )
+        except BaseException:
+            await self.disconnect()
+            raise
+        self._reader = asyncio.create_task(self._read_loop(proc, generation))
+
+    async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
+                      fork: bool = False) -> None:
+        if self.proc is not None:
+            await self.disconnect()
+        self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
+        # version-probes subprocesses on first call; keep it off the event loop.
+        codex_bin = await asyncio.to_thread(_resolve_codex_bin)
+        private_core = None
+        http_only_resume = False
+        if not self.work_mode and not self._daemon_proxy_established:
+            http_only_resume = await asyncio.to_thread(
+                _oversized_desktop_openai_resume_requires_http,
+                resume_id,
+            )
+            private_core = await asyncio.to_thread(
+                _newer_private_core_for_oversized_resume,
+                codex_bin,
+                resume_id,
+            )
+            if private_core is not None:
+                codex_bin = private_core
+        child_env = _codex_env(codex_bin)
+        stdio_argv = [codex_bin, "app-server", "--stdio"]
+        if http_only_resume:
+            _append_openai_http_resume_provider(stdio_argv)
+            log.info(
+                "oversized Codex Desktop resume uses official HTTP transport",
+                thread_id=resume_id,
+            )
+        if self.work_mode:
+            # One app-server process belongs to one resident session, so a
+            # per-process permission profile can enforce this Work cwd without
+            # mutating the user's global ~/.codex/config.toml.
+            # The arg0 sandbox helper is a symlink to this exact executable. A
+            # grant for CODEX_HOME/tmp alone leaves that target invisible inside
+            # bwrap and every tool fails with ENOENT before its command starts.
+            filesystem_entries = [
+                '":minimal" = "read"',
+                f'{json.dumps(_codex_runtime_tmp())} = "read"',
+                f'{json.dumps(os.path.realpath(codex_bin))} = "read"',
+                f'{json.dumps(self._cwd)} = "write"',
+            ]
+            filesystem = "{ " + ", ".join(filesystem_entries) + " }"
+            stdio_argv.extend([
+                "-c", 'default_permissions="cc_remote_work"',
+                "-c", f"permissions.cc_remote_work.filesystem={filesystem}",
+                "-c", "permissions.cc_remote_work.network.enabled=false",
+            ])
+        proxy_argv: Optional[list[str]] = None
+        strict_shared = False
+        if (private_core is None and not http_only_resume and not self.work_mode
+                and self.daemon_mode == "auto"):
+            try:
+                proxy_argv = await self.daemon_manager.proxy_args(
+                    codex_bin, child_env)
+                strict_shared = bool(
+                    getattr(
+                        self.daemon_manager,
+                        "strict_shared_affinity",
+                        False,
+                    )
+                )
+            except CodexDaemonUpgradeRequired:
+                # Starting private stdio here would appear healthy while
+                # silently severing the terminal CLI <-> Remote live channel.
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Codex daemon preparation failed; using stdio",
+                    error_type=type(exc).__name__,
+                )
+        attempts = (
+            [(proxy_argv, True), (stdio_argv, False)]
+            if proxy_argv is not None else [(stdio_argv, False)]
+        )
+        if strict_shared and proxy_argv is not None:
+            attempts = [(proxy_argv, True)]
+        if self._daemon_proxy_established:
+            if proxy_argv is None:
+                raise RuntimeError(
+                    "shared Codex app-server proxy is unavailable")
+            # A previously shared thread must never reconnect through private
+            # stdio.  Leave the handle disconnected and let Machine retry the
+            # shared proxy instead of manufacturing a false external-CLI lock.
+            attempts = [(proxy_argv, True)]
+        initialized: Any = None
+        for argv, daemon_proxy in attempts:
+            try:
+                await self._open_process(
+                    argv, codex_bin, daemon_proxy=daemon_proxy)
+                initialized = await self._request(
+                    "initialize", _initialize_params())
+                self.app_server_version = _app_server_version(initialized)
+                await self._notify("initialized")
+                if daemon_proxy:
+                    self._daemon_proxy_established = True
+                break
+            except asyncio.CancelledError:
+                await self.disconnect()
+                raise
+            except Exception as exc:
+                await self.disconnect()
+                if not daemon_proxy:
+                    raise
+                self.daemon_manager.invalidate()
+                if strict_shared or self._daemon_proxy_established:
+                    log.warning(
+                        "Codex shared daemon proxy unavailable; reconnect required",
+                        error_type=type(exc).__name__,
+                    )
+                    raise
+                log.warning(
+                    "Codex daemon proxy unavailable; using stdio",
+                    error_type=type(exc).__name__,
+                )
+        else:  # pragma: no cover - the attempt list is never empty
+            raise RuntimeError("unable to start Codex app-server transport")
+        try:
+            if self.work_mode:
+                # Inspect the effective native runtime rather than guessing at
+                # user-configured skill and MCP names.  Failure is fatal: silently
+                # falling back would leak Code's global context into Work again.
+                skills_response, config_response = await asyncio.gather(
+                    self._request("skills/list", {
+                        "cwds": [self._cwd],
+                        # Work must not miss a skill installed since the last
+                        # native cache snapshot; a partial inventory would make
+                        # the supposedly isolated context depend on timing.
+                        "forceReload": True,
+                    }),
+                    self._request("config/read", {
+                        "cwd": self._cwd,
+                        "includeLayers": False,
+                    }),
+                )
+                self._work_config = _work_thread_config(
+                    skills_response, config_response)
 
             if fork and resume_id:
                 # ephemeral /btw fork: inherits resume_id's context into a throwaway
                 # thread; the parent thread is never touched (verified: fork answers
                 # from parent context, parent stays coherent).
-                res = await self._request("thread/fork", {
+                fork_params: dict[str, Any] = {
                     "threadId": resume_id, "ephemeral": True,
                     "cwd": self._cwd,
-                    "approvalPolicy": self.approval_policy})
+                    "approvalPolicy": self.approval_policy,
+                }
+                if http_only_resume:
+                    fork_params["modelProvider"] = (
+                        _OPENAI_HTTP_RESUME_PROVIDER_ID)
+                if self.work_mode:
+                    fork_params.update({
+                        "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                        "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                        "personality": "none",
+                        "config": self._work_config,
+                    })
+                if _supports_lightweight_resume(self.app_server_version):
+                    # Official app-server pagination contract: fork the durable
+                    # context without serializing its complete turn history over
+                    # this control connection. History remains available through
+                    # thread/turns/list (and cc-remote's bounded projection).
+                    fork_params["excludeTurns"] = True
+                res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
             elif resume_id:
                 # Do not send local/config defaults here: omitted fields tell
                 # app-server to resume the thread's persisted settings. The
                 # authoritative response is adopted below.
-                res = await self._request("thread/resume", {
-                    "threadId": resume_id, "cwd": self._cwd})
+                resume_params: dict[str, Any] = {
+                    "threadId": resume_id, "cwd": self._cwd,
+                }
+                if http_only_resume:
+                    resume_params["modelProvider"] = (
+                        _OPENAI_HTTP_RESUME_PROVIDER_ID)
+                if self.work_mode:
+                    resume_params.update({
+                        "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                        "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                        "personality": "none",
+                        "config": self._work_config,
+                    })
+                if _supports_lightweight_resume(self.app_server_version):
+                    # Since Codex 0.144.6, excludeTurns is the official way for
+                    # clients with a paged history UI to resume a live thread.
+                    # It prevents a multi-hundred-MiB rollout from becoming one
+                    # oversized JSON-RPC response while preserving native context.
+                    resume_params["excludeTurns"] = True
+                else:
+                    # Older app-servers reject excludeTurns. Preserve legacy
+                    # compatibility only while the rollout can fit within the
+                    # transport ceiling; otherwise fail before the stdout reader
+                    # is destroyed by an oversized thread/resume response.
+                    rollout_path = await asyncio.to_thread(
+                        codex_rollout_path, resume_id)
+                    try:
+                        rollout_size = (
+                            await asyncio.to_thread(os.path.getsize, rollout_path)
+                            if rollout_path else 0
+                        )
+                    except OSError:
+                        rollout_size = 0
+                    if rollout_size > _PROXY_MESSAGE_MAX:
+                        version = self.app_server_version or "unknown"
+                        minimum = ".".join(
+                            str(part) for part in _LIGHTWEIGHT_RESUME_MIN_VERSION)
+                        raise RuntimeError(
+                            "Codex app-server " + version
+                            + " 不支持超长会话的轻量恢复；请升级 Codex 至 "
+                            + minimum + " 或更高版本"
+                        )
+                res = await self._request("thread/resume", resume_params)
                 self.thread_id = _thread_id_of(res) or resume_id
             else:
                 params: dict[str, Any] = {
@@ -537,6 +1241,13 @@ class CodexHandle:
                 }
                 if self.model:
                     params["model"] = self.model
+                if self.work_mode:
+                    params.update({
+                        "baseInstructions": WORK_BASE_INSTRUCTIONS,
+                        "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
+                        "personality": "none",
+                        "config": self._work_config,
+                    })
                 res = await self._request("thread/start", params)
                 self.thread_id = _thread_id_of(res)
             if not self.thread_id:
@@ -569,38 +1280,36 @@ class CodexHandle:
         log.info("codex connected", thread_id=self.thread_id, cwd=self._cwd,
                  resume=bool(resume_id), fork=fork)
 
-    async def query(self, prompt, images=None) -> None:
+    async def query(self, prompt, images=None) -> Optional[str]:
         if self.thread_id and (
             self.proc is None or self._dead or self.proc.returncode is not None
         ):
             await self.force_reconnect(self.thread_id, self._cwd, reason="app-server unavailable")
         assert self.proc is not None and self.thread_id, "connect() first"
-        self._turn_q = asyncio.Queue(
-            maxsize=max(1, getattr(self.cfg, "turn_reader_queue_cap", 4)))
+        self._open_managed_stream()
+        queue = self._turn_q
         params = {
             "threadId": self.thread_id,
             "input": _to_input(prompt, images),
             "approvalPolicy": self.approval_policy,
         }
+        if self.work_mode:
+            params["cwd"] = self._cwd
+            # Do not add the legacy sandboxPolicy here. Codex gives legacy
+            # sandbox settings precedence over named permission profiles; the
+            # old workspaceWrite policy therefore re-protected this cwd merely
+            # because Work lives below ~/.codex.
         if self.model:
             params["model"] = self.model
         if self.effort:
             params["effort"] = self.effort
         # Codex Plan mode is a collaboration-mode override, not an approval
-        # policy.  The app-server schema requires settings.model; null developer
-        # instructions selects Codex's built-in instructions for the chosen mode.
+        # policy. The app-server schema requires settings.model. Code selects the
+        # built-in mode instructions with null; Work repeats its isolated policy.
         collaboration_model = self.model or codex_model()
         if collaboration_model:
-            settings: dict[str, Any] = {
-                "model": collaboration_model,
-                "developer_instructions": None,
-            }
-            if self.effort:
-                settings["reasoning_effort"] = self.effort
-            params["collaborationMode"] = {
-                "mode": self.collaboration_mode,
-                "settings": settings,
-            }
+            params["collaborationMode"] = self._collaboration_setting(
+                self.collaboration_mode)
         elif self.collaboration_mode == "plan":
             raise RuntimeError("Codex Plan mode requires an active model")
         # null is intentional: in app-server 0.144.1 it clears a persisted Fast
@@ -621,6 +1330,10 @@ class CodexHandle:
             res = await self._request("turn/start", params)
         except BaseException:
             self.turn_active = False
+            self.turn_id = None
+            if self._turn_q is queue:
+                self._turn_q = None
+            self._managed_overflow = False
             raise
         finally:
             self.turn_start_pending = False
@@ -633,6 +1346,8 @@ class CodexHandle:
             # notification already cleared turn_active.
             if self.turn_active:
                 self.turn_id = returned_turn_id
+            return returned_turn_id
+        return None
 
     def remember_owned_turn_id(self, turn_id: str) -> None:
         self._owned_turn_ids[turn_id] = None
@@ -643,6 +1358,36 @@ class CodexHandle:
     @property
     def owned_turn_ids(self) -> frozenset[str]:
         return frozenset(self._owned_turn_ids)
+
+    @property
+    def turn_attribution_pending(self) -> bool:
+        """Whether a rollout task may still belong to the current local launch.
+
+        Ordinary turns learn their id from ``turn/start``. Inline Review is
+        different: ``review/start`` returns the visible outer id first, then
+        app-server announces a second nested id which is the rollout writer and
+        interrupt target. Keep the ownership watcher in its attribution grace
+        until that second notification has arrived.
+        """
+        return bool(
+            self.turn_start_pending
+            or (self._review_active
+                and self._review_execution_turn_id is None)
+        )
+
+    def _begin_review_tracking(self) -> None:
+        self._review_active = True
+        self._review_outer_turn_id = None
+        self._review_execution_turn_id = None
+        self._review_execution_ready = asyncio.Event()
+
+    def _clear_review_tracking(self) -> None:
+        # Wake an interrupt which is waiting for the nested reviewer id.  It will
+        # re-check the ids/active flag and avoid issuing a stale RPC.
+        self._review_execution_ready.set()
+        self._review_active = False
+        self._review_outer_turn_id = None
+        self._review_execution_turn_id = None
 
     async def receive_response(self):
         """Async-gen of this turn's raw notification dicts, ending at turn/completed."""
@@ -655,9 +1400,15 @@ class CodexHandle:
                 if msg is None:      # sentinel pushed by the reader on turn/completed
                     break
                 yield msg
+                # The fail-fast managed bridge preserves terminal frames without
+                # spending a third queue slot on a sentinel. Legacy asyncio.Queue
+                # tests may still append one; it is harmlessly abandoned below.
+                if isinstance(msg, dict) and msg.get("method") == "turn/completed":
+                    break
         finally:
             if self._turn_q is q:
                 self._turn_q = None
+            self._managed_overflow = False
             # An automatic continuation may have started after this managed
             # queue received its terminal sentinel but before its consumer
             # unwound. Do not let the old generator clear the new turn's active
@@ -665,22 +1416,45 @@ class CodexHandle:
             if self._spontaneous_turn_id is None:
                 self.turn_active = False
 
-    def _open_spontaneous_stream(self, turn_id: str) -> None:
-        """Create the bounded raw-notification bridge before announcing a turn."""
-        if self._spontaneous_q is not None:
-            self._close_spontaneous_stream(self._spontaneous_queue_turn_id)
+    def _notification_queue_limits(
+        self, *, managed: bool,
+    ) -> tuple[int, int]:
         reader_cap = max(1, int(getattr(self.cfg, "turn_reader_queue_cap", 4)))
-        item_cap = min(
-            _SPONTANEOUS_QUEUE_MAX_ITEMS,
-            max(_SPONTANEOUS_QUEUE_MIN_ITEMS, reader_cap * 16),
+        item_cap = (
+            min(
+                _MANAGED_QUEUE_MAX_ITEMS,
+                max(_MANAGED_QUEUE_MIN_ITEMS, reader_cap * 16),
+            )
+            if managed
+            else min(
+                _SPONTANEOUS_QUEUE_MAX_ITEMS,
+                max(_SPONTANEOUS_QUEUE_MIN_ITEMS, reader_cap * 16),
+            )
         )
         ws_cap = max(1024, int(getattr(
             self.cfg, "ws_max_size_bytes", 16 * 1024 * 1024)))
         tool_cap = max(1024, int(getattr(self.cfg, "tool_result_max", 65536)))
         byte_cap = min(
             ws_cap,
-            max(_SPONTANEOUS_QUEUE_MIN_BYTES, tool_cap * 16),
+            max(
+                (_MANAGED_QUEUE_MIN_BYTES if managed
+                 else _SPONTANEOUS_QUEUE_MIN_BYTES),
+                tool_cap * 16,
+            ),
         )
+        return item_cap, byte_cap
+
+    def _open_managed_stream(self) -> None:
+        """Create a bounded producer that can never block JSON-RPC stdout."""
+        item_cap, byte_cap = self._notification_queue_limits(managed=True)
+        self._turn_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
+        self._managed_overflow = False
+
+    def _open_spontaneous_stream(self, turn_id: str) -> None:
+        """Create the bounded raw-notification bridge before announcing a turn."""
+        if self._spontaneous_q is not None:
+            self._close_spontaneous_stream(self._spontaneous_queue_turn_id)
+        item_cap, byte_cap = self._notification_queue_limits(managed=False)
         self._spontaneous_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
         self._spontaneous_queue_turn_id = turn_id
         self._spontaneous_overflow = False
@@ -759,6 +1533,56 @@ class CodexHandle:
             q.put_nowait(terminal_message, terminal_size)
         return True
 
+    def _queue_managed_notification(
+        self, message: dict, raw_size: Optional[int] = None,
+    ) -> bool:
+        """Offer a managed-turn frame without blocking the sole stdout reader.
+
+        review/start can emit multiple item notifications before its RPC response.
+        A regular bounded ``asyncio.Queue.put`` deadlocks once full because the
+        response which starts the consumer is waiting behind those notifications.
+        On overflow retain one signal plus the authoritative terminal frame.
+        """
+        q = self._turn_q
+        if not isinstance(q, _SpontaneousNotificationQueue):
+            return False
+        method = message.get("method")
+        terminal = method == "turn/completed"
+        if self._managed_overflow and not terminal:
+            return True
+        size = (
+            raw_size if isinstance(raw_size, int) and raw_size >= 0
+            else self._notification_wire_size(message)
+        )
+        if not self._managed_overflow and q.put_nowait(message, size):
+            return True
+
+        turn_id = self.turn_id or _notification_turn_id(message)
+        if not self._managed_overflow:
+            log.warning(
+                "codex managed notification bridge overflow",
+                turn_id=turn_id,
+                queued=q.qsize(),
+                queued_bytes=q.byte_size,
+            )
+            self._managed_overflow = True
+            q.clear()
+            q.put_nowait(CodexManagedOverflow(turn_id))
+        if terminal:
+            terminal_message = message
+            terminal_size = size
+            if terminal_size > q.max_bytes:
+                terminal_message = self._minimal_turn_completed(message)
+                terminal_size = self._notification_wire_size(terminal_message)
+            if not q.put_nowait(terminal_message, terminal_size):
+                # The queue reserves two slots (overflow + terminal). This final
+                # fallback only covers an unexpectedly tiny byte budget.
+                q.clear()
+                q.put_nowait(CodexManagedOverflow(turn_id))
+                minimal = self._minimal_turn_completed(message)
+                q.put_nowait(minimal, self._notification_wire_size(minimal))
+        return True
+
     def _close_spontaneous_stream(self, turn_id: Optional[str]) -> None:
         """Wake the bridge consumer after disconnect/EOF, without blocking stdout."""
         q = self._spontaneous_q
@@ -793,18 +1617,45 @@ class CodexHandle:
                 self._spontaneous_overflow = False
 
     async def interrupt(self) -> None:
-        if self.proc and self.thread_id and self.turn_id:
-            try:
-                await self._request("turn/interrupt", {"threadId": self.thread_id, "turnId": self.turn_id})
-            except Exception as e:
-                log.warning("codex interrupt failed", error=str(e))
+        if not (self.proc and self.thread_id and self.turn_id):
+            raise RuntimeError("codex turn is not running")
+        target_turn_id = self._review_execution_turn_id or self.turn_id
+        try:
+            await self._request(
+                "turn/interrupt",
+                {"threadId": self.thread_id, "turnId": target_turn_id},
+            )
+            return
+        except Exception:
+            # A click can race review/start's outer response and the nested
+            # turn/started notification.  app-server serializes both on stdout,
+            # so a rejected outer interrupt is normally followed immediately by
+            # the authoritative nested id.  Wait briefly and retry only when the
+            # target actually changed; unrelated interrupt failures still surface.
+            if self._review_active and self._review_execution_turn_id is None:
+                ready = self._review_execution_ready
+                try:
+                    await asyncio.wait_for(ready.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+            retry_turn_id = self._review_execution_turn_id
+            if (self._review_active and retry_turn_id
+                    and retry_turn_id != target_turn_id):
+                await self._request(
+                    "turn/interrupt",
+                    {"threadId": self.thread_id, "turnId": retry_turn_id},
+                )
+                return
+            raise
 
     async def disconnect(self) -> None:
         proc = self.proc
         process_group = self._process_group
+        daemon_proxy = self._using_daemon_proxy
         spontaneous_turn_id = self._spontaneous_turn_id
         self._close_spontaneous_stream(spontaneous_turn_id)
         self._spontaneous_turn_id = None
+        self._clear_review_tracking()
         tasks = [t for t in (self._reader, self._stderr_task)
                  if t is not None and t is not asyncio.current_task()]
         server_tasks = [
@@ -812,6 +1663,8 @@ class CodexHandle:
             if task is not asyncio.current_task()
         ]
         self._server_request_tasks.clear()
+        self._server_request_tasks_by_id.clear()
+        self._pending_server_request_ids.clear()
         self.proc = None
         self._process_group = None
         self._reader = None
@@ -842,14 +1695,18 @@ class CodexHandle:
                 except asyncio.TimeoutError:
                     stop(getattr(signal, "SIGKILL", signal.SIGTERM), force=True)
                     await proc.wait()
-            # The app-server parent can exit before a tool subprocess that ignored
-            # SIGTERM. A final group kill guarantees no descendant survives session
-            # eviction, /btw close, or reconnect.
+            # For stdio this also cleans tool descendants.  For daemon mode the
+            # process group contains only this connection's proxy; the shared
+            # app-server was started independently by the official manager.
             if process_group is not None:
                 stop(signal.SIGKILL, force=True)
+        self._using_daemon_proxy = False
+        self._proxy_read_buffer.clear()
+        self._proxy_close_sent = False
         if self._turn_q is not None:
             self._force_turn_sentinel(self._turn_q)
             self._turn_q = None
+        self._managed_overflow = False
         for fut in list(self._pending.values()):
             if not fut.done():
                 fut.set_exception(RuntimeError("codex app-server disconnected"))
@@ -860,6 +1717,8 @@ class CodexHandle:
         if spontaneous_turn_id is not None:
             await self._publish_turn_lifecycle(
                 "completed", spontaneous_turn_id)
+        if daemon_proxy:
+            log.debug("codex daemon proxy disconnected")
 
     async def force_reconnect(self, resume_id: Optional[str], cwd: Optional[str] = None,
                               reason: str = "reconnect") -> None:
@@ -878,6 +1737,8 @@ class CodexHandle:
         # Existing machine/tests assign this projection directly. Keep the raw
         # policy in lockstep for named policies; granular snapshots set _approval
         # directly so turn/start can preserve their full official object.
+        if self.work_mode:
+            value = "never"
         self._approval = value
         self.approval_policy: Any = value
 
@@ -913,7 +1774,8 @@ class CodexHandle:
             raise RuntimeError("Codex collaboration mode requires an active model")
         settings: dict[str, Any] = {
             "model": model,
-            "developer_instructions": None,
+            "developer_instructions": (
+                WORK_DEVELOPER_INSTRUCTIONS if self.work_mode else None),
         }
         if self.effort:
             settings["reasoning_effort"] = self.effort
@@ -942,7 +1804,11 @@ class CodexHandle:
                 self.applied_effort = self.effort
 
         approval = settings.get("approvalPolicy")
-        if isinstance(approval, str) and approval in {
+        if self.work_mode:
+            # A resume response may carry the thread's previous Code policy.
+            # Work's filesystem profile is non-escalating by construction.
+            self.approval = "never"
+        elif isinstance(approval, str) and approval in {
             "untrusted",
             "on-request",
             "never",
@@ -1004,6 +1870,10 @@ class CodexHandle:
         # Codex "mode" = approval policy (untrusted | on-request | never).
         if mode not in ("untrusted", "on-request", "never"):
             raise ValueError(f"unsupported codex approval policy: {mode}")
+        if self.work_mode and mode != "never":
+            raise ValueError(
+                "Codex Work approval is fixed to never; its named permission "
+                "profile controls access")
         authoritative = await self._update_thread_settings(
             approvalPolicy=mode, wait_for_notification=True)
         if not authoritative:
@@ -1058,6 +1928,100 @@ class CodexHandle:
         if cleared:
             self.last_goal = None
         return cleared
+
+    async def start_review(self, target: dict[str, Any]) -> dict[str, str]:
+        """Start an official inline review on this resident app-server.
+
+        The resident process is required: review/start creates a real turn and
+        its reasoning/tool notifications must flow through the same stdout
+        reader as ordinary turns instead of disappearing in a one-shot RPC.
+        """
+        assert self.thread_id, "connect() first"
+        if self.turn_active:
+            raise RuntimeError("codex thread is busy")
+        self._open_managed_stream()
+        queue = self._turn_q
+        assert queue is not None
+        # review/start creates a normal inline turn. Claim it before awaiting the
+        # RPC exactly like turn/start: app-server can emit enteredReviewMode and
+        # even turn/completed before the response coroutine is scheduled again.
+        # Without this queue those frames are classified as orphan/spontaneous,
+        # and the UI can never observe the review's terminal event.
+        self.turn_id = None
+        self.turn_active = True
+        self.turn_start_pending = True
+        self._begin_review_tracking()
+        try:
+            result = await self._request("review/start", {
+                "threadId": self.thread_id,
+                "target": target,
+                "delivery": "inline",
+            })
+            review_thread_id = (result or {}).get("reviewThreadId")
+            turn = (result or {}).get("turn")
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if not isinstance(review_thread_id, str) or not review_thread_id:
+                raise RuntimeError(
+                    "codex app-server did not return a review thread")
+            if not isinstance(turn_id, str) or not turn_id:
+                raise RuntimeError(
+                    "codex app-server did not return a review turn")
+            self.remember_owned_turn_id(turn_id)
+            if self._review_active:
+                if (self._review_outer_turn_id is not None
+                        and self._review_outer_turn_id != turn_id):
+                    raise RuntimeError(
+                        "codex app-server returned mismatched review turns")
+                self._review_outer_turn_id = turn_id
+                # A revision which reports turn/started for the outer lifecycle
+                # before answering review/start can provisionally look like the
+                # nested executor. The RPC response is authoritative; reopen the
+                # nested-id attribution window for the actual reviewer turn.
+                if self._review_execution_turn_id == turn_id:
+                    self._review_execution_turn_id = None
+                    self._review_execution_ready = asyncio.Event()
+            # A fast review may already have queued its terminal event. Do not
+            # resurrect it as interruptible after turn/completed cleared the flag.
+            if self.turn_active:
+                self.turn_id = turn_id
+            else:
+                # turn/completed can precede the RPC response, when the outer id
+                # is not known yet and _dispatch therefore cannot clear Review
+                # tracking. The completed state is authoritative here.
+                self._clear_review_tracking()
+            return {"thread_id": review_thread_id, "turn_id": turn_id}
+        except BaseException:
+            self.turn_active = False
+            self.turn_id = None
+            self._clear_review_tracking()
+            if self._turn_q is queue:
+                self._turn_q = None
+            raise
+        finally:
+            self.turn_start_pending = False
+
+    async def compact_thread(self) -> None:
+        assert self.thread_id, "connect() first"
+        if self.turn_active:
+            raise RuntimeError("codex thread is busy")
+        await self._request(
+            "thread/compact/start", {"threadId": self.thread_id})
+
+    async def rollback_thread(self, num_turns: int) -> dict[str, Any]:
+        assert self.thread_id, "connect() first"
+        if self.turn_active:
+            raise RuntimeError("codex thread is busy")
+        if not isinstance(num_turns, int) or isinstance(num_turns, bool) \
+                or not 1 <= num_turns <= 1000:
+            raise ValueError("num_turns must be between 1 and 1000")
+        result = await self._request("thread/rollback", {
+            "threadId": self.thread_id,
+            "numTurns": num_turns,
+        })
+        thread = (result or {}).get("thread")
+        if not isinstance(thread, dict):
+            raise RuntimeError("codex app-server did not return the rolled back thread")
+        return thread
 
     async def _publish_goal(self, goal: Optional[dict[str, Any]]) -> None:
         """Forward one sanitized goal notification without killing the reader."""
@@ -1319,31 +2283,36 @@ class CodexHandle:
             "error": {"code": code, "message": message},
         })
 
-    async def _approval_decision(self, method: str, params: dict) -> str:
-        """Return one current-schema approval decision, failing closed."""
+    async def _approval_decision(
+        self, method: str, params: dict,
+    ) -> Optional[str]:
+        """Return a decision, or stay silent for a shared pending request."""
         if self.approval == "never":
             return "decline"
         if self.approval not in {"on-request", "untrusted"}:
             log.warning("invalid codex approval policy; denying", approval=self.approval)
-            return "decline"
+            return None if self._using_daemon_proxy else "decline"
         callback = self.approval_callback
         if callback is None:
             log.warning("codex approval requested without a client callback", method=method)
-            return "decline"
+            return None if self._using_daemon_proxy else "decline"
         try:
             decision = await asyncio.wait_for(
                 callback(method, params), timeout=_APPROVAL_TIMEOUT)
         except asyncio.TimeoutError:
-            log.warning("codex approval timed out; denying", method=method)
-            return "decline"
+            log.warning("codex approval timed out", method=method)
+            return None if self._using_daemon_proxy else "decline"
         except Exception as exc:
-            log.warning("codex approval callback failed; denying",
-                        method=method, error=str(exc))
-            return "decline"
+            log.warning(
+                "codex approval callback failed",
+                method=method,
+                error_type=type(exc).__name__,
+            )
+            return None if self._using_daemon_proxy else "decline"
         if decision not in _APPROVAL_DECISIONS:
-            log.warning("invalid codex approval decision; denying",
+            log.warning("invalid codex approval decision",
                         method=method, decision=decision)
-            return "decline"
+            return None if self._using_daemon_proxy else "decline"
         return decision
 
     async def _handle_server_request(self, message: dict) -> None:
@@ -1364,22 +2333,34 @@ class CodexHandle:
         if method in _INTERACTION_METHODS:
             callback = self.interaction_callback
             if callback is None:
+                if self._using_daemon_proxy:
+                    return
                 await self._respond_error(rid, -32000, "remote interaction callback unavailable")
                 return
             try:
                 result = await asyncio.wait_for(
                     callback(method, params), timeout=_APPROVAL_TIMEOUT)
             except asyncio.TimeoutError:
+                if self._using_daemon_proxy:
+                    return
                 await self._respond_error(rid, -32001, "remote user input timed out")
                 return
             except Exception as exc:
-                log.warning("codex interaction callback failed", method=method, error=str(exc))
+                log.warning(
+                    "codex interaction callback failed",
+                    method=method,
+                    error_type=type(exc).__name__,
+                )
+                if self._using_daemon_proxy:
+                    return
                 await self._respond_error(rid, -32000, "remote user input failed")
                 return
             await self._respond(rid, result)
             return
 
         decision = await self._approval_decision(method, params)
+        if decision is None:
+            return
         if method in _LEGACY_APPROVAL_METHODS:
             decision = _LEGACY_DECISIONS[decision]
         await self._respond(rid, {"decision": decision})
@@ -1387,6 +2368,10 @@ class CodexHandle:
     def _server_request_done(self, task: asyncio.Task) -> None:
         """Observe a detached server-request task and keep the set bounded."""
         self._server_request_tasks.discard(task)
+        for request_id, owner in list(self._server_request_tasks_by_id.items()):
+            if owner is task:
+                self._server_request_tasks_by_id.pop(request_id, None)
+                self._pending_server_request_ids.discard(request_id)
         if task.cancelled():
             return
         try:
@@ -1399,39 +2384,188 @@ class CodexHandle:
                 error_type=type(error).__name__,
             )
 
+    async def _proxy_read_exact(
+        self, proc: asyncio.subprocess.Process, size: int,
+    ) -> bytes:
+        if proc.stdout is None:
+            raise CodexProxyProtocolError("proxy stdout unavailable")
+        while len(self._proxy_read_buffer) < size:
+            chunk = await proc.stdout.read(size - len(self._proxy_read_buffer))
+            if not chunk:
+                raise EOFError("Codex daemon proxy closed")
+            self._proxy_read_buffer.extend(chunk)
+        data = bytes(self._proxy_read_buffer[:size])
+        del self._proxy_read_buffer[:size]
+        return data
+
+    async def _proxy_read_frame(
+        self, proc: asyncio.subprocess.Process,
+    ) -> tuple[bool, int, bytes]:
+        header = await self._proxy_read_exact(proc, 2)
+        first, second = header
+        fin = bool(first & 0x80)
+        if first & 0x70:
+            raise CodexProxyProtocolError("unsupported WebSocket extension")
+        opcode = first & 0x0F
+        if opcode not in {0x0, 0x1, 0x2, 0x8, 0x9, 0xA}:
+            raise CodexProxyProtocolError("invalid WebSocket opcode")
+        # Servers never mask frames.  Accepting a masked local stream would hide
+        # a direction/protocol mixup and risks feeding arbitrary bytes to JSON.
+        if second & 0x80:
+            raise CodexProxyProtocolError("masked WebSocket server frame")
+        length_marker = second & 0x7F
+        if length_marker == 126:
+            length = int.from_bytes(
+                await self._proxy_read_exact(proc, 2), "big")
+            if length <= 125:
+                raise CodexProxyProtocolError("non-canonical WebSocket length")
+        elif length_marker == 127:
+            raw_length = await self._proxy_read_exact(proc, 8)
+            if raw_length[0] & 0x80:
+                raise CodexProxyProtocolError("invalid WebSocket length")
+            length = int.from_bytes(raw_length, "big")
+            if length <= 0xFFFF:
+                raise CodexProxyProtocolError("non-canonical WebSocket length")
+        else:
+            length = length_marker
+        if length > _PROXY_MESSAGE_MAX:
+            raise CodexProxyProtocolError("WebSocket frame exceeds limit")
+        if opcode >= 0x8 and (not fin or length > 125):
+            raise CodexProxyProtocolError("invalid WebSocket control frame")
+        return fin, opcode, await self._proxy_read_exact(proc, length)
+
+    async def _send_proxy_frame(self, payload: bytes, opcode: int) -> None:
+        if not self._using_daemon_proxy:
+            raise CodexProxyProtocolError("proxy transport is not active")
+        frame = _websocket_client_frame(payload, opcode=opcode)
+        async with self._send_lock:
+            proc = self.proc
+            if proc is None or proc.stdin is None:
+                raise RuntimeError("codex daemon proxy disconnected")
+            proc.stdin.write(frame)
+            await proc.stdin.drain()
+
+    async def _proxy_read_message(
+        self, proc: asyncio.subprocess.Process,
+    ) -> Optional[bytes]:
+        fragments: Optional[bytearray] = None
+        while True:
+            fin, opcode, payload = await self._proxy_read_frame(proc)
+            if opcode == 0x8:  # close
+                if len(payload) == 1:
+                    raise CodexProxyProtocolError("invalid WebSocket close frame")
+                if len(payload) >= 2:
+                    code = int.from_bytes(payload[:2], "big")
+                    defined = code in {
+                        1000, 1001, 1002, 1003, 1007, 1008,
+                        1009, 1010, 1011, 1012, 1013, 1014,
+                    }
+                    if not defined and not 3000 <= code < 5000:
+                        raise CodexProxyProtocolError("invalid WebSocket close code")
+                    try:
+                        payload[2:].decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise CodexProxyProtocolError(
+                            "invalid WebSocket close reason") from exc
+                if not self._proxy_close_sent:
+                    self._proxy_close_sent = True
+                    await self._send_proxy_frame(payload, 0x8)
+                return None
+            if opcode == 0x9:  # ping
+                await self._send_proxy_frame(payload, 0xA)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+            if opcode == 0x2:
+                raise CodexProxyProtocolError(
+                    "binary app-server WebSocket message")
+            if opcode == 0x1:
+                if fragments is not None:
+                    raise CodexProxyProtocolError(
+                        "interleaved WebSocket data messages")
+                if fin:
+                    try:
+                        payload.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise CodexProxyProtocolError(
+                            "invalid WebSocket text") from exc
+                    return payload
+                fragments = bytearray(payload)
+                continue
+            # continuation
+            if fragments is None:
+                raise CodexProxyProtocolError(
+                    "unexpected WebSocket continuation")
+            if len(fragments) + len(payload) > _PROXY_MESSAGE_MAX:
+                raise CodexProxyProtocolError(
+                    "WebSocket message exceeds limit")
+            fragments.extend(payload)
+            if fin:
+                complete = bytes(fragments)
+                try:
+                    complete.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise CodexProxyProtocolError(
+                        "invalid fragmented WebSocket text") from exc
+                return complete
+
     async def _send(self, obj: dict) -> None:
-        assert self.proc and self.proc.stdin
-        self.proc.stdin.write((json.dumps(obj) + "\n").encode())
-        await self.proc.stdin.drain()
+        payload = json.dumps(obj).encode("utf-8")
+        if self._using_daemon_proxy:
+            await self._send_proxy_frame(payload, 0x1)
+            return
+        async with self._send_lock:
+            proc = self.proc
+            assert proc and proc.stdin
+            proc.stdin.write(payload + b"\n")
+            await proc.stdin.drain()
 
     async def _read_loop(self, proc: asyncio.subprocess.Process,
                          generation: int) -> None:
         assert proc.stdout
+        daemon_proxy = self._using_daemon_proxy
         try:
             while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
+                if daemon_proxy:
+                    line = await self._proxy_read_message(proc)
+                    if line is None:
+                        break
+                else:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
                 try:
                     m = json.loads(line)
-                except Exception:
+                except Exception as exc:
+                    if daemon_proxy:
+                        raise CodexProxyProtocolError(
+                            "invalid app-server JSON message") from exc
+                    continue
+                if not isinstance(m, dict):
+                    if daemon_proxy:
+                        raise CodexProxyProtocolError(
+                            "non-object app-server WebSocket message")
                     continue
                 if generation != self._generation:
                     return
                 await self._dispatch(m, raw_size=len(line))
-                if self._spontaneous_q is not None:
+                if self._turn_q is not None or self._spontaneous_q is not None:
                     # StreamReader can satisfy many buffered readline() calls
                     # without yielding. Give the independent bridge consumer one
                     # scheduling opportunity per frame; never wait for its relay
-                    # I/O or for queue capacity.
+                    # I/O or for queue capacity. Managed bridges are fail-fast too,
+                    # so they need the same fairness once their consumer exists.
                     await asyncio.sleep(0)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             log.warning("codex read loop ended", error=str(e))
+            if daemon_proxy and generation == self._generation:
+                self.daemon_manager.invalidate()
+                await self.disconnect()
         finally:
             # A stale reader belongs to an app-server generation already replaced
             # by disconnect/reconnect.  Leave the new generation alone, but do not
@@ -1439,6 +2573,11 @@ class CodexHandle:
             # exception from this reader task.
             if generation == self._generation:
                 self._dead = True
+                if daemon_proxy:
+                    self.daemon_manager.invalidate()
+                    self._using_daemon_proxy = False
+                    self._proxy_read_buffer.clear()
+                self._clear_review_tracking()
                 spontaneous_turn_id = self._spontaneous_turn_id
                 self._spontaneous_turn_id = None
                 self._close_spontaneous_stream(spontaneous_turn_id)
@@ -1450,6 +2589,7 @@ class CodexHandle:
                 # unblock any waiting turn/request
                 if self._turn_q is not None:
                     self._force_turn_sentinel(self._turn_q)
+                self._managed_overflow = False
                 for fut in self._pending.values():
                     if not fut.done():
                         fut.set_exception(RuntimeError("codex app-server closed"))
@@ -1483,6 +2623,32 @@ class CodexHandle:
         if (not _is_turn_notification(method)
                 and method not in {"error", "thread/compacted"}):
             return True
+
+        if self._review_active and target_turn_id is not None:
+            # ``review/start`` owns an outer visible turn plus one nested reviewer
+            # execution turn.  The nested turn is authoritative for interrupt and
+            # rollout attribution, while outer items/completion remain the public
+            # managed stream. There is exactly one nested executor; a third id is
+            # foreign and must not be allowed to hijack cancellation.
+            if method == "turn/started":
+                if target_turn_id != self._review_outer_turn_id:
+                    if (self._review_execution_turn_id is not None
+                            and self._review_execution_turn_id != target_turn_id):
+                        log.warning(
+                            "foreign codex review execution notification dropped",
+                            method=method,
+                        )
+                        return False
+                    self._review_execution_turn_id = target_turn_id
+                    self.remember_owned_turn_id(target_turn_id)
+                    self._review_execution_ready.set()
+                return True
+            if target_turn_id in {
+                self._review_outer_turn_id,
+                self._review_execution_turn_id,
+                self.turn_id,
+            }:
+                return True
 
         if method == "turn/started":
             if target_turn_id is None:
@@ -1518,6 +2684,19 @@ class CodexHandle:
         # notifications in the v2 schema are attributable; dropping a malformed
         # one is safer than guessing which active reply owns it.
         if method == "error":
+            if self._using_daemon_proxy:
+                # Shared app-server provider errors currently carry neither a
+                # thread nor a turn id.  The daemon can emit one while another
+                # subscribed thread is active; accepting it merely because this
+                # handle also has a live turn renders a foreign retry/failure in
+                # the wrong conversation.  Terminal turn/completed remains the
+                # authoritative, attributable result for this handle.
+                log.warning(
+                    "unattributed shared Codex provider error dropped",
+                    active_thread_id=self.thread_id,
+                    active_turn_id=self.turn_id,
+                )
+                return False
             return self.turn_active
         if isinstance(method, str) and method.startswith("hook/"):
             return self.turn_active
@@ -1536,11 +2715,46 @@ class CodexHandle:
                     fut.set_result(m.get("result"))
             return
         if has_id and has_method:                            # server -> client request
+            method = m.get("method")
+            request_id = _server_request_key(m.get("id"))
+            missing_callback = isinstance(method, str) and ((
+                method in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS
+                and self.approval != "never"
+                and self.approval_callback is None
+            ) or (
+                method in _INTERACTION_METHODS
+                and self.interaction_callback is None
+            ))
+            if self._using_daemon_proxy and missing_callback:
+                # A shared app-server can deliver the same prompt to another
+                # subscribed client.  Silence means "still pending"; replying
+                # decline/error here would win the race and reject it globally.
+                if (request_id is not None
+                        and len(self._pending_server_request_ids)
+                        < _MAX_SERVER_REQUEST_TASKS):
+                    self._pending_server_request_ids.add(request_id)
+                log.warning(
+                    "Codex shared server request left pending without callback",
+                    method=method,
+                )
+                return
             if len(self._server_request_tasks) >= _MAX_SERVER_REQUEST_TASKS:
-                method = m.get("method")
                 rid = m.get("id")
-                log.warning("codex server request cap reached; rejecting",
-                            method=method)
+                supported = isinstance(method, str) and method in (
+                    _NEW_APPROVAL_METHODS
+                    | _LEGACY_APPROVAL_METHODS
+                    | _INTERACTION_METHODS
+                )
+                if self._using_daemon_proxy and supported:
+                    # Do not let this saturated connection reject a prompt which
+                    # another subscribed official client can still resolve.
+                    log.warning(
+                        "Codex shared server request cap reached; left pending",
+                        method=method,
+                    )
+                    return
+                log.warning(
+                    "codex server request cap reached; rejecting", method=method)
                 if method in _NEW_APPROVAL_METHODS:
                     await self._respond(rid, {"decision": "decline"})
                 elif method in _LEGACY_APPROVAL_METHODS:
@@ -1551,11 +2765,40 @@ class CodexHandle:
                 return
             task = asyncio.create_task(self._handle_server_request(m))
             self._server_request_tasks.add(task)
+            if request_id is not None:
+                self._server_request_tasks_by_id[request_id] = task
+                self._pending_server_request_ids.add(request_id)
             task.add_done_callback(self._server_request_done)
             return
         # notification
         method = m.get("method")
+        if method == "serverRequest/resolved":
+            params = m.get("params")
+            request_id = _server_request_key(
+                params.get("requestId") if isinstance(params, dict) else None)
+            if request_id is not None:
+                self._pending_server_request_ids.discard(request_id)
+                task = self._server_request_tasks_by_id.pop(request_id, None)
+                if task is not None and not task.done():
+                    task.cancel()
         if not self._notification_is_current(m):
+            return
+        if method == "error":
+            diagnostic = _provider_error_diagnostic(m.get("params"))
+            logger_method = log.info if diagnostic["will_retry"] else log.warning
+            logger_method("codex provider error", **diagnostic)
+        target_turn_id = _notification_turn_id(m)
+        review_execution_frame = bool(
+            self._review_active
+            and target_turn_id is not None
+            and target_turn_id == self._review_execution_turn_id
+            and target_turn_id != self._review_outer_turn_id
+        )
+        # Some app-server revisions may report a nested terminal before the
+        # outer Review finishes its exitedReviewMode/agentMessage lifecycle.  It
+        # is not the managed turn's terminal and must not close the queue.
+        if method == "turn/completed" and review_execution_frame:
+            self._review_execution_turn_id = None
             return
         completed_spontaneous_turn_id: Optional[str] = None
         if method == "thread/started" and not self.thread_id:
@@ -1572,11 +2815,13 @@ class CodexHandle:
             was_active = self.turn_active
             turn = (m.get("params") or {}).get("turn") or {}
             turn_id = turn.get("id")
-            if isinstance(turn_id, str) and turn_id:
+            if (isinstance(turn_id, str) and turn_id
+                    and not review_execution_frame):
                 self.turn_id = turn_id
                 self.remember_owned_turn_id(turn_id)
             self.turn_active = True
-            if not was_active and isinstance(turn_id, str) and turn_id:
+            if (not was_active and isinstance(turn_id, str) and turn_id
+                    and not review_execution_frame):
                 # A goal loop/automatic continuation is not backed by query().
                 # The previous managed turn's receive_response() may still hold
                 # its local queue after consuming completed+sentinel. Detach the
@@ -1665,9 +2910,12 @@ class CodexHandle:
                 completed_spontaneous_turn_id = spontaneous_turn_id
         if self._turn_q is not None and _is_turn_queue_notification(method):
             queue = self._turn_q
-            await queue.put(m)
-            if method == "turn/completed":
-                await queue.put(None)
+            if not self._queue_managed_notification(m, raw_size):
+                # Compatibility for narrow unit tests which inject an
+                # asyncio.Queue directly instead of opening the live bridge.
+                await queue.put(m)
+                if method == "turn/completed":
+                    await queue.put(None)
         elif (_is_turn_queue_notification(method)
               and self._spontaneous_turn_id is not None):
             self._queue_spontaneous_notification(m, raw_size)
@@ -1679,12 +2927,26 @@ class CodexHandle:
             completed_turn_id = _notification_turn_id(m)
             if completed_turn_id == self.turn_id:
                 self.turn_id = None
+            if (self._review_active
+                    and completed_turn_id == self._review_outer_turn_id):
+                self._clear_review_tracking()
 
     @staticmethod
-    def _force_turn_sentinel(queue: asyncio.Queue) -> None:
+    def _force_turn_sentinel(queue: Any) -> None:
         """Wake a consumer during disconnect even when the bounded queue is full."""
+        if (isinstance(queue, _SpontaneousNotificationQueue)
+                and queue.has_turn_completed()):
+            # receive_response terminates on this authoritative frame. Replacing
+            # a full [Overflow, turn/completed] bridge with None would erase the
+            # only terminal evidence during an EOF/disconnect race.
+            return
         try:
-            queue.put_nowait(None)
+            offered = queue.put_nowait(None)
+            if offered is False:
+                clear = getattr(queue, "clear", None)
+                if clear is not None:
+                    clear()
+                    queue.put_nowait(None)
         except asyncio.QueueFull:
             try:
                 queue.get_nowait()
@@ -1972,6 +3234,49 @@ def _status_error_message(error: BaseException) -> str:
     ):
         return "unavailable for the current account"
     return "app-server request failed"
+
+
+def _provider_error_diagnostic(params: Any) -> dict[str, Any]:
+    """Extract non-sensitive provider failure fields for operator logs.
+
+    The full app-server error can contain account, endpoint or connector data.
+    Keep only retry state, an HTTP status and a coarse failure class so future
+    upstream incidents are attributable without copying provider text to disk.
+    """
+    public = params if isinstance(params, dict) else {}
+    error = public.get("error") if isinstance(public.get("error"), dict) else {}
+    message = error.get("message") if isinstance(error.get("message"), str) else ""
+    details = (error.get("additionalDetails")
+               if isinstance(error.get("additionalDetails"), str) else "")
+    combined = (message + " " + details)[:8192].lower()
+    status_match = re.search(r"\b([45]\d\d)\b", combined)
+    status = int(status_match.group(1)) if status_match else None
+    info = error.get("codexErrorInfo")
+    if isinstance(info, dict):
+        disconnected = info.get("responseStreamDisconnected")
+        if isinstance(disconnected, dict):
+            candidate = disconnected.get("httpStatusCode")
+            if isinstance(candidate, int) and 400 <= candidate <= 599:
+                status = candidate
+    if status in {401, 403}:
+        category = "authentication"
+    elif status == 429:
+        category = "rate_limit"
+    elif isinstance(status, int) and status >= 500:
+        category = "upstream_server"
+    elif "timeout" in combined or "timed out" in combined:
+        category = "timeout"
+    elif any(token in combined for token in (
+        "connect", "network", "dns", "tls", "stream disconnected",
+    )):
+        category = "connection"
+    else:
+        category = "provider"
+    return {
+        "will_retry": bool(public.get("willRetry")),
+        "category": category,
+        "http_status": status,
+    }
 
 
 def _append_status_error(errors: list[str], component: str,

@@ -17,6 +17,13 @@ function textChannel(block: TextBlock): string {
   return block.channel ?? "final";
 }
 
+function canFuzzyMatchText(block: TextBlock): boolean {
+  // A completed assistant envelope without a delta is tool scaffolding, not a
+  // semantic text position. Open empty blocks remain eligible so a
+  // focus-triggered History merge can retain the id targeted by future deltas.
+  return block.text.length > 0 || !block.done;
+}
+
 function textAffinity(first: string, second: string): number {
   if (first === second) return Number.MAX_SAFE_INTEGER;
   if (first.includes(second) || second.includes(first)) {
@@ -84,11 +91,12 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
       const candidate = out[index] as TextBlock;
       return !matchedTextIndexes.has(index) && candidate.message_id === block.message_id;
     });
-    if (existingIndex == null) {
+    if (existingIndex == null && canFuzzyMatchText(block)) {
       const candidates = historyTextIndexes.filter((index) => {
         const candidate = out[index] as TextBlock;
         return !matchedTextIndexes.has(index)
-          && textChannel(candidate) === textChannel(block);
+          && textChannel(candidate) === textChannel(block)
+          && canFuzzyMatchText(candidate);
       });
       let bestScore = 0;
       for (const index of candidates) {
@@ -107,6 +115,11 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
       existing.text = combineText(existing.text, block.text);
       existing.done = existing.done || block.done;
       if (block.channel !== "unknown") existing.channel = block.channel;
+      // History parsers can regenerate an assistant item id. While this turn
+      // is still open, future deltas continue targeting the live app-server id.
+      // Keeping the history id here makes the next delta create a second block,
+      // which then survives every focus-triggered History reconciliation.
+      if (preserveLiveOpen) existing.message_id = block.message_id;
     } else {
       out.push({ ...block });
     }
@@ -130,11 +143,22 @@ function sameTurn(history: Turn, live: Turn): boolean {
   return Math.abs(history.ts - live.ts) <= 3000;
 }
 
+export function historyContainsTurn(history: Turn[], live: Turn): boolean {
+  return history.some((turn) => sameTurn(turn, live));
+}
+
 function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
+  const historyImageRefs = history.imageRefs?.length
+    ? history.imageRefs : undefined;
+  const historyTurnId = historyImageRefs
+    ? (history.historyTurnId ?? history.id)
+    : (history.historyTurnId ?? live.historyTurnId);
   return {
     ...history,
     id: live.id,
+    historyTurnId,
     forkPointId: history.forkPointId ?? live.forkPointId,
+    checkpointId: history.checkpointId ?? live.checkpointId,
     prompt: history.prompt || live.prompt,
     blocks: mergeBlocks(history.blocks, live.blocks, preserveLiveOpen),
     // A transcript has no ResultMessage, so its EOF is represented by a
@@ -144,7 +168,11 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     interrupted: history.interrupted || live.interrupted,
     error: live.error ?? history.error,
     progress: preserveLiveOpen ? live.progress : undefined,
-    images: live.images ?? history.images,
+    // A summary page replaces optimistic inline image bodies with canonical,
+    // payload-free references. Retaining both makes ChatView lay out the same
+    // attachment twice and leaves a large placeholder below the visible image.
+    images: historyImageRefs ? undefined : live.images ?? history.images,
+    imageRefs: historyImageRefs ?? live.imageRefs ?? history.imageRefs,
     files: live.files ?? history.files,
     ts: Math.min(history.ts ?? Number.MAX_SAFE_INTEGER,
       live.ts ?? Number.MAX_SAFE_INTEGER) === Number.MAX_SAFE_INTEGER
@@ -154,8 +182,42 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     doneTs: preserveLiveOpen
       ? live.doneTs
       : Math.max(history.doneTs ?? 0, live.doneTs ?? 0) || undefined,
-    durationMs: history.durationMs ?? live.durationMs,
+    durationMs: history.durationMs === 0 && (live.durationMs ?? 0) > 0
+      ? live.durationMs
+      : history.durationMs ?? live.durationMs,
   };
+}
+
+/** Merge previously-loaded heavyweight detail into a newer summary without
+ * allowing stale detail lifecycle fields to reopen a steered/completed turn. */
+export function mergeAuthoritativeTurnDetail(
+  summary: Turn,
+  detail: Turn,
+): Turn {
+  const merged = mergeTurn(summary, detail, false);
+  return {
+    ...merged,
+    id: summary.id,
+    done: summary.done,
+    doneTs: summary.doneTs,
+    durationMs: summary.durationMs,
+    interrupted: summary.interrupted,
+    error: summary.error,
+    progress: summary.progress,
+    detailEventCount: summary.detailEventCount,
+    detailLoaded: true,
+    detailLoading: false,
+  };
+}
+
+function chronologicalTurnTime(turn: Turn): number | undefined {
+  if (turn.prompt || turn.doneTs == null) return turn.ts;
+  const terminalStart = Math.max(0, turn.doneTs - (turn.durationMs ?? 0));
+  // Older caches and mixed-version wrappers may contain replay-generated
+  // assistant-only starts stamped after their authoritative terminal. Use the
+  // terminal-derived time for ordering without mutating the rendered payload.
+  if (turn.ts == null || turn.ts > turn.doneTs) return terminalStart;
+  return turn.ts;
 }
 
 /** Merge transcript history with cache/live state without deleting a just-finished
@@ -163,7 +225,9 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
 export function mergeInitialHistory(
   history: Turn[],
   live: Turn[],
-  options: { preserveLiveTailOpen?: boolean } = {},
+  options: {
+    preserveLiveTailOpen?: boolean;
+  } = {},
 ): Turn[] {
   const merged = history.map((turn) => ({ ...turn, blocks: turn.blocks.map((b) => ({ ...b })) }));
   const used = new Set<number>();
@@ -177,6 +241,10 @@ export function mergeInitialHistory(
     if (index >= 0) {
       const isOpenLiveTail = !!options.preserveLiveTailOpen
         && liveTurn === live[live.length - 1]
+        // A newer authoritative history turn proves this local placeholder is
+        // no longer the active tail (for example, same-task steering). Only the
+        // matching newest history row may inherit an unfinished live state.
+        && index === merged.length - 1
         && !liveTurn.done;
       merged[index] = mergeTurn(merged[index], liveTurn, isOpenLiveTail);
       used.add(index);
@@ -187,8 +255,10 @@ export function mergeInitialHistory(
 
   const rows = [...merged, ...unmatched].map((turn, order) => ({ turn, order }));
   rows.sort((a, b) => {
-    if (a.turn.ts != null && b.turn.ts != null && a.turn.ts !== b.turn.ts) {
-      return a.turn.ts - b.turn.ts;
+    const aTime = chronologicalTurnTime(a.turn);
+    const bTime = chronologicalTurnTime(b.turn);
+    if (aTime != null && bTime != null && aTime !== bTime) {
+      return aTime - bTime;
     }
     return a.order - b.order;
   });

@@ -8,11 +8,15 @@ only env changes.
 from __future__ import annotations
 
 import math
+import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from cc_remote.claude_broker.paths import default_socket_path
 
 try:
     from dotenv import load_dotenv
@@ -37,10 +41,52 @@ def _float(key: str, default: float) -> float:
 
 
 def _bool(key: str, default: bool = False) -> bool:
-    v = os.environ.get(key)
-    if v is None or not v.strip():
+    value = os.environ.get(key)
+    if value is None or not value.strip():
         return default
-    return v.strip().lower() in {"1", "true", "yes", "on"}
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def device_config_path() -> Path:
+    return Path(_env(
+        "CC_REMOTE_DEVICE_CONFIG",
+        str(Path.home() / ".cc-remote" / "device.json"),
+    )).expanduser()
+
+
+def _load_device_config() -> dict[str, str]:
+    path = device_config_path()
+    if not path.exists():
+        return {}
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise ValueError(
+            f"device credential file must not be accessible by group/others: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"invalid device credential file: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid device credential file: {path}")
+    allowed = {"relay_url", "wrapper_token", "machine_id", "label"}
+    return {
+        key: value for key, value in payload.items()
+        if key in allowed and isinstance(value, str)
+    }
+
+
+def _wrapper_value(env_key: str, file_key: str, default: str) -> str:
+    explicit = os.environ.get(env_key)
+    if explicit is not None and explicit.strip():
+        return explicit
+    return _load_device_config().get(file_key, default)
+
+
+def _default_device_db_path() -> str:
+    push_path = _env("PUSH_DB_PATH", "").strip()
+    if push_path:
+        return str(Path(push_path).expanduser().parent / "relay-devices.sqlite3")
+    return str(Path.home() / ".cc-remote" / "relay-devices.sqlite3")
 
 
 @dataclass
@@ -65,6 +111,13 @@ class RelayConfig:
     # Login gate: web clients POST /api/login with this password and receive a
     # short-lived HMAC session in an HttpOnly cookie.
     login_password: str = field(default_factory=lambda: _env("LOGIN_PASSWORD", ""))
+    # Optional multi-user policy. When configured it replaces LOGIN_PASSWORD:
+    # {"alice":{"password":"...","machines":["mac","nono"]}}
+    login_users_json: str = field(default_factory=lambda: _env("LOGIN_USERS_JSON", "").strip())
+    # Optional per-machine wrapper credentials. When configured it replaces
+    # the wildcard WRAPPER_TOKEN:
+    # {"mac":"long-secret", "nono":"another-long-secret"}
+    wrapper_tokens_json: str = field(default_factory=lambda: _env("WRAPPER_TOKENS_JSON", "").strip())
     session_secret: str = field(default_factory=lambda: _env("SESSION_SECRET", ""))
     session_ttl_seconds: int = field(default_factory=lambda: _int("SESSION_TTL_SECONDS", 7 * 24 * 3600))
     login_body_max_bytes: int = field(default_factory=lambda: _int("LOGIN_BODY_MAX_BYTES", 4096))
@@ -87,21 +140,60 @@ class RelayConfig:
     # traffic travel in cleartext) for being reachable over a bare public IP
     # without a TLS terminator in front.
     allow_insecure_http: bool = field(default_factory=lambda: _bool("ALLOW_INSECURE_HTTP"))
+    # Optional Web Push. Configure all three VAPID values to deliver completion
+    # notices even when no browser WebSocket is connected.
+    push_vapid_public_key: str = field(
+        default_factory=lambda: _env("PUSH_VAPID_PUBLIC_KEY", "").strip()
+    )
+    push_vapid_private_key: str = field(
+        default_factory=lambda: _env("PUSH_VAPID_PRIVATE_KEY", "").strip()
+    )
+    push_vapid_subject: str = field(
+        default_factory=lambda: _env("PUSH_VAPID_SUBJECT", "").strip()
+    )
+    push_db_path: str = field(default_factory=lambda: _env(
+        "PUSH_DB_PATH", str(Path.home() / ".cc-remote" / "relay-push.sqlite3")))
+    # Persistent enrollment metadata and hashed per-device credentials. This
+    # database never contains conversations, artifacts, or plaintext tokens.
+    device_db_path: str = field(default_factory=lambda: _env(
+        "DEVICE_DB_PATH", _default_device_db_path()))
+    device_pairing_ttl_seconds: int = field(
+        default_factory=lambda: _int("DEVICE_PAIRING_TTL_SECONDS", 600))
 
 
 @dataclass
 class WrapperConfig:
-    relay_url: str = field(default_factory=lambda: _env("RELAY_URL", "ws://127.0.0.1:8765/ws"))
+    relay_url: str = field(default_factory=lambda: _wrapper_value(
+        "RELAY_URL", "relay_url", "ws://127.0.0.1:8765/ws"))
     # Token the wrapper presents to the relay at WS upgrade (must match the
     # relay's WRAPPER_TOKEN). Same env name as the relay for convenience.
-    wrapper_token: str = field(default_factory=lambda: _env("WRAPPER_TOKEN", "change-me-wrapper"))
+    wrapper_token: str = field(default_factory=lambda: _wrapper_value(
+        "WRAPPER_TOKEN", "wrapper_token", "change-me-wrapper"))
     # Same opt-in escape hatch as the relay's ALLOW_INSECURE_HTTP: lets
     # RELAY_URL stay ws:// against a non-loopback host instead of requiring
     # wss://. Off by default.
-    allow_insecure_http: bool = field(default_factory=lambda: _bool("ALLOW_INSECURE_HTTP"))
+    allow_insecure_http: bool = field(
+        default_factory=lambda: _bool("ALLOW_INSECURE_HTTP"))
+    # Stable relay routing key. Multiple wrapper hosts may share one relay when
+    # each uses a distinct id; "default" preserves the single-machine setup.
+    machine_id: str = field(default_factory=lambda: _wrapper_value(
+        "CC_REMOTE_MACHINE_ID", "machine_id", "default").strip() or "default")
     # Optional explicit Claude Code executable. Blank preserves the existing
     # SDK/PATH discovery behavior.
     claude_bin: str = field(default_factory=lambda: _env("CLAUDE_BIN", "").strip())
+    # Optional proxy inherited only by Codex subprocesses launched by this
+    # wrapper.  It deliberately does not mutate the wrapper process or the
+    # user's shell/CLI environment.
+    codex_proxy: str = field(
+        default_factory=lambda: _env("CC_REMOTE_CODEX_PROXY", "").strip())
+    # Optional local PTY broker used only by the explicit `claude-remote`
+    # experiment. It is intentionally disabled in the supported product path:
+    # direct native Claude owners are mirrored read-only and explicitly taken
+    # over by the SDK instead of sharing a PTY input state machine.
+    claude_broker_socket: str = field(default_factory=default_socket_path)
+    experimental_claude_broker: bool = field(
+        default_factory=lambda: _bool(
+            "CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER", False))
     # cwd for the cc session. MUST match the resumed session's cwd, otherwise
     # --resume cannot locate the session jsonl under ~/.claude/projects/.
     cc_cwd: str = field(default_factory=lambda: _env("CC_CWD", os.getcwd()))
@@ -111,6 +203,10 @@ class WrapperConfig:
     tool_result_max: int = field(default_factory=lambda: _int("TOOL_RESULT_MAX", 65536))
     history_source_max_bytes: int = field(
         default_factory=lambda: _int("HISTORY_SOURCE_MAX_BYTES", 64 * 1024 * 1024)
+    )
+    codex_history_window_max_bytes: int = field(
+        default_factory=lambda: _int(
+            "CODEX_HISTORY_WINDOW_MAX_BYTES", 32 * 1024 * 1024)
     )
     # Bound relay-facing queues and inbound frames. The frame cap must be large
     # enough for an encoded attachment command, but remains finite so one
@@ -124,6 +220,8 @@ class WrapperConfig:
         default_factory=lambda: _int("WRAPPER_SEND_QUEUE_BYTES", 32 * 1024 * 1024)
     )
     ws_max_size_bytes: int = field(default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 16 * 1024 * 1024))
+    # Consumer-facing per-turn queue. CodexHandle derives a separate bounded
+    # burst window from this value so app-server stdout never waits on relay I/O.
     turn_reader_queue_cap: int = field(
         default_factory=lambda: _int("TURN_READER_QUEUE_CAP", 4)
     )
@@ -136,12 +234,24 @@ class WrapperConfig:
     codex_turn_idle_warn_seconds: float = field(
         default_factory=lambda: _float("CODEX_TURN_IDLE_WARN_SECONDS", 90.0)
     )
+    # Code sessions prefer Codex's official shared app-server daemon so the
+    # native TUI and Remote can attach to the same thread/control plane. Work
+    # intentionally keeps its private stdio app-server for isolation.
+    codex_daemon_mode: str = field(
+        default_factory=lambda: _env("CC_REMOTE_CODEX_DAEMON", "auto").strip().lower()
+    )
     # Max cc subprocesses (resident sessions) the wrapper runs concurrently. Each
     # session = one `claude --resume` child (~190MB RAM). Over the cap → evict an
     # idle one (client keeps its cached history; viewing stays instant). Raised
     # from 4 so browsing many sessions doesn't thrash-respawn. Tune via env.
     max_concurrent_sessions: int = field(default_factory=lambda: _int("MAX_CONCURRENT_SESSIONS", 20))
     state_dir: Path = field(default_factory=lambda: Path(_env("CC_REMOTE_STATE_DIR", str(Path.home() / ".cc-remote"))))
+    # Work uses native engine sessions, but gives them private provider-scoped
+    # working directories and a cc-remote metadata registry.
+    claude_work_root: Path = field(default_factory=lambda: Path(_env(
+        "CLAUDE_WORK_ROOT", str(Path.home() / ".claude" / "cc-remote" / "work"))))
+    codex_work_root: Path = field(default_factory=lambda: Path(_env(
+        "CODEX_WORK_ROOT", str(Path.home() / ".codex" / "cc-remote" / "work"))))
 
 
 def relay_config() -> RelayConfig:
@@ -149,11 +259,80 @@ def relay_config() -> RelayConfig:
 
 
 _PLACEHOLDER_PREFIXES = ("change-me", "changeme", "replace_with", "replace-with")
+_MACHINE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
 
 
 def _placeholder(value: str) -> bool:
     normalized = value.strip().lower()
     return not normalized or normalized.startswith(_PLACEHOLDER_PREFIXES)
+
+
+def valid_machine_id(value: str) -> bool:
+    return bool(_MACHINE_ID_RE.fullmatch(value))
+
+
+def parse_login_users(raw: str) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Parse the optional username/password/machine policy without logging secrets."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise ValueError("LOGIN_USERS_JSON must be valid JSON") from exc
+    if not isinstance(data, dict) or not data:
+        raise ValueError("LOGIN_USERS_JSON must be a non-empty object")
+    if len(data) > 256:
+        raise ValueError("LOGIN_USERS_JSON supports at most 256 users")
+    users: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for username, entry in data.items():
+        if (not isinstance(username, str) or not username.strip()
+                or username != username.strip() or len(username) > 128
+                or any(ord(char) < 32 for char in username)):
+            raise ValueError("LOGIN_USERS_JSON contains an invalid username")
+        if not isinstance(entry, dict):
+            raise ValueError("LOGIN_USERS_JSON user entries must be objects")
+        password = entry.get("password")
+        machines = entry.get("machines")
+        if (not isinstance(password, str) or _placeholder(password)
+                or len(password) < 12):
+            raise ValueError("LOGIN_USERS_JSON passwords must be non-placeholder and at least 12 characters")
+        if (not isinstance(machines, list) or not machines
+                or len(machines) > 64):
+            raise ValueError("LOGIN_USERS_JSON machines must be a non-empty list of at most 64 ids")
+        normalized: list[str] = []
+        for machine in machines:
+            if not isinstance(machine, str) or (
+                    machine != "*" and not valid_machine_id(machine)):
+                raise ValueError("LOGIN_USERS_JSON contains an invalid machine id")
+            if machine not in normalized:
+                normalized.append(machine)
+        if "*" in normalized and len(normalized) != 1:
+            raise ValueError("LOGIN_USERS_JSON wildcard machine must be used alone")
+        users[username] = (password, tuple(normalized))
+    return users
+
+
+def parse_wrapper_tokens(raw: str) -> dict[str, str]:
+    """Parse optional machine-bound wrapper credentials."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise ValueError("WRAPPER_TOKENS_JSON must be valid JSON") from exc
+    if not isinstance(data, dict) or not data:
+        raise ValueError("WRAPPER_TOKENS_JSON must be a non-empty object")
+    if len(data) > 256:
+        raise ValueError("WRAPPER_TOKENS_JSON supports at most 256 machines")
+    tokens: dict[str, str] = {}
+    for machine, token in data.items():
+        if not isinstance(machine, str) or not valid_machine_id(machine):
+            raise ValueError("WRAPPER_TOKENS_JSON contains an invalid machine id")
+        if (not isinstance(token, str) or _placeholder(token)
+                or len(token) < 32):
+            raise ValueError("WRAPPER_TOKENS_JSON tokens must be non-placeholder and at least 32 characters")
+        tokens[machine] = token
+    return tokens
 
 
 def validate_relay_config(cfg: RelayConfig) -> None:
@@ -164,11 +343,21 @@ def validate_relay_config(cfg: RelayConfig) -> None:
     relay entry point and the no-argument app factory call this before serving.
     """
     errors: list[str] = []
-    if _placeholder(cfg.login_password) or len(cfg.login_password) < 12:
+    try:
+        parse_login_users(cfg.login_users_json)
+    except ValueError as exc:
+        errors.append(str(exc))
+    if not cfg.login_users_json and (
+            _placeholder(cfg.login_password) or len(cfg.login_password) < 12):
         errors.append("LOGIN_PASSWORD must be non-placeholder and at least 12 characters")
     if _placeholder(cfg.session_secret) or len(cfg.session_secret) < 32:
         errors.append("SESSION_SECRET must be non-placeholder and at least 32 characters")
-    if _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32:
+    try:
+        parse_wrapper_tokens(cfg.wrapper_tokens_json)
+    except ValueError as exc:
+        errors.append(str(exc))
+    if not cfg.wrapper_tokens_json and (
+            _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32):
         errors.append("WRAPPER_TOKEN must be non-placeholder and at least 32 characters")
     if cfg.session_ttl_seconds <= 0:
         errors.append("SESSION_TTL_SECONDS must be positive")
@@ -192,6 +381,33 @@ def validate_relay_config(cfg: RelayConfig) -> None:
         errors.append("WS_MAX_SIZE_BYTES must be between 12582912 and 67108864")
     if cfg.client_queue_bytes < cfg.ws_max_size_bytes:
         errors.append("CLIENT_QUEUE_BYTES must be at least WS_MAX_SIZE_BYTES")
+
+    push_values = (
+        cfg.push_vapid_public_key,
+        cfg.push_vapid_private_key,
+        cfg.push_vapid_subject,
+    )
+    if any(push_values) and not all(push_values):
+        errors.append(
+            "PUSH_VAPID_PUBLIC_KEY, PUSH_VAPID_PRIVATE_KEY and "
+            "PUSH_VAPID_SUBJECT must be configured together")
+    if cfg.push_vapid_public_key and not re.fullmatch(
+            r"[A-Za-z0-9_-]{80,128}", cfg.push_vapid_public_key):
+        errors.append("PUSH_VAPID_PUBLIC_KEY has an invalid format")
+    if cfg.push_vapid_subject and not (
+            cfg.push_vapid_subject.startswith("mailto:")
+            or cfg.push_vapid_subject.startswith("https://")):
+        errors.append("PUSH_VAPID_SUBJECT must use mailto: or https://")
+    if (not cfg.push_db_path or "\x00" in cfg.push_db_path
+            or len(cfg.push_db_path.encode("utf-8", errors="surrogatepass")) > 4096):
+        errors.append("PUSH_DB_PATH must be a non-empty path of at most 4096 UTF-8 bytes")
+    if (not cfg.device_db_path or "\x00" in cfg.device_db_path
+            or len(cfg.device_db_path.encode(
+                "utf-8", errors="surrogatepass")) > 4096):
+        errors.append(
+            "DEVICE_DB_PATH must be a non-empty path of at most 4096 UTF-8 bytes")
+    if not (60 <= cfg.device_pairing_ttl_seconds <= 3600):
+        errors.append("DEVICE_PAIRING_TTL_SECONDS must be between 60 and 3600")
 
     origin = cfg.public_origin.strip()
     try:
@@ -251,6 +467,8 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
     errors: list[str] = []
     if _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32:
         errors.append("WRAPPER_TOKEN must be non-placeholder and at least 32 characters")
+    if not valid_machine_id(cfg.machine_id):
+        errors.append("CC_REMOTE_MACHINE_ID has an invalid format")
 
     parsed = urlsplit(cfg.relay_url)
     if (
@@ -285,6 +503,31 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
     elif (cfg.claude_bin
           and not os.path.isabs(os.path.expanduser(cfg.claude_bin))):
         errors.append("CLAUDE_BIN must be an absolute path")
+    if cfg.codex_proxy:
+        proxy = urlsplit(cfg.codex_proxy)
+        if (
+            proxy.scheme not in {"http", "https", "socks5", "socks5h"}
+            or not proxy.netloc
+            or proxy.username is not None
+            or proxy.password is not None
+            or proxy.query
+            or proxy.fragment
+            or proxy.path not in {"", "/"}
+        ):
+            errors.append(
+                "CC_REMOTE_CODEX_PROXY must be an http(s) or socks5 URL "
+                "without credentials, path, query, or fragment")
+    if cfg.experimental_claude_broker:
+        if (not cfg.claude_broker_socket
+                or "\x00" in cfg.claude_broker_socket
+                or len(cfg.claude_broker_socket.encode(
+                    "utf-8", errors="surrogatepass")) > 4096):
+            errors.append(
+                "CC_REMOTE_CLAUDE_BROKER_SOCKET must be a non-empty path of at "
+                "most 4096 UTF-8 bytes")
+        elif not os.path.isabs(os.path.expanduser(cfg.claude_broker_socket)):
+            errors.append(
+                "CC_REMOTE_CLAUDE_BROKER_SOCKET must be an absolute path")
 
     if not (12 * 1024 * 1024 <= cfg.ws_max_size_bytes <= 64 * 1024 * 1024):
         errors.append("WS_MAX_SIZE_BYTES must be between 12582912 and 67108864")
@@ -315,12 +558,17 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
             "TOOL_RESULT_MAX is too large for WS_MAX_SIZE_BYTES after UTF-8 encoding")
     if not (1024 * 1024 <= cfg.history_source_max_bytes <= 1024 * 1024 * 1024):
         errors.append("HISTORY_SOURCE_MAX_BYTES must be between 1048576 and 1073741824")
+    if not (1024 * 1024 <= cfg.codex_history_window_max_bytes <= 256 * 1024 * 1024):
+        errors.append(
+            "CODEX_HISTORY_WINDOW_MAX_BYTES must be between 1048576 and 268435456")
     if not (0 < cfg.drain_timeout <= 300):
         errors.append("DRAIN_TIMEOUT must be greater than 0 and at most 300")
     if (cfg.codex_turn_idle_warn_seconds != 0
             and not (5 <= cfg.codex_turn_idle_warn_seconds <= 3600)):
         errors.append(
             "CODEX_TURN_IDLE_WARN_SECONDS must be 0 or between 5 and 3600")
+    if cfg.codex_daemon_mode not in {"auto", "off"}:
+        errors.append("CC_REMOTE_CODEX_DAEMON must be auto or off")
 
     if errors:
         raise ValueError("invalid wrapper configuration: " + "; ".join(errors))

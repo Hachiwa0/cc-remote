@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 import time
 from types import SimpleNamespace
+from pathlib import Path
 from urllib.parse import quote
 
 import pytest
@@ -25,6 +27,7 @@ from cc_remote.relay.auth import (
     session_token_claims,
     session_token_expiry,
     verify_session_token,
+    wrapper_machine_scope,
 )
 from cc_remote.relay.log_safety import (
     SensitiveLogFilter, redact_log_text, uvicorn_log_config,
@@ -39,6 +42,12 @@ def _cfg(**overrides) -> RelayConfig:
         "wrapper_token": "w" * 48,
         "public_origin": "https://remote.example",
         "session_ttl_seconds": 3600,
+        # Relay construction creates the device registry immediately. Keep
+        # zero-model auth tests out of the developer's real ~/.cc-remote.
+        "device_db_path": str(
+            Path(tempfile.mkdtemp(prefix="cc-remote-auth-test-"))
+            / "devices.sqlite3"
+        ),
     }
     values.update(overrides)
     return RelayConfig(**values)
@@ -109,6 +118,79 @@ def test_legacy_client_bearer_is_rejected_but_wrapper_bearer_still_works():
     cfg = _cfg()
     assert authenticate("Bearer change-me-client", cfg) is None
     assert authenticate(f"Bearer {cfg.wrapper_token}", cfg) == "wrapper"
+
+
+def test_multi_user_login_filters_machine_discovery_and_websocket_access():
+    users = {
+        "alice": {
+            "password": "alice correct horse battery staple",
+            "machines": ["mac"],
+        },
+    }
+    cfg = _cfg(login_users_json=json.dumps(users))
+    app = create_app(cfg)
+    app.state.hub._wrappers.update({"mac": object(), "nono": object()})
+    with TestClient(app, base_url=cfg.public_origin) as client:
+        assert client.get("/api/auth-config").json() == {"multi_user": True}
+        assert client.post(
+            "/api/login",
+            json={"password": users["alice"]["password"]},
+        ).status_code == 401
+        login = client.post(
+            "/api/login",
+            json={"username": "alice", "password": users["alice"]["password"]},
+        )
+        assert login.status_code == 200
+        assert client.get("/api/machines").json() == {
+            "ok": True, "machines": ["mac"],
+        }
+        headers = {"cookie": _cookie_header(login), "origin": cfg.public_origin}
+        with client.websocket_connect("/ws?machine=nono", headers=headers) as websocket:
+            closed = websocket.receive()
+    assert closed == {
+        "type": "websocket.close",
+        "code": 1008,
+        "reason": "machine not authorized",
+    }
+
+
+def test_wildcard_user_cannot_accumulate_empty_machine_buckets():
+    cfg = _cfg()
+    app = create_app(cfg)
+    with TestClient(app, base_url=cfg.public_origin) as client:
+        login = _login(client, cfg)
+        headers = {"cookie": _cookie_header(login), "origin": cfg.public_origin}
+        for index in range(4):
+            with client.websocket_connect(
+                f"/ws?machine=unused-{index}", headers=headers
+            ):
+                pass
+
+        assert app.state.hub._machine_clients == {}
+
+
+def test_machine_bound_wrapper_tokens_replace_legacy_wildcard_token():
+    token = "n" * 48
+    cfg = _cfg(wrapper_tokens_json=json.dumps({"nono": token}))
+    assert wrapper_machine_scope(token, cfg) == "nono"
+    assert authenticate(f"Bearer {token}", cfg) == "wrapper"
+    assert wrapper_machine_scope(cfg.wrapper_token, cfg) is None
+    assert authenticate(f"Bearer {cfg.wrapper_token}", cfg) is None
+
+
+def test_session_token_round_trips_subject_and_machine_authority():
+    token, _ = make_session_token(
+        "s" * 48,
+        60,
+        subject="alice",
+        machines=("mac", "nono"),
+    )
+    claims = session_token_claims(token, "s" * 48)
+    assert claims is not None
+    assert claims.subject == "alice"
+    assert claims.machines == ("mac", "nono")
+    assert claims.allows_machine("mac") is True
+    assert claims.allows_machine("other") is False
 
 
 def test_login_ip_trusts_forwarding_header_only_from_loopback_proxy():

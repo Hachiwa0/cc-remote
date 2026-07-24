@@ -44,6 +44,7 @@ _CLAUDE_MESSAGE_UUID = re.compile(
 _MAX_TRANSCRIPT_MATCHES = 1000
 _MAX_TRANSCRIPT_RECORD_CHARS = 16 * 1024 * 1024
 _MAX_TIMESTAMP_ENTRIES = 200_000
+_MAX_INTERNAL_USER_EVENTS = 10_000
 _MAX_SUBAGENT_FILES = 128
 _MAX_SUBAGENT_TOTAL_BYTES = 32 * 1024 * 1024
 _MAX_SUBAGENT_EVENTS = 50_000
@@ -55,6 +56,7 @@ _MAX_DIFF_SOURCE_CHARS = 512 * 1024
 _MAX_DIFF_SOURCE_LINES = 4096
 _MAX_LIVE_TOOL_ITEMS = 4096
 _LIVE_TOOL_ITEMS_OMITTED_ID = "cc-remote-live-tools-omitted"
+_SYNTHETIC_NO_RESPONSE_TEXT = "No response requested."
 _DIFF_LINE_BREAK = re.compile(
     r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
@@ -337,6 +339,11 @@ def _task_progress(usage: Any, last_tool_name: str | None = None) -> str | None:
     return " · ".join(bits) or None
 
 
+def _agent_process_id(tool_id: str) -> str:
+    """Stable process row paired with one Claude Agent/Task tool call."""
+    return _wire_id(f"agent:{tool_id}", "agent")
+
+
 class StreamTranslator:
     def __init__(self, tool_result_max: int, turn_id: str | None = None,
                  item_turns: dict[str, str] | None = None,
@@ -383,6 +390,10 @@ class StreamTranslator:
         # fork_session(up_to_message_id=...) accepts the transcript UUID, not the
         # API message_id, so retain the last valid one until ResultMessage.
         self._last_assistant_uuid: str | None = None
+        # rewind_files() and rewind_conversation target the top-level user
+        # transcript UUID. Keep it separate from the browser's optimistic turn
+        # id and from tool-result user envelopes.
+        self._last_user_uuid: str | None = None
 
     def _remember_turn(self, item_id: str, parent_id: str | None = None) -> str | None:
         turn = (self.item_turns.get(item_id)
@@ -438,6 +449,23 @@ class StreamTranslator:
         self._started_channels.clear()
         self._emitted = {"thinking": 0, "text": 0}
 
+    def _agent_tool_event(
+        self, tool_id: str, *, phase: str, status: str,
+        title: str | None = None, summary: str | None = None,
+        progress: str | None = None, duration_ms: int | None = None,
+    ) -> ProcessEvent:
+        item_id = _agent_process_id(tool_id)
+        resolved_title = (title or self.item_titles.get(item_id)
+                          or self.item_titles.get(tool_id) or "协作代理")
+        self.item_titles[item_id] = resolved_title
+        self.item_meta[item_id] = ("agent", tool_id)
+        return ProcessEvent(
+            item_id=item_id, kind="agent", phase=phase, status=status,
+            turn_id=self._remember_turn(item_id, tool_id), parent_id=tool_id,
+            title=resolved_title, summary=summary, progress=progress,
+            duration_ms=duration_ms,
+        )
+
     def _emit_tool_use(self, events: list, block: ToolUseBlock | ServerToolUseBlock,
                        message_id: str, parent_id: str | None,
                        server_tool: bool = False) -> None:
@@ -464,7 +492,14 @@ class StreamTranslator:
             self._tool_diffs[tool_id] = (diff, was_truncated)
 
         lower = block.name.lower()
-        if lower == "enterplanmode":
+        if category == "agent":
+            agent_type = (_short_text(block.input.get("subagent_type"), 1024)
+                          or _short_text(block.input.get("agent_type"), 1024))
+            events.append(self._agent_tool_event(
+                tool_id, phase="start", status="running", title=title,
+                summary=(f"类型：{agent_type}" if agent_type else None),
+            ))
+        elif lower == "enterplanmode":
             self._plan_item_id = _wire_id(
                 f"plan:{self.turn_id or tool_id}", "plan")
             events.append(ProcessEvent(
@@ -489,7 +524,8 @@ class StreamTranslator:
             ))
 
     def _emit_tool_result(self, events: list, tool_use_id: Any, content: Any,
-                          is_error: bool = False, summary: str | None = None) -> None:
+                          is_error: bool = False, summary: str | None = None,
+                          duration_ms: int | None = None) -> None:
         self._ambiguous_final_mid = None
         tool_id = _wire_id(tool_use_id, "tool")
         # Fail closed for a result whose ToolUse was omitted/never observed. In
@@ -510,6 +546,12 @@ class StreamTranslator:
             truncated=truncated, status="failed" if is_error else "succeeded",
             summary=summary, diff=diff,
         ))
+        if (self._tool_names.get(tool_id) or "").lower() in {"agent", "task"}:
+            events.append(self._agent_tool_event(
+                tool_id, phase="end",
+                status="failed" if is_error else "succeeded",
+                summary=summary, duration_ms=duration_ms,
+            ))
         self._finished_tool_items.add(tool_id)
         self._tool_outputs.pop(tool_id, None)
         self._tool_delta_totals.pop(tool_id, None)
@@ -684,6 +726,12 @@ class StreamTranslator:
     def _feed_user(self, msg: UserMessage) -> list:
         events: list = []
         content = msg.content if isinstance(msg.content, list) else []
+        has_tool_result = any(isinstance(block, (
+            ToolResultBlock, ServerToolResultBlock)) for block in content)
+        if (not msg.parent_tool_use_id and not has_tool_result
+                and isinstance(msg.uuid, str)
+                and _CLAUDE_MESSAGE_UUID.fullmatch(msg.uuid)):
+            self._last_user_uuid = msg.uuid
         result_meta = msg.tool_use_result if isinstance(msg.tool_use_result, dict) else {}
         summary_bits = []
         for key, label in (("agentType", "代理"), ("status", "状态"),
@@ -692,17 +740,21 @@ class StreamTranslator:
             if isinstance(value, (str, int, float)) and not isinstance(value, bool):
                 summary_bits.append(f"{label}：{value}")
         duration = result_meta.get("totalDurationMs")
-        if isinstance(duration, (int, float)) and duration >= 0:
+        if (isinstance(duration, (int, float)) and not isinstance(duration, bool)
+                and duration >= 0):
             summary_bits.append(f"耗时：{duration / 1000:g}s")
+            duration_ms = int(duration)
+        else:
+            duration_ms = None
         summary = _short_text(" · ".join(summary_bits), 64 * 1024) if summary_bits else None
-        if any(isinstance(block, (
-                ToolResultBlock, ServerToolResultBlock)) for block in content):
+        if has_tool_result:
             self._ambiguous_final_mid = None
         for block in content:
             if isinstance(block, ToolResultBlock):
                 self._emit_tool_result(
                     events, block.tool_use_id, block.content,
-                    bool(block.is_error), summary=summary)
+                    bool(block.is_error), summary=summary,
+                    duration_ms=duration_ms)
             elif isinstance(block, ServerToolResultBlock):
                 self._emit_tool_result(events, block.tool_use_id, block.content)
         return events
@@ -742,7 +794,14 @@ class StreamTranslator:
             if progress == self._tool_last_progress.get(tool_id):
                 return []
             self._tool_last_progress[tool_id] = progress
-            return events + self._queue_tool_delta(tool_id, "progress", progress)
+            emitted = events + self._queue_tool_delta(
+                tool_id, "progress", progress)
+            if (self._tool_names.get(tool_id) or "").lower() in {"agent", "task"}:
+                emitted.append(self._agent_tool_event(
+                    tool_id, phase="update", status="running",
+                    progress=progress,
+                ))
+            return emitted
         return events
 
     def _feed_tool_summary(self, msg: SystemMessage) -> list:
@@ -768,6 +827,12 @@ class StreamTranslator:
                 if self._admit_tool_item(tool_id, events):
                     events.extend(self._queue_tool_delta(
                         tool_id, "summary", summary))
+                    if (self._tool_names.get(tool_id) or "").lower() in {
+                            "agent", "task"}:
+                        events.append(self._agent_tool_event(
+                            tool_id, phase="update", status="running",
+                            progress=summary,
+                        ))
         return events
 
     def _feed_task(self, msg: SystemMessage) -> list:
@@ -780,30 +845,38 @@ class StreamTranslator:
             task_id, ("task", None))
         parent = (_wire_id(parent_raw, "tool") if parent_raw
                   else remembered_parent)
-        turn = self._remember_turn(task_id, parent)
+        kind = ("agent" if parent
+                else remembered_kind if remembered_kind in {"agent", "task"}
+                else "task")
+        item_id = _agent_process_id(parent) if parent else task_id
+        turn = self._remember_turn(item_id, parent)
         title = (getattr(msg, "description", None)
+                 or self.item_titles.get(item_id)
                  or self.item_titles.get(task_id) or "后台任务")
         title = _short_text(title, 1000) or "后台任务"
         self.item_titles[task_id] = title
+        self.item_titles[item_id] = title
+        self.item_meta[task_id] = (kind, parent)
+        self.item_meta[item_id] = (kind, parent)
         if isinstance(msg, TaskStartedMessage):
-            kind = "agent" if (msg.task_type or "").lower() in {"agent", "subagent"} or parent else "task"
+            if ((msg.task_type or "").lower() in {"agent", "subagent"}
+                    or parent):
+                kind = "agent"
             self.item_meta[task_id] = (kind, parent)
+            self.item_meta[item_id] = (kind, parent)
             return [ProcessEvent(
-                item_id=task_id, kind=kind, phase="start", status="running",
+                item_id=item_id, kind=kind, phase="start", status="running",
                 turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.task_type, 1024),
             )]
         if isinstance(msg, TaskProgressMessage):
-            kind = remembered_kind if task_id in self.item_meta else ("agent" if parent else "task")
-            self.item_meta[task_id] = (kind, parent)
             return [ProcessEvent(
-                item_id=task_id, kind=kind,
+                item_id=item_id, kind=kind,
                 phase="update", status="running", turn_id=turn,
                 parent_id=parent, title=title,
                 progress=_task_progress(msg.usage, msg.last_tool_name),
             )]
         if isinstance(msg, TaskUpdatedMessage):
-            kind = remembered_kind
             status = _task_status(msg.status)
             terminal = status in {"succeeded", "failed", "cancelled"}
             patch_summary = None
@@ -811,15 +884,14 @@ class StreamTranslator:
                 patch_summary = _short_text(
                     msg.patch.get("description") or msg.patch.get("subject"), 4096)
             return [ProcessEvent(
-                item_id=task_id, kind=kind, phase="end" if terminal else "update",
+                item_id=item_id, kind=kind, phase="end" if terminal else "update",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=patch_summary,
             )]
         if isinstance(msg, TaskNotificationMessage):
-            kind = remembered_kind if task_id in self.item_meta else ("agent" if parent else "task")
             status = _task_status(msg.status)
             return [ProcessEvent(
-                item_id=task_id, kind=kind, phase="end",
+                item_id=item_id, kind=kind, phase="end",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.summary, 64 * 1024),
                 progress=_task_progress(msg.usage),
@@ -906,8 +978,10 @@ class StreamTranslator:
                 is_error=msg.is_error,
                 total_cost_usd=msg.total_cost_usd,
                 num_turns=msg.num_turns,
-            ), turn_id=self._last_assistant_uuid))
+            ), turn_id=self._last_assistant_uuid,
+                checkpoint_id=self._last_user_uuid))
             self._last_assistant_uuid = None
+            self._last_user_uuid = None
             self._ambiguous_final_mid = None
             self._has_final_text = False
             return events
@@ -1018,7 +1092,101 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
     return out
 
 
-def translate_history(messages, tool_result_max: int, timestamps: dict | None = None) -> list:
+def _notification_tag(text: str, name: str, limit: int) -> str | None:
+    start_token = f"<{name}>"
+    end_token = f"</{name}>"
+    start = text.find(start_token)
+    if start < 0:
+        return None
+    start += len(start_token)
+    end = text.find(end_token, start)
+    if end < 0:
+        return None
+    return _short_text(text[start:end].strip(), limit)
+
+
+def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
+    """Recover structured Claude-internal user rows from raw transcript proof.
+
+    ``get_session_messages`` drops ``origin`` and queue-operation records.  We
+    therefore classify a task notification only when the raw JSONL contains
+    both Claude's enqueue record and a user row whose authoritative origin is
+    ``task-notification`` with the exact same content.  XML-looking human text
+    remains ordinary conversation content.
+    """
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return {}
+    path = transcript_path(session_id)
+    if not path:
+        return {}
+    queued: set[tuple[int, str]] = set()
+    events: dict[str, ProcessEvent] = {}
+    try:
+        with open(path, encoding="utf-8") as source:
+            for line in _bounded_jsonl_lines(source):
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("type") == "queue-operation" \
+                        and row.get("operation") == "enqueue":
+                    content = row.get("content")
+                    if (isinstance(content, str)
+                            and content.lstrip().startswith("<task-notification>")):
+                        queued.add((len(content), hashlib.sha256(
+                            content.encode("utf-8", "surrogatepass")
+                        ).hexdigest()))
+                    continue
+                origin = row.get("origin")
+                message = row.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                uid = row.get("uuid")
+                if not (row.get("type") == "user"
+                        and isinstance(origin, dict)
+                        and origin.get("kind") == "task-notification"
+                        and isinstance(content, str)
+                        and isinstance(uid, str)
+                        and _SAFE_WIRE_ID.fullmatch(uid)):
+                    continue
+                fingerprint = (len(content), hashlib.sha256(
+                    content.encode("utf-8", "surrogatepass")
+                ).hexdigest())
+                if fingerprint not in queued:
+                    continue
+                task_id = _notification_tag(content, "task-id", 128)
+                tool_id = _notification_tag(content, "tool-use-id", 128)
+                if not task_id or not _SAFE_WIRE_ID.fullmatch(task_id):
+                    continue
+                if tool_id and not _SAFE_WIRE_ID.fullmatch(tool_id):
+                    tool_id = None
+                raw_status = _notification_tag(content, "status", 64)
+                summary = _notification_tag(content, "summary", 1000)
+                usage: dict[str, int] = {}
+                for tag in ("tool_uses", "total_tokens", "duration_ms"):
+                    value = _notification_tag(content, tag, 32)
+                    if value and value.isdigit():
+                        usage[tag] = int(value)
+                status = _task_status(raw_status)
+                item_id = _agent_process_id(tool_id) if tool_id else task_id
+                events[uid] = ProcessEvent(
+                    item_id=item_id,
+                    kind="agent" if tool_id else "task",
+                    phase="end",
+                    status=status,
+                    parent_id=tool_id,
+                    title=summary or ("协作代理" if tool_id else "后台任务"),
+                    progress=_task_progress(usage),
+                    duration_ms=usage.get("duration_ms"),
+                )
+                if len(events) >= _MAX_INTERNAL_USER_EVENTS:
+                    break
+    except (OSError, UnicodeError):
+        return {}
+    return events
+
+
+def translate_history(messages, tool_result_max: int, timestamps: dict | None = None,
+                      internal_user_events: dict[str, ProcessEvent] | None = None) -> list:
     """Translate a session's on-disk transcript (list[SessionMessage]) into wire
     events the client reducer renders as past turns.
 
@@ -1033,6 +1201,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     events: list = []
     turn_open = False
     last_ts = None  # transcript ts of the most-recent message in the open turn
+    turn_start_ts = None  # timestamp of the visible human message
     last_assistant_uuid = None
     current_turn_id = None
     history_tool_diffs: dict[str, tuple[str, bool]] = {}
@@ -1070,6 +1239,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     def close_turn():
         nonlocal turn_open, last_assistant_uuid, current_turn_id, history_plan_id
         nonlocal ambiguous_final_mid, ambiguous_final_start
+        nonlocal turn_start_ts
         if turn_open:
             # SessionMessage rows can omit stop_reason. Live must conservatively
             # treat such text as commentary, but history has the next user/EOF as
@@ -1084,10 +1254,15 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                             and event.message_id == ambiguous_final_mid
                             and event.channel == "commentary"):
                         event.channel = "final"
+            duration_ms = 0
+            if turn_start_ts is not None and last_ts is not None:
+                duration_ms = max(
+                    0, round((last_ts - turn_start_ts) * 1000))
             te = TurnEnd(
                 result=TurnResult(
-                    subtype="success", duration_ms=0, is_error=False),
+                    subtype="success", duration_ms=duration_ms, is_error=False),
                 turn_id=last_assistant_uuid,
+                checkpoint_id=current_turn_id,
             )
             if last_ts is not None:
                 te.ts = last_ts   # answer-done time = last message of the turn
@@ -1098,6 +1273,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
             history_plan_id = None
             ambiguous_final_mid = None
             ambiguous_final_start = None
+            turn_start_ts = None
 
     for message_index, m in enumerate(messages):
         msg = m.message
@@ -1110,12 +1286,23 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
 
         if role == "user":
             if isinstance(content, str):
-                if _is_meta_user_text(content):
+                internal_event = (internal_user_events or {}).get(source_uid)
+                if internal_event is not None:
+                    event = internal_event.model_copy(deep=True)
+                    event.turn_id = event.turn_id or current_turn_id
+                    t = _ts(source_uid)
+                    if t is not None:
+                        event.ts = t
+                    events.append(event)
+                    turn_open = True
+                elif _is_meta_user_text(content):
                     continue
-                close_turn()
-                events.append(_um(message_uid, content))
-                turn_open = True
-                current_turn_id = message_uid
+                else:
+                    close_turn()
+                    turn_start_ts = _ts(source_uid)
+                    events.append(_um(message_uid, content))
+                    turn_open = True
+                    current_turn_id = message_uid
             elif isinstance(content, list):
                 # collect any uploaded images up front so they attach to this turn's
                 # UserMsg (replay on reload — the transcript stores the base64).
@@ -1156,6 +1343,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                         txt = b.get("text", "")
                         if txt and not _is_meta_user_text(txt):
                             close_turn()
+                            turn_start_ts = _ts(source_uid)
                             um = _um(message_uid, txt)
                             if imgs and not made:
                                 um.images = imgs
@@ -1165,6 +1353,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                             current_turn_id = message_uid
                 if imgs and not made:   # image-only user turn
                     close_turn()
+                    turn_start_ts = _ts(source_uid)
                     um = _um(message_uid, "")
                     um.images = imgs
                     events.append(um)
@@ -1172,6 +1361,8 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                     current_turn_id = message_uid
         elif role == "assistant":
             if not isinstance(content, list):
+                continue
+            if _is_synthetic_no_response(msg):
                 continue
             if _CLAUDE_MESSAGE_UUID.fullmatch(source_uid):
                 last_assistant_uuid = source_uid
@@ -1375,8 +1566,12 @@ def translate_subagent_history(session_id: str, tool_result_max: int) -> list:
                 role = msg.get("role") or row.get("type")
                 content = msg.get("content")
                 if role == "user":
+                    origin = row.get("origin")
                     visible = (isinstance(content, str) and content
                                and not _is_meta_user_text(content))
+                    if (isinstance(origin, dict)
+                            and origin.get("kind") == "task-notification"):
+                        visible = False
                     if isinstance(content, list):
                         visible = any(
                             isinstance(block, dict) and block.get("type") == "text"
@@ -1562,11 +1757,33 @@ def _is_meta_user_text(text: str) -> bool:
     )
 
 
+def _is_synthetic_no_response(message: dict[str, Any]) -> bool:
+    """Hide Claude's non-response placeholder for cancelled native commands.
+
+    Claude persists this as an assistant row even though no model response was
+    produced. Match both the synthetic model marker and the exact single text
+    block so a real assistant reply with the same words remains visible.
+    """
+    if message.get("model") != "<synthetic>":
+        return False
+    content = message.get("content")
+    return (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+        and content[0]["text"].strip() == _SYNTHETIC_NO_RESPONSE_TEXT
+    )
+
+
 def last_assistant_model(messages) -> str | None:
     """Most recent assistant message's model id, for restoring the model readout
     when loading a switched session's history."""
     for m in reversed(messages):
         if getattr(m, "type", None) == "assistant" and isinstance(m.message, dict):
+            if _is_synthetic_no_response(m.message):
+                continue
             mdl = m.message.get("model")
             if mdl:
                 return mdl

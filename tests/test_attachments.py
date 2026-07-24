@@ -112,7 +112,8 @@ def test_invalid_query_attachment_is_rejected_before_turn_claim():
         assert ctx.state == "idle" and ctx.turn_task is None
         assert transport.sent[-1].type == "error"
         assert transport.sent[-1].code == ERR_BAD_PROMPT
-        assert "base64" in transport.sent[-1].message
+        assert transport.sent[-1].message == "附件不符合要求，请调整后重试。"
+        assert "base64" not in transport.sent[-1].message
 
     asyncio.run(run())
 

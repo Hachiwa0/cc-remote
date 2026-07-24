@@ -6,6 +6,8 @@ import json
 import os
 from typing import Any, Optional
 
+from cc_remote import __version__
+
 
 _RPC_TIMEOUT = 30.0
 _STREAM_LIMIT = 16 * 1024 * 1024
@@ -122,7 +124,9 @@ async def codex_rpc(
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {"clientInfo": {"name": "cc-remote", "version": "0.1.0"}},
+            "params": {
+                "clientInfo": {"name": "cc-remote", "version": __version__},
+            },
         })
         await asyncio.wait_for(result(1), timeout=_RPC_TIMEOUT)
         await send({"jsonrpc": "2.0", "method": "initialized"})

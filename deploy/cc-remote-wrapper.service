@@ -11,6 +11,10 @@ WorkingDirectory=/path/to/cc-remote
 # systemd reads this as root before dropping privileges. Keep it root:root 0600;
 # the service and all model/tool descendants are then denied the source file.
 EnvironmentFile=/etc/cc-remote/wrapper.env
+# Optional credential created by `python -m cc_remote.device pair --env-file`.
+# It is loaded after wrapper.env so a paired machine can replace the legacy
+# relay token/id without editing the rest of the service configuration.
+EnvironmentFile=-/etc/cc-remote/device.env
 Environment=PYTHON_DOTENV_DISABLED=1
 InaccessiblePaths=/etc/cc-remote -/path/to/cc-remote/.env
 # Prefer an absolute CLAUDE_BIN in the EnvironmentFile. PATH remains the

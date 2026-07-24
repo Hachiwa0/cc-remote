@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,8 @@ from cc_remote.protocol import (
     PREVIEW_ASSET_MAX_BYTES,
     PreviewAsset,
     SaveMarkdown,
+    ToolResult,
+    ToolUse,
 )
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -120,6 +123,59 @@ def test_source_preview_rejects_binary_content(tmp_path):
         machine._read_text_preview(str(tmp_path), "binary.dat")
 
 
+def test_rendered_artifacts_read_html_images_and_pdf_without_persistence(tmp_path):
+    (tmp_path / "page.html").write_text(
+        "<h1>Report</h1><script>window.bad = true</script>", encoding="utf-8")
+    (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\npreview")
+    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.7\npreview")
+    machine, _ = _mk_machine()
+
+    html = machine._read_file_preview(str(tmp_path), "page.html")
+    image = machine._read_file_preview(str(tmp_path), "image.png")
+    pdf = machine._read_file_preview(str(tmp_path), "report.pdf")
+
+    assert html["format"] == "html" and "<h1>Report</h1>" in html["content"]
+    assert image["format"] == "image" and image["media_type"] == "image/png"
+    assert image["data"] == b"\x89PNG\r\n\x1a\npreview"
+    assert pdf["format"] == "pdf" and pdf["media_type"] == "application/pdf"
+    assert pdf["data"] == b"%PDF-1.7\npreview"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "image.png", "page.html", "report.pdf",
+    ]
+
+
+def test_rendered_artifact_rejects_mismatched_content_type(tmp_path):
+    (tmp_path / "fake.png").write_text("<script>alert(1)</script>", encoding="utf-8")
+    machine, _ = _mk_machine()
+
+    with pytest.raises(ValueError, match="格式不匹配"):
+        machine._read_file_preview(str(tmp_path), "fake.png")
+
+
+def test_office_preview_converts_inside_ephemeral_sandbox(tmp_path, monkeypatch):
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(b"office-source")
+    machine, _ = _mk_machine()
+
+    monkeypatch.setattr("cc_remote.wrapper.machine.shutil.which",
+                        lambda name: f"/usr/bin/{name}")
+
+    def fake_convert(cls, command):
+        mount = Path(command[command.index("--bind") + 1])
+        (mount / "out" / "input.pdf").write_bytes(b"%PDF-1.7\nconverted")
+
+    monkeypatch.setattr(
+        type(machine), "_run_office_conversion", classmethod(fake_convert))
+
+    preview = machine._read_file_preview(str(tmp_path), "deck.pptx")
+
+    assert preview["format"] == "pdf"
+    assert preview["converted_from"] == "pptx"
+    assert preview["data"] == b"%PDF-1.7\nconverted"
+    assert preview["size"] == len(b"office-source")
+    assert list(tmp_path.iterdir()) == [source]
+
+
 def test_markdown_preview_truncates_without_breaking_split_utf8(tmp_path):
     path = tmp_path / "large.md"
     path.write_bytes(b"a" * (FILE_PREVIEW_MAX_BYTES - 1) + "界".encode() + b"tail")
@@ -153,6 +209,144 @@ def test_markdown_preview_rejects_absolute_and_symlink_escape(tmp_path):
         machine._read_markdown_preview(str(root), str(outside))
     with pytest.raises(ValueError, match="超出"):
         machine._read_markdown_preview(str(root), "escape.md")
+
+
+def test_successful_write_grants_exact_cross_cwd_preview_and_edit(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("# created", encoding="utf-8")
+    neighbor = tmp_path / "neighbor.md"
+    neighbor.write_text("secret", encoding="utf-8")
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        machine.sessions[ctx.key] = ctx
+        machine.focused_sid = ctx.key
+
+        machine._observe_preview_path_event(ctx, ToolUse(
+            message_id="message-1",
+            tool_use_id="write-1",
+            tool="Write",
+            input={"file_path": str(outside), "content": "# created"},
+        ))
+        machine._observe_preview_path_event(ctx, ToolResult(
+            tool_use_id="write-1",
+            content=f"File created successfully at: {outside}",
+            is_error=False,
+            status="succeeded",
+        ))
+
+        preview = await machine._handle_get_file_preview(GetFilePreview(
+            sid=ctx.key,
+            client_id="client-1",
+            path=str(outside),
+            request_id="preview-external",
+        ))
+        assert preview.error is None
+        assert preview.path == str(outside.resolve())
+        assert preview.content == "# created"
+
+        denied = await machine._handle_get_file_preview(GetFilePreview(
+            sid=ctx.key,
+            client_id="client-1",
+            path=str(neighbor),
+            request_id="preview-neighbor",
+        ))
+        assert denied.error and "本会话" in denied.error
+
+        saved = await machine._handle_save_markdown(SaveMarkdown(
+            sid=ctx.key,
+            client_id="client-1",
+            path=preview.path,
+            request_id="save-external",
+            content="# edited",
+            expected_size=preview.size,
+            expected_mtime_ns=preview.mtime_ns,
+            expected_revision=preview.revision,
+        ))
+        assert saved.status == "saved"
+        assert saved.path == str(outside.resolve())
+        assert outside.read_text(encoding="utf-8") == "# edited"
+
+    asyncio.run(run())
+
+
+def test_failed_write_never_grants_cross_cwd_preview(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret", encoding="utf-8")
+    machine, _ = _mk_machine()
+    ctx = _mk_ctx("session-1", session_id="session-1")
+    ctx.cwd = str(root)
+
+    machine._observe_preview_path_event(ctx, ToolUse(
+        message_id="message-1",
+        tool_use_id="write-1",
+        tool="Write",
+        input={"file_path": str(outside), "content": "not written"},
+    ))
+    machine._observe_preview_path_event(ctx, ToolResult(
+        tool_use_id="write-1",
+        content="permission denied",
+        is_error=True,
+        status="failed",
+    ))
+
+    with pytest.raises(ValueError, match="本会话"):
+        machine._read_markdown_preview(
+            str(root), str(outside),
+            frozenset(ctx.preview_external_paths),
+        )
+
+
+def test_successful_codex_patch_grants_multiple_exact_cross_cwd_paths(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    first = tmp_path / "one.txt"
+    second = tmp_path / "two.md"
+    first.write_text("1\n", encoding="utf-8")
+    second.write_text("# two\n", encoding="utf-8")
+    machine, _ = _mk_machine()
+    ctx = _mk_ctx("session-1", session_id="session-1")
+    ctx.cwd = str(root)
+    use = ToolUse(
+        message_id="message-1",
+        tool_use_id="patch-1",
+        tool="apply_patch",
+        category="file",
+        input={"changes": [
+            {"path": str(first), "kind": "add"},
+            {"path": str(second), "kind": "add"},
+        ]},
+    )
+
+    machine._observe_preview_path_event(ctx, use)
+    assert use.input["file_paths"] == [str(first), str(second)]
+    assert ctx.preview_write_candidates["patch-1"] == (
+        str(first), str(second))
+    machine._observe_preview_path_event(ctx, ToolResult(
+        tool_use_id="patch-1",
+        content="ok",
+        is_error=False,
+        status="succeeded",
+    ))
+
+    allowed = frozenset(ctx.preview_external_paths)
+    assert allowed == {str(first.resolve()), str(second.resolve())}
+    assert machine._read_text_preview(
+        str(root), str(first), allowed)[1] == "1\n"
+    assert machine._read_markdown_preview(
+        str(root), str(second), allowed)[1] == "# two\n"
+    diff = asyncio.run(machine._git_diff(str(root), str(first), allowed))
+    assert "--- /dev/null" in diff
+    assert "+1" in diff
+    with pytest.raises(ValueError, match="outside the session repository"):
+        asyncio.run(machine._git_diff(
+            str(root), str(tmp_path / "not-authorized.txt"), allowed))
 
 
 def test_markdown_preview_rejects_special_files_without_blocking(tmp_path):
@@ -225,6 +419,32 @@ def test_preview_responses_are_requester_routed_and_correlated(tmp_path):
         assert asset.to == "client-1" and asset.sid == "session-1"
         assert asset.preview_id == "preview-1" and asset.request_id == "asset-1"
         assert transport.sent[-2:] == [preview, asset]
+
+    asyncio.run(run())
+
+
+def test_rendered_preview_response_is_requester_routed(tmp_path):
+    (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\npreview")
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(tmp_path)
+        machine.sessions[ctx.key] = ctx
+        machine.focused_sid = ctx.key
+
+        preview = await machine._handle_get_file_preview(GetFilePreview(
+            sid=ctx.key,
+            client_id="client-1",
+            path="image.png",
+            request_id="preview-image",
+        ))
+
+        assert isinstance(preview, FilePreview)
+        assert preview.to == "client-1" and preview.sid == "session-1"
+        assert preview.format == "image" and preview.media_type == "image/png"
+        assert preview.data == "iVBORw0KGgpwcmV2aWV3"
+        assert transport.sent[-1] == preview
 
     asyncio.run(run())
 

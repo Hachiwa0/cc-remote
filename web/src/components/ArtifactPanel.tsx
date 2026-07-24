@@ -9,12 +9,106 @@ import { PanelTabs } from "./PanelTabs";
 import { GIT_DIFF_PAGE_LINES, pageGitDiff, type GitDiffSection } from "../diff";
 import { classifyPreviewTarget } from "../preview-path";
 import { parseLocalFileTarget } from "../file-link";
+import { buildSandboxDocument } from "../html-preview";
 import { clampPanelWidth } from "../responsive-layout";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
 const SOURCE_PAGE_LINES = 500;
 const PANEL_WIDTH_KEY = "cc_remote_artifact_panel_width";
+const URL_ATTRIBUTES = new Set(["src", "href", "xlink:href", "poster", "action", "formaction"]);
+const UNSAFE_CSS = /(?:url\s*\(|@import|expression\s*\()/i;
+
+function HtmlArtifactPreview({ content }: { content: string }) {
+  const [document, setDocument] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const prepare = async () => {
+      try {
+        const { default: DOMPurify } = await import("dompurify");
+        const clean = DOMPurify.sanitize(content, {
+          FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "meta", "link"],
+          FORBID_ATTR: ["srcset", "action", "formaction"],
+        });
+        const parsed = new DOMParser().parseFromString(clean, "text/html");
+        for (const element of parsed.body.querySelectorAll("*")) {
+          for (const attribute of Array.from(element.attributes)) {
+            const name = attribute.name.toLowerCase();
+            const value = attribute.value.trim();
+            if (name.startsWith("on")) {
+              element.removeAttribute(attribute.name);
+            } else if (URL_ATTRIBUTES.has(name)) {
+              const allowedAnchor = name === "href" && value.startsWith("#");
+              const allowedImage = name === "src"
+                && /^data:image\/(?:png|jpeg|gif|webp|avif);base64,/i.test(value);
+              if (!allowedAnchor && !allowedImage) element.removeAttribute(attribute.name);
+            } else if (name === "style" && UNSAFE_CSS.test(value)) {
+              element.removeAttribute(attribute.name);
+            }
+          }
+        }
+        for (const style of parsed.body.querySelectorAll("style")) {
+          if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
+        }
+        if (cancelled) return;
+        setDocument(buildSandboxDocument(parsed.body.innerHTML));
+        setError(null);
+      } catch {
+        if (cancelled) return;
+        setDocument(null);
+        setError("HTML 安全处理失败");
+      }
+    };
+    void prepare();
+    return () => { cancelled = true; };
+  }, [content]);
+
+  if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
+  if (!document) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 HTML…</div>;
+  return <iframe className="artifact-html-preview" title="HTML 预览"
+    sandbox="" referrerPolicy="no-referrer" srcDoc={document} />;
+}
+
+function BinaryArtifactPreview({ data, mediaType, kind, title }: {
+  data?: string;
+  mediaType?: string;
+  kind: "image" | "pdf";
+  title: string;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!data || !mediaType) {
+      setObjectUrl(null);
+      setError("预览数据不完整");
+      return;
+    }
+    try {
+      const binary = window.atob(data);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      const url = URL.createObjectURL(new Blob([bytes], { type: mediaType }));
+      setObjectUrl(url);
+      setError(null);
+      return () => URL.revokeObjectURL(url);
+    } catch {
+      setObjectUrl(null);
+      setError("预览数据损坏");
+    }
+  }, [data, mediaType]);
+
+  if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
+  if (!objectUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
+  if (kind === "image") {
+    return <div className="artifact-image-stage"><img src={objectUrl} alt={title} /></div>;
+  }
+  return <iframe className="artifact-pdf-preview" src={objectUrl} title={`${title} PDF 预览`} />;
+}
 
 function SourceFile({ content, targetLine, artifactKey }: {
   content: string;
@@ -354,7 +448,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   }), [artifact.assets, artifact.file, onOpenFile, requestAsset]);
 
   const title = artifact.file.split("/").pop()
-    || (["md", "file"].includes(artifact.kind) ? "文件预览" : "改动");
+    || (["md", "file", "html", "image", "pdf"].includes(artifact.kind) ? "文件预览" : "改动");
+  const renderedArtifact = ["image", "pdf"].includes(artifact.kind)
+    || (artifact.kind === "html" && mode === "preview");
 
   return (
     <div className="artifact-panel" ref={panelRef} data-lock-horizontal-swipe="true"
@@ -368,7 +464,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         {hasBtw ? <PanelTabs active={active} artifactKind={artifact.kind} onTab={switchPanelTab} />
           : <span className="artifact-title">{title}</span>}
         <span className="artifact-path" title={artifact.file}>{artifact.file || "所有改动"}</span>
-        {artifact.kind === "md" && !loading && !artifact.error && <div className="preview-modes" role="group" aria-label="Markdown 显示模式">
+        {["md", "html"].includes(artifact.kind) && !loading && !artifact.error && <div
+          className="preview-modes" role="group"
+          aria-label={`${artifact.kind === "html" ? "HTML" : "Markdown"} 显示模式`}>
           <button className={mode === "preview" ? "on" : ""}
             onClick={() => setModeState({ key: artifactKey, mode: "preview" })}>预览</button>
           <button className={mode === "source" ? "on" : ""}
@@ -384,14 +482,18 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         </button>}
         {artifact.kind === "md" && artifact.saveStatus === "saved" && !dirty
           && <span className="markdown-save-state ok">已保存</span>}
-        {["md", "file"].includes(artifact.kind) && <button className="iconbtn"
+        {artifact.convertedFrom && <span className="artifact-converted"
+          title="由 nono 本机沙箱临时转换，VPS 不保存文件">
+          {artifact.convertedFrom.toUpperCase()} → PDF
+        </span>}
+        {["md", "file", "html", "image", "pdf"].includes(artifact.kind) && <button className="iconbtn"
           onClick={() => onRefresh?.(artifact.file, artifact.line)}
           aria-label="刷新文件" title="重新读取文件"><Icon name="refresh" size={17} /></button>}
         <button className="iconbtn" onClick={leavePanel} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>
-      <div className="artifact-body">
+      <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}`}>
         {loading ? (
-          <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> {["md", "file"].includes(artifact.kind) ? "正在读取文件…" : "正在读取 diff…"}</div>
+          <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> {["md", "file", "html", "image", "pdf"].includes(artifact.kind) ? "正在读取文件…" : "正在读取 diff…"}</div>
         ) : artifact.error ? (
           <div className="preview-error"><Icon name="read" size={18} />{artifact.error}</div>
         ) : artifact.kind === "gitdiff" ? (
@@ -438,6 +540,16 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
               <span key={i} className={"diff-" + l.type}>{(l.type === "add" ? "+" : l.type === "del" ? "−" : " ") + " " + l.text + "\n"}</span>
             ))}
           </pre>
+        ) : artifact.kind === "html" ? (
+          mode === "source"
+            ? <SourceFile content={artifact.content || ""} artifactKey={artifactKey} />
+            : <HtmlArtifactPreview content={artifact.content || ""} />
+        ) : artifact.kind === "image" ? (
+          <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
+            kind="image" title={title} />
+        ) : artifact.kind === "pdf" ? (
+          <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
+            kind="pdf" title={title} />
         ) : artifact.kind === "file" ? (
           <>
             {artifact.truncated && <div className="preview-truncated">文件共 {artifact.size?.toLocaleString()} 字节，仅预览前 512 KiB。</div>}
