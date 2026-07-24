@@ -18,11 +18,11 @@ and control its sessions through your self-hosted WebSocket relay. Models,
 authentication, and tool execution remain under the local CLI; cc-remote does
 not proxy model APIs or bake API keys into the web client.
 
-v3.0.0 is not a visual rebrand. It keeps the existing two-engine, Code / Work,
-multi-session, and remote-control capabilities while redesigning history
-projection, native-client coordination, multi-device routing, and release
-boundaries. The work targets real failures seen with very long sessions, stale
-App/CLI state, mobile history jumps, and cross-machine leakage.
+v3.0.0 is not a visual rebrand. It adds isolated Code / Work spaces on top of
+the existing two-engine, multi-session remote control plane, while redesigning
+history projection, native-client coordination, multi-device routing, and
+release boundaries. The work targets real failures seen with very long
+sessions, stale App/CLI state, mobile history jumps, and cross-machine leakage.
 
 ![cc-remote Claude sessions and multi-session workspace](assets/readme-claude-multisession.jpg)
 
@@ -35,6 +35,7 @@ App/CLI state, mobile history jumps, and cross-machine leakage.
 - [Architecture](#architecture)
 - [Real interface and practical features](#real-interface-and-practical-features)
 - [Quick start (local, one machine, 5 min)](#quick-start-local-one-machine-5-min)
+- [One-command GitHub Release install (recommended for production)](#one-command-github-release-install-recommended-for-production)
 - [Production deploy (public VPS relay + wrapper on your machine)](#production-deploy-public-vps-relay--wrapper-on-your-machine)
 - [Environment variables](#environment-variables)
 - [Auth model](#auth-model)
@@ -55,6 +56,7 @@ with the previous public release, the major changes are:
 
 | Area | v3.0.0 |
 |---|---|
+| **Code / Work spaces** | Add an independent Cowork surface beside repository-oriented Code sessions. Claude and Codex each receive private projects, file/link/note knowledge sources, reusable templates, schedules, and artifacts. Work and Code isolate directories, sessions, base prompts, and permission boundaries. |
 | **History startup and very long sessions** | The browser first paints its last validated IndexedDB projection. A source-fingerprinted SQLite index on the wrapper serves recent turn summaries first, while tool output, reasoning, process logs, and oversized text load per turn. Short sessions no longer wait for a full source scan; long sessions page backward without losing the reader's viewport. |
 | **Large Codex rollouts** | Codex history is read backward by turn while preserving app-server-native resume and compaction state; cc-remote never re-uploads the entire rollout to the model. A tightly guarded official HTTP compatibility path is used only for a specific oversized Codex Desktop + OpenAI resume case. |
 | **Native App / CLI coordination** | Claude CLI/Desktop/Agent View and Codex shared daemon/App/CLI retain engine-specific ownership models. v3 reconciles running, read-only, interrupt, steer, compact, turn binding, and terminal state so sibling sessions do not lock each other, old turns do not move to the tail, and interrupted work does not leave ghost activity. |
@@ -83,9 +85,9 @@ requirements.
 | **Complete process** | Expand the reasoning summaries, plans, command output, file diffs, MCP calls, collaboration agents, Hooks, and terminal interaction events exposed by each engine. |
 | **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. |
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
-| **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Codex supports conversation rollback, conflict-safe code rollback, explicit compact, native Review, and isolated Git worktree forks. |
+| **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Codex supports explicit compact, native Review, and isolated Git worktree forks. |
 | **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses `/permissions` for approval control while inheriting the local Sandbox configuration. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
-| **Real extension catalog** | Open the slash-command manager for current Skills, Plugins, Apps, MCP, and Hooks. Local Skills and Claude Hooks are safely manageable; Codex Hooks reflect its official read-only API; plugin changes use native managers. |
+| **Real extension catalog** | Open `/extensions`, `/skills`, `/plugins`, `/apps`, `/mcp`, or `/hooks` against the current engine. Code can manage Skills, plugins, and Claude Hooks where the engine allows it; Codex Hooks remain read-only because the official API has no write path. Work presents every extension category read-only to preserve its private environment. |
 | **Continuity** | Let background sessions keep running and synchronize them across clients. Paint the browser projection first, validate paged materialized summaries from Claude transcripts or Codex rollouts, and resume only the live tail after reconnecting. |
 | **Multi-machine and PWA** | Connect multiple named wrappers to one relay and optionally restrict accounts to selected machines. Install the web client as a PWA and receive generic background completion/failure notifications without conversation content. |
 | **Self-hosted** | The wrapper only makes outbound connections. Sessions, Work data, and preview conversion stay on that machine; the replaceable VPS remains a stateless relay. Web auth uses an HttpOnly cookie, and CLI credentials or API keys never enter the frontend. |
@@ -220,14 +222,17 @@ context usage, and command entry points such as `/goal` and `/status`.
 
 ### Common operations at a glance
 
-- **Sessions:** create, search, run in the background, rename, archive, delete, fork, roll back Codex conversation and code, compact, Review, and create a Codex worktree.
+- **Sessions:** create, search, run in the background, rename, archive, delete, fork, compact Codex context, run native Review, and create an isolated Codex worktree.
 - **Turns:** stream, queue, interrupt, copy, edit and resend, or fork from a specific message.
 - **Tools:** inspect command output, file changes and diffs, MCP, collaboration agents, Hooks, approvals, and user-input requests.
 - **Terminal coordination:** Codex Code shares the official daemon with native
   bidirectional control. Native Claude CLI, Desktop, and Agent View sessions are
   mirrored read-only until the user explicitly takes over from Remote.
 - **Status:** inspect the model, reasoning effort, permissions, Plan mode, context, goals, usage, rate limits, and runtime warnings.
-- **Extensions:** open `/extensions`, `/skills`, `/plugins`, `/apps`, `/mcp`, or `/hooks` to inspect the live engine inventory; safely create/remove local Skills, manage Claude Hooks, and install/uninstall plugins through native managers. Codex Hooks remain read-only because app-server currently exposes no write API.
+- **Extensions:** inspect the live Skills, Plugins, Apps, MCP, and Hooks inventory.
+  Code can create/remove local Skills, manage Claude Hooks, and install/uninstall
+  plugins through native managers where supported. Codex Hooks and every Work
+  extension category remain read-only.
 - **Devices:** use a responsive mobile UI, light or dark themes, multi-browser/multi-machine synchronization, PWA installation, background completion alerts, and reconnect recovery.
 
 ## Quick start (local, one machine, 5 min)

@@ -10,16 +10,16 @@
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
 [生产部署](#生产部署公网-vps-中继--你机器上的-wrapper) ·
 [安全须知](#安全须知务必读) ·
-[更新记录](CHANGELOG.md)
+[更新记录](CHANGELOG_zh.md)
 
 cc-remote 是一个开源的远程控制面：本机 `wrapper` 驱动已经安装并登录的
 `claude` / `codex`，浏览器通过你自托管的 WebSocket 中继查看和控制会话。
 模型、认证与工具执行仍由本地 CLI 决定；cc-remote 不代理模型 API，也不会把
 API key 烤进网页。
 
-v3.0.0 不是一次换皮升级。它保留原有双引擎、Code / Work、多会话和远程控制
-能力，重新设计了历史投影、原生客户端协同、多设备路由和发布边界，重点解决
-超长会话打开慢、App/CLI 状态不同步、移动端历史跳动和多机器串台等真实问题。
+v3.0.0 不是一次换皮升级。它在原有双引擎、多会话和远程控制之上新增相互隔离的
+Code / Work 双空间，并重新设计历史投影、原生客户端协同、多设备路由和发布边界，
+重点解决超长会话打开慢、App/CLI 状态不同步、移动端历史跳动和多机器串台等真实问题。
 
 ![cc-remote 的 Claude 会话与多会话工作台](assets/readme-claude-multisession.jpg)
 
@@ -32,6 +32,7 @@ v3.0.0 不是一次换皮升级。它保留原有双引擎、Code / Work、多�
 - [架构](#架构)
 - [真实界面与实用功能](#真实界面与实用功能)
 - [本地快速开始（一台机器，5 分钟）](#本地快速开始一台机器5-分钟)
+- [GitHub Release 一键安装（生产推荐）](#github-release-一键安装生产推荐)
 - [生产部署（公网 VPS 中继 + 你机器上的 wrapper）](#生产部署公网-vps-中继--你机器上的-wrapper)
 - [环境变量](#环境变量)
 - [鉴权模型](#鉴权模型)
@@ -51,6 +52,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 
 | 升级方向 | v3.0.0 |
 |---|---|
+| **Code / Work 双空间** | 在原有仓库开发会话之外新增独立 Cowork 工作台。Claude/Codex 各自拥有私有项目、文件/链接/笔记资料库、可复用模板、定时任务和 Artifacts；Work 与 Code 的目录、会话、提示词和权限边界彼此隔离。 |
 | **历史打开与超长会话** | 浏览器先绘制 IndexedDB 中最近一次验证的本地投影；wrapper 使用与源文件指纹绑定的 SQLite 摘要页，只先返回最新回合，工具输出、reasoning、进程日志和超长正文按回合展开。短会话不再等待全量扫描，长会话可继续向前分页且保持当前阅读位置。 |
 | **Codex 大 rollout** | Codex 历史按回合从文件尾部向前读取，保留 app-server 的原生 resume / compact 状态，不把整个 rollout 重新上传给模型。对特定超大 Codex Desktop + OpenAI 恢复场景，才启用严格限定的官方 HTTP 兼容路径。 |
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
@@ -62,7 +64,8 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 > wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
 > transcript / rollout 和可重建投影，不会 resume 引擎，也不会创建模型回合。
 
-完整发布记录和升级注意事项见 [CHANGELOG.md](CHANGELOG.md)。
+完整发布记录和升级注意事项见 [中文 CHANGELOG](CHANGELOG_zh.md)
+（[English](CHANGELOG.md)）。
 
 ## 核心能力
 
@@ -76,9 +79,9 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
 | **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。 |
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
-| **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Codex 支持对话与冲突安全的代码回滚、主动 compact、原生 Review，以及在 Git 仓库中派生到独立 worktree。 |
+| **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Codex 支持主动 compact、原生 Review，以及在 Git 仓库中派生到独立 worktree。 |
 | **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 通过 `/permissions` 控制审批并继承本机 Sandbox 配置；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
-| **真实扩展目录** | 通过 `/extensions`、`/skills`、`/plugins`、`/apps`、`/mcp`、`/hooks` 按需读取当前引擎目录；Skills 与 Claude Hooks 可安全管理，Codex Hooks 按官方只读能力展示，插件安装/卸载调用原生管理器。 |
+| **真实扩展目录** | 通过 `/extensions`、`/skills`、`/plugins`、`/apps`、`/mcp`、`/hooks` 按需读取当前引擎目录。Code 中可按引擎能力管理 Skills、插件和 Claude Hooks；Codex Hooks 受官方接口限制为只读。Work 为避免改变私有工作环境，只读展示全部扩展。 |
 | **连续性** | 后台会话继续运行，多端实时同步；浏览器本地投影先绘制，wrapper 从 Claude transcript / Codex rollout 的物化摘要索引分页校验，断线后只按游标补实时尾巴。 |
 | **多机器与 PWA** | 一个 relay 可连接多个具名 wrapper；可选账号策略把用户限制到指定机器。网页可安装为 PWA，并在后台回合完成/失败时发送不含对话正文的系统通知。 |
 | **自托管** | wrapper 只出站连接；会话、Work 数据和预览转换都留在本机，VPS 只做无状态中继且可替换；网页认证使用 HttpOnly cookie，CLI 凭据与 API key 不进入前端。 |
@@ -179,13 +182,15 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### 常用操作速查
 
-- **会话**：新建、搜索、后台运行、重命名、归档、删除、派生、Codex 对话与代码回滚、compact、Review、Codex worktree。
+- **会话**：新建、搜索、后台运行、重命名、归档、删除、派生、Codex compact、Review 和独立 worktree。
 - **回合**：流式输出、排队、打断、复制、编辑重发、从指定消息派生。
 - **工具**：命令输出、文件修改与 diff、MCP、协作代理、Hook、审批和用户输入回传。
 - **终端协同**：Codex Code 共享官方 daemon 并支持双向控制；Claude 原生 CLI、Desktop
   和 Agent View 在 Remote 中实时只读镜像，需要写入时由用户明确接管。
 - **状态**：模型、思考强度、权限、Plan、上下文、目标、用量、rate limit 和运行告警。
-- **扩展**：通过斜杠命令实时查看 Skills、Plugins、Apps、MCP 和 Hooks；安全增删本地 Skills、管理 Claude Hooks，并通过引擎原生管理器安装/卸载插件。Codex Hooks 因官方暂无写接口保持只读。
+- **扩展**：通过斜杠命令实时查看 Skills、Plugins、Apps、MCP 和 Hooks；Code
+  可按引擎能力安全增删本地 Skills、管理 Claude Hooks，并通过原生管理器安装/卸载插件。
+  Codex Hooks 和 Work 中的全部扩展保持只读。
 - **设备**：响应式手机界面、深浅主题、多浏览器/多机器同步、PWA、后台完成提醒与断线重连。
 
 ## 本地快速开始（一台机器，5 分钟）

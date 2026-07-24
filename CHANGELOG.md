@@ -1,10 +1,41 @@
 # Changelog
 
+[中文](CHANGELOG_zh.md)
+
 ## v3.0.0 — 2026-07-24
 
-cc-remote v3 keeps the established Claude Code + Codex and Code + Work product
-surface, while rebuilding the control plane for very long histories, native
-client coexistence, multiple wrapper machines, and reliable mobile use.
+cc-remote v3 adds an isolated Cowork-style Work surface to the established
+Claude Code + Codex remote control plane, while rebuilding history, native
+client coexistence, multi-machine routing, mobile reliability, and release
+operations.
+
+### Code and Work
+
+- Add separate Code / Work spaces for both Claude and Codex, with independent
+  session lists, focus, directories, prompts, permissions, and recovery state.
+- Add provider-scoped Work projects with file, link, and note knowledge sources,
+  reusable instruction templates, and materialized per-work context.
+- Add persistent one-shot, daily, and weekly schedules with run records, leases,
+  heartbeats, retries, and overlap prevention.
+- Keep every Work item inside a registry-owned private directory. External
+  material enters only through attachments or project knowledge sources.
+- List files produced by a Work item as artifacts and preview source, Markdown,
+  sanitized HTML, images, PDFs, and sandbox-converted Office documents locally.
+
+### Sessions, controls, and extensions
+
+- Add reliable delete, rename, archive, per-message fork, ephemeral side-chat,
+  queue, interrupt, and background-session control without focus stealing.
+- Add native Codex compact and Review, plus isolated Git worktree forks. The
+  unfinished Codex Rollback and Claude Rewind surfaces remain unavailable.
+- Keep model, reasoning effort, service tier, collaboration/Plan mode,
+  permissions, context, goals, status, usage, and rate limits scoped to the
+  active session.
+- Add live Skills, Plugins, Apps, MCP, and Hooks catalogs. Code can manage
+  Skills, plugins, and Claude Hooks where supported; Codex Hooks and all Work
+  extension categories remain read-only.
+- Forward Claude tool approval and Codex command, file-change, user-input,
+  general-permission, and MCP elicitation requests to the controlling browser.
 
 ### Local-first history
 
@@ -36,12 +67,16 @@ client coexistence, multiple wrapper machines, and reliable mobile use.
 
 - Add Device Center, expiring single-use pairing codes, hashed machine
   credentials, rename/revoke controls, and online state.
+- Add optional multi-user account policies that restrict each account to an
+  explicit set of wrapper machines.
 - Enforce account-to-machine authorization on discovery, commands, events, and
   push subscriptions.
 - Scope working directories and delayed focus/rekey frames by device, surface,
   engine, socket generation, and session ownership.
 - Add shared Darwin/Linux process identity scanning for native Claude ownership
   while keeping takeover limited to an exact same-user process.
+- Add privacy-preserving Web Push for background completion/failure state,
+  scoped by user and machine and containing no conversation text.
 
 ### Mobile and artifact experience
 
@@ -49,10 +84,14 @@ client coexistence, multiple wrapper machines, and reliable mobile use.
   bounded live-tail replay.
 - Add on-demand conversation images and a touch-friendly lightbox with
   tap-to-close and pinch zoom.
+- Support multiple image attachments, stable pending previews, and per-session
+  composer drafts across session and engine switches.
 - Keep Markdown relative links/images, source files, sanitized HTML, PDFs, and
   sandbox-converted Office previews inside the wrapper security boundary.
 - Refresh PWA and notification assets and fix narrow-screen sheets, process
   timelines, and persistent error presentation.
+- Keep running indicators above queue/interrupt controls, preserve Claude turn
+  durations, and compact repeated tool activity without hiding final replies.
 
 ### Release and operations
 
