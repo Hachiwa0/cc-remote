@@ -280,7 +280,7 @@ function isCodexPresentationNoise(block: Block): boolean {
   return !["failed", "declined", "cancelled", "interrupted"].includes(block.status);
 }
 
-export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
+export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onOpenFile,
   deferredCount = 0, detailLoading = false, onLoadDetail,
   imageAssets, onLoadImage, onPreviewImage, engine = "claude",
   openOverride, onOpenChange, itemOpen, onItemOpenChange,
@@ -289,6 +289,7 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
   done: boolean;
   durationMs?: number;
   startTs?: number;
+  doneTs?: number;
   onOpenFile?: (path: string, line?: number) => void;
   deferredCount?: number;
   detailLoading?: boolean;
@@ -350,7 +351,13 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, onOpenFile,
     : engine === "codex" && toolCount === items.length
       ? `${toolCount} 个工具调用`
       : `${items.length} 项`;
-  const elapsed = complete ? (durationMs ?? 0) : Math.max(0, now - (startTs ?? now));
+  const elapsed = complete
+    ? durationMs != null && durationMs > 0
+      ? durationMs
+      : engine === "claude" && startTs != null && doneTs != null
+        ? Math.max(0, doneTs - startTs)
+        : durationMs ?? 0
+    : Math.max(0, now - (startTs ?? now));
   const toggle = () => {
     manuallyToggled.current = true;
     if (hasDeferredDetail) {

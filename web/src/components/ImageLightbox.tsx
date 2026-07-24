@@ -34,6 +34,8 @@ export function ImageLightbox({ src, alt, onClose }: {
   const transformRef = useRef<ImageTransform>({ scale: 1, x: 0, y: 0 });
   const suppressClick = useRef(false);
   const closeTimer = useRef<number | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const [transform, setTransform] = useState<ImageTransform>(transformRef.current);
   const [entered, setEntered] = useState(false);
   const [interacting, setInteracting] = useState(false);
@@ -46,8 +48,9 @@ export function ImageLightbox({ src, alt, onClose }: {
   const requestClose = useCallback(() => {
     if (closeTimer.current !== null) return;
     setEntered(false);
-    closeTimer.current = window.setTimeout(onClose, CLOSE_ANIMATION_MS);
-  }, [onClose]);
+    closeTimer.current = window.setTimeout(
+      () => onCloseRef.current(), CLOSE_ANIMATION_MS);
+  }, []);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => setEntered(true));

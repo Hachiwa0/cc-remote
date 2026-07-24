@@ -1594,8 +1594,53 @@ def test_translate_history_stamps_real_timestamps():
     te = next(e for e in events if e.type == "turn_end")
     assert um.ts == 1000.0        # question time
     assert te.ts == 1005.0        # answer-done = last (assistant) message time
+    assert te.result.duration_ms == 5000
     # missing timestamps must not crash (falls back to the _Base default)
-    assert any(e.type == "user_msg" for e in translate_history(msgs, 10000))
+    missing = translate_history(msgs, 10000)
+    assert any(e.type == "user_msg" for e in missing)
+    assert next(e for e in missing if e.type == "turn_end").result.duration_ms == 0
+
+    backwards = translate_history(
+        msgs, 10000, timestamps={"u1": 1005.0, "a1": 1000.0})
+    assert next(
+        e for e in backwards if e.type == "turn_end"
+    ).result.duration_ms == 0
+
+
+def test_translate_history_duration_spans_tool_results():
+    """Tool-result user rows belong to the existing human turn and must not
+    restart its elapsed clock."""
+    from cc_remote.wrapper.stream import translate_history
+    msgs = [
+        SimpleNamespace(
+            uuid="u1", type="user",
+            message={"role": "user", "content": "inspect"}),
+        SimpleNamespace(
+            uuid="a1", type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use", "id": "tool-1", "name": "Read",
+                "input": {"file_path": "/tmp/a"},
+            }]}),
+        SimpleNamespace(
+            uuid="r1", type="user",
+            message={"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "tool-1",
+                "content": "contents",
+            }]}),
+        SimpleNamespace(
+            uuid="a2", type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "text", "text": "done",
+            }]}),
+    ]
+    events = translate_history(
+        msgs, 10000, timestamps={
+            "u1": 1000.0, "a1": 1002.0, "r1": 1004.0, "a2": 1007.0,
+        })
+
+    ends = [e for e in events if e.type == "turn_end"]
+    assert len(ends) == 1
+    assert ends[0].result.duration_ms == 7000
 
 
 def test_task_notification_history_is_structured_only_with_raw_origin_evidence(

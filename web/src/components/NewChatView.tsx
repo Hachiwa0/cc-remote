@@ -6,6 +6,7 @@ import { Icon } from "../icons";
 import { attachmentBytes, pickFiles } from "../img";
 import type { CodexPermissionMode, CodexServiceTier, CollaborationModeName, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
+import { PendingImageAttachments } from "./PendingImageAttachments";
 
 interface Props {
   cwd: string;
@@ -151,12 +152,9 @@ export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus 
 
         {hasAttachments && (
           <div className="attach show newchat-attach">
-            {images.map((img, i) => (
-              <span key={i} className="attach-img">
-                <img src={`data:${img.media_type};base64,${img.data}`} alt="" />
-                <button className="attach-x" onClick={() => setImages(images.filter((_, j) => j !== i))} aria-label="移除"><Icon name="close" size={12} /></button>
-              </span>
-            ))}
+            <PendingImageAttachments images={images}
+              onRemove={(index) => setImages((previous) =>
+                previous.filter((_, candidate) => candidate !== index))} />
             {files.map((f, i) => (
               <span key={i} className="attach-file">
                 <Icon name="read" size={14} />

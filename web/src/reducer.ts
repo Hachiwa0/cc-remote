@@ -217,6 +217,10 @@ export interface SessionRuntime {
   // Greatest downstream sequence that confirmed a turn on this connection.
   // A History captured before it may merge rows but cannot delete the live tail.
   lastLiveSeq: number;
+  // Greatest direct lifecycle state sequence. A positive running bit captured
+  // by older History may recover from unrelated live settings races, but must
+  // never overwrite a newer explicit idle state.
+  lastLifecycleSeq: number;
   // IDs painted from IndexedDB before authoritative History arrives. They are
   // not a genuine live tail, even when an old cache row happens to be marked
   // unfinished (for example a tab closed halfway through streaming).
@@ -318,7 +322,7 @@ export function createRuntime(): SessionRuntime {
     historyInvalidated: false,
     historyRevision: null, pendingHistoryRevision: null,
     historyGeneration: null, historyBuildSeq: 0, historyLiveSeq: 0,
-    lastLiveSeq: 0,
+    lastLiveSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
     historyNewestId: null,
@@ -1211,6 +1215,8 @@ function reduceEvent(
             historyNewestId: source.historyRevision == null
               ? target.historyNewestId : source.historyNewestId,
             lastLiveSeq: Math.max(source.lastLiveSeq, target.lastLiveSeq),
+            lastLifecycleSeq: Math.max(
+              source.lastLifecycleSeq, target.lastLifecycleSeq),
             hydratedCacheTurnIds: Array.from(new Set([
               ...target.hydratedCacheTurnIds,
               ...source.hydratedCacheTurnIds,
@@ -1534,6 +1540,12 @@ function reduceEvent(
       const acceptsControlState = !e.before;
       const acceptsOwnershipState = acceptsControlState && !racedLiveEvent
         && !base.hasRevisionedControl;
+      const confirmsWrapperRunning = acceptsControlState
+        && e.in_progress === true
+        && e.external !== true
+        && !base.external
+        && (!racedLiveEvent || (e.live_seq != null
+          && base.lastLifecycleSeq <= e.live_seq));
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
       const acceptanceConfirmed = !!base.acceptancePending && (
@@ -1555,13 +1567,14 @@ function reduceEvent(
           [sid]: {
             ...base, turns, loading: false,
             ccSessionId: acceptsControlState ? sid : base.ccSessionId,
-            state: acceptsControlState && !racedLiveEvent
-              && e.external !== true && e.in_progress != null
-              ? (e.in_progress
-                  ? (base.state === "interrupting" || base.state === "draining"
-                      ? base.state : "running")
-                  : "idle")
-              : base.state,
+            state: confirmsWrapperRunning
+              ? (base.state === "interrupting" || base.state === "draining"
+                  ? base.state : "running")
+              : acceptsControlState && !racedLiveEvent
+                  && e.external !== true && !base.external
+                  && e.in_progress === false
+                ? "idle"
+                : base.state,
             mirroredRunning: acceptsControlState && !racedLiveEvent
               ? e.external === true && e.in_progress === true
               : base.mirroredRunning,
@@ -1815,6 +1828,9 @@ function reduceEvent(
     case "state":
       return patch(state, e.sid, (rt) => {
         rt.state = e.state;
+        if (typeof e.seq === "number") {
+          rt.lastLifecycleSeq = Math.max(rt.lastLifecycleSeq, e.seq);
+        }
         // A direct lifecycle frame belongs to this wrapper's resident turn and
         // supersedes any older rollout-only activity projection.
         rt.mirroredRunning = false;
@@ -1949,6 +1965,7 @@ function reduceEvent(
             rt.historyGeneration = null;
             rt.historyNewestId = null;
             rt.lastLiveSeq = 0;
+            rt.lastLifecycleSeq = 0;
           }
           rt.loading = true;
         }

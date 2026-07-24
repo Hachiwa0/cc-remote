@@ -182,7 +182,9 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     doneTs: preserveLiveOpen
       ? live.doneTs
       : Math.max(history.doneTs ?? 0, live.doneTs ?? 0) || undefined,
-    durationMs: history.durationMs ?? live.durationMs,
+    durationMs: history.durationMs === 0 && (live.durationMs ?? 0) > 0
+      ? live.durationMs
+      : history.durationMs ?? live.durationMs,
   };
 }
 

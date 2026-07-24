@@ -3,7 +3,9 @@ import { createRoot } from "react-dom/client";
 
 import "../src/index.css";
 import type { Turn } from "../src/reducer";
+import type { QueryImg } from "../src/protocol";
 import { ChatView } from "../src/components/ChatView";
+import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
 
 function finalTurn(id: string, paragraphs: number): Turn {
   const text = Array.from(
@@ -112,6 +114,45 @@ function dualImageTurn(): Turn {
   };
 }
 
+function compactToolsTurn(): Turn {
+  return {
+    id: "compact-tools",
+    prompt: "连续工具调用应保持紧凑",
+    blocks: [
+      {
+        kind: "tool",
+        message_id: "compact-tool-message-1",
+        tool_use_id: "compact-tool-1",
+        tool: "shell",
+        input: { command: "git status --short --branch" },
+        done: true,
+        result: { content: "clean", is_error: false },
+      },
+      {
+        kind: "tool",
+        message_id: "compact-tool-message-2",
+        tool_use_id: "compact-tool-2",
+        tool: "web_search",
+        input: { query: "compact tool rows" },
+        done: true,
+        result: { content: "result", is_error: false },
+      },
+      {
+        kind: "tool",
+        message_id: "compact-tool-message-3",
+        tool_use_id: "compact-tool-3",
+        tool: "web_search",
+        input: { query: "dense activity list" },
+        done: true,
+        result: { content: "result", is_error: false },
+      },
+    ],
+    done: true,
+    ts: Date.now(),
+    doneTs: Date.now(),
+  };
+}
+
 interface FixtureSession {
   turns: Turn[];
   cursor: string;
@@ -130,12 +171,17 @@ export function HistoryBrowserFixture() {
   const timeline = params.has("timeline");
   const interactiveTimeline = params.has("interactive-timeline");
   const dualImage = params.has("dual-image");
+  const compactTools = params.has("compact-tools");
+  const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
   const emptyFinalPage = params.has("empty-final");
   const initialA = useMemo(() => {
     if (dualImage) {
       return [dualImageTurn()];
+    }
+    if (compactTools) {
+      return [compactToolsTurn()];
     }
     if (large) {
       return Array.from({ length: largeCount }, (_, index) =>
@@ -155,13 +201,15 @@ export function HistoryBrowserFixture() {
       ];
     }
     return INITIAL;
-  }, [dualImage, interactiveTimeline, large, largeCount, timeline]);
+  }, [
+    compactTools, dualImage, interactiveTimeline, large, largeCount, timeline,
+  ]);
   const [sid, setSid] = useState("history-browser-session-a");
   const [sessions, setSessions] = useState<Record<string, FixtureSession>>({
     "history-browser-session-a": {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
-      hasMore: !large && !timeline,
+      hasMore: !compactTools && !large && !timeline,
       pagesLoaded: 0,
     },
     "history-browser-session-b": {
@@ -174,6 +222,11 @@ export function HistoryBrowserFixture() {
   const [loads, setLoads] = useState(0);
   const [historyRevision, setHistoryRevision] = useState("revision-1");
   const [composerExpanded, setComposerExpanded] = useState(false);
+  const [pendingImages, setPendingImages] = useState<QueryImg[]>(() =>
+    composerAttachment ? [{
+      media_type: "image/png",
+      data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlK4h8AAAAASUVORK5CYII=",
+    }] : []);
   const active = sessions[sid];
   const growOlderRow = useCallback((targetSid: string) => {
     setSessions((current) => ({
@@ -306,6 +359,13 @@ export function HistoryBrowserFixture() {
           onClick={replaceHistoryRevision}>
           replace revision
         </button>
+        {composerAttachment && (
+          <div className="attach show" data-testid="fixture-attachments">
+            <PendingImageAttachments images={pendingImages}
+              onRemove={(index) => setPendingImages((current) =>
+                current.filter((_, candidate) => candidate !== index))} />
+          </div>
+        )}
         {interactiveTimeline && (
           <button data-testid="grow-stream" type="button"
             onClick={growStreamingTurn}>

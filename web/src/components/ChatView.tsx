@@ -1064,7 +1064,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
             )}
             {showProcessTimeline && (
               <ProcessTimeline blocks={t.blocks} done={t.done} engine={engine}
-                durationMs={t.durationMs} startTs={t.ts}
+                durationMs={t.durationMs} startTs={t.ts} doneTs={t.doneTs}
                 deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
                 detailLoading={t.detailLoading}
                 onLoadDetail={onLoadDetail ? () => onLoadDetail(t.id) : undefined}

@@ -1201,6 +1201,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     events: list = []
     turn_open = False
     last_ts = None  # transcript ts of the most-recent message in the open turn
+    turn_start_ts = None  # timestamp of the visible human message
     last_assistant_uuid = None
     current_turn_id = None
     history_tool_diffs: dict[str, tuple[str, bool]] = {}
@@ -1238,6 +1239,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     def close_turn():
         nonlocal turn_open, last_assistant_uuid, current_turn_id, history_plan_id
         nonlocal ambiguous_final_mid, ambiguous_final_start
+        nonlocal turn_start_ts
         if turn_open:
             # SessionMessage rows can omit stop_reason. Live must conservatively
             # treat such text as commentary, but history has the next user/EOF as
@@ -1252,9 +1254,13 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                             and event.message_id == ambiguous_final_mid
                             and event.channel == "commentary"):
                         event.channel = "final"
+            duration_ms = 0
+            if turn_start_ts is not None and last_ts is not None:
+                duration_ms = max(
+                    0, round((last_ts - turn_start_ts) * 1000))
             te = TurnEnd(
                 result=TurnResult(
-                    subtype="success", duration_ms=0, is_error=False),
+                    subtype="success", duration_ms=duration_ms, is_error=False),
                 turn_id=last_assistant_uuid,
                 checkpoint_id=current_turn_id,
             )
@@ -1267,6 +1273,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
             history_plan_id = None
             ambiguous_final_mid = None
             ambiguous_final_start = None
+            turn_start_ts = None
 
     for message_index, m in enumerate(messages):
         msg = m.message
@@ -1292,6 +1299,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                     continue
                 else:
                     close_turn()
+                    turn_start_ts = _ts(source_uid)
                     events.append(_um(message_uid, content))
                     turn_open = True
                     current_turn_id = message_uid
@@ -1335,6 +1343,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                         txt = b.get("text", "")
                         if txt and not _is_meta_user_text(txt):
                             close_turn()
+                            turn_start_ts = _ts(source_uid)
                             um = _um(message_uid, txt)
                             if imgs and not made:
                                 um.images = imgs
@@ -1344,6 +1353,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                             current_turn_id = message_uid
                 if imgs and not made:   # image-only user turn
                     close_turn()
+                    turn_start_ts = _ts(source_uid)
                     um = _um(message_uid, "")
                     um.images = imgs
                     events.append(um)

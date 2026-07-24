@@ -1005,6 +1005,12 @@ assert.equal(terminalMerged[0].blocks[0].kind === "tool"
   && terminalMerged[0].blocks[0].result?.content, "ok");
 assert.equal(terminalMerged[0].blocks[1].kind === "process"
   && terminalMerged[0].blocks[1].title, "代理完成");
+const liveDurationMerged = mergeInitialHistory(
+  [{ ...terminalHistory, durationMs: 0 }],
+  [{ ...staleLive, durationMs: 5000 }],
+);
+assert.equal(liveDurationMerged[0].durationMs, 5000,
+  "a synthetic Claude history duration must not erase a real live duration");
 const openTailMerged = mergeInitialHistory(
   [terminalHistory], [staleLive], { preserveLiveTailOpen: true });
 assert.equal(openTailMerged[0].blocks.some((block) => !block.done), true);
@@ -2271,6 +2277,43 @@ try {
   assert.equal(racedIdle.runtimes[liveHistorySid].state, "running");
   assert.equal(racedIdle.runtimes[liveHistorySid].turns[0].done, false);
 
+  // A reconnect can receive a lightweight live setting frame before the
+  // transcript read completes. That makes the History narrative stale, but an
+  // explicit wrapper-owned in_progress=true is still a safe positive running
+  // signal. Keeping the cache-hydrated idle state here makes the composer send
+  // Query instead of interrupt + replacement, which the busy wrapper rejects.
+  const racedRunningSid = "history-running-positive-race";
+  let racedRunning = {
+    ...initialState, focusedSid: racedRunningSid,
+    runtimes: { [racedRunningSid]: createRuntime() },
+  };
+  racedRunning = reduce(racedRunning, { type: "event", event: event({
+    type: "model", sid: racedRunningSid, seq: 81, model: "gpt-5",
+  }) });
+  racedRunning = reduce(racedRunning, { type: "event", event: event({
+    type: "history", sid: racedRunningSid, session_id: racedRunningSid,
+    revision: "running-positive-rev", build_seq: 1, live_seq: 80,
+    external: false, in_progress: true, has_more: false, events: [],
+  }) });
+  assert.equal(racedRunning.runtimes[racedRunningSid].state, "running",
+    "a stale narrative History must still recover positive wrapper activity");
+  assert.equal(racedRunning.runtimes[racedRunningSid].mirroredRunning, false);
+
+  let newerIdle = {
+    ...initialState, focusedSid: racedRunningSid,
+    runtimes: { [racedRunningSid]: createRuntime() },
+  };
+  newerIdle = reduce(newerIdle, { type: "event", event: event({
+    type: "state", sid: racedRunningSid, seq: 82, state: "idle",
+  }) });
+  newerIdle = reduce(newerIdle, { type: "event", event: event({
+    type: "history", sid: racedRunningSid, session_id: racedRunningSid,
+    revision: "running-positive-rev", build_seq: 2, live_seq: 81,
+    external: false, in_progress: true, has_more: false, events: [],
+  }) });
+  assert.equal(newerIdle.runtimes[racedRunningSid].state, "idle",
+    "older positive History must not overwrite a newer terminal lifecycle");
+
   // Ownership is control state too. A History build which started before a
   // newer live state frame must never resurrect a stale terminal lock (the
   // /review false-positive), nor clear a newer takeover/ownership decision.
@@ -2785,6 +2828,7 @@ try {
     ...initialState, focusedSid: rebuildSeqSid,
     runtimes: { [rebuildSeqSid]: {
       ...createRuntime(), historyBuildSeq: 8, lastLiveSeq: 200,
+      lastLifecycleSeq: 199,
     } },
   };
   rebuildSeqState = reduce(rebuildSeqState, { type: "event", event: event({
@@ -2793,6 +2837,7 @@ try {
   }) });
   assert.equal(rebuildSeqState.runtimes[rebuildSeqSid].historyBuildSeq, 0);
   assert.equal(rebuildSeqState.runtimes[rebuildSeqSid].lastLiveSeq, 0);
+  assert.equal(rebuildSeqState.runtimes[rebuildSeqSid].lastLifecycleSeq, 0);
 
   state = { ...state, focusedSid: sid };
   // Claude has a static presentation catalog, but its explicit defaults come
@@ -3312,6 +3357,37 @@ try {
     "the original reply copy icon remains in the completed-turn metadata row");
   assert.doesNotMatch(richMarkup, /先检查代码/);
   assert.doesNotMatch(richMarkup, /class="turn-working"/);
+
+  const cachedClaudeDurationMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "cached-claude-duration", engine: "claude",
+    turns: [{
+      id: "cached-claude-turn", prompt: "处理", done: true,
+      ts: 1000, doneTs: 6000, durationMs: 0,
+      blocks: [{
+        kind: "process", item_id: "cached-tool", processKind: "hook",
+        phase: "end", status: "succeeded", title: "完成", done: true,
+      }],
+    }],
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(cachedClaudeDurationMarkup, /已处理 5s/,
+    "old Claude history caches derive wall time from their timestamps");
+
+  const cachedCodexDurationMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "cached-codex-duration", engine: "codex",
+    turns: [{
+      id: "cached-codex-turn", prompt: "处理", done: true,
+      ts: 1000, doneTs: 6000, durationMs: 0,
+      blocks: [{
+        kind: "tool", message_id: "cached-codex-message",
+        tool_use_id: "cached-codex-tool", tool: "shell",
+        input: {}, done: true, result: { content: "ok", is_error: false },
+      }],
+    }],
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(cachedCodexDurationMarkup, /已处理 0s/,
+    "Claude cache compatibility must not reinterpret a valid Codex duration");
 
   // The animated turn marker is driven by the turn lifecycle, not by an empty
   // placeholder. It must survive reasoning expansion, process activity, final
@@ -4258,8 +4334,12 @@ const newChatSource = readFileSync(
   resolve(process.cwd(), "src/components/NewChatView.tsx"), "utf8");
 assert.match(newChatSource, /autoFocus=\{autoFocus\}/,
   "new-chat focus must follow the navigation intent instead of being unconditional");
+assert.match(newChatSource, /<PendingImageAttachments/,
+  "new-chat attachments must share the interactive image preview");
 const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
+assert.match(composerSource, /<PendingImageAttachments/,
+  "session drafts must expose the shared interactive image preview");
 assert.match(composerSource, /workSurface \? \(/);
 assert.match(composerSource, /p\.draftStore\.get\(p\.draftKey\)/);
 assert.match(composerSource, /accept="image\/\*" multiple/);

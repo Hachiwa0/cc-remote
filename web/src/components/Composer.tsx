@@ -25,6 +25,7 @@ import {
 } from "../composer-submit";
 import { workContextMetrics } from "../work-context";
 import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
+import { PendingImageAttachments } from "./PendingImageAttachments";
 
 interface Props {
   draftKey: string;
@@ -616,12 +617,9 @@ export function Composer(p: Props) {
 
         {hasAttachments && (
           <div className="attach show">
-            {images.map((img, i) => (
-              <span key={i} className="attach-img">
-                <img src={`data:${img.media_type};base64,${img.data}`} alt="" />
-                <button className="attach-x" onClick={() => setImages(images.filter((_, j) => j !== i))} aria-label="移除"><Icon name="close" size={12} /></button>
-              </span>
-            ))}
+            <PendingImageAttachments key={p.draftKey} images={images}
+              onRemove={(index) => setImages((previous) =>
+                previous.filter((_, candidate) => candidate !== index))} />
             {files.map((f, i) => (
               <span key={i} className="attach-file">
                 <Icon name="read" size={14} />

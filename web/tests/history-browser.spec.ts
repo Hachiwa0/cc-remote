@@ -200,6 +200,65 @@ test("a canonical image reference does not reserve a second hidden image row", a
   await assertCanonicalImageLayout();
 });
 
+test("streaming rerenders cannot cancel an image preview close", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?dual-image=1");
+  await page.locator(".ubub-image-trigger").click();
+  await expect(page.locator(".image-lightbox")).toBeVisible();
+
+  await page.evaluate(() => {
+    document.querySelector<HTMLButtonElement>(".image-lightbox-close")?.click();
+    document.querySelector<HTMLButtonElement>('[data-testid="append-turn"]')?.click();
+  });
+
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+});
+
+test("expanded tool batches use dense rows instead of individual cards", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?compact-tools=1");
+  await page.locator(".turn-process-head").click();
+  await page.locator(".tool-group-h").click();
+
+  const rows = page.locator(".tool-group-b .tool");
+  await expect(rows).toHaveCount(3);
+  const styles = await rows.evaluateAll((nodes) => nodes.map((node) => {
+    const style = getComputedStyle(node);
+    return {
+      height: node.getBoundingClientRect().height,
+      border: style.borderTopWidth,
+      radius: style.borderTopLeftRadius,
+      shadow: style.boxShadow,
+    };
+  }));
+  for (const style of styles) {
+    expect(style.height).toBeLessThan(40);
+    expect(style.border).toBe("0px");
+    expect(style.radius).toBe("0px");
+    expect(style.shadow).toBe("none");
+  }
+});
+
+test("a pending composer image previews without triggering removal", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?composer-attachment=1");
+  const preview = page.getByRole("button", { name: "预览待发送图片 1" });
+  await expect(preview).toBeVisible();
+
+  await preview.click();
+  await expect(page.locator(".image-lightbox")).toBeVisible();
+  await page.getByRole("button", { name: "关闭图片预览" }).click();
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+  await expect(preview).toBeVisible();
+
+  await page.getByRole("button", { name: "移除待发送图片 1" }).click();
+  await expect(preview).toHaveCount(0);
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+});
+
 test("a page that finishes under an active touch restores its retained boundary", async ({
   page,
 }, testInfo) => {
