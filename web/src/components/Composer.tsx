@@ -555,7 +555,6 @@ export function Composer(p: Props) {
     : null;
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm?.id === "plan" ? " plan" : perm?.danger ? " danger" : "";
-  const hintBusy = p.state !== "idle";
 
   const inputControl = (placeholder: string) => (
     <textarea
@@ -756,7 +755,7 @@ export function Composer(p: Props) {
           <div className="hint">
           <button
             type="button"
-            className={"hint-mode" + modeCls + (hintBusy ? " busy" : "")}
+            className={"hint-mode" + modeCls}
             onClick={() => setSheetKind("perms")}
             disabled={locked}
             title={deferredClaudeControls
@@ -765,7 +764,7 @@ export function Composer(p: Props) {
           >
             {deferredClaudeControls
               ? externalClaudeOwner
-              : (perm ? perm.short : "Mode loading")} · {stateZh[p.state]}
+              : (perm ? perm.short : "Mode loading")}
             {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
           </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令</span>

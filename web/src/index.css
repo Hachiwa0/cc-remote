@@ -1061,10 +1061,15 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .hint-mode .hint-mode-ch{ font-size:9px; opacity:.6; }
 .hint-mode.plan{ color:var(--accent-ink); }
 .hint-mode.danger{ color:var(--danger); }
-.hint-mode.busy{ color:var(--warn); }
 .hint-kbds{ white-space:nowrap; flex:1; text-align:center; overflow:hidden; text-overflow:ellipsis; }
-/* narrow screens: drop the keyboard hint (shortcuts are desktop-only), keep mode + controls */
-@media (max-width:640px){ .hint-kbds{ display:none; } .hint-right{ gap:12px; } }
+/* Narrow screens: hide desktop shortcuts and distribute every live control
+   across the remaining row width. Desktop keeps the original split layout. */
+@media (max-width:640px){
+  .hint{ gap:clamp(6px,2vw,12px); }
+  .hint-kbds{ display:none; }
+  .hint-right{ min-width:0; margin-left:0; flex:1; justify-content:space-between;
+    gap:clamp(4px,1.4vw,10px); }
+}
 
 /* COMMAND SHEET */
 .scrim{ position:fixed; inset:0; z-index:40; background:rgba(30,22,12,.34);
