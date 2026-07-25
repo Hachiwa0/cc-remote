@@ -7,6 +7,71 @@ import type { QueryImg } from "../src/protocol";
 import { ChatView } from "../src/components/ChatView";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
 
+const ROBOT_CORE_MERMAID_SOURCE = `flowchart TB
+    USER["任务入口<br/>语音 · 文本 · App · API"]
+
+    subgraph CORE["① 通用 Robot Agent Core｜所有机器人共用"]
+        INPUT["任务理解<br/>目标 · 约束 · 优先级"]
+        PLAN["任务规划器<br/>生成 Skill DAG"]
+        CHECK["计划校验器<br/>能力 · 前置条件 · 风险 · 资源"]
+        EXEC["任务执行器<br/>反馈 · 超时 · 取消 · 重试 · 恢复"]
+        REG["能力注册中心<br/>Capability Registry"]
+        MEM["任务状态与记忆<br/>事件日志 · 世界状态 · 经验"]
+        OBS["策略与可观测性<br/>权限 · Trace · 指标 · 审计"]
+        INPUT --> PLAN --> CHECK --> EXEC
+        REG --> PLAN
+        REG --> CHECK
+        MEM <--> PLAN
+        MEM <--> EXEC
+        OBS -.监控与约束.-> CHECK
+        OBS -.监控与约束.-> EXEC
+    end
+
+    subgraph CONTRACT["② Robot Capability Contract｜核心解耦点"]
+        PROFILE["Robot Profile<br/>本体 · 传感器 · 末端 · 坐标系"]
+        SKILL["Semantic Skill API<br/>goal · feedback · result<br/>cancel · timeout · error"]
+        STATE["统一状态模型<br/>位置 · 电量 · 模式 · 故障 · 能力状态"]
+        PROFILE --> SKILL
+        STATE --> SKILL
+    end
+
+    subgraph ADAPTER["③ 本体适配层｜每种机器人单独实现"]
+        DOG["四足 Adapter<br/>Go2 / Go1 / B2"]
+        HUMAN["人形 Adapter<br/>G1 / H1 / 青龙 / 天工"]
+        OTHER["其他机器人 Adapter<br/>轮式 · 机械臂 · 无人机"]
+        SIM["仿真 Adapter<br/>Mock · MuJoCo · Gazebo"]
+    end
+
+    subgraph CONTROL["④ 实时控制与安全层｜不交给 LLM"]
+        DOGCTRL["四足控制<br/>导航 · 步态 · 姿态 · HAL"]
+        HUMANCTRL["人形控制<br/>平衡 · 全身控制 · 操作"]
+        OTHERCTRL["设备控制器<br/>厂商 SDK · ROS 2 Control"]
+        SIMCTRL["仿真控制器<br/>动力学 · 传感器 · 故障注入"]
+        SAFETY["独立安全域<br/>急停 · 限幅 · 看门狗<br/>失联停车 · 人员接管"]
+    end
+
+    subgraph EMBODIMENT["⑤ 实际本体或数字本体"]
+        DOGBOT["四足机器人"]
+        HUMANBOT["人形机器人"]
+        OTHERBOT["其他机器人"]
+        SIMBOT["数字机器人"]
+    end
+
+    USER --> INPUT
+    EXEC -->|"语义目标"| SKILL
+    SKILL -->|"能力发现 / 调用 / 反馈"| DOG
+    SKILL --> HUMAN
+    SKILL --> OTHER
+    SKILL --> SIM
+    DOG --> DOGCTRL --> DOGBOT
+    HUMAN --> HUMANCTRL --> HUMANBOT
+    OTHER --> OTHERCTRL --> OTHERBOT
+    SIM --> SIMCTRL --> SIMBOT
+    SAFETY -.监控并可中断.-> DOGCTRL
+    SAFETY -.监控并可中断.-> HUMANCTRL
+    SAFETY -.监控并可中断.-> OTHERCTRL
+    SAFETY -.安全事件反馈.-> EXEC`;
+
 function finalTurn(id: string, paragraphs: number): Turn {
   const text = Array.from(
     { length: paragraphs },
@@ -153,9 +218,11 @@ function compactToolsTurn(): Turn {
   };
 }
 
-function mermaidTurn(invalid = false): Turn {
+function mermaidTurn(invalid = false, source?: string): Turn {
   const text = invalid
     ? "```mermaid\nthis is not a supported diagram\n```"
+    : source
+      ? `\`\`\`mermaid\n${source}\n\`\`\``
     : [
         "```mermaid",
         "flowchart LR",
@@ -204,6 +271,7 @@ export function HistoryBrowserFixture() {
   const dualImage = params.has("dual-image");
   const compactTools = params.has("compact-tools");
   const mermaid = params.has("mermaid");
+  const actualMermaid = params.has("actual-mermaid");
   const invalidMermaid = params.has("invalid-mermaid");
   const mermaidHistory = params.has("mermaid-history");
   const composerAttachment = params.has("composer-attachment");
@@ -217,8 +285,11 @@ export function HistoryBrowserFixture() {
     if (compactTools) {
       return [compactToolsTurn()];
     }
-    if (mermaid || invalidMermaid) {
-      return [mermaidTurn(invalidMermaid)];
+    if (mermaid || invalidMermaid || actualMermaid) {
+      return [mermaidTurn(
+        invalidMermaid,
+        actualMermaid ? ROBOT_CORE_MERMAID_SOURCE : undefined,
+      )];
     }
     if (mermaidHistory) {
       return [
@@ -246,8 +317,8 @@ export function HistoryBrowserFixture() {
     }
     return INITIAL;
   }, [
-    compactTools, dualImage, interactiveTimeline, invalidMermaid, large,
-    largeCount, mermaid, mermaidHistory, timeline,
+    actualMermaid, compactTools, dualImage, interactiveTimeline,
+    invalidMermaid, large, largeCount, mermaid, mermaidHistory, timeline,
   ]);
   const [sid, setSid] = useState("history-browser-session-a");
   const [sessions, setSessions] = useState<Record<string, FixtureSession>>({

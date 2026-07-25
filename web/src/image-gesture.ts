@@ -39,6 +39,33 @@ export function panImageTransform(
   }, image, viewport);
 }
 
+export function zoomImageTransform(
+  start: ImageTransform,
+  scaleFactor: number,
+  focalPoint: ImagePoint,
+  image: ImageSize,
+  viewport: ImageSize,
+): ImageTransform {
+  if (start.scale <= 0 || !Number.isFinite(scaleFactor)) {
+    return constrainImageTransform(start, image, viewport);
+  }
+  const scale = clamp(
+    start.scale * scaleFactor,
+    MIN_IMAGE_SCALE,
+    MAX_IMAGE_SCALE,
+  );
+  const center = { x: viewport.width / 2, y: viewport.height / 2 };
+  const contentPoint = {
+    x: (focalPoint.x - center.x - start.x) / start.scale,
+    y: (focalPoint.y - center.y - start.y) / start.scale,
+  };
+  return constrainImageTransform({
+    scale,
+    x: focalPoint.x - center.x - scale * contentPoint.x,
+    y: focalPoint.y - center.y - scale * contentPoint.y,
+  }, image, viewport);
+}
+
 export function pinchImageTransform(
   start: ImageTransform,
   startFirst: ImagePoint,
@@ -52,7 +79,9 @@ export function pinchImageTransform(
     startSecond.x - startFirst.x,
     startSecond.y - startFirst.y,
   );
-  if (startDistance <= 0) return constrainImageTransform(start, image, viewport);
+  if (startDistance <= 0) {
+    return constrainImageTransform(start, image, viewport);
+  }
   const currentDistance = Math.hypot(
     currentSecond.x - currentFirst.x,
     currentSecond.y - currentFirst.y,

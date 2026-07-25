@@ -740,3 +740,21 @@ def test_caddy_site_sets_browser_security_headers():
     assert "request_body @login" in source
     assert "max_size 4KB" in source
     assert " ws:" not in source
+
+
+@pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
+def test_caddy_image_policy_allows_only_image_blob_urls(template):
+    source = (ROOT / "deploy" / template).read_text()
+    match = re.search(r'Content-Security-Policy "([^"]+)"', source)
+    assert match is not None
+    directives = {
+        parts[0]: parts[1:]
+        for directive in match.group(1).split(";")
+        if (parts := directive.strip().split())
+    }
+    assert "blob:" in directives["img-src"]
+    assert all(
+        "blob:" not in sources
+        for name, sources in directives.items()
+        if name != "img-src"
+    )

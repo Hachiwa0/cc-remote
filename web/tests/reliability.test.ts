@@ -99,6 +99,7 @@ import {
   constrainImageTransform,
   panImageTransform,
   pinchImageTransform,
+  zoomImageTransform,
 } from "../src/image-gesture.ts";
 import {
   bumpSessionActivity,
@@ -246,6 +247,11 @@ assert.deepEqual(constrainImageTransform(
   { width: 300, height: 200 }, { width: 300, height: 300 },
 ), { scale: 1, x: 0, y: 0 },
 "returning to fit scale resets stale translation");
+assert.deepEqual(zoomImageTransform(
+  { scale: 1, x: 0, y: 0 }, 2, { x: 225, y: 150 },
+  { width: 300, height: 300 }, { width: 300, height: 300 },
+), { scale: 2, x: -75, y: 0 },
+"wheel zoom keeps the content beneath the trackpad focal point");
 assert.equal(mergeSessionActivityState("running", "idle"), "running",
   "catalog-native activity must not be overwritten by an idle resident runtime");
 assert.equal(mergeSessionActivityState("idle", "running"), "running",

@@ -7,7 +7,6 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { Icon } from "../icons";
-import { PointerTapGuard } from "../pointer-tap";
 import {
   mermaidPreviewSvg,
   mermaidSourceProblem,
@@ -25,7 +24,7 @@ interface RenderedMermaid {
 }
 
 interface MermaidPreview {
-  src: string;
+  svg: string;
   source: string;
   theme: MermaidTheme;
 }
@@ -43,8 +42,6 @@ function safeRenderId(id: string): string {
 export function MermaidBlock({ source }: { source: string }) {
   const element = useRef<HTMLDivElement | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const previewUrl = useRef<string | null>(null);
-  const previewTap = useRef(new PointerTapGuard());
   const renderGeneration = useRef(0);
   const renderId = safeRenderId(useId());
   const [nearViewport, setNearViewport] = useState(false);
@@ -112,14 +109,10 @@ export function MermaidBlock({ source }: { source: string }) {
 
   useEffect(() => () => {
     if (copyTimer.current) clearTimeout(copyTimer.current);
-    if (previewUrl.current) URL.revokeObjectURL(previewUrl.current);
   }, []);
 
   const closePreview = useCallback(() => {
-    const url = previewUrl.current;
-    previewUrl.current = null;
     setPreview(null);
-    if (url) URL.revokeObjectURL(url);
   }, []);
 
   useEffect(() => {
@@ -141,12 +134,11 @@ export function MermaidBlock({ source }: { source: string }) {
     : { source, theme, state: "idle" as const };
   const openPreview = () => {
     if (current.state !== "ready" || !current.svg) return;
-    if (previewUrl.current) URL.revokeObjectURL(previewUrl.current);
-    const src = URL.createObjectURL(new Blob([mermaidPreviewSvg(current.svg)], {
-      type: "image/svg+xml;charset=utf-8",
-    }));
-    previewUrl.current = src;
-    setPreview({ src, source, theme });
+    setPreview({
+      svg: mermaidPreviewSvg(current.svg),
+      source,
+      theme,
+    });
   };
 
   return (
@@ -172,24 +164,9 @@ export function MermaidBlock({ source }: { source: string }) {
         </div>
       </div>
       {current.state === "ready" && current.svg
-        ? <div className="mermaid-svg" role="img" aria-label="Mermaid 图表"
-            title="点击放大"
-            onPointerDown={(event) => {
-              previewTap.current.pointerDown(
-                event.pointerId, event.clientX, event.clientY,
-              );
-              event.currentTarget.setPointerCapture?.(event.pointerId);
-            }}
-            onPointerMove={(event) => previewTap.current.pointerMove(
-              event.pointerId, event.clientX, event.clientY,
-            )}
-            onPointerUp={(event) =>
-              previewTap.current.pointerUp(event.pointerId)}
-            onPointerCancel={(event) =>
-              previewTap.current.pointerCancel(event.pointerId)}
-            onClick={(event) => {
-              if (previewTap.current.consumeClick(event.detail)) openPreview();
-            }}
+        ? <button type="button" className="mermaid-svg"
+            aria-label="放大 Mermaid 图表" title="点击放大"
+            onClick={openPreview}
             dangerouslySetInnerHTML={{ __html: current.svg }} />
         : <pre className="mermaid-source"><code>{source}</code></pre>}
       {current.state === "error" && <div className="mermaid-error" role="status">
@@ -198,7 +175,7 @@ export function MermaidBlock({ source }: { source: string }) {
     </div>
     {preview && typeof document !== "undefined"
       ? createPortal(
-          <ImageLightbox src={preview.src} alt="Mermaid 图表预览"
+          <ImageLightbox sanitizedSvg={preview.svg} alt="Mermaid 图表预览"
             dialogLabel="Mermaid 图表预览" closeLabel="关闭 Mermaid 图表预览"
             onClose={closePreview} />,
           document.body,

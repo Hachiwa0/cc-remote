@@ -63,6 +63,14 @@ let modulesPromise: Promise<{
 }> | null = null;
 let renderQueue: Promise<void> = Promise.resolve();
 
+function removeRootLayoutStyles(root: Element & ElementCSSInlineStyle): void {
+  root.style.removeProperty("width");
+  root.style.removeProperty("height");
+  root.style.removeProperty("max-width");
+  root.style.removeProperty("max-height");
+  if (!root.getAttribute("style")?.trim()) root.removeAttribute("style");
+}
+
 function loadModules() {
   modulesPromise ??= Promise.all([
     import("mermaid"),
@@ -103,6 +111,7 @@ function sanitizeSvg(
       || document.documentElement.localName !== "svg") {
     throw new Error("Mermaid 返回了无效 SVG");
   }
+  removeRootLayoutStyles(document.documentElement);
 
   for (const anchor of Array.from(document.documentElement.querySelectorAll("a"))) {
     const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
@@ -173,6 +182,7 @@ export function mermaidPreviewSvg(svg: string): string {
       || viewBox[2] <= 0 || viewBox[3] <= 0) {
     throw new Error("Mermaid 预览尺寸无效");
   }
+  removeRootLayoutStyles(root);
   root.setAttribute("width", String(viewBox[2]));
   root.setAttribute("height", String(viewBox[3]));
   return new XMLSerializer().serializeToString(root);

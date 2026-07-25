@@ -400,7 +400,8 @@ body{
 .mermaid-copy.copied{ color:var(--ok); }
 .prose .mermaid-source{ margin:0; padding:11px 12px; border:0; border-radius:0;
   background:transparent; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
-.mermaid-svg{ padding:12px; overflow:auto; -webkit-overflow-scrolling:touch;
+.mermaid-svg{ display:block; width:100%; padding:12px; overflow:auto;
+  -webkit-overflow-scrolling:touch; text-align:initial;
   background:var(--surface); cursor:zoom-in; touch-action:pan-x pan-y pinch-zoom; }
 .mermaid-svg svg{ display:block; max-width:100%; height:auto; margin:0 auto; }
 .mermaid-error{ padding:7px 11px; border-top:1px solid var(--border);
@@ -947,8 +948,8 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .history-image-trigger{ width:min(180px, 42vw); max-height:180px; background:var(--soft); }
 .history-image-placeholder{ display:block; width:100%; height:100%; min-height:72px; border-radius:10px; background:linear-gradient(110deg,var(--soft) 30%,var(--raised) 45%,var(--soft) 60%); background-size:220% 100%; animation:history-image-pulse 1.4s ease-in-out infinite; }
 @keyframes history-image-pulse{ from{ background-position:100% 0; } to{ background-position:-100% 0; } }
-/* Shared chat-image viewer: a tap closes; pinch/pan use pointer events on the
-   full stage so the gesture does not depend on grabbing a small image target. */
+/* Shared preview: backdrop/X close, while pinch/pan use the full stage so the
+   gesture does not depend on grabbing a small image target. */
 .image-lightbox{ position:fixed; inset:0; z-index:100; display:grid; place-items:center;
   overflow:hidden; padding:max(18px,env(safe-area-inset-top)) max(18px,env(safe-area-inset-right))
     max(18px,env(safe-area-inset-bottom)) max(18px,env(safe-area-inset-left));
@@ -958,10 +959,16 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .image-lightbox-content{ display:grid; place-items:center; max-width:100%; max-height:100%; pointer-events:none;
   transform:scale(.965); transition:transform .17s var(--ease); }
 .image-lightbox.entered .image-lightbox-content{ transform:scale(1); }
+.image-lightbox-visual{ transform:translate(0,0) scale(1); transform-origin:center;
+  transition:transform .16s var(--ease); }
 .image-lightbox-image{ display:block; max-width:calc(100vw - 36px); max-height:calc(100vh - 36px);
-  width:auto; height:auto; border-radius:8px; object-fit:contain; box-shadow:var(--shadow-lg);
-  will-change:transform; transform-origin:center; transition:transform .16s var(--ease); }
-.image-lightbox.interacting .image-lightbox-image{ transition:none; }
+  width:auto; height:auto; border-radius:8px; object-fit:contain; box-shadow:var(--shadow-lg); }
+.image-lightbox-vector{ display:inline-grid; width:fit-content; height:fit-content;
+  max-width:calc(100vw - 36px); max-height:calc(100vh - 36px);
+  border-radius:8px; box-shadow:var(--shadow-lg); }
+.image-lightbox-vector>svg{ display:block; width:auto; height:auto;
+  max-width:calc(100vw - 36px); max-height:calc(100vh - 36px); overflow:hidden; }
+.image-lightbox.interacting .image-lightbox-visual{ will-change:transform; transition:none; }
 .image-lightbox-close{ position:fixed; top:max(14px,env(safe-area-inset-top));
   right:max(14px,env(safe-area-inset-right)); width:42px; height:42px; border:0; border-radius:50%;
   display:inline-flex; align-items:center; justify-content:center; color:#fff;
@@ -970,7 +977,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   .image-lightbox-close:hover{ background:rgba(255,255,255,.28); }
 }
 @media (prefers-reduced-motion:reduce){
-  .image-lightbox,.image-lightbox-content,.image-lightbox-image{ transition:none; }
+  .image-lightbox,.image-lightbox-content,.image-lightbox-visual{ transition:none; }
 }
 .ubub-files{ display:flex; flex-wrap:wrap; gap:6px; max-width:82%; margin-left:auto; margin-bottom:6px; }
 .ubub-file{ display:inline-flex; align-items:center; gap:6px; background:var(--accent-weak); border:1px solid var(--accent-line); border-radius:8px; padding:5px 9px; font-size:12.5px; color:var(--text); }

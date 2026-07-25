@@ -1,4 +1,153 @@
 import { expect, test } from "@playwright/test";
+import { readFileSync } from "node:fs";
+
+const productionCsp = (() => {
+  const template = readFileSync(
+    new URL("../../deploy/Caddyfile", import.meta.url),
+    "utf8",
+  );
+  const match = template.match(/Content-Security-Policy "([^"]+)"/);
+  if (!match) throw new Error("production Content-Security-Policy is missing");
+  return match[1].replace(
+    "wss://cc-remote.example.com",
+    "ws://127.0.0.1:4174",
+  );
+})();
+
+async function applyProductionCsp(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  await page.evaluate((policy) => {
+    const meta = document.createElement("meta");
+    meta.httpEquiv = "Content-Security-Policy";
+    meta.content = policy;
+    document.head.append(meta);
+  }, productionCsp);
+}
+
+async function pinchThenPanPreview(
+  page: import("@playwright/test").Page,
+): Promise<{
+  afterPinch: { scale: number; x: number; y: number };
+  afterPan: { scale: number; x: number; y: number };
+}> {
+  return page.locator(".image-lightbox").evaluate(async (node) => {
+    const stage = node as HTMLElement;
+    const visual = stage.querySelector<HTMLElement>(".image-lightbox-visual");
+    if (!visual) throw new Error("lightbox visual is missing");
+    Object.defineProperties(stage, {
+      setPointerCapture: { configurable: true, value: () => {} },
+      releasePointerCapture: { configurable: true, value: () => {} },
+      hasPointerCapture: { configurable: true, value: () => false },
+    });
+    const emit = (
+      type: "pointerdown" | "pointermove" | "pointerup"
+        | "lostpointercapture",
+      pointerId: number,
+      x: number,
+      y: number,
+    ) => stage.dispatchEvent(new PointerEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      pointerId,
+      pointerType: "touch",
+      clientX: x,
+      clientY: y,
+      buttons: type === "pointerup" || type === "lostpointercapture" ? 0 : 1,
+    }));
+    const nextPaint = () => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+    const transform = () => {
+      const matrix = new DOMMatrix(visual.style.transform);
+      return {
+        x: matrix.e,
+        y: matrix.f,
+        scale: Math.hypot(matrix.a, matrix.b),
+      };
+    };
+
+    emit("pointerdown", 1, 150, 260);
+    emit("pointerdown", 2, 250, 260);
+    emit("pointermove", 1, 50, 260);
+    emit("pointermove", 2, 350, 260);
+    await nextPaint();
+    const afterPinch = transform();
+
+    emit("lostpointercapture", 2, 350, 260);
+    emit("pointermove", 1, 0, 300);
+    await nextPaint();
+    const afterPan = transform();
+    emit("pointerup", 1, 50, 300);
+    stage.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      detail: 1,
+    }));
+    return { afterPinch, afterPan };
+  });
+}
+
+async function wheelZoomThenPanPreview(
+  page: import("@playwright/test").Page,
+): Promise<{
+  zoomPrevented: boolean;
+  panPrevented: boolean;
+  afterZoom: { scale: number; x: number; y: number };
+  afterPan: { scale: number; x: number; y: number };
+}> {
+  return page.locator(".image-lightbox").evaluate(async (node) => {
+    const stage = node as HTMLElement;
+    const visual = stage.querySelector<HTMLElement>(".image-lightbox-visual");
+    if (!visual) throw new Error("lightbox visual is missing");
+    Object.defineProperties(stage, {
+      clientWidth: { configurable: true, value: 900 },
+      clientHeight: { configurable: true, value: 720 },
+    });
+    Object.defineProperties(visual, {
+      clientWidth: { configurable: true, value: 600 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    const nextPaint = () => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+    const transform = () => {
+      const matrix = new DOMMatrix(visual.style.transform);
+      return {
+        x: matrix.e,
+        y: matrix.f,
+        scale: Math.hypot(matrix.a, matrix.b),
+      };
+    };
+    const zoomPrevented = !stage.dispatchEvent(new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      ctrlKey: true,
+      clientX: 450,
+      clientY: 360,
+      deltaY: -600,
+      deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+    }));
+    await nextPaint();
+    const afterZoom = transform();
+    const panPrevented = !stage.dispatchEvent(new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 450,
+      clientY: 360,
+      deltaX: 45,
+      deltaY: 30,
+      deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+    }));
+    await nextPaint();
+    return {
+      zoomPrevented,
+      panPrevented,
+      afterZoom,
+      afterPan: transform(),
+    };
+  });
+}
 
 async function readingAnchor(page: import("@playwright/test").Page): Promise<{
   id: string;
@@ -308,16 +457,26 @@ test("completed Mermaid fences render isolated sanitized SVGs", async ({
 test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
   page,
 }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/tests/history-browser.html?mermaid=1");
   const diagram = page.locator(".mermaid-block").first();
   await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  await applyProductionCsp(page);
 
-  await diagram.getByRole("button", { name: "放大 Mermaid 图表" }).click();
+  await diagram.locator(".mermaid-zoom").click();
   const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
   await expect(preview).toBeVisible();
-  const image = preview.locator("img");
-  await expect(image).toBeVisible();
-  await expect(image).toHaveAttribute("src", /^blob:/);
+  const vector = preview.locator(".image-lightbox-vector > svg");
+  await expect(vector).toBeVisible();
+  await expect(preview.locator("img")).toHaveCount(0);
+  const gesture = await pinchThenPanPreview(page);
+  expect(gesture.afterPinch.scale).toBeGreaterThan(1);
+  expect(gesture.afterPan.scale).toBe(gesture.afterPinch.scale);
+  expect(gesture.afterPan.x).toBeLessThan(gesture.afterPinch.x);
+  await expect(preview).toBeVisible();
+  await expect(preview).not.toHaveClass(/interacting/);
+  await expect.poll(() => preview.locator(".image-lightbox-visual")
+    .evaluate((node) => getComputedStyle(node).willChange)).toBe("auto");
 
   await page.getByRole("button", { name: "关闭 Mermaid 图表预览" }).click();
   await expect(preview).toHaveCount(0);
@@ -330,6 +489,163 @@ test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
       ?.click();
   });
   await expect(page.locator(".image-lightbox")).toHaveCount(0);
+});
+
+test("the real wide Robot Core diagram opens once and fits the viewport", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1568, height: 870 });
+  await page.goto("/tests/history-browser.html?actual-mermaid=1");
+  const diagram = page.locator(".mermaid-block");
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  const trigger = diagram.locator(".mermaid-svg");
+  await expect(trigger).toHaveJSProperty("tagName", "BUTTON");
+  const inlineBounds = await trigger.evaluate((node) => {
+    const svg = node.querySelector("svg");
+    if (!svg) throw new Error("inline Mermaid SVG is missing");
+    return {
+      containerWidth: node.getBoundingClientRect().width,
+      svgWidth: svg.getBoundingClientRect().width,
+    };
+  });
+  expect(inlineBounds.svgWidth).toBeLessThanOrEqual(
+    inlineBounds.containerWidth + 1,
+  );
+
+  await trigger.click();
+  const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
+  await expect(preview).toBeVisible();
+  const bounds = await preview.evaluate((node) => {
+    const visual = node.querySelector<HTMLElement>(".image-lightbox-visual");
+    if (!visual) throw new Error("lightbox visual is missing");
+    const stage = node.getBoundingClientRect();
+    const image = visual.getBoundingClientRect();
+    return {
+      stage: {
+        left: stage.left,
+        top: stage.top,
+        right: stage.right,
+        bottom: stage.bottom,
+      },
+      image: {
+        left: image.left,
+        top: image.top,
+        right: image.right,
+        bottom: image.bottom,
+      },
+    };
+  });
+  expect(bounds.image.left).toBeGreaterThanOrEqual(bounds.stage.left + 17);
+  expect(bounds.image.right).toBeLessThanOrEqual(bounds.stage.right - 17);
+  expect(bounds.image.top).toBeGreaterThanOrEqual(bounds.stage.top + 17);
+  expect(bounds.image.bottom).toBeLessThanOrEqual(bounds.stage.bottom - 17);
+
+  await preview.evaluate((node) => {
+    const visual = node.querySelector<HTMLElement>(".image-lightbox-visual");
+    if (!visual) throw new Error("lightbox visual is missing");
+    const bounds = visual.getBoundingClientRect();
+    node.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      clientX: (bounds.left + bounds.right) / 2,
+      clientY: (bounds.top + bounds.bottom) / 2,
+      detail: 1,
+    }));
+  });
+  await expect(preview).toBeVisible();
+});
+
+test("desktop trackpad wheel zooms around the pointer and pans the preview", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "desktop trackpad behavior");
+  await page.goto("/tests/history-browser.html?mermaid=1");
+  const diagram = page.locator(".mermaid-block").first();
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  await diagram.locator(".mermaid-zoom").click();
+
+  const gesture = await wheelZoomThenPanPreview(page);
+  expect(gesture.zoomPrevented).toBe(true);
+  expect(gesture.panPrevented).toBe(true);
+  expect(gesture.afterZoom.scale).toBeGreaterThan(1);
+  expect(gesture.afterPan.scale).toBe(gesture.afterZoom.scale);
+  expect(gesture.afterPan.x).toBeLessThan(gesture.afterZoom.x);
+  expect(gesture.afterPan.y).toBeLessThan(gesture.afterZoom.y);
+  await expect(page.getByRole("dialog", { name: "Mermaid 图表预览" }))
+    .toBeVisible();
+});
+
+test("a wide zoomed Mermaid can pan to both horizontal edges", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "desktop trackpad behavior");
+  await page.setViewportSize({ width: 900, height: 720 });
+  await page.goto("/tests/history-browser.html?mermaid=1");
+  const diagram = page.locator(".mermaid-block").nth(1);
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  await diagram.locator(".mermaid-zoom").click();
+  const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
+  await page.waitForTimeout(200);
+  await preview.dispatchEvent("wheel", {
+    ctrlKey: true,
+    deltaY: -1_000,
+    clientX: 450,
+    clientY: 360,
+  });
+  await page.waitForTimeout(120);
+
+  const horizontalEdges = async () => preview.evaluate((node) => {
+    const visual = node.querySelector<HTMLElement>(".image-lightbox-visual");
+    if (!visual) throw new Error("lightbox visual is missing");
+    const stage = node.getBoundingClientRect();
+    const image = visual.getBoundingClientRect();
+    return {
+      stageLeft: stage.left,
+      stageRight: stage.right,
+      imageLeft: image.left,
+      imageRight: image.right,
+    };
+  });
+  await preview.dispatchEvent("wheel", {
+    deltaX: 5_000,
+    clientX: 450,
+    clientY: 360,
+  });
+  await page.waitForTimeout(120);
+  const rightEdge = await horizontalEdges();
+  expect(Math.abs(rightEdge.imageRight - rightEdge.stageRight)).toBeLessThan(1);
+
+  await preview.dispatchEvent("wheel", {
+    deltaX: -10_000,
+    clientX: 450,
+    clientY: 360,
+  });
+  await page.waitForTimeout(120);
+  const leftEdge = await horizontalEdges();
+  expect(Math.abs(leftEdge.imageLeft - leftEdge.stageLeft)).toBeLessThan(1);
+});
+
+test("desktop Mermaid content clicks are inert and the backdrop closes", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "desktop mouse behavior");
+  await page.goto("/tests/history-browser.html?mermaid=1");
+  const diagram = page.locator(".mermaid-block").first();
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  await diagram.locator(".mermaid-zoom").click();
+  const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
+  const visual = preview.locator(".image-lightbox-visual");
+  const scale = () => visual.evaluate((node) => {
+    const matrix = new DOMMatrix(node.style.transform);
+    return Math.hypot(matrix.a, matrix.b);
+  });
+
+  await preview.click({ position: { x: 450, y: 360 } });
+  await expect(preview).toBeVisible();
+  await expect.poll(scale).toBeCloseTo(1, 5);
+
+  await preview.click({ position: { x: 5, y: 5 } });
+  await expect(preview).toHaveCount(0);
 });
 
 test("invalid Mermaid falls back to copyable source", async ({ page }) => {
@@ -396,7 +712,52 @@ test("a pending composer image previews without triggering removal", async ({
 
   await preview.click();
   await expect(page.locator(".image-lightbox")).toBeVisible();
+  await expect(page.locator(".image-lightbox img.image-lightbox-image"))
+    .toBeVisible();
+  await expect(page.locator(".image-lightbox-vector")).toHaveCount(0);
   await page.getByRole("button", { name: "关闭图片预览" }).click();
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+  await expect(preview).toBeVisible();
+
+  await preview.click();
+  await expect(page.locator(".image-lightbox")).toBeVisible();
+  await page.locator(".image-lightbox").evaluate((node) => {
+    const stage = node as HTMLElement;
+    const visual = stage.querySelector<HTMLElement>(".image-lightbox-visual");
+    if (!visual) throw new Error("lightbox visual is missing");
+    Object.defineProperties(stage, {
+      setPointerCapture: { configurable: true, value: () => {} },
+      releasePointerCapture: { configurable: true, value: () => {} },
+      hasPointerCapture: { configurable: true, value: () => false },
+    });
+    const bounds = visual.getBoundingClientRect();
+    const x = (bounds.left + bounds.right) / 2;
+    const y = (bounds.top + bounds.bottom) / 2;
+    stage.dispatchEvent(new PointerEvent("pointerdown", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 73,
+      pointerType: "touch",
+      clientX: x,
+      clientY: y,
+      buttons: 1,
+    }));
+    stage.dispatchEvent(new PointerEvent("pointerup", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 73,
+      pointerType: "touch",
+      clientX: x,
+      clientY: y,
+    }));
+    stage.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      clientX: x,
+      clientY: y,
+      detail: 1,
+    }));
+  });
   await expect(page.locator(".image-lightbox")).toHaveCount(0);
   await expect(preview).toBeVisible();
 
