@@ -857,6 +857,30 @@ def test_transcript_fallback_fails_closed_for_duplicate_sid_across_cwds(
     assert session._find_transcript() is None
 
 
+def test_transcript_lookup_uses_configured_claude_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    home = tmp_path / "home"
+    active = tmp_path / "profiles" / "claude"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(active))
+    sid = "11111111-1111-4111-8111-111111111111"
+    cwd = "/configured-root"
+    source = active / "projects" / "-configured-root" / f"{sid}.jsonl"
+    decoy = home / ".claude" / "projects" / "-configured-root" / f"{sid}.jsonl"
+    source.parent.mkdir(parents=True)
+    decoy.parent.mkdir(parents=True)
+    source.write_text("", encoding="utf-8")
+    decoy.write_text("", encoding="utf-8")
+
+    session = object.__new__(PTYSession)
+    session.id = sid
+    session.cwd = cwd
+    session._transcript_path_cache = None
+
+    assert session._find_transcript() == str(source.resolve())
+
+
 @pytest.mark.asyncio
 async def test_cli_new_freezes_the_invoking_process_cwd(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],

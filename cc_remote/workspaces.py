@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Iterable, Literal, cast
 from uuid import uuid4
 
+from cc_remote.claude_paths import claude_config_dir
+
 
 Engine = Literal["claude", "codex"]
 
@@ -108,9 +110,7 @@ def _claude_runtime_settings() -> dict[str, object]:
     cannot cross from Code into Work, while a compatible endpoint configured in
     the user's settings remains usable.
     """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    root = Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
-    path = root / "settings.json"
+    path = claude_config_dir() / "settings.json"
     try:
         info = path.stat()
         if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_CLAUDE_SETTINGS_BYTES:

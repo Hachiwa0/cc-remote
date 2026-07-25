@@ -28,6 +28,7 @@ from claude_agent_sdk.types import (
     TaskNotificationMessage, HookEventMessage,
 )
 
+from cc_remote.claude_paths import claude_projects_dir
 from cc_remote.protocol import (
     AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     ToolDelta, ProcessEvent, TurnPlan,
@@ -1031,7 +1032,10 @@ def transcript_path(session_id: str) -> str | None:
         return None
     try:
         safe_id = glob.escape(session_id)
-        root = os.path.realpath(os.path.expanduser("~/.claude/projects"))
+        # The SDK deliberately preserves a relative CLAUDE_CONFIG_DIR. Resolve
+        # it at the point of filesystem access so containment compares two
+        # absolute paths while retaining the SDK's literal "~" semantics.
+        root = str(claude_projects_dir().resolve())
         matches = glob.iglob(os.path.join(root, "*", f"{safe_id}.jsonl"))
         for index, match in enumerate(matches):
             if index >= _MAX_TRANSCRIPT_MATCHES:

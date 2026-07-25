@@ -22,6 +22,8 @@ import time
 from typing import Callable, Literal
 import uuid
 
+from cc_remote.claude_paths import claude_projects_dir
+
 from .control_store import ControlStore, ControlStoreError
 
 
@@ -842,7 +844,7 @@ class PTYSession:
         return cursor
 
     def _find_transcript(self) -> str | None:
-        root = Path(os.path.expanduser("~/.claude/projects")).resolve()
+        root = claude_projects_dir().resolve()
         cached = self._transcript_path_cache
         if cached is not None:
             try:

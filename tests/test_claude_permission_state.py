@@ -10,8 +10,9 @@ from cc_remote.config import WrapperConfig
 from cc_remote.protocol import GetModels, Hello, NewSession, OpenBtw
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper import sdk as sdk_module
-from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.sdk import CLAUDE_DEFAULT_MODEL, SdkHandle
 from cc_remote.wrapper.claude_controls import ClaudeControls
+from cc_remote.workspaces import WorkStores
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -214,10 +215,35 @@ def test_claude_new_session_defaults_use_settings_without_sdk_probe(
         monkeypatch.setenv("ANTHROPIC_MODEL", "claude-env-model")
         assert machine._claude_configured_model(
             str(project)) == "claude-env-model"
+        (project / ".claude" / "settings.local.json").write_text(
+            '{"model":"claude-mythos-5[1m]",'
+            '"env":{"ANTHROPIC_MODEL":"claude-settings-env-model"}}')
+        assert machine._claude_configured_model(
+            str(project)) == "claude-settings-env-model"
+
         monkeypatch.setenv("ANTHROPIC_MODEL", "default")
         (project / ".claude" / "settings.local.json").write_text(
             '{"model":"default"}')
         assert machine._claude_configured_model(str(project)) is None
+        fallback_model, fallback_effort = (
+            await machine._claude_new_session_defaults(str(project)))
+        assert fallback_model == CLAUDE_DEFAULT_MODEL
+        assert fallback_effort == "max"
+
+        monkeypatch.delenv("ANTHROPIC_MODEL")
+        for configured, expected in (
+            ("opus", CLAUDE_DEFAULT_MODEL),
+            ("opus[1m]", CLAUDE_DEFAULT_MODEL),
+            ("claude-opus-5", CLAUDE_DEFAULT_MODEL),
+            (CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_MODEL),
+            ("claude-sonnet-5", "claude-sonnet-5"),
+            ("provider-custom-model", "provider-custom-model"),
+        ):
+            (project / ".claude" / "settings.local.json").write_text(
+                f'{{"model":"{configured}"}}')
+            resolved, _ = await machine._claude_new_session_defaults(
+                str(project))
+            assert resolved == expected
 
         managed = tmp_path / "managed-settings.json"
         managed.write_text('{"model":"claude-managed-model"}')
@@ -226,6 +252,320 @@ def test_claude_new_session_defaults_use_settings_without_sdk_probe(
             staticmethod(lambda: [str(managed)]))
         assert machine._claude_configured_model(
             str(project)) == "claude-managed-model"
+
+    asyncio.run(go())
+
+
+def test_fresh_claude_spawn_applies_the_resolved_default_model(
+    monkeypatch,
+    tmp_path,
+):
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    (home / ".claude").mkdir(parents=True)
+    project.mkdir()
+    (home / ".claude" / "settings.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.setattr(
+        machine_module.WrapperMachine, "_claude_managed_settings_paths",
+        staticmethod(lambda: []))
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        machine, _ = _mk_machine()
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            resume_id=None, cwd=str(project), engine="claude")
+
+        assert ctx is not None
+        assert ctx.sdk.model == CLAUDE_DEFAULT_MODEL
+        assert _FakeClaudeClient.created[-1].model_calls == [
+            CLAUDE_DEFAULT_MODEL]
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_explicit_fresh_claude_model_wins_without_reading_default(
+    monkeypatch,
+    tmp_path,
+):
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        machine, _ = _mk_machine()
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        async def forbidden_default(_cwd):
+            raise AssertionError("an explicit model must bypass default lookup")
+
+        machine._claude_new_session_defaults = forbidden_default
+        ctx = await machine._spawn(
+            resume_id=None,
+            cwd=str(tmp_path),
+            engine="claude",
+            model="claude-sonnet-5",
+        )
+
+        assert ctx is not None
+        assert ctx.sdk.model == "claude-sonnet-5"
+        assert _FakeClaudeClient.created[-1].model_calls == [
+            "claude-sonnet-5"]
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        ("opus", CLAUDE_DEFAULT_MODEL),
+        ("opus[1m]", CLAUDE_DEFAULT_MODEL),
+        ("claude-opus-5", CLAUDE_DEFAULT_MODEL),
+        (CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_MODEL),
+        ("claude-sonnet-5", "claude-sonnet-5"),
+        ("provider-custom-model", "provider-custom-model"),
+    ],
+)
+def test_explicit_new_session_normalizes_only_opus_5_aliases(
+    monkeypatch,
+    tmp_path,
+    requested,
+    expected,
+):
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        machine, _ = _mk_machine()
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        async def forbidden_default(_cwd):
+            raise AssertionError("an explicit model must bypass default lookup")
+
+        machine._claude_new_session_defaults = forbidden_default
+        await machine._handle_new_session(NewSession(
+            request_id="explicit-alias",
+            cwd=str(tmp_path),
+            model=requested,
+        ))
+
+        assert len(machine.sessions) == 1
+        ctx = next(iter(machine.sessions.values()))
+        assert ctx.sdk.model == expected
+        assert _FakeClaudeClient.created[-1].model_calls == [expected]
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_implicit_claude_default_failure_reports_probed_provider_model(
+    monkeypatch,
+    tmp_path,
+):
+    class RejectingModelClient(_FakeClaudeClient):
+        async def set_model(self, model):
+            self.model_calls.append(model)
+            raise RuntimeError("provider rejected curated model")
+
+    async def go():
+        RejectingModelClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", RejectingModelClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        machine, transport = _mk_machine()
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        await machine._handle_new_session(NewSession(
+            request_id="implicit-default", cwd=str(tmp_path)))
+
+        assert len(machine.sessions) == 1
+        ctx = next(iter(machine.sessions.values()))
+        assert ctx.sdk.model == "claude-mythos-5"
+        assert ctx.announced_model == "claude-mythos-5"
+        assert [
+            event.model for event in transport.sent if event.type == "model"
+        ] == ["claude-mythos-5"]
+        assert RejectingModelClient.created[-1].model_calls == [
+            CLAUDE_DEFAULT_MODEL]
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_implicit_claude_default_and_probe_failure_emit_no_fake_model(
+    monkeypatch,
+    tmp_path,
+):
+    class UnreportedModelClient(_FakeClaudeClient):
+        async def _send_control_request(self, request, timeout):
+            raise RuntimeError("model probe unavailable")
+
+        async def set_model(self, model):
+            self.model_calls.append(model)
+            raise RuntimeError("provider rejected curated model")
+
+    async def go():
+        UnreportedModelClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", UnreportedModelClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        machine, transport = _mk_machine()
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        await machine._handle_new_session(NewSession(
+            request_id="implicit-unreported", cwd=str(tmp_path)))
+
+        assert len(machine.sessions) == 1
+        ctx = next(iter(machine.sessions.values()))
+        assert ctx.sdk.model is None
+        assert ctx.announced_model is None
+        assert not [event for event in transport.sent
+                    if event.type == "model"]
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_explicit_claude_model_failure_is_one_correlated_create_error(
+    monkeypatch,
+    tmp_path,
+):
+    class RejectingModelClient(_FakeClaudeClient):
+        async def set_model(self, model):
+            self.model_calls.append(model)
+            raise RuntimeError("explicit model rejected")
+
+    async def go():
+        RejectingModelClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", RejectingModelClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        machine, transport = _mk_machine()
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        await machine._handle_new_session(NewSession(
+            request_id="explicit-model",
+            client_id="browser-one",
+            cwd=str(tmp_path),
+            model="claude-sonnet-5",
+        ))
+
+        assert machine.sessions == {}
+        assert len(transport.sent) == 1
+        error = transport.sent[0]
+        assert error.type == "error"
+        assert error.to == "browser-one"
+        assert error.request_id == "explicit-model"
+        assert error.sid is None
+        assert RejectingModelClient.created[-1].disconnected is True
+
+    asyncio.run(go())
+
+
+def test_claude_code_resume_without_override_never_reads_fresh_default(
+    monkeypatch,
+    tmp_path,
+):
+    session_id = "11111111-1111-4111-8111-111111111111"
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setattr(
+            SdkHandle, "refresh_goal", lambda *_args: asyncio.sleep(0))
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=str(tmp_path)))
+        monkeypatch.setattr(
+            machine_module, "save_session_id", lambda *_args: None)
+        machine, _ = _mk_machine()
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        async def forbidden_default(_cwd):
+            raise AssertionError("resume must not resolve a fresh default")
+
+        machine._claude_new_session_defaults = forbidden_default
+        ctx = await machine._spawn(
+            resume_id=session_id, engine="claude", space="code")
+
+        assert ctx is not None
+        assert _FakeClaudeClient.created[-1].model_calls == []
+        assert _FakeClaudeClient.created[-1].options.model is None
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_claude_work_resume_never_applies_code_fresh_default(
+    monkeypatch,
+    tmp_path,
+):
+    session_id = "22222222-2222-4222-8222-222222222222"
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setattr(
+            SdkHandle, "refresh_goal", lambda *_args: asyncio.sleep(0))
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=record.cwd))
+        monkeypatch.setattr(
+            machine_module, "save_session_id", lambda *_args: None)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        machine, _ = _mk_machine()
+        machine._work = WorkStores(
+            tmp_path / "work-claude", tmp_path / "work-codex")
+        store = machine._work.for_engine("claude")
+        record = store.create_session()
+        store.bind_session(record.work_id, session_id)
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        async def forbidden_default(_cwd):
+            raise AssertionError("Work resume must preserve its native model")
+
+        machine._claude_new_session_defaults = forbidden_default
+        ctx = await machine._spawn(
+            resume_id=session_id,
+            engine="claude",
+            space="work",
+            work_id=record.work_id,
+        )
+
+        assert ctx is not None
+        assert _FakeClaudeClient.created[-1].model_calls == []
+        assert _FakeClaudeClient.created[-1].options.model is None
+        await ctx.sdk.disconnect()
 
     asyncio.run(go())
 

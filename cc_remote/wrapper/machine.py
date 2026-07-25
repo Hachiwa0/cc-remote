@@ -73,6 +73,7 @@ from cc_remote.attachments import (
     image_dimensions,
     validate_attachments,
 )
+from cc_remote.claude_paths import claude_config_dir
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.workspaces import WorkStores
@@ -112,7 +113,11 @@ from cc_remote.wrapper.claude_broker_history import (
     parse_claude_broker_lifecycle,
 )
 from cc_remote.wrapper.ask import make_ask_server
-from cc_remote.wrapper.sdk import CLAUDE_DEFAULT_EFFORT, SdkHandle
+from cc_remote.wrapper.sdk import (
+    CLAUDE_DEFAULT_EFFORT,
+    CLAUDE_DEFAULT_MODEL,
+    SdkHandle,
+)
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
 from cc_remote.wrapper.rollback_commands import (
     RollbackCommandJournal,
@@ -198,6 +203,21 @@ CLAUDE_PERMISSION_MODES = frozenset({
 CODEX_PERMISSION_MODES = frozenset({"never", "on-request", "untrusted"})
 CODEX_COLLABORATION_MODES = frozenset({"default", "plan"})
 CODEX_FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
+_CLAUDE_OPUS_5_1M_ALIASES = frozenset({
+    "opus",
+    "opus[1m]",
+    "claude-opus-5",
+    "claude-opus-5[1m]",
+})
+
+
+def _normalize_claude_new_session_model(model: Optional[str]) -> Optional[str]:
+    """Pin only fresh-session Opus 5 aliases to the explicit 1M model."""
+    if model is None:
+        return None
+    if model.strip().lower() in _CLAUDE_OPUS_5_1M_ALIASES:
+        return CLAUDE_DEFAULT_MODEL
+    return model
 
 
 def _codex_fast_on(value: Optional[str]) -> bool:
@@ -5299,17 +5319,11 @@ class WrapperMachine:
         """Resolve an explicit new-session model without starting Claude CLI.
 
         Claude's account/organization runtime Default cannot be read without a
-        live CLI, so an absent explicit value deliberately returns None. The UI
-        then keeps the honest generic "local default" label.
+        live CLI, so an absent explicit value returns None. The caller then uses
+        cc-remote's curated new-session default.
         """
         root = cls._claude_project_root(cwd)
-        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        if config_dir:
-            user_settings = os.path.join(
-                os.path.realpath(os.path.expanduser(config_dir)),
-                "settings.json")
-        else:
-            user_settings = os.path.expanduser("~/.claude/settings.json")
+        user_settings = str(claude_config_dir() / "settings.json")
         ordinary_paths = [
             user_settings,
             os.path.join(root, ".claude", "settings.json"),
@@ -5362,19 +5376,19 @@ class WrapperMachine:
                 managed_env_model_set = True
                 managed_env_model = candidate
 
-        # Managed policy cannot be overridden. Otherwise the launch environment
-        # wins over settings, and settings-provided ANTHROPIC_MODEL wins over the
-        # scalar model field just as it does in Claude Code.
+        # Managed policy cannot be overridden. Claude then applies an `env`
+        # value from settings over the process environment inherited at launch;
+        # the scalar model field remains the lowest-precedence explicit source.
         external_model_set, external_model = explicit_model(
             os.environ.get("ANTHROPIC_MODEL"))
         if managed_env_model_set:
             return managed_env_model
         if managed_model_set:
             return managed_model
-        if external_model_set:
-            return external_model
         if settings_env_model_set:
             return settings_env_model
+        if external_model_set:
+            return external_model
         return model if model_set else None
 
     async def _claude_new_session_defaults(
@@ -5383,18 +5397,26 @@ class WrapperMachine:
         raw_cwd = cwd or self.cfg.cc_cwd
         target_cwd = os.path.realpath(os.path.expanduser(raw_cwd))
         if not os.path.isdir(target_cwd):
-            return None, CLAUDE_DEFAULT_EFFORT
+            return CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_EFFORT
         model = await asyncio.to_thread(
             self._claude_configured_model, target_cwd)
-        return model, CLAUDE_DEFAULT_EFFORT
+        # Claude's generic Opus aliases intentionally track the current Opus.
+        # Pin cc-remote's new-session choice to the context-qualified id so a
+        # provider cannot silently drop the requested 1M window. Exact custom
+        # and non-Opus ids remain provider-owned and pass through unchanged.
+        return (
+            _normalize_claude_new_session_model(model)
+            or CLAUDE_DEFAULT_MODEL,
+            CLAUDE_DEFAULT_EFFORT,
+        )
 
     async def _handle_get_models(self, cmd) -> None:
         """Answer with the engine's catalog and effective new-session defaults.
 
         Codex exposes its catalog through app-server. Claude has no side-effect-
         free catalog/default RPC, so its list stays empty while bounded settings
-        reads resolve an explicit cwd-aware model; the client keeps its static
-        presentation table.
+        reads resolve a cwd-aware model and fall back to the curated default;
+        the client keeps its static presentation table.
         """
         engine = getattr(cmd, "engine", None) or "cc"
         models = await codex_catalog() if engine == "codex" else []
@@ -8772,6 +8794,28 @@ class WrapperMachine:
         ctx = self.sessions.get(sid)
         if ctx is None:
             ctx = next((c for c in self.sessions.values() if c.session_id == sid), None)
+        if ctx is None and engine == "claude" and actual_space == "code":
+            # Claude's catalog accepts metadata-only JSONL files (for example,
+            # an ai-title row) even though the native CLI cannot resume them:
+            # there is no message cwd or conversation chain to restore.  Catch
+            # that exact on-disk state before _spawn so one click produces one
+            # session-scoped error instead of both _spawn's focused error and
+            # this handler's fallback error.
+            info = await asyncio.to_thread(get_session_info, sid)
+            if (info is not None and not getattr(info, "cwd", None)
+                    and transcript_path(sid) is not None):
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message=(
+                        "Claude 会话历史不完整，无法恢复；"
+                        "可从会话菜单删除该条目。"
+                    ),
+                    request_id=getattr(cmd, "cmd_id", None),
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
         if (ctx is not None
                 and getattr(ctx.sdk, "is_claude_broker", False)):
             # Terminal exit recovery is an in-place SDK handoff. Transport
@@ -8983,6 +9027,10 @@ class WrapperMachine:
             return error
         engine = getattr(cmd, "engine", "claude")
         space = getattr(cmd, "space", "code")
+        requested_model = getattr(cmd, "model", None)
+        if engine == "claude":
+            requested_model = _normalize_claude_new_session_model(
+                requested_model)
         work_record = None
         target_cwd = getattr(cmd, "cwd", None)
         if space == "work":
@@ -9008,7 +9056,7 @@ class WrapperMachine:
                 resume_id=None,
                 cwd=target_cwd,
                 engine=engine,
-                model=getattr(cmd, "model", None),
+                model=requested_model,
                 effort=getattr(cmd, "effort", None),
                 collaboration_mode=getattr(cmd, "collaboration_mode", None),
                 permission_mode=getattr(cmd, "permission_mode", None),
@@ -9421,7 +9469,12 @@ class WrapperMachine:
         if engine == "claude" and cwd is None:
             info = await asyncio.to_thread(get_session_info, sid)
             cwd = info.cwd if info is not None else None
-            if not cwd:
+            # A metadata-only Claude transcript has no cwd but is still a real
+            # exact-SID file in the SDK catalog. delete_session(directory=None)
+            # safely searches all project roots for that UUID and deletes only
+            # the matching transcript. Preserve the old not-found rejection
+            # when no exact transcript exists.
+            if not cwd and transcript_path(sid) is None:
                 error = Error(
                     code=ERR_NOT_RUNNING,
                     message="Claude 会话不存在",
@@ -11627,7 +11680,7 @@ class WrapperMachine:
     @staticmethod
     def _bg_blocked_session_ids() -> set[str]:
         ids: set[str] = set()
-        jobs = os.path.expanduser("~/.claude/jobs")
+        jobs = str(claude_config_dir() / "jobs")
         if not os.path.isdir(jobs):
             return ids
         try:
@@ -11683,8 +11736,11 @@ class WrapperMachine:
         retries resume→fresh on connect failure. `model`/`effort` (new_session
         only) pre-select those at spawn: effort BEFORE connect so the first turn
         runs at that strength with no respawn; cc model via a live set_model
-        after connect; codex model as a per-turn field. Omitted => engine
-        defaults (unchanged behavior)."""
+        after connect; codex model as a per-turn field. An omitted Claude model
+        resolves from current settings, then falls back to the curated default;
+        omitted Codex controls retain native defaults."""
+        explicit_claude_model = engine == "claude" and model is not None
+
         async def reject(
             code: str,
             message: str,
@@ -11853,6 +11909,13 @@ class WrapperMachine:
             effort = effort or saved_controls.effort
             permission_mode = (
                 permission_mode or saved_controls.permission_mode)
+        elif engine == "claude" and resume_id is None and model is None:
+            # Resolve the cwd-aware default at spawn time so a fresh session
+            # starts on the model shown by Remote. The browser still sends null
+            # for an implicit choice; this read is local, current, and cannot be
+            # stale across a settings/provider change.
+            model, _default_effort = await self._claude_new_session_defaults(
+                target_cwd)
 
         sdk = (
             (CodexHandle(
@@ -12086,8 +12149,24 @@ class WrapperMachine:
                 await ctx.sdk.set_model(model)
             except Exception as e:
                 log.warning("spawn set_model failed", model=model, error=str(e))
+                if explicit_claude_model and raise_on_failure:
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception:
+                        log.warning(
+                            "disconnect after explicit model failure failed")
+                    await reject(
+                        ERR_INTERNAL,
+                        "所选 Claude 模型暂不可用，请检查 Provider 配置后重试。",
+                    )
+                    return None
+                # An implicit curated default is a preference, not a reason to
+                # discard an otherwise healthy provider connection. Report only
+                # the model proven by the connect-time control probe.
+                model = getattr(ctx.sdk, "model", None)
             else:
                 await self._refresh_pending_claude_work_baseline(ctx)
+                model = getattr(ctx.sdk, "model", None) or model
         if (engine == "claude" and space == "code" and resume_id
                 and broker_handle is None):
             # Seed a migrated/existing SDK-owned session as soon as its native

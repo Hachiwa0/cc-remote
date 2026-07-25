@@ -47,6 +47,7 @@ from cc_remote.wrapper.claude_goal import (
 
 log = logger("cc_remote.wrapper.sdk")
 
+CLAUDE_DEFAULT_MODEL = "claude-opus-5[1m]"
 CLAUDE_DEFAULT_EFFORT = "max"
 _CONVERSATION_REWIND_PROBE_UUID = "00000000-0000-0000-0000-000000000000"
 

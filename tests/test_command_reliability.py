@@ -14,6 +14,7 @@ from cc_remote.protocol import (
     BtwOpened,
     CloseBtw,
     CommandAck,
+    DeleteSession,
     Effort,
     Error,
     GetContext,
@@ -917,6 +918,130 @@ def test_claude_btw_real_id_is_hidden_and_cannot_be_cold_resumed(monkeypatch):
                   and message.sid in {fork.key, real_id}]
         assert len(denied) == 3
         assert all(message.code == "auth" for message in denied)
+
+    asyncio.run(run())
+
+
+def test_metadata_only_claude_session_switch_fails_once_without_spawn(
+        monkeypatch, tmp_path):
+    async def run():
+        machine, transport = _mk_machine()
+        session_id = "11111111-2222-4333-8444-555555555555"
+        claude_root = tmp_path / "claude-root"
+        transcript = (
+            claude_root / "projects" / "-metadata-only"
+            / f"{session_id}.jsonl"
+        )
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            '{"type":"ai-title","aiTitle":"orphan",'
+            f'"sessionId":"{session_id}"' '}\n'
+            '{"type":"mode","mode":"normal",'
+            f'"sessionId":"{session_id}"' '}\n'
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_root))
+
+        async def forbidden_spawn(*_args, **_kwargs):
+            raise AssertionError("metadata-only session must not be resumed")
+
+        machine._spawn = forbidden_spawn
+        result = await machine._handle_switch_session(SwitchSession(
+            session_id=session_id,
+            engine="claude",
+            space="code",
+            cmd_id="switch-metadata-only",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == "not_running"
+        assert "历史不完整" in result.message
+        assert result.sid == session_id
+        assert result.to == "client-1"
+        assert result.request_id == "switch-metadata-only"
+        assert transport.sent == [result]
+
+    asyncio.run(run())
+
+
+def test_metadata_only_claude_session_can_be_deleted_by_exact_global_id(
+        monkeypatch, tmp_path):
+    async def run():
+        machine, transport = _mk_machine()
+        session_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        claude_root = tmp_path / "claude-root"
+        transcript = (
+            claude_root / "projects" / "-metadata-only"
+            / f"{session_id}.jsonl"
+        )
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            '{"type":"ai-title","aiTitle":"orphan",'
+            f'"sessionId":"{session_id}"' '}\n'
+            '{"type":"mode","mode":"normal",'
+            f'"sessionId":"{session_id}"' '}\n'
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_root))
+
+        async def not_codex(_sid):
+            return False
+
+        async def listed(_cmd):
+            return None
+
+        machine._is_codex_session = not_codex
+        machine._handle_list_sessions = listed
+
+        result = await machine._handle_delete_session(DeleteSession(
+            session_id=session_id,
+            engine="claude",
+            space="code",
+            cmd_id="delete-metadata-only",
+            client_id="client-1",
+        ))
+
+        assert result is None
+        assert not transcript.exists()
+        assert not [message for message in transport.sent
+                    if isinstance(message, Error)]
+
+    asyncio.run(run())
+
+
+def test_cwdless_claude_delete_still_rejects_unknown_transcript(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        session_id = "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb"
+        deleted = []
+
+        async def not_codex(_sid):
+            return False
+
+        machine._is_codex_session = not_codex
+        monkeypatch.setattr(
+            machine_module,
+            "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=None),
+        )
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: None)
+        monkeypatch.setattr(
+            machine_module,
+            "delete_session",
+            lambda sid, directory=None: deleted.append((sid, directory)),
+        )
+
+        result = await machine._handle_delete_session(DeleteSession(
+            session_id=session_id,
+            engine="claude",
+            space="code",
+            cmd_id="delete-unknown",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == "not_running"
+        assert deleted == []
 
     asyncio.run(run())
 

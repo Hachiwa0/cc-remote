@@ -106,6 +106,65 @@ def test_claude_skill_create_and_remove_uses_scoped_recoverable_trash(
     asyncio.run(run())
 
 
+def test_claude_user_skills_follow_config_dir_outside_home(
+    monkeypatch, tmp_path
+):
+    async def run():
+        home = tmp_path / "home"
+        config = tmp_path / "profiles" / "claude"
+        project = tmp_path / "project"
+        home.mkdir()
+        project.mkdir()
+        monkeypatch.setattr(
+            capabilities_module.Path, "home", classmethod(lambda _cls: home)
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+        active = config / "skills" / "active" / "SKILL.md"
+        legacy = home / ".claude" / "skills" / "legacy" / "SKILL.md"
+        project_skill = project / ".claude" / "skills" / "project" / "SKILL.md"
+        for manifest, name in (
+            (active, "active"),
+            (legacy, "legacy"),
+            (project_skill, "project"),
+        ):
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(f"---\nname: {name}\n---\n")
+
+        items = capabilities_module._claude_skills(str(project))
+        assert {(item["name"], item["scope"]) for item in items} == {
+            ("active", "user"),
+            ("project", "project"),
+        }
+
+        await capabilities_module.manage_engine_skill(
+            "claude", "create", str(project), name="created-user",
+            instructions="Use the configured root.", scope="user",
+        )
+        await capabilities_module.manage_engine_skill(
+            "claude", "create", str(project), name="created-project",
+            instructions="Stay project-local.", scope="project",
+        )
+        user_manifest = config / "skills" / "created-user" / "SKILL.md"
+        assert user_manifest.is_file()
+        assert not (home / ".claude" / "skills" / "created-user").exists()
+        assert (
+            project / ".claude" / "skills" / "created-project" / "SKILL.md"
+        ).is_file()
+
+        created = next(
+            item for item in capabilities_module._claude_skills(str(project))
+            if item["name"] == "created-user"
+        )
+        await capabilities_module.manage_engine_skill(
+            "claude", "remove", str(project), skill_id=created["id"]
+        )
+        assert not user_manifest.parent.exists()
+        assert list((config / ".cc-remote-trash" / "skills").iterdir())
+
+    asyncio.run(run())
+
+
 def test_skill_create_rejects_path_traversal(monkeypatch, tmp_path):
     async def run():
         home = tmp_path / "home"
@@ -157,6 +216,80 @@ def test_claude_hook_create_remove_preserves_unrelated_settings(
         )
         after_remove = json.loads(settings.read_text())
         assert after_remove == {"model": "keep-me", "custom": {"x": 1}}
+
+    asyncio.run(run())
+
+
+def test_claude_user_hooks_follow_config_dir_outside_home(
+    monkeypatch, tmp_path
+):
+    async def run():
+        home = tmp_path / "home"
+        config = tmp_path / "profiles" / "claude"
+        project = tmp_path / "project"
+        home.mkdir()
+        config.mkdir(parents=True)
+        project.mkdir()
+        monkeypatch.setattr(
+            capabilities_module.Path, "home", classmethod(lambda _cls: home)
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+
+        active_settings = config / "settings.json"
+        active_settings.write_text(json.dumps({
+            "model": "keep-active",
+            "hooks": {
+                "PreToolUse": [{"hooks": [{"type": "command", "command": "a"}]}]
+            },
+        }))
+        legacy_settings = home / ".claude" / "settings.json"
+        legacy_settings.parent.mkdir(parents=True)
+        legacy_settings.write_text(json.dumps({
+            "hooks": {
+                "Notification": [
+                    {"hooks": [{"type": "command", "command": "legacy"}]}
+                ]
+            }
+        }))
+        project_settings = project / ".claude" / "settings.local.json"
+        project_settings.parent.mkdir(parents=True)
+        project_settings.write_text(json.dumps({
+            "hooks": {
+                "PostToolUse": [
+                    {"hooks": [{"type": "command", "command": "project"}]}
+                ]
+            }
+        }))
+
+        hooks = capabilities_module._claude_hooks(str(project))
+        assert {(hook["name"], hook["scope"]) for hook in hooks} == {
+            ("PreToolUse", "user"),
+            ("PostToolUse", "project-local"),
+        }
+
+        await capabilities_module.manage_engine_hook(
+            "claude", "create", str(project), event="SessionStart",
+            command="user-hook", scope="user",
+        )
+        await capabilities_module.manage_engine_hook(
+            "claude", "create", str(project), event="SessionEnd",
+            command="project-hook", scope="project",
+        )
+        assert json.loads(active_settings.read_text())["model"] == "keep-active"
+        assert "SessionStart" in json.loads(active_settings.read_text())["hooks"]
+        assert "SessionEnd" in json.loads(project_settings.read_text())["hooks"]
+        assert "SessionStart" not in json.loads(legacy_settings.read_text())["hooks"]
+
+        created = next(
+            hook for hook in capabilities_module._claude_hooks(str(project))
+            if hook["name"] == "SessionStart"
+        )
+        await capabilities_module.manage_engine_hook(
+            "claude", "remove", str(project), hook_id=created["id"]
+        )
+        after_remove = json.loads(active_settings.read_text())
+        assert after_remove["model"] == "keep-active"
+        assert "SessionStart" not in after_remove["hooks"]
 
     asyncio.run(run())
 

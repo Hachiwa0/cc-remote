@@ -51,6 +51,8 @@ import {
   commandsFor,
   isKnownCodeOnlySlash,
   matchCommands,
+  matchModelId,
+  MODELS,
   modelsFor,
   permsFor,
 } from "../src/data.ts";
@@ -1226,6 +1228,15 @@ try {
     message: "Traceback: secret path /private/token",
   }) });
   assert.equal(commandProblem.banner, "操作未完成，请稍后重试。");
+  const incompleteClaudeSession = reduce(
+    commandProblem,
+    { type: "event", event: event({
+      type: "error", sid: problemSid, code: "not_running",
+      message: "Claude 会话历史不完整，无法恢复；可从会话菜单删除该条目。",
+    }) },
+  );
+  assert.equal(incompleteClaudeSession.banner,
+    "Claude 会话历史不完整，无法恢复；可从会话菜单删除该条目。");
   // Work/Code and engine switches restore the target surface's last accepted
   // list immediately. The authoritative refresh may take ~1s for Codex because
   // app-server is started on demand, but it must not blank the sidebar meanwhile.
@@ -1752,6 +1763,8 @@ try {
   const claudeModelsMarkup = renderToStaticMarkup(createElement(ModelCommandSheet, {
     open: true, kind: "models", engine: "claude", onClose: () => undefined,
   }));
+  assert.match(claudeModelsMarkup, /Opus 5/);
+  assert.match(claudeModelsMarkup, /1M 上下文/);
   assert.doesNotMatch(claudeModelsMarkup, /自定义 \/ Provider 模型 ID|custom-claude-model/,
     "Claude's ordinary model sheet must not expose raw provider ids");
   const codexModelsMarkup = renderToStaticMarkup(createElement(ModelCommandSheet, {
@@ -4570,6 +4583,27 @@ assert.equal(btwEffortFrame.sid, "btw-pinned");
 assert.equal(btwEffortFrame.effort, "high");
 
 const codexModels = modelsFor("codex");
+const opus5 = MODELS.find((model) => model.id === "claude-opus-5[1m]");
+assert.ok(opus5, "Claude's curated model sheet must expose Opus 5 with 1M context");
+assert.equal(MODELS[0].id, "claude-opus-5[1m]",
+  "Opus 5 with 1M context must be the default curated Claude card");
+assert.equal(opus5.name, "Opus 5");
+assert.match(opus5.ds, /1M 上下文/);
+assert.equal(matchModelId("claude-opus-5[1m]", "claude"),
+  "claude-opus-5[1m]",
+  "an exact context-qualified Claude model id must not be reduced to its base alias");
+assert.equal(matchModelId("claude-opus-5", "claude"),
+  "claude-opus-5[1m]",
+  "the legacy unqualified Opus 5 alias must resolve to the curated 1M model");
+assert.equal(matchModelId("claude-mythos-5[1m]", "claude"),
+  "claude-mythos-5",
+  "context suffix compatibility must remain for existing Claude cards");
+assert.equal(matchModelId("claude-opus-5-custom", "claude"),
+  "claude-opus-5-custom",
+  "a provider-specific model id must not be swallowed by the curated Opus alias");
+assert.equal(matchModelId("claude-opus-5[provider]", "claude"),
+  "claude-opus-5[provider]",
+  "only the literal 1M suffix may participate in curated model compatibility");
 assert.equal(clientSlashesFor("codex").has("plan"), true);
 assert.equal(clientSlashesFor("codex").has("normal"), true);
 assert.equal(commandsFor("codex").some((command) => (
