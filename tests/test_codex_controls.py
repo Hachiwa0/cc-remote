@@ -1568,6 +1568,16 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
 
     async def run():
         process = FakeProcess()
+        repair_calls = []
+
+        def repair_provider_records(**kwargs):
+            repair_calls.append(kwargs)
+            return SimpleNamespace(
+                changed_db_thread_ids=(),
+                changed_rollout_thread_ids=(),
+                deferred_thread_ids=(),
+            )
+
         monkeypatch.setattr(
             codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
@@ -1578,6 +1588,16 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
+        monkeypatch.setattr(
+            codex_handle_module,
+            "repair_http_provider_records",
+            repair_provider_records,
+        )
+        monkeypatch.setattr(
+            codex_handle_module,
+            "canonical_thread_provider_is_restored",
+            lambda _sid: True,
+        )
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
         calls = []
@@ -1635,6 +1655,86 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
             "persisted-model", "ultra",
             "never" if work_mode else "on-request", "fast")
         await handle.disconnect()
+        assert bool(repair_calls) is http_only
+
+    asyncio.run(run())
+
+
+def test_http_provider_guard_runs_after_every_persisting_request(monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._http_provider_root_id = "root-thread"
+        handle.thread_id = "root-thread"
+        restored = []
+
+        async def restore(**kwargs):
+            restored.append(kwargs)
+
+        async def send(message):
+            handle._pending[message["id"]].set_result({"ok": True})
+
+        monkeypatch.setattr(handle, "_restore_http_provider_state", restore)
+        monkeypatch.setattr(handle, "_send", send)
+
+        for method in sorted(
+            codex_handle_module._HTTP_PROVIDER_PERSISTING_METHODS
+        ):
+            await handle._request(method, {"threadId": "root-thread"})
+        await handle._request(
+            "thread/read",
+            {"threadId": "root-thread", "includeTurns": False},
+        )
+
+        assert restored == [
+            {} for _ in codex_handle_module._HTTP_PROVIDER_PERSISTING_METHODS
+        ]
+
+    asyncio.run(run())
+
+
+def test_http_provider_guard_runs_for_late_persisting_notification(monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._http_provider_root_id = "root-thread"
+        handle.thread_id = "root-thread"
+        restored = []
+
+        async def restore(**kwargs):
+            restored.append(kwargs)
+
+        monkeypatch.setattr(handle, "_restore_http_provider_state", restore)
+        await handle._dispatch({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "root-thread",
+                "status": {"type": "idle"},
+            },
+        })
+
+        assert restored == [{}]
+
+    asyncio.run(run())
+
+
+def test_http_provider_delayed_repair_stops_cleanly(monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._http_provider_root_id = "root-thread"
+        calls = []
+
+        async def restore(**kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr(handle, "_restore_http_provider_state", restore)
+        handle._schedule_http_provider_descendant_repair()
+        tasks = set(handle._http_provider_repair_tasks)
+        assert len(tasks) == 3
+
+        handle._http_provider_repair_stop.set()
+        await asyncio.gather(*tasks)
+
+        assert calls == []
+        assert handle._http_provider_repair_tasks == set()
 
     asyncio.run(run())
 

@@ -53,6 +53,11 @@ from cc_remote.wrapper.codex_sessions import (
     codex_model,
     codex_rollout_path,
 )
+from cc_remote.wrapper.codex_provider_repair import (
+    HTTP_COMPAT_PROVIDER_ID,
+    canonical_thread_provider_is_restored,
+    repair_http_provider_records,
+)
 from cc_remote.wrapper.child_env import sanitized_child_env
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
@@ -99,7 +104,7 @@ _LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
 # sessions keep the shared daemon and its CLI <-> Remote live channel.
 _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES = 256 * 1024 * 1024
 _ROLLOUT_SESSION_META_MAX_BYTES = 1024 * 1024
-_OPENAI_HTTP_RESUME_PROVIDER_ID = "cc_remote_openai_http"
+_OPENAI_HTTP_RESUME_PROVIDER_ID = HTTP_COMPAT_PROVIDER_ID
 _OPENAI_HTTP_RESUME_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _CODEX_DESKTOP_BIN_CANDIDATES = (
     "/Applications/ChatGPT.app/Contents/Resources/codex",
@@ -117,6 +122,21 @@ _WORK_DISABLED_FEATURES = (
     "remote_plugin",
     "tool_suggest",
 )
+_HTTP_PROVIDER_PERSISTING_METHODS = frozenset({
+    "review/start",
+    "thread/compact/start",
+    "thread/goal/clear",
+    "thread/goal/set",
+    "thread/rollback",
+    "thread/settings/update",
+    "turn/start",
+})
+_HTTP_PROVIDER_PERSISTING_NOTIFICATIONS = frozenset({
+    "thread/settings/updated",
+    "thread/status/changed",
+    "turn/completed",
+    "turn/started",
+})
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
@@ -769,6 +789,14 @@ class CodexHandle:
         self._runtime_event_seen: OrderedDict[str, None] = OrderedDict()
         self._runtime_rate_keys: OrderedDict[str, str] = OrderedDict()
         self._runtime_event_lock = asyncio.Lock()
+        # The process-local HTTP alias is a transport implementation detail.
+        # Codex persists it after several otherwise unrelated thread mutations;
+        # serialize the narrow durable-state repair so concurrent controls
+        # cannot race each other or expose the alias to ordinary App/CLI clients.
+        self._http_provider_root_id: Optional[str] = None
+        self._http_provider_repair_lock = asyncio.Lock()
+        self._http_provider_repair_tasks: set[asyncio.Task] = set()
+        self._http_provider_repair_stop = asyncio.Event()
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
         self.app_server_version: Optional[str] = None
@@ -1041,6 +1069,9 @@ class CodexHandle:
             )
             if private_core is not None:
                 codex_bin = private_core
+        self._http_provider_root_id = resume_id if http_only_resume else None
+        if http_only_resume:
+            self._http_provider_repair_stop.clear()
         child_env = _codex_env(codex_bin)
         stdio_argv = [codex_bin, "app-server", "--stdio"]
         if http_only_resume:
@@ -1252,6 +1283,8 @@ class CodexHandle:
                 self.thread_id = _thread_id_of(res)
             if not self.thread_id:
                 raise RuntimeError("codex app-server did not return a thread id")
+            if http_only_resume:
+                await self._restore_http_provider_state(strict=True)
             if isinstance(res, dict):
                 authoritative = res
                 if not resume_id:
@@ -1394,6 +1427,7 @@ class CodexHandle:
         q = self._turn_q
         if q is None:
             return
+        terminal_seen = False
         try:
             while True:
                 msg = await q.get()
@@ -1404,6 +1438,7 @@ class CodexHandle:
                 # spending a third queue slot on a sentinel. Legacy asyncio.Queue
                 # tests may still append one; it is harmlessly abandoned below.
                 if isinstance(msg, dict) and msg.get("method") == "turn/completed":
+                    terminal_seen = True
                     break
         finally:
             if self._turn_q is q:
@@ -1415,6 +1450,11 @@ class CodexHandle:
             # ownership (thread-scoped hooks depend on this flag).
             if self._spontaneous_turn_id is None:
                 self.turn_active = False
+            if terminal_seen:
+                await self._restore_http_provider_state(
+                    include_descendants=True,
+                )
+                self._schedule_http_provider_descendant_repair()
 
     def _notification_queue_limits(
         self, *, managed: bool,
@@ -1602,6 +1642,7 @@ class CodexHandle:
         q = self._spontaneous_q
         if q is None or self._spontaneous_queue_turn_id != turn_id:
             return
+        terminal_seen = False
         try:
             while True:
                 item = await q.get()
@@ -1609,12 +1650,18 @@ class CodexHandle:
                 if isinstance(item, CodexSpontaneousClosed):
                     break
                 if isinstance(item, dict) and item.get("method") == "turn/completed":
+                    terminal_seen = True
                     break
         finally:
             if self._spontaneous_q is q:
                 self._spontaneous_q = None
                 self._spontaneous_queue_turn_id = None
                 self._spontaneous_overflow = False
+            if terminal_seen:
+                await self._restore_http_provider_state(
+                    include_descendants=True,
+                )
+                self._schedule_http_provider_descendant_repair()
 
     async def interrupt(self) -> None:
         if not (self.proc and self.thread_id and self.turn_id):
@@ -1649,6 +1696,7 @@ class CodexHandle:
             raise
 
     async def disconnect(self) -> None:
+        self._http_provider_repair_stop.set()
         proc = self.proc
         process_group = self._process_group
         daemon_proxy = self._using_daemon_proxy
@@ -1717,6 +1765,15 @@ class CodexHandle:
         if spontaneous_turn_id is not None:
             await self._publish_turn_lifecycle(
                 "completed", spontaneous_turn_id)
+        await self._restore_http_provider_state(include_descendants=True)
+        self._http_provider_root_id = None
+        repair_tasks = [
+            task for task in self._http_provider_repair_tasks
+            if task is not asyncio.current_task()
+        ]
+        if repair_tasks:
+            await asyncio.gather(*repair_tasks, return_exceptions=True)
+        self._http_provider_repair_tasks.clear()
         if daemon_proxy:
             log.debug("codex daemon proxy disconnected")
 
@@ -1763,6 +1820,7 @@ class CodexHandle:
                     self._thread_settings_updated.wait(),
                     timeout=_THREAD_SETTINGS_NOTIFY_TIMEOUT,
                 )
+                await self._restore_http_provider_state()
                 return True
             except asyncio.TimeoutError:
                 log.warning("codex thread settings notification timed out")
@@ -2263,9 +2321,113 @@ class CodexHandle:
             obj["params"] = params
         await self._send(obj)
         try:
-            return await asyncio.wait_for(fut, timeout=_REQ_TIMEOUT)
+            result = await asyncio.wait_for(fut, timeout=_REQ_TIMEOUT)
+            if method in _HTTP_PROVIDER_PERSISTING_METHODS:
+                await self._restore_http_provider_state()
+            return result
         finally:
             self._pending.pop(rid, None)
+
+    async def _restore_http_provider_state(
+        self,
+        *,
+        include_descendants: bool = False,
+        strict: bool = False,
+    ) -> None:
+        root_id = self._http_provider_root_id
+        if root_id is None:
+            return
+        include_ids = {
+            value for value in (root_id, self.thread_id)
+            if isinstance(value, str) and value
+        }
+        roots = {root_id} if include_descendants else set()
+        async with self._http_provider_repair_lock:
+            try:
+                report = await asyncio.to_thread(
+                    repair_http_provider_records,
+                    apply=True,
+                    roots=roots,
+                    include_thread_ids=include_ids,
+                )
+                restored = await asyncio.to_thread(
+                    canonical_thread_provider_is_restored,
+                    root_id,
+                )
+                if strict and not restored:
+                    raise RuntimeError(
+                        "Codex HTTP compatibility provider was not restored")
+                if report.changed_db_thread_ids or report.changed_rollout_thread_ids:
+                    log.info(
+                        "Codex HTTP provider durable state canonicalized",
+                        db_rows=len(report.changed_db_thread_ids),
+                        rollout_rows=len(report.changed_rollout_thread_ids),
+                    )
+                if report.deferred_thread_ids:
+                    log.info(
+                        "Codex HTTP provider child repair deferred",
+                        rows=len(report.deferred_thread_ids),
+                    )
+            except Exception as exc:
+                log.warning(
+                    "Codex HTTP provider durable state repair failed",
+                    error_type=type(exc).__name__,
+                )
+                if strict:
+                    raise
+
+    def _schedule_http_provider_descendant_repair(self) -> None:
+        root_id = self._http_provider_root_id
+        if root_id is None:
+            return
+        # Codex can flush/archive subagent rollouts after the parent terminal.
+        # Retry in the background without delaying the visible TurnEnd.  A later
+        # disconnect performs one final synchronous pass before clearing root_id.
+        live = {
+            task for task in self._http_provider_repair_tasks
+            if not task.done()
+        }
+        self._http_provider_repair_tasks = live
+        if live:
+            return
+        for delay in (1.0, 5.0, 20.0):
+            task = asyncio.create_task(
+                self._delayed_http_provider_descendant_repair(
+                    root_id, delay),
+            )
+            self._http_provider_repair_tasks.add(task)
+            task.add_done_callback(self._http_provider_repair_done)
+
+    async def _delayed_http_provider_descendant_repair(
+        self,
+        root_id: str,
+        delay: float,
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                self._http_provider_repair_stop.wait(),
+                timeout=delay,
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        if self._http_provider_root_id != root_id:
+            return
+        await self._restore_http_provider_state(include_descendants=True)
+
+    def _http_provider_repair_done(self, task: asyncio.Task) -> None:
+        self._http_provider_repair_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            log.warning(
+                "delayed Codex HTTP provider repair failed",
+                error_type=type(error).__name__,
+            )
 
     async def _notify(self, method: str, params: Optional[dict] = None) -> None:
         obj = {"jsonrpc": "2.0", "method": method}
@@ -2908,6 +3070,8 @@ class CodexHandle:
                      or completed_turn_id == spontaneous_turn_id)
             ):
                 completed_spontaneous_turn_id = spontaneous_turn_id
+        if method in _HTTP_PROVIDER_PERSISTING_NOTIFICATIONS:
+            await self._restore_http_provider_state()
         if self._turn_q is not None and _is_turn_queue_notification(method):
             queue = self._turn_q
             if not self._queue_managed_notification(m, raw_size):
