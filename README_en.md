@@ -241,7 +241,7 @@ First get the relay + wrapper + web running on the **machine where the agent CLI
 
 ### Prerequisites
 
-- A machine signed in to **Claude Code** or to a **Codex CLI** that supports `app-server`, with the CLI itself already **able to chat**. Claude uses the official CLI bundled with the locked and regression-tested SDK by default; each new Codex app-server reselects the newest usable local install. Make both available to switch engines in the web UI.
+- A machine signed in to **Claude Code** or to a **Codex CLI** that supports `app-server`, with the CLI itself already **able to chat**. The Claude wrapper explicitly launches the daily `~/.local/bin/claude` rather than the SDK-bundled copy; each new Codex app-server reselects the newest usable local install. Make both available to switch engines in the web UI.
 - **Python 3.10+**, **Node 20.19+** (to build the web client).
 - Optional: Office artifact preview requires **LibreOffice + bubblewrap** on the
   Linux wrapper host (for example, `sudo apt install libreoffice bubblewrap`).
@@ -280,14 +280,21 @@ PUBLIC_ORIGIN=http://127.0.0.1:8765
 WEB_STATIC_DIR=web/dist
 # default working directory of the agent session (the project you want it to work on)
 CC_CWD=/path/to/your/project
-# optional explicit Claude CLI path when systemd/PATH cannot find it
-CLAUDE_BIN=/absolute/path/to/claude
+# share the same Claude Code install used by the normal terminal
+CLAUDE_BIN=~/.local/bin/claude
 ```
 
 > For a local loopback quick start, the relay and wrapper may share this `.env`;
 > it is not a production secret store. A public deployment must use the
 > root-only `/etc/cc-remote/wrapper.env` below so bypass-permissions model/tools
 > cannot read control-plane credentials directly.
+>
+> The Python SDK remains pinned to the repository-tested version and owns the
+> message protocol plus interrupt/drain behavior. `CLAUDE_BIN` is the Claude
+> Code executable that actually runs each session, so Remote and the terminal
+> share CLI updates, Keychain/login state, and `~/.claude/settings.json`.
+> An empty `CLAUDE_BIN` still resolves to `~/.local/bin/claude`; it does not
+> silently switch back to the SDK bundle.
 
 ### 3) Run (two terminals)
 
@@ -620,7 +627,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `WRAPPER_TOKEN` | `change-me-wrapper` | Same as relay. |
 | `CC_REMOTE_MACHINE_ID` | `default` | Stable route id on a multi-machine relay; must match its `WRAPPER_TOKENS_JSON` key when that policy is enabled. |
 | `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | Interactive pairing credential; the file must be private to the current user. Explicit `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` values take precedence. |
-| `CLAUDE_BIN` | empty | Optional absolute Claude CLI path; set it when systemd/PATH cannot find `claude`. |
+| `CLAUDE_BIN` | `~/.local/bin/claude` | Daily Claude Code executable launched by the wrapper. Empty still selects this default; use another absolute path only when the CLI is installed elsewhere. |
 | `CC_REMOTE_CODEX_PROXY` | empty | Optional HTTP(S)/SOCKS5 proxy injected only into Codex subprocesses launched by the wrapper. It does not change the wrapper-to-relay connection or the user's terminal `codex`. |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server. Work is always private and ignores this setting. |
 | `CC_CWD` | cwd | Default working directory for new sessions. Claude `--resume` needs it to locate `~/.claude/projects/` — **it must be correct**; Codex resume first recovers the original cwd from its rollout. |

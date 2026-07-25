@@ -549,6 +549,10 @@ def test_release_docs_and_examples_describe_one_atomic_v20_layout():
     readme_en = (ROOT / "README_en.md").read_text()
     claude = (ROOT / "CLAUDE.md").read_text()
     wrapper_env = (ROOT / "deploy" / "env.wrapper.example").read_text()
+    wrapper_plist = (
+        ROOT / "deploy" / "com.muggle.cc-remote.wrapper.plist.in"
+    ).read_text()
+    wrapper_installer = (ROOT / "deploy" / "install-wrapper.sh").read_text()
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
@@ -561,12 +565,15 @@ def test_release_docs_and_examples_describe_one_atomic_v20_layout():
         assert "sudo rsync -a --delete" not in document
         assert "/opt/cc-remote/current" in document
         assert "/opt/cc-remote/releases" in document
-    assert "CLAUDE_BIN=\n" in wrapper_env
-    assert "CLAUDE_BIN=/" not in wrapper_env
+    assert "CLAUDE_BIN=/home/youruser/.local/bin/claude" in wrapper_env
+    assert "<key>CLAUDE_BIN</key>" in wrapper_plist
+    assert "<string>__HOME__/.local/bin/claude</string>" in wrapper_plist
+    assert "printf 'CLAUDE_BIN=%s/.local/bin/claude" in wrapper_installer
+    assert "daily Claude Code executable is missing" in wrapper_installer
     assert "WEB_STATIC_DIR=/opt/cc-remote/current/web/dist" in relay_env
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
-    assert "claude-agent-sdk==0.2.119" in claude
+    assert "claude-agent-sdk==0.2.128" in claude
     assert "protocol v20" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude

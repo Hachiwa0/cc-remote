@@ -21,7 +21,9 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   Linux Wrapper bundles. It builds the immutable release before pairing and
   activation, stores device authority outside the release, atomically switches
   `current`, installs a per-user LaunchAgent or root-managed systemd unit, and
-  restores the previous release/service definition on failure.
+  restores the previous release/service definition on failure. The installer
+  requires and explicitly selects the service user's daily
+  `~/.local/bin/claude`; it never silently falls back to the SDK-bundled CLI.
 - `setup-vps.sh` — atomic VPS release installer. It validates a user-owned
   upload, copies it to a new root-owned
   `/opt/cc-remote/releases/release-*` directory, builds that release's own

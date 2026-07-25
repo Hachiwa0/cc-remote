@@ -199,7 +199,7 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### 前置
 
-- 一台已完成 **Claude Code** 或支持 `app-server` 的 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器；Claude 默认使用锁定 SDK 自带并经过回归的官方 CLI，Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个都可用即可在网页中切换引擎。
+- 一台已完成 **Claude Code** 或支持 `app-server` 的 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器。Claude wrapper 会显式启动日常使用的 `~/.local/bin/claude`，而不是 SDK 内置副本；Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个都可用即可在网页中切换引擎。
 - **Python 3.10+**、**Node 20.19+**（用来构建网页）。
 - 可选：要预览 DOCX/XLSX/PPTX 等 Office 文件，Linux wrapper 主机需安装
   **LibreOffice + bubblewrap**（例如 `sudo apt install libreoffice bubblewrap`）；VPS 不需要。
@@ -237,13 +237,18 @@ PUBLIC_ORIGIN=http://127.0.0.1:8765
 WEB_STATIC_DIR=web/dist
 # agent 会话的默认工作目录（你要让它操作的项目目录）
 CC_CWD=/path/to/your/project
-# systemd/PATH 找不到 Claude CLI 时可显式指定；否则留空
-CLAUDE_BIN=/absolute/path/to/claude
+# 与日常终端共用同一个 Claude Code 安装；仅在安装位置不同时覆盖
+CLAUDE_BIN=~/.local/bin/claude
 ```
 
 > 本地 loopback 快速体验时，中继和 wrapper 可读同一个 `.env`；它不适合生产。
 > 公网 wrapper 必须按下文使用 root-only `/etc/cc-remote/wrapper.env`，避免
 > `bypassPermissions` 模型/工具直接读取控制面密钥。
+>
+> Python SDK 仍固定为仓库验证过的版本，负责消息协议和 interrupt/drain；
+> 真正执行会话的是 `CLAUDE_BIN` 指向的日常 Claude Code。这样 Remote 与终端
+> 共用同一套 CLI 更新、Keychain/登录状态和 `~/.claude/settings.json`。
+> `CLAUDE_BIN` 为空时也会回到 `~/.local/bin/claude`，不会静默改用 SDK bundle。
 
 ### 3）跑起来（两个终端）
 
@@ -556,7 +561,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `WRAPPER_TOKEN` | `change-me-wrapper` | 同中继。 |
 | `CC_REMOTE_MACHINE_ID` | `default` | 多机器 relay 中的稳定路由 id；使用 `WRAPPER_TOKENS_JSON` 时必须匹配对应键。 |
 | `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | 交互配对凭据路径；文件必须仅当前用户可读。显式的 `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` 优先。 |
-| `CLAUDE_BIN` | 空 | 可选的 Claude CLI 绝对路径；systemd/PATH 找不到 `claude` 时设置。 |
+| `CLAUDE_BIN` | `~/.local/bin/claude` | wrapper 实际启动的日常 Claude Code；空值仍使用该默认路径。只有 CLI 安装在别处时才设为另一个绝对路径。 |
 | `CC_REMOTE_CODEX_PROXY` | 空 | 仅注入 wrapper 启动的 Codex 子进程的 HTTP(S)/SOCKS5 代理；不改 wrapper 到 relay 的连接，也不影响用户终端里的 `codex`。例如 nono 可填 `http://127.0.0.1:7897`。 |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server。Work 始终私有，不受此项影响。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |

@@ -132,7 +132,7 @@ def test_claude_work_passes_complete_policy_path_without_sdk_replacement(
     command = transport._build_command()
     settings_index = command.index("--settings")
 
-    # SDK 0.2.119 returns inline JSON here whenever options.sandbox is set,
+    # SDK 0.2.128 returns inline JSON here whenever options.sandbox is set,
     # replacing the policy file's complete sandbox object. Work must pass the
     # wrapper-owned file path verbatim instead.
     assert command[settings_index + 1] == str(policy)
@@ -220,9 +220,18 @@ def test_wrapper_systemd_keeps_secret_source_outside_model_namespace():
     assert "NoNewPrivileges=true" in unit
 
 
-def test_claude_bin_defaults_to_path_and_can_be_configured(monkeypatch, tmp_path):
+def test_claude_bin_defaults_to_daily_local_cli_and_can_be_configured(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("CLAUDE_BIN", raising=False)
-    assert WrapperConfig().claude_bin == ""
+    assert WrapperConfig().claude_bin == str(home / ".local/bin/claude")
+
+    # An explicitly empty dotenv value must not silently restore the SDK bundle.
+    monkeypatch.setenv("CLAUDE_BIN", "   ")
+    assert WrapperConfig().claude_bin == str(home / ".local/bin/claude")
 
     cli = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_BIN", f"  {cli}  ")
@@ -254,8 +263,8 @@ def test_claude_preflight_inspects_effective_bundled_runtime(monkeypatch):
         sdk_module,
         "inspect_claude_runtime",
         lambda configured: seen.append(configured) or SimpleNamespace(
-            sdk_version="0.2.119",
-            cli_version="2.1.210",
+            sdk_version="0.2.128",
+            cli_version="2.1.220",
             cli_source="bundled",
             cli_path="/sdk/_bundled/claude",
         ),
@@ -272,8 +281,8 @@ def test_claude_preflight_inspects_configured_runtime(monkeypatch, tmp_path):
         sdk_module,
         "inspect_claude_runtime",
         lambda configured: seen.append(configured) or SimpleNamespace(
-            sdk_version="0.2.119",
-            cli_version="2.1.210",
+            sdk_version="0.2.128",
+            cli_version="2.1.220",
             cli_source="configured",
             cli_path=configured,
         ),

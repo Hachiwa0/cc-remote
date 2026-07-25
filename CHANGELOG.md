@@ -2,6 +2,12 @@
 
 [中文](CHANGELOG_zh.md)
 
+## Unreleased
+
+- Upgrade Claude Agent SDK to `0.2.128` and make wrappers explicitly run the
+  user's daily `~/.local/bin/claude` instead of silently selecting the SDK
+  bundle, keeping Remote and terminal credentials and CLI updates aligned.
+
 ## v3.0.0 — 2026-07-24
 
 cc-remote v3 adds an isolated Cowork-style Work surface to the established

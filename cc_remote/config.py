@@ -30,6 +30,12 @@ def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+def _claude_bin() -> str:
+    """Use the user's normal Claude Code install unless explicitly overridden."""
+    configured = _env("CLAUDE_BIN", "").strip()
+    return configured or str(Path.home() / ".local/bin/claude")
+
+
 def _int(key: str, default: int) -> int:
     v = os.environ.get(key)
     return int(v) if v and v.strip() else default
@@ -178,9 +184,10 @@ class WrapperConfig:
     # each uses a distinct id; "default" preserves the single-machine setup.
     machine_id: str = field(default_factory=lambda: _wrapper_value(
         "CC_REMOTE_MACHINE_ID", "machine_id", "default").strip() or "default")
-    # Optional explicit Claude Code executable. Blank preserves the existing
-    # SDK/PATH discovery behavior.
-    claude_bin: str = field(default_factory=lambda: _env("CLAUDE_BIN", "").strip())
+    # Keep Remote on the same rolling Claude Code install used from the user's
+    # shell. An explicit absolute CLAUDE_BIN may override this standard path,
+    # but an empty value must never silently select the SDK-bundled executable.
+    claude_bin: str = field(default_factory=_claude_bin)
     # Optional proxy inherited only by Codex subprocesses launched by this
     # wrapper.  It deliberately does not mutate the wrapper process or the
     # user's shell/CLI environment.

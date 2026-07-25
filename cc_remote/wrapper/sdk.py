@@ -159,9 +159,9 @@ class SdkHandle:
 
     @staticmethod
     def preflight(cli_path: str = "") -> None:
-        # ClaudeAgentOptions prefers the SDK-bundled executable when cli_path is
-        # blank. Inspect that effective runtime instead of requiring an unrelated
-        # PATH entry, and reject any unverified SDK patch release exactly.
+        # WrapperConfig supplies the user's daily ~/.local/bin/claude by
+        # default. Inspect that exact runtime (or an explicit override), and
+        # reject any unverified SDK patch release exactly.
         runtime = inspect_claude_runtime(cli_path)
         log.info(
             "Claude runtime verified",
@@ -230,7 +230,7 @@ class SdkHandle:
             setting_sources=[] if self.work_mode else None,
             skills=[] if self.work_mode else None,
             # The wrapper-owned Work settings file already contains the complete
-            # fail-closed sandbox including its filesystem allowlist. SDK 0.2.119
+            # fail-closed sandbox including its filesystem allowlist. SDK 0.2.128
             # replaces (rather than deep-merges) that object when `sandbox=` is
             # also supplied, silently dropping filesystem policy and inlining
             # provider credentials in argv. Pass only the policy path instead.

@@ -2,6 +2,12 @@
 
 [English](CHANGELOG.md)
 
+## 未发布
+
+- Claude Agent SDK 升级到 `0.2.128`，同时让 wrapper 显式运行用户日常使用的
+  `~/.local/bin/claude`，不再静默选择 SDK 内置副本，使 Remote 与终端的凭据和
+  CLI 更新保持一致。
+
 ## v3.0.0 — 2026-07-24
 
 cc-remote v3 在原有 Claude Code + Codex 远程控制面之上新增隔离的 Cowork 风格

@@ -12,9 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_claude_sdk_policy_is_exact():
-    assert claude_runtime.validate_sdk_version("0.2.119") == "0.2.119"
-    with pytest.raises(RuntimeError, match="not the verified 0.2.119"):
-        claude_runtime.validate_sdk_version("0.2.120")
+    assert claude_runtime.validate_sdk_version("0.2.128") == "0.2.128"
+    with pytest.raises(RuntimeError, match="not the verified 0.2.128"):
+        claude_runtime.validate_sdk_version("0.2.127")
 
 
 def test_verified_claude_sdk_matches_dependency_pin():
@@ -51,9 +51,9 @@ def test_claude_runtime_configured_path_and_version_probe(monkeypatch, tmp_path)
     monkeypatch.setattr(
         claude_runtime.subprocess, "run",
         lambda *args, **kwargs: SimpleNamespace(
-            stdout="2.1.210 (Claude Code)\n", stderr="", returncode=0),
+            stdout="2.1.220 (Claude Code)\n", stderr="", returncode=0),
     )
-    assert claude_runtime.probe_claude_cli_version(str(cli)) == "2.1.210"
+    assert claude_runtime.probe_claude_cli_version(str(cli)) == "2.1.220"
 
 
 def test_claude_runtime_rejects_relative_configured_path():
