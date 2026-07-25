@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { HistoryRequestCoordinator } from "../src/history-requests.ts";
+import {
+  HistoryRequestCoordinator,
+  resolveHistoryCwdHint,
+} from "../src/history-requests.ts";
 import { RecoverableReadCoordinator } from "../src/recoverable-read.ts";
 import {
   HistoryImageAssetCache,
@@ -33,6 +36,36 @@ assert.equal(coordinator.request({
   sid: "session-2", limit: 4,
 }, send), true);
 assert.equal(sends, 3);
+
+const acceptedHistoryLists = {
+  "code:claude": [{
+    session_id: "session-1",
+    engine: "claude" as const,
+    space: "code" as const,
+    cwd: "/project/one",
+  }],
+  "work:claude": [{
+    session_id: "session-2",
+    engine: "claude" as const,
+    space: "work" as const,
+    cwd: "/project/two",
+  }],
+};
+assert.equal(
+  resolveHistoryCwdHint(acceptedHistoryLists, "session-1"),
+  "/project/one",
+);
+assert.equal(resolveHistoryCwdHint(acceptedHistoryLists, "missing"), undefined);
+assert.equal(resolveHistoryCwdHint({
+  ...acceptedHistoryLists,
+  "code:codex": [{
+    session_id: "session-1",
+    engine: "codex" as const,
+    space: "code" as const,
+    cwd: "/different/project",
+  }],
+}, "session-1"), undefined,
+"conflicting accepted scopes must omit the optional hint");
 
 // An older response must not clear a rollback-bound replacement request.
 assert.equal(coordinator.request({

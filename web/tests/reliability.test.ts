@@ -432,6 +432,12 @@ const historyBeforeResume = historyAppSource.match(
 ) ?? [];
 assert.equal(historyBeforeResume.length, 3,
   "every existing-session activation must request first paint before engine resume");
+assert.match(historyAppSource,
+  /msg\.type === "session_list" && ownership[\s\S]*historySessionListsRef/,
+  "only an ownership-accepted SessionList may seed a Claude history cwd hint");
+assert.match(historyAppSource,
+  /resolveHistoryCwdHint\(historySessionListsRef\.current, sid\)/,
+  "every initial, reconnect, invalidation and pagination read shares the accepted cwd hint");
 assert.match(historyAppSource, /history_invalidated[\s\S]*invalidateSessionCache/,
   "history invalidation must evict the matching IndexedDB row");
 assert.match(historyAppSource, /historyCacheEpochRef[\s\S]*loadSession/,
@@ -4515,6 +4521,11 @@ assert.equal(artifactsFrame.session_id, "surface-work");
 assert.equal(typeof artifactsFrame.client_id, "string");
 
 relay.setFocusedSid("main-after-navigation", "claude", "code");
+relay.sendGetHistory("history-with-cwd", null, 4, "/project/from-list");
+const historyWithCwdFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(historyWithCwdFrame.type, "get_history");
+assert.equal(historyWithCwdFrame.session_id, "history-with-cwd");
+assert.equal(historyWithCwdFrame.cwd, "/project/from-list");
 relay.sendGetFilePreview(
   "notes.md", "btw-preview-request", "btw-pinned",
 );

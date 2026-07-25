@@ -628,6 +628,157 @@ def test_claude_history_append_paints_cached_page_before_revalidation(
     asyncio.run(go())
 
 
+def test_nonresident_claude_history_uses_authoritative_session_cwd(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "claude.jsonl"
+    transcript.write_text("{}\n")
+    calls = []
+    canned = [
+        UserMsg(msg_id="turn-1", prompt="hello"),
+        TurnEnd(result=TurnResult(
+            subtype="success", duration_ms=1, is_error=False)),
+    ]
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        mm, "get_session_info",
+        lambda _sid: SimpleNamespace(cwd="/authoritative/project"),
+    )
+
+    def messages(_sid, directory=None):
+        calls.append(directory)
+        return ["message"] if directory == "/authoritative/project" else []
+
+    monkeypatch.setattr(mm, "get_session_messages", messages)
+    monkeypatch.setattr(mm, "transcript_timestamps", lambda _sid: {})
+    monkeypatch.setattr(
+        mm, "transcript_internal_user_events", lambda _sid: [])
+    monkeypatch.setattr(
+        mm, "translate_history",
+        lambda *_args, **_kwargs: [event.model_copy() for event in canned])
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+    monkeypatch.setattr(mm, "last_assistant_model", lambda _msgs: None)
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine.cfg.cc_cwd = "/wrong/default"
+        history = await machine._build_history(
+            "claude-session", limit=4, cwd_hint="/stale/browser")
+
+        assert [turn.prompt for turn in history.turns] == []
+        assert [row["prompt"] for row in history.events
+                if row["type"] == "user_msg"] == ["hello"]
+        assert calls == ["/authoritative/project"]
+
+    asyncio.run(go())
+
+
+def test_scoped_empty_claude_history_retries_global_lookup(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "claude.jsonl"
+    transcript.write_text("{}\n")
+    calls = []
+    canned = [
+        UserMsg(msg_id="turn-1", prompt="recovered"),
+        TurnEnd(result=TurnResult(
+            subtype="success", duration_ms=1, is_error=False)),
+    ]
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+
+    def messages(_sid, directory=None):
+        calls.append(directory)
+        return [] if directory else ["global-message"]
+
+    monkeypatch.setattr(mm, "get_session_messages", messages)
+    monkeypatch.setattr(mm, "transcript_timestamps", lambda _sid: {})
+    monkeypatch.setattr(
+        mm, "transcript_internal_user_events", lambda _sid: [])
+    monkeypatch.setattr(
+        mm, "translate_history",
+        lambda *_args, **_kwargs: [event.model_copy() for event in canned])
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+    monkeypatch.setattr(mm, "last_assistant_model", lambda _msgs: None)
+
+    async def go():
+        machine, _ = _mk_machine()
+        history = await machine._build_history(
+            "claude-session", limit=4, cwd_hint="/stale/browser")
+
+        assert [row["prompt"] for row in history.events
+                if row["type"] == "user_msg"] == ["recovered"]
+        assert calls == ["/stale/browser", None]
+
+    asyncio.run(go())
+
+
+def test_truly_empty_claude_history_is_authoritative_after_global_retry(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "claude-empty.jsonl"
+    transcript.write_text("{}\n")
+    calls = []
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+
+    def messages(_sid, directory=None):
+        calls.append(directory)
+        return []
+
+    monkeypatch.setattr(mm, "get_session_messages", messages)
+    monkeypatch.setattr(mm, "transcript_timestamps", lambda _sid: {})
+    monkeypatch.setattr(
+        mm, "transcript_internal_user_events", lambda _sid: [])
+    monkeypatch.setattr(mm, "translate_history", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+    monkeypatch.setattr(mm, "last_assistant_model", lambda _msgs: None)
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-empty")
+        history = await machine._build_history(
+            "claude-empty", limit=4, cwd_hint="/listed/project")
+        source = HistorySourceFingerprint.capture(transcript)
+
+        assert history.authoritative is True
+        assert history.events == []
+        assert calls == ["/listed/project", None]
+        cached = machine._history_index.get_page(
+            "claude-empty", "claude", source, before=None, limit=4)
+        assert cached is not None and cached.turns == ()
+
+    asyncio.run(go())
+
+
+def test_claude_history_read_failure_never_materializes_empty_page(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "claude-error.jsonl"
+    transcript.write_text("{}\n")
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        mm, "get_session_info",
+        lambda _sid: SimpleNamespace(cwd="/authoritative/project"),
+    )
+    monkeypatch.setattr(
+        mm, "get_session_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("transcript unavailable")),
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-error")
+        history = await machine._build_history("claude-error", limit=4)
+        source = HistorySourceFingerprint.capture(transcript)
+
+        assert history.authoritative is False
+        assert history.events == []
+        assert machine._history_index.get_page(
+            "claude-error", "claude", source,
+            before=None, limit=4,
+        ) is None
+
+    asyncio.run(go())
+
+
 def test_claude_history_refresh_coalesces_appends_during_full_scan(monkeypatch):
     async def go():
         machine, transport = _mk_machine()

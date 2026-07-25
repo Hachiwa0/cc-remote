@@ -4178,12 +4178,39 @@ class WrapperMachine:
             # not a read failure banner.
             events = []
         else:
-            directory = (ctx.cwd if ctx else None) or cwd_hint or self.cfg.cc_cwd
+            # Existing Claude sessions must never inherit the wrapper's current
+            # default cwd. Resolve their immutable transcript directory from
+            # resident state or SDK metadata. The browser hint comes only from
+            # an accepted SessionInfo and remains non-authoritative: a scoped
+            # miss is retried through the SDK's all-project lookup below.
+            directory = (ctx.cwd if ctx else None) or None
+            if directory is None:
+                try:
+                    info = await asyncio.to_thread(get_session_info, sid)
+                except Exception as exc:
+                    log.warning(
+                        "Claude history session metadata unavailable",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+                    info = None
+                info_cwd = getattr(info, "cwd", None)
+                if isinstance(info_cwd, str) and info_cwd:
+                    directory = info_cwd
+            if directory is None and isinstance(cwd_hint, str) and cwd_hint:
+                expanded_hint = os.path.expanduser(cwd_hint)
+                if os.path.isabs(expanded_hint) and "\x00" not in expanded_hint:
+                    directory = os.path.realpath(expanded_hint)
             try:
                 def _read():
-                    return (get_session_messages(sid, directory=directory),
-                            transcript_timestamps(sid),
-                            transcript_internal_user_events(sid))
+                    messages = get_session_messages(sid, directory=directory)
+                    if not messages and directory is not None:
+                        messages = get_session_messages(sid, directory=None)
+                    return (
+                        messages,
+                        transcript_timestamps(sid),
+                        transcript_internal_user_events(sid),
+                    )
                 msgs, tss, internal_events = await asyncio.to_thread(_read)
                 if internal_events:
                     events = translate_history(

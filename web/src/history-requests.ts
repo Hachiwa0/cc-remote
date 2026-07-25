@@ -1,9 +1,29 @@
+import type { SessionInfo } from "./protocol";
+
 export interface HistoryRequestKey {
   sid: string;
   before?: string | null;
   limit: number;
   generation?: string | null;
   revision?: string | null;
+}
+
+/** Resolve an optional acceleration hint from ownership-accepted session lists.
+ *
+ * The wrapper remains authoritative. If two accepted engine/space scopes ever
+ * claim the same id with different directories, omit the hint and let the SDK
+ * perform its global session lookup.
+ */
+export function resolveHistoryCwdHint(
+  lists: Readonly<Record<string, readonly SessionInfo[]>>,
+  sid: string,
+): string | undefined {
+  const hints = new Set<string>();
+  for (const sessions of Object.values(lists)) {
+    const cwd = sessions.find((session) => session.session_id === sid)?.cwd?.trim();
+    if (cwd) hints.add(cwd);
+  }
+  return hints.size === 1 ? hints.values().next().value : undefined;
 }
 
 interface PendingHistoryRequest extends HistoryRequestKey {

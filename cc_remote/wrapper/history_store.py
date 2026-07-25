@@ -27,8 +27,9 @@ from cc_remote.attachments import (
 )
 
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 _CODEX_ONLY_MIGRATION_VERSION = 6
+_CLAUDE_EMPTY_PAGE_MIGRATION_VERSION = 7
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -725,8 +726,16 @@ class HistoryIndexStore:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
             migrate_codex_only = current == _CODEX_ONLY_MIGRATION_VERSION
+            migrate_empty_claude = current in (
+                _CODEX_ONLY_MIGRATION_VERSION,
+                _CLAUDE_EMPTY_PAGE_MIGRATION_VERSION,
+            )
             if current not in (
-                    0, _CODEX_ONLY_MIGRATION_VERSION, _SCHEMA_VERSION):
+                    0,
+                    _CODEX_ONLY_MIGRATION_VERSION,
+                    _CLAUDE_EMPTY_PAGE_MIGRATION_VERSION,
+                    _SCHEMA_VERSION,
+            ):
                 # This database is derived exclusively from engine transcripts.
                 # Rebuilding is safer than carrying migrations for stale cached
                 # projections across wire-shape changes.
@@ -833,8 +842,35 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-                connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
-            elif current == 0:
+            if migrate_empty_claude:
+                # v7 could bind a scoped empty SDK read to the fingerprint of a
+                # real Claude transcript. Decode in Python so this migration
+                # does not depend on SQLite's optional JSON1 extension. Only
+                # the poisoned summary page is derived incorrectly; retained
+                # turn details and image assets remain source-bound and valid.
+                rows = connection.execute(
+                    """
+                    SELECT rowid, payload_json
+                    FROM history_pages
+                    WHERE engine='claude'
+                    """
+                ).fetchall()
+                empty_rowids = []
+                for row in rows:
+                    raw = row["payload_json"]
+                    try:
+                        payload = json.loads(
+                            raw if isinstance(raw, str) else bytes(raw))
+                    except (TypeError, ValueError, UnicodeDecodeError):
+                        continue
+                    if isinstance(payload, dict) and payload.get("turns") == []:
+                        empty_rowids.append((int(row["rowid"]),))
+                if empty_rowids:
+                    connection.executemany(
+                        "DELETE FROM history_pages WHERE rowid=?",
+                        empty_rowids,
+                    )
+            if current != _SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
         try:
             os.chmod(self.path, 0o600)

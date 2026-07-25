@@ -83,7 +83,10 @@ import {
   turnNotificationPresentation,
   turnNotificationTag,
 } from "./turn-notification";
-import { HistoryRequestCoordinator } from "./history-requests";
+import {
+  HistoryRequestCoordinator,
+  resolveHistoryCwdHint,
+} from "./history-requests";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
 import { HistoryImageAssetCache } from "./history-image-assets";
@@ -220,6 +223,7 @@ export default function App() {
   const pendingSessionForkRef = useRef<PendingSessionFork | null>(null);
   const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
   const sessionListsBySurfaceRef = useRef<Record<string, SessionInfo[]>>({});
+  const historySessionListsRef = useRef<Record<string, SessionInfo[]>>({});
   // Cached lists are paint-only during a surface switch. A surface may choose
   // its remembered/latest focus only after a fresh wrapper list is accepted.
   const authoritativeSurfaceListsRef = useRef<Set<string>>(new Set());
@@ -283,7 +287,12 @@ export default function App() {
       sid, before, limit,
       generation: generation ?? ws.generationFor(sid),
       revision,
-    }, () => ws.sendGetHistory(sid, before, limit));
+    }, () => ws.sendGetHistory(
+      sid,
+      before,
+      limit,
+      resolveHistoryCwdHint(historySessionListsRef.current, sid),
+    ));
   }, []);
   const cancelPendingNotificationTarget = useCallback(() => {
     setPendingNotificationTarget(null);
@@ -320,6 +329,7 @@ export default function App() {
     btwDraftsRef.current.clear();
     setCompletionReceipts({});
     sessionListsBySurfaceRef.current = {};
+    historySessionListsRef.current = {};
     authoritativeSurfaceListsRef.current.clear();
     notificationListRequestRef.current = null;
     sessionActivityPendingRef.current.clear();
@@ -1205,6 +1215,12 @@ export default function App() {
               return next;
             });
           }
+          if (msg.type === "session_list" && ownership) {
+            const listedSpace = msg.space ?? "code";
+            historySessionListsRef.current[
+              `${listedSpace}:${msg.engine}`
+            ] = msg.sessions;
+          }
           if (msg.type === "session_list") {
             ws.setSessionEngines(msg.sessions);
             const listedSpace = msg.space ?? "code";
@@ -1365,6 +1381,7 @@ export default function App() {
           discardedBtwSidsRef.current.clear();
           historyInvalidationsRef.current.clear();
           historyCacheEpochRef.current.clear();
+          historySessionListsRef.current = {};
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
           bumpInlineImageRevision();

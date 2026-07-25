@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 
@@ -12,11 +13,13 @@ from cc_remote.wrapper.history_store import (
 
 
 def _page(label: str, *, more: bool = False) -> MaterializedHistoryPage:
+    events = ({"type": "user_msg", "msg_id": label, "prompt": label},)
     return MaterializedHistoryPage(
-        events=({"type": "user_msg", "msg_id": label, "prompt": label},),
+        events=events,
         has_more=more,
         oldest_id=label,
         newest_id=label,
+        turns=materialize_history_turns(events),
     )
 
 
@@ -205,7 +208,7 @@ def test_v6_migration_invalidates_only_codex_derived_rows(tmp_path):
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         for table in (
             "history_pages",
             "history_turn_details",
@@ -231,6 +234,85 @@ def test_v6_migration_invalidates_only_codex_derived_rows(tmp_path):
     assert migrated.get_page(
         "codex-session", "codex", source, before=None, limit=4,
     ) is None
+
+
+def test_v7_migration_invalidates_only_empty_claude_pages(tmp_path):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    empty_session = "claude-empty"
+    assert store.put_page(
+        empty_session, "claude", source, before=None, limit=4,
+        page=_page(empty_session),
+    )
+    store.put_image_asset(
+        empty_session, "claude", source, empty_session, "claude-image",
+        "thumbnail", "image/png", 1, 1, b"image",
+    )
+    assert store.put_page(
+        "claude-nonempty", "claude", source, before=None, limit=4,
+        page=_page("claude-nonempty"),
+    )
+    codex_empty = MaterializedHistoryPage(
+        events=(), has_more=False, oldest_id=None, newest_id=None, turns=())
+    assert store.put_page(
+        "codex-empty", "codex", source, before=None, limit=4,
+        page=codex_empty,
+    )
+
+    empty_payload = json.dumps({
+        "events": [],
+        "has_more": False,
+        "oldest_id": None,
+        "newest_id": None,
+        "turns": [],
+    }, separators=(",", ":")).encode()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE history_pages
+            SET payload_json=?, payload_bytes=?
+            WHERE session_id=? AND engine='claude'
+            """,
+            (empty_payload, len(empty_payload), empty_session),
+        )
+        connection.execute("PRAGMA user_version=7")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_pages "
+            "WHERE session_id=? AND engine='claude'",
+            (empty_session,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_turn_details WHERE session_id=?",
+            (empty_session,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_image_assets WHERE session_id=?",
+            (empty_session,),
+        ).fetchone()[0] == 1
+
+    assert migrated.get_page(
+        empty_session, "claude", source, before=None, limit=4) is None
+    assert migrated.get_page(
+        "claude-nonempty", "claude", source, before=None, limit=4,
+    ) == _page("claude-nonempty")
+    assert migrated.get_page(
+        "codex-empty", "codex", source, before=None, limit=4,
+    ) == codex_empty
+    assert migrated.get_turn_detail(
+        empty_session, "claude", source, empty_session,
+    ) is not None
+    assert migrated.get_image_asset(
+        empty_session, "claude", source, empty_session,
+        "claude-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"image")
 
 
 def test_history_index_rejects_one_page_larger_than_total_budget(tmp_path):

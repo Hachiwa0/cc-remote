@@ -602,11 +602,17 @@ export class RelayWs {
 
   /** Fetch a small canonical conversation page. Heavy per-turn detail remains
    *  in the wrapper materialized index until the user expands it. */
-  sendGetHistory(sessionId: string, before?: string | null, limit?: number | null): void {
+  sendGetHistory(
+    sessionId: string,
+    before?: string | null,
+    limit?: number | null,
+    cwd?: string | null,
+  ): void {
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_history", session_id: sessionId,
       client_id: this.clientId, detail: "summary", ts: nowTs(),
     };
+    if (cwd) obj.cwd = cwd;
     if (before) obj.before = before;
     if (limit) obj.limit = limit;
     this.send(obj);
