@@ -4853,12 +4853,26 @@ assert.match(headerMenuSource, /document\.contains\(trigger\).*trigger\.focus\(\
   "closing the menu restores focus to the three-dot trigger");
 assert.match(headerMenuSource, /data-lock-horizontal-swipe/,
   "the menu trigger and portal must opt out of global horizontal navigation");
+assert.match(headerMenuSource,
+  /<div className="header-menu-scrim"[^>]*onClick=/s,
+  "outside taps must close only after the complete click to prevent touch-through");
+assert.doesNotMatch(headerMenuSource,
+  /<div className="header-menu-scrim"[^>]*onPointerDown=/s,
+  "pointerdown must not unmount the scrim before the tap click is dispatched");
+assert.doesNotMatch(headerMenuSource, /header-menu-close/,
+  "the anchored menu closes through its trigger, outside tap, or Escape without an extra X");
+assert.match(headerMenuSource,
+  /top: Math\.min\(rect\.bottom \+ 8, window\.innerHeight - 24\)/,
+  "the header menu must stay anchored below its trigger within the viewport");
 assert.match(layoutCss, /\.header-menu-card\{[^}]*position:fixed/s);
 assert.match(layoutCss,
-  /@media\(max-width:640px\)\{[\s\S]*?\.header-menu-card\{[^}]*bottom:var\(--keyboard-inset,0px\)/,
-  "mobile header actions must use a keyboard-aware bottom sheet");
+  /\.header-menu-card\{[^}]*right:max\(var\(--header-menu-right\),env\(safe-area-inset-right\)\)/s,
+  "the anchored header menu must respect the iPhone right safe area");
+assert.doesNotMatch(layoutCss,
+  /\.header-menu-card\{ top:auto!important; right:0!important; bottom:/,
+  "mobile header actions must remain anchored to the three-dot trigger");
 assert.match(layoutCss, /env\(safe-area-inset-bottom\)/,
-  "the mobile menu must preserve the home-indicator safe area");
+  "mobile overlays and composers must preserve the home-indicator safe area");
 const serviceWorkerSource = readFileSync(
   resolve(process.cwd(), "public/sw.js"), "utf8");
 assert.match(serviceWorkerSource, /existing\.postMessage\(\{[\s\S]*cc-remote-notification/,
@@ -4866,7 +4880,7 @@ assert.match(serviceWorkerSource, /existing\.postMessage\(\{[\s\S]*cc-remote-not
 assert.match(serviceWorkerSource, /self\.clients\.openWindow\(target\)/,
   "cold notification clicks must retain the fragment route");
 assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\)/,
-  "the mobile sheet height accounts for the virtual keyboard inset");
+  "keyboard-aware mobile sheets must account for the virtual keyboard inset");
 
 class MemoryStorage {
   readonly values = new Map<string, string>();

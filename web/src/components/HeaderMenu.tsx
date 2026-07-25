@@ -130,7 +130,7 @@ export function HeaderMenu({
       </button>
       {open && typeof document !== "undefined" && createPortal(
         <div className="header-menu-scrim" data-lock-horizontal-swipe
-          onPointerDown={(event) => {
+          onClick={(event) => {
             if (event.target === event.currentTarget) close();
           }}>
           <section ref={cardRef} className="header-menu-card" style={style}
@@ -140,10 +140,6 @@ export function HeaderMenu({
               <>
                 <header className="header-menu-title">
                   <b>设置</b>
-                  <button type="button" className="header-menu-close"
-                    onClick={close} aria-label="关闭设置">
-                    <Icon name="close" size={16} />
-                  </button>
                 </header>
                 <div className="header-menu-items">
                   <button ref={firstRef} type="button" className="header-menu-item"
@@ -172,10 +168,6 @@ export function HeaderMenu({
                     <Icon name="back" size={17} />
                   </button>
                   <b>完成通知</b>
-                  <button type="button" className="header-menu-close"
-                    onClick={close} aria-label="关闭设置">
-                    <Icon name="close" size={16} />
-                  </button>
                 </header>
                 <p className="header-menu-help">
                   通用提醒不会把会话名称或编号发送给 Push 服务；会话提醒可从通知精确打开对应对话。
