@@ -745,16 +745,18 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...this.sidObj() });
   }
 
-  sendListSessions(engine?: "claude" | "codex", space: Space = "code"): void {
+  sendListSessions(engine?: "claude" | "codex", space: Space = "code"): boolean {
     const targetEngine = engine ?? "claude";
     const scopeKey = sessionScopeKey(this.machineId, targetEngine, space);
     const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    if (this.send(obj)) {
+    const queued = this.send(obj);
+    if (queued) {
       this.queueOwnership(this.pendingListOwnership, scopeKey, ownership);
     }
+    return queued;
   }
 
   sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {

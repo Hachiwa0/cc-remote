@@ -88,12 +88,12 @@ assert.equal(inlineAssets.begin({
   sid: "session-1", path: "qr.png", previewId: "preview-2", requestId: "request-2",
 }), false, "one visible local image must have at most one in-flight request");
 assert.equal(inlineAssets.accept({
-  v: 19, type: "preview_asset", ts: 1, sid: "other-session",
+  v: 20, type: "preview_asset", ts: 1, sid: "other-session",
   path: "qr.png", preview_id: "preview-1", request_id: "request-1",
   media_type: "image/png", data: "cG5n",
 }), false, "a response from another session must not satisfy the request");
 assert.equal(inlineAssets.accept({
-  v: 19, type: "preview_asset", ts: 2, sid: "session-1",
+  v: 20, type: "preview_asset", ts: 2, sid: "session-1",
   path: "qr.png", preview_id: "preview-1", request_id: "request-1",
   media_type: "image/png", data: "cG5n",
 }), true);
@@ -131,7 +131,7 @@ assert.equal(sizedInlineAssets.begin({
   previewId: "preview-sized", requestId: "request-sized",
 }), true);
 assert.equal(sizedInlineAssets.accept({
-  v: 19, type: "preview_asset", ts: 3, sid: "session-1",
+  v: 20, type: "preview_asset", ts: 3, sid: "session-1",
   path: "sized-qr.png", preview_id: "preview-sized",
   request_id: "request-sized", media_type: "image/png", data: pngHeaderBase64,
 }), true);
@@ -500,7 +500,7 @@ try {
     kind: "file",
   });
   state = reduce(state, { type: "event", event: {
-    v: 19,
+    v: 20,
     type: "file_preview",
     ts: 6,
     sid: "session-1",

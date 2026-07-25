@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 19
+PROTOCOL_VERSION = 20
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -660,6 +660,21 @@ class TurnResult(BaseModel):
     num_turns: Optional[int] = None
 
 
+class TurnNotificationContext(BaseModel):
+    """Realtime-only presentation metadata for completion notifications.
+
+    The wrapper strips this field before buffering a TurnEnd, so reconnect and
+    history replay cannot create a second OS notification for an old turn.
+    """
+    model_config = ConfigDict(extra="forbid")
+    engine: Engine
+    space: Space
+    display_name: Optional[str] = Field(default=None, max_length=160)
+    # A private /btw runtime routes under its ephemeral sid, but a notification
+    # opens the durable parent conversation that owns the side panel.
+    parent_session_id: Optional[WireId] = None
+
+
 class TurnEnd(_Base):
     type: Literal["turn_end"] = "turn_end"
     result: TurnResult
@@ -671,6 +686,7 @@ class TurnEnd(_Base):
     # Claude's file-checkpoint API targets the top-level user transcript UUID,
     # not the assistant UUID above or the browser's optimistic message id.
     checkpoint_id: Optional[WireId] = None
+    notification_context: Optional[TurnNotificationContext] = None
 
 
 class Error(_Base):

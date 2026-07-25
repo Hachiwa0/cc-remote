@@ -307,6 +307,7 @@ class RelayHub:
         if (
             msg.type == "turn_end"
             and not to
+            and getattr(msg, "notification_context", None) is not None
             and self._on_live_turn_end is not None
         ):
             task = asyncio.create_task(self._on_live_turn_end(machine_id, msg))

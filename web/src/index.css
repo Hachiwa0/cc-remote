@@ -205,7 +205,55 @@ body{
   .c-head{ padding-left:4px; padding-right:3px; }
   .c-head .titlewrap{ flex-basis:56px; min-width:56px; }
   .c-head .iconbtn{ width:38px; }
-  .header-theme{ display:none; }
+}
+
+/* Authenticated header actions share one three-dot menu. The portal escapes
+   c-head's overflow clipping; mobile promotes the same content to a sheet. */
+.header-menu-scrim{ position:fixed; inset:0; z-index:70; background:transparent; }
+.header-menu-card{ position:fixed; z-index:71; top:var(--header-menu-top);
+  right:var(--header-menu-right); width:min(330px,calc(100vw - 16px));
+  max-height:min(520px,calc(100dvh - var(--header-menu-top) - 10px)); overflow:auto;
+  padding:10px; border:1px solid var(--border-strong); border-radius:14px;
+  color:var(--text); background:var(--surface); box-shadow:var(--shadow-lg);
+  animation:panel-in .16s var(--ease); }
+.header-menu-title{ min-height:38px; display:flex; align-items:center; gap:8px;
+  padding:0 3px 7px 8px; border-bottom:1px solid var(--divider); }
+.header-menu-title>b{ flex:1; font-size:13px; }
+.header-menu-close,.header-menu-back{ width:34px; height:34px; display:grid;
+  place-items:center; border-radius:9px; color:var(--dim); }
+.header-menu-close:hover,.header-menu-back:hover{ color:var(--text); background:var(--raised); }
+.header-menu-items{ padding-top:5px; }
+.header-menu-item{ width:100%; min-height:54px; display:flex; align-items:center;
+  gap:11px; padding:8px 10px; border-radius:10px; text-align:left; color:var(--dim); }
+.header-menu-item:hover{ color:var(--text); background:var(--raised); }
+.header-menu-item>span{ flex:1; min-width:0; display:flex; flex-direction:column; }
+.header-menu-item b,.header-menu-modes b{ color:var(--text); font-size:12.5px; }
+.header-menu-item small,.header-menu-modes small{ color:var(--dim); font-size:10.5px;
+  line-height:1.4; overflow-wrap:anywhere; }
+.header-menu-item.danger,.header-menu-item.danger b{ color:var(--danger); }
+.header-menu-help,.header-menu-warning{ margin:10px 9px 5px; color:var(--dim);
+  font-size:11px; line-height:1.5; }
+.header-menu-warning{ padding:7px 9px; border-radius:8px;
+  color:var(--warn); background:var(--warn-weak); }
+.header-menu-modes{ display:flex; flex-direction:column; gap:3px; margin-top:8px; }
+.header-menu-modes>button{ width:100%; min-height:58px; display:flex; align-items:flex-start;
+  gap:10px; padding:9px 10px; border-radius:10px; text-align:left; }
+.header-menu-modes>button:hover{ background:var(--raised); }
+.header-menu-modes>button:disabled{ opacity:.55; cursor:default; }
+.header-menu-modes>button>span:last-child{ display:flex; flex-direction:column; }
+.header-menu-radio{ width:16px; height:16px; margin-top:2px; flex:none; border-radius:50%;
+  border:1.5px solid var(--border-strong); box-shadow:inset 0 0 0 3px var(--surface); }
+.header-menu-modes>button[aria-checked="true"] .header-menu-radio{
+  border-color:var(--accent); background:var(--accent); }
+@media(max-width:640px){
+  .header-menu-scrim{ background:rgba(20,16,10,.34); }
+  .header-menu-card{ top:auto!important; right:0!important; bottom:var(--keyboard-inset,0px);
+    left:0; width:100%; max-height:min(72dvh,calc(var(--app-height,100dvh) - var(--keyboard-inset,0px) - 12px));
+    padding:14px max(16px,env(safe-area-inset-right))
+      calc(14px + env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left));
+    border-width:1px 0 0; border-radius:18px 18px 0 0; animation:sheetup .2s var(--ease); }
+  .header-menu-item{ min-height:58px; }
+  .header-menu-modes>button{ min-height:64px; }
 }
 
 /* WORK has its own product surface: a private desk, not the Code toolbar with

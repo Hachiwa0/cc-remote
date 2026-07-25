@@ -46,7 +46,7 @@ from cc_remote.wrapper.stream import (
 from tests.test_multisession import _mk_machine, _mk_ctx
 
 
-def test_protocol_v19_get_history_and_materialized_summary_roundtrip():
+def test_protocol_v20_get_history_and_materialized_summary_roundtrip():
     gh = GetHistory(
         session_id="s1", client_id="c1", limit=50, detail="summary")
     assert deserialize(serialize(gh)) == gh

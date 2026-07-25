@@ -77,7 +77,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   shared sessions stay on the daemon; only the guarded oversized-resume path may
   select a newer official private app-server for compatibility.
 - **History = local projection + materialized summary pages; reconnect = live-tail replay**
-  (protocol v19): IndexedDB paints the browser's last projection before network
+  (protocol v20): IndexedDB paints the browser's last projection before network
   validation. `GetHistory(detail="summary")` returns a small canonical turn page
   (newest four, then `before`/`limit` pagination), while the wrapper's rebuildable
   SQLite index avoids retranslating unchanged transcript/rollout bytes. Heavy

@@ -43,7 +43,7 @@ assert.equal(isWorktreeForkNameValid("x".repeat(WORKTREE_FORK_NAME_MAX + 1)), fa
 assert.deepEqual(
   makeForkSessionCommand("codex-parent", "turn-7", "request-message", 122),
   {
-    v: 19,
+    v: 20,
     type: "fork_session",
     session_id: "codex-parent",
     request_id: "request-message",
@@ -55,7 +55,7 @@ assert.deepEqual(
 assert.deepEqual(
   makeForkSessionWorktreeCommand("codex-parent", "fix-login", "request-1", 123),
   {
-    v: 19,
+    v: 20,
     type: "fork_session_worktree",
     session_id: "codex-parent",
     name: "fix-login",

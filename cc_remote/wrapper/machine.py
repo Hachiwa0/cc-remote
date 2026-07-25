@@ -51,6 +51,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import unicodedata
 from collections import OrderedDict
 from pathlib import Path
 from uuid import uuid4
@@ -85,7 +86,8 @@ from cc_remote.protocol import (
     HistoryInvalidated, ArtifactInvalidated, AskUser,
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg,
-    ToolUse, ToolResult, TurnBinding, TurnEnd, TurnResult, is_downstream,
+    ToolUse, ToolResult, TurnBinding, TurnEnd, TurnNotificationContext,
+    TurnResult, is_downstream,
     is_reliable_command,
     SessionInfo, SessionList, SessionActivity, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
@@ -355,6 +357,8 @@ class WrapperMachine:
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
     PREVIEW_EXTERNAL_PATH_CAP = 256
     PREVIEW_WRITE_CANDIDATE_CAP = 64
+    NOTIFICATION_TITLE_CAP = 512
+    NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
         "write", "edit", "multiedit", "notebookedit", "editfile",
         "apply_patch", "filechange",
@@ -451,6 +455,11 @@ class WrapperMachine:
         # explicit History/resident watches.  Keep them bounded so a long-lived
         # wrapper never accumulates one transcript watcher per historical thread.
         self._codex_sidebar_watches: OrderedDict[str, None] = OrderedDict()
+        # Display metadata is populated by catalog reads and successful local
+        # mutations. Keep it bounded and memory-only: transcripts remain the
+        # authority, and a terminal event must never synchronously reread a
+        # multi-gigabyte history merely to format an OS notification.
+        self._notification_titles: OrderedDict[str, str] = OrderedDict()
         self._watch_task: Optional[asyncio.Task] = None
         self._work_schedule_task: Optional[asyncio.Task] = None
         self._work_schedule_runs: set[asyncio.Task] = set()
@@ -583,6 +592,49 @@ class WrapperMachine:
         )
 
     # ---- pool helpers ----
+
+    @classmethod
+    def _clean_notification_title(cls, value: object) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        # Newlines become word boundaries; other control/format characters are
+        # removed. A small input cap prevents a first prompt from turning title
+        # formatting into another large-history path.
+        cleaned = "".join(
+            " " if char.isspace()
+            else "" if unicodedata.category(char).startswith("C")
+            else char
+            for char in value[:2048]
+        )
+        normalized = " ".join(cleaned.split())
+        return normalized[:cls.NOTIFICATION_TITLE_LENGTH].strip() or None
+
+    def _remember_notification_title(self, sid: Optional[str], value: object) -> None:
+        if not sid:
+            return
+        title = self._clean_notification_title(value)
+        if not title:
+            return
+        self._notification_titles[sid] = title
+        self._notification_titles.move_to_end(sid)
+        while len(self._notification_titles) > self.NOTIFICATION_TITLE_CAP:
+            self._notification_titles.popitem(last=False)
+
+    def _notification_context(
+        self,
+        ctx: SessionContext,
+    ) -> TurnNotificationContext:
+        route_sid = (
+            ctx.parent_sid if ctx.btw and ctx.parent_sid
+            else (ctx.session_id or ctx.key)
+        )
+        display_name = self._notification_titles.get(route_sid or "")
+        return TurnNotificationContext(
+            engine="codex" if ctx.engine == "codex" else "claude",
+            space="work" if ctx.space == "work" else "code",
+            display_name=display_name,
+            parent_session_id=ctx.parent_sid if ctx.btw else None,
+        )
 
     def _history_revision(self, sid: str) -> str:
         return f"{self.instance_id}-{self._history_revision_epochs.get(sid, 0)}"
@@ -2257,10 +2309,21 @@ class WrapperMachine:
                           type=getattr(msg, "type", None))
                 return
             msg.to = ctx.owner_client_id
+        if isinstance(msg, TurnEnd):
+            # The replayable object is deliberately notification-free. Only a
+            # copy sent on this live call receives presentation metadata.
+            msg.notification_context = None
         if is_downstream(msg):
             msg.seq = ctx.next_seq()
             ctx.buffer.append(msg)
-        await self.transport.send(msg)
+        live = (
+            msg.model_copy(update={
+                "notification_context": self._notification_context(ctx),
+            })
+            if isinstance(msg, TurnEnd)
+            else msg
+        )
+        await self.transport.send(live)
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
         self._observe_preview_path_event(ctx, msg)
@@ -5075,6 +5138,17 @@ class WrapperMachine:
                 )
                 await self._emit(ctx, error)
                 return error
+        # All synchronous rejection paths have passed. A new conversation may
+        # now finish before the next sidebar catalog read, so remember its first
+        # accepted prompt under the temporary key; capture migrates it to the
+        # real engine session id.
+        title_sid = ctx.session_id or ctx.key
+        if (
+            ctx.session_id is None
+            and title_sid
+            and title_sid not in self._notification_titles
+        ):
+            self._remember_notification_title(title_sid, cmd.prompt)
         # claim synchronously so a concurrent query on THIS ctx can't race in
         ctx.interrupt_event.clear()
         ctx.interrupt_deadline = None
@@ -8475,6 +8549,9 @@ class WrapperMachine:
                                 space="code",
                             ))
                             known.add(broker_sid)
+            for session in sessions:
+                self._remember_notification_title(
+                    session.session_id, session.summary or session.first_prompt)
             event = SessionList(
                 engine="claude",
                 space=space,
@@ -8622,6 +8699,9 @@ class WrapperMachine:
                     forked_from_id=row.get("forked_from_id"),
                     codex_status=row.get("status"),
                 ))
+            for session in sessions:
+                self._remember_notification_title(
+                    session.session_id, session.summary or session.first_prompt)
             event = SessionList(
                 engine="codex",
                 space=space,
@@ -8825,6 +8905,9 @@ class WrapperMachine:
             return
         old_key = ctx.key
         ctx.session_id = sid
+        old_title = self._notification_titles.pop(old_key, None) if old_key else None
+        if old_title:
+            self._remember_notification_title(sid, old_title)
         if ctx.space == "work" and ctx.work_id:
             store = self._work.for_engine(ctx.engine)
             await asyncio.to_thread(store.bind_session, ctx.work_id, sid)
@@ -9047,6 +9130,7 @@ class WrapperMachine:
                     await asyncio.to_thread(
                         self._work.for_engine(engine).update_title,
                         sid, cmd.title)
+                self._remember_notification_title(sid, cmd.title)
                 log.info("codex session renamed", session_id=sid,
                          title_length=len(cmd.title))
                 return await self._list_codex_sessions(cmd)
@@ -9065,6 +9149,7 @@ class WrapperMachine:
                 await asyncio.to_thread(
                     self._work.for_engine(engine).update_title,
                     sid, cmd.title)
+            self._remember_notification_title(sid, cmd.title)
             # our own append -> re-baseline, else the watcher calls it an external write
             self._resync_watch(sid)
             log.info("session renamed", session_id=sid,

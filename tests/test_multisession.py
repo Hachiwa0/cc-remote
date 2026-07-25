@@ -21,6 +21,7 @@ from cc_remote.config import WrapperConfig
 from cc_remote.protocol import (
     serialize, deserialize, is_downstream,
     Hello, SessionRekey, StateEvent, UserMsg, ReplayStart, ReplayEnd,
+    TurnEnd, TurnNotificationContext, TurnResult,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_ctx import SessionContext
@@ -169,6 +170,91 @@ def test_emit_routes_by_temp_key_before_capture_then_real_sid():
     asyncio.run(run())
 
 
+def test_live_turn_end_has_notification_context_but_ring_replay_does_not():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(key="session-notify", session_id="session-notify")
+        ctx.engine = "codex"
+        ctx.space = "work"
+        machine._remember_notification_title(
+            ctx.key, "  Fix\nnotifications\u0000 now  ")
+
+        await machine._emit_locked(ctx, TurnEnd(result=TurnResult(
+            subtype="success", duration_ms=12, is_error=False,
+        )))
+
+        live = transport.sent[-1]
+        assert live.notification_context == TurnNotificationContext(
+            engine="codex",
+            space="work",
+            display_name="Fix notifications now",
+        )
+        replay = next(
+            frame for frame in ctx.buffer.replay_from(
+                0,
+                cc_session_id=ctx.session_id,
+                state="idle",
+            )
+            if isinstance(frame, TurnEnd)
+        )
+        assert replay.notification_context is None
+
+    asyncio.run(run())
+
+
+def test_btw_turn_end_routes_owner_only_and_points_notification_to_parent():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(key="btw-private", session_id=None)
+        ctx.engine = "claude"
+        ctx.btw = True
+        ctx.parent_sid = "parent-session"
+        ctx.owner_client_id = "owner-client"
+        machine._remember_notification_title(
+            ctx.parent_sid, "Parent conversation")
+
+        await machine._emit_locked(ctx, TurnEnd(result=TurnResult(
+            subtype="error_during_execution",
+            duration_ms=4,
+            is_error=True,
+        )))
+
+        live = transport.sent[-1]
+        assert live.to == "owner-client"
+        assert live.sid == "btw-private"
+        assert live.notification_context == TurnNotificationContext(
+            engine="claude",
+            space="code",
+            display_name="Parent conversation",
+            parent_session_id="parent-session",
+        )
+        replay = next(
+            frame for frame in ctx.buffer.replay_from(
+                0,
+                cc_session_id=None,
+                state="idle",
+            )
+            if isinstance(frame, TurnEnd)
+        )
+        assert replay.notification_context is None
+
+    asyncio.run(run())
+
+
+def test_turn_notification_context_protocol_roundtrip():
+    message = TurnEnd(
+        result=TurnResult(subtype="success", duration_ms=1, is_error=False),
+        notification_context=TurnNotificationContext(
+            engine="claude",
+            space="code",
+            display_name="A named session",
+            parent_session_id="parent-1",
+        ),
+    )
+    restored = deserialize(serialize(message))
+    assert restored.notification_context == message.notification_context
+
+
 # ---- focus-steal fix ----
 
 def test_capture_follows_focus_when_captured_session_is_focused():
@@ -177,10 +263,13 @@ def test_capture_follows_focus_when_captured_session_is_focused():
         ctx = _mk_ctx(key="tmp-1", session_id=None)
         m.sessions["tmp-1"] = ctx
         m.focused_sid = "tmp-1"                  # user is viewing this new session
+        m._remember_notification_title("tmp-1", "First prompt")
         await m._capture_session_id(ctx, "real-1")
         assert "tmp-1" not in m.sessions and m.sessions["real-1"] is ctx
         assert ctx.key == "real-1" and ctx.session_id == "real-1"
         assert m.focused_sid == "real-1"         # focus followed the re-key
+        assert "tmp-1" not in m._notification_titles
+        assert m._notification_titles["real-1"] == "First prompt"
         rekeys = [s for s in tr.sent if getattr(s, "type", None) == "session_rekey"]
         assert rekeys and rekeys[-1].old_key == "tmp-1" and rekeys[-1].session_id == "real-1"
         # never a focus frame for a re-key

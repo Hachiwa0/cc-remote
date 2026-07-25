@@ -98,13 +98,13 @@ assert.equal(images.begin({
   variant: "thumbnail", requestId: "image-request-1", revision: "revision-1",
 }), true);
 assert.equal(images.accept({
-  v: 19, type: "history_image", ts: 1,
+  v: 20, type: "history_image", ts: 1,
   session_id: "session-2", turn_id: "turn-1", image_id: "image-1",
   variant: "thumbnail", request_id: "image-request-1", revision: "revision-1",
   media_type: "image/webp", data: "abc",
 }), false, "a delayed response from another session cannot fill this cache");
 assert.equal(images.accept({
-  v: 19, type: "history_image", ts: 1,
+  v: 20, type: "history_image", ts: 1,
   session_id: "session-1", turn_id: "turn-1", image_id: "image-1",
   variant: "thumbnail", request_id: "image-request-1", revision: "revision-1",
   media_type: "image/webp", width: 10, height: 5, data: "abc",

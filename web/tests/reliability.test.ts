@@ -66,8 +66,26 @@ import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.t
 import {
   classifyTurnNotification,
   turnNotificationBody,
+  turnNotificationPresentation,
   turnNotificationTag,
 } from "../src/turn-notification.ts";
+import {
+  NOTIFICATION_MODE_KEY,
+  readNotificationMode,
+  writeNotificationMode,
+} from "../src/notification-mode.ts";
+import {
+  captureNotificationFragment,
+  encodeNotificationRoute,
+  parseNotificationFragment,
+} from "../src/notification-route.ts";
+import {
+  resolveNotificationNavigation,
+} from "../src/notification-navigation.ts";
+import {
+  PushBindingCoordinator,
+  type PushBindingTarget,
+} from "../src/push.ts";
 import {
   classifyBusySubmit,
   isComposerBusy,
@@ -316,7 +334,7 @@ assert.deepEqual(visibleAgentTimeline.map((block) => block.kind), ["process"],
   "a dedicated live agent row must replace the duplicate generic ToolUse row");
 
 const legacyWorkContext = workContextMetrics({
-  v: 19, ts: 0, type: "context_report",
+  v: 20, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, categories: [],
 });
@@ -326,7 +344,7 @@ assert.equal(legacyWorkContext.sessionTokens, 25_572,
 assert.equal(legacyWorkContext.sessionPercentage, 2.5572);
 
 const freshWorkContext = workContextMetrics({
-  v: 19, ts: 0, type: "context_report",
+  v: 20, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, session_tokens: 72, fixed_tokens: 25_500,
   session_percentage: 0.0072, categories: [],
@@ -338,7 +356,7 @@ assert.equal(freshWorkContext.sessionPercentage, 0.0072);
 assert.equal(freshWorkContext.totalPercentage, 2.5572);
 
 const derivedWorkContext = workContextMetrics({
-  v: 19, ts: 0, type: "context_report",
+  v: 20, ts: 0, type: "context_report",
   total_tokens: 11_194, max_tokens: 353_400,
   percentage: 3.1675, fixed_tokens: 11_000, categories: [],
 });
@@ -1172,7 +1190,7 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 19, ts: 10, ...body,
+    v: 20, ts: 10, ...body,
   } as ServerEvent);
   const problemSid = "safe-problem-presentation";
   let problemState = reduce({
@@ -4441,7 +4459,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 19, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 20, ts: 1, ...frame }) });
   }
 }
 
@@ -4609,6 +4627,30 @@ assert.match(appSource, /prepareSurfaceSwitch\(nextEngine, space\)/,
   "engine switches must restore their own remembered surface session");
 assert.match(appSource, /prepareSurfaceSwitch\(engine, next\)/,
   "Work/Code switches must share the remembered-session restoration path");
+assert.match(appSource,
+  /authoritativeSurfaceListsRef\.current\.has\(surfaceKey\)/,
+  "notification navigation must wait for an authoritative surface list");
+assert.match(appSource,
+  /notificationOriginRef\.current === null[\s\S]*?authoritativeSurfaceListsRef\.current\.delete\(surfaceKey\)/,
+  "each notification click must invalidate a pre-click target catalog");
+assert.match(appSource, /resolveNotificationNavigation\(\{/,
+  "notification navigation must pass through the fail-closed resolver");
+assert.match(appSource, /focusListedSession\(navigation\.session\)/,
+  "notification and sidebar navigation must share the exact focus path");
+assert.match(appSource,
+  /msg\.type === "turn_end" && msg\.sid && msg\.notification_context/,
+  "buffered or historical TurnEnd frames must never create a local notification");
+assert.match(appSource, /cancelPendingNotificationTarget\(\)/,
+  "manual navigation must be able to cancel a pending notification target");
+assert.match(appSource,
+  /authoritativeSurfaceListsRef\.current\.clear\(\);\s*notificationListRequestRef\.current = null;/,
+  "a machine change must clear the prior socket's list request marker");
+assert.match(appSource,
+  /const ws = wsRef\.current;\s*if \(!ws\) return;[\s\S]*?if \(ws\.sendListSessions/,
+  "a target list is marked requested only after the current socket accepts it");
+assert.match(appSource,
+  /if \(s === "connected"\) \{[\s\S]*?notificationListRequestRef\.current = null;[\s\S]*?bumpNotificationListRevision\(\)/,
+  "each underlying socket connection must retry an unresolved target list");
 assert.doesNotMatch(appSource,
   /sendCloseBtw\(s\); dispatch\(\{ type: "clear_btw" \}\); \}\s*[\s\S]{0,120}\}, \[focusedSid, engine\]\)/,
   "session and harness navigation must retain a session-scoped BTW");
@@ -4631,7 +4673,12 @@ assert.match(appSource, /btwSendModeBySid/,
   "BTW send mode must not reuse the main composer's global mode");
 assert.match(appSource, /if \(latest && latest\.session_id !== state\.focusedSid\) \{\s*dispatch\(\{ type: "exit_new_chat" \}\)/,
   "restored focus must replace the temporary new-session page");
-assert.match(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/);
+assert.match(appSource, /<HeaderMenu[\s\S]*notificationMode=\{notificationMode\}/,
+  "authenticated header actions must be grouped behind the three-dot menu");
+assert.doesNotMatch(appSource, /className="iconbtn header-theme"/,
+  "the authenticated header must not retain a separate theme shortcut");
+assert.doesNotMatch(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/,
+  "the authenticated header must not retain a separate logout shortcut");
 assert.match(appSource, /rt\.replaying \|\| !rt\.syncReady \? "syncing" : "online"/,
   "cached terminal state must be downgraded until the focused session is authoritative");
 assert.match(appSource, /legacyExternal=\{!rt\.control && !!rt\.external\}/,
@@ -4746,16 +4793,260 @@ assert.match(composerSource, /case "skills": p\.onOpenExtensions\?\.\("skill"\)/
   "Skills remain reachable from the composer on mobile");
 assert.match(composerSource, /case "hooks": p\.onOpenExtensions\?\.\("hook"\)/,
   "Hooks remain reachable from the composer on mobile");
-assert.match(appSource, /className=\{`iconbtn header-notify/,
-  "notification settings remain reachable on mobile");
-assert.match(layoutCss, /\.header-theme\{ display:none; \}/,
-  "only the non-essential theme shortcut may collapse on the narrowest header");
+const headerMenuSource = readFileSync(
+  resolve(process.cwd(), "src/components/HeaderMenu.tsx"), "utf8");
+assert.match(headerMenuSource, /createPortal\(/,
+  "the desktop menu must escape the clipped header");
+assert.match(headerMenuSource, /event\.key === "Escape"/);
+assert.match(headerMenuSource, /document\.contains\(trigger\).*trigger\.focus\(\)/s,
+  "closing the menu restores focus to the three-dot trigger");
+assert.match(headerMenuSource, /data-lock-horizontal-swipe/,
+  "the menu trigger and portal must opt out of global horizontal navigation");
+assert.match(layoutCss, /\.header-menu-card\{[^}]*position:fixed/s);
+assert.match(layoutCss,
+  /@media\(max-width:640px\)\{[\s\S]*?\.header-menu-card\{[^}]*bottom:var\(--keyboard-inset,0px\)/,
+  "mobile header actions must use a keyboard-aware bottom sheet");
+assert.match(layoutCss, /env\(safe-area-inset-bottom\)/,
+  "the mobile menu must preserve the home-indicator safe area");
+const serviceWorkerSource = readFileSync(
+  resolve(process.cwd(), "public/sw.js"), "utf8");
+assert.match(serviceWorkerSource, /existing\.postMessage\(\{[\s\S]*cc-remote-notification/,
+  "an already-open page must receive the exact notification target");
+assert.match(serviceWorkerSource, /self\.clients\.openWindow\(target\)/,
+  "cold notification clicks must retain the fragment route");
 assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\)/,
   "the mobile sheet height accounts for the virtual keyboard inset");
 
+class MemoryStorage {
+  readonly values = new Map<string, string>();
+  getItem(key: string) { return this.values.get(key) ?? null; }
+  setItem(key: string, value: string) { this.values.set(key, value); }
+  removeItem(key: string) { this.values.delete(key); }
+}
+const legacyNotifications = new MemoryStorage();
+legacyNotifications.setItem("cc_remote_notifications", "1");
+assert.equal(readNotificationMode(legacyNotifications), "generic");
+assert.equal(legacyNotifications.getItem(NOTIFICATION_MODE_KEY), "generic",
+  "legacy enabled users must migrate to the privacy-preserving generic mode");
+writeNotificationMode(legacyNotifications, "session");
+assert.equal(legacyNotifications.getItem("cc_remote_notifications"), "1",
+  "the rollback-compatible enabled marker remains set for both active modes");
+writeNotificationMode(legacyNotifications, "off");
+assert.equal(legacyNotifications.getItem("cc_remote_notifications"), null);
+
+const notificationRoute = {
+  machine_id: "nono",
+  session_id: "session-a",
+  engine: "codex" as const,
+  space: "work" as const,
+};
+const notificationUrl = encodeNotificationRoute(notificationRoute);
+assert.match(notificationUrl, /^\/#notification=/);
+assert.deepEqual(
+  parseNotificationFragment(new URL(notificationUrl, "https://remote.example").hash),
+  notificationRoute,
+);
+assert.equal(parseNotificationFragment(
+  `#notification=${encodeURIComponent(JSON.stringify({
+    ...notificationRoute, injected: "value",
+  }))}`), null, "unknown notification-route fields must fail closed");
+assert.equal(parseNotificationFragment(
+  `#notification=${encodeURIComponent(JSON.stringify({
+    ...notificationRoute, session_id: "../../other",
+  }))}`), null, "notification routes accept only protocol-safe session ids");
+assert.equal(parseNotificationFragment(
+  `?notification=${encodeURIComponent(JSON.stringify(notificationRoute))}`), null,
+  "notification routing must never use a query string");
+let replacedNotificationUrl = "";
+assert.deepEqual(captureNotificationFragment({
+  hash: new URL(notificationUrl, "https://remote.example").hash,
+  pathname: "/",
+  search: "",
+}, {
+  setItem() { throw new Error("storage unavailable"); },
+}, {
+  replaceState(_data, _unused, url) {
+    replacedNotificationUrl = String(url);
+  },
+}), notificationRoute,
+"a valid route remains usable in memory when sessionStorage is unavailable");
+assert.equal(replacedNotificationUrl, "/",
+  "notification fragments must be cleared even when storage is unavailable");
+
+const notificationOrigin = {
+  machineId: "mac",
+  engine: "claude" as const,
+  space: "code" as const,
+  sid: "origin-session",
+};
+const navigationBase = {
+  target: notificationRoute,
+  origin: notificationOrigin,
+  deviceState: "ready" as const,
+  authorizedMachineIds: ["mac", "nono"],
+  machineId: "nono",
+  engine: "claude" as const,
+  space: "code" as const,
+};
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  authoritativeSessions: null,
+}), {
+  kind: "request_list",
+  engine: "codex",
+  space: "work",
+}, "the authoritative target list must arrive before focus");
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  authoritativeSessions: [],
+}), {
+  kind: "fail",
+  reason: "session_missing",
+  restore: notificationOrigin,
+}, "an unknown cross-device sid must restore the exact origin");
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  origin: { ...notificationOrigin, machineId: "nono" },
+  authoritativeSessions: [],
+}), {
+  kind: "fail",
+  reason: "session_missing",
+  restore: null,
+}, "an unknown sid on another surface must not switch that surface");
+const listedNotificationSession = {
+  session_id: notificationRoute.session_id,
+  summary: "Release prep",
+};
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  authoritativeSessions: [listedNotificationSession],
+}), {
+  kind: "switch_surface",
+  engine: "codex",
+  space: "work",
+  session: {
+    ...listedNotificationSession,
+    engine: "codex",
+    space: "work",
+  },
+});
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  machineId: "mac",
+  authoritativeSessions: null,
+}), {
+  kind: "switch_machine",
+  machineId: "nono",
+}, "a validated cross-device target switches only the machine first");
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  deviceState: "error",
+  authoritativeSessions: null,
+}), {
+  kind: "fail",
+  reason: "devices_unavailable",
+  restore: notificationOrigin,
+}, "device-list failure after a cross-device switch restores the origin");
+
+type DeferredBinding = {
+  target: PushBindingTarget | null;
+  resolve: (enabled: boolean) => void;
+};
+const bindingCalls: DeferredBinding[] = [];
+const bindingCoordinator = new PushBindingCoordinator(
+  (target) => new Promise<boolean>((resolveBinding) => {
+    bindingCalls.push({ target, resolve: resolveBinding });
+  }),
+);
+const bindingA = { machineId: "machine-a", mode: "generic" as const };
+const bindingB = { machineId: "machine-b", mode: "session" as const };
+const bindA = bindingCoordinator.setTarget(bindingA);
+const bindB = bindingCoordinator.setTarget(bindingB);
+await Promise.resolve();
+assert.deepEqual(bindingCalls.map((entry) => entry.target), [bindingA],
+  "machine rebinds must be serialized");
+bindingCalls[0].resolve(true);
+await Promise.resolve();
+await Promise.resolve();
+assert.deepEqual(bindingCalls.map((entry) => entry.target), [bindingA, bindingB]);
+assert.equal(bindingCoordinator.isRemoteActive("machine-b"), false,
+  "an old machine binding must not masquerade as the new target");
+bindingCalls[1].resolve(true);
+await Promise.all([bindA, bindB]);
+assert.equal(bindingCoordinator.snapshot().state, "remote");
+assert.equal(bindingCoordinator.isRemoteActive("machine-b"), true);
+assert.equal(bindingCoordinator.isRemoteActive("machine-a"), false);
+
+const reboundCalls: DeferredBinding[] = [];
+const reboundCoordinator = new PushBindingCoordinator(
+  (target) => new Promise<boolean>((resolveBinding) => {
+    reboundCalls.push({ target, resolve: resolveBinding });
+  }),
+);
+const reboundA1 = reboundCoordinator.setTarget(bindingA);
+const reboundB = reboundCoordinator.setTarget(bindingB);
+const reboundA2 = reboundCoordinator.setTarget(bindingA);
+await Promise.resolve();
+reboundCalls[0].resolve(true);
+await Promise.all([reboundA1, reboundB, reboundA2]);
+assert.deepEqual(reboundCalls.map((entry) => entry.target), [bindingA],
+  "A to B to A coalesces to the latest binding without stale completion");
+assert.equal(reboundCoordinator.isRemoteActive("machine-a"), true);
+
+const recoveryCalls: DeferredBinding[] = [];
+const recoveryCoordinator = new PushBindingCoordinator(
+  (target) => new Promise<boolean>((resolveBinding) => {
+    recoveryCalls.push({ target, resolve: resolveBinding });
+  }),
+);
+const recoveryA = recoveryCoordinator.setTarget(bindingA);
+await Promise.resolve();
+recoveryCalls[0].resolve(true);
+await recoveryA;
+const recoveryB = recoveryCoordinator.setTarget(bindingB);
+await Promise.resolve();
+assert.equal(recoveryCoordinator.isRemoteActive("machine-b"), false);
+recoveryCalls[1].resolve(false);
+await recoveryB;
+assert.equal(recoveryCoordinator.snapshot().state, "local");
+assert.equal(recoveryCoordinator.isRemoteActive("machine-a"), false,
+  "a failed machine-B bind cannot report the stale machine-A endpoint as active");
+await recoveryCoordinator.setTarget(bindingA);
+assert.equal(recoveryCoordinator.snapshot().state, "remote",
+  "returning to the last confirmed binding recovers without another mutation");
+
+const modeCalls: DeferredBinding[] = [];
+const modeCoordinator = new PushBindingCoordinator(
+  (target) => new Promise<boolean>((resolveBinding) => {
+    modeCalls.push({ target, resolve: resolveBinding });
+  }),
+);
+const genericA = modeCoordinator.setTarget(bindingA);
+await Promise.resolve();
+modeCalls[0].resolve(true);
+await genericA;
+const sessionA = {
+  machineId: bindingA.machineId,
+  mode: "session" as const,
+};
+const modeUpdate = modeCoordinator.setTarget(sessionA);
+await Promise.resolve();
+assert.equal(modeCoordinator.snapshot().state, "binding");
+assert.equal(modeCoordinator.isRemoteActive(bindingA.machineId), true,
+  "same-machine privacy-mode updates retain remote ownership while binding");
+modeCalls[1].resolve(false);
+await modeUpdate;
+assert.equal(modeCoordinator.isRemoteActive(bindingA.machineId), true,
+  "a failed same-machine update must not add a duplicate local notification");
+
 const successfulTurn = {
-  v: 19, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
+  v: 20, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
   result: { subtype: "success", duration_ms: 1, is_error: false },
+  notification_context: {
+    engine: "codex" as const,
+    space: "work" as const,
+    display_name: "Release prep",
+  },
 };
 const interruptedTurn = {
   ...successfulTurn, ts: 2, turn_id: "turn-b",
@@ -4766,6 +5057,22 @@ assert.equal(classifyTurnNotification(interruptedTurn.result), "interrupted");
 assert.equal(turnNotificationBody("Codex", interruptedTurn.result), "Codex 会话已中断");
 assert.notEqual(turnNotificationTag(successfulTurn), turnNotificationTag(interruptedTurn),
   "successive turns in one session must not replace each other's notifications");
+assert.deepEqual(turnNotificationPresentation(successfulTurn, "session"), {
+  title: "Release prep",
+  body: "Codex 会话已经完成",
+  sessionId: "session-a",
+  engine: "codex",
+  space: "work",
+});
+assert.equal(
+  turnNotificationPresentation(interruptedTurn, "session").body,
+  "Codex 会话已中断",
+);
+assert.equal(
+  turnNotificationPresentation(successfulTurn, "generic").sessionId,
+  null,
+  "generic notifications must not retain an exact route",
+);
 const chatViewSource = readFileSync(
   resolve(process.cwd(), "src/components/ChatView.tsx"), "utf8");
 assert.match(chatViewSource, /surface !== "work"/);
@@ -4895,7 +5202,7 @@ controlSocket.onopen?.();
 const wireControlSid = "wire-control-revision";
 controlRelay.seedReplayState({}, {}, {
   [wireControlSid]: {
-    v: 19, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 20, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation", revision: 10,
   },
@@ -4913,7 +5220,7 @@ controlSocket.receive({
   revision: "wire-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 19, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 20, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 9,
   },
@@ -4927,7 +5234,7 @@ controlSocket.receive({
   revision: "wire-cross-session-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 19, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 20, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -4941,7 +5248,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation",
   control: {
-    v: 19, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 20, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -4970,7 +5277,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation-next",
   control: {
-    v: 19, ts: 2, type: "session_control", sid: wireControlSid,
+    v: 20, ts: 2, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation-next", revision: 0,
   },
@@ -5004,12 +5311,12 @@ controlRelay.seedReplayState(
   { [aliasOld]: "wire-alias-live", [aliasReal]: "wire-alias-cache" },
   {
     [aliasOld]: {
-      v: 19, ts: 3, type: "session_control", sid: aliasOld,
+      v: 20, ts: 3, type: "session_control", sid: aliasOld,
       control_mode: "remote", write_state: "writable",
       terminal_attached: false, generation: "wire-alias-live", revision: 2,
     },
     [aliasReal]: {
-      v: 19, ts: 2, type: "session_control", sid: aliasReal,
+      v: 20, ts: 2, type: "session_control", sid: aliasReal,
       control_mode: "desktop", write_state: "read_only",
       terminal_attached: true, generation: "wire-alias-cache", revision: 50,
     },

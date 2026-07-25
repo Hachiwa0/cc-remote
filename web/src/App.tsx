@@ -23,6 +23,7 @@ import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
 import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
+import { HeaderMenu } from "./components/HeaderMenu";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
@@ -54,8 +55,34 @@ import {
   sessionCommandTarget,
   setSessionPinned,
 } from "./session-order";
-import { disableRemotePush, enableRemotePush } from "./push";
-import { turnNotificationBody, turnNotificationTag } from "./turn-notification";
+import {
+  disableRemotePush,
+  enableRemotePush,
+  PushBindingCoordinator,
+  type PushBindingSnapshot,
+} from "./push";
+import {
+  readNotificationMode,
+  writeNotificationMode,
+  type NotificationMode,
+} from "./notification-mode";
+import {
+  captureNotificationFragment,
+  consumeNotificationTarget,
+  encodeNotificationRoute,
+  NOTIFICATION_TARGET_KEY,
+  parseNotificationRoute,
+  storeNotificationTarget,
+  type NotificationRoute,
+} from "./notification-route";
+import {
+  resolveNotificationNavigation,
+  type NotificationOrigin,
+} from "./notification-navigation";
+import {
+  turnNotificationPresentation,
+  turnNotificationTag,
+} from "./turn-notification";
 import { HistoryRequestCoordinator } from "./history-requests";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
@@ -74,7 +101,6 @@ import {
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const SPACE_KEY = "cc_remote_space";
-const NOTIFY_KEY = "cc_remote_notifications";
 const MACHINE_KEY = "cc_remote_machine";
 // Paint the newest few turns first. Older history is intentionally fetched in
 // follow-up pages so one tool-heavy conversation cannot monopolize the socket,
@@ -121,12 +147,35 @@ export default function App() {
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
   const [deviceSheetOpen, setDeviceSheetOpen] = useState(false);
   const [capabilitiesBySurface, setCapabilitiesBySurface] = useState<Record<string, EngineCapabilities>>({});
-  const [notificationsEnabled, setNotificationsEnabled] = useState(
-    () => localStorage.getItem(NOTIFY_KEY) === "1"
-      && typeof Notification !== "undefined" && Notification.permission === "granted");
+  const [notificationMode, setNotificationMode] = useState<NotificationMode>(
+    () => readNotificationMode(localStorage));
+  const [pushBinding, setPushBinding] = useState<PushBindingSnapshot>({
+    state: "off", target: null, bound: null,
+  });
   const [machineId, setMachineId] = useState(
     () => localStorage.getItem(MACHINE_KEY) || "default");
   const [remoteDevices, setRemoteDevices] = useState<RemoteDevice[]>([]);
+  const [devicesLoadState, setDevicesLoadState] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [pendingNotificationTarget, setPendingNotificationTarget] = useState<
+    NotificationRoute | null
+  >(() => {
+    let captured: NotificationRoute | null = null;
+    try {
+      captured = captureNotificationFragment(
+        window.location, sessionStorage, window.history);
+    } catch {
+      // Keep trying the in-memory capture below.
+    }
+    try {
+      return consumeNotificationTarget(sessionStorage) ?? captured;
+    } catch {
+      return captured;
+    }
+  });
+  const [notificationListRevision, bumpNotificationListRevision] = useReducer(
+    (value: number) => value + 1, 0);
   const [devicePairing, setDevicePairing] = useState<PairingState>({
     enabled: false, expires_at: null,
   });
@@ -147,7 +196,14 @@ export default function App() {
   const dismissBanner = useCallback((banner: string) => {
     dispatch({ type: "dismiss_banner", banner });
   }, []);
-  const remotePushActiveRef = useRef(false);
+  const pushCoordinatorRef = useRef<PushBindingCoordinator | null>(null);
+  if (pushCoordinatorRef.current === null) {
+    pushCoordinatorRef.current = new PushBindingCoordinator(async (target) => (
+      target
+        ? enableRemotePush(target.machineId, target.mode)
+        : disableRemotePush()
+    ));
+  }
   const stateRef = useRef(state);
   stateRef.current = state;
   const rightViewRef = useRef(rightView);
@@ -187,6 +243,9 @@ export default function App() {
   const historyInvalidationsRef = useRef<Map<string, string | null>>(new Map());
   const historyCacheEpochRef = useRef<Map<string, number>>(new Map());
   const previousMachineRef = useRef(machineId);
+  const notificationListRequestRef = useRef<string | null>(null);
+  const notificationOriginRef = useRef<NotificationOrigin | null>(null);
+  const pendingNotificationErrorRef = useRef<string | null>(null);
   const touchStartX = useRef(0);
   const touchStartY = useRef(0);
   const touchSwipeLocked = useRef(false);
@@ -226,6 +285,13 @@ export default function App() {
       revision,
     }, () => ws.sendGetHistory(sid, before, limit));
   }, []);
+  const cancelPendingNotificationTarget = useCallback(() => {
+    setPendingNotificationTarget(null);
+    notificationListRequestRef.current = null;
+    notificationOriginRef.current = null;
+    try { sessionStorage.removeItem(NOTIFICATION_TARGET_KEY); }
+    catch { /* private browsing storage may be unavailable */ }
+  }, []);
   // guards the once-per-connection "land on the latest session" auto-focus below
   const didInitFocusRef = useRef(false);
   const shortcutRef = useRef<{
@@ -255,6 +321,7 @@ export default function App() {
     setCompletionReceipts({});
     sessionListsBySurfaceRef.current = {};
     authoritativeSurfaceListsRef.current.clear();
+    notificationListRequestRef.current = null;
     sessionActivityPendingRef.current.clear();
     historyRequestsRef.current.clear();
     prefetchedSurfacesRef.current.clear();
@@ -265,6 +332,13 @@ export default function App() {
     bumpInlineImageRevision();
     bumpHistoryImageRevision();
     dispatch({ type: "reset" });
+    if (pendingNotificationErrorRef.current) {
+      dispatch({
+        type: "command_error",
+        detail: pendingNotificationErrorRef.current,
+      });
+      pendingNotificationErrorRef.current = null;
+    }
     void import("./cache").then((module) => module.clearCache());
   }, [machineId]);
 
@@ -413,13 +487,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!authed) { setRemoteDevices([]); return; }
+    if (!authed) {
+      setRemoteDevices([]);
+      setDevicesLoadState("idle");
+      return;
+    }
+    setDevicesLoadState("loading");
     let cancelled = false;
     void fetch("/api/devices", {
       credentials: "same-origin", cache: "no-store",
     }).then(async (response) => response.ok ? response.json() : null)
       .then((payload) => {
-        if (cancelled || !payload || !Array.isArray(payload.devices)) return;
+        if (cancelled) return;
+        if (!payload || !Array.isArray(payload.devices)) {
+          setDevicesLoadState("error");
+          return;
+        }
         const validDevices: RemoteDevice[] = (payload.devices as unknown[]).filter((value: unknown): value is RemoteDevice => {
           if (!value || typeof value !== "object") return false;
           const item = value as Partial<RemoteDevice>;
@@ -429,25 +512,45 @@ export default function App() {
         });
         const available = validDevices.map((device) => device.machine_id);
         setRemoteDevices(validDevices);
+        setDevicesLoadState("ready");
         setDevicePairing(payload.pairing ?? { enabled: false, expires_at: null });
         if (available.length && !available.includes(machineId)) {
           setMachineId(available[0]);
         }
-      }).catch(() => undefined);
+      }).catch(() => {
+        if (!cancelled) setDevicesLoadState("error");
+      });
     return () => { cancelled = true; };
   }, [authed, machineId]);
 
   useEffect(() => {
-    let cancelled = false;
-    if (!authed || !notificationsEnabled) {
-      remotePushActiveRef.current = false;
-      return;
-    }
-    void enableRemotePush(machineId).then((enabled) => {
-      if (!cancelled) remotePushActiveRef.current = enabled;
-    });
-    return () => { cancelled = true; };
-  }, [authed, machineId, notificationsEnabled]);
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (event: MessageEvent) => {
+      if (event.data?.type !== "cc-remote-notification") return;
+      const target = parseNotificationRoute(event.data.route);
+      if (!target) return;
+      notificationListRequestRef.current = null;
+      notificationOriginRef.current = null;
+      try { storeNotificationTarget(sessionStorage, target); }
+      catch { /* retain the in-memory route below */ }
+      setPendingNotificationTarget(target);
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, []);
+
+  useEffect(() => pushCoordinatorRef.current?.subscribe(setPushBinding), []);
+
+  useEffect(() => {
+    const enabled = notificationMode !== "off"
+      && typeof Notification !== "undefined"
+      && Notification.permission === "granted";
+    void pushCoordinatorRef.current?.setTarget(
+      authed && enabled
+        ? { machineId, mode: notificationMode }
+        : null,
+    );
+  }, [authed, machineId, notificationMode]);
 
   // Swipe right -> open sidebar, swipe left -> close (mobile). Interactive
   // vertical scrollers opt out so a diagonal scroll never becomes navigation.
@@ -495,24 +598,34 @@ export default function App() {
     document.documentElement.setAttribute("data-space", space);
     localStorage.setItem(SPACE_KEY, space);
   }, [space]);
-  const rememberSurfaceFocus = (currentEngine: Engine, currentSpace: Space) => {
+  const rememberSurfaceFocus = useCallback((
+    currentEngine: Engine,
+    currentSpace: Space,
+  ) => {
     if (focusedSid && !state.newChat) {
       lastFocusBySurfaceRef.current[`${currentSpace}:${currentEngine}`] = focusedSid;
     }
-  };
+  }, [focusedSid, state.newChat]);
 
-  const prepareSurfaceSwitch = (nextEngine: Engine, nextSpace: Space) => {
+  const prepareSurfaceSwitch = useCallback((
+    nextEngine: Engine,
+    nextSpace: Space,
+    preserveAuthority = false,
+  ) => {
     rememberSurfaceFocus(engine, space);
     const surfaceKey = `${nextSpace}:${nextEngine}`;
-    authoritativeSurfaceListsRef.current.delete(surfaceKey);
+    if (!preserveAuthority) {
+      authoritativeSurfaceListsRef.current.delete(surfaceKey);
+    }
     dispatch({
       type: "restore_session_list",
       sessions: sessionListsBySurfaceRef.current[surfaceKey] ?? [],
     });
     const remembered = lastFocusBySurfaceRef.current[surfaceKey];
-    preferredSurfaceFocusRef.current = remembered
-      ? { key: surfaceKey, sid: remembered } : null;
-    didInitFocusRef.current = false;
+    preferredSurfaceFocusRef.current = preserveAuthority
+      ? null
+      : remembered ? { key: surfaceKey, sid: remembered } : null;
+    didInitFocusRef.current = preserveAuthority;
     wsRef.current?.setSurface(nextEngine, nextSpace);
     wsRef.current?.setFocusedSid(null);
     // Keep the previous surface's transcript out of view while its accepted
@@ -520,11 +633,133 @@ export default function App() {
     // soon as the remembered (or latest valid) session is available.
     dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
     setNewChatAutoFocus(false);
-  };
+  }, [engine, rememberSurfaceFocus, space]);
+
+  const focusListedSession = useCallback((selected: SessionInfo) => {
+    const selectedEngine: Engine = selected.engine === "codex"
+      || selected.engine === "claude"
+      ? selected.engine : engineRef.current;
+    const selectedSpace: Space = selected.space === "work"
+      || selected.space === "code"
+      ? selected.space : spaceRef.current;
+    const id = selected.session_id;
+    pendingCreateRef.current = null;
+    setCreateError(null);
+    setStatusOpenSid(null);
+    setWorkArtifactsOpen(false);
+    dispatch({ type: "exit_new_chat" });
+    dispatch({ type: "focus_session", sid: id });
+    wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
+    requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
+    wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
+    if (selectedSpace === "work") {
+      wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
+    }
+    if (isMobile()) setSidebarOpen(false);
+  }, [requestHistory]);
+
+  useEffect(() => {
+    const target = pendingNotificationTarget;
+    if (!target || !authed) return;
+    const surfaceKey = `${target.space}:${target.engine}`;
+    if (notificationOriginRef.current === null) {
+      notificationOriginRef.current = {
+        machineId,
+        engine,
+        space,
+        sid: state.focusedSid,
+      };
+      // A cached/preloaded catalog is paint-only here. Resolve every click
+      // against a list requested after that click so a deleted or revoked
+      // target cannot move focus.
+      authoritativeSurfaceListsRef.current.delete(surfaceKey);
+      notificationListRequestRef.current = null;
+    }
+    const navigation = resolveNotificationNavigation({
+      target,
+      origin: notificationOriginRef.current,
+      deviceState: devicesLoadState,
+      authorizedMachineIds: remoteDevices.map((device) => device.machine_id),
+      machineId,
+      engine,
+      space,
+      authoritativeSessions: authoritativeSurfaceListsRef.current.has(surfaceKey)
+        ? sessionListsBySurfaceRef.current[surfaceKey] ?? []
+        : null,
+    });
+    if (navigation.kind === "wait") return;
+    if (navigation.kind === "fail") {
+      const detail = navigation.reason === "devices_unavailable"
+        ? "无法验证通知对应的设备，当前会话没有切换。"
+        : navigation.reason === "device_missing"
+          ? "通知对应的设备不存在或当前账号无权访问。"
+          : "通知对应的会话已删除或不属于当前设备。";
+      if (navigation.restore) {
+        const origin = navigation.restore;
+        pendingNotificationErrorRef.current = detail;
+        setPendingNotificationTarget(null);
+        notificationListRequestRef.current = null;
+        notificationOriginRef.current = null;
+        try { sessionStorage.removeItem(NOTIFICATION_TARGET_KEY); }
+        catch { /* best-effort stale route cleanup */ }
+        preferredSurfaceFocusRef.current = origin.sid
+          ? { key: `${origin.space}:${origin.engine}`, sid: origin.sid }
+          : null;
+        didInitFocusRef.current = false;
+        setEngine(origin.engine);
+        setSpace(origin.space);
+        setMachineId(origin.machineId);
+      } else {
+        dispatch({ type: "command_error", detail });
+        cancelPendingNotificationTarget();
+      }
+      return;
+    }
+    if (navigation.kind === "switch_machine") {
+      setMachineId(navigation.machineId);
+      return;
+    }
+    if (navigation.kind === "request_list") {
+      const ws = wsRef.current;
+      if (!ws) return;
+      const requestKey = `${machineId}:${surfaceKey}`;
+      if (notificationListRequestRef.current !== requestKey) {
+        if (ws.sendListSessions(navigation.engine, navigation.space)) {
+          notificationListRequestRef.current = requestKey;
+        }
+      }
+      return;
+    }
+    if (navigation.kind === "switch_surface") {
+      pendingCreateRef.current = null;
+      setCreateError(null);
+      prepareSurfaceSwitch(navigation.engine, navigation.space, true);
+      setEngine(navigation.engine);
+      setSpace(navigation.space);
+      return;
+    }
+    didInitFocusRef.current = true;
+    focusListedSession(navigation.session);
+    cancelPendingNotificationTarget();
+  }, [
+    authed,
+    cancelPendingNotificationTarget,
+    devicesLoadState,
+    engine,
+    focusListedSession,
+    machineId,
+    notificationListRevision,
+    pendingNotificationTarget,
+    prepareSurfaceSwitch,
+    remoteDevices,
+    space,
+    state.focusedSid,
+  ]);
 
   // Engine and Work/Code switches are navigation. Each surface restores the
   // session that was last open there instead of silently starting a new one.
   const toggleEngine = () => {
+    cancelPendingNotificationTarget();
     const nextEngine: Engine = engine === "codex" ? "claude" : "codex";
     pendingCreateRef.current = null;
     setCreateError(null);
@@ -538,6 +773,7 @@ export default function App() {
 
   const switchSpace = (next: Space) => {
     if (next === space || !confirmArtifactDiscard()) return;
+    cancelPendingNotificationTarget();
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
@@ -975,6 +1211,7 @@ export default function App() {
             const surfaceKey = `${listedSpace}:${msg.engine}`;
             sessionListsBySurfaceRef.current[surfaceKey] = msg.sessions;
             authoritativeSurfaceListsRef.current.add(surfaceKey);
+            bumpNotificationListRevision();
             prefetchedSurfacesRef.current.add(surfaceKey);
             // Warm the sibling Work/Code surface once per page lifetime. Codex
             // reuses the just-read native catalog in the wrapper, so this does
@@ -1016,20 +1253,35 @@ export default function App() {
               setCapabilitiesLoading(false);
             }
           }
-          if (msg.type === "turn_end" && msg.sid && document.hidden
-              && localStorage.getItem(NOTIFY_KEY) === "1"
-              && !remotePushActiveRef.current
+          if (msg.type === "turn_end" && msg.sid && msg.notification_context
+              && document.hidden
               && typeof Notification !== "undefined"
               && Notification.permission === "granted") {
-            const session = stateRef.current.sessions.find(
-              (candidate) => candidate.session_id === msg.sid);
-            const label = session?.engine === "codex" ? "Codex" : "Claude";
-            const body = turnNotificationBody(label, msg.result);
-            void navigator.serviceWorker?.ready.then((registration) =>
-              registration.showNotification("cc-remote", {
-                body, icon: "/icon-192.png", badge: "/favicon.svg",
-                tag: turnNotificationTag(msg), data: { url: "/" },
-              })).catch(() => undefined);
+            const mode = readNotificationMode(localStorage);
+            const remoteWillNotify = !msg.to
+              && !!pushCoordinatorRef.current?.isRemoteActive(machineId);
+            if (mode === "off" || remoteWillNotify) {
+              // Web Push owns broadcast completions while /btw's owner-routed
+              // TurnEnd remains a local-only notification.
+            } else {
+              const presentation = turnNotificationPresentation(msg, mode);
+              const route = presentation.sessionId
+                && presentation.engine && presentation.space
+                ? {
+                    machine_id: machineId,
+                    session_id: presentation.sessionId,
+                    engine: presentation.engine,
+                    space: presentation.space,
+                  }
+                : null;
+              const url = route ? encodeNotificationRoute(route) : "/";
+              void navigator.serviceWorker?.ready.then((registration) =>
+                registration.showNotification(presentation.title, {
+                  body: presentation.body,
+                  icon: "/icon-192.png", badge: "/favicon.svg",
+                  tag: turnNotificationTag(msg), data: { url, route },
+                })).catch(() => undefined);
+            }
           }
           if (msg.type === "session_focus" && spaceRef.current === "work"
               && !msg.session_id.startsWith("tmp-")) {
@@ -1086,6 +1338,8 @@ export default function App() {
           if (s === "connected") {
             recoverableReads.clear();
             historyRequestsRef.current.beginConnection();
+            notificationListRequestRef.current = null;
+            bumpNotificationListRevision();
             ws.sendListSessions(engineRef.current, spaceRef.current);
             if (spaceRef.current === "work") {
               ws.sendGetWorkDashboard(engineRef.current);
@@ -1191,6 +1445,7 @@ export default function App() {
   // Land on the preferred/recent session only after an accepted list for the
   // active engine+space arrives. Background snapshots never pick focus.
   useEffect(() => {
+    if (pendingNotificationTarget) return;
     if (didInitFocusRef.current || !wsRef.current) return;
     const surfaceKey = `${spaceRef.current}:${engineRef.current}`;
     if (!authoritativeSurfaceListsRef.current.has(surfaceKey)) return;
@@ -1221,7 +1476,12 @@ export default function App() {
         latest.session_id, undefined, HISTORY_INITIAL_PAGE);
       wsRef.current.sendSwitchSession(latest.session_id, latestEngine, spaceRef.current);
     }
-  }, [state.sessions, state.focusedSid, requestHistory]);
+  }, [
+    pendingNotificationTarget,
+    state.sessions,
+    state.focusedSid,
+    requestHistory,
+  ]);
 
   // Direct sidebar selection and newly-created sessions both update the
   // per-surface bookmark. A later Work/Code or engine toggle can therefore
@@ -1752,6 +2012,23 @@ export default function App() {
       dispatch({ type: "command_error", detail: "退出失败：服务暂不可用，请稍后重试" });
     }
   };
+  const updateNotificationMode = async (mode: NotificationMode): Promise<boolean> => {
+    if (mode !== "off") {
+      if (typeof Notification === "undefined") {
+        dispatch({ type: "command_error", detail: "当前浏览器不支持系统通知。" });
+        return false;
+      }
+      const permission = Notification.permission === "granted"
+        ? "granted" : await Notification.requestPermission();
+      if (permission !== "granted") {
+        dispatch({ type: "command_error", detail: "通知权限未开启，设置没有更改。" });
+        return false;
+      }
+    }
+    writeNotificationMode(localStorage, mode);
+    setNotificationMode(mode);
+    return true;
+  };
   const activeDevice = remoteDevices.find(
     (device) => device.machine_id === machineId);
   const activeDeviceOnline = state.connState === "connected" && state.wrapperOnline;
@@ -1784,25 +2061,12 @@ export default function App() {
         activeSessionId={focusedSid}
         onSelect={(id) => {
           if (!confirmArtifactDiscard()) return;
-          pendingCreateRef.current = null;
-          setCreateError(null);
-          setStatusOpenSid(null);
-          setWorkArtifactsOpen(false);
+          cancelPendingNotificationTarget();
           const selected = state.sessions.find((s) => s.session_id === id);
-          const selectedEngine = (selected?.engine as "claude" | "codex") || engine;
-          const selectedSpace = selected?.space === "work" ? "work" : space;
-          dispatch({ type: "exit_new_chat" });
-          dispatch({ type: "focus_session", sid: id });
-          wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
-          requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
-          wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
-          if (selectedSpace === "work") {
-            wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
-          }
-          if (isMobile()) setSidebarOpen(false);
+          if (selected) focusListedSession(selected);
         }}
-        onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit" }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={() => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit" }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -1875,32 +2139,15 @@ export default function App() {
           </button>
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
-          {typeof Notification !== "undefined" && <button
-            className={`iconbtn header-notify${notificationsEnabled ? " notify-on" : ""}`}
-            onClick={() => { void (async () => {
-              if (notificationsEnabled) {
-                localStorage.removeItem(NOTIFY_KEY);
-                setNotificationsEnabled(false);
-                remotePushActiveRef.current = false;
-                await disableRemotePush();
-                return;
-              }
-              const permission = await Notification.requestPermission();
-              const enabled = permission === "granted";
-              if (enabled) localStorage.setItem(NOTIFY_KEY, "1");
-              else localStorage.removeItem(NOTIFY_KEY);
-              setNotificationsEnabled(enabled);
-              remotePushActiveRef.current = enabled
-                ? await enableRemotePush(machineId) : false;
-            })(); }} aria-label="完成提醒"
-            title={notificationsEnabled ? "后台完成提醒已开启" : "开启后台完成提醒"}>
-            <Icon name="notify" />
-          </button>}
-          <button className="iconbtn header-theme" onClick={toggleTheme} aria-label="切换主题">
-            <Icon name={theme === "dark" ? "sun" : "moon"} />
-          </button>
-          <button className="iconbtn" onClick={() => void logout()}
-            aria-label="退出登录" title="退出登录"><Icon name="logout" /></button>
+          <HeaderMenu
+            theme={theme}
+            notificationMode={notificationMode}
+            notificationBinding={pushBinding.state}
+            notificationAvailable={typeof Notification !== "undefined"}
+            onNotificationMode={updateNotificationMode}
+            onToggleTheme={toggleTheme}
+            onLogout={() => void logout()}
+          />
         </header>
 
         <ReconnectBanner banner={state.banner} replaying={rt.replaying}
@@ -2197,6 +2444,7 @@ export default function App() {
           setDevicePairing(nextPairing);
         }}
         onSelect={(nextMachineId) => {
+          cancelPendingNotificationTarget();
           if (nextMachineId !== machineId) setMachineId(nextMachineId);
           setDeviceSheetOpen(false);
         }}

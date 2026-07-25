@@ -76,7 +76,9 @@ operations.
 - Add shared Darwin/Linux process identity scanning for native Claude ownership
   while keeping takeover limited to an exact same-user process.
 - Add privacy-preserving Web Push for background completion/failure state,
-  scoped by user and machine and containing no conversation text.
+  scoped by user and machine. Existing users migrate to generic notices; an
+  explicit session mode adds a bounded display name and an exact validated
+  device/surface/session route, never prompt, answer, path, or tool content.
 
 ### Mobile and artifact experience
 
@@ -90,6 +92,8 @@ operations.
   sandbox-converted Office previews inside the wrapper security boundary.
 - Refresh PWA and notification assets and fix narrow-screen sheets, process
   timelines, and persistent error presentation.
+- Group authenticated notification, theme, and logout actions behind an
+  accessible three-dot popover on desktop and safe-area-aware sheet on mobile.
 - Keep running indicators above queue/interrupt controls, preserve Claude turn
   durations, and compact repeated tool activity without hiding final replies.
 
@@ -97,7 +101,7 @@ operations.
 
 - Align Python, Codex `clientInfo`, Web package metadata, and the public build
   manifest on product version `3.0.0`.
-- Upgrade the strict wire gate to protocol v19.
+- Upgrade the strict wire gate to protocol v20.
 - Publish reproducible, checksummed Relay/Wrapper archives for Linux x86_64,
   Linux arm64, macOS Intel, and macOS Apple Silicon, with GitHub artifact
   attestations.
@@ -111,10 +115,10 @@ operations.
 
 ### Upgrade notes
 
-- v3.0.0 uses wire protocol v19. Wrapper, relay, and Web must be upgraded
+- v3.0.0 uses wire protocol v20. Wrapper, relay, and Web must be upgraded
   together; mixed protocol versions are rejected.
 - Hard-refresh already-open browser tabs after deployment so they load the v3
-  hashed assets and rebuild their local projection against protocol v19.
+  hashed assets and rebuild their local projection against protocol v20.
 - Keep runtime secrets and machine state outside release directories. Do not
   replace `.env`, `~/.cc-remote`, Claude transcripts, or Codex rollouts.
 - Claude integration remains pinned to `claude-agent-sdk==0.2.119`.
