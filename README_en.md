@@ -362,6 +362,19 @@ Caddy/systemd, and performs immutable staging, atomic `current` activation, and
 rollback under `/opt/cc-remote/releases/`. An existing
 `/opt/cc-remote/.env` is preserved.
 
+To add direct LAN/Tailscale IPv4 access to the same Relay, opt in on the first
+install:
+
+```bash
+./install.sh relay --domain remote.example.com --allow-private-origins
+```
+
+This binds the Relay to `0.0.0.0:8765`; Caddy still serves the public domain
+over HTTPS. Port 8765 is then present on every IPv4 interface, so use the host
+firewall to admit only trusted LAN/Tailscale peers. Existing installs preserve
+`.env`; enable this mode by setting both `RELAY_HOST=0.0.0.0` and
+`ALLOW_PRIVATE_ORIGINS=1` there before upgrading with the same option.
+
 Open `https://remote.example.com/`, sign in, choose **Allow adding devices** in
 Device Center, and copy the one-time pair code.
 
@@ -600,7 +613,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 
 | Var | Default | Notes |
 |---|---|---|
-| `RELAY_HOST` / `RELAY_PORT` | `127.0.0.1` / `8765` | Listen address (behind Caddy in prod — keep 127.0.0.1). |
+| `RELAY_HOST` / `RELAY_PORT` | `127.0.0.1` / `8765` | Listen address (keep `127.0.0.1` for Caddy-only public access; use `0.0.0.0` together with `ALLOW_PRIVATE_ORIGINS=1` for simultaneous LAN/Tailscale IPv4 access, and restrict it with a firewall). |
 | `LOGIN_PASSWORD` | empty | Single-user web login password. **Required** unless `LOGIN_USERS_JSON` is set. |
 | `LOGIN_USERS_JSON` | empty | Optional multi-user policy: `{"alice":{"password":"…","machines":["mac","nono"]}}`; replaces `LOGIN_PASSWORD`. |
 | `SESSION_SECRET` | empty | HMAC secret to sign session tokens. **Required** (`openssl rand -hex 32`). |
@@ -612,6 +625,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `DEVICE_DB_PATH` | `~/.cc-remote/relay-devices.sqlite3` | Durable device names, last-seen metadata, and credential hashes; never sessions or artifacts. |
 | `DEVICE_PAIRING_TTL_SECONDS` | `600` | Lifetime of a single-use pairing code in seconds; allowed range 60–3600. |
 | `PUBLIC_ORIGIN` | empty | Exact browser origin allowed to connect, e.g. `https://remote.example.com`; **required**, and non-loopback origins must use HTTPS unless `ALLOW_INSECURE_HTTP` is enabled. |
+| `ALLOW_PRIVATE_ORIGINS` | `0` | Set to `1` to retain `PUBLIC_ORIGIN` while also accepting literal private/loopback IP origins on `RELAY_PORT`: `127/8`, `10/8`, `172.16/12`, `192.168/16`, Tailscale `100.64/10`, IPv6 loopback, and ULA. The Origin scheme/host/port must also exactly match the effective request target; hostnames, public IPs, and other ports remain rejected. Private HTTP is unencrypted and normally cannot install a PWA. |
 | `ALLOW_INSECURE_HTTP` | `0` | Escape hatch for a bare public IPv4 address: allows plain `http://`/`ws://` outside loopback. Off by default; login credentials, cookies, wrapper tokens, and all session traffic are unencrypted while enabled. Prefer TLS whenever possible. |
 | `WRAPPER_TOKEN` | placeholder | Wrapper Bearer token for single-machine/compatibility mode; required unless `WRAPPER_TOKENS_JSON` is set. |
 | `WRAPPER_TOKENS_JSON` | empty | Optional machine-bound tokens: `{"mac":"…","nono":"…"}`; replaces the relay's wildcard `WRAPPER_TOKEN`. |
@@ -667,7 +681,7 @@ Each message accepts at most 8 attachments, at most 6 MiB each and 8 MiB decoded
 
 - Code sessions remain a remote development control plane: Claude defaults to `permissionMode: bypassPermissions`, and Codex defaults to approval policy `never` while inheriting the machine's Codex sandbox configuration; both can expose approval controls in the web client. **Treat anyone who can log in and enter Code as holding remote agent/shell authority on the wrapper machine.** Work uses a separate private root and does not expose external directories, but this only narrows the default capability surface; it is not a substitute for OS-user, container, or VM isolation.
 - `LOGIN_PASSWORD` / `LOGIN_USERS_JSON`, `WRAPPER_TOKEN` / `WRAPPER_TOKENS_JSON`, and `SESSION_SECRET` form the authentication boundary: use strong random values, never commit or paste them into chats, and rotate them. A repository `.env` is for local development only; production wrappers must use the root-only `/etc/cc-remote/wrapper.env` above. The systemd template prevents the service and model descendants from reading that source file or a legacy repository `.env`; on Linux the wrapper also disables dumpability so children cannot recover captured credentials through `/proc/<pid>/environ` or process memory.
-- Always use TLS (`wss://`) in production. Only set `ALLOW_INSECURE_HTTP=1` for a temporary bare-public-IPv4 deployment; login credentials, cookies, wrapper tokens, and all session traffic are unencrypted while it is enabled, so switch back to TLS as soon as possible.
+- Always use TLS (`wss://`) in production. Only set `ALLOW_INSECURE_HTTP=1` for a temporary bare-public-IPv4 deployment; login credentials, cookies, wrapper tokens, and all session traffic are unencrypted while it is enabled, so switch back to TLS as soon as possible. `ALLOW_PRIVATE_ORIGINS=1` adds only same-port literal private-IP entry points that match the effective request target and does not relax the public-domain check. Cookie `Secure` follows the trusted request transport, not the caller-provided Origin, but login credentials, cookies, and session traffic are still plaintext when a private HTTP entry point is used.
 - Recommended: restrict the relay by IP / only run it when needed; login is rate-limited (5/min per IP) out of the box.
 
 ## Model backend (optional)

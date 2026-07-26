@@ -47,9 +47,13 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   the user's `settings.json` that decides.
 - **Auth is URL-secret-free**: the wrapper uses `Authorization: Bearer <token>`
   at WS upgrade. Web clients POST `LOGIN_PASSWORD` to `/api/login` and receive a
-  short-lived HttpOnly/SameSite cookie; `/ws` also enforces exact
-  `PUBLIC_ORIGIN`. Never put tokens in URLs or protocol message bodies; logging
-  redacts token/password fields.
+  short-lived HttpOnly/SameSite cookie; `/ws` enforces exact `PUBLIC_ORIGIN`.
+  When `ALLOW_PRIVATE_ORIGINS=1`, the only additional origins are literal
+  private/loopback IPs on `RELAY_PORT`, and their scheme/host/port must match
+  the effective request target. Cookie `Secure` follows that trusted request
+  transport, never the caller's Origin. Uvicorn trusts forwarded transport
+  metadata only from loopback Caddy. Never put tokens in URLs or protocol
+  message bodies; logging redacts token/password fields.
 - **Protocol version gate**: `PROTOCOL_VERSION` in both `protocol.py` and
   `web/src/protocol.ts`. `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all

@@ -8,7 +8,7 @@ die() {
 }
 
 usage() {
-  echo "usage: install-relay.sh BUNDLE --domain remote.example.com" >&2
+  echo "usage: install-relay.sh BUNDLE --domain remote.example.com [--allow-private-origins]" >&2
   exit 2
 }
 
@@ -16,12 +16,17 @@ bundle="${1:-}"
 [ -n "$bundle" ] || usage
 shift
 domain=""
+allow_private_origins=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --domain)
       [ "$#" -ge 2 ] || usage
       domain="$2"
       shift 2
+      ;;
+    --allow-private-origins)
+      allow_private_origins=1
+      shift
       ;;
     *) die "unknown relay installer argument: $1" ;;
   esac
@@ -113,11 +118,16 @@ if [ ! -e "$env_file" ]; then
   install -d -o root -g root -m 0755 "$appdir"
   umask 077
   new_env="$(mktemp "$appdir/.env.new.XXXXXX")"
+  relay_host=127.0.0.1
+  if [ "$allow_private_origins" -eq 1 ]; then
+    relay_host=0.0.0.0
+  fi
   {
     printf '%s\n' \
-      'RELAY_HOST=127.0.0.1' \
+      "RELAY_HOST=${relay_host}" \
       'RELAY_PORT=8765' \
       "PUBLIC_ORIGIN=https://${domain}" \
+      "ALLOW_PRIVATE_ORIGINS=${allow_private_origins}" \
       "LOGIN_PASSWORD='${password}'" \
       "SESSION_SECRET=${session_secret}" \
       "WRAPPER_TOKEN=${wrapper_token}" \
@@ -129,11 +139,43 @@ if [ ! -e "$env_file" ]; then
   install -o root -g root -m 0600 "$new_env" "$env_file"
   rm -f -- "$new_env"
   new_env=""
-  unset password password_repeat session_secret wrapper_token
+  unset password password_repeat session_secret wrapper_token relay_host
   echo "==> created root-only relay configuration"
+  if [ "$allow_private_origins" -eq 1 ]; then
+    echo "WARNING: relay port 8765 will listen on every IPv4 interface."
+    echo "Restrict direct access to trusted LAN/Tailscale peers with a firewall."
+  fi
 else
   if [ ! -f "$env_file" ] || [ -L "$env_file" ]; then
     die "$env_file must be a regular file"
+  fi
+  if [ "$allow_private_origins" -eq 1 ]; then
+    private_setting="$(
+      awk -F= '
+        /^[[:space:]]*ALLOW_PRIVATE_ORIGINS[[:space:]]*=/ {
+          value = $0
+          sub(/^[^=]*=/, "", value)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+          print tolower(value)
+        }
+      ' "$env_file" | tail -n 1
+    )"
+    relay_setting="$(
+      awk -F= '
+        /^[[:space:]]*RELAY_HOST[[:space:]]*=/ {
+          value = $0
+          sub(/^[^=]*=/, "", value)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+          print value
+        }
+      ' "$env_file" | tail -n 1
+    )"
+    case "$private_setting" in
+      1|true|yes|on) ;;
+      *) die "--allow-private-origins requires ALLOW_PRIVATE_ORIGINS=1 in the existing $env_file" ;;
+    esac
+    [ "$relay_setting" = "0.0.0.0" ] || \
+      die "--allow-private-origins requires RELAY_HOST=0.0.0.0 in the existing $env_file"
   fi
   echo "==> preserving existing relay configuration"
 fi

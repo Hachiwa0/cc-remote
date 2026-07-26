@@ -72,6 +72,11 @@ def _cookie_header(response) -> str:
     return f"{SESSION_COOKIE_NAME}={token}"
 
 
+def _ws_url(origin: str, path: str = "/ws") -> str:
+    scheme = "wss" if origin.startswith("https://") else "ws"
+    return f"{scheme}://{origin.split('://', 1)[1]}{path}"
+
+
 async def _asgi_login(app, body: bytes = b'{}') -> tuple[int, bytes, list[tuple[bytes, bytes]]]:
     """Issue one login request without a socket (supports concurrency tests)."""
     sent = []
@@ -145,7 +150,9 @@ def test_multi_user_login_filters_machine_discovery_and_websocket_access():
             "ok": True, "machines": ["mac"],
         }
         headers = {"cookie": _cookie_header(login), "origin": cfg.public_origin}
-        with client.websocket_connect("/ws?machine=nono", headers=headers) as websocket:
+        with client.websocket_connect(
+            _ws_url(cfg.public_origin, "/ws?machine=nono"), headers=headers,
+        ) as websocket:
             closed = websocket.receive()
     assert closed == {
         "type": "websocket.close",
@@ -162,7 +169,8 @@ def test_wildcard_user_cannot_accumulate_empty_machine_buckets():
         headers = {"cookie": _cookie_header(login), "origin": cfg.public_origin}
         for index in range(4):
             with client.websocket_connect(
-                f"/ws?machine=unused-{index}", headers=headers
+                _ws_url(cfg.public_origin, f"/ws?machine=unused-{index}"),
+                headers=headers,
             ):
                 pass
 
@@ -245,6 +253,144 @@ def test_login_and_logout_reject_cross_origin_browser_posts():
             "/api/logout", headers={"Origin": "https://evil.example"})
         assert rejected_logout.status_code == 403
         assert client.get("/api/session").status_code == 200
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://127.1.2.3:8765",
+        "http://10.23.45.67:8765",
+        "http://172.16.0.1:8765",
+        "http://172.31.255.254:8765",
+        "http://192.168.88.9:8765",
+        "http://100.64.0.1:8765",
+        "http://100.127.255.254:8765",
+        "http://[::1]:8765",
+        "http://[fd12:3456::1]:8765",
+    ],
+)
+def test_private_literal_origins_on_relay_port_are_allowed(origin: str):
+    cfg = _cfg(allow_private_origins=True, port=8765)
+    assert server._origin_allowed(origin, cfg) is True
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://127.0.0.1:8764",
+        "http://10.0.0.1",
+        "http://172.15.255.255:8765",
+        "http://172.32.0.0:8765",
+        "http://192.0.2.1:8765",
+        "http://100.63.255.255:8765",
+        "http://100.128.0.0:8765",
+        "http://169.254.1.1:8765",
+        "http://8.8.8.8:8765",
+        "http://localhost:8765",
+        "http://router.lan:8765",
+        "http://user@192.168.1.2:8765",
+        "http://192.168.1.2:8765/",
+        "ws://192.168.1.2:8765",
+    ],
+)
+def test_private_origin_allowlist_rejects_broad_or_ambiguous_hosts(
+    origin: str,
+):
+    cfg = _cfg(allow_private_origins=True, port=8765)
+    assert server._origin_allowed(origin, cfg) is False
+
+
+def test_private_origins_remain_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("ALLOW_PRIVATE_ORIGINS", raising=False)
+    cfg = _cfg(port=8765)
+    assert cfg.allow_private_origins is False
+    assert server._origin_allowed("http://192.168.1.2:8765", cfg) is False
+
+
+def test_private_http_login_sets_host_cookie_and_authenticates_websocket():
+    origin = "http://192.168.1.2:8765"
+    cfg = _cfg(
+        allow_private_origins=True,
+        port=8765,
+    )
+    with TestClient(create_app(cfg), base_url=origin) as client:
+        login = client.post(
+            "/api/login",
+            json={"password": cfg.login_password},
+            headers={"origin": origin},
+        )
+        assert login.status_code == 200
+        cookie = login.headers["set-cookie"].lower()
+        assert "secure" not in cookie
+        assert "httponly" in cookie
+        assert "samesite=strict" in cookie
+        assert client.get("/api/session").status_code == 200
+
+        headers = {"cookie": _cookie_header(login), "origin": origin}
+        with client.websocket_connect(
+            _ws_url(origin), headers=headers,
+        ) as websocket:
+            websocket.send_text(serialize(Hello(
+                role="client",
+                client_id="private-origin-auth-test",
+            )))
+            assert json.loads(websocket.receive_text())["code"] == "wrapper_offline"
+            websocket.close()
+
+
+@pytest.mark.parametrize(
+    ("target", "origin"),
+    [
+        ("http://192.168.1.2:8765", "http://10.0.0.2:8765"),
+        ("http://remote.example", "https://remote.example"),
+    ],
+)
+def test_browser_origin_must_match_effective_request_target(target, origin):
+    cfg = _cfg(allow_private_origins=True, port=8765)
+    with TestClient(create_app(cfg), base_url=target) as client:
+        rejected = client.post(
+            "/api/login",
+            json={"password": cfg.login_password},
+            headers={"origin": origin},
+        )
+        assert rejected.status_code == 403
+
+
+def test_private_websocket_origin_must_match_effective_request_target():
+    target = "http://192.168.1.2:8765"
+    other_private_origin = "http://10.0.0.2:8765"
+    cfg = _cfg(allow_private_origins=True, port=8765)
+    with TestClient(create_app(cfg), base_url=target) as client:
+        login = client.post(
+            "/api/login",
+            json={"password": cfg.login_password},
+            headers={"origin": target},
+        )
+        assert login.status_code == 200
+        headers = {
+            "cookie": _cookie_header(login),
+            "origin": other_private_origin,
+        }
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(_ws_url(target), headers=headers):
+                pass
+        assert exc.value.code == 1008
+
+
+def test_private_https_login_keeps_secure_cookie():
+    origin = "https://100.95.58.23:8765"
+    cfg = _cfg(
+        allow_private_origins=True,
+        port=8765,
+    )
+    with TestClient(create_app(cfg), base_url=origin) as client:
+        login = client.post(
+            "/api/login",
+            json={"password": cfg.login_password},
+            headers={"origin": origin},
+        )
+    assert login.status_code == 200
+    assert "secure" in login.headers["set-cookie"].lower()
 
 
 @pytest.mark.parametrize("message", [
@@ -460,8 +606,12 @@ def test_logout_revokes_session_and_closes_all_of_its_websockets():
     with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
         login = _login(client, cfg)
         headers = {"cookie": _cookie_header(login), "origin": cfg.public_origin}
-        with client.websocket_connect("/ws", headers=headers) as first:
-            with client.websocket_connect("/ws", headers=headers) as second:
+        with client.websocket_connect(
+            _ws_url(cfg.public_origin), headers=headers,
+        ) as first:
+            with client.websocket_connect(
+                _ws_url(cfg.public_origin), headers=headers,
+            ) as second:
                 response = client.post("/api/logout", headers={"cookie": _cookie_header(login)})
                 first_close = first.receive()
                 second_close = second.receive()
@@ -486,7 +636,9 @@ def test_relay_restart_invalidates_old_registry_session():
     with TestClient(create_app(cfg), base_url=cfg.public_origin) as restarted:
         assert restarted.get("/api/session", headers=headers).status_code == 401
         with pytest.raises(WebSocketDisconnect) as error:
-            with restarted.websocket_connect("/ws", headers=headers):
+            with restarted.websocket_connect(
+                _ws_url(cfg.public_origin), headers=headers,
+            ):
                 pass
     assert error.value.code == 1008
 
@@ -505,7 +657,9 @@ def test_cookie_and_exact_origin_authenticate_browser_websocket():
     with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
         login = _login(client, cfg)
         headers = {"cookie": _cookie_header(login), "origin": cfg.public_origin}
-        with client.websocket_connect("/ws", headers=headers) as websocket:
+        with client.websocket_connect(
+            _ws_url(cfg.public_origin), headers=headers,
+        ) as websocket:
             websocket.send_text(serialize(Hello(role="client", client_id="auth-test")))
             assert json.loads(websocket.receive_text())["code"] == "wrapper_offline"
             websocket.close()
@@ -526,7 +680,9 @@ def test_cookie_websocket_is_bound_to_signed_expiry(monkeypatch):
     with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
         login = _login(client, cfg)
         headers = {"cookie": _cookie_header(login), "origin": cfg.public_origin}
-        with client.websocket_connect("/ws", headers=headers) as websocket:
+        with client.websocket_connect(
+            _ws_url(cfg.public_origin), headers=headers,
+        ) as websocket:
             closed = websocket.receive()
 
     assert guarded["expires_at"] == login.json()["exp"]
@@ -578,7 +734,9 @@ def test_cookie_websocket_rejects_missing_or_mismatched_origin(origin: str):
         if origin:
             headers["origin"] = origin
         with pytest.raises(WebSocketDisconnect) as error:
-            with client.websocket_connect("/ws", headers=headers):
+            with client.websocket_connect(
+                _ws_url(cfg.public_origin), headers=headers,
+            ):
                 pass
     assert error.value.code == 1008
 
@@ -589,7 +747,10 @@ def test_query_session_token_is_rejected_even_when_signature_is_valid():
     with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
         with pytest.raises(WebSocketDisconnect) as error:
             with client.websocket_connect(
-                f"/ws?token={quote(token, safe='')}",
+                _ws_url(
+                    cfg.public_origin,
+                    f"/ws?token={quote(token, safe='')}",
+                ),
                 headers={"origin": cfg.public_origin},
             ):
                 pass
@@ -766,6 +927,8 @@ def test_uvicorn_access_log_is_disabled(monkeypatch):
 
     assert called["args"] == (app,)
     assert called["kwargs"]["access_log"] is False
+    assert called["kwargs"]["proxy_headers"] is True
+    assert called["kwargs"]["forwarded_allow_ips"] == "127.0.0.1,::1"
     configured = called["kwargs"]["log_config"]
     expected = uvicorn_log_config()
     assert configured.keys() == expected.keys()

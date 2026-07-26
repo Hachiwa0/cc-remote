@@ -4,7 +4,8 @@ origin.
 
 Auth: wrapper authenticates with a Bearer WRAPPER_TOKEN header; web clients
 authenticate with a Secure HttpOnly session cookie obtained from /api/login.
-Cookie-authenticated WebSockets must also match PUBLIC_ORIGIN when configured.
+Cookie-authenticated WebSockets must also match PUBLIC_ORIGIN, or an explicitly
+enabled same-port private-IP origin.
 
 The relay never imports claude_agent_sdk and never touches the model API.
 """
@@ -65,6 +66,18 @@ SESSION_REVOKED_CLOSE_REASON = "session revoked"
 _PUSH_BODY_MAX_BYTES = 16 * 1024
 _DEVICE_BODY_MAX_BYTES = 8 * 1024
 _PUSH_KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,1024}")
+_PRIVATE_ORIGIN_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "::1/128",
+        "fc00::/7",
+    )
+)
 
 
 class LoginRateLimiter:
@@ -207,26 +220,114 @@ class _BodyTooLarge(ValueError):
     pass
 
 
-def _cookie_secure(cfg: RelayConfig) -> bool:
-    """Allow an insecure cookie for the loopback quick-start, or when the
-    operator has explicitly opted into ALLOW_INSECURE_HTTP for a plain-http
-    public origin."""
-    origin = urlsplit(cfg.public_origin.strip().rstrip("/"))
-    if origin.scheme != "http":
-        return True
-    if origin.hostname in {"127.0.0.1", "::1", "localhost"}:
+def _private_origin_allowed(origin: str, cfg: RelayConfig) -> bool:
+    """Allow only a literal private IP on the relay's direct listening port."""
+    if not cfg.allow_private_origins:
         return False
-    return not cfg.allow_insecure_http
+    try:
+        parsed = urlsplit(origin)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    effective_port = port or (443 if parsed.scheme == "https" else 80)
+    if effective_port != cfg.port:
+        return False
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return any(address in network for network in _PRIVATE_ORIGIN_NETWORKS)
+
+
+def _origin_allowed(origin: str, cfg: RelayConfig) -> bool:
+    candidate = origin.strip()
+    return candidate == cfg.public_origin or _private_origin_allowed(candidate, cfg)
+
+
+def _canonical_origin_host(hostname: str) -> str | None:
+    try:
+        return str(ipaddress.ip_address(hostname))
+    except ValueError:
+        try:
+            return hostname.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            return None
+
+
+def _origin_parts(origin: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urlsplit(origin)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or hostname is None:
+        return None
+    host = _canonical_origin_host(hostname)
+    if host is None:
+        return None
+    return (
+        parsed.scheme,
+        host,
+        port or (443 if parsed.scheme == "https" else 80),
+    )
+
+
+def _request_target_parts(
+    req: Request | WebSocket,
+) -> tuple[str, str, int] | None:
+    scheme = req.url.scheme.lower()
+    if scheme == "ws":
+        scheme = "http"
+    elif scheme == "wss":
+        scheme = "https"
+    if scheme not in {"http", "https"} or req.url.hostname is None:
+        return None
+    host = _canonical_origin_host(req.url.hostname)
+    if host is None:
+        return None
+    return (
+        scheme,
+        host,
+        req.url.port or (443 if scheme == "https" else 80),
+    )
+
+
+def _request_cookie_secure(req: Request) -> bool:
+    """Select Secure from the trusted effective request transport."""
+    return req.url.scheme.lower() == "https"
 
 
 def _rate_limited(ip: str) -> bool:
     return _login_limiter.limited(ip)
 
 
-def _request_origin_allowed(req: Request, cfg: RelayConfig) -> bool:
-    """Reject browser cross-origin POSTs while retaining non-browser CLI use."""
+def _request_origin_allowed(
+    req: Request | WebSocket,
+    cfg: RelayConfig,
+    *,
+    allow_missing: bool = True,
+) -> bool:
+    """Bind an accepted browser Origin to the effective request target."""
     origin = req.headers.get("origin", "").strip()
-    return not origin or origin == cfg.public_origin
+    if not origin:
+        return allow_missing
+    return (
+        _origin_allowed(origin, cfg)
+        and _origin_parts(origin) == _request_target_parts(req)
+    )
 
 
 def _request_ip(req: Request) -> str:
@@ -621,7 +722,7 @@ def create_app(
             token,
             max_age=cfg.session_ttl_seconds,
             path="/",
-            secure=_cookie_secure(cfg),
+            secure=_request_cookie_secure(req),
             httponly=True,
             samesite="strict",
         )
@@ -663,7 +764,7 @@ def create_app(
         response.delete_cookie(
             SESSION_COOKIE_NAME,
             path="/",
-            secure=_cookie_secure(cfg),
+            secure=_request_cookie_secure(req),
             httponly=True,
             samesite="strict",
         )
@@ -872,8 +973,9 @@ def create_app(
         if role is None:
             token = websocket.cookies.get(SESSION_COOKIE_NAME, "")
             origin = websocket.headers.get("origin", "")
-            expected_origin = cfg.public_origin.strip().rstrip("/")
-            origin_ok = not expected_origin or origin == expected_origin
+            origin_ok = _request_origin_allowed(
+                websocket, cfg, allow_missing=False,
+            )
             claims = session_token_claims(token, cfg.session_secret)
             if (
                 claims is not None
@@ -883,7 +985,7 @@ def create_app(
             ):
                 role = "client"
             elif token and not origin_ok:
-                log.warning("ws origin rejected", origin=origin or "-")
+                log.warning("ws origin rejected", origin=(origin or "-")[:512])
         if role is None:
             await websocket.close(code=1008, reason="unauthorized")
             return
