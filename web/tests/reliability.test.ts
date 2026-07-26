@@ -6247,6 +6247,9 @@ assert.match(appSource, /legacyExternal=\{!rt\.control && !!rt\.external\}/,
   "rolling-deploy compatibility keeps legacy external ownership actionable");
 assert.match(appSource, /sessionControlLocksInput\(rt\.control\)/,
   "Shift+Tab must not mutate controls while the authoritative session is read-only");
+assert.match(appSource,
+  /state\.connState !== "connected" \|\| !state\.wrapperOnline\) return;[\s\S]{0,300}sendGetContext\(\)[\s\S]{0,200}begin_context_request/,
+  "a focused session must prime its context ring after initial sync and reconnect");
 assert.doesNotMatch(appSource, /className="work-artifacts-btn"/);
 assert.doesNotMatch(appSource, /className="work-head-manage"/);
 assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
