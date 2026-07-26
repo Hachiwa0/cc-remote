@@ -398,6 +398,8 @@ class WrapperMachine:
     })
     OFFICE_PREVIEW_INPUT_MAX_BYTES = 32 * 1024 * 1024
     OFFICE_PREVIEW_TIMEOUT_SECONDS = 45
+    HISTORY_REFRESH_MIN_INTERVAL_SECONDS = 1.0
+    HISTORY_REFRESH_MAX_INTERVAL_SECONDS = 10.0
     PREVIEW_ASSET_MEDIA_TYPES = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -3995,6 +3997,7 @@ class WrapperMachine:
             (ctx is not None and ctx.engine == "codex") or watched_engine == "codex")
         source_path = None
         source_fingerprint = None
+        source_snapshot_stable: bool | None = None
         indexed_page = None
         stale_indexed_page = False
         source_too_large = False
@@ -4011,10 +4014,20 @@ class WrapperMachine:
             )
         except OSError:
             source_path = None
-        if source_path and self._history_index is not None:
+        if source_path:
             try:
                 source_fingerprint = await asyncio.to_thread(
                     HistorySourceFingerprint.capture, source_path)
+            except OSError:
+                source_snapshot_stable = False
+            except Exception as exc:
+                source_snapshot_stable = False
+                log.warning(
+                    "history source fingerprint failed", session_id=sid,
+                    error=str(exc),
+                )
+        if source_fingerprint is not None and self._history_index is not None:
+            try:
                 indexed_page = await asyncio.to_thread(
                     self._history_index.get_page,
                     sid,
@@ -4024,18 +4037,18 @@ class WrapperMachine:
                     limit=int(limit) if isinstance(limit, int) else 0,
                 )
                 if (indexed_page is None and allow_stale
-                        and not is_codex_hist and before is None):
+                        and before is None):
                     indexed_page = await asyncio.to_thread(
                         self._history_index.get_append_page,
                         sid,
-                        "claude",
+                        "codex" if is_codex_hist else "claude",
                         source_fingerprint,
                         before=None,
                         limit=int(limit) if isinstance(limit, int) else 0,
                     )
                     stale_indexed_page = indexed_page is not None
             except OSError:
-                source_fingerprint = None
+                indexed_page = None
             except Exception as exc:
                 log.warning(
                     "history index read failed", session_id=sid,
@@ -4102,6 +4115,28 @@ class WrapperMachine:
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
             )
+            if stale_indexed_page:
+                # A sampled append-prefix page is useful for first paint, but it
+                # is not the exact current rollout/transcript projection. The
+                # browser keeps it display-only until the refresh below commits
+                # a matching authoritative page.
+                cached_history.authoritative = False
+            cached_source_stable = True
+            try:
+                cached_source_stable = (
+                    await asyncio.to_thread(
+                        HistorySourceFingerprint.capture,
+                        source_fingerprint.path,
+                    )
+                    == source_fingerprint
+                )
+            except Exception:
+                cached_source_stable = False
+            if not cached_source_stable:
+                # The source grew after the exact cache lookup but before this
+                # response was assembled. Treat it like any other sampled first
+                # paint instead of letting a stale cache hit replace live rows.
+                cached_history.authoritative = False
             if detail == "summary":
                 cached_history.turns = [
                     ConversationTurn.model_validate(turn)
@@ -4112,7 +4147,11 @@ class WrapperMachine:
                     row for row in cached_events
                     if row.get("type") in {"model", "effort"}
                 ]
-            if stale_indexed_page and not source_too_large:
+            if (
+                (stale_indexed_page or not cached_source_stable)
+                and not source_too_large
+                and before is None
+            ):
                 self._schedule_history_refresh(
                     sid,
                     before=before,
@@ -4477,8 +4516,9 @@ class WrapperMachine:
                     is_codex_hist and in_progress and before is None),
             ),
         )
-        if source_fingerprint is not None and self._history_index is not None:
-            if (indexed_page is not None
+        if source_fingerprint is not None:
+            if (self._history_index is not None
+                    and indexed_page is not None
                     and not indexed_page.semantically_equals(materialized)):
                 # Shadow mismatches never affect the response.  Remove the row
                 # and refresh it below so corruption or a missed source change
@@ -4492,7 +4532,19 @@ class WrapperMachine:
             try:
                 current_fingerprint = await asyncio.to_thread(
                     HistorySourceFingerprint.capture, source_fingerprint.path)
-                if current_fingerprint == source_fingerprint:
+                source_snapshot_stable = (
+                    current_fingerprint == source_fingerprint
+                )
+            except OSError:
+                source_snapshot_stable = False
+            except Exception as exc:
+                source_snapshot_stable = False
+                log.warning(
+                    "history source verification failed", session_id=sid,
+                    error=str(exc),
+                )
+            if source_snapshot_stable and self._history_index is not None:
+                try:
                     await asyncio.to_thread(
                         self._history_index.put_page,
                         sid,
@@ -4502,12 +4554,26 @@ class WrapperMachine:
                         limit=int(limit) if isinstance(limit, int) else 0,
                         page=materialized,
                     )
-            except OSError:
-                pass
-            except Exception as exc:
-                log.warning(
-                    "history index write failed", session_id=sid,
-                    error=str(exc),
+                except Exception as exc:
+                    # The index is a rebuildable acceleration layer. A failed
+                    # write cannot make an otherwise coherent source snapshot
+                    # non-authoritative or trigger an endless refresh loop.
+                    log.warning(
+                        "history index write failed", session_id=sid,
+                        error=str(exc),
+                    )
+        if source_snapshot_stable is False:
+            # The translator did not observe one coherent source snapshot. It
+            # may still provide a useful first paint, but it cannot replace the
+            # canonical transcript or clear a replay/rollback barrier.
+            history.authoritative = False
+            if allow_stale and before is None:
+                self._schedule_history_refresh(
+                    sid,
+                    before=before,
+                    limit=limit,
+                    cwd=cwd_hint,
+                    detail=detail,
                 )
         if detail == "summary":
             history.turns = [
@@ -4530,44 +4596,86 @@ class WrapperMachine:
         cwd: str | None,
         detail: str,
     ) -> None:
-        """Refresh one append-stale Claude page without delaying first paint."""
-        key = (sid, before or "", limit or 0, f"{cwd or ''}\0{detail}")
+        """Refresh one provisional moving-source page off the first-paint path."""
+        ctx = self._ctx_by_sid(sid)
+        watch = self._watch.get(sid) or {}
+        is_codex = bool(
+            (ctx is not None and ctx.engine == "codex")
+            or watch.get("engine") == "codex"
+        )
+        # Codex rollouts are addressed by sid and never use cwd. Normalizing it
+        # prevents clients carrying different cwd hints from starting parallel
+        # scans of the same multi-gigabyte rollout.
+        refresh_cwd = None if is_codex else cwd
+        key = (
+            sid,
+            before or "",
+            limit or 0,
+            f"{refresh_cwd or ''}\0{detail}",
+        )
         current = self._history_refresh_tasks.get(key)
         if current is not None and not current.done():
             self._history_refresh_dirty.add(key)
             return
 
         async def refresh() -> None:
+            provisional_attempts = 0
             try:
                 while True:
                     self._history_refresh_dirty.discard(key)
+                    scan_started = time.monotonic()
                     history = await self._build_history(
                         sid,
                         before=before,
                         limit=limit,
-                        cwd_hint=cwd,
+                        cwd_hint=refresh_cwd,
                         detail=detail,
                         allow_stale=False,
                     )
+                    scan_elapsed = time.monotonic() - scan_started
                     if history.authoritative is not False:
                         history.sid = sid
                         await self.transport.send(history)
                         log.info(
-                            "stale Claude history refreshed",
+                            "stale history refreshed",
                             session_id=sid,
                             turns=len(history.turns),
                             before=bool(before),
                         )
                     # Coalesce every append observed during the scan into one
                     # final exact rebuild. This converges at turn completion
-                    # without launching one full Claude parse per tool delta.
-                    if key not in self._history_refresh_dirty:
+                    # without launching one full transcript/rollout parse per
+                    # tool delta. Rate-limit a continuously moving source scan
+                    # so one long-running turn cannot monopolize disk and CPU.
+                    needs_rescan = (
+                        key in self._history_refresh_dirty
+                        or (
+                            history.authoritative is False
+                            and history.error is None
+                        )
+                    )
+                    source_still_moving = (
+                        history.authoritative is False
+                        and history.error is None
+                    )
+                    provisional_attempts = (
+                        provisional_attempts + 1
+                        if source_still_moving
+                        else 0
+                    )
+                    if not needs_rescan:
                         return
+                    if (
+                        self._history_refresh_in_progress(sid)
+                        or provisional_attempts > 1
+                    ):
+                        await asyncio.sleep(
+                            self._history_refresh_backoff_seconds(scan_elapsed))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning(
-                    "stale Claude history refresh failed",
+                    "stale history refresh failed",
                     session_id=sid,
                     error_type=type(exc).__name__,
                 )
@@ -4581,6 +4689,25 @@ class WrapperMachine:
             self._history_refresh_dirty.discard(key)
 
         task.add_done_callback(forget)
+
+    def _history_refresh_in_progress(self, sid: str) -> bool:
+        ctx = self._ctx_by_sid(sid)
+        active_external_turns = (
+            (self._watch.get(sid) or {}).get("active_external_turns")
+        )
+        return bool(
+            (ctx is not None and ctx.state != "idle")
+            or (
+                isinstance(active_external_turns, dict)
+                and active_external_turns
+            )
+        )
+
+    def _history_refresh_backoff_seconds(self, scan_elapsed: float) -> float:
+        return min(
+            max(self.HISTORY_REFRESH_MIN_INTERVAL_SECONDS, scan_elapsed),
+            self.HISTORY_REFRESH_MAX_INTERVAL_SECONDS,
+        )
 
     async def _build_requested_history(
         self,

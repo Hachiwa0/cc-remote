@@ -209,52 +209,223 @@ class _SpontaneousNotificationQueue:
     The app-server stdout reader must keep draining even if the relay is slow.  A
     regular ``asyncio.Queue.put`` would transfer relay backpressure all the way to
     stdout and can deadlock JSON-RPC responses/approvals.  This queue therefore has
-    a synchronous, fail-fast producer and one asynchronous consumer.
+    a synchronous, fail-fast producer and one asynchronous consumer. One item and
+    a small byte allowance are reserved for the authoritative terminal/close
+    frame, so a saturated live-detail queue can never erase turn completion.
     """
 
     def __init__(self, max_items: int, max_bytes: int):
         self.max_items = max(2, max_items)
         self.max_bytes = max(1024, max_bytes)
+        self.max_end_bytes = min(
+            4 * 1024,
+            max(512, self.max_bytes // 8),
+        )
+        self._live_max_items = self.max_items - 1
+        self._live_max_bytes = self.max_bytes - self.max_end_bytes
         self._items: deque[tuple[object, int]] = deque()
+        self._end: Optional[tuple[object, int]] = None
         self._bytes = 0
         self._ready = asyncio.Event()
+        self._lossy = False
+        self._post_gap_items: set[str] = set()
 
     @property
     def byte_size(self) -> int:
         return self._bytes
 
     def qsize(self) -> int:
-        return len(self._items)
+        return len(self._items) + (1 if self._end is not None else 0)
 
     def has_turn_completed(self) -> bool:
-        return any(
-            isinstance(item, dict) and item.get("method") == "turn/completed"
-            for item, _size in self._items
+        return bool(
+            self._end is not None
+            and isinstance(self._end[0], dict)
+            and self._end[0].get("method") == "turn/completed"
         )
 
     def put_nowait(self, item: object, size: int = 0) -> bool:
         size = max(0, size)
-        if (size > self.max_bytes or len(self._items) >= self.max_items
-                or self._bytes + size > self.max_bytes):
+        if not self._can_put_live(size):
             return False
         self._items.append((item, size))
         self._bytes += size
         self._ready.set()
         return True
 
-    def clear(self) -> None:
+    def _can_put_live(self, size: int) -> bool:
+        return not (
+            self._end is not None
+            or size > self._live_max_bytes
+            or len(self._items) >= self._live_max_items
+            or self._bytes + size > self._live_max_bytes
+        )
+
+    def put_terminal_nowait(self, item: dict, size: int) -> bool:
+        """Retain exactly one terminal in the queue's reserved end slot."""
+        size = max(0, size)
+        if self.has_turn_completed():
+            return True
+        if size > self.max_end_bytes:
+            return False
+        if self._end is not None:
+            _old_item, old_size = self._end
+            self._bytes = max(0, self._bytes - old_size)
+        self._end = (item, size)
+        self._bytes += size
+        self._ready.set()
+        return True
+
+    def put_end_nowait(self, item: object, size: int = 0) -> bool:
+        """Retain one EOF/close sentinel without competing with live detail."""
+        size = max(0, size)
+        if self._end is not None or size > self.max_end_bytes:
+            return False
+        self._end = (item, size)
+        self._bytes += size
+        self._ready.set()
+        return True
+
+    def begin_gap(self, marker: object) -> None:
+        """Drop one stale live tail and open a bounded loss epoch."""
         self._items.clear()
-        self._bytes = 0
-        self._ready.clear()
+        if self._end is None:
+            self._bytes = 0
+        else:
+            self._bytes = self._end[1]
+        self._lossy = True
+        self._post_gap_items.clear()
+        # A zero-byte marker always fits in the live reservation.
+        self._items.append((marker, 0))
+        self._ready.set()
+
+    def retry_after_gap_nowait(self, message: dict, size: int) -> bool:
+        """Retain the overflow-triggering frame when it is safe and now fits."""
+        size = max(0, size)
+        # Check capacity before lifecycle admission mutates the tracker. A single
+        # oversized start must not authorize its later orphan deltas.
+        if not self._can_put_live(size):
+            return False
+        if not self.accepts_after_gap(message):
+            return False
+        return self.put_nowait(message, size)
+
+    def accepts_after_gap(self, message: dict) -> bool:
+        """Admit only post-gap frames whose lifecycle boundary is intact.
+
+        Normal turns retain app-server compatibility with delta-only and
+        completion-only providers. Once frames were shed, however, forwarding an
+        orphan incremental update lets the translator resurrect a tool or message
+        whose start was lost. Keep strict delta admission for the remainder of
+        that turn while allowing authoritative completion snapshots.
+        """
+        if not self._lossy:
+            return True
+
+        method = message.get("method")
+        params = (
+            message.get("params")
+            if isinstance(message.get("params"), dict)
+            else {}
+        )
+        if not isinstance(method, str):
+            return False
+        if not method.startswith(("item/", "hook/")):
+            # Turn/model/error/thread notifications are self-contained snapshots.
+            return True
+
+        if method == "item/started":
+            item = params.get("item")
+            item_id = item.get("id") if isinstance(item, dict) else None
+            return self._admit_post_gap_start("item", item_id)
+        if method == "item/reasoning/summaryPartAdded":
+            return self._admit_post_gap_start(
+                "item", params.get("itemId"))
+        if method == "item/completed":
+            item = params.get("item")
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("type"), str)
+                or not item["type"]
+            ):
+                return False
+            return self._admit_post_gap_completion("item", item_id)
+        if method == "item/autoApprovalReview/started":
+            return self._admit_post_gap_start(
+                "review", params.get("reviewId"))
+        if method == "item/autoApprovalReview/completed":
+            if not isinstance(params.get("review"), dict):
+                return False
+            return self._admit_post_gap_completion(
+                "review", params.get("reviewId"))
+        if method == "hook/started":
+            run = params.get("run")
+            run_id = run.get("id") if isinstance(run, dict) else None
+            return self._admit_post_gap_start("hook", run_id)
+        if method == "hook/completed":
+            run = params.get("run")
+            run_id = run.get("id") if isinstance(run, dict) else None
+            if not isinstance(run, dict):
+                return False
+            return self._admit_post_gap_completion("hook", run_id)
+
+        # Every other item notification is an incremental update to itemId.
+        item_id = params.get("itemId")
+        return self._post_gap_key("item", item_id) in self._post_gap_items
+
+    def _admit_post_gap_start(self, kind: str, value: Any) -> bool:
+        key = self._post_gap_key(kind, value)
+        if key is None:
+            return False
+        if key in self._post_gap_items:
+            return True
+        if len(self._post_gap_items) >= self.max_items:
+            return False
+        self._post_gap_items.add(key)
+        return True
+
+    def _admit_post_gap_completion(self, kind: str, value: Any) -> bool:
+        """Admit one authoritative, self-contained completion snapshot.
+
+        Completion-only items are part of the official app-server contract. The
+        start may have reached the consumer before the gap, been shed inside the
+        gap, or never have been emitted by this provider revision. A valid
+        completion closes a tracked lifecycle when present, but never depends on
+        that tracker for admission. Incremental deltas remain strict above.
+        """
+        key = self._post_gap_key(kind, value)
+        if key is None:
+            return False
+        self._post_gap_items.discard(key)
+        return True
+
+    @staticmethod
+    def _post_gap_key(kind: str, value: Any) -> Optional[str]:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 4096
+        ):
+            return None
+        digest = hashlib.sha256(
+            value.encode("utf-8", errors="surrogatepass"),
+        ).hexdigest()
+        return f"{kind}:{digest}"
 
     async def get(self) -> object:
-        while not self._items:
+        while not self._items and self._end is None:
             self._ready.clear()
-            if not self._items:
+            if not self._items and self._end is None:
                 await self._ready.wait()
-        item, size = self._items.popleft()
+        if self._items:
+            item, size = self._items.popleft()
+        else:
+            assert self._end is not None
+            item, size = self._end
+            self._end = None
         self._bytes = max(0, self._bytes - size)
-        if not self._items:
+        if not self._items and self._end is None:
             self._ready.clear()
         return item
 
@@ -1517,21 +1688,64 @@ class CodexHandle:
         raw_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
         turn: dict[str, Any] = {}
         turn_id = raw_turn.get("id") or params.get("turnId")
-        if isinstance(turn_id, str) and turn_id:
+        if isinstance(turn_id, str) and 0 < len(turn_id) <= 512:
             turn["id"] = turn_id
         status = raw_turn.get("status")
         if status in {"completed", "interrupted", "failed"}:
             turn["status"] = status
         duration = raw_turn.get("durationMs")
         if isinstance(duration, (int, float)) and not isinstance(duration, bool):
-            turn["durationMs"] = max(0, int(duration))
+            try:
+                turn["durationMs"] = max(0, int(duration))
+            except (OverflowError, ValueError):
+                pass
         out_params: dict[str, Any] = {"turn": turn}
         thread_id = params.get("threadId")
-        if isinstance(thread_id, str) and thread_id:
+        if isinstance(thread_id, str) and 0 < len(thread_id) <= 512:
             out_params["threadId"] = thread_id
-        if isinstance(turn_id, str) and turn_id:
+        if isinstance(turn_id, str) and 0 < len(turn_id) <= 512:
             out_params["turnId"] = turn_id
         return {"method": "turn/completed", "params": out_params}
+
+    def _retain_terminal_notification(
+        self,
+        q: _SpontaneousNotificationQueue,
+        message: dict,
+        size: int,
+    ) -> None:
+        terminal_message = message
+        terminal_size = size
+        if terminal_size > q.max_end_bytes:
+            terminal_message = self._minimal_turn_completed(message)
+            terminal_size = self._notification_wire_size(terminal_message)
+        if q.put_terminal_nowait(terminal_message, terminal_size):
+            return
+        # The bounded minimal form above is normally below 2 KiB. Keep one
+        # schema-valid status-only terminal even if untrusted ids were extreme.
+        params = (
+            message.get("params")
+            if isinstance(message.get("params"), dict)
+            else {}
+        )
+        raw_turn = (
+            params.get("turn")
+            if isinstance(params.get("turn"), dict)
+            else {}
+        )
+        status = raw_turn.get("status")
+        tiny = {
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "status": (
+                        status
+                        if status in {"completed", "interrupted", "failed"}
+                        else "failed"
+                    ),
+                },
+            },
+        }
+        q.put_terminal_nowait(tiny, self._notification_wire_size(tiny))
 
     def _queue_spontaneous_notification(
         self, message: dict, raw_size: Optional[int] = None,
@@ -1543,12 +1757,15 @@ class CodexHandle:
             return False
         method = message.get("method")
         terminal = method == "turn/completed"
-        if self._spontaneous_overflow and not terminal:
-            return True
         size = (
             raw_size if isinstance(raw_size, int) and raw_size >= 0
             else self._notification_wire_size(message)
         )
+        if terminal:
+            self._retain_terminal_notification(q, message, size)
+            return True
+        if not q.accepts_after_gap(message):
+            return True
         if q.put_nowait(message, size):
             return True
 
@@ -1560,17 +1777,8 @@ class CodexHandle:
                 queued_bytes=q.byte_size,
             )
         self._spontaneous_overflow = True
-        q.clear()
-        q.put_nowait(CodexSpontaneousOverflow(turn_id))
-        if terminal:
-            terminal_message = message
-            terminal_size = size
-            if terminal_size > q.max_bytes:
-                terminal_message = self._minimal_turn_completed(message)
-                terminal_size = self._notification_wire_size(terminal_message)
-            # The queue always reserves at least two item slots. Byte overflow is
-            # impossible for the bounded minimal fallback above.
-            q.put_nowait(terminal_message, terminal_size)
+        q.begin_gap(CodexSpontaneousOverflow(turn_id))
+        q.retry_after_gap_nowait(message, size)
         return True
 
     def _queue_managed_notification(
@@ -1581,20 +1789,24 @@ class CodexHandle:
         review/start can emit multiple item notifications before its RPC response.
         A regular bounded ``asyncio.Queue.put`` deadlocks once full because the
         response which starts the consumer is waiting behind those notifications.
-        On overflow retain one signal plus the authoritative terminal frame.
+        On overflow retain one gap signal, then admit only intact new item
+        lifecycles; the authoritative terminal has its own reserved end slot.
         """
         q = self._turn_q
         if not isinstance(q, _SpontaneousNotificationQueue):
             return False
         method = message.get("method")
         terminal = method == "turn/completed"
-        if self._managed_overflow and not terminal:
-            return True
         size = (
             raw_size if isinstance(raw_size, int) and raw_size >= 0
             else self._notification_wire_size(message)
         )
-        if not self._managed_overflow and q.put_nowait(message, size):
+        if terminal:
+            self._retain_terminal_notification(q, message, size)
+            return True
+        if not q.accepts_after_gap(message):
+            return True
+        if q.put_nowait(message, size):
             return True
 
         turn_id = self.turn_id or _notification_turn_id(message)
@@ -1606,21 +1818,8 @@ class CodexHandle:
                 queued_bytes=q.byte_size,
             )
             self._managed_overflow = True
-            q.clear()
-            q.put_nowait(CodexManagedOverflow(turn_id))
-        if terminal:
-            terminal_message = message
-            terminal_size = size
-            if terminal_size > q.max_bytes:
-                terminal_message = self._minimal_turn_completed(message)
-                terminal_size = self._notification_wire_size(terminal_message)
-            if not q.put_nowait(terminal_message, terminal_size):
-                # The queue reserves two slots (overflow + terminal). This final
-                # fallback only covers an unexpectedly tiny byte budget.
-                q.clear()
-                q.put_nowait(CodexManagedOverflow(turn_id))
-                minimal = self._minimal_turn_completed(message)
-                q.put_nowait(minimal, self._notification_wire_size(minimal))
+        q.begin_gap(CodexManagedOverflow(turn_id))
+        q.retry_after_gap_nowait(message, size)
         return True
 
     def _close_spontaneous_stream(self, turn_id: Optional[str]) -> None:
@@ -1629,13 +1828,11 @@ class CodexHandle:
         current = self._spontaneous_queue_turn_id
         if q is None or current is None or (turn_id and turn_id != current):
             return
-        closed = CodexSpontaneousClosed(current)
-        if q.put_nowait(closed):
+        if q.has_turn_completed():
             return
-        self._spontaneous_overflow = True
-        q.clear()
-        q.put_nowait(CodexSpontaneousOverflow(current))
-        q.put_nowait(closed)
+        closed = CodexSpontaneousClosed(current)
+        if q.put_end_nowait(closed):
+            return
 
     async def receive_spontaneous_response(self, turn_id: str):
         """Yield exactly one spontaneous turn's raw frames and internal signals."""
@@ -3098,11 +3295,13 @@ class CodexHandle:
     @staticmethod
     def _force_turn_sentinel(queue: Any) -> None:
         """Wake a consumer during disconnect even when the bounded queue is full."""
-        if (isinstance(queue, _SpontaneousNotificationQueue)
-                and queue.has_turn_completed()):
-            # receive_response terminates on this authoritative frame. Replacing
-            # a full [Overflow, turn/completed] bridge with None would erase the
-            # only terminal evidence during an EOF/disconnect race.
+        if isinstance(queue, _SpontaneousNotificationQueue):
+            # The reserved end slot never competes with live frames. An existing
+            # authoritative terminal wins over EOF; otherwise one sentinel wakes
+            # the consumer after its retained live tail drains.
+            if queue.has_turn_completed():
+                return
+            queue.put_end_nowait(None)
             return
         try:
             offered = queue.put_nowait(None)

@@ -19,6 +19,18 @@ import {
 } from "../src/runtime-drain.ts";
 import { mergeInitialHistory } from "../src/history-merge.ts";
 import {
+  displayHistoryProjection,
+  historyConfirmsRecovery,
+  historyConfirmsRuntimeRecovery,
+  historyNeedsConfirmationRequest,
+  isHistoryRecoveryPending,
+  isRuntimeHistoryRecoveryPending,
+} from "../src/history-recovery.ts";
+import {
+  acceptsCachedNewerPage,
+  appendNewerPage,
+} from "../src/history-browse.ts";
+import {
   acknowledgeCompletion,
   completionBadgeKind,
   discardBtwCompletionReceipts,
@@ -62,8 +74,8 @@ import {
   type MobileViewportEvent,
   type ViewportReading,
 } from "../src/use-mobile-viewport.ts";
-import type { ServerEvent, SessionControl } from "../src/protocol.ts";
-import type { Block } from "../src/reducer.ts";
+import type { History, ServerEvent, SessionControl } from "../src/protocol.ts";
+import type { Block, Turn } from "../src/reducer.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
 import {
   classifyTurnNotification,
@@ -455,6 +467,23 @@ assert.match(historyAppSource, /history_invalidated[\s\S]*requestHistory/,
 assert.match(historyAppSource,
   /msg\.type === "history" && msg\.authoritative !== false[\s\S]*allowSessionCache/,
   "a failed non-authoritative History must not reopen the IndexedDB cache barrier");
+assert.match(historyAppSource,
+  /const displayRecoveryMatches = !isHistoryRecoveryPending\([\s\S]{0,240}historyConfirmsRecovery/,
+  "cache recovery must distinguish a display candidate from a confirmation");
+assert.match(historyAppSource,
+  /const runtimeRecoveryMatches =[\s\S]{0,240}!isRuntimeHistoryRecoveryPending\([\s\S]{0,240}historyConfirmsRuntimeRecovery/,
+  "cache recovery must preserve the per-runtime barrier across focus changes");
+assert.match(historyAppSource,
+  /displayRecoveryMatches[\s\S]{0,240}runtimeRecoveryMatches[\s\S]{0,240}buildIsCurrent[\s\S]{0,500}allowSessionCache/,
+  "the first matching recovery build must remain behind both cache barriers");
+assert.match(historyAppSource,
+  /historyRequestsRef\.current\.complete\(msg\)[\s\S]{0,4000}historyNeedsConfirmationRequest\([\s\S]{0,500}requestHistory\(\s*msg\.session_id,\s*undefined,\s*HISTORY_INITIAL_PAGE,\s*msg\.generation/,
+  "a candidate must release coordinator dedupe before requesting its generation-bound confirmation");
+assert.match(historyAppSource,
+  /msg\.error == null && !msg\.before[\s\S]{0,180}HISTORY_PROVISIONAL_WATCHDOG_MS[\s\S]{0,600}recoverableReads\.retry\([\s\S]{0,700}retryDelay\)/,
+  "a moving newest-page preview must use one slow fallback instead of a parallel 250ms rescan");
+assert.match(historyAppSource, /buildIsCurrent[\s\S]{0,900}allowSessionCache/,
+  "a lower same-generation build must not reopen cache before reducer acceptance");
 assert.match(historyAppSource, /artifact_invalidated[\s\S]*sendGetWorkArtifacts/,
   "file rollback must refresh the Work artifact inventory");
 assert.match(historyAppSource,
@@ -513,6 +542,56 @@ assert.match(historyAppSource, /replay_start[\s\S]*requestHistory/,
   "a replay gap must request authoritative history instead of ending on an empty view");
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
   "a replay gap must discard a possibly stale Work artifact inventory");
+assert.match(historyAppSource,
+  /displayHistoryProjection\(\s*state\.historyRecovery,\s*focusedSid,\s*rt,\s*state\.historyBrowse\s*\)/,
+  "ChatView must select recovery, browse, then live runtime without rebuilding rt.turns");
+assert.match(historyAppSource,
+  /new HistoryPageCache\(\)/,
+  "deep-history pages must use their independent best-effort IndexedDB");
+assert.match(historyAppSource,
+  /new HistoryDetailRequestCoordinator\([\s\S]{0,200}history_detail_cancelled/,
+  "turn detail responses need a frozen target with bounded loading recovery");
+assert.match(historyAppSource,
+  /Any view navigation revokes[\s\S]{0,220}clearHistoryDetailRequests\(\);[\s\S]{0,180}focusedSid/,
+  "surface/session navigation must release frozen detail loading rows");
+assert.match(historyAppSource,
+  /return \(\) => \{[\s\S]{0,260}historyRequests\.clear\(\);\s*clearHistoryDetailRequests\(\);/,
+  "WebSocket cleanup must release frozen detail loading rows");
+assert.match(historyAppSource,
+  /const browseWaiters\s*=\s*historyRequestsRef\.current\.complete\(msg\)/,
+  "History.before must consume request-time browse authority instead of current UI state");
+assert.match(historyAppSource,
+  /await historyPageCacheRef\.current\.getPage[\s\S]{0,400}acceptsCachedNewerPage\(current, frozen\)/,
+  "a deferred cached-newer read must revalidate the current browse authority");
+assert.match(historyAppSource,
+  /if \(msg\.before\)[\s\S]{0,1600}return;/,
+  "every History.before path must terminate before the generic live reducer");
+assert.match(historyAppSource,
+  /browseMode=\{historyView\.browsing\}/);
+assert.match(historyAppSource,
+  /historyViewId=\{historyView\.viewId\}/);
+assert.match(historyAppSource,
+  /onLoadNewer=\{loadNewerHistoryPage\}/);
+assert.match(historyAppSource,
+  /onReturnLatest=\{returnToLatestHistory\}/);
+assert.match(historyAppSource,
+  /historyInvalidationsRef\.current\.has\(sid\)[\s\S]{0,160}isHistoryRecoveryPending/,
+  "cache writes must remain blocked while a display recovery is pending");
+assert.match(historyAppSource,
+  /historyViewRevision=\{historyView\.viewRevision\}/,
+  "an atomic recovery replacement must retain the prior virtual-scroll scope");
+assert.match(historyAppSource,
+  /replaying=\{rt\.replaying \|\| historyView\.recovering\}/,
+  "the retained projection must remain visibly marked as synchronizing");
+assert.match(historyAppSource,
+  /onEdit=\{historyView\.recovering\s*\? undefined/,
+  "display-only recovery turns must not expose edit/resend callbacks");
+assert.match(historyAppSource,
+  /onOpenFile=\{historyView\.recovering \? undefined/,
+  "display-only recovery turns must not issue file reads");
+assert.match(historyAppSource,
+  /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
+  "display-only recovery turns must not issue history-image reads");
 assert.match(cacheSource, /const CACHE_VER = 9/,
   "open-turn merge repair must invalidate duplicate IndexedDB projections");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
@@ -2490,6 +2569,10 @@ try {
   }) });
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
     (turn: { id: string }) => turn.id), ["new"]);
+  const orderedRuntimeBeforePage = structuredClone(
+    orderedHistory.runtimes[orderedHistorySid]);
+  // Uncorrelated protocol pages have no request-time scope/view authority and
+  // therefore cannot touch either runtime or browse state.
   orderedHistory = reduce(orderedHistory, { type: "event", event: event({
     type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
     revision: "ordered-rev-new", generation: "wrapper-one",
@@ -2501,7 +2584,44 @@ try {
         result: { subtype: "success", duration_ms: 1, is_error: false } }),
     ],
   }) });
+  assert.deepEqual(
+    orderedHistory.runtimes[orderedHistorySid],
+    orderedRuntimeBeforePage,
+    "an uncorrelated before page must leave every live runtime field unchanged");
+  assert.equal(orderedHistory.historyBrowse, null);
+  orderedHistory = reduce(orderedHistory, {
+    type: "begin_history_browse",
+    sid: orderedHistorySid,
+    scopeKey: "machine-a:code:codex",
+    revision: "ordered-rev-new",
+    generation: "wrapper-one",
+    viewId: "ordered-view",
+    basePageKey: "ordered-head",
+  });
+  assert.ok(orderedHistory.historyBrowse);
+  orderedHistory = reduce(orderedHistory, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: "machine-a:code:codex",
+    revision: "ordered-rev-new",
+    generation: "wrapper-one",
+    viewId: "ordered-view",
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    before: "new",
+    page: {
+      pageKey: "ordered-older",
+      turns: [{
+        id: "older-page", prompt: "older", blocks: [], done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "older-page",
+      newerPageKey: "ordered-head",
+    },
+  });
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
+    (turn: { id: string }) => turn.id), ["new"],
+  "correlated pagination is display-only and never prepends into runtime");
+  assert.deepEqual(orderedHistory.historyBrowse?.turns.map(
     (turn: { id: string }) => turn.id), ["older-page", "new"]);
   orderedHistory = reduce(orderedHistory, { type: "event", event: event({
     type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
@@ -2515,7 +2635,373 @@ try {
     ],
   }) });
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
-    (turn: { id: string }) => turn.id), ["stale-page", "older-page", "new"]);
+    (turn: { id: string }) => turn.id), ["new"]);
+  assert.deepEqual(orderedHistory.historyBrowse?.turns.map(
+    (turn: { id: string }) => turn.id), ["older-page", "new"],
+  "a late uncorrelated page cannot extend the active browse epoch");
+
+  const browseBeforeLive = orderedHistory.historyBrowse!;
+  const runtimeBeforeLive = orderedHistory.runtimes[orderedHistorySid].turns;
+  const browseAfterLive = reduce(orderedHistory, {
+    type: "event",
+    event: event({
+      type: "state", sid: orderedHistorySid, seq: 91, state: "running",
+    }),
+  });
+  assert.equal(browseAfterLive.historyBrowse?.turns, browseBeforeLive.turns,
+    "live lifecycle state is owned by runtime and cannot rewrite browse rows");
+  assert.deepEqual(browseAfterLive.runtimes[orderedHistorySid].turns,
+    runtimeBeforeLive);
+  const browseAfterDelta = reduce(browseAfterLive, {
+    type: "event",
+    event: event({
+      type: "delta", sid: orderedHistorySid, seq: 92,
+      message_id: "background-live", text: "new live output",
+    }),
+  });
+  assert.equal(browseAfterDelta.historyBrowse?.latestDirty, true);
+  assert.equal(browseAfterDelta.historyBrowse?.turns,
+    browseAfterLive.historyBrowse?.turns,
+    "live narrative marks the browse stale without appending into its window");
+
+  const cacheRaceBrowse = {
+    ...browseBeforeLive,
+    hasNewer: true,
+    newerPageKey: "ordered-head",
+    latestDirty: false,
+  };
+  let cacheRaceState = {
+    ...orderedHistory,
+    historyBrowse: cacheRaceBrowse,
+  };
+  let resolveCachedLatest!: (page: {
+    pageKey: string;
+    turns: Turn[];
+    isLatest: boolean;
+  }) => void;
+  const deferredCachedLatest = new Promise<{
+    pageKey: string;
+    turns: Turn[];
+    isLatest: boolean;
+  }>((resolvePage) => {
+    resolveCachedLatest = resolvePage;
+  });
+  const frozenCachedLatest = {
+    sid: cacheRaceBrowse.sid,
+    scopeKey: cacheRaceBrowse.scopeKey,
+    revision: cacheRaceBrowse.revision,
+    generation: cacheRaceBrowse.generation,
+    viewId: cacheRaceBrowse.viewId,
+    windowEpoch: cacheRaceBrowse.windowEpoch,
+    pageKey: cacheRaceBrowse.newerPageKey!,
+  };
+  const deferredInstall = (async () => {
+    const page = await deferredCachedLatest;
+    const current = cacheRaceState.historyBrowse;
+    if (!current || !acceptsCachedNewerPage(current, frozenCachedLatest)) {
+      return "discarded" as const;
+    }
+    if (page.isLatest && current.latestDirty) {
+      return "settle" as const;
+    }
+    return appendNewerPage(current, page, {
+      expectedScopeKey: frozenCachedLatest.scopeKey,
+      expectedViewId: frozenCachedLatest.viewId,
+      expectedWindowEpoch: frozenCachedLatest.windowEpoch,
+      expectedNewerPageKey: frozenCachedLatest.pageKey,
+    }).projection;
+  })();
+  cacheRaceState = reduce(cacheRaceState, {
+    type: "event",
+    event: event({
+      type: "delta", sid: orderedHistorySid, seq: 93,
+      message_id: "cache-race-live", text: "arrived during IndexedDB read",
+    }),
+  });
+  resolveCachedLatest({
+    pageKey: "ordered-head",
+    turns: runtimeBeforeLive,
+    isLatest: true,
+  });
+  const deferredOutcome = await deferredInstall;
+  assert.equal(deferredOutcome, "settle",
+    "a live delta during the cache read must revoke the frozen latest page");
+  cacheRaceState = reduce(cacheRaceState, {
+    type: "history_browse_newer_settled",
+    sid: frozenCachedLatest.sid,
+    scopeKey: frozenCachedLatest.scopeKey,
+    revision: frozenCachedLatest.revision,
+    generation: frozenCachedLatest.generation,
+    viewId: frozenCachedLatest.viewId,
+    windowEpoch: frozenCachedLatest.windowEpoch,
+    pageKey: frozenCachedLatest.pageKey,
+  });
+  assert.equal(cacheRaceState.historyBrowse?.latestDirty, true);
+  assert.equal(cacheRaceState.historyBrowse?.hasNewer, true);
+  assert.equal(cacheRaceState.historyBrowse?.newerPageKey, "ordered-head",
+    "rejecting stale cached latest must not clear the newer affordance");
+  assert.equal(
+    cacheRaceState.historyBrowse?.windowEpoch,
+    frozenCachedLatest.windowEpoch + 1,
+    "settling stale cached latest must release ChatView's accepted page request");
+
+  const browseAfterOtherSidSend = reduce({
+    ...orderedHistory,
+    runtimes: {
+      ...orderedHistory.runtimes,
+      "background-send": createRuntime(),
+    },
+  }, {
+    type: "query_sent", sid: "background-send",
+    prompt: "background", msg_id: "background-message", ts: 99,
+  });
+  assert.equal(browseAfterOtherSidSend.historyBrowse,
+    orderedHistory.historyBrowse,
+    "a background or /btw send cannot close the focused parent browse");
+
+  const successfulQueuedBrowse = reduce(orderedHistory, {
+    type: "enqueue", sid: orderedHistorySid, query: { prompt: "later" },
+  });
+  assert.equal(successfulQueuedBrowse.historyBrowse, null,
+    "a successfully accepted queued send atomically returns to latest");
+  const successfulPendingBrowse = reduce(orderedHistory, {
+    type: "set_pending", sid: orderedHistorySid,
+    query: { prompt: "interrupt after drain" },
+  });
+  assert.equal(successfulPendingBrowse.historyBrowse, null,
+    "a successfully accepted interrupt-send atomically returns to latest");
+  assert.equal(
+    successfulPendingBrowse.runtimes[orderedHistorySid].pendingSend?.prompt,
+    "interrupt after drain");
+  const fullQueue = Array.from({ length: 32 }, (_, index) => ({
+    prompt: `queued-${index}`,
+  }));
+  const capacityState = {
+    ...orderedHistory,
+    runtimes: {
+      ...orderedHistory.runtimes,
+      [orderedHistorySid]: {
+        ...orderedHistory.runtimes[orderedHistorySid],
+        queue: fullQueue,
+      },
+    },
+  };
+  assert.equal(reduce(capacityState, {
+    type: "enqueue", sid: orderedHistorySid,
+    query: { prompt: "must fail capacity" },
+  }), capacityState,
+  "a rejected queue mutation must preserve the user's browse window");
+
+  const directSendBrowse = reduce(orderedHistory, {
+    type: "query_sent", sid: orderedHistorySid,
+    prompt: "new live question", msg_id: "new-live-question", ts: 100,
+  });
+  assert.equal(directSendBrowse.historyBrowse, null);
+  assert.equal(
+    directSendBrowse.runtimes[orderedHistorySid].turns.at(-1)?.id,
+    "new-live-question",
+    "the same reducer commit installs the optimistic turn and exits browse");
+
+  const detailRequestedBrowse = reduce(orderedHistory, {
+    type: "history_browse_detail_requested",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    viewId: orderedHistory.historyBrowse!.viewId,
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    turnId: "older-page",
+  });
+  assert.equal(detailRequestedBrowse.historyBrowse?.turns[0].detailLoading, true);
+  const cancelledBrowseDetail = reduce(detailRequestedBrowse, {
+    type: "history_detail_cancelled",
+    context: {
+      target: "browse",
+      scopeKey: detailRequestedBrowse.historyBrowse!.scopeKey,
+      sid: orderedHistorySid,
+      revision: detailRequestedBrowse.historyBrowse!.revision,
+      turnId: "older-page",
+      viewId: detailRequestedBrowse.historyBrowse!.viewId,
+      windowEpoch: detailRequestedBrowse.historyBrowse!.windowEpoch,
+    },
+  });
+  assert.equal(cancelledBrowseDetail.historyBrowse?.turns.find(
+    (turn: Turn) => turn.id === "older-page")?.detailLoading, false,
+  "navigation/reconnect cancellation must make browse detail retryable");
+  const detailRequestEpoch = detailRequestedBrowse.historyBrowse!.windowEpoch;
+  const detailPagedBrowse = reduce(detailRequestedBrowse, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: detailRequestedBrowse.historyBrowse!.scopeKey,
+    revision: detailRequestedBrowse.historyBrowse!.revision,
+    generation: detailRequestedBrowse.historyBrowse!.generation,
+    viewId: detailRequestedBrowse.historyBrowse!.viewId,
+    windowEpoch: detailRequestEpoch,
+    before: detailRequestedBrowse.historyBrowse!.olderCursor!,
+    page: {
+      pageKey: "detail-older-page",
+      turns: [{
+        id: "ancient-detail-page", prompt: "ancient", blocks: [], done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "ancient-detail-page",
+      newerPageKey: detailRequestedBrowse.historyBrowse!.oldestPageKey,
+    },
+  });
+  assert.ok(detailPagedBrowse.historyBrowse!.windowEpoch > detailRequestEpoch);
+  assert.equal(detailPagedBrowse.historyBrowse?.turns.find(
+    (turn: Turn) => turn.id === "older-page")?.detailLoading, true,
+  "pagination retains the requested row while advancing the display window");
+  const runtimeBeforeBrowseDetail =
+    detailPagedBrowse.runtimes[orderedHistorySid];
+  const detailedBrowse = reduce(detailPagedBrowse, {
+    type: "history_browse_detail",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    viewId: orderedHistory.historyBrowse!.viewId,
+    // The response carries the request-time epoch. It remains authoritative
+    // inside this same scope/revision/view while the canonical row still exists.
+    windowEpoch: detailRequestEpoch,
+    turnId: "older-page",
+    events: [
+      event({
+        type: "user_msg", sid: orderedHistorySid,
+        msg_id: "older-page", prompt: "older",
+      }),
+      event({
+        type: "assistant_msg_start", sid: orderedHistorySid,
+        message_id: "older-answer", channel: "final",
+      }),
+      event({
+        type: "delta", sid: orderedHistorySid,
+        message_id: "older-answer", text: "full older answer",
+      }),
+      event({
+        type: "assistant_msg_end", sid: orderedHistorySid,
+        message_id: "older-answer",
+      }),
+      event({
+        type: "turn_end", sid: orderedHistorySid,
+        result: { subtype: "success", duration_ms: 1, is_error: false },
+      }),
+    ],
+  });
+  assert.equal(detailedBrowse.runtimes[orderedHistorySid],
+    runtimeBeforeBrowseDetail,
+    "browse detail hydration cannot mutate the authoritative live runtime");
+  const hydratedOlderTurn = detailedBrowse.historyBrowse?.turns.find(
+    (turn: Turn) => turn.id === "older-page");
+  assert.equal(hydratedOlderTurn?.detailLoaded, true);
+  assert.equal(hydratedOlderTurn?.detailLoading, false);
+  assert.equal(hydratedOlderTurn?.blocks[0]?.kind, "text");
+
+  const runtimeDetailRequested = reduce(orderedHistory, {
+    type: "turn_detail_requested",
+    sid: orderedHistorySid,
+    turnId: "new",
+  });
+  assert.equal(
+    runtimeDetailRequested.runtimes[orderedHistorySid].turns[0].detailLoading,
+    true);
+  const runtimeDetailCancelled = reduce(runtimeDetailRequested, {
+    type: "history_detail_cancelled",
+    context: {
+      target: "runtime",
+      scopeKey: orderedHistory.historyBrowse!.scopeKey,
+      sid: orderedHistorySid,
+      revision: "ordered-rev-new",
+      turnId: "new",
+    },
+  });
+  assert.equal(
+    runtimeDetailCancelled.runtimes[orderedHistorySid].turns[0].detailLoading,
+    false,
+    "reconnect cancellation must make runtime detail retryable");
+
+  const noNewerCache = reduce(detailedBrowse, {
+    type: "history_browse_newer_unavailable",
+    sid: orderedHistorySid,
+    scopeKey: detailedBrowse.historyBrowse!.scopeKey,
+    revision: detailedBrowse.historyBrowse!.revision,
+    viewId: detailedBrowse.historyBrowse!.viewId,
+    windowEpoch: detailedBrowse.historyBrowse!.windowEpoch,
+  });
+  assert.equal(noNewerCache.historyBrowse?.hasNewer, false);
+  assert.equal(noNewerCache.historyBrowse?.newerPageKey, null);
+
+  const invalidatedBrowse = reduce(orderedHistory, {
+    type: "event",
+    event: event({
+      type: "history_invalidated", sid: orderedHistorySid,
+      session_id: orderedHistorySid,
+      revision: "ordered-rev-after-rollback", reason: "rollback",
+    }),
+  });
+  assert.equal(invalidatedBrowse.historyBrowse, null);
+  const delayedBrowsePage = reduce(invalidatedBrowse, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    generation: "wrapper-one",
+    viewId: orderedHistory.historyBrowse!.viewId,
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    before: orderedHistory.historyBrowse!.olderCursor!,
+    page: {
+      pageKey: "must-not-revive",
+      turns: [{ id: "ancient", prompt: "ancient", blocks: [], done: true }],
+      hasOlder: false,
+      olderCursor: "ancient",
+    },
+  });
+  assert.equal(delayedBrowsePage.historyBrowse, null,
+    "a delayed pre-rollback page cannot revive a cleared browse projection");
+
+  let abaBrowse = reduce({
+    ...orderedHistory,
+    runtimes: {
+      ...orderedHistory.runtimes,
+      "browse-session-b": createRuntime(),
+    },
+  }, { type: "focus_session", sid: "browse-session-b" });
+  abaBrowse = reduce(abaBrowse, {
+    type: "focus_session", sid: orderedHistorySid,
+  });
+  abaBrowse = reduce(abaBrowse, {
+    type: "begin_history_browse",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    generation: orderedHistory.historyBrowse!.generation,
+    viewId: "ordered-view-after-aba",
+    basePageKey: "ordered-head-after-aba",
+  });
+  const abaBeforeDelayedPage = structuredClone(abaBrowse.historyBrowse);
+  abaBrowse = reduce(abaBrowse, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    generation: orderedHistory.historyBrowse!.generation,
+    viewId: orderedHistory.historyBrowse!.viewId,
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    before: orderedHistory.historyBrowse!.olderCursor!,
+    page: {
+      pageKey: "delayed-old-view-page",
+      turns: [{
+        id: "must-not-enter-new-view", prompt: "stale", blocks: [], done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "must-not-enter-new-view",
+    },
+  });
+  assert.deepEqual(abaBrowse.historyBrowse, abaBeforeDelayedPage,
+    "A to B to A creates a new viewId which rejects A's delayed old page");
+
+  assert.equal(reduce(orderedHistory, {
+    type: "conn", connState: "reconnecting",
+  }).historyBrowse, null,
+  "a new socket generation revokes every frozen browse-page waiter");
 
   // A targeted newest-page refresh is only the moving head window. Once this
   // browser has explicitly paged backwards, that refresh must retain the older
@@ -2534,17 +3020,35 @@ try {
       ],
     }),
   });
-  pagedHead = reduce(pagedHead, { type: "event", event: event({
-    type: "history", sid: pagedHeadSid, session_id: pagedHeadSid,
-    revision: "paged-rev", generation: "wrapper-one", build_seq: 1,
-    before: "head-cursor", has_more: false, oldest_id: "history-floor",
-    events: [
-      event({ type: "user_msg", sid: pagedHeadSid,
-        msg_id: "older-one", prompt: "older one", ts: 10 }),
-      event({ type: "turn_end", sid: pagedHeadSid,
-        result: { subtype: "success", duration_ms: 1, is_error: false } }),
-    ],
-  }) });
+  pagedHead = reduce(pagedHead, {
+    type: "begin_history_browse",
+    sid: pagedHeadSid,
+    scopeKey: "machine-a:code:codex",
+    revision: "paged-rev",
+    generation: "wrapper-one",
+    viewId: "paged-view",
+    basePageKey: "paged-head",
+  });
+  pagedHead = reduce(pagedHead, {
+    type: "install_history_browse_page",
+    sid: pagedHeadSid,
+    scopeKey: "machine-a:code:codex",
+    revision: "paged-rev",
+    generation: "wrapper-one",
+    viewId: "paged-view",
+    windowEpoch: pagedHead.historyBrowse!.windowEpoch,
+    before: "head-cursor",
+    page: {
+      pageKey: "paged-older",
+      turns: [{
+        id: "older-one", prompt: "older one", blocks: [], done: true,
+        ts: 10_000,
+      }],
+      hasOlder: false,
+      olderCursor: "history-floor",
+      newerPageKey: "paged-head",
+    },
+  });
   pagedHead = reduce(pagedHead, { type: "event", event: event({
     type: "history", sid: pagedHeadSid, session_id: pagedHeadSid,
     revision: "paged-rev", generation: "wrapper-one", build_seq: 2,
@@ -2556,11 +3060,13 @@ try {
     ],
   }) });
   assert.deepEqual(pagedHead.runtimes[pagedHeadSid].turns.map(
-    (turn: { id: string }) => turn.id), ["older-one", "head-one", "head-two"]);
-  assert.equal(pagedHead.runtimes[pagedHeadSid].hasMore, false,
-    "a head refresh cannot reopen pagination after the browser reached the floor");
-  assert.equal(pagedHead.runtimes[pagedHeadSid].oldestId, "history-floor");
-  assert.equal(pagedHead.runtimes[pagedHeadSid].hasLoadedOlderHistory, true);
+    (turn: { id: string }) => turn.id), ["head-one", "head-two"]);
+  assert.deepEqual(pagedHead.historyBrowse?.turns.map(
+    (turn: { id: string }) => turn.id), ["older-one", "head-one"],
+  "a moving head refresh cannot rewrite the user's display-only reading window");
+  assert.equal(pagedHead.historyBrowse?.hasOlder, false);
+  assert.equal(pagedHead.historyBrowse?.olderCursor, "history-floor");
+  assert.equal(pagedHead.historyBrowse?.latestDirty, true);
 
   // Even before the user explicitly paginates, a same-revision compact/head
   // refresh is only a suffix. It must not erase rows already rendered from the
@@ -2701,10 +3207,35 @@ try {
   assert.equal(
     boundedCursorState.runtimes[boundedCursorSid].turns.length,
     MAX_RUNTIME_TURNS);
-  assert.equal(boundedCursorState.runtimes[boundedCursorSid].hasMore, true);
+  assert.equal(boundedCursorState.runtimes[boundedCursorSid].hasMore, true,
+    "a full newest-biased runtime must keep server pagination available to the browse window");
   assert.equal(boundedCursorState.runtimes[boundedCursorSid].oldestId,
-    "server-byte-cursor");
+    "bounded-40",
+    "local retention must page from the first retained native turn");
   assert.equal(boundedCursorState.runtimes[boundedCursorSid].truncated, true);
+
+  const liveBoundSid = "live-bound-keeps-native-cursor";
+  const liveBoundTurns = Array.from(
+    { length: MAX_RUNTIME_TURNS + 1 },
+    (_, index) => ({
+      id: `optimistic-${index}`,
+      historyTurnId: `native-${index}`,
+      prompt: `question ${index}`,
+      blocks: [],
+      done: true,
+    }),
+  );
+  const liveBoundState = reduce({
+    ...initialState, focusedSid: liveBoundSid,
+  }, {
+    type: "set_turns", sid: liveBoundSid, turns: liveBoundTurns,
+  });
+  assert.equal(liveBoundState.runtimes[liveBoundSid].hasMore, true,
+    "a locally full runtime must keep older history available to the browse window");
+  assert.equal(
+    liveBoundState.runtimes[liveBoundSid].oldestId,
+    "native-1",
+    "a local trim must expose the first retained authoritative history id");
 
   const failedHistorySid = "non-authoritative-history";
   const preservedTurn = {
@@ -2730,6 +3261,127 @@ try {
   assert.equal(failedHistory.runtimes[failedHistorySid].loading, false);
   assert.equal(failedHistory.banner, undefined,
     "a recoverable history read must stay silent while preserving the projection");
+
+  const coldPrefixSid = "cold-append-prefix-preview";
+  const sampledPrefixTurn = {
+    id: "sampled-prefix", prompt: "sampled stale prefix",
+    blocks: [], done: true,
+  };
+  const coldPrefixState = reduce({
+    ...initialState,
+    focusedSid: coldPrefixSid,
+    runtimes: {
+      [coldPrefixSid]: { ...createRuntime(), loading: true },
+    },
+  }, {
+    type: "event", event: event({
+      type: "history", sid: coldPrefixSid, session_id: coldPrefixSid,
+      revision: "prefix-revision", generation: "prefix-generation",
+      build_seq: 11, authoritative: false, error: null,
+      detail: "summary", turns: [sampledPrefixTurn],
+      has_more: true, oldest_id: "sampled-prefix", events: [],
+    }),
+  });
+  assert.deepEqual(coldPrefixState.runtimes[coldPrefixSid].turns, [],
+    "a sampled append prefix must never enter the canonical runtime");
+  assert.deepEqual(
+    displayHistoryProjection(
+      coldPrefixState.historyRecovery,
+      coldPrefixSid,
+      coldPrefixState.runtimes[coldPrefixSid],
+    ).turns.map((turn: { id: string }) => turn.id),
+    ["sampled-prefix"],
+    "an empty cold first screen may use the sampled prefix as display-only preview");
+  assert.equal(coldPrefixState.historyRecovery?.candidateBuildSeq, 11,
+    "the sampled prefix build must seed confirmation without another exact scan");
+  assert.equal(
+    isRuntimeHistoryRecoveryPending(coldPrefixState.runtimes[coldPrefixSid]),
+    false,
+    "a sampled prefix preview is not a replay-gap runtime recovery");
+  const coldExactHistory = event({
+    type: "history", sid: coldPrefixSid, session_id: coldPrefixSid,
+    revision: "exact-revision", generation: "prefix-generation",
+    build_seq: 12, authoritative: true,
+    detail: "summary", turns: [{
+      id: "exact-current", prompt: "exact current history",
+      blocks: [], done: true,
+    }],
+    has_more: false, events: [],
+  }) as History;
+  assert.equal(
+    historyNeedsConfirmationRequest(
+      coldPrefixState.runtimes[coldPrefixSid], coldExactHistory),
+    false,
+    "prefix recovery must not request a second potentially multi-GB exact scan");
+  assert.equal(
+    historyConfirmsRecovery(coldPrefixState.historyRecovery, coldExactHistory),
+    true,
+    "the first newer exact build must confirm a sampled prefix");
+  const coldExactState = reduce(coldPrefixState, {
+    type: "event", event: coldExactHistory,
+  });
+  assert.equal(coldExactState.historyRecovery?.turns, null);
+  assert.deepEqual(
+    coldExactState.runtimes[coldPrefixSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["exact-current"]);
+
+  const trustedPrefixSid = "trusted-live-beats-append-prefix";
+  const trustedLiveTurn = {
+    id: "trusted-live", prompt: "current live question",
+    blocks: [], done: false,
+  };
+  const trustedPrefixState = reduce({
+    ...initialState,
+    focusedSid: trustedPrefixSid,
+    runtimes: {
+      [trustedPrefixSid]: {
+        ...createRuntime(),
+        turns: [trustedLiveTurn],
+        state: "running" as const,
+        historyRevision: "trusted-revision",
+        historyGeneration: "prefix-generation",
+        historyBuildSeq: 10,
+        lastLiveSeq: 42,
+        loading: true,
+      },
+    },
+  }, {
+    type: "event", event: event({
+      type: "history", sid: trustedPrefixSid, session_id: trustedPrefixSid,
+      revision: "prefix-revision", generation: "prefix-generation",
+      build_seq: 11, authoritative: false, error: null,
+      detail: "summary", turns: [sampledPrefixTurn],
+      has_more: true, oldest_id: "sampled-prefix", events: [],
+    }),
+  });
+  assert.deepEqual(
+    trustedPrefixState.runtimes[trustedPrefixSid].turns,
+    [trustedLiveTurn],
+    "a sampled append prefix must not mutate trusted live/current turns");
+  assert.equal(
+    isHistoryRecoveryPending(
+      trustedPrefixState.historyRecovery, trustedPrefixSid),
+    false,
+    "a trusted base must not enter recovery or lock ordinary interactions");
+  assert.equal(trustedPrefixState.runtimes[trustedPrefixSid].loading, false,
+    "a stale prefix must not leave a trusted live runtime synchronizing");
+  const trustedQueryAfterPrefix = reduce(trustedPrefixState, {
+    type: "query_sent", sid: trustedPrefixSid,
+    prompt: "continue from trusted head",
+    msg_id: "trusted-query-after-prefix", ts: 123,
+  });
+  assert.deepEqual(
+    trustedQueryAfterPrefix.runtimes[trustedPrefixSid]
+      .acceptanceHistoryBaseline,
+    {
+      revision: "trusted-revision",
+      generation: "prefix-generation",
+      buildSeq: 10,
+      liveSeq: 42,
+      newestId: null,
+    },
+    "a sampled prefix must not hide the trusted acceptance watermark");
 
   // Even when the revision is unchanged, a first page is authoritative for
   // completed rows. This prevents generic stale-cache resurrection, not only
@@ -2767,29 +3419,344 @@ try {
     runtimes: {
       [gapSid]: {
         ...createRuntime(), turns: staleTurns,
-        historyRevision: "boot-old:9", syncReady: true,
+        historyRevision: "boot-old:9",
+        historyGeneration: "gap-generation-new",
+        historyBuildSeq: 4,
+        syncReady: true,
       },
     },
   };
   gapState = reduce(gapState, { type: "event", event: event({
     type: "replay_start", sid: gapSid, from_seq: 20, to_seq: 30,
-    truncated: true, rebuild: false,
+    truncated: true, rebuild: false, generation: "gap-generation-new",
   }) });
   assert.equal(gapState.artifact, null);
   assert.deepEqual(gapState.runtimes[gapSid].turns, []);
+  assert.deepEqual(
+    (gapState as typeof gapState & {
+      historyRecovery?: { sid: string; turns: unknown[] | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "a focused replay gap must retain the last projection for display only");
+  assert.equal(isHistoryRecoveryPending(gapState.historyRecovery, gapSid), true);
+  assert.deepEqual(
+    displayHistoryProjection(
+      gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+    ).turns,
+    staleTurns,
+  );
+  assert.equal(
+    displayHistoryProjection(
+      gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+    ).hasMore,
+    false,
+    "a retained projection must never paginate with its old generation cursor");
+  const queryDuringGapState = reduce(gapState, {
+    type: "query_sent", sid: gapSid, prompt: "new live question",
+    msg_id: "new-live-question", ts: 123,
+  });
+  assert.deepEqual(
+    queryDuringGapState.runtimes[gapSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["new-live-question"],
+    "display-only recovery turns must never enter the active query runtime");
+  assert.equal(
+    queryDuringGapState.runtimes[gapSid].acceptanceHistoryBaseline,
+    null,
+    "a query racing recovery must not freeze stale history watermarks");
+  assert.deepEqual(
+    (queryDuringGapState as typeof queryDuringGapState & {
+      historyRecovery?: { turns: unknown[] | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "query_sent must not mutate the retained display-only projection");
   assert.equal(gapState.runtimes[gapSid].historyInvalidated, true);
   assert.equal(gapState.runtimes[gapSid].loading, true);
+  const staleGenerationGapState = reduce(gapState, {
+    type: "event", event: event({
+      type: "history", sid: gapSid, session_id: gapSid,
+      revision: "boot-stale:9", generation: "gap-generation-old",
+      has_more: false, events: [],
+    }),
+  });
+  assert.deepEqual(
+    (staleGenerationGapState as typeof staleGenerationGapState & {
+      historyRecovery?: { turns: unknown[] | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "an older wrapper generation cannot retire the retained display projection");
+  assert.equal(
+    staleGenerationGapState.runtimes[gapSid].historyInvalidated,
+    true,
+  );
+  const staleBuildGapState = reduce(gapState, {
+    type: "event", event: event({
+      type: "history", sid: gapSid, session_id: gapSid,
+      revision: "boot-old:9", generation: "gap-generation-new",
+      build_seq: 3, has_more: false, events: [],
+    }),
+  });
+  assert.equal(
+    isHistoryRecoveryPending(staleBuildGapState.historyRecovery, gapSid),
+    true,
+    "a lower same-generation build cannot retire the recovery projection");
+  const failedGapReadState = reduce(gapState, {
+    type: "event", event: event({
+      type: "history", sid: gapSid, session_id: gapSid,
+      revision: "boot-new:9", generation: "gap-generation-new",
+      authoritative: false, has_more: false, events: [],
+    }),
+  });
+  assert.deepEqual(
+    (failedGapReadState as typeof failedGapReadState & {
+      historyRecovery?: { turns: unknown[] | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "a failed History read cannot replace the visible projection with an empty page");
   gapState = reduce(gapState, { type: "event", event: event({
     type: "replay_end", sid: gapSid, to_seq: 30, truncated: true,
   }) });
   assert.equal(gapState.runtimes[gapSid].loading, true,
     "ReplayEnd cannot satisfy a transcript gap");
-  gapState = reduce(gapState, { type: "event", event: event({
+  const recoveryBeforeCandidate = gapState.historyRecovery;
+  const runtimeBeforeCandidate = gapState.runtimes[gapSid];
+  const firstRecoveryCandidate = event({
     type: "history", sid: gapSid, session_id: gapSid,
-    revision: "boot-new:9", has_more: false, events: [],
-  }) });
+    revision: "boot-new:9", generation: "gap-generation-new",
+    build_seq: 5, has_more: false, detail: "summary",
+    turns: [{
+      id: "candidate-only", prompt: "must stay provisional",
+      blocks: [], done: true,
+    }],
+    events: [],
+  }) as History;
+  assert.equal(
+    historyNeedsConfirmationRequest(
+      runtimeBeforeCandidate, firstRecoveryCandidate),
+    true,
+    "the first matching build must explicitly request a second newest page");
+  assert.equal(
+    historyNeedsConfirmationRequest(runtimeBeforeCandidate, event({
+      ...firstRecoveryCandidate, generation: "gap-generation-old",
+    }) as History),
+    false,
+    "an older generation cannot trigger or satisfy confirmation");
+  assert.equal(
+    historyNeedsConfirmationRequest(runtimeBeforeCandidate, event({
+      ...firstRecoveryCandidate, generation: undefined,
+    }) as History),
+    false,
+    "a generation-less response cannot trigger or satisfy confirmation");
+  assert.equal(
+    historyConfirmsRecovery(recoveryBeforeCandidate, firstRecoveryCandidate),
+    false,
+    "the first matching build is only a candidate and cannot clear cache");
+  assert.equal(
+    historyConfirmsRuntimeRecovery(
+      runtimeBeforeCandidate, firstRecoveryCandidate),
+    false,
+    "the first matching build cannot clear the per-runtime gap barrier");
+  let delayedCandidateRoundTripState = reduce(gapState, {
+    type: "focus_session", sid: "delayed-candidate-other-session",
+  });
+  assert.equal(delayedCandidateRoundTripState.historyRecovery, null);
+  delayedCandidateRoundTripState = reduce(delayedCandidateRoundTripState, {
+    type: "event", event: firstRecoveryCandidate,
+  });
+  assert.deepEqual(
+    delayedCandidateRoundTripState.runtimes[gapSid].turns,
+    [],
+    "a background first candidate must not install canonical narrative");
+  assert.equal(
+    delayedCandidateRoundTripState.runtimes[gapSid]
+      .pendingHistoryCandidateBuildSeq,
+    5,
+    "the background runtime must retain the lightweight candidate watermark");
+  assert.equal(
+    isRuntimeHistoryRecoveryPending(
+      delayedCandidateRoundTripState.runtimes[gapSid]),
+    true,
+    "clearing the focused display recovery must not clear the runtime barrier");
+  delayedCandidateRoundTripState = reduce(delayedCandidateRoundTripState, {
+    type: "focus_session", sid: gapSid,
+  });
+  assert.deepEqual(
+    displayHistoryProjection(
+      delayedCandidateRoundTripState.historyRecovery,
+      gapSid,
+      delayedCandidateRoundTripState.runtimes[gapSid],
+    ).turns,
+    [],
+    "ReplayStart A to focus B to first History A to focus A stays empty/loading");
+  assert.equal(
+    delayedCandidateRoundTripState.runtimes[gapSid].historyInvalidated,
+    true);
+  gapState = reduce(gapState, {
+    type: "event", event: firstRecoveryCandidate,
+  });
+  assert.deepEqual(gapState.runtimes[gapSid].turns, [],
+    "the first candidate must not enter the canonical runtime");
+  assert.equal(gapState.runtimes[gapSid].historyInvalidated, true,
+    "the first candidate must not clear the invalidation barrier");
+  assert.equal(gapState.runtimes[gapSid].pendingHistoryGeneration,
+    "gap-generation-new",
+    "the first candidate must keep the generation barrier");
+  assert.equal(gapState.runtimes[gapSid].loading, true,
+    "the first candidate must keep loading until confirmation");
+  assert.equal(
+    gapState.historyRecovery?.candidateBuildSeq,
+    5,
+    "the first matching build must remain pending as a candidate");
+  assert.equal(
+    (gapState as typeof gapState & {
+      historyRecovery?: { turns: unknown[] | null; acceptedRevision?: string | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "the candidate must not replace the retained projection");
+  let candidateRoundTripState = reduce(gapState, {
+    type: "focus_session", sid: "candidate-other-session",
+  });
+  assert.equal(candidateRoundTripState.historyRecovery, null,
+    "switching away releases only the display copy");
+  candidateRoundTripState = reduce(candidateRoundTripState, {
+    type: "focus_session", sid: gapSid,
+  });
+  assert.deepEqual(candidateRoundTripState.runtimes[gapSid].turns, [],
+    "switching back before confirmation must not expose candidate narrative");
+  assert.deepEqual(
+    displayHistoryProjection(
+      candidateRoundTripState.historyRecovery,
+      gapSid,
+      candidateRoundTripState.runtimes[gapSid],
+    ).turns,
+    [],
+    "A to B to A must show an empty loading runtime, never gap-era history");
+  assert.equal(
+    candidateRoundTripState.runtimes[gapSid].historyInvalidated,
+    true,
+    "A to B to A must remain behind the cache invalidation barrier");
+  const recoveryConfirmation = event({
+    type: "history", sid: gapSid, session_id: gapSid,
+    revision: "boot-new:9", generation: "gap-generation-new",
+    build_seq: 6, has_more: false, detail: "summary",
+    turns: [{
+      id: "confirmed-current", prompt: "confirmed current history",
+      blocks: [], done: true,
+    }],
+    events: [],
+  }) as History;
+  assert.equal(
+    historyConfirmsRuntimeRecovery(
+      gapState.runtimes[gapSid], recoveryConfirmation),
+    true,
+    "only a newer build from the bound generation clears the runtime barrier");
+  assert.equal(
+    historyConfirmsRecovery(gapState.historyRecovery, recoveryConfirmation),
+    true,
+    "only that newer build can also clear the focused cache/display barrier");
+  gapState = reduce(gapState, {
+    type: "event", event: recoveryConfirmation,
+  });
   assert.equal(gapState.runtimes[gapSid].historyInvalidated, false);
+  assert.equal(gapState.runtimes[gapSid].pendingHistoryGeneration, null);
   assert.equal(gapState.runtimes[gapSid].loading, false);
+  assert.deepEqual(
+    gapState.runtimes[gapSid].turns.map((turn: { id: string }) => turn.id),
+    ["confirmed-current"],
+    "only the newer confirmation may install canonical narrative");
+  assert.equal(gapState.historyRecovery?.turns, null,
+    "the explicit newer confirmation commits the projection atomically");
+  assert.equal(
+    (gapState as typeof gapState & {
+      historyRecovery?: { acceptedRevision?: string | null };
+    }).historyRecovery?.acceptedRevision,
+    "boot-new:9",
+  );
+  assert.deepEqual(
+    displayHistoryProjection(
+      gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+    ).turns,
+    gapState.runtimes[gapSid].turns,
+    "after commit the selector must expose only the authoritative runtime");
+  const laterRevisionState = reduce(gapState, {
+    type: "event", event: event({
+      type: "history", sid: gapSid, session_id: gapSid,
+      revision: "boot-new:10", generation: "gap-generation-new",
+      has_more: false, events: [],
+    }),
+  });
+  assert.equal(laterRevisionState.historyRecovery, null,
+    "a later independent revision must release the retained scroll scope");
+
+  const backgroundGapSid = "background-replay-gap";
+  let backgroundGapState = {
+    ...initialState,
+    focusedSid: gapSid,
+    runtimes: {
+      [gapSid]: { ...createRuntime(), turns: staleTurns },
+      [backgroundGapSid]: { ...createRuntime(), turns: staleTurns },
+    },
+  };
+  backgroundGapState = reduce(backgroundGapState, {
+    type: "event", event: event({
+      type: "replay_start", sid: backgroundGapSid,
+      from_seq: 1, to_seq: 2, truncated: true,
+      rebuild: false, generation: "background-generation",
+    }),
+  });
+  assert.equal(
+    (backgroundGapState as typeof backgroundGapState & {
+      historyRecovery?: unknown;
+    }).historyRecovery,
+    null,
+    "background replay gaps must not duplicate a full display projection");
+  const staleBackgroundHistory = reduce(backgroundGapState, {
+    type: "event", event: event({
+      type: "history", sid: backgroundGapSid,
+      session_id: backgroundGapSid, revision: "background-stale-revision",
+      generation: "older-background-generation",
+      has_more: false, events: [],
+    }),
+  });
+  assert.equal(
+    staleBackgroundHistory.runtimes[backgroundGapSid].historyInvalidated,
+    true,
+    "generation matching must also protect rebuilding background runtimes");
+  const switchedAwayFromRecovery = reduce(failedGapReadState, {
+    type: "focus_session", sid: backgroundGapSid,
+  });
+  assert.equal(switchedAwayFromRecovery.historyRecovery, null,
+    "switching sessions must release the former visible projection");
+
+  let rollbackDuringRecoveryState = {
+    ...initialState,
+    focusedSid: gapSid,
+    runtimes: {
+      [gapSid]: {
+        ...createRuntime(), turns: staleTurns,
+        historyRevision: "before-rollback",
+      },
+    },
+  };
+  rollbackDuringRecoveryState = reduce(rollbackDuringRecoveryState, {
+    type: "event", event: event({
+      type: "replay_start", sid: gapSid, from_seq: 10, to_seq: 20,
+      truncated: true, rebuild: false, generation: "rollback-generation",
+    }),
+  });
+  rollbackDuringRecoveryState = reduce(rollbackDuringRecoveryState, {
+    type: "event", event: event({
+      type: "history_invalidated", sid: gapSid, session_id: gapSid,
+      revision: "after-rollback", reason: "rollback",
+    }),
+  });
+  assert.deepEqual(rollbackDuringRecoveryState.runtimes[gapSid].turns, []);
+  assert.equal(
+    (rollbackDuringRecoveryState as typeof rollbackDuringRecoveryState & {
+      historyRecovery?: unknown;
+    }).historyRecovery,
+    null,
+    "rollback must clear both the rebuilding runtime and retained display");
 
   // A truncated live-tail replay can begin in the middle of an older turn.
   // Without its UserMsg/TurnEnd, that fragment looks like a new unfinished
@@ -2800,7 +3767,7 @@ try {
     ...initialState, focusedSid: replayFragmentSid,
   }, { type: "event", event: event({
     type: "replay_start", sid: replayFragmentSid, from_seq: 70, to_seq: 74,
-    truncated: true, rebuild: false,
+    truncated: true, rebuild: false, generation: "wrapper-one",
   }) });
   replayFragmentState = reduce(replayFragmentState, {
     type: "event", event: event({
@@ -2834,30 +3801,37 @@ try {
       truncated: true,
     }),
   });
+  const replayFragmentCandidate = event({
+    type: "history", sid: replayFragmentSid,
+    session_id: replayFragmentSid, revision: "fragment-rev",
+    generation: "wrapper-one", build_seq: 1, live_seq: 74,
+    has_more: true, oldest_id: "authoritative-old",
+    in_progress: true, detail: "summary", events: [],
+    turns: [
+      {
+        id: "authoritative-old", prompt: "real older question",
+        blocks: [], done: true, detailEventCount: 0,
+        detailLoaded: false, ts: 5_000, doneTs: 6_000,
+      },
+      {
+        id: "current-turn", prompt: "current question",
+        blocks: [{
+          kind: "text", message_id: "current-commentary",
+          text: "current work", done: false, channel: "commentary",
+        }],
+        done: false, detailEventCount: 1,
+        detailLoaded: false, ts: 9_000,
+      },
+    ],
+  }) as History;
+  replayFragmentState = reduce(replayFragmentState, {
+    type: "event", event: replayFragmentCandidate,
+  });
+  assert.equal(replayFragmentState.historyRecovery?.candidateBuildSeq, 1);
   replayFragmentState = reduce(replayFragmentState, {
     type: "event", event: event({
-      type: "history", sid: replayFragmentSid,
-      session_id: replayFragmentSid, revision: "fragment-rev",
-      generation: "wrapper-one", build_seq: 1, live_seq: 74,
-      has_more: true, oldest_id: "authoritative-old",
-      in_progress: true, detail: "summary", events: [],
-      turns: [
-        {
-          id: "authoritative-old", prompt: "real older question",
-          blocks: [], done: true, detailEventCount: 0,
-          detailLoaded: false, ts: 5_000, doneTs: 6_000,
-        },
-        {
-          id: "current-turn", prompt: "current question",
-          blocks: [{
-            kind: "text", message_id: "current-commentary",
-            text: "current work", done: false, channel: "commentary",
-          }],
-          done: false, detailEventCount: 1,
-          detailLoaded: false, ts: 9_000,
-        },
-      ],
-    }),
+      ...replayFragmentCandidate, build_seq: 2,
+    }) as History,
   });
   assert.deepEqual(
     replayFragmentState.runtimes[replayFragmentSid].turns.map(
@@ -2878,7 +3852,7 @@ try {
     ...initialState, focusedSid: unflushedTailSid,
   }, { type: "event", event: event({
     type: "replay_start", sid: unflushedTailSid, from_seq: 80, to_seq: 83,
-    truncated: true, rebuild: false,
+    truncated: true, rebuild: false, generation: "wrapper-one",
   }) });
   for (const replayEvent of [
     event({
@@ -2898,18 +3872,24 @@ try {
       type: "event", event: replayEvent,
     });
   }
+  const unflushedCandidate = event({
+    type: "history", sid: unflushedTailSid,
+    session_id: unflushedTailSid, revision: "unflushed-rev",
+    generation: "wrapper-one", build_seq: 1, live_seq: 83,
+    has_more: true, in_progress: true, detail: "summary", events: [],
+    turns: [{
+      id: "last-flushed", prompt: "last flushed question",
+      blocks: [], done: true, detailEventCount: 0,
+      detailLoaded: false, ts: 5_000, doneTs: 6_000,
+    }],
+  }) as History;
+  unflushedTailState = reduce(unflushedTailState, {
+    type: "event", event: unflushedCandidate,
+  });
   unflushedTailState = reduce(unflushedTailState, {
     type: "event", event: event({
-      type: "history", sid: unflushedTailSid,
-      session_id: unflushedTailSid, revision: "unflushed-rev",
-      generation: "wrapper-one", build_seq: 1, live_seq: 83,
-      has_more: true, in_progress: true, detail: "summary", events: [],
-      turns: [{
-        id: "last-flushed", prompt: "last flushed question",
-        blocks: [], done: true, detailEventCount: 0,
-        detailLoaded: false, ts: 5_000, doneTs: 6_000,
-      }],
-    }),
+      ...unflushedCandidate, build_seq: 2,
+    }) as History,
   });
   assert.deepEqual(
     unflushedTailState.runtimes[unflushedTailSid].turns.map(
@@ -4530,7 +5510,7 @@ assert.equal("sid" in JSON.parse(socket.sent.at(-1) ?? "{}"), false);
 socket.receive({ type: "session_focus", session_id: "surface-work" });
 relay.sendGetContext();
 assert.equal(JSON.parse(socket.sent.at(-1) ?? "{}").sid, "surface-work");
-relay.setSurface("codex", "code");
+  relay.setSurface("codex", "code");
 
 relay.sendGetWorkArtifacts("claude", "surface-work");
 const artifactsFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
@@ -4539,8 +5519,9 @@ assert.equal(artifactsFrame.engine, "claude");
 assert.equal(artifactsFrame.session_id, "surface-work");
 assert.equal(typeof artifactsFrame.client_id, "string");
 
-relay.setFocusedSid("main-after-navigation", "claude", "code");
-relay.sendGetHistory("history-with-cwd", null, 4, "/project/from-list");
+  relay.setFocusedSid("main-after-navigation", "claude", "code");
+  assert.equal(relay.sendGetHistory(
+    "history-with-cwd", null, 4, "/project/from-list"), true);
 const historyWithCwdFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(historyWithCwdFrame.type, "get_history");
 assert.equal(historyWithCwdFrame.session_id, "history-with-cwd");

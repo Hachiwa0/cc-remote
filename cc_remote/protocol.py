@@ -1656,9 +1656,9 @@ class History(_Base):
     # When the browser has already consumed a newer live event, this History is
     # still useful for merging older rows but cannot delete the newer live tail.
     live_seq: Optional[int] = Field(default=None, ge=0)
-    # A parse/read failure is not an authoritative empty transcript. Keeping the
-    # failure on the History envelope lets clients stop loading without erasing
-    # their last known good conversation.
+    # False means this frame cannot replace the canonical transcript projection:
+    # either `error` describes a parse/read failure, or its populated page is a
+    # sampled/changed-during-read preview while an exact refresh runs in background.
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
     events: list[dict[str, Any]] = []

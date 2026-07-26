@@ -607,7 +607,7 @@ export class RelayWs {
     before?: string | null,
     limit?: number | null,
     cwd?: string | null,
-  ): void {
+  ): boolean {
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_history", session_id: sessionId,
       client_id: this.clientId, detail: "summary", ts: nowTs(),
@@ -615,7 +615,7 @@ export class RelayWs {
     if (cwd) obj.cwd = cwd;
     if (before) obj.before = before;
     if (limit) obj.limit = limit;
-    this.send(obj);
+    return this.send(obj);
   }
 
   sendGetTurnDetail(

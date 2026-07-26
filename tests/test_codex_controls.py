@@ -13,8 +13,8 @@ from pydantic import ValidationError
 
 from cc_remote import __version__
 from cc_remote.protocol import (
-    CollaborationMode, Error, GoalState, Model, NewSession, PinSession, StateEvent,
-    ThreadGoal, TurnBinding, TurnEnd, UserMsg,
+    CollaborationMode, Delta, Error, GoalState, Model, NewSession, PinSession,
+    StateEvent, ThreadGoal, TurnBinding, TurnEnd, UserMsg,
 )
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
@@ -530,13 +530,475 @@ def test_codex_review_pre_response_burst_never_blocks_rpc_reader():
                 "turn": {"id": "review-outer", "status": "completed"},
             },
         })
+        queue_cap = handle._turn_q.max_items
         # EOF/disconnect racing the consumer must not replace the already
         # retained authoritative terminal with a bare sentinel.
         handle._force_turn_sentinel(handle._turn_q)
         frames = [frame async for frame in handle.receive_response()]
-        assert len(frames) == 2
+        assert len(frames) == 4
         assert isinstance(frames[0], CodexManagedOverflow)
-        assert frames[1]["method"] == "turn/completed"
+        assert [
+            frame["params"]["item"]["id"] for frame in frames[1:-1]
+        ] == [
+            f"early-{queue_cap - 1}",
+            f"early-{queue_cap}",
+        ]
+        assert frames[-1]["method"] == "turn/completed"
+
+    asyncio.run(run())
+
+
+def test_codex_managed_bridge_recovers_after_consumed_gap_at_item_boundary():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "managed-gap"
+        handle.turn_id = "managed-gap-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+
+        # One pathological frame creates a loss epoch without blocking the sole
+        # app-server reader.  Machine consumes this marker and keeps its sticky
+        # overflow flag solely for the terminal history repair.
+        await asyncio.wait_for(handle._dispatch({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "managed-gap",
+                "turnId": "managed-gap-turn",
+                "itemId": "lost-answer",
+                "delta": "lost",
+            },
+        }, raw_size=queue.max_bytes + 1), timeout=0.1)
+        marker = await asyncio.wait_for(queue.get(), timeout=0.1)
+        assert isinstance(marker, CodexManagedOverflow)
+
+        # A delta whose start was lost must not be resurrected after the gap.
+        # Its later complete snapshot is authoritative and independently safe.
+        await handle._dispatch({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "managed-gap",
+                "turnId": "managed-gap-turn",
+                "itemId": "lost-answer",
+                "delta": "orphan",
+            },
+        })
+        recovered = {
+            "method": "item/completed",
+            "params": {
+                "threadId": "managed-gap",
+                "turnId": "managed-gap-turn",
+                "item": {
+                    "id": "lost-answer",
+                    "type": "agentMessage",
+                    "text": "orphan result",
+                },
+            },
+        }
+        await handle._dispatch(recovered)
+        fresh = [
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "managed-gap",
+                    "turnId": "managed-gap-turn",
+                    "item": {
+                        "id": "fresh-answer",
+                        "type": "agentMessage",
+                    },
+                },
+            },
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "managed-gap",
+                    "turnId": "managed-gap-turn",
+                    "itemId": "fresh-answer",
+                    "delta": "still live",
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-gap",
+                    "turnId": "managed-gap-turn",
+                    "item": {
+                        "id": "fresh-answer",
+                        "type": "agentMessage",
+                        "text": "still live",
+                    },
+                },
+            },
+        ]
+        for message in fresh:
+            await handle._dispatch(message)
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "managed-gap",
+                "turn": {
+                    "id": "managed-gap-turn",
+                    "status": "completed",
+                },
+            },
+        })
+
+        frames = [frame async for frame in handle.receive_response()]
+        assert frames[:-1] == [recovered, *fresh]
+        assert frames[-1]["method"] == "turn/completed"
+        assert all(
+            (frame.get("params") or {}).get("delta") != "orphan"
+            for frame in frames
+            if isinstance(frame, dict)
+        )
+
+    asyncio.run(run())
+
+
+def test_codex_managed_bridge_keeps_complete_snapshots_across_gap():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "managed-completions"
+        handle.turn_id = "managed-completions-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+
+        # The consumer already rendered this start before a later frame opened
+        # the loss epoch. Its authoritative completion must still close the item.
+        before_gap_start = {
+            "method": "item/started",
+            "params": {
+                "threadId": "managed-completions",
+                "turnId": "managed-completions-turn",
+                "item": {
+                    "id": "started-before-gap",
+                    "type": "commandExecution",
+                    "command": "true",
+                    "status": "inProgress",
+                },
+            },
+        }
+        await handle._dispatch(before_gap_start)
+        assert await queue.get() == before_gap_start
+
+        await handle._dispatch({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "managed-completions",
+                "turnId": "managed-completions-turn",
+                "itemId": "lost-delta",
+                "delta": "must stay dropped",
+            },
+        }, raw_size=queue.max_bytes + 1)
+        assert isinstance(await queue.get(), CodexManagedOverflow)
+
+        malformed = [
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {"id": "missing-type"},
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {"type": "agentMessage", "text": "missing id"},
+                },
+            },
+            {
+                "method": "hook/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "run": {"eventName": "postToolUse"},
+                },
+            },
+            {
+                "method": "item/autoApprovalReview/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "reviewId": "missing-review-snapshot",
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": "x" * 4097,
+                        "type": "agentMessage",
+                        "text": "oversized id",
+                    },
+                },
+            },
+        ]
+        for message in malformed:
+            await handle._dispatch(message)
+
+        snapshots = [
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": "started-before-gap",
+                        "type": "commandExecution",
+                        "command": "true",
+                        "status": "completed",
+                        "aggregatedOutput": "",
+                        "exitCode": 0,
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": "completion-only-answer",
+                        "type": "agentMessage",
+                        "text": "authoritative answer",
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": "completion-only-image",
+                        "type": "imageGeneration",
+                        "status": "completed",
+                        "savedPath": "/tmp/generated.png",
+                    },
+                },
+            },
+            {
+                "method": "hook/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "run": {
+                        "id": "completion-only-hook",
+                        "eventName": "postToolUse",
+                        "status": "completed",
+                    },
+                },
+            },
+            {
+                "method": "item/autoApprovalReview/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "reviewId": "completion-only-review",
+                    "review": {"status": "approved"},
+                },
+            },
+        ]
+        # Fill the post-gap live reservation so the first completion itself is
+        # the frame that opens a second gap. The bridge must retry and retain
+        # that current self-contained snapshot after installing the marker.
+        for index in range(queue.max_items - 1):
+            await handle._dispatch({
+                "method": "item/started",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": f"filler-{index}",
+                        "type": "reasoning",
+                    },
+                },
+            })
+        assert queue.qsize() == queue.max_items - 1
+        await handle._dispatch(snapshots[0])
+        assert isinstance(await queue.get(), CodexManagedOverflow)
+
+        for message in snapshots[1:]:
+            await handle._dispatch(message)
+        terminal = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "managed-completions",
+                "turn": {
+                    "id": "managed-completions-turn",
+                    "status": "completed",
+                },
+            },
+        }
+        await handle._dispatch(terminal)
+
+        frames = [frame async for frame in handle.receive_response()]
+        assert frames == [*snapshots, terminal]
+
+    asyncio.run(run())
+
+
+def test_codex_overflow_does_not_block_approval_or_interaction_requests():
+    async def run():
+        approvals = []
+        interactions = []
+        sent = []
+
+        async def approve(method, params):
+            approvals.append((method, params))
+            return "accept"
+
+        async def interact(method, params):
+            interactions.append((method, params))
+            return {"answers": {"choice": {"answers": ["yes"]}}}
+
+        handle = CodexHandle(
+            _Cfg(),
+            approval_callback=approve,
+            interaction_callback=interact,
+        )
+        handle.approval = "on-request"
+        handle.thread_id = "overflow-requests"
+        handle.turn_id = "overflow-requests-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+
+        async def send(message):
+            sent.append(message)
+
+        handle._send = send
+        await handle._dispatch({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "overflow-requests",
+                "turnId": "overflow-requests-turn",
+                "itemId": "lost",
+                "delta": "lost",
+            },
+        }, raw_size=queue.max_bytes + 1)
+        assert isinstance(await queue.get(), CodexManagedOverflow)
+
+        await handle._dispatch({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "overflow-requests",
+                "turnId": "overflow-requests-turn",
+                "itemId": "command",
+                "command": "true",
+            },
+        })
+        await handle._dispatch({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "overflow-requests",
+                "turnId": "overflow-requests-turn",
+                "itemId": "question",
+                "questions": [],
+            },
+        })
+        await asyncio.gather(*list(handle._server_request_tasks))
+
+        assert [message["id"] for message in sent] == [41, 42]
+        assert sent[0]["result"] == {"decision": "accept"}
+        assert sent[1]["result"] == {
+            "answers": {"choice": {"answers": ["yes"]}},
+        }
+        assert len(approvals) == len(interactions) == 1
+        assert queue.qsize() == 0
+        assert queue.byte_size == 0
+
+    asyncio.run(run())
+
+
+def test_codex_managed_bridge_repeated_overflow_is_bounded_and_terminal_unique():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "managed-repeat"
+        handle.turn_id = "managed-repeat-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+
+        markers = []
+        for epoch in range(8):
+            # Each consumed gap opens a new loss epoch. Fill the complete live
+            # reservation again so this is eight real overflows, not one sticky
+            # flag suppressing seven later bursts.
+            for index in range(queue.max_items):
+                await asyncio.wait_for(handle._dispatch({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "managed-repeat",
+                        "turnId": "managed-repeat-turn",
+                        "item": {
+                            "id": f"epoch-{epoch}-item-{index}",
+                            "type": "reasoning",
+                        },
+                    },
+                }), timeout=0.1)
+                assert queue.qsize() <= queue.max_items
+                assert queue.byte_size <= queue.max_bytes
+            if epoch == 0:
+                # Overflow again before the first marker is consumed. The stale
+                # post-gap tail is replaced. Exactly one marker remains before
+                # the two newest complete starts retained around that gap.
+                for index in range(queue.max_items - 1):
+                    await asyncio.wait_for(handle._dispatch({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "managed-repeat",
+                            "turnId": "managed-repeat-turn",
+                            "item": {
+                                "id": f"merged-gap-item-{index}",
+                                "type": "reasoning",
+                            },
+                        },
+                    }), timeout=0.1)
+                    assert queue.qsize() <= queue.max_items
+                    assert queue.byte_size <= queue.max_bytes
+                assert queue.qsize() == 3
+            marker = await asyncio.wait_for(queue.get(), timeout=0.1)
+            assert isinstance(marker, CodexManagedOverflow)
+            markers.append(marker)
+
+        terminal = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "managed-repeat",
+                "turn": {
+                    "id": "managed-repeat-turn",
+                    "status": "completed",
+                },
+            },
+        }
+        # The bridge itself owns terminal de-duplication. This also covers an
+        # EOF/dispatch race before receive_response() has detached the queue.
+        assert handle._queue_managed_notification(
+            terminal, raw_size=queue.max_bytes + 1)
+        assert handle._queue_managed_notification(
+            terminal, raw_size=queue.max_bytes + 1)
+        assert len(markers) == 8
+        assert queue.qsize() <= queue.max_items
+        assert queue.byte_size <= queue.max_bytes
+        assert queue.has_turn_completed()
+
+        frames = [frame async for frame in handle.receive_response()]
+        assert sum(
+            isinstance(frame, dict)
+            and frame.get("method") == "turn/completed"
+            for frame in frames
+        ) == 1
 
     asyncio.run(run())
 
@@ -867,6 +1329,35 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
             async def receive_response(self):
                 yield CodexManagedOverflow("managed-overflow-turn")
                 yield {
+                    "method": "item/started",
+                    "params": {
+                        "turnId": "managed-overflow-turn",
+                        "item": {
+                            "id": "after-gap",
+                            "type": "agentMessage",
+                        },
+                    },
+                }
+                yield {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "turnId": "managed-overflow-turn",
+                        "itemId": "after-gap",
+                        "delta": "still streaming",
+                    },
+                }
+                yield {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "managed-overflow-turn",
+                        "item": {
+                            "id": "after-gap",
+                            "type": "agentMessage",
+                            "text": "still streaming",
+                        },
+                    },
+                }
+                yield {
                     "method": "turn/completed",
                     "params": {"turn": {
                         "id": "managed-overflow-turn", "status": "completed",
@@ -880,6 +1371,10 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
 
         assert not [event for event in transport.sent
                     if isinstance(event, Error)]
+        assert any(
+            isinstance(event, Delta) and event.text == "still streaming"
+            for event in transport.sent
+        )
         terminal = [event for event in transport.sent
                     if isinstance(event, TurnEnd)]
         assert len(terminal) == 1

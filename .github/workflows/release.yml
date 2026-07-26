@@ -64,6 +64,7 @@ jobs:
       - name: Materialize Web client for release tests
         run: |
           npm --prefix web ci
+          npm --prefix web exec -- playwright install --with-deps chromium webkit
           npm --prefix web run build
       - name: Python tests and lint
         run: |
@@ -72,6 +73,7 @@ jobs:
       - name: Web tests and lint
         run: |
           npm --prefix web run test:reliability
+          npm --prefix web run test:history-browser
           npm --prefix web run lint
       - name: Release script syntax
         run: |

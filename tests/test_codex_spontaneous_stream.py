@@ -73,6 +73,119 @@ def test_spontaneous_bridge_is_bounded_nonblocking_and_keeps_terminal_frame():
     asyncio.run(run())
 
 
+def test_spontaneous_bridge_keeps_streaming_complete_items_after_gap():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "auto-gap-recovery"
+        await handle._dispatch(_notification(
+            "turn/started", turn_id, turn={"id": turn_id},
+        ))
+        queue = handle._spontaneous_q
+        stream = handle.receive_spontaneous_response(turn_id)
+
+        await asyncio.wait_for(handle._dispatch(_notification(
+            "item/agentMessage/delta", turn_id,
+            itemId="lost-answer", delta="lost",
+        ), raw_size=queue.max_bytes + 1), timeout=0.1)
+
+        # Unknown deltas remain unsafe after a gap, but a subsequent explicit
+        # item lifecycle must be retained behind the still-unconsumed marker.
+        # Buffered stdout commonly delivers this whole sequence before the
+        # independent relay-facing consumer gets its first scheduling turn.
+        await handle._dispatch(_notification(
+            "item/agentMessage/delta", turn_id,
+            itemId="lost-answer", delta="orphan",
+        ))
+        fresh = [
+            _notification(
+                "item/started", turn_id,
+                item={"id": "fresh-answer", "type": "agentMessage"},
+            ),
+            _notification(
+                "item/agentMessage/delta", turn_id,
+                itemId="fresh-answer", delta="new live detail",
+            ),
+            _notification(
+                "item/completed", turn_id,
+                item={
+                    "id": "fresh-answer",
+                    "type": "agentMessage",
+                    "text": "new live detail",
+                },
+            ),
+        ]
+        for message in fresh:
+            await handle._dispatch(message)
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        ))
+
+        rest = [item async for item in stream]
+        assert isinstance(rest[0], CodexSpontaneousOverflow)
+        assert rest[1:-1] == fresh
+        assert rest[-1]["method"] == "turn/completed"
+        assert all(
+            (item.get("params") or {}).get("delta") != "orphan"
+            for item in rest
+            if isinstance(item, dict)
+        )
+
+    asyncio.run(run())
+
+
+def test_spontaneous_bridge_completion_snapshot_and_terminal_win_after_gap():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "auto-completion-race"
+        await handle._dispatch(_notification(
+            "turn/started", turn_id, turn={"id": turn_id},
+        ))
+        queue = handle._spontaneous_q
+
+        await handle._dispatch(_notification(
+            "item/agentMessage/delta", turn_id,
+            itemId="lost", delta="lost",
+        ), raw_size=queue.max_bytes + 1)
+
+        completion = _notification(
+            "item/completed", turn_id,
+            item={
+                "id": "completion-only-answer",
+                "type": "agentMessage",
+                "text": "final snapshot",
+            },
+        )
+        await handle._dispatch(completion)
+        # EOF/close may race the final app-server frame. The terminal must replace
+        # that provisional close without erasing the retained gap or completion.
+        handle._close_spontaneous_stream(turn_id)
+        terminal = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        )
+        await handle._dispatch(terminal, raw_size=queue.max_bytes + 1)
+        # Duplicate terminal and a later close must not add another end frame.
+        await handle._dispatch(terminal, raw_size=queue.max_bytes + 1)
+        handle._close_spontaneous_stream(turn_id)
+
+        frames = [
+            item async for item in
+            handle.receive_spontaneous_response(turn_id)
+        ]
+        assert isinstance(frames[0], CodexSpontaneousOverflow)
+        assert frames[1] == completion
+        assert frames[2]["method"] == "turn/completed"
+        assert frames[2]["params"]["turn"]["status"] == "interrupted"
+        assert len(frames) == 3
+        assert not any(
+            isinstance(item, CodexSpontaneousClosed) for item in frames)
+
+    asyncio.run(run())
+
+
 def test_stdout_reader_drains_burst_when_spontaneous_consumer_is_stalled():
     async def run():
         turn_id = "auto-burst"
@@ -293,6 +406,22 @@ def test_spontaneous_overflow_preserves_authoritative_success_terminal():
                 assert requested_turn_id == turn_id
                 yield CodexSpontaneousOverflow(turn_id)
                 yield _notification(
+                    "item/started", turn_id,
+                    item={"id": "after-gap", "type": "agentMessage"},
+                )
+                yield _notification(
+                    "item/agentMessage/delta", turn_id,
+                    itemId="after-gap", delta="still streaming",
+                )
+                yield _notification(
+                    "item/completed", turn_id,
+                    item={
+                        "id": "after-gap",
+                        "type": "agentMessage",
+                        "text": "still streaming",
+                    },
+                )
+                yield _notification(
                     "turn/completed", turn_id,
                     turn={"id": turn_id, "status": "completed"},
                 )
@@ -311,6 +440,10 @@ def test_spontaneous_overflow_preserves_authoritative_success_terminal():
 
         assert not [event for event in transport.sent
                     if isinstance(event, Error)]
+        assert any(
+            isinstance(event, Delta) and event.text == "still streaming"
+            for event in transport.sent
+        )
         terminal = [event for event in transport.sent
                     if isinstance(event, TurnEnd)]
         assert len(terminal) == 1

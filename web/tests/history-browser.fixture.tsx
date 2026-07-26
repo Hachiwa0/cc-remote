@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 import "../src/index.css";
@@ -256,6 +256,9 @@ interface FixtureSession {
   cursor: string;
   hasMore: boolean;
   pagesLoaded: number;
+  hasNewer?: boolean;
+  newerPagesLoaded?: number;
+  windowEpoch?: number;
 }
 
 export function HistoryBrowserFixture() {
@@ -276,6 +279,9 @@ export function HistoryBrowserFixture() {
   const mermaidHistory = params.has("mermaid-history");
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
+  const recoveryReplacement = params.has("recovery-replace");
+  const deepBrowse = params.has("deep-browse");
+  const runtimeBrowse = params.has("runtime-browse");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
   const emptyFinalPage = params.has("empty-final");
   const initialA = useMemo(() => {
@@ -302,6 +308,10 @@ export function HistoryBrowserFixture() {
       return Array.from({ length: largeCount }, (_, index) =>
         finalTurn(`m${index + 1}`, 2));
     }
+    if (deepBrowse) {
+      return Array.from({ length: 20 }, (_, index) =>
+        finalTurn(`m${index + 1}`, 3));
+    }
     if (timeline) {
       return [
         timelineTurn("timeline"),
@@ -318,7 +328,8 @@ export function HistoryBrowserFixture() {
     return INITIAL;
   }, [
     actualMermaid, compactTools, dualImage, interactiveTimeline,
-    invalidMermaid, large, largeCount, mermaid, mermaidHistory, timeline,
+    deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
+    timeline,
   ]);
   const [sid, setSid] = useState("history-browser-session-a");
   const [sessions, setSessions] = useState<Record<string, FixtureSession>>({
@@ -326,18 +337,36 @@ export function HistoryBrowserFixture() {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
       hasMore: !compactTools && !invalidMermaid && !large && !mermaid
-        && !mermaidHistory && !timeline,
+        && !mermaidHistory && !timeline && !deepBrowse,
       pagesLoaded: 0,
+      hasNewer: deepBrowse,
+      newerPagesLoaded: 0,
+      windowEpoch: 0,
     },
     "history-browser-session-b": {
       turns: SESSION_B,
       cursor: "b1",
       hasMore: false,
       pagesLoaded: 0,
+      hasNewer: false,
+      newerPagesLoaded: 0,
+      windowEpoch: 0,
     },
   });
   const [loads, setLoads] = useState(0);
   const [historyRevision, setHistoryRevision] = useState("revision-1");
+  const [historyViewRevision, setHistoryViewRevision] = useState("revision-1");
+  const [historyViewId, setHistoryViewId] = useState(
+    deepBrowse ? "browse-1" : "runtime",
+  );
+  const [browseMode, setBrowseMode] = useState(deepBrowse);
+  const [newerLoads, setNewerLoads] = useState(0);
+  const [latestTurns, setLatestTurns] = useState<Turn[]>(() =>
+    deepBrowse
+      ? Array.from({ length: 20 }, (_, index) =>
+        finalTurn(`m${index + 21}`, 3))
+      : []);
+  const nextLiveTurnRef = useRef(41);
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [pendingImages, setPendingImages] = useState<QueryImg[]>(() =>
     composerAttachment ? [{
@@ -356,10 +385,29 @@ export function HistoryBrowserFixture() {
       },
     }));
   }, []);
+  const growBrowseRow = useCallback((targetSid: string) => {
+    setSessions((current) => ({
+      ...current,
+      [targetSid]: {
+        ...current[targetSid],
+        turns: current[targetSid].turns.map((turn) => turn.id === "m15"
+          ? finalTurn("m15", 28)
+          : turn),
+      },
+    }));
+  }, []);
 
-  const loadMore = useCallback(() => {
+  const loadMore = useCallback((): boolean | {
+    accepted: true;
+    viewId: string;
+  } => {
     const requestSid = sid;
     if (!sessions[requestSid]?.hasMore) return false;
+    const enteringViewId = runtimeBrowse && !browseMode ? "browse-1" : null;
+    if (enteringViewId) {
+      setBrowseMode(true);
+      setHistoryViewId(enteringViewId);
+    }
     setLoads((value) => value + 1);
     window.setTimeout(() => {
       if (emptyFinalPage) {
@@ -394,13 +442,74 @@ export function HistoryBrowserFixture() {
         window.setTimeout(() => growOlderRow(requestSid), growthDelayMs);
       }
     }, delayMs);
-    return true;
+    return enteringViewId
+      ? { accepted: true, viewId: enteringViewId }
+      : true;
   }, [
-    delayMs, emptyFinalPage, growOlderRow, growthDelayMs, manualGrowth,
-    pageCount, sessions, sid,
+    browseMode, delayMs, emptyFinalPage, growOlderRow, growthDelayMs,
+    manualGrowth, pageCount, runtimeBrowse, sessions, sid,
   ]);
 
+  const loadNewer = useCallback((anchorTurnId?: string) => {
+    const requestSid = sid;
+    const session = sessions[requestSid];
+    if (!browseMode || !session?.hasNewer) return false;
+    setNewerLoads((value) => value + 1);
+    window.setTimeout(() => {
+      setSessions((current) => {
+        const target = current[requestSid];
+        if (!target?.hasNewer) return current;
+        const nextPage = (target.newerPagesLoaded ?? 0) + 1;
+        const first = 21 + (nextPage - 1) * 8;
+        const last = Math.min(40, first + 7);
+        const page = Array.from(
+          { length: Math.max(0, last - first + 1) },
+          (_, index) => finalTurn(`m${first + index}`, 3),
+        );
+        const ids = new Set(target.turns.map((turn) => turn.id));
+        const merged = [
+          ...target.turns,
+          ...page.filter((turn) => !ids.has(turn.id)),
+        ];
+        const bounded = [...merged];
+        while (bounded.length > 20
+            && bounded[0]?.id !== anchorTurnId
+            && bounded[0]?.historyTurnId !== anchorTurnId) {
+          bounded.shift();
+        }
+        return {
+          ...current,
+          [requestSid]: {
+            ...target,
+            turns: bounded,
+            hasNewer: last < 40,
+            newerPagesLoaded: nextPage,
+            windowEpoch: (target.windowEpoch ?? 0) + 1,
+          },
+        };
+      });
+    }, delayMs);
+    return true;
+  }, [browseMode, delayMs, sessions, sid]);
+
   const appendTurn = () => {
+    if (deepBrowse) {
+      const next = finalTurn(`live-${nextLiveTurnRef.current++}`, 4);
+      setLatestTurns((current) => [...current, next].slice(-20));
+      if (!browseMode) {
+        setSessions((current) => {
+          const session = current[sid];
+          return {
+            ...current,
+            [sid]: {
+              ...session,
+              turns: [...session.turns, next].slice(-20),
+            },
+          };
+        });
+      }
+      return;
+    }
     setSessions((current) => {
       const session = current[sid];
       const next = finalTurn(`live-${session.turns.length + 1}`, 4);
@@ -409,6 +518,20 @@ export function HistoryBrowserFixture() {
         [sid]: { ...session, turns: [...session.turns, next] },
       };
     });
+  };
+
+  const returnLatest = () => {
+    setSessions((current) => ({
+      ...current,
+      [sid]: {
+        ...current[sid],
+        turns: latestTurns,
+        hasNewer: false,
+        windowEpoch: (current[sid].windowEpoch ?? 0) + 1,
+      },
+    }));
+    setBrowseMode(false);
+    setHistoryViewId("runtime");
   };
 
   const growStreamingTurn = () => {
@@ -432,6 +555,25 @@ export function HistoryBrowserFixture() {
   };
 
   const replaceHistoryRevision = () => {
+    if (recoveryReplacement) {
+      setSessions((current) => {
+        const session = current[sid];
+        return {
+          ...current,
+          [sid]: {
+            ...session,
+            turns: session.turns.map((turn, index) =>
+              finalTurn(turn.id, index % 3 === 0 ? 4 : 3)),
+          },
+        };
+      });
+      // Recovery commits a new authoritative revision while deliberately
+      // retaining the old view key. A later unrelated replacement is what
+      // should reset that scope.
+      setHistoryRevision((current) =>
+        current === "revision-1" ? "revision-2" : "revision-3");
+      return;
+    }
     const replacement = Array.from(
       { length: 24 },
       (_, index) => finalTurn(`r${index + 1}`, 3),
@@ -445,8 +587,10 @@ export function HistoryBrowserFixture() {
         pagesLoaded: 0,
       },
     }));
-    setHistoryRevision((current) =>
-      current === "revision-1" ? "revision-2" : "revision-3");
+    const nextRevision = historyRevision === "revision-1"
+      ? "revision-2" : "revision-3";
+    setHistoryRevision(nextRevision);
+    setHistoryViewRevision(nextRevision);
     window.setTimeout(() => {
       setSessions((current) => ({
         ...current,
@@ -464,6 +608,10 @@ export function HistoryBrowserFixture() {
     <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
       <div style={{ flex: "none", minHeight: 24 }}>
         <output data-testid="load-count">{loads}</output>
+        <output data-testid="newer-load-count">{newerLoads}</output>
+        <output data-testid="newest-turn-id">{
+          active.turns[active.turns.length - 1]?.id ?? ""
+        }</output>
         <button data-testid="switch-session" type="button"
           onClick={() => setSid((current) => current.endsWith("-a")
             ? "history-browser-session-b" : "history-browser-session-a")}>
@@ -491,7 +639,9 @@ export function HistoryBrowserFixture() {
         )}
         {manualGrowth && (
           <button data-testid="grow-row" type="button"
-            onClick={() => growOlderRow("history-browser-session-a")}>
+            onClick={() => deepBrowse
+              ? growBrowseRow("history-browser-session-a")
+              : growOlderRow("history-browser-session-a")}>
             grow
           </button>
         )}
@@ -502,8 +652,15 @@ export function HistoryBrowserFixture() {
         engine={timelineEngine}
         hasMore={active.hasMore}
         historyRevision={historyRevision}
+        historyViewRevision={historyViewRevision}
+        historyViewId={deepBrowse || browseMode ? historyViewId : undefined}
+        historyWindowEpoch={active.windowEpoch ?? 0}
         historyCursor={active.cursor}
+        browseMode={browseMode && sid.endsWith("-a")}
+        hasNewer={!!active.hasNewer}
         onLoadMore={loadMore}
+        onLoadNewer={loadNewer}
+        onReturnLatest={returnLatest}
         onEdit={() => {}}
         onGetDiff={() => {}}
       />

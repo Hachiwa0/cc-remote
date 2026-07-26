@@ -27,6 +27,32 @@ import { canEnqueueQuery, collectWaitingQueries, reduceTargetedRuntime } from ".
 import {
   historyContainsTurn, mergeAuthoritativeTurnDetail, mergeInitialHistory,
 } from "./history-merge";
+import {
+  advanceHistoryRecovery,
+  beginHistoryRecovery,
+  historyConfirmsRecovery,
+  historyConfirmsRuntimeRecovery,
+  historyMatchesRecovery,
+  historyMatchesRuntimeRecovery,
+  historyNeedsConfirmationRequest,
+  isHistoryRecoveryPending,
+  isRuntimeHistoryRecoveryPending,
+  type HistoryRecoveryProjection,
+} from "./history-recovery";
+import {
+  appendNewerPage,
+  canonicalTurnId,
+  createHistoryBrowse,
+  markBrowseDetail,
+  markBrowseDetailLoading,
+  markBrowseLatestDirty,
+  markBrowseNewerUnavailable,
+  prependOlderPage,
+  settleBrowsePageRequest,
+  type HistoryBrowsePage,
+  type HistoryBrowseProjection,
+} from "./history-browse";
+import type { HistoryDetailRequestContext } from "./history-requests";
 import { boundRuntimeTurns, pruneRuntimeMap } from "./runtime-bounds";
 import { bumpSessionActivity, setSessionPinned } from "./session-order";
 import { presentCommandProblem, presentTurnProblem } from "./problem-presentation";
@@ -206,6 +232,14 @@ export interface SessionRuntime {
   // Ordering watermark for newest-page History builds within one wrapper
   // generation. Pagination never advances it.
   historyGeneration: string | null;
+  // Wrapper generation whose replay gap is awaiting a first authoritative
+  // History page. This is metadata only; the single display copy lives on
+  // AppState so background sessions never duplicate their bounded transcripts.
+  pendingHistoryGeneration: string | null;
+  // First matching newest-page build observed after a replay gap. Unlike the
+  // focused display projection this lightweight barrier survives navigation,
+  // so a background/returned session still requires a strictly newer build.
+  pendingHistoryCandidateBuildSeq: number | null;
   historyBuildSeq: number;
   historyLiveSeq: number;
   // A browser-triggered older-page response has been installed for the current
@@ -290,6 +324,13 @@ export interface AppState {
   sessions: SessionInfo[];
   focusedSid: string | null;
   runtimes: Record<string, SessionRuntime>;
+  // At most one current, display-only transcript projection survives a replay
+  // gap. It never participates in control, queue draining, or cache writes.
+  historyRecovery: HistoryRecoveryProjection | null;
+  // Explicit older-history browsing is a focused, display-only projection.
+  // Live turns, control, queue draining and query acceptance remain owned by
+  // the per-session runtime even while this older window is visible.
+  historyBrowse: HistoryBrowseProjection | null;
   // /btw ephemeral side-forks are owned by their parent sessions. Their
   // runtimes live under each binding's `sid`; navigation only changes which
   // binding is visible and never reassigns a fork to another parent.
@@ -321,7 +362,9 @@ export function createRuntime(): SessionRuntime {
     replaying: false, syncReady: false, truncated: false,
     historyInvalidated: false,
     historyRevision: null, pendingHistoryRevision: null,
-    historyGeneration: null, historyBuildSeq: 0, historyLiveSeq: 0,
+    historyGeneration: null, pendingHistoryGeneration: null,
+    pendingHistoryCandidateBuildSeq: null,
+    historyBuildSeq: 0, historyLiveSeq: 0,
     lastLiveSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
@@ -368,6 +411,16 @@ export type Action =
   | { type: "set_session_pinned"; sid: string; pinned: boolean }
   | { type: "focus_session"; sid: string }
   | { type: "turn_detail_requested"; sid: string; turnId: string }
+  | { type: "begin_history_browse"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; basePageKey: string }
+  | { type: "install_history_browse_page"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
+  | { type: "install_history_browse_newer"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
+  | { type: "history_browse_newer_settled"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; pageKey: string }
+  | { type: "history_browse_newer_unavailable"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number }
+  | { type: "history_browse_page_failed"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string }
+  | { type: "history_browse_detail_requested"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string }
+  | { type: "history_browse_detail"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; events: ServerEvent[] }
+  | { type: "history_detail_cancelled"; context: HistoryDetailRequestContext }
+  | { type: "return_to_latest"; sid: string }
   | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null }
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question" }
@@ -392,6 +445,8 @@ export const initialState: AppState = {
   sessions: [],
   focusedSid: null,
   runtimes: {},
+  historyRecovery: null,
+  historyBrowse: null,
   btwByParentSid: {},
   catalog: {},
   catalogDefault: {},
@@ -682,8 +737,11 @@ function replaceWithBoundedTurns(runtime: SessionRuntime, turns: Turn[]): void {
   const bounded = boundRuntimeTurns(itemBounded);
   if (bounded.length < itemBounded.length) {
     runtime.truncated = true;
-    runtime.hasMore = false;
-    runtime.oldestId = bounded[0]?.id ?? null;
+    // Deep history is rendered in a separate sliding projection. The live
+    // runtime may therefore remain newest-biased while still exposing the
+    // first retained native turn as a valid server-before cursor.
+    runtime.hasMore = true;
+    runtime.oldestId = bounded[0]?.historyTurnId ?? bounded[0]?.id ?? null;
   }
   runtime.turns = bounded;
 }
@@ -865,6 +923,11 @@ export function reduce(state: AppState, action: Action): AppState {
         // A reconnect may land on a restarted relay with no wrapper. Wait for
         // replay/snapshot proof before allowing background queue removal.
         wrapperOnline: action.connState === "connected" ? state.wrapperOnline : false,
+        // Pagination waiters are frozen to one underlying socket generation.
+        // Keep the authoritative live runtime, but reopen deep history from its
+        // newest page after reconnect instead of accepting a delayed old page.
+        historyBrowse: action.connState === "connected"
+          ? state.historyBrowse : null,
         banner,
       };
     }
@@ -878,7 +941,9 @@ export function reduce(state: AppState, action: Action): AppState {
       const current = state.runtimes[action.sid];
       if (!current || (current.acceptancePending
           && current.acceptancePending !== action.msg_id)) return state;
-      const acceptanceHistoryBaseline = current.historyRevision
+      const acceptanceHistoryBaseline = !current.historyInvalidated
+          && !isHistoryRecoveryPending(state.historyRecovery, action.sid)
+          && current.historyRevision
           && current.historyBuildSeq > 0
         ? {
           revision: current.historyRevision,
@@ -907,15 +972,22 @@ export function reduce(state: AppState, action: Action): AppState {
         };
       }
       const sessions = bumpSessionActivity(state.sessions, action.sid, action.ts);
-      if (runtimes === state.runtimes && sessions === state.sessions) return state;
-      return { ...state, runtimes, sessions };
+      const historyBrowse = state.historyBrowse?.sid === action.sid
+        ? null : state.historyBrowse;
+      if (runtimes === state.runtimes && sessions === state.sessions
+          && historyBrowse === state.historyBrowse) return state;
+      return { ...state, runtimes, sessions, historyBrowse };
     }
     case "enqueue": {
       const allQueued = collectWaitingQueries(state.runtimes);
       if (!canEnqueueQuery(allQueued, action.query)) return state;
-      return patch(state, action.sid ?? state.focusedSid, (rt) => {
+      const targetSid = action.sid ?? state.focusedSid;
+      const next = patch(state, targetSid, (rt) => {
         rt.queue = [...rt.queue, action.query];
       });
+      return targetSid && next.historyBrowse?.sid === targetSid
+        ? { ...next, historyBrowse: null }
+        : next;
     }
     case "dequeue_at": {
       const runtimes = reduceTargetedRuntime(
@@ -928,7 +1000,11 @@ export function reduce(state: AppState, action: Action): AppState {
       const targetSid = action.sid ?? state.focusedSid;
       const waiting = collectWaitingQueries(state.runtimes, targetSid);
       if (!canEnqueueQuery(waiting, action.query)) return state;
-      return patch(state, targetSid, (rt) => { rt.pendingSend = action.query; });
+      const next = patch(
+        state, targetSid, (rt) => { rt.pendingSend = action.query; });
+      return targetSid && next.historyBrowse?.sid === targetSid
+        ? { ...next, historyBrowse: null }
+        : next;
     }
     case "clear_pending": {
       const runtimes = reduceTargetedRuntime(
@@ -1006,13 +1082,19 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, btwByParentSid: {}, runtimes };
     }
     case "clear_session_list":
-      return { ...state, sessions: [], focusedSid: null };
+      return {
+        ...state, sessions: [], focusedSid: null, historyRecovery: null,
+        historyBrowse: null,
+      };
     case "restore_session_list":
       // Surface switches are view changes. Paint that surface's last accepted
       // list immediately, then let the in-flight authoritative list replace it.
       // Clearing first exposed Codex app-server startup time as a blank/frozen
       // sidebar even though the browser already had the exact rows in memory.
-      return { ...state, sessions: action.sessions, focusedSid: null };
+      return {
+        ...state, sessions: action.sessions, focusedSid: null,
+        historyRecovery: null, historyBrowse: null,
+      };
     case "set_session_pinned": {
       const sessions = setSessionPinned(state.sessions, action.sid, action.pinned);
       return sessions === state.sessions ? state : { ...state, sessions };
@@ -1026,14 +1108,252 @@ export function reduce(state: AppState, action: Action): AppState {
       // if we have no turns yet, mark loading so the UI shows a spinner (not the
       // empty "send a message" prompt) until cache-hydrate or the wrapper replay lands.
       const runtimes = { ...state.runtimes, [sid]: { ...rt, loading: rt.turns.length === 0 } };
-      return { ...state, focusedSid: sid, runtimes, artifact: null };
+      return {
+        ...state, focusedSid: sid, runtimes, artifact: null,
+        historyRecovery: state.historyRecovery?.sid === sid
+          ? state.historyRecovery : null,
+        // Switching away and back always opens the authoritative latest
+        // runtime. A delayed page from the previous viewId is then harmless.
+        historyBrowse: null,
+      };
     }
     case "turn_detail_requested":
       return patch(state, action.sid, (rt) => {
-        rt.turns = rt.turns.map((turn) => turn.id === action.turnId
+        rt.turns = rt.turns.map((turn) => (
+          turn.id === action.turnId || canonicalTurnId(turn) === action.turnId)
           ? { ...turn, detailLoading: true }
           : turn);
       }, true);
+    case "begin_history_browse": {
+      const runtime = state.runtimes[action.sid];
+      if (!runtime || state.focusedSid !== action.sid
+          || isHistoryRecoveryPending(state.historyRecovery, action.sid)
+          || runtime.historyInvalidated
+          || runtime.historyRevision !== action.revision
+          || (action.generation != null
+            && runtime.historyGeneration !== action.generation)
+          || !runtime.hasMore || !runtime.oldestId) return state;
+      const mutation = createHistoryBrowse({
+        scopeKey: action.scopeKey,
+        sid: action.sid,
+        revision: action.revision,
+        generation: action.generation ?? runtime.historyGeneration,
+        viewId: action.viewId,
+        baseTurns: runtime.turns,
+        basePageKey: action.basePageKey,
+        hasOlder: !!runtime.hasMore,
+        olderCursor: runtime.oldestId,
+      });
+      return { ...state, historyBrowse: mutation.projection };
+    }
+    case "install_history_browse_page": {
+      const browse = state.historyBrowse;
+      if (!browse || state.focusedSid !== action.sid
+          || browse.sid !== action.sid
+          || browse.scopeKey !== action.scopeKey
+          || browse.revision !== action.revision
+          || browse.viewId !== action.viewId
+          || browse.windowEpoch !== action.windowEpoch
+          || browse.olderCursor !== action.before
+          || (action.generation != null
+            && browse.generation !== action.generation)) return state;
+      // App already needs the pure mutation result to persist evicted pages.
+      // Reuse it when no intervening reducer action changed the source object;
+      // otherwise recompute from the actual current state to preserve live
+      // latestDirty/detail updates queued in the meantime.
+      const prepared = action.prepared?.from === browse
+          && action.prepared.to.sid === action.sid
+          && action.prepared.to.scopeKey === action.scopeKey
+          && action.prepared.to.revision === action.revision
+          && action.prepared.to.generation === browse.generation
+          && action.prepared.to.viewId === action.viewId
+          && action.prepared.to.windowEpoch === action.windowEpoch + 1
+        ? action.prepared.to : null;
+      const mutation = prepared
+        ? { projection: prepared, evictedPages: [] }
+        : prependOlderPage(browse, action.page, {
+            expectedScopeKey: action.scopeKey,
+            expectedViewId: action.viewId,
+            expectedWindowEpoch: action.windowEpoch,
+            expectedOlderCursor: action.before,
+            protectedTurnIds: action.protectedTurnIds,
+          });
+      const historyBrowse = mutation.projection;
+      return historyBrowse === browse
+        ? state : { ...state, historyBrowse };
+    }
+    case "install_history_browse_newer": {
+      const browse = state.historyBrowse;
+      if (!browse || state.focusedSid !== action.sid
+          || browse.sid !== action.sid
+          || browse.scopeKey !== action.scopeKey
+          || browse.revision !== action.revision
+          || browse.viewId !== action.viewId
+          || browse.windowEpoch !== action.windowEpoch
+          || (action.generation != null
+            && browse.generation !== action.generation)
+          || !browse.hasNewer
+          || browse.newerPageKey !== action.page.pageKey) return state;
+      const prepared = action.prepared?.from === browse
+          && action.prepared.to.sid === action.sid
+          && action.prepared.to.scopeKey === action.scopeKey
+          && action.prepared.to.revision === action.revision
+          && action.prepared.to.generation === browse.generation
+          && action.prepared.to.viewId === action.viewId
+          && action.prepared.to.windowEpoch === action.windowEpoch + 1
+        ? action.prepared.to : null;
+      const mutation = prepared
+        ? { projection: prepared, evictedPages: [] }
+        : appendNewerPage(browse, action.page, {
+            expectedScopeKey: action.scopeKey,
+            expectedViewId: action.viewId,
+            expectedWindowEpoch: action.windowEpoch,
+            expectedNewerPageKey: action.page.pageKey,
+            protectedTurnIds: action.protectedTurnIds,
+          });
+      return mutation.projection === browse
+        ? state : { ...state, historyBrowse: mutation.projection };
+    }
+    case "history_browse_newer_unavailable": {
+      const browse = state.historyBrowse;
+      if (!browse || state.focusedSid !== action.sid
+          || browse.sid !== action.sid
+          || browse.scopeKey !== action.scopeKey
+          || browse.revision !== action.revision
+          || browse.viewId !== action.viewId
+          || browse.windowEpoch !== action.windowEpoch
+          || (action.generation != null
+            && browse.generation !== action.generation)) return state;
+      const historyBrowse = markBrowseNewerUnavailable(browse, {
+        expectedScopeKey: action.scopeKey,
+        expectedViewId: action.viewId,
+        expectedWindowEpoch: action.windowEpoch,
+      });
+      return historyBrowse === browse ? state : { ...state, historyBrowse };
+    }
+    case "history_browse_newer_settled": {
+      const browse = state.historyBrowse;
+      if (!browse || state.focusedSid !== action.sid
+          || browse.sid !== action.sid
+          || browse.scopeKey !== action.scopeKey
+          || browse.revision !== action.revision
+          || browse.viewId !== action.viewId
+          || browse.windowEpoch !== action.windowEpoch
+          || !browse.hasNewer
+          || browse.newerPageKey !== action.pageKey
+          || (action.generation != null
+            && browse.generation !== action.generation)) return state;
+      const historyBrowse = settleBrowsePageRequest(browse, {
+        expectedScopeKey: action.scopeKey,
+        expectedViewId: action.viewId,
+        expectedWindowEpoch: action.windowEpoch,
+      });
+      return { ...state, historyBrowse };
+    }
+    case "history_browse_page_failed": {
+      const browse = state.historyBrowse;
+      if (!browse || state.focusedSid !== action.sid
+          || browse.sid !== action.sid
+          || browse.scopeKey !== action.scopeKey
+          || browse.revision !== action.revision
+          || browse.viewId !== action.viewId
+          || browse.windowEpoch !== action.windowEpoch
+          || browse.olderCursor !== action.before
+          || (action.generation != null
+            && browse.generation !== action.generation)) return state;
+      const historyBrowse = settleBrowsePageRequest(browse, {
+        expectedScopeKey: action.scopeKey,
+        expectedViewId: action.viewId,
+        expectedWindowEpoch: action.windowEpoch,
+      });
+      return { ...state, historyBrowse };
+    }
+    case "history_browse_detail_requested": {
+      const browse = state.historyBrowse;
+      if (!browse || state.focusedSid !== action.sid
+          || browse.sid !== action.sid
+          || browse.scopeKey !== action.scopeKey
+          || browse.revision !== action.revision
+          || browse.viewId !== action.viewId) return state;
+      // Detail authority belongs to the revisioned browse view, not to one
+      // particular page window. Older/newer pagination may legitimately
+      // advance windowEpoch while the requested canonical turn remains
+      // mounted; rejecting that late response would strand detailLoading.
+      const historyBrowse = markBrowseDetailLoading(
+        browse, action.turnId, true, {
+          expectedScopeKey: action.scopeKey,
+          expectedViewId: action.viewId,
+        });
+      return historyBrowse === browse ? state : { ...state, historyBrowse };
+    }
+    case "history_browse_detail": {
+      const browse = state.historyBrowse;
+      if (!browse || state.focusedSid !== action.sid
+          || browse.sid !== action.sid
+          || browse.scopeKey !== action.scopeKey
+          || browse.revision !== action.revision
+          || browse.viewId !== action.viewId
+          || !browse.turns.some((turn) =>
+            canonicalTurnId(turn) === action.turnId
+            || turn.id === action.turnId)) return state;
+      let scratch: AppState = {
+        ...state,
+        banner: undefined,
+        historyBrowse: null,
+        runtimes: { [action.sid]: createRuntime() },
+      };
+      for (const event of action.events) {
+        scratch = reduceEvent(scratch, event, false);
+      }
+      const detailed = (scratch.runtimes[action.sid]?.turns ?? []).find(
+        (turn) => canonicalTurnId(turn) === action.turnId
+          || turn.id === action.turnId,
+      );
+      if (!detailed) {
+        const historyBrowse = markBrowseDetailLoading(
+          browse, action.turnId, false, {
+            expectedScopeKey: action.scopeKey,
+            expectedViewId: action.viewId,
+          });
+        return historyBrowse === browse ? state : { ...state, historyBrowse };
+      }
+      const historyBrowse = markBrowseDetail(
+        browse, action.turnId, withLimitedTurnBlocks(detailed), {
+          expectedScopeKey: action.scopeKey,
+          expectedViewId: action.viewId,
+        });
+      return historyBrowse === browse ? state : { ...state, historyBrowse };
+    }
+    case "history_detail_cancelled": {
+      const context = action.context;
+      if (context.target === "browse") {
+        const browse = state.historyBrowse;
+        if (!browse || state.focusedSid !== context.sid
+            || browse.sid !== context.sid
+            || browse.scopeKey !== context.scopeKey
+            || browse.revision !== context.revision
+            || browse.viewId !== context.viewId) return state;
+        const historyBrowse = markBrowseDetailLoading(
+          browse, context.turnId, false, {
+            expectedScopeKey: context.scopeKey,
+            expectedViewId: context.viewId,
+          });
+        return historyBrowse === browse ? state : { ...state, historyBrowse };
+      }
+      const runtime = state.runtimes[context.sid];
+      if (!runtime || runtime.historyRevision !== context.revision) return state;
+      return patch(state, context.sid, (rt) => {
+        rt.turns = rt.turns.map((turn) => (
+          turn.id === context.turnId
+            || canonicalTurnId(turn) === context.turnId)
+          ? { ...turn, detailLoading: false }
+          : turn);
+      }, true);
+    }
+    case "return_to_latest":
+      return state.historyBrowse?.sid === action.sid
+        ? { ...state, historyBrowse: null }
+        : state;
     case "hydrate_cache":
       // fill a session's turns from the IndexedDB cache for an INSTANT render;
       // only if still empty (never clobber live/streaming or already-replayed turns).
@@ -1074,12 +1394,17 @@ export function reduce(state: AppState, action: Action): AppState {
           (notice) => notice.notice_id !== action.noticeId);
       });
     case "enter_new_chat":
-      return { ...state, newChat: {
-        cwd: action.cwd,
-        cwdSource: action.cwdSource ?? "default",
-        model: action.model ?? null,
-        effort: action.effort ?? null,
-      } };
+      return {
+        ...state,
+        historyRecovery: null,
+        historyBrowse: null,
+        newChat: {
+          cwd: action.cwd,
+          cwdSource: action.cwdSource ?? "default",
+          model: action.model ?? null,
+          effort: action.effort ?? null,
+        },
+      };
     case "set_new_chat_cwd":
       return state.newChat ? { ...state, newChat: {
         ...state.newChat,
@@ -1117,6 +1442,18 @@ function reduceEvent(
     state = patch(state, e.sid, (rt) => {
       rt.lastLiveSeq = Math.max(rt.lastLiveSeq, e.seq!);
     });
+  }
+  if (boundCompletedTurns && e.sid
+      && state.historyBrowse?.sid === e.sid
+      && [
+        "user_msg", "assistant_msg_start", "delta", "tool_use",
+        "tool_delta", "tool_result", "assistant_msg_end", "process",
+        "turn_end", "error",
+      ].includes(e.type)) {
+    state = {
+      ...state,
+      historyBrowse: markBrowseLatestDirty(state.historyBrowse),
+    };
   }
   switch (e.type) {
     case "snapshot": {
@@ -1172,6 +1509,10 @@ function reduceEvent(
         : state.sessions;
       return {
         ...state, focusedSid: newF, runtimes, sessions,
+        historyRecovery: state.historyRecovery?.sid === newF
+          ? state.historyRecovery : null,
+        historyBrowse: state.focusedSid === newF
+          ? state.historyBrowse : null,
         artifact: state.focusedSid && state.focusedSid !== newF ? null : state.artifact,
         cwdByScope,
       };
@@ -1225,6 +1566,11 @@ function reduceEvent(
                 : source.historyLiveSeq,
             historyGeneration: source.historyRevision == null
               ? target.historyGeneration : source.historyGeneration,
+            pendingHistoryGeneration:
+              source.pendingHistoryGeneration ?? target.pendingHistoryGeneration,
+            pendingHistoryCandidateBuildSeq: source.historyInvalidated
+              ? source.pendingHistoryCandidateBuildSeq
+              : target.pendingHistoryCandidateBuildSeq,
             historyNewestId: source.historyRevision == null
               ? target.historyNewestId : source.historyNewestId,
             lastLiveSeq: Math.max(source.lastLiveSeq, target.lastLiveSeq),
@@ -1287,9 +1633,17 @@ function reduceEvent(
         else if (targetBtw.sid !== parentBtw.sid) delete runtimes[parentBtw.sid];
         delete btwByParentSid[old_key];
       }
+      const historyRecovery = state.historyRecovery?.sid === old_key
+        ? { ...state.historyRecovery, sid: session_id }
+        : state.historyRecovery;
+      // A new session cannot have deep authoritative history yet. Keeping a
+      // temp-keyed browse projection through re-key would also leave its page
+      // cache under the wrong durable identity.
+      const historyBrowse = state.historyBrowse?.sid === old_key
+        ? null : state.historyBrowse;
       return {
         ...state,
-        runtimes, sessions,
+        runtimes, sessions, historyRecovery, historyBrowse,
         focusedSid: wasFocused ? session_id : state.focusedSid,
         btwByParentSid,
         cwdByScope,
@@ -1303,6 +1657,8 @@ function reduceEvent(
         ...state,
         sessions: e.sessions,
         focusedSid: focusedMissing ? null : state.focusedSid,
+        historyRecovery: focusedMissing ? null : state.historyRecovery,
+        historyBrowse: focusedMissing ? null : state.historyBrowse,
         newChat: focusedMissing
           ? {
             cwd: (ownership
@@ -1334,7 +1690,7 @@ function reduceEvent(
       // independent from the focused conversation runtime.
       return state;
     case "history_invalidated": {
-      const next = patch(state, e.session_id, (rt) => {
+      let next = patch(state, e.session_id, (rt) => {
         // This small frame is replayable even when the authoritative History
         // replacement is too large for the bounded ring. Empty stale turns
         // immediately; the following live/history refresh rebuilds from the
@@ -1355,6 +1711,12 @@ function reduceEvent(
         rt.hydratedCacheTurnIds = [];
         rt.loading = true;
       }, true);
+      if (next.historyRecovery?.sid === e.session_id) {
+        next = { ...next, historyRecovery: null };
+      }
+      if (next.historyBrowse?.sid === e.session_id) {
+        next = { ...next, historyBrowse: null };
+      }
       return next.artifact?.sid === e.session_id
         ? { ...next, artifact: null }
         : next;
@@ -1372,6 +1734,63 @@ function reduceEvent(
       // already in the runtime (an in-flight turn still streaming live, not yet in
       // the transcript) is preserved and appended after the rebuilt history.
       const sid = e.session_id;
+      if (e.before) {
+        // Older pages are requester-correlated, display-only browse data.
+        // App freezes machine/surface/view authority at request time and routes
+        // them through install_history_browse_page. Letting an uncorrelated
+        // page reach this generic path would mutate live/control watermarks and
+        // reintroduce the very history/runtime coupling the sliding window
+        // removes.
+        return state;
+      }
+      const preControlBase = state.runtimes[sid] ?? createRuntime();
+      if (!e.before && preControlBase.pendingHistoryGeneration
+          && e.generation !== preControlBase.pendingHistoryGeneration) {
+        return state;
+      }
+      if (!e.before && e.authoritative !== false
+          && isHistoryRecoveryPending(state.historyRecovery, sid)
+          && !historyMatchesRecovery(state.historyRecovery, e)) {
+        return state;
+      }
+      const sameBuildGeneration = e.generation != null
+        ? preControlBase.historyGeneration === e.generation
+        : preControlBase.historyGeneration == null
+          && preControlBase.historyRevision === e.revision;
+      const staleHistoryBuild = !e.before && e.build_seq != null
+        && sameBuildGeneration
+        && e.build_seq < preControlBase.historyBuildSeq;
+      const runtimeRecoveryPending =
+        isRuntimeHistoryRecoveryPending(preControlBase);
+      if (!e.before && e.authoritative !== false && runtimeRecoveryPending) {
+        if (!historyMatchesRuntimeRecovery(preControlBase, e)) return state;
+        if (historyNeedsConfirmationRequest(preControlBase, e)) {
+          let next = patch(state, sid, (rt) => {
+            rt.pendingHistoryCandidateBuildSeq = e.build_seq ?? 0;
+          }, true);
+          if (isHistoryRecoveryPending(next.historyRecovery, sid)) {
+            next = {
+              ...next,
+              historyRecovery: advanceHistoryRecovery(next.historyRecovery, e),
+            };
+          }
+          // The first matching build after ReplayStart may itself have started
+          // before the replay gap was known. It advances only lightweight
+          // confirmation state. Do not install narrative/control state or clear
+          // loading/invalidation: navigation can release the display copy, and
+          // the canonical runtime must still be unmistakably unconfirmed.
+          return next;
+        }
+        if (!historyConfirmsRuntimeRecovery(preControlBase, e)) return state;
+      }
+      if (!e.before && e.authoritative !== false
+          && isHistoryRecoveryPending(state.historyRecovery, sid)
+          && state.historyRecovery!.candidateBuildSeq != null
+          && !historyConfirmsRecovery(state.historyRecovery, e)) {
+        // A duplicate/equal build cannot be installed behind a sampled-prefix
+        // preview. Only the wrapper's strictly newer exact refresh is canonical.
+        return state;
+      }
       // Control has its own monotonic revision and remains authoritative even
       // when this History page later loses a transcript build/live race. Apply
       // it before any narrative early-return.
@@ -1385,21 +1804,8 @@ function reduceEvent(
           switchControlGeneration(rt, e.generation);
         }, true);
       }
+      if (staleHistoryBuild) return state;
       const base = state.runtimes[sid] ?? createRuntime();
-      const sameBuildGeneration = e.generation != null
-        ? base.historyGeneration === e.generation
-        : base.historyGeneration == null && base.historyRevision === e.revision;
-      if (!e.before && e.build_seq != null && sameBuildGeneration
-          && e.build_seq < base.historyBuildSeq) return state;
-      // A failed read/parse is explicitly non-authoritative. It satisfies the
-      // current loading attempt but must not turn "could not read" into "the
-      // conversation is empty" or clear a pending rollback barrier.
-      if (e.authoritative === false) {
-        const next = patch(state, sid, (rt) => {
-          rt.loading = false;
-        }, true);
-        return next;
-      }
       // build_seq orders newest-page reads only within the same boot-scoped
       // revision. A restart legitimately resets the sequence while changing
       // revision. Pagination remains revision/cursor based: another client's
@@ -1427,6 +1833,49 @@ function reduceEvent(
           doneTs: turn.doneTs ?? undefined,
           durationMs: turn.durationMs ?? undefined,
         }));
+      }
+      if (e.authoritative === false) {
+        const provisional = !e.error && !e.before && built.turns.length > 0;
+        const pendingRecovery = isHistoryRecoveryPending(
+          state.historyRecovery, sid);
+        const coldPreview = provisional
+          && base.turns.length === 0
+          && state.focusedSid === sid
+          && !state.newChat;
+        let next = patch(state, sid, (rt) => {
+          // A failed read stops an ordinary loading attempt. A populated stale
+          // append-prefix may keep an otherwise empty first screen readable,
+          // but a trusted current runtime remains fully interactive while the
+          // wrapper's already-scheduled exact refresh runs in the background.
+          rt.loading = pendingRecovery || coldPreview;
+        }, true);
+        if (coldPreview) {
+          // Never install a sampled prefix in the authoritative runtime. It is
+          // useful only for an empty cold first paint, and cannot drive cache,
+          // acceptance, pagination, detail reads, or replace a newer replay
+          // recovery view. Any existing canonical turn is strictly preferred
+          // without creating a recovery lock.
+          const previewRuntime: SessionRuntime = {
+            ...base,
+            turns: built.turns,
+            hasMore: e.has_more,
+            oldestId: e.oldest_id ?? null,
+            historyRevision: e.revision,
+          };
+          next = {
+            ...next,
+            historyRecovery: pendingRecovery
+              ? state.historyRecovery!
+              : beginHistoryRecovery(
+                  state.historyRecovery,
+                  sid,
+                  previewRuntime,
+                  e.generation,
+                  e.build_seq ?? 0,
+                ),
+          };
+        }
+        return next;
       }
       // A pre-rollback first page and an older pagination response can arrive
       // after the replayable marker. Only the marker's exact revision may cross
@@ -1560,6 +2009,9 @@ function reduceEvent(
       const boundedTurns = boundRuntimeTurns(turns);
       const historyTrimmed = boundedTurns.length < turns.length;
       turns = boundedTurns;
+      const locallyRetainedCursor = historyTrimmed
+        ? (turns[0]?.historyTurnId ?? turns[0]?.id ?? null)
+        : null;
       const acceptsControlState = !e.before;
       const acceptsOwnershipState = acceptsControlState && !racedLiveEvent
         && !base.hasRevisionedControl;
@@ -1580,6 +2032,18 @@ function reduceEvent(
           && ev.msg_id === base.acceptancePending
         ))
       );
+      let historyBrowse = state.historyBrowse;
+      if (historyBrowse?.sid === sid) {
+        if (historyBrowse.revision !== e.revision
+            || (e.generation != null
+              && historyBrowse.generation !== e.generation)) {
+          historyBrowse = null;
+        } else if ((e.newest_id != null
+            && e.newest_id !== base.historyNewestId)
+            || (e.build_seq ?? 0) > base.historyBuildSeq) {
+          historyBrowse = markBrowseLatestDirty(historyBrowse);
+        }
+      }
       return {
         ...state,
         // History can contain legacy Error rows.  They may reconstruct a
@@ -1610,6 +2074,10 @@ function reduceEvent(
             historyGeneration: acceptsControlState
               ? (e.generation ?? base.historyGeneration)
               : base.historyGeneration,
+            pendingHistoryGeneration: acceptsControlState
+              ? null : base.pendingHistoryGeneration,
+            pendingHistoryCandidateBuildSeq: acceptsControlState
+              ? null : base.pendingHistoryCandidateBuildSeq,
             historyBuildSeq: acceptsControlState
               ? (e.build_seq ?? base.historyBuildSeq)
               : base.historyBuildSeq,
@@ -1637,14 +2105,16 @@ function reduceEvent(
               ? built.model : base.model,
             effort: acceptsControlState && !racedLiveEvent && hadEffort
               ? built.effort : base.effort,
-            // Browser retention and server pagination are independent. When
-            // the newest window is bounded locally, keep the authoritative
-            // backend cursor so compacted/older transcript pages remain
-            // reachable through "load earlier history".
-            hasMore: preserveStableHeadHistory
-              ? base.hasMore : e.has_more,
-            oldestId: preserveStableHeadHistory
-              ? base.oldestId : (e.oldest_id ?? base.oldestId),
+            // The display-only browse window can evict from the opposite edge,
+            // so a newest-biased runtime trim is now a valid older-page cursor
+            // instead of a terminal pagination boundary.
+            hasMore: historyTrimmed
+              ? true
+              : preserveStableHeadHistory ? base.hasMore : e.has_more,
+            oldestId: historyTrimmed
+              ? locallyRetainedCursor
+              : preserveStableHeadHistory
+                ? base.oldestId : (e.oldest_id ?? base.oldestId),
             truncated: base.truncated || historyTrimmed,
             // A native `claude`/`codex` in the terminal owns this session and is
             // appending to its transcript; the wrapper mirrors those appends here.
@@ -1661,6 +2131,8 @@ function reduceEvent(
               ? null : base.acceptanceHistoryBaseline,
           },
         },
+        historyRecovery: advanceHistoryRecovery(state.historyRecovery, e),
+        historyBrowse,
       };
     }
     case "turn_detail": {
@@ -1670,6 +2142,7 @@ function reduceEvent(
       if (e.authoritative === false) {
         const next = patch(state, sid, (rt) => {
           rt.turns = rt.turns.map((turn) => turn.id === e.turn_id
+              || canonicalTurnId(turn) === e.turn_id
             ? { ...turn, detailLoading: false }
             : turn);
         });
@@ -1684,18 +2157,21 @@ function reduceEvent(
         scratch = reduceEvent(scratch, event as ServerEvent, false);
       }
       const detailed = (scratch.runtimes[sid]?.turns ?? []).find(
-        (turn) => turn.id === e.turn_id,
+        (turn) => turn.id === e.turn_id
+          || canonicalTurnId(turn) === e.turn_id,
       );
       if (!detailed) {
         return patch(state, sid, (rt) => {
-          rt.turns = rt.turns.map((turn) => turn.id === e.turn_id
+          rt.turns = rt.turns.map((turn) => (
+            turn.id === e.turn_id || canonicalTurnId(turn) === e.turn_id)
             ? { ...turn, detailLoading: false }
             : turn);
         });
       }
       return patch(state, sid, (rt) => {
         rt.turns = rt.turns.map((turn) => {
-          if (turn.id !== e.turn_id) return turn;
+          if (turn.id !== e.turn_id
+              && canonicalTurnId(turn) !== e.turn_id) return turn;
           return withLimitedTurnBlocks({
             ...turn,
             ...detailed,
@@ -1971,6 +2447,16 @@ function reduceEvent(
       });
     case "replay_start": {
       const needsAuthoritativeHistory = e.truncated || !!e.rebuild;
+      let historyRecovery = state.historyRecovery;
+      if (needsAuthoritativeHistory && state.focusedSid === e.sid
+          && !state.newChat && e.sid) {
+        historyRecovery = beginHistoryRecovery(
+          state.historyRecovery,
+          e.sid,
+          state.runtimes[e.sid] ?? createRuntime(),
+          e.generation,
+        );
+      }
       const next = patch(state, e.sid, (rt) => {
         switchControlGeneration(rt, e.generation);
         rt.replaying = true;
@@ -1984,6 +2470,8 @@ function reduceEvent(
           rt.hasMore = false;
           rt.oldestId = null;
           rt.historyInvalidated = true;
+          rt.pendingHistoryGeneration = e.generation ?? null;
+          rt.pendingHistoryCandidateBuildSeq = null;
           // A replay gap does not reveal which revision was missed. Accept the
           // next authoritative first page; an actual rollback marker replayed
           // inside this envelope will immediately replace this with its token.
@@ -2003,9 +2491,15 @@ function reduceEvent(
           rt.loading = true;
         }
       }, true);
-      return needsAuthoritativeHistory && next.artifact?.sid === e.sid
-        ? { ...next, artifact: null }
-        : next;
+      return {
+        ...next,
+        historyRecovery,
+        historyBrowse: needsAuthoritativeHistory
+            && next.historyBrowse?.sid === e.sid
+          ? null : next.historyBrowse,
+        artifact: needsAuthoritativeHistory && next.artifact?.sid === e.sid
+          ? null : next.artifact,
+      };
     }
     case "replay_end":
       return { ...patch(state, e.sid, (rt) => {

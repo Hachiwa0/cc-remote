@@ -303,6 +303,21 @@ async function requestOlderHistory(
   await dispatchTouchGesture(page, 60, repeat);
 }
 
+async function requestNewerHistory(
+  page: import("@playwright/test").Page,
+  projectName: string,
+  repeat = 1,
+): Promise<void> {
+  const viewport = page.locator(".thread");
+  if (projectName !== "webkit") {
+    for (let index = 0; index < repeat; index += 1) {
+      await viewport.dispatchEvent("wheel", { deltaY: 80 });
+    }
+    return;
+  }
+  await dispatchTouchGesture(page, -60, repeat);
+}
+
 test("prepend preserves the exact reading row through delayed row growth", async ({
   page,
 }, testInfo) => {
@@ -323,6 +338,99 @@ test("prepend preserves the exact reading row through delayed row growth", async
   const settled = await readingAnchor(page);
   expect(settled.id).toBe(before.id);
   expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
+});
+
+test("history page cache upgrades v1 and preserves pages in real IndexedDB", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html");
+  const result = await page.evaluate(async () => {
+    const modulePath = "/src/history-page-cache.ts";
+    const cacheModule = await import(modulePath);
+    const scope = {
+      machineId: "browser-machine",
+      engine: "codex",
+      space: "code",
+      sid: "browser-cache-session",
+      revision: "browser-cache-revision",
+    };
+    const pageKey = "v1-page";
+    const key = cacheModule.historyPageCachePageKey(scope, pageKey);
+    const scopeKey = cacheModule.historyPageCacheScopeKey(scope);
+    const sessionKey = cacheModule.historyPageCacheSessionKey(scope);
+    const legacyDb = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(cacheModule.HISTORY_PAGE_CACHE_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const store = request.result.createObjectStore("pages", {
+          keyPath: "key",
+        });
+        store.createIndex("scope", "scopeKey", { unique: false });
+        store.createIndex("session", "sessionKey", { unique: false });
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = legacyDb.transaction("pages", "readwrite");
+      transaction.objectStore("pages").put({
+        version: 1,
+        key,
+        scopeKey,
+        sessionKey,
+        ...scope,
+        pageKey,
+        page: {
+          pageKey,
+          turns: [{
+            id: "legacy-turn",
+            prompt: "legacy",
+            blocks: [],
+            done: true,
+          }],
+          hasOlder: false,
+          olderCursor: "legacy-turn",
+          hasNewer: false,
+          newerPageKey: null,
+          isLatest: false,
+        },
+        savedAt: 1,
+        byteSize: 256,
+      });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+    legacyDb.close();
+
+    const cache = new cacheModule.HistoryPageCache();
+    const upgraded = await cache.getPage(scope, pageKey);
+    const stored = await cache.putPage(scope, {
+      pageKey,
+      turns: [{
+        id: "new-turn",
+        prompt: "new",
+        blocks: [],
+        done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "legacy-turn",
+    });
+    const merged = await cache.getPage(scope, pageKey);
+    const invalidated = await cache.invalidateScope(scope);
+    const afterInvalidation = await cache.getPage(scope, pageKey);
+    return {
+      upgradedIds: upgraded?.turns.map((turn: { id: string }) => turn.id),
+      stored,
+      mergedIds: merged?.turns.map((turn: { id: string }) => turn.id),
+      invalidated,
+      afterInvalidation,
+    };
+  });
+  expect(result.upgradedIds).toEqual(["legacy-turn"]);
+  expect(result.stored.ok).toBe(true);
+  expect(result.mergedIds).toEqual(["legacy-turn", "new-turn"]);
+  expect(result.invalidated.ok).toBe(true);
+  expect(result.afterInvalidation).toBeNull();
 });
 
 test("a canonical image reference does not reserve a second hidden image row", async ({
@@ -791,6 +899,28 @@ test("a page that finishes under an active touch restores its retained boundary"
   expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
 });
 
+test("a cached-newer page that finishes under touch keeps its retained row", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  await page.goto("/tests/history-browser.html?deep-browse=1&delay=5");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await dispatchTouchPhase(page, "touchstart", 220);
+  await dispatchTouchPhase(page, "touchmove", 160);
+  await expect(page.getByTestId("newer-load-count")).toHaveText("1");
+  await expect(page.getByTestId("newest-turn-id")).toHaveText("m28");
+  await dispatchTouchPhase(page, "touchend", 160);
+
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+});
+
 test("movement after an attached page rebases the held touch boundary", async ({
   page,
 }, testInfo) => {
@@ -863,6 +993,26 @@ test("repeated prepends preserve each page boundary instead of jumping to the in
   }
 });
 
+test("the first runtime-to-browse page preserves its captured reading row", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?runtime-browse=1&delay=5&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await page.locator(".load-more-btn").dispatchEvent("click");
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+});
+
 test("one upward gesture starts at most one older-page request", async ({
   page,
 }, testInfo) => {
@@ -871,6 +1021,113 @@ test("one upward gesture starts at most one older-page request", async ({
   await viewport.evaluate((node) => { node.scrollTop = 0; });
   await requestOlderHistory(page, testInfo.project.name, 2);
   await expect(page.getByTestId("load-count")).toHaveText("1");
+});
+
+test("cached-newer append with head eviction preserves the reading row", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?deep-browse=1&delay=5&manual-growth=1");
+  const viewport = page.locator(".thread");
+  await expect(page.locator('[data-turn-id="m20"]')).toBeVisible();
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await requestNewerHistory(page, testInfo.project.name);
+  await expect(page.getByTestId("newer-load-count")).toHaveText("1");
+  await expect(page.getByTestId("newest-turn-id")).toHaveText("m28");
+  await expect(page.locator('[data-turn-id="m1"]')).toHaveCount(0);
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+
+  // A late image/Markdown measurement before the retained row must reuse the
+  // same transaction instead of introducing a second scroll writer.
+  await page.getByTestId("grow-row").click();
+  await expect(page.locator('[data-turn-id="m15"] p')).toHaveCount(28);
+  await waitForScrollIdle(page);
+  const settled = await readingAnchor(page);
+  expect(settled.id).toBe(before.id);
+  expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
+});
+
+test("one downward gesture starts at most one cached-newer page", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?deep-browse=1&delay=80");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await requestNewerHistory(page, testInfo.project.name, 2);
+  await expect(page.getByTestId("newer-load-count")).toHaveText("1");
+});
+
+test("repeated cached-newer pages keep the protected row through the final page", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?deep-browse=1&delay=5");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await waitForScrollIdle(page);
+  const expectedNewest = ["m28", "m36", "m40"];
+
+  for (let index = 0; index < expectedNewest.length; index += 1) {
+    const before = await readingAnchor(page);
+    await page.getByRole("button", { name: "加载更新的历史" })
+      .dispatchEvent("click");
+    await expect(page.getByTestId("newer-load-count"))
+      .toHaveText(String(index + 1));
+    await expect(page.getByTestId("newest-turn-id"))
+      .toHaveText(expectedNewest[index]);
+    await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+    await expect.poll(async () =>
+      Math.abs((await readingAnchor(page)).offset - before.offset),
+    ).toBeLessThan(2);
+    await page.waitForTimeout(80);
+  }
+  await expect(page.getByRole("button", {
+    name: "加载更新的历史",
+  })).toHaveCount(0);
+});
+
+test("browse live updates stay passive until the user returns to latest", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?deep-browse=1");
+  await expect(page.locator('[data-turn-id="m20"]')).toBeVisible();
+  await wheelUntilTurn(page, "m12", -1_200, testInfo.project.name);
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await page.getByTestId("append-turn").click();
+  await page.waitForTimeout(100);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+  await expect(page.locator('[data-turn-id="live-41"]')).toHaveCount(0);
+
+  await page.getByRole("button", { name: "回到最新" }).click();
+  await expect(page.locator('[data-turn-id="live-41"]')).toBeVisible();
+  await expect(page.getByRole("button", { name: "回到最新" })).toHaveCount(0);
+});
+
+test("a delayed cached-newer page cannot move another session", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?deep-browse=1&delay=350");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await requestNewerHistory(page, testInfo.project.name);
+  await page.getByTestId("switch-session").click();
+  await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+  await page.waitForTimeout(500);
+  await waitForScrollIdle(page);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+  await expect(page.locator('[data-turn-id="m28"]')).toHaveCount(0);
 });
 
 test("an empty final page removes the loader without moving the reading row", async ({
@@ -939,6 +1196,23 @@ test("same-session revision replacement resets to the latest row", async ({
   await expect(page.locator('[data-turn-id="m1"]')).toHaveCount(0);
   await expect(page.locator('[data-turn-id="r24"]')).toBeVisible();
   await expect(page.locator('[data-turn-id="r1"]')).toHaveCount(0);
+});
+
+test("replay recovery replacement preserves the current reading row", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?large=40&recovery-replace=1");
+  await expect(page.locator('[data-turn-id="m40"]')).toBeVisible();
+  await wheelUntilTurn(page, "m10", -2_000, testInfo.project.name);
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await page.getByTestId("replace-revision").click();
+  await expect(page.locator('[data-turn-id="m10"] p')).toHaveCount(4);
+  await waitForScrollIdle(page);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 });
 
 test("reversing direction while a page is pending preserves the reading row", async ({

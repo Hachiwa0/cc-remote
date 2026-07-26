@@ -43,7 +43,7 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexServiceTier, type CollaborationModeName,
   type DiffTheme, type Engine, type Space,
-  type SessionControl, sessionControlLocksInput } from "./protocol";
+  type SessionControl, type History, sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { parseGitDiff } from "./diff";
@@ -85,11 +85,35 @@ import {
 } from "./turn-notification";
 import {
   HistoryRequestCoordinator,
+  HistoryDetailRequestCoordinator,
   resolveHistoryCwdHint,
+  type HistoryBrowseRequestContext,
+  type HistoryDetailRequestContext,
 } from "./history-requests";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
 import { HistoryImageAssetCache } from "./history-image-assets";
+import {
+  displayHistoryProjection,
+  historyConfirmsRecovery,
+  historyConfirmsRuntimeRecovery,
+  historyNeedsConfirmationRequest,
+  isHistoryRecoveryPending,
+  isRuntimeHistoryRecoveryPending,
+} from "./history-recovery";
+import {
+  acceptsCachedNewerPage,
+  appendNewerPage,
+  canonicalTurnId,
+  prependOlderPage,
+  type HistoryBrowsePage,
+} from "./history-browse";
+import {
+  HistoryPageCache,
+  historyPageCacheScopeKey,
+  type HistoryPageCacheScope,
+  type HistoryPageCacheSessionScope,
+} from "./history-page-cache";
 import { ComposerDraftStore, composerDraftKey } from "./composer-drafts";
 import {
   acknowledgeCompletion,
@@ -110,6 +134,35 @@ const MACHINE_KEY = "cc_remote_machine";
 // reducer, and main thread before the current answer becomes usable.
 const HISTORY_INITIAL_PAGE = 4;
 const HISTORY_MORE_PAGE = 12;
+// A source-drift preview already starts one wrapper-owned exact rebuild. Keep
+// one slow client watchdog for a transient background failure, but do not start
+// another multi-gigabyte scan in parallel on the ordinary 250ms retry path.
+const HISTORY_PROVISIONAL_WATCHDOG_MS = 60_000;
+const HISTORY_LATEST_PAGE_KEY = "latest";
+
+function historyPageKey(before: string): string {
+  return `before:${before}`;
+}
+
+function summaryHistoryTurns(history: History): Turn[] | null {
+  if (history.detail !== "summary" || !Array.isArray(history.turns)) {
+    return null;
+  }
+  return history.turns.map((turn) => ({
+    ...turn,
+    blocks: turn.blocks as Turn["blocks"],
+    forkPointId: turn.forkPointId ?? undefined,
+    checkpointId: turn.checkpointId ?? undefined,
+    interrupted: turn.interrupted ?? undefined,
+    error: turn.error ?? undefined,
+    images: turn.images ?? undefined,
+    imageRefs: turn.imageRefs ?? undefined,
+    files: turn.files ?? undefined,
+    ts: turn.ts ?? undefined,
+    doneTs: turn.doneTs ?? undefined,
+    durationMs: turn.durationMs ?? undefined,
+  }));
+}
 
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
@@ -213,6 +266,19 @@ export default function App() {
   rightViewRef.current = rightView;
   const wsRef = useRef<RelayWs | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
+  const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
+    (context) => {
+      dispatch({ type: "history_detail_cancelled", context });
+    },
+  ));
+  const clearHistoryDetailRequests = useCallback(() => {
+    for (const context of historyDetailRequestsRef.current.clear()) {
+      dispatch({ type: "history_detail_cancelled", context });
+    }
+  }, []);
+  const historyPageCacheRef = useRef(new HistoryPageCache());
+  const historyPageScopesRef =
+    useRef(new Map<string, HistoryPageCacheScope>());
   const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
   const createRequestsRef = useRef<Map<string, {
@@ -245,6 +311,8 @@ export default function App() {
   // sid -> exact revision required by a rollback marker. null means a replay
   // gap hid the revision, so the next authoritative first page may satisfy it.
   const historyInvalidationsRef = useRef<Map<string, string | null>>(new Map());
+  const historyInvalidationGenerationsRef =
+    useRef<Map<string, string | null>>(new Map());
   const historyCacheEpochRef = useRef<Map<string, number>>(new Map());
   const previousMachineRef = useRef(machineId);
   const notificationListRequestRef = useRef<string | null>(null);
@@ -280,6 +348,7 @@ export default function App() {
     limit: number,
     generation?: string | null,
     revision?: string | null,
+    browse?: HistoryBrowseRequestContext,
   ) => {
     const ws = wsRef.current;
     if (!ws) return false;
@@ -287,6 +356,7 @@ export default function App() {
       sid, before, limit,
       generation: generation ?? ws.generationFor(sid),
       revision,
+      browse,
     }, () => ws.sendGetHistory(
       sid,
       before,
@@ -334,8 +404,11 @@ export default function App() {
     notificationListRequestRef.current = null;
     sessionActivityPendingRef.current.clear();
     historyRequestsRef.current.clear();
+    clearHistoryDetailRequests();
+    historyPageScopesRef.current.clear();
     prefetchedSurfacesRef.current.clear();
     historyInvalidationsRef.current.clear();
+    historyInvalidationGenerationsRef.current.clear();
     historyCacheEpochRef.current.clear();
     inlineImageAssetsRef.current.clear();
     historyImageAssetsRef.current.clear();
@@ -350,7 +423,8 @@ export default function App() {
       pendingNotificationErrorRef.current = null;
     }
     void import("./cache").then((module) => module.clearCache());
-  }, [machineId]);
+    void historyPageCacheRef.current.clear();
+  }, [clearHistoryDetailRequests, machineId]);
 
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
@@ -369,6 +443,8 @@ export default function App() {
   const activeScopeKey = sessionScopeKey(machineId, engine, space);
   const currentCwd = state.cwdByScope[activeScopeKey] ?? "";
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
+  const historyView = displayHistoryProjection(
+    state.historyRecovery, focusedSid, rt, state.historyBrowse);
   const focusedEngine = (state.sessions.find(
     (session) => session.session_id === focusedSid)?.engine ?? engine) as "claude" | "codex";
   const focusedComposerDraftKey = composerDraftKey(
@@ -597,6 +673,140 @@ export default function App() {
   engineRef.current = engine;
   const spaceRef = useRef(space);
   spaceRef.current = space;
+  const historyPageScopeFor = useCallback((
+    sid: string,
+    revision: string,
+    fallbackEngine: Engine = engineRef.current,
+    fallbackSpace: Space = spaceRef.current,
+  ): HistoryPageCacheScope => {
+    const listed = stateRef.current.sessions.find(
+      (session) => session.session_id === sid)
+      ?? Object.values(historySessionListsRef.current)
+        .flat()
+        .find((session) => session.session_id === sid);
+    const scope: HistoryPageCacheScope = {
+      machineId,
+      engine: listed?.engine === "codex" || listed?.engine === "claude"
+        ? listed.engine : fallbackEngine,
+      space: listed?.space === "work" || listed?.space === "code"
+        ? listed.space : fallbackSpace,
+      sid,
+      revision,
+    };
+    historyPageScopesRef.current.set(historyPageCacheScopeKey(scope), scope);
+    return scope;
+  }, [machineId]);
+  const invalidateHistoryPageScopes = useCallback((sid: string) => {
+    const scopes = new Map<string, HistoryPageCacheSessionScope>();
+    for (const scope of historyPageScopesRef.current.values()) {
+      if (scope.machineId !== machineId || scope.sid !== sid) continue;
+      const sessionScope: HistoryPageCacheSessionScope = {
+        machineId: scope.machineId,
+        engine: scope.engine,
+        space: scope.space,
+        sid: scope.sid,
+      };
+      scopes.set(JSON.stringify(sessionScope), sessionScope);
+    }
+    for (const [surfaceKey, sessions] of Object.entries(
+      historySessionListsRef.current)) {
+      if (!sessions.some((session) => session.session_id === sid)) continue;
+      const [listedSpace, listedEngine] = surfaceKey.split(":");
+      if ((listedEngine !== "claude" && listedEngine !== "codex")
+          || (listedSpace !== "code" && listedSpace !== "work")) continue;
+      const sessionScope: HistoryPageCacheSessionScope = {
+        machineId,
+        engine: listedEngine,
+        space: listedSpace,
+        sid,
+      };
+      scopes.set(JSON.stringify(sessionScope), sessionScope);
+    }
+    if (stateRef.current.focusedSid === sid) {
+      const sessionScope: HistoryPageCacheSessionScope = {
+        machineId,
+        engine: engineRef.current,
+        space: spaceRef.current,
+        sid,
+      };
+      scopes.set(JSON.stringify(sessionScope), sessionScope);
+    }
+    for (const scope of scopes.values()) {
+      void historyPageCacheRef.current.invalidateScope(scope);
+    }
+    for (const [key, scope] of historyPageScopesRef.current) {
+      if (scope.machineId === machineId && scope.sid === sid) {
+        historyPageScopesRef.current.delete(key);
+      }
+    }
+  }, [machineId]);
+  const installBrowseHistoryPage = useCallback((
+    history: History,
+    waiters: readonly HistoryBrowseRequestContext[],
+  ) => {
+    const turns = summaryHistoryTurns(history);
+    if (!history.before || !turns) return;
+    for (const waiter of waiters) {
+      const browse = stateRef.current.historyBrowse;
+      if (!browse
+          || stateRef.current.focusedSid !== history.session_id
+          || browse.sid !== history.session_id
+          || browse.scopeKey !== waiter.scopeKey
+          || browse.revision !== history.revision
+          || browse.viewId !== waiter.viewId
+          || browse.windowEpoch !== waiter.windowEpoch
+          || browse.olderCursor !== waiter.pendingBefore
+          || waiter.pendingBefore !== history.before
+          || (history.generation != null
+            && browse.generation !== history.generation)) continue;
+      const scope = historyPageScopesRef.current.get(waiter.scopeKey);
+      if (!scope) continue;
+      const page: HistoryBrowsePage = {
+        pageKey: historyPageKey(history.before),
+        turns,
+        hasOlder: history.has_more,
+        olderCursor: history.oldest_id
+          ?? (turns[0] ? canonicalTurnId(turns[0]) : null),
+        hasNewer: !!waiter.sourcePageKey,
+        newerPageKey: waiter.sourcePageKey,
+        isLatest: false,
+      };
+      const mutation = prependOlderPage(browse, page, {
+        expectedScopeKey: waiter.scopeKey,
+        expectedViewId: waiter.viewId,
+        expectedWindowEpoch: waiter.windowEpoch,
+        expectedOlderCursor: waiter.pendingBefore,
+        protectedTurnIds: waiter.anchorTurnId
+          ? [waiter.anchorTurnId] : undefined,
+      });
+      if (mutation.projection === browse) continue;
+      // Paint the received page immediately. Page-cache writes are best-effort
+      // acceleration and must never hold the visible history response behind
+      // IndexedDB quota/LRU work. A later cache miss keeps this readable window
+      // mounted and degrades the downward affordance to "return to latest".
+      void historyPageCacheRef.current.putPage(scope, page);
+      for (const evicted of mutation.evictedPages) {
+        void historyPageCacheRef.current.putPage(scope, evicted);
+      }
+      dispatch({
+        type: "install_history_browse_page",
+        sid: history.session_id,
+        scopeKey: waiter.scopeKey,
+        revision: history.revision,
+        generation: history.generation,
+        viewId: waiter.viewId,
+        windowEpoch: waiter.windowEpoch,
+        before: waiter.pendingBefore,
+        page,
+        protectedTurnIds: waiter.anchorTurnId
+          ? [waiter.anchorTurnId] : undefined,
+        prepared: {
+          from: browse,
+          to: mutation.projection,
+        },
+      });
+    }
+  }, []);
   useEffect(() => {
     document.documentElement.setAttribute("data-engine", engine);
     localStorage.setItem(ENGINE_KEY, engine);
@@ -608,6 +818,14 @@ export default function App() {
     document.documentElement.setAttribute("data-space", space);
     localStorage.setItem(SPACE_KEY, space);
   }, [space]);
+  useEffect(() => {
+    // TurnDetail has no request id. Any view navigation revokes the frozen
+    // runtime/browse target so a delayed response cannot cross sessions.
+    clearHistoryDetailRequests();
+  }, [
+    clearHistoryDetailRequests,
+    machineId, engine, space, focusedSid, state.newChat,
+  ]);
   const rememberSurfaceFocus = useCallback((
     currentEngine: Engine,
     currentSpace: Space,
@@ -876,6 +1094,8 @@ export default function App() {
           }
           if (msg.type === "history_invalidated") {
             const sid = msg.session_id;
+            clearHistoryDetailRequests();
+            invalidateHistoryPageScopes(sid);
             if (inlineImageAssetsRef.current.dropSession(sid)) {
               bumpInlineImageRevision();
             }
@@ -884,6 +1104,9 @@ export default function App() {
             }
             if (historyInvalidationsRef.current.get(sid) !== msg.revision) {
               historyInvalidationsRef.current.set(sid, msg.revision);
+              if (!historyInvalidationGenerationsRef.current.has(sid)) {
+                historyInvalidationGenerationsRef.current.set(sid, null);
+              }
               historyCacheEpochRef.current.set(
                 sid, (historyCacheEpochRef.current.get(sid) ?? 0) + 1);
               void import("./cache").then((module) =>
@@ -918,6 +1141,10 @@ export default function App() {
           } else if (msg.type === "replay_start" && msg.sid
               && (msg.truncated || msg.rebuild)) {
             const sid = msg.sid;
+            clearHistoryDetailRequests();
+            invalidateHistoryPageScopes(sid);
+            historyInvalidationGenerationsRef.current.set(
+              sid, msg.generation ?? null);
             // If a marker is still retained inside this replay it will follow
             // ReplayStart and replace null with its exact revision.
             if (!historyInvalidationsRef.current.has(sid)) {
@@ -940,52 +1167,181 @@ export default function App() {
           } else if (msg.type === "history" && msg.authoritative !== false && !msg.before
               && historyInvalidationsRef.current.has(msg.session_id)) {
             const expected = historyInvalidationsRef.current.get(msg.session_id);
-            if (expected === null || expected === msg.revision) {
+            const expectedGeneration =
+              historyInvalidationGenerationsRef.current.get(msg.session_id) ?? null;
+            const recovery = stateRef.current.historyRecovery;
+            const currentRuntime =
+              stateRef.current.runtimes[msg.session_id];
+            const displayRecoveryMatches = !isHistoryRecoveryPending(
+              recovery, msg.session_id)
+              || historyConfirmsRecovery(recovery, msg);
+            const runtimeRecoveryMatches =
+              !isRuntimeHistoryRecoveryPending(currentRuntime)
+              || historyConfirmsRuntimeRecovery(currentRuntime, msg);
+            const sameBuildGeneration = msg.generation != null
+              ? currentRuntime?.historyGeneration === msg.generation
+              : currentRuntime?.historyGeneration == null
+                && currentRuntime?.historyRevision === msg.revision;
+            const buildIsCurrent = msg.build_seq == null
+              || !sameBuildGeneration
+              || msg.build_seq >= (currentRuntime?.historyBuildSeq ?? 0);
+            if ((expected === null || expected === msg.revision)
+                && (expectedGeneration === null
+                  || expectedGeneration === msg.generation)
+                && displayRecoveryMatches
+                && runtimeRecoveryMatches
+                && buildIsCurrent) {
               // A late first page from an older revision must not re-enable the
               // cache behind a newer destructive marker.
               historyInvalidationsRef.current.delete(msg.session_id);
+              historyInvalidationGenerationsRef.current.delete(msg.session_id);
               void import("./cache").then((module) =>
                 module.allowSessionCache(msg.session_id));
             }
           }
           if (msg.type === "history") {
-            historyRequestsRef.current.complete(msg);
+            const browseWaiters =
+              historyRequestsRef.current.complete(msg);
             const retryKey = ["history", msg.session_id, msg.before ?? "",
               msg.revision ?? ""].join("\u0000");
+            let retryScheduled = false;
             if (msg.authoritative === false) {
-              recoverableReads.retry(retryKey, () => {
+              const retryDelay = msg.error == null && !msg.before
+                ? HISTORY_PROVISIONAL_WATCHDOG_MS
+                : undefined;
+              retryScheduled = recoverableReads.retry(retryKey, () => {
                 if (cancelled) return;
                 if (stateRef.current.focusedSid !== msg.session_id) return;
-                requestHistory(
-                  msg.session_id, msg.before,
-                  msg.before ? HISTORY_MORE_PAGE : HISTORY_INITIAL_PAGE,
-                  msg.generation, msg.revision,
-                );
-              });
+                if (msg.before) {
+                  for (const browse of browseWaiters) {
+                    requestHistory(
+                      msg.session_id, msg.before, HISTORY_MORE_PAGE,
+                      msg.generation, msg.revision, browse);
+                  }
+                } else {
+                  requestHistory(
+                    msg.session_id, undefined, HISTORY_INITIAL_PAGE,
+                    msg.generation, msg.revision);
+                }
+              }, retryDelay);
             } else {
               recoverableReads.complete(retryKey);
             }
+            if (msg.before) {
+              if (msg.authoritative !== false) {
+                void installBrowseHistoryPage(msg, browseWaiters);
+              } else if (!retryScheduled) {
+                for (const browse of browseWaiters) {
+                  dispatch({
+                    type: "history_browse_page_failed",
+                    sid: msg.session_id,
+                    scopeKey: browse.scopeKey,
+                    revision: msg.revision,
+                    generation: msg.generation,
+                    viewId: browse.viewId,
+                    windowEpoch: browse.windowEpoch,
+                    before: browse.pendingBefore,
+                  });
+                }
+              }
+              // History.before is display-only and requester-correlated. It
+              // must never fall through to the generic runtime reducer.
+              return;
+            }
+            const needsRecoveryConfirmation =
+              historyNeedsConfirmationRequest(
+                stateRef.current.runtimes[msg.session_id], msg);
+            if (needsRecoveryConfirmation
+                && stateRef.current.focusedSid === msg.session_id
+                && msg.generation) {
+              requestHistory(
+                msg.session_id, undefined, HISTORY_INITIAL_PAGE,
+                msg.generation);
+            }
           }
           if (msg.type === "turn_detail") {
-            const retryKey = ["detail", msg.session_id, msg.turn_id].join("\u0000");
+            const detailTarget =
+              historyDetailRequestsRef.current.complete(msg);
+            if (!detailTarget) return;
+            const retryKey = [
+              "detail", msg.session_id, msg.revision, msg.turn_id,
+            ].join("\u0000");
             if (msg.authoritative === false) {
+              if (detailTarget.target === "browse") {
+                dispatch({
+                  type: "history_browse_detail",
+                  sid: detailTarget.sid,
+                  scopeKey: detailTarget.scopeKey,
+                  revision: detailTarget.revision,
+                  viewId: detailTarget.viewId,
+                  windowEpoch: detailTarget.windowEpoch,
+                  turnId: detailTarget.turnId,
+                  events: [],
+                });
+              } else {
+                dispatch({ type: "event", event: msg, ownership });
+              }
               recoverableReads.retry(retryKey, () => {
                 if (cancelled) return;
                 if (stateRef.current.focusedSid !== msg.session_id) return;
-                const current = stateRef.current.runtimes[msg.session_id];
-                const turn = current?.turns.find((item) => item.id === msg.turn_id);
-                if (!turn || turn.detailLoaded) return;
+                const current = stateRef.current;
+                if (detailTarget.target === "browse") {
+                  const browse = current.historyBrowse;
+                  if (!browse
+                      || browse.scopeKey !== detailTarget.scopeKey
+                      || browse.viewId !== detailTarget.viewId
+                      || browse.revision !== detailTarget.revision
+                      || !browse.turns.some((turn) =>
+                        canonicalTurnId(turn) === detailTarget.turnId
+                        || turn.id === detailTarget.turnId)) return;
+                } else {
+                  const runtime = current.runtimes[msg.session_id];
+                  const turn = runtime?.turns.find(
+                    (item) => canonicalTurnId(item) === msg.turn_id
+                      || item.id === msg.turn_id);
+                  if (!turn || turn.detailLoaded
+                      || runtime.historyRevision !== detailTarget.revision) return;
+                }
+                if (!historyDetailRequestsRef.current.begin(detailTarget)) return;
                 const sent = ws.sendGetTurnDetail(
-                  msg.session_id, msg.turn_id,
-                  current.historyRevision ?? msg.revision,
-                );
-                if (sent) dispatch({
-                  type: "turn_detail_requested", sid: msg.session_id,
-                  turnId: msg.turn_id,
-                });
+                  msg.session_id, msg.turn_id, detailTarget.revision);
+                if (!sent) {
+                  historyDetailRequestsRef.current.cancel(detailTarget);
+                  return;
+                }
+                if (detailTarget.target === "browse") {
+                  dispatch({
+                    type: "history_browse_detail_requested",
+                    sid: detailTarget.sid,
+                    scopeKey: detailTarget.scopeKey,
+                    revision: detailTarget.revision,
+                    viewId: detailTarget.viewId,
+                    windowEpoch: detailTarget.windowEpoch,
+                    turnId: detailTarget.turnId,
+                  });
+                } else {
+                  dispatch({
+                    type: "turn_detail_requested", sid: detailTarget.sid,
+                    turnId: detailTarget.turnId,
+                  });
+                }
               });
+              return;
             } else {
               recoverableReads.complete(retryKey);
+            }
+            if (detailTarget.target === "browse") {
+              dispatch({
+                type: "history_browse_detail",
+                sid: detailTarget.sid,
+                scopeKey: detailTarget.scopeKey,
+                revision: detailTarget.revision,
+                viewId: detailTarget.viewId,
+                windowEpoch: detailTarget.windowEpoch,
+                turnId: detailTarget.turnId,
+                events: msg.events,
+              });
+              return;
             }
           }
           if (msg.type === "rollback_result" && msg.files === "succeeded"
@@ -1354,6 +1710,7 @@ export default function App() {
           if (s === "connected") {
             recoverableReads.clear();
             historyRequestsRef.current.beginConnection();
+            clearHistoryDetailRequests();
             notificationListRequestRef.current = null;
             bumpNotificationListRevision();
             ws.sendListSessions(engineRef.current, spaceRef.current);
@@ -1380,6 +1737,7 @@ export default function App() {
           btwRequestParentsRef.current.clear();
           discardedBtwSidsRef.current.clear();
           historyInvalidationsRef.current.clear();
+          historyInvalidationGenerationsRef.current.clear();
           historyCacheEpochRef.current.clear();
           historySessionListsRef.current = {};
           inlineImageAssetsRef.current.clear();
@@ -1387,6 +1745,9 @@ export default function App() {
           bumpInlineImageRevision();
           bumpHistoryImageRevision();
           historyRequestsRef.current.clear();
+          clearHistoryDetailRequests();
+          historyPageScopesRef.current.clear();
+          void historyPageCacheRef.current.clear();
           setBtwOpeningByParentSid({});
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
@@ -1412,6 +1773,7 @@ export default function App() {
           dispatch({ type: "prune_runtimes", protectedSids });
         },
         onWrapperGenerationChanged: () => {
+          clearHistoryDetailRequests();
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
           bumpInlineImageRevision();
@@ -1454,10 +1816,19 @@ export default function App() {
       wsRef.current?.stop();
       wsRef.current = null;
       historyRequests.clear();
+      clearHistoryDetailRequests();
       recoverableReads.clear();
       draining.clear();
     };
-  }, [authed, machineId, requestHistory, setBtwOpeningFor]);
+  }, [
+    authed,
+    clearHistoryDetailRequests,
+    installBrowseHistoryPage,
+    invalidateHistoryPageScopes,
+    machineId,
+    requestHistory,
+    setBtwOpeningFor,
+  ]);
 
   // Land on the preferred/recent session only after an accepted list for the
   // active engine+space arrives. Background snapshots never pick focus.
@@ -1560,7 +1931,8 @@ export default function App() {
     const sid = rt.ccSessionId;
     const revision = rt.historyRevision;
     if (!sid || !revision
-        || historyInvalidationsRef.current.has(sid)) return;
+        || historyInvalidationsRef.current.has(sid)
+        || isHistoryRecoveryPending(state.historyRecovery, sid)) return;
     import("./cache").then(({ saveSession }) => {
       const live = wsRef.current?.lastSeqFor(sid) || 0;
       saveSession(
@@ -1569,20 +1941,30 @@ export default function App() {
         rt.control,
       );
     });
-  }, [focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control]);
+  }, [
+    focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control,
+    state.historyRecovery,
+  ]);
 
-  // Paint IndexedDB before starting the newest-page network read.  A browser
-  // can otherwise receive a very fast summary response in the same task that
-  // opened the session, leaving no frame in which the local projection is
-  // visible.  The next animation frame is the cache-first boundary; the wrapper
-  // then validates/replaces it in the background. A 6s fallback clears the
-  // spinner only when both cache and wrapper stay silent.
+  // Race the small authoritative newest page with IndexedDB. A healthy local
+  // projection still paints immediately, but a slow/blocked IDB open must never
+  // delay the wrapper's four-turn response. hydrate_cache only fills an empty
+  // runtime, so whichever source wins cannot clobber the other. A 6s fallback
+  // clears the spinner only when both cache and wrapper stay silent.
   useEffect(() => {
     const sid = focusedSid;
     if (!sid) return;
     let cancelled = false;
     let requestFrame: number | null = null;
     const cacheEpoch = historyCacheEpochRef.current.get(sid) ?? 0;
+    if (state.connState === "connected") {
+      requestFrame = window.requestAnimationFrame(() => {
+        requestFrame = null;
+        if (!cancelled) {
+          requestHistory(sid, undefined, HISTORY_INITIAL_PAGE);
+        }
+      });
+    }
     void import("./cache").then(({ loadSession }) => loadSession(sid)).then((cached) => {
       const valid = !cancelled
           && cacheEpoch === (historyCacheEpochRef.current.get(sid) ?? 0)
@@ -1598,14 +1980,6 @@ export default function App() {
           revision: cached.revision,
           generation: cached.generation ?? cached.control?.generation,
           control: cached.control,
-        });
-      }
-      if (!cancelled && state.connState === "connected") {
-        requestFrame = window.requestAnimationFrame(() => {
-          requestFrame = null;
-          if (!cancelled) {
-            requestHistory(sid, undefined, HISTORY_INITIAL_PAGE);
-          }
         });
       }
     });
@@ -1713,6 +2087,207 @@ export default function App() {
     dispatch({ type: "query_sent", sid: focusedSid, prompt, msg_id, images, files,
       ts: activityMs });
     return true;
+  };
+  const loadOlderHistoryPage = (
+    anchorTurnId?: string,
+  ): boolean | { accepted: true; viewId: string } => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime?.historyRevision || !wsRef.current
+        || runtime.historyInvalidated
+        || isHistoryRecoveryPending(current.historyRecovery, sid)) return false;
+    const existing = current.historyBrowse?.sid === sid
+      ? current.historyBrowse : null;
+    if (existing) {
+      if (!existing.hasOlder || !existing.olderCursor
+          || !historyPageScopesRef.current.has(existing.scopeKey)) return false;
+      const context: HistoryBrowseRequestContext = {
+        scopeKey: existing.scopeKey,
+        viewId: existing.viewId,
+        windowEpoch: existing.windowEpoch,
+        pendingBefore: existing.olderCursor,
+        sourcePageKey: existing.oldestPageKey,
+        anchorTurnId: anchorTurnId ?? null,
+      };
+      return requestHistory(
+        sid, existing.olderCursor, HISTORY_MORE_PAGE,
+        existing.generation, existing.revision, context);
+    }
+    if (!runtime.hasMore || !runtime.oldestId) return false;
+    const scope = historyPageScopeFor(
+      sid, runtime.historyRevision, focusedEngine, space);
+    const scopeKey = historyPageCacheScopeKey(scope);
+    const viewId = uuid();
+    const basePageKey = `${HISTORY_LATEST_PAGE_KEY}:${viewId}`;
+    const browseGeneration = runtime.historyGeneration
+      ?? wsRef.current.generationFor(sid)
+      ?? null;
+    const basePage: HistoryBrowsePage = {
+      pageKey: basePageKey,
+      turns: runtime.turns,
+      hasOlder: true,
+      olderCursor: runtime.oldestId,
+      hasNewer: false,
+      newerPageKey: null,
+      isLatest: true,
+    };
+    void historyPageCacheRef.current.putPage(scope, basePage);
+    dispatch({
+      type: "begin_history_browse",
+      sid,
+      scopeKey,
+      revision: runtime.historyRevision,
+      generation: browseGeneration,
+      viewId,
+      basePageKey,
+    });
+    const accepted = requestHistory(
+      sid, runtime.oldestId, HISTORY_MORE_PAGE,
+      browseGeneration, runtime.historyRevision, {
+        scopeKey,
+        viewId,
+        windowEpoch: 0,
+        pendingBefore: runtime.oldestId,
+        sourcePageKey: basePageKey,
+        anchorTurnId: anchorTurnId ?? null,
+      });
+    return accepted ? { accepted: true, viewId } : false;
+  };
+  const loadNewerHistoryPage = (anchorTurnId?: string): boolean => {
+    const browse = stateRef.current.historyBrowse;
+    if (!browse || !browse.hasNewer || !browse.newerPageKey) return false;
+    const scope = historyPageScopesRef.current.get(browse.scopeKey);
+    if (!scope) return false;
+    const frozen = {
+      sid: browse.sid,
+      scopeKey: browse.scopeKey,
+      revision: browse.revision,
+      generation: browse.generation,
+      viewId: browse.viewId,
+      windowEpoch: browse.windowEpoch,
+      pageKey: browse.newerPageKey,
+      anchorTurnId: anchorTurnId ?? null,
+    };
+    void (async () => {
+      const page = await historyPageCacheRef.current.getPage(
+        scope, frozen.pageKey);
+      const currentState = stateRef.current;
+      const current = currentState.historyBrowse;
+      if (currentState.focusedSid !== frozen.sid
+          || !current
+          || !acceptsCachedNewerPage(current, frozen)) return;
+      if (page?.isLatest && current.latestDirty) {
+        dispatch({
+          type: "history_browse_newer_settled",
+          sid: frozen.sid,
+          scopeKey: frozen.scopeKey,
+          revision: frozen.revision,
+          generation: frozen.generation,
+          viewId: frozen.viewId,
+          windowEpoch: frozen.windowEpoch,
+          pageKey: frozen.pageKey,
+        });
+        return;
+      }
+      if (!page) {
+        dispatch({
+          type: "history_browse_newer_unavailable",
+          sid: frozen.sid,
+          scopeKey: frozen.scopeKey,
+          revision: frozen.revision,
+          generation: frozen.generation,
+          viewId: frozen.viewId,
+          windowEpoch: frozen.windowEpoch,
+        });
+        return;
+      }
+      const mutation = appendNewerPage(current, page, {
+        expectedScopeKey: frozen.scopeKey,
+        expectedViewId: frozen.viewId,
+        expectedWindowEpoch: frozen.windowEpoch,
+        expectedNewerPageKey: frozen.pageKey,
+        protectedTurnIds: frozen.anchorTurnId
+          ? [frozen.anchorTurnId] : undefined,
+      });
+      if (mutation.projection === current) return;
+      for (const evicted of mutation.evictedPages) {
+        void historyPageCacheRef.current.putPage(scope, evicted);
+      }
+      dispatch({
+        type: "install_history_browse_newer",
+        sid: frozen.sid,
+        scopeKey: frozen.scopeKey,
+        revision: frozen.revision,
+        generation: frozen.generation,
+        viewId: frozen.viewId,
+        windowEpoch: frozen.windowEpoch,
+        page,
+        protectedTurnIds: frozen.anchorTurnId
+          ? [frozen.anchorTurnId] : undefined,
+        prepared: {
+          from: current,
+          to: mutation.projection,
+        },
+      });
+    })();
+    return true;
+  };
+  const returnToLatestHistory = () => {
+    const sid = stateRef.current.historyBrowse?.sid;
+    if (sid) dispatch({ type: "return_to_latest", sid });
+  };
+  const loadHistoryTurnDetail = (displayTurnId: string) => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime?.historyRevision) return;
+    const browse = current.historyBrowse?.sid === sid
+      ? current.historyBrowse : null;
+    const displayed = (browse?.turns ?? runtime.turns).find(
+      (turn) => turn.id === displayTurnId
+        || canonicalTurnId(turn) === displayTurnId);
+    if (!displayed) return;
+    const turnId = canonicalTurnId(displayed);
+    const scope = historyPageScopeFor(
+      sid, runtime.historyRevision, focusedEngine, space);
+    const context: HistoryDetailRequestContext = browse
+      ? {
+          target: "browse",
+          scopeKey: browse.scopeKey,
+          sid,
+          revision: browse.revision,
+          turnId,
+          viewId: browse.viewId,
+          windowEpoch: browse.windowEpoch,
+        }
+      : {
+          target: "runtime",
+          scopeKey: historyPageCacheScopeKey(scope),
+          sid,
+          revision: runtime.historyRevision,
+          turnId,
+        };
+    if (!historyDetailRequestsRef.current.begin(context)) return;
+    const sent = wsRef.current?.sendGetTurnDetail(
+      sid, turnId, context.revision) ?? false;
+    if (!sent) {
+      historyDetailRequestsRef.current.cancel(context);
+      return;
+    }
+    if (context.target === "browse") {
+      dispatch({
+        type: "history_browse_detail_requested",
+        sid,
+        scopeKey: context.scopeKey,
+        revision: context.revision,
+        viewId: context.viewId,
+        windowEpoch: context.windowEpoch,
+        turnId,
+      });
+    } else {
+      dispatch({ type: "turn_detail_requested", sid, turnId });
+    }
   };
   // One command creates the session and starts its first query atomically. The
   // wrapper targets the new temp-keyed ctx directly; no later focus event is used
@@ -2001,6 +2576,7 @@ export default function App() {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       await import("./cache").then((module) => module.clearCache());
+      await historyPageCacheRef.current.clear();
       wsRef.current?.stop();
       pendingCreateRef.current = null;
       createRequestsRef.current.clear();
@@ -2012,7 +2588,11 @@ export default function App() {
       btwRequestParentsRef.current.clear();
       discardedBtwSidsRef.current.clear();
       historyInvalidationsRef.current.clear();
+      historyInvalidationGenerationsRef.current.clear();
       historyCacheEpochRef.current.clear();
+      historyRequestsRef.current.clear();
+      clearHistoryDetailRequests();
+      historyPageScopesRef.current.clear();
       composerDraftsRef.current.clear();
       btwDraftsRef.current.clear();
       setBtwSendModeBySid({});
@@ -2112,6 +2692,8 @@ export default function App() {
           composerDraftsRef.current.delete(composerDraftKey(
             machineId, target.space, target.engine, id,
           ));
+          invalidateHistoryPageScopes(id);
+          if (focusedSid === id) clearHistoryDetailRequests();
           if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
           wsRef.current?.sendDeleteSession(id, engine, space);
         }}
@@ -2167,9 +2749,11 @@ export default function App() {
           />
         </header>
 
-        <ReconnectBanner banner={state.banner} replaying={rt.replaying}
+        <ReconnectBanner banner={state.banner}
+          replaying={rt.replaying || historyView.recovering}
           truncated={rt.truncated}
-          busy={state.connState !== "connected" || !state.wrapperOnline || rt.replaying}
+          busy={state.connState !== "connected" || !state.wrapperOnline
+            || rt.replaying || historyView.recovering}
           onDismiss={dismissBanner} />
         <NoticeStack notices={rt.notices}
           onDismiss={(noticeId) => {
@@ -2189,37 +2773,45 @@ export default function App() {
             onSend={sendFirstMessage} />
         ) : (
           <>
-            <ChatView sid={focusedSid} turns={rt.turns} loading={!!rt.loading}
+            <ChatView sid={focusedSid} turns={historyView.turns}
+              loading={!!rt.loading}
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
-              hasMore={!!rt.hasMore}
+              hasMore={historyView.hasMore}
               historyRevision={rt.historyRevision}
-              historyCursor={rt.oldestId}
-              onLoadMore={() => focusedSid ? requestHistory(
-                focusedSid, rt.oldestId, HISTORY_MORE_PAGE) : false}
-              onLoadDetail={(turnId) => {
-                if (!focusedSid) return;
-                const sent = wsRef.current?.sendGetTurnDetail(
-                  focusedSid, turnId, rt.historyRevision) ?? false;
-                if (sent) dispatch({
-                  type: "turn_detail_requested", sid: focusedSid, turnId,
-                });
-              }}
-              onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff}
-              onOpenTurnDiff={openTurnDiff}
-              onPreviewMarkdown={previewMarkdown}
-              onOpenFile={previewFile}
-              onOpenArtifacts={() => {
+              historyViewRevision={historyView.viewRevision}
+              historyViewId={historyView.viewId}
+              historyWindowEpoch={historyView.windowEpoch}
+              historyCursor={historyView.oldestId}
+              browseMode={historyView.browsing}
+              hasNewer={historyView.hasNewer}
+              onLoadMore={loadOlderHistoryPage}
+              onLoadNewer={loadNewerHistoryPage}
+              onReturnLatest={returnToLatestHistory}
+              onLoadDetail={historyView.recovering
+                ? undefined : loadHistoryTurnDetail}
+              onEdit={historyView.recovering
+                ? undefined : (prompt) => setEditPrompt(prompt)}
+              onGetDiff={historyView.recovering ? undefined : getDiff}
+              onOpenTurnDiff={historyView.recovering
+                ? undefined : openTurnDiff}
+              onPreviewMarkdown={historyView.recovering
+                ? undefined : previewMarkdown}
+              onOpenFile={historyView.recovering ? undefined : previewFile}
+              onOpenArtifacts={historyView.recovering ? undefined : () => {
                 if (focusedSid) {
                   wsRef.current?.sendGetWorkArtifacts(focusedEngine, focusedSid);
                 }
                 setWorkArtifactsOpen(true);
               }}
               imageAssets={inlineImageAssets}
-              onLoadImage={loadFocusedMessageImage}
+              onLoadImage={historyView.recovering
+                ? undefined : loadFocusedMessageImage}
               historyImageAssets={historyImageAssets}
-              onLoadHistoryImage={loadHistoryImage}
-              onFork={space === "code" ? forkFromTurn : undefined} />
+              onLoadHistoryImage={historyView.recovering
+                ? undefined : loadHistoryImage}
+              onFork={!historyView.recovering && space === "code"
+                ? forkFromTurn : undefined} />
 
             <GoalPanel engine={engine} goal={rt.goal}
               revealed={!!goalUi?.revealed} open={!!goalUi?.open}

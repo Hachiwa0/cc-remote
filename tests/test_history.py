@@ -10,7 +10,9 @@ import asyncio
 import base64
 import io
 import json
+import os
 import threading
+import time
 from types import SimpleNamespace
 
 from claude_agent_sdk.types import (
@@ -623,7 +625,281 @@ def test_claude_history_append_paints_cached_page_before_revalidation(
         )
 
         assert [turn.prompt for turn in history.turns] == ["old"]
+        assert history.authoritative is False
         assert refreshes and refreshes[0][0] == "claude-fast"
+
+    asyncio.run(go())
+
+
+def test_codex_history_append_paints_cached_page_before_revalidation(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"id":"codex-fast"}}\n')
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_translate_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "append-stale Codex first paint performed a full scan")),
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-codex-fast")
+        ctx = _mk_ctx("codex-fast", "codex-fast")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+        old_source = HistorySourceFingerprint.capture(rollout)
+        events = (
+            {"type": "user_msg", "sid": "codex-fast",
+             "msg_id": "old", "prompt": "old"},
+            {"type": "turn_end", "sid": "codex-fast", "turn_id": "turn-old",
+             "result": {"subtype": "success", "duration_ms": 1,
+                        "is_error": False}},
+        )
+        page = MaterializedHistoryPage(
+            events=events,
+            has_more=True,
+            oldest_id="old",
+            newest_id="old",
+            turns=materialize_history_turns(events),
+        )
+        machine._history_index.put_page(
+            "codex-fast", "codex", old_source,
+            before=None, limit=4, page=page,
+        )
+        with rollout.open("ab") as stream:
+            stream.write(
+                b'{"type":"event_msg","payload":{"type":"task_started"}}\n')
+        refreshes = []
+        monkeypatch.setattr(
+            machine,
+            "_schedule_history_refresh",
+            lambda sid, **kwargs: refreshes.append((sid, kwargs)),
+        )
+
+        history = await machine._build_requested_history(
+            "codex-fast", before=None, limit=4, cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert [turn.prompt for turn in history.turns] == ["old"]
+        assert history.authoritative is False
+        assert history.in_progress is True
+        assert history.has_more is True
+        assert refreshes and refreshes[0][0] == "codex-fast"
+
+    asyncio.run(go())
+
+
+def test_exact_history_cache_hit_that_grows_before_send_is_provisional(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "cache-race-rollout.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"id":"codex-cache-race"}}\n')
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_translate_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an exact cache race performed a full scan")),
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(
+            tmp_path / "state-cache-race")
+        ctx = _mk_ctx("codex-cache-race", "codex-cache-race")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        events = (
+            {"type": "user_msg", "sid": "codex-cache-race",
+             "msg_id": "old", "prompt": "old"},
+            {"type": "turn_end", "sid": "codex-cache-race",
+             "turn_id": "turn-old",
+             "result": {"subtype": "success", "duration_ms": 1,
+                        "is_error": False}},
+        )
+        machine._history_index.put_page(
+            "codex-cache-race",
+            "codex",
+            source,
+            before=None,
+            limit=4,
+            page=MaterializedHistoryPage(
+                events=events,
+                has_more=False,
+                oldest_id="old",
+                newest_id="old",
+                turns=materialize_history_turns(events),
+            ),
+        )
+        original_get_page = machine._history_index.get_page
+        appended = False
+
+        def get_page(*args, **kwargs):
+            nonlocal appended
+            page = original_get_page(*args, **kwargs)
+            if page is not None and not appended:
+                appended = True
+                with rollout.open("ab") as stream:
+                    stream.write(
+                        b'{"type":"event_msg",'
+                        b'"payload":{"type":"task_started"}}\n')
+            return page
+
+        monkeypatch.setattr(machine._history_index, "get_page", get_page)
+        refreshes = []
+        monkeypatch.setattr(
+            machine,
+            "_schedule_history_refresh",
+            lambda sid, **kwargs: refreshes.append((sid, kwargs)),
+        )
+
+        history = await machine._build_history(
+            "codex-cache-race",
+            limit=4,
+            detail="summary",
+            allow_stale=True,
+        )
+
+        assert history.authoritative is False
+        assert [turn.prompt for turn in history.turns] == ["old"]
+        assert refreshes and refreshes[0][0] == "codex-cache-race"
+
+    asyncio.run(go())
+
+
+def test_codex_history_growth_during_scan_is_provisional_without_index(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "growing-rollout.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"id":"codex-growing"}}\n')
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_history_window",
+        lambda path, **_kwargs: (
+            0, os.path.getsize(path), False, None, None,
+        ),
+    )
+
+    translated = False
+
+    def translate(*_args, **_kwargs):
+        nonlocal translated
+        if not translated:
+            translated = True
+            with rollout.open("ab") as stream:
+                stream.write(
+                    b'{"type":"event_msg","payload":{"type":"task_started"}}\n')
+        return [
+            UserMsg(msg_id="turn-1", prompt="hello"),
+            TurnEnd(result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False)),
+        ], None
+
+    monkeypatch.setattr(mm, "codex_translate_history", translate)
+
+    async def go():
+        nonlocal translated
+        machine, _ = _mk_machine()
+        machine._history_index = None
+        ctx = _mk_ctx("codex-growing", "codex-growing")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        refreshes = []
+        monkeypatch.setattr(
+            machine,
+            "_schedule_history_refresh",
+            lambda sid, **kwargs: refreshes.append((sid, kwargs)),
+        )
+
+        history = await machine._build_history(
+            "codex-growing",
+            limit=4,
+            detail="summary",
+            allow_stale=True,
+        )
+
+        assert history.authoritative is False
+        assert history.error is None
+        assert [turn.prompt for turn in history.turns] == ["hello"]
+        assert refreshes == [(
+            "codex-growing",
+            {
+                "before": None,
+                "limit": 4,
+                "cwd": None,
+                "detail": "summary",
+            },
+        )]
+
+        refreshes.clear()
+        translated = False
+        older = await machine._build_history(
+            "codex-growing",
+            before="turn-1",
+            limit=4,
+            detail="summary",
+            allow_stale=True,
+        )
+        assert older.authoritative is False
+        assert refreshes == []
+
+    asyncio.run(go())
+
+
+def test_history_index_write_failure_keeps_coherent_source_authoritative(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "stable-rollout.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"id":"codex-stable"}}\n')
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_history_window",
+        lambda path, **_kwargs: (
+            0, os.path.getsize(path), False, None, None,
+        ),
+    )
+    monkeypatch.setattr(
+        mm,
+        "codex_translate_history",
+        lambda *_args, **_kwargs: ([
+            UserMsg(msg_id="turn-1", prompt="hello"),
+            TurnEnd(result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False)),
+        ], None),
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-write-fail")
+        ctx = _mk_ctx("codex-stable", "codex-stable")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        monkeypatch.setattr(
+            machine._history_index,
+            "put_page",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("disk full")),
+        )
+
+        history = await machine._build_history(
+            "codex-stable",
+            limit=4,
+            detail="summary",
+            allow_stale=True,
+        )
+
+        assert history.authoritative is True
+        assert history.error is None
+        assert [turn.prompt for turn in history.turns] == ["hello"]
 
     asyncio.run(go())
 
@@ -782,6 +1058,7 @@ def test_claude_history_read_failure_never_materializes_empty_page(
 def test_claude_history_refresh_coalesces_appends_during_full_scan(monkeypatch):
     async def go():
         machine, transport = _mk_machine()
+        machine.HISTORY_REFRESH_MIN_INTERVAL_SECONDS = 0
         entered = asyncio.Event()
         release = asyncio.Event()
         builds = 0
@@ -815,6 +1092,201 @@ def test_claude_history_refresh_coalesces_appends_during_full_scan(monkeypatch):
         assert builds == 2
         assert len([row for row in transport.sent
                     if isinstance(row, History)]) == 2
+
+    asyncio.run(go())
+
+
+def test_codex_history_refresh_coalesces_cwd_hints_and_rate_limits_rescan(
+        monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        machine.HISTORY_REFRESH_MIN_INTERVAL_SECONDS = 0.03
+        ctx = _mk_ctx("codex-refresh", "codex-refresh")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        starts = []
+
+        async def build(sid, **_kwargs):
+            starts.append(time.monotonic())
+            if len(starts) == 1:
+                entered.set()
+                await release.wait()
+            return History(
+                session_id=sid,
+                revision=f"refresh-{len(starts)}",
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=False,
+            )
+
+        monkeypatch.setattr(machine, "_build_history", build)
+        args = {
+            "before": None, "limit": 4, "detail": "summary",
+        }
+        machine._schedule_history_refresh(
+            "codex-refresh", cwd="/client/a", **args)
+        await entered.wait()
+        machine._schedule_history_refresh(
+            "codex-refresh", cwd="/client/b", **args)
+        machine._schedule_history_refresh(
+            "codex-refresh", cwd="/client/c", **args)
+
+        assert len(machine._history_refresh_tasks) == 1
+        release.set()
+        await asyncio.gather(*list(machine._history_refresh_tasks.values()))
+
+        assert len(starts) == 2
+        assert starts[1] - starts[0] >= 0.02
+        assert len([row for row in transport.sent
+                    if isinstance(row, History)]) == 2
+
+    asyncio.run(go())
+
+
+def test_history_refresh_backoff_scales_with_scan_cost():
+    machine, _ = _mk_machine()
+    machine.HISTORY_REFRESH_MIN_INTERVAL_SECONDS = 0.5
+    machine.HISTORY_REFRESH_MAX_INTERVAL_SECONDS = 10.0
+
+    assert machine._history_refresh_backoff_seconds(0.1) == 0.5
+    assert machine._history_refresh_backoff_seconds(3.0) == 3.0
+    assert machine._history_refresh_backoff_seconds(30.0) == 10.0
+
+
+def test_history_refresh_skips_backoff_for_final_idle_rebuild(monkeypatch):
+    async def go():
+        machine, _ = _mk_machine()
+        machine.HISTORY_REFRESH_MIN_INTERVAL_SECONDS = 10.0
+        machine.HISTORY_REFRESH_MAX_INTERVAL_SECONDS = 10.0
+        ctx = _mk_ctx("codex-final-refresh", "codex-final-refresh")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        builds = 0
+
+        async def build(sid, **_kwargs):
+            nonlocal builds
+            builds += 1
+            if builds == 1:
+                entered.set()
+                await release.wait()
+            return History(
+                session_id=sid,
+                revision=f"refresh-{builds}",
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=False,
+            )
+
+        monkeypatch.setattr(machine, "_build_history", build)
+        args = {
+            "before": None, "limit": 4, "cwd": None, "detail": "summary",
+        }
+        machine._schedule_history_refresh("codex-final-refresh", **args)
+        await entered.wait()
+        machine._schedule_history_refresh("codex-final-refresh", **args)
+        ctx.state = "idle"
+        release.set()
+
+        await asyncio.wait_for(
+            asyncio.gather(*list(machine._history_refresh_tasks.values())),
+            timeout=0.5,
+        )
+        assert builds == 2
+
+    asyncio.run(go())
+
+
+def test_history_refresh_retries_provisional_source_drift_without_dirty_signal(
+        monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("codex-drift-refresh", "codex-drift-refresh")
+        ctx.engine = "codex"
+        ctx.state = "idle"
+        machine.sessions[ctx.key] = ctx
+        builds = 0
+
+        async def build(sid, **_kwargs):
+            nonlocal builds
+            builds += 1
+            return History(
+                session_id=sid,
+                revision=f"refresh-{builds}",
+                authoritative=builds > 1,
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=False,
+            )
+
+        monkeypatch.setattr(machine, "_build_history", build)
+        machine._schedule_history_refresh(
+            "codex-drift-refresh",
+            before=None,
+            limit=4,
+            cwd=None,
+            detail="summary",
+        )
+        await asyncio.wait_for(
+            asyncio.gather(*list(machine._history_refresh_tasks.values())),
+            timeout=0.5,
+        )
+
+        assert builds == 2
+        sent = [row for row in transport.sent if isinstance(row, History)]
+        assert len(sent) == 1
+        assert sent[0].revision == "refresh-2"
+        assert sent[0].authoritative is True
+
+    asyncio.run(go())
+
+
+def test_history_refresh_rate_limits_repeated_drift_when_activity_is_unknown(
+        monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        machine.HISTORY_REFRESH_MIN_INTERVAL_SECONDS = 0.03
+        machine.HISTORY_REFRESH_MAX_INTERVAL_SECONDS = 0.03
+        starts = []
+
+        async def build(sid, **_kwargs):
+            starts.append(time.monotonic())
+            return History(
+                session_id=sid,
+                revision=f"refresh-{len(starts)}",
+                authoritative=len(starts) > 2,
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=False,
+            )
+
+        monkeypatch.setattr(machine, "_build_history", build)
+        machine._schedule_history_refresh(
+            "unknown-drift-refresh",
+            before=None,
+            limit=4,
+            cwd=None,
+            detail="summary",
+        )
+        await asyncio.wait_for(
+            asyncio.gather(*list(machine._history_refresh_tasks.values())),
+            timeout=0.5,
+        )
+
+        assert len(starts) == 3
+        assert starts[2] - starts[1] >= 0.02
+        sent = [row for row in transport.sent if isinstance(row, History)]
+        assert len(sent) == 1
+        assert sent[0].revision == "refresh-3"
 
     asyncio.run(go())
 
