@@ -67,10 +67,12 @@ import {
   commandsFor,
   isKnownCodeOnlySlash,
   matchCommands,
+  matchSkills,
   matchModelId,
   MODELS,
   modelsFor,
   permsFor,
+  skillToken,
 } from "../src/data.ts";
 import {
   createMobileViewportSync,
@@ -113,6 +115,13 @@ import {
 import { workContextMetrics } from "../src/work-context.ts";
 import { processBlocks } from "../src/process-blocks.ts";
 import { PointerTapGuard } from "../src/pointer-tap.ts";
+import {
+  cacheSkillCatalog,
+  MAX_SKILL_CATALOGS,
+  skillCatalogFresh,
+  skillCatalogKey,
+  SKILL_CATALOG_TTL_MS,
+} from "../src/skill-catalog-cache.ts";
 import {
   constrainImageTransform,
   panImageTransform,
@@ -329,6 +338,47 @@ for (const engine of ["claude", "codex"] as const) {
 }
 assert.equal(clientSlashesFor("claude").has("hook"), false,
   "Claude singular /hook remains native; Remote management uses /hooks");
+assert.equal(skillToken("$"), "");
+assert.equal(skillToken("$cavecrew"), "cavecrew");
+assert.equal(skillToken("$cavecrew explain this"), null,
+  "Skill suggestions must close as soon as prompt arguments begin");
+assert.equal(skillToken("use $cavecrew"), null,
+  "only a leading $ is an explicit Codex Skill invocation");
+const skillCatalog = [
+  { kind: "skill", id: "1", name: "cavecrew", enabled: true,
+    description: "Delegate work" },
+  { kind: "skill", id: "2", name: "Caveman", enabled: true },
+  { kind: "skill", id: "3", name: "cavecrew", enabled: true },
+  { kind: "skill", id: "4", name: "disabled-skill", enabled: false },
+  { kind: "plugin", id: "5", name: "cave-plugin", installed: true },
+] satisfies import("../src/protocol.ts").EngineCapabilityItem[];
+assert.deepEqual(matchSkills("cave", skillCatalog).map((item) => item.name),
+  ["cavecrew", "Caveman"],
+  "Skill completion must prefix-match case-insensitively and deduplicate triggers");
+assert.deepEqual(matchSkills("", skillCatalog).map((item) => item.name),
+  ["cavecrew", "Caveman"],
+  "only enabled Skills may be offered for explicit invocation");
+const repoSkillKey = skillCatalogKey(
+  "machine-a", "codex", "code", "/repo/a");
+assert.notEqual(repoSkillKey, skillCatalogKey(
+  "machine-a", "codex", "code", "/repo/b"),
+  "Skill catalogs from different repositories must never share a cache entry");
+assert.notEqual(repoSkillKey, skillCatalogKey(
+  "machine-b", "codex", "code", "/repo/a"),
+  "Skill catalogs must remain inside the machine authorization boundary");
+const freshSkillEntry = { items: skillCatalog, fetchedAt: 1_000 };
+assert.equal(skillCatalogFresh(freshSkillEntry, 1_000 + SKILL_CATALOG_TTL_MS - 1),
+  true);
+assert.equal(skillCatalogFresh(freshSkillEntry, 1_000 + SKILL_CATALOG_TTL_MS),
+  false, "an expired Skill catalog must refresh without hiding its stale items");
+let boundedSkillCache = {};
+for (let index = 0; index <= MAX_SKILL_CATALOGS; index += 1) {
+  boundedSkillCache = cacheSkillCatalog(
+    boundedSkillCache, `scope-${index}`, skillCatalog, index);
+}
+assert.equal(Object.keys(boundedSkillCache).length, MAX_SKILL_CATALOGS);
+assert.equal("scope-0" in boundedSkillCache, false,
+  "the bounded cache must evict the oldest cwd catalog first");
 const recentProject = { session_id: "project-new", cwd: "/home/nancy/project",
   last_modified: "300" };
 const oldHome = { session_id: "home-old", cwd: "/home/nancy", last_modified: "100" };
@@ -6300,6 +6350,22 @@ assert.match(composerSource, /不是\$\{externalClaudeOwner\}当前强度/,
 assert.doesNotMatch(composerSource, /终端占用/,
   "shared control must never be presented as exclusive terminal occupancy");
 assert.match(composerSource, /presentLegacyExternalControl/);
+assert.match(composerSource, /p\.engine === "codex"[\s\S]*?<kbd>\$<\/kbd> Skills/,
+  "desktop Codex controls must advertise the $ Skill completion trigger");
+assert.match(composerSource, /skillMatches\[0\]\.name/,
+  "Enter must complete the first matching Skill instead of sending a partial trigger");
+assert.match(composerSource, /正在读取当前目录的 Skills/,
+  "the Skill palette must stay visible while native discovery is in flight");
+assert.match(appSource, /skills=\{skillCatalogs\[focusedSkillCatalogKey\]\?\.items\}/,
+  "the composer must paint a cwd-scoped Skill cache synchronously");
+assert.match(appSource, /Warm the cwd-scoped Codex Skill catalog[\s\S]*requestSkillCatalog/,
+  "focused Codex sessions must prefetch Skills before the user types $");
+assert.match(appSource,
+  /msg\.type === "wrapper_reconnected"[\s\S]*skillCatalogsRef\.current = \{\}[\s\S]*requestSkillCatalog\(focusedSkills, true\)/,
+  "a wrapper generation change must invalidate and rewarm native Skill catalogs");
+assert.doesNotMatch(appSource,
+  /onRequestSkills=\{\(\) => \{[\s\S]{0,500}delete next\[/,
+  "opening $ completion must never clear a usable Skill cache");
 assert.doesNotMatch(composerSource, /control-bar/,
   "terminal state no longer consumes a permanent row above the composer");
 const workDashboardSource = readFileSync(

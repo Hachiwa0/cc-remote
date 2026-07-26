@@ -5,7 +5,9 @@
 // handled in Composer.send) and cc skills (forwarded verbatim to cc). Model/perm
 // chips drive set_model / set_permission_mode on the wrapper.
 
-import type { CatalogModel } from "./protocol";
+import type {
+  CatalogModel, EngineCapabilityItem,
+} from "./protocol";
 
 export interface CmdGroup { g: string }
 export interface Cmd { slash: string; name: string; ds: string; ic: string }
@@ -295,6 +297,34 @@ export function slashToken(input: string): string | null {
   const after = input.slice(1);
   if (/\s/.test(after)) return null; // a space => choosing args, not the command
   return after;
+}
+
+// Codex explicitly invokes a Skill with "$skill-name". Keep this separate from
+// slash parsing: "$" is forwarded as prompt text after selection, while slash
+// commands may be handled locally by cc-remote.
+export function skillToken(input: string): string | null {
+  if (!input.startsWith("$")) return null;
+  const after = input.slice(1);
+  if (/\s/.test(after)) return null;
+  return after;
+}
+
+/** Enabled Skills whose trigger starts with `token`, deduplicated by trigger.
+ * The app-server catalog is authoritative; disabled Skills must not be offered
+ * as invokable even though extension management still lists them. */
+export function matchSkills(
+  token: string,
+  items: EngineCapabilityItem[],
+): EngineCapabilityItem[] {
+  const prefix = token.toLowerCase();
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (item.kind !== "skill" || item.enabled === false) return false;
+    const name = item.name.toLowerCase();
+    if (!name.startsWith(prefix) || seen.has(name)) return false;
+    seen.add(name);
+    return true;
+  }).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // Commands whose slash starts with `token` (case-insensitive, prefix match).

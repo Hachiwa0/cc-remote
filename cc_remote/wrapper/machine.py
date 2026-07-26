@@ -6403,9 +6403,14 @@ class WrapperMachine:
         engine = cmd.engine
         space = getattr(cmd, "space", "code")
         target_cwd = getattr(cmd, "cwd", None)
-        focused = self._focused_ctx()
-        if focused is not None and focused.engine == engine and focused.space == space:
-            target_cwd = focused.cwd
+        if not target_cwd:
+            focused = self._focused_ctx()
+            if (
+                focused is not None
+                and focused.engine == engine
+                and focused.space == space
+            ):
+                target_cwd = focused.cwd
         if not target_cwd:
             target_cwd = self.cfg.cc_cwd
         client_id = getattr(cmd, "client_id", None)
@@ -6431,14 +6436,16 @@ class WrapperMachine:
 
     def _engine_capability_cwd(self, cmd) -> str:
         target_cwd = getattr(cmd, "cwd", None)
+        if target_cwd:
+            return target_cwd
         focused = self._focused_ctx()
         if (
             focused is not None
             and focused.engine == cmd.engine
             and focused.space == getattr(cmd, "space", "code")
         ):
-            target_cwd = focused.cwd
-        return target_cwd or self.cfg.cc_cwd
+            return focused.cwd
+        return self.cfg.cc_cwd
 
     async def _send_capability_mutation_error(self, cmd, exc: Exception):
         if isinstance(exc, ValueError):
