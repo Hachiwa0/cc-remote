@@ -1,17 +1,122 @@
 // Empty-state "new chat" page: a centered composer (a la Claude app / Codex)
-// with a working directory and optional attachments. Model, effort, and Codex
-// modes use the local defaults; users can change them after the session starts.
+// with a working directory, optional model/effort overrides, and attachments.
+// A null override is intentional: the wrapper/engine keeps its own local default.
+/* oxlint-disable react/only-export-components */
 import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import { Icon } from "../icons";
+import {
+  effortsFor, modelsFor, type Catalog, type Effort, type Model,
+} from "../data";
 import { attachmentBytes, pickFiles } from "../img";
 import type { CodexPermissionMode, CodexServiceTier, CollaborationModeName, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { PendingImageAttachments } from "./PendingImageAttachments";
 
+type Engine = "claude" | "codex";
+
+export interface NewChatCatalogRequest {
+  engine: Engine;
+  cwd?: string;
+}
+
+/** Catalog reads are scoped like the session they describe. Work owns its own
+ * private cwd, so it must never probe Claude settings through the Code cwd. */
+export function newChatCatalogRequest(
+  engine: Engine, space: Space, cwd: string,
+): NewChatCatalogRequest | null {
+  if (engine === "codex") return { engine };
+  return space === "code" ? { engine, cwd } : null;
+}
+
+export interface NewChatLocalDefaults {
+  model: string | null;
+  effort: string | null;
+}
+
+/** Cwd-aware Claude defaults are presentation metadata for that exact Code
+ * directory only. Codex defaults are machine-wide and may be shown in either
+ * surface. The selected overrides themselves remain null until the user picks. */
+export function resolveNewChatLocalDefaults(
+  engine: Engine,
+  space: Space,
+  cwd: string,
+  modelDefaults: Record<string, string>,
+  effortDefaults: Record<string, string>,
+  defaultCwds: Record<string, string>,
+): NewChatLocalDefaults {
+  if (engine === "claude"
+      && (space !== "code" || defaultCwds.claude !== cwd)) {
+    return { model: null, effort: null };
+  }
+  return {
+    model: modelDefaults[engine] ?? null,
+    effort: effortDefaults[engine] ?? null,
+  };
+}
+
+/** Keep a user's explicit effort only when the newly selected model supports
+ * it. Unknown/default targets fail safe to null; we never invent a highest
+ * effort on the user's behalf. */
+export function compatibleNewChatEffort(
+  engine: Engine,
+  nextModel: string | null,
+  currentEffort: string | null,
+  catalog: Catalog,
+  localDefaultModel: string | null,
+): string | null {
+  if (!currentEffort) return null;
+  const effectiveModel = nextModel ?? localDefaultModel;
+  if (!effectiveModel) return null;
+  if (!modelsFor(engine, catalog).some(
+    (candidate) => candidate.id === effectiveModel,
+  )) return null;
+  return effortsFor(engine, effectiveModel, catalog).some(
+    (candidate) => candidate.id === currentEffort,
+  ) ? currentEffort : null;
+}
+
+export function reconcileNewChatSelection(
+  engine: Engine,
+  model: string | null,
+  effort: string | null,
+  catalog: Catalog,
+  localDefaultModel: string | null,
+): { model: string | null; effort: string | null } {
+  if (model && !modelsFor(engine, catalog).some(
+    (candidate) => candidate.id === model,
+  )) {
+    // A fallback model can disappear when the authoritative, entitlement-
+    // filtered catalog arrives. Clear both overrides instead of submitting a
+    // now-inaccessible model with a stale effort.
+    return { model: null, effort: null };
+  }
+  return {
+    model,
+    effort: compatibleNewChatEffort(
+      engine, model, effort, catalog, localDefaultModel),
+  };
+}
+
+export function newChatEfforts(
+  engine: Engine,
+  effectiveModel: string | null,
+  catalog: Catalog,
+): Effort[] {
+  // Without an authoritative Codex default there is no model against which an
+  // explicit effort can be validated. Keep only the null/default choice.
+  if (engine === "codex" && !effectiveModel) return [];
+  return effortsFor(engine, effectiveModel, catalog);
+}
+
 interface Props {
   cwd: string;
   space?: Space;
-  engine?: "claude" | "codex";  // which backend this new chat will use
+  engine?: Engine;  // which backend this new chat will use
+  catalog?: Catalog;
+  model?: string | null;
+  effort?: string | null;
+  defaultModel?: string | null;
+  defaultEffort?: string | null;
   autoFocus?: boolean;
   createError?: string | null;
   workDashboard?: WorkDashboard | null;
@@ -19,21 +124,86 @@ interface Props {
   onSelectProject?: (projectId: string | null) => void;
   onManageWork?: () => void;
   onPickCwd: () => void;  // open the directory picker
+  onPickModel?: (model: string | null) => void;
+  onPickEffort?: (effort: string | null) => void;
   onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[],
            collaborationMode?: CollaborationModeName,
            permissionMode?: CodexPermissionMode,
            serviceTier?: CodexServiceTier) => boolean;
 }
 
-export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus = true,
-  createError,
+interface SelectorOption {
+  id: string | null;
+  name: string;
+  description: string;
+  icon: string;
+}
+
+function NewChatSelectorSheet({
+  open, kind, options, current, onClose, onPick,
+}: {
+  open: boolean;
+  kind: "models" | "efforts";
+  options: SelectorOption[];
+  current: string | null;
+  onClose: () => void;
+  onPick: (value: string | null) => void;
+}) {
+  const title = kind === "models" ? "选择模型" : "选择思考强度";
+  return (
+    <>
+      <div className={"scrim" + (open ? " show" : "")} onClick={onClose} />
+      <div className={"sheet" + (open ? " show" : "")}
+        role="dialog" aria-label={title}>
+        <div className="sheet-grip" />
+        <div className="sheet-title">{title}</div>
+        <div className="sheet-scroll">
+          {options.map((option) => (
+            <button key={option.id ?? "__local_default__"}
+              className={"cmd" + (option.id === current ? " sel" : "")}
+              onClick={() => onPick(option.id)}>
+              <span className="cmd-ic"><Icon name={option.icon} size={17} /></span>
+              <span className="cmd-tx">
+                <span className="cmd-nm">{option.name}</span>
+                <span className="cmd-ds">{option.description}</span>
+              </span>
+              {option.id === current
+                ? <span className="cmd-check"><Icon name="check" size={19} /></span>
+                : <span className="cmd-kbd" />}
+            </button>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function displayModel(
+  id: string | null | undefined, models: Model[],
+): string | null {
+  if (!id) return null;
+  return models.find((candidate) => candidate.id === id)?.name ?? id;
+}
+
+function displayEffort(
+  id: string | null | undefined, efforts: Effort[],
+): string | null {
+  if (!id) return null;
+  return efforts.find((candidate) => candidate.id === id)?.name ?? id;
+}
+
+export function NewChatView({ cwd, space = "code", engine = "claude",
+  catalog = {}, model = null, effort = null,
+  defaultModel = null, defaultEffort = null, autoFocus = true, createError,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
-  onSend }: Props) {
+  onPickModel, onPickEffort, onSend }: Props) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
   const [importing, setImporting] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [sheetKind, setSheetKind] =
+    useState<"models" | "efforts" | null>(null);
   const photoRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -52,6 +222,44 @@ export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus 
 
   const hasAttachments = images.length > 0 || files.length > 0;
   const canSend = (text.trim().length > 0 || hasAttachments) && !creating && !importing;
+  const modelList = modelsFor(engine, catalog);
+  const effectiveModel = model ?? defaultModel;
+  const effortList = newChatEfforts(engine, effectiveModel, catalog);
+  const localModelName = displayModel(defaultModel, modelList);
+  const localEffortName = model === null
+    ? displayEffort(defaultEffort, effortList) : null;
+  const modelLabel = model
+    ? displayModel(model, modelList) ?? model
+    : localModelName ? `本机默认 · ${localModelName}` : "本机默认";
+  const effortLabel = effort
+    ? displayEffort(effort, effortList) ?? effort
+    : localEffortName ? `默认 · ${localEffortName}` : "默认";
+  const modelOptions: SelectorOption[] = [{
+    id: null,
+    name: "本机默认",
+    description: localModelName
+      ? `使用本机配置 · ${localModelName}`
+      : "不发送模型覆盖，使用本机配置",
+    icon: "cpu",
+  }, ...modelList.map((candidate) => ({
+    id: candidate.id,
+    name: candidate.name,
+    description: candidate.ds,
+    icon: candidate.ic,
+  }))];
+  const effortOptions: SelectorOption[] = [{
+    id: null,
+    name: "默认",
+    description: localEffortName
+      ? `使用本机配置 · ${localEffortName}`
+      : "不发送强度覆盖，使用所选模型或本机配置",
+    icon: "gauge3",
+  }, ...effortList.map((candidate) => ({
+    id: candidate.id,
+    name: candidate.name,
+    description: candidate.ds,
+    icon: candidate.ic,
+  }))];
 
   const onPick = async (fl: FileList | File[] | null) => {
     if (importing) return;
@@ -199,6 +407,17 @@ export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus 
               onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
             <input ref={fileRef} type="file" multiple aria-label="添加文件" hidden
               onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
+            <button type="button" className="hint-ctl"
+              onClick={() => setSheetKind("models")}
+              title="选择模型" disabled={creating || importing || !onPickModel}>
+              {modelLabel}
+            </button>
+            <button type="button" className="hint-ctl"
+              onClick={() => setSheetKind("efforts")}
+              title="选择思考强度"
+              disabled={creating || importing || !onPickEffort}>
+              {effortLabel}
+            </button>
           </div>
           <div className="newchat-foot-right">
             <span className="newchat-hint">{createError
@@ -216,6 +435,18 @@ export function NewChatView({ cwd, space = "code", engine = "claude", autoFocus 
         </div>
       </div>
 
+      <NewChatSelectorSheet
+        open={sheetKind !== null}
+        kind={sheetKind ?? "models"}
+        options={sheetKind === "efforts" ? effortOptions : modelOptions}
+        current={sheetKind === "efforts" ? effort : model}
+        onClose={() => setSheetKind(null)}
+        onPick={(value) => {
+          if (sheetKind === "efforts") onPickEffort?.(value);
+          else onPickModel?.(value);
+          setSheetKind(null);
+        }}
+      />
     </div>
   );
 }

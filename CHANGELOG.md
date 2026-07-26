@@ -7,6 +7,16 @@
 - Upgrade Claude Agent SDK to `0.2.128` and make wrappers explicitly run the
   user's daily `~/.local/bin/claude` instead of silently selecting the SDK
   bundle, keeping Remote and terminal credentials and CLI updates aligned.
+- Align busy Codex input with the official client: sending defaults to native
+  `turn/steer`, queue remains available, and Stop stays an explicit separate
+  action. Claude keeps its interrupt-and-send behavior.
+- Page heavyweight detail from the configured safe source window inside a
+  single very long turn, so the browser's 256-block presentation cap no longer
+  replaces otherwise available process rows with a synthetic omission marker.
+- Reject foreign shared-daemon lifecycle frames during resume binding and
+  reconcile a proven inactive spontaneous turn without leaving a phantom
+  running state.
+- Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v21.
 
 ## v3.0.0 — 2026-07-24
 

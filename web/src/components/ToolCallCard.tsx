@@ -43,19 +43,36 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
   const resultSummary = block.result?.summary?.trim();
   const diff = block.result?.diff || block.diff;
   const hasInput = Object.keys(block.input).length > 0;
+  const hasBody = !!(
+    block.progress || resultSummary || diff || output || hasInput
+    || block.result?.exit_code != null
+    || block.result?.duration_ms != null
+  );
+  const header = (
+    <>
+      <span className="tool-ic"><Icon name={presentation.icon} size={15} /></span>
+      <span className="tool-nm">{presentation.title}</span>
+      <span className="tool-arg">{presentation.subtitle}</span>
+      <span className={`tool-st ${status}`}>
+        {status === "done" ? <Icon name="verify" size={16} />
+          : status === "err" ? <Icon name="close" size={16} />
+          : null}
+      </span>
+      {hasBody && (
+        <span className="tool-chev"><Icon name="chev" size={16} sw={2} /></span>
+      )}
+    </>
+  );
+  if (!hasBody) {
+    return (
+      <div className="tool tool-static">
+        <div className="tool-h">{header}</div>
+      </div>
+    );
+  }
   return (
     <details className="tool" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary className="tool-h">
-        <span className="tool-ic"><Icon name={presentation.icon} size={15} /></span>
-        <span className="tool-nm">{presentation.title}</span>
-        <span className="tool-arg">{presentation.subtitle}</span>
-        <span className={`tool-st ${status}`}>
-          {status === "done" ? <Icon name="verify" size={16} />
-            : status === "err" ? <Icon name="close" size={16} />
-            : null}
-        </span>
-        <span className="tool-chev"><Icon name="chev" size={16} sw={2} /></span>
-      </summary>
+      <summary className="tool-h">{header}</summary>
       {open && <div className="tool-b">
         {block.progress && <div className="tool-progress">{block.progress}</div>}
         {resultSummary && resultSummary !== output && (

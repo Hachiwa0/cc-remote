@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 20
+PROTOCOL_VERSION = 21
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -234,6 +234,8 @@ ERR_WRAPPER_OFFLINE = "wrapper_offline"
 ERR_WRAPPER_ALREADY_CONNECTED = "wrapper_already_connected"
 ERR_AUTH = "auth"
 ERR_FORK_RECONCILING = "fork_reconciling"
+ERR_NOT_STEERABLE = "not_steerable"
+ERR_STEER_UNKNOWN = "steer_outcome_unknown"
 
 
 class _Base(BaseModel):
@@ -309,6 +311,31 @@ class Query(_Command):
         if _attachment_count(self.images, self.files) > MAX_ATTACHMENT_COUNT:
             raise ValueError(
                 f"query attachments exceed {MAX_ATTACHMENT_COUNT} items")
+        return self
+
+
+class Steer(_Command):
+    """Append input to the active Codex turn without interrupting it."""
+    type: Literal["steer"] = "steer"
+    # Steer has no pre-v21 compatibility form. Requiring the reliable identity
+    # prevents an ACK-lost retry from appending the same instruction twice.
+    cmd_id: WireId
+    client_id: WireId
+    # Steer is new in v21 and has no legacy focused-session form. Requiring the
+    # target prevents a delayed command from falling through to a newer focus.
+    sid: WireId
+    prompt: str = Field(max_length=2 * 1024 * 1024)
+    msg_id: WireId
+    images: Optional[list[QueryImage]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+    files: Optional[list[QueryFile]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+
+    @model_validator(mode="after")
+    def bounded_attachment_count(self):
+        if _attachment_count(self.images, self.files) > MAX_ATTACHMENT_COUNT:
+            raise ValueError(
+                f"steer attachments exceed {MAX_ATTACHMENT_COUNT} items")
         return self
 
 
@@ -528,11 +555,28 @@ class UserMsg(_Base):
     other devices / fresh replays render the attachment."""
     type: Literal["user_msg"] = "user_msg"
     msg_id: WireId
+    # Codex persists turn/steer's clientUserMessageId on the legacy
+    # event_msg/user_message record, while its history pagination cursor remains
+    # a source-derived id. Carry both so a history-first race can deduplicate
+    # the later live echo.
+    client_msg_id: Optional[WireId] = None
     prompt: str
     images: Optional[list[QueryImage]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
     # Metadata only: file bodies stay out of replay/cache, while names remain
     # visible across devices and after transcript history reload.
     files: Optional[list[UserFileMeta]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
+
+
+class TurnSteered(_Base):
+    """A user message appended to the active Codex turn."""
+    type: Literal["turn_steered"] = "turn_steered"
+    msg_id: WireId
+    turn_id: WireId
+    prompt: str
+    images: Optional[list[QueryImage]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+    files: Optional[list[UserFileMeta]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
 
 
 class AssistantMsgStart(_Base):
@@ -1611,6 +1655,7 @@ class ConversationTurn(BaseModel):
     """Canonical lightweight turn rendered without replaying raw events."""
     model_config = ConfigDict(extra="forbid")
     id: WireId
+    clientMsgId: Optional[WireId] = None
     prompt: str = Field(default="", max_length=128 * 1024)
     blocks: list[dict[str, Any]] = Field(default_factory=list, max_length=32)
     done: bool = False
@@ -1698,10 +1743,13 @@ class GetTurnDetail(_Command):
     turn_id: WireId
     client_id: Optional[WireId] = None
     revision: Optional[WireId] = None
+    # Opaque, revision-bound cursor returned by a newer TurnDetail page.
+    before: Optional[WireId] = None
+    limit: int = Field(default=192, ge=1, le=256)
 
 
 class TurnDetail(_Base):
-    """wrapper -> requester: full translated events for one turn."""
+    """wrapper -> requester: one translated event page for a visible turn."""
     type: Literal["turn_detail"] = "turn_detail"
     session_id: WireId
     turn_id: WireId
@@ -1709,6 +1757,11 @@ class TurnDetail(_Base):
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
     events: list[dict[str, Any]] = []
+    has_more: bool = False
+    oldest_cursor: Optional[WireId] = None
+    has_newer: bool = False
+    newer_cursor: Optional[WireId] = None
+    before: Optional[WireId] = None
 
 
 class GetHistoryImage(_Command):
@@ -1849,12 +1902,12 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
     SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
-    UserMsg, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
+    UserMsg, TurnSteered, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
     AssistantMsgEnd, ProcessEvent, TurnPlan, TurnDiff, TurnBinding,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
 ]
@@ -1863,7 +1916,7 @@ AnyMessage = Union[
 # control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "state", "model", "effort", "perm", "fast",
+    "user_msg", "turn_steered", "state", "model", "effort", "perm", "fast",
     "collaboration_mode", "session_control", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_binding",
@@ -1874,6 +1927,7 @@ DOWNSTREAM_TYPES = frozenset({
 _TYPE_MAP: dict[str, type[BaseModel]] = {
     "hello": Hello,
     "query": Query,
+    "steer": Steer,
     "interrupt": Interrupt,
     "takeover": Takeover,
     "takeover_state": TakeoverState,
@@ -1967,6 +2021,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "session_rekey": SessionRekey,
     "work_dashboard": WorkDashboard,
     "user_msg": UserMsg,
+    "turn_steered": TurnSteered,
     "assistant_msg_start": AssistantMsgStart,
     "delta": Delta,
     "tool_use": ToolUse,

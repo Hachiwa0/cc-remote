@@ -93,8 +93,8 @@ _BIDI_CONTROLS = frozenset({
     *map(chr, range(0x2066, 0x2070)),
 })
 _HISTORY_NARRATIVE_TYPES = frozenset({
-    "user_msg", "assistant_msg_start", "delta", "tool_use", "tool_result",
-    "assistant_msg_end",
+    "user_msg", "turn_steered", "assistant_msg_start", "delta", "tool_use",
+    "tool_result", "assistant_msg_end",
 })
 
 
@@ -864,7 +864,7 @@ class Tui:
                     self.session_engines[new] = self.session_engines[old]
                 self.session_engines.pop(old, None)
                 self._touch_replay(new)
-        elif t == "user_msg":
+        elif t in {"user_msg", "turn_steered"}:
             if self._for_me(d):
                 if own_user_echo:
                     return  # our own — already echoed locally
@@ -991,7 +991,7 @@ class Tui:
 
     def _handle_history_event(self, ev: dict) -> None:
         t = ev.get("type")
-        if t == "user_msg":
+        if t in {"user_msg", "turn_steered"}:
             self._line(GREEN("» ") + _safe_remote_text(ev.get("prompt", "")))
         elif t == "assistant_msg_start":
             self._nl()

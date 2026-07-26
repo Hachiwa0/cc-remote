@@ -15,7 +15,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
     validate_attachments,
 )
-from cc_remote.protocol import ERR_BAD_PROMPT, Query
+from cc_remote.protocol import ERR_BAD_PROMPT, Query, Steer, TurnSteered
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -185,3 +185,113 @@ def test_startup_cleanup_only_removes_owned_attachment_names(monkeypatch, tmp_pa
     assert not turn.exists()
     assert not legacy.exists()
     assert unrelated.is_dir()
+
+
+def test_accepted_codex_steer_attachments_live_until_native_turn_terminal(
+        monkeypatch, tmp_path):
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.file_path = None
+            self.image_path = None
+
+        async def steer(
+            self, prompt, images=None, *, client_user_message_id=None,
+        ):
+            assert client_user_message_id == "steer-message"
+            self.file_path = prompt.rsplit("\n", 1)[-1]
+            self.image_path = images[0]
+            assert os.path.isfile(self.file_path)
+            assert os.path.isfile(self.image_path)
+            return self.turn_id
+
+    async def run():
+        machine, _transport = _mk_machine()
+        created = tmp_path / "cc-remote-turn-lifetime"
+
+        def make_temp_dir(*, prefix):
+            assert prefix == "cc-remote-turn-"
+            created.mkdir(mode=0o700)
+            return str(created)
+
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.tempfile.mkdtemp", make_temp_dir)
+        ctx = _mk_ctx("sid-1", "sid-1")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        sdk = Sdk()
+        ctx.sdk = sdk
+        machine.sessions[ctx.key] = ctx
+
+        event = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            prompt="inspect both",
+            msg_id="steer-message",
+            images=[{"media_type": "image/png", "data": _png()}],
+            files=[{"filename": "note.txt", "data": _b64(8)}],
+        ))
+
+        assert isinstance(event, TurnSteered)
+        assert event.files == [{"filename": "note.txt"}]
+        assert event.images and event.images[0]["data"] == _png()
+        assert created.is_dir()
+        assert os.path.isfile(sdk.file_path)
+        assert os.path.isfile(sdk.image_path)
+        assert ctx.codex_steer_attachment_dirs == [str(created)]
+
+        await machine._set_idle_after_managed_turn(ctx)
+
+        assert not created.exists()
+        assert ctx.codex_steer_attachment_dirs == []
+        assert ctx.state == "idle"
+
+    asyncio.run(run())
+
+
+def test_rejected_codex_steer_removes_staged_attachments_immediately(
+        monkeypatch, tmp_path):
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        async def steer(self, prompt, images=None, **_kwargs):
+            assert os.path.isfile(prompt.rsplit("\n", 1)[-1])
+            assert os.path.isfile(images[0])
+            raise RuntimeError("synthetic steer rejection")
+
+    async def run():
+        machine, _transport = _mk_machine()
+        created = tmp_path / "cc-remote-turn-rejected"
+
+        def make_temp_dir(*, prefix):
+            assert prefix == "cc-remote-turn-"
+            created.mkdir(mode=0o700)
+            return str(created)
+
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.tempfile.mkdtemp", make_temp_dir)
+        ctx = _mk_ctx("sid-1", "sid-1")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.sdk = Sdk()
+        machine.sessions[ctx.key] = ctx
+
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            prompt="inspect both",
+            msg_id="steer-message",
+            images=[{"media_type": "image/png", "data": _png()}],
+            files=[{"filename": "note.txt", "data": _b64(8)}],
+        ))
+
+        assert result.type == "error"
+        assert not created.exists()
+        assert ctx.codex_steer_attachment_dirs == []
+
+    asyncio.run(run())

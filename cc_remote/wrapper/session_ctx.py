@@ -89,6 +89,15 @@ class SessionContext:
     # managed turn stream so the session remains single-writer and interruptible.
     codex_spontaneous_turn_id: Optional[str] = None
     codex_spontaneous_task: Optional[asyncio.Task] = None
+    # ``turn/steer`` can accept localImage paths and consume them after the RPC
+    # response. Keep Code's private attachment directories alive until the
+    # enclosing native turn reaches its authoritative terminal boundary.
+    codex_steer_attachment_dirs: list[str] = field(default_factory=list)
+    # A timed-out turn/steer may still have been accepted by app-server. Keep
+    # exactly one bounded user boundary until an authoritative userMessage item
+    # with the same clientId confirms it, or the enclosing turn terminates.
+    # ``Any`` avoids coupling this shared context module to a v21 wire class.
+    codex_uncertain_steer: Any = None
     # Remote-owned Git checkpoint journal for Codex Code turns. It is created
     # lazily only in Git workspaces; Work and Claude use their own restore paths.
     codex_checkpoint: Any = None
@@ -150,6 +159,17 @@ class SessionContext:
     # interrupt either marks the event before query (so the turn aborts) or waits
     # until query() has returned and can interrupt the newly-created live turn.
     launch_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serializes multiple native turn/steer requests without blocking explicit
+    # interrupt, which deliberately uses the separate launch_lock.
+    steer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Native notifications can be read immediately after app-server resolves a
+    # turn/steer RPC, before the handler coroutine gets CPU time to publish the
+    # matching user boundary. Hold those notifications until TurnSteered (or a
+    # rejection) establishes the correct visible segment.
+    codex_steer_gate: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __post_init__(self) -> None:
+        self.codex_steer_gate.set()
 
     def next_seq(self) -> int:
         self.seq += 1

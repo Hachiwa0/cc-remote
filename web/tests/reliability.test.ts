@@ -129,6 +129,7 @@ import {
   ComposerDraftStore,
   composerDraftKey,
 } from "../src/composer-drafts.ts";
+import { updateScopedSessionLifecycle } from "../src/session-list.ts";
 
 const composerDrafts = new ComposerDraftStore();
 const draftA = composerDraftKey("machine-a", "code", "codex", "session-a");
@@ -272,6 +273,26 @@ assert.equal(mergeSessionActivityState("idle", "running"), "running",
   "a locally running resident runtime remains authoritative");
 assert.equal(mergeSessionActivityState("running", "interrupting"), "interrupting",
   "an explicit local transition overrides catalog activity");
+const scopedLifecycleCatalog = {
+  "code:claude": [{
+    session_id: "same-session", engine: "claude" as const,
+    space: "code" as const, state: "running" as const,
+  }],
+  "work:claude": [{
+    session_id: "same-session", engine: "claude" as const,
+    space: "work" as const, state: "running" as const,
+  }],
+  "code:codex": [{
+    session_id: "same-session", engine: "codex" as const,
+    space: "code" as const, state: "running" as const,
+  }],
+};
+const scopedLifecycleIdle = updateScopedSessionLifecycle(
+  scopedLifecycleCatalog, "claude", "code", "same-session", "idle");
+assert.equal(scopedLifecycleIdle["code:claude"][0].state, "idle");
+assert.equal(scopedLifecycleIdle["work:claude"][0].state, "running");
+assert.equal(scopedLifecycleIdle["code:codex"][0].state, "running",
+  "a terminal lifecycle frame updates only its frozen engine/space catalog");
 
 assert.deepEqual(
   permsFor("claude").map(({ id, name, short }) => ({ id, name, short })),
@@ -404,15 +425,28 @@ assert.equal(isSettlingStopDisabled("running", false), false);
 assert.equal(isSettlingStopDisabled("interrupting", false), true);
 assert.equal(isSettlingStopDisabled("draining", false), true);
 assert.equal(isSettlingStopDisabled("interrupting", true), false);
-assert.equal(classifyBusySubmit("running", "interrupt", false), "noop",
-  "empty Enter must not implicitly interrupt a running turn");
-assert.equal(classifyBusySubmit("interrupting", "interrupt", false), "noop");
-assert.equal(classifyBusySubmit("draining", "interrupt", false), "noop");
+assert.equal(classifyBusySubmit("running", "steer", "codex", true), "steer",
+  "the default Codex busy submit appends input to its active native turn");
+assert.equal(
+  classifyBusySubmit("running", "steer", "claude", true),
+  "interrupt-and-replace",
+  "Claude retains interrupt-and-replace because it cannot steer an active turn",
+);
 assert.equal(classifyBusySubmit(
-  "running", "interrupt", true), "interrupt-and-replace");
-assert.equal(classifyBusySubmit("interrupting", "interrupt", true), "replace");
-assert.equal(classifyBusySubmit("draining", "interrupt", true), "replace");
-assert.equal(classifyBusySubmit("interrupting", "queue", true), "enqueue");
+  "interrupting", "steer", "codex", true), "replace",
+  "input submitted while an interrupt settles replaces the pending follow-up");
+assert.equal(classifyBusySubmit(
+  "draining", "steer", "claude", true), "replace",
+  "the settling replacement contract is engine-independent");
+assert.equal(classifyBusySubmit(
+  "running", "queue", "codex", true), "enqueue",
+  "explicit queue mode remains an enqueue even when Codex could steer");
+for (const engine of ["claude", "codex"] as const) {
+  for (const state of ["running", "interrupting", "draining"] as const) {
+    assert.equal(classifyBusySubmit(state, "steer", engine, false), "noop",
+      "empty Enter is a no-op; Stop remains a separate explicit control");
+  }
+}
 
 const loginFormSource = readFileSync(resolve(
   process.cwd(), "src/components/LoginForm.tsx"), "utf8");
@@ -896,6 +930,8 @@ const mergedHistory = mergeInitialHistory(
 assert.deepEqual(mergedHistory.map((turn) => turn.id), ["client-id", "client-lag"]);
 assert.equal(mergedHistory[0].done, true);
 assert.equal(mergedHistory[0].blocks.length, 1);
+assert.equal(mergedHistory[0].historyTurnId, "engine-id",
+  "an attachment-free optimistic alias retains its native history lookup id");
 assert.equal(mergedHistory[1].prompt, "not flushed");
 
 const repeatedOld = {
@@ -1283,8 +1319,27 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 20, ts: 10, ...body,
+    v: 21, ts: 10, ...body,
   } as ServerEvent);
+  assert.equal(createRuntime().sendMode, "steer",
+    "Codex running input uses steer mode by default");
+  const sendModeA = "send-mode-a";
+  const sendModeB = "send-mode-b";
+  const isolatedSendModes = reduce({
+    ...initialState,
+    focusedSid: sendModeA,
+    runtimes: {
+      [sendModeA]: createRuntime(),
+      [sendModeB]: createRuntime(),
+    },
+  }, {
+    type: "set_send_mode",
+    sid: sendModeA,
+    mode: "queue",
+  });
+  assert.equal(isolatedSendModes.runtimes[sendModeA].sendMode, "queue");
+  assert.equal(isolatedSendModes.runtimes[sendModeB].sendMode, "steer",
+    "busy-send selection must not leak between sessions");
   const problemSid = "safe-problem-presentation";
   let problemState = reduce({
     ...initialState, focusedSid: problemSid,
@@ -1652,6 +1707,253 @@ try {
   );
   assert.equal(exactEndState.runtimes[exactEndSid].acceptancePending, null);
 
+  const steeredTurnSid = "codex-turn-steered";
+  const steeredNativeTurnId = "native-task-steered";
+  let steeredTurnState = {
+    ...initialState,
+    focusedSid: steeredTurnSid,
+    runtimes: {
+      [steeredTurnSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        acceptancePending: "steered-follow-up",
+        turns: [{
+          id: "steered-original",
+          forkPointId: steeredNativeTurnId,
+          prompt: "start the task",
+          blocks: [{
+            kind: "text" as const,
+            message_id: "steered-original-commentary",
+            channel: "commentary" as const,
+            text: "working",
+            done: false,
+          }, {
+            kind: "process" as const,
+            item_id: "steered-original-process",
+            processKind: "command" as const,
+            phase: "start" as const,
+            status: "running" as const,
+            turn_id: steeredNativeTurnId,
+            title: "original native work",
+            done: false,
+          }],
+          done: false,
+          ts: 1_000,
+        }],
+      },
+    },
+  };
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      sid: steeredTurnSid,
+      msg_id: "steered-follow-up",
+      turn_id: steeredNativeTurnId,
+      prompt: "change direction",
+      images: [{ media_type: "image/png", data: "steered-image" }],
+      files: [{ filename: "steered.txt" }],
+      ts: 11,
+    }),
+  });
+  const firstSteeredTurns = steeredTurnState.runtimes[steeredTurnSid].turns;
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].acceptancePending,
+    null,
+    "TurnSteered is the narrative acceptance boundary for the steer command",
+  );
+  assert.deepEqual(firstSteeredTurns.map((turn: Turn) => ({
+    id: turn.id,
+    prompt: turn.prompt,
+    done: turn.done,
+    forkPointId: turn.forkPointId,
+    liveTaskId: turn.liveTaskId,
+  })), [{
+    id: "steered-original",
+    prompt: "start the task",
+    done: true,
+    forkPointId: undefined,
+    liveTaskId: undefined,
+  }, {
+    id: "steered-follow-up",
+    prompt: "change direction",
+    done: false,
+    forkPointId: undefined,
+    liveTaskId: steeredNativeTurnId,
+  }], "TurnSteered atomically closes the prior segment and opens the steered one");
+  assert.equal(firstSteeredTurns[0].durationMs, 0);
+  assert.equal(firstSteeredTurns[0].doneTs, 11_000);
+  assert.ok(firstSteeredTurns[0].blocks.every((block: Block) => block.done),
+    "closing the old segment also settles every open block it owned");
+  assert.equal(firstSteeredTurns[1].images?.[0]?.data, "steered-image");
+  assert.deepEqual(firstSteeredTurns[1].files, [{
+    filename: "steered.txt", data: "",
+  }]);
+
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "process",
+      sid: steeredTurnSid,
+      item_id: "steered-native-process",
+      kind: "command",
+      phase: "start",
+      status: "running",
+      turn_id: steeredNativeTurnId,
+      title: "native work after steer",
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "assistant_msg_start",
+      sid: steeredTurnSid,
+      message_id: "steered-final",
+      channel: "final",
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "delta",
+      sid: steeredTurnSid,
+      message_id: "steered-final",
+      channel: "final",
+      text: "finished after steering",
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "assistant_msg_end",
+      sid: steeredTurnSid,
+      message_id: "steered-final",
+      channel: "final",
+    }),
+  });
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks.some(
+      (block: Block) => block.kind === "process"
+        && block.item_id === "steered-native-process"),
+    false,
+    "native task events after a steer must not route back to the old segment",
+  );
+  const latestSteered = steeredTurnState.runtimes[steeredTurnSid].turns[1];
+  assert.ok(latestSteered.blocks.some(
+    (block: Block) => block.kind === "process"
+      && block.item_id === "steered-native-process"));
+  assert.ok(latestSteered.blocks.some(
+    (block: Block) => block.kind === "text"
+      && block.channel === "final"
+      && block.text === "finished after steering"),
+  "the final answer after a steer belongs to the latest visible segment");
+
+  const beforeDuplicateSteer = JSON.stringify(
+    steeredTurnState.runtimes[steeredTurnSid].turns);
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      sid: steeredTurnSid,
+      msg_id: "steered-follow-up",
+      turn_id: steeredNativeTurnId,
+      prompt: "change direction",
+      images: [{ media_type: "image/png", data: "steered-image" }],
+      files: [{ filename: "steered.txt" }],
+      ts: 11,
+    }),
+  });
+  assert.equal(
+    JSON.stringify(steeredTurnState.runtimes[steeredTurnSid].turns),
+    beforeDuplicateSteer,
+    "a reliable duplicate TurnSteered cannot close or duplicate a segment",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: steeredTurnSid,
+      turn_id: steeredNativeTurnId,
+      result: { subtype: "success", duration_ms: 42, is_error: false },
+      ts: 12,
+    }),
+  });
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].forkPointId,
+    undefined,
+  );
+  assert.deepEqual(
+    {
+      done: steeredTurnState.runtimes[steeredTurnSid].turns[1].done,
+      forkPointId:
+        steeredTurnState.runtimes[steeredTurnSid].turns[1].forkPointId,
+      liveTaskId:
+        steeredTurnState.runtimes[steeredTurnSid].turns[1].liveTaskId,
+    },
+    { done: true, forkPointId: steeredNativeTurnId, liveTaskId: undefined },
+    "the native TurnEnd closes and binds only the latest steered segment",
+  );
+
+  const rejectedSteerSid = "codex-steer-rejected";
+  const rejectedSteerBefore: Turn = {
+    id: "still-running-after-rejection",
+    prompt: "keep working",
+    blocks: [{
+      kind: "text",
+      message_id: "still-running-message",
+      channel: "commentary",
+      text: "before rejection",
+      done: false,
+    }],
+    done: false,
+  };
+  let rejectedSteerState = {
+    ...initialState,
+    focusedSid: rejectedSteerSid,
+    runtimes: {
+      [rejectedSteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [rejectedSteerBefore],
+      },
+    },
+  };
+  rejectedSteerState = reduce(rejectedSteerState, {
+    type: "event", event: event({
+      type: "error",
+      sid: rejectedSteerSid,
+      msg_id: "rejected-steer-message",
+      code: "not_steerable",
+      message: "active turn cannot be steered",
+    }),
+  });
+  assert.deepEqual(
+    rejectedSteerState.runtimes[rejectedSteerSid].turns,
+    [rejectedSteerBefore],
+    "a rejected steer is a command problem and cannot close the active turn",
+  );
+  assert.equal(
+    rejectedSteerState.runtimes[rejectedSteerSid].state,
+    "running",
+  );
+  assert.ok(rejectedSteerState.banner);
+  rejectedSteerState = reduce(rejectedSteerState, {
+    type: "event", event: event({
+      type: "delta",
+      sid: rejectedSteerSid,
+      message_id: "still-running-message",
+      channel: "commentary",
+      text: " and after rejection",
+    }),
+  });
+  assert.equal(
+    rejectedSteerState.runtimes[rejectedSteerSid].turns.length,
+    1,
+  );
+  assert.equal(
+    rejectedSteerState.runtimes[rejectedSteerSid].turns[0].blocks[0].kind
+      === "text"
+      ? rejectedSteerState.runtimes[rejectedSteerSid].turns[0].blocks[0].text
+      : "",
+    "before rejection and after rejection",
+    "subsequent native deltas continue on the still-running segment",
+  );
+
   const duplicateSid = "duplicate-first-message";
   let duplicateState = reduce({
     ...initialState, focusedSid: duplicateSid,
@@ -1753,8 +2055,11 @@ try {
   assert.equal(detailState.runtimes[summarySid].turns.length, 1);
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoaded, true);
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, false);
-  assert.ok(detailState.runtimes[summarySid].turns[0].blocks.some(
+  assert.ok(detailState.runtimes[summarySid].turns[0].detailProjection?.blocks.some(
     (block: Block) => block.kind === "tool"));
+  assert.deepEqual(detailState.runtimes[summarySid].turns[0].blocks.map(
+    (block: Block) => block.kind), ["text"],
+  "heavy process blocks stay outside the bounded canonical summary");
   assert.equal(detailState.runtimes[summarySid].turns[0].blocks.filter(
     (block: Block) => block.kind === "text" && block.channel === "final").length, 1,
   "detail replaces the summary projection instead of duplicating its final text");
@@ -1778,9 +2083,71 @@ try {
     }],
   }) });
   assert.equal(refreshedSummary.runtimes[summarySid].turns[0].detailLoaded, true);
-  assert.ok(refreshedSummary.runtimes[summarySid].turns[0].blocks.some(
-    (block: Block) => block.kind === "tool"),
+  assert.ok(refreshedSummary.runtimes[summarySid].turns[0]
+    .detailProjection?.blocks.some((block: Block) => block.kind === "tool"),
   "a same-revision head refresh must not collapse detail the user opened");
+
+  const managedClaudeSid = "managed-claude-session";
+  const managedClaudeIdle = reduce({
+    ...initialState,
+    sessions: [{
+      session_id: managedClaudeSid,
+      engine: "claude",
+      space: "code",
+      summary: "managed Claude",
+      state: "running",
+    }],
+    runtimes: {
+      [managedClaudeSid]: {
+        ...createRuntime(),
+        state: "running",
+      },
+    },
+  }, { type: "event", event: event({
+    type: "state",
+    sid: managedClaudeSid,
+    seq: 44,
+    state: "idle",
+  }), ownership: {
+    scopeKey: "machine-a:code:claude",
+    machineId: "machine-a",
+    engine: "claude",
+    space: "code",
+    surfaceEpoch: 4,
+    connectionGeneration: 7,
+  } });
+  assert.equal(managedClaudeIdle.runtimes[managedClaudeSid].state, "idle");
+  assert.equal(managedClaudeIdle.sessions[0].state, "idle");
+  assert.equal(mergeSessionActivityState(
+    managedClaudeIdle.sessions[0].state,
+    managedClaudeIdle.runtimes[managedClaudeSid].state,
+  ), "idle",
+  "an authoritative managed-turn terminal clears a stale catalog running badge");
+  const wrongSurfaceTerminal = reduce({
+    ...managedClaudeIdle,
+    sessions: [{
+      ...managedClaudeIdle.sessions[0],
+      state: "running",
+    }],
+  }, { type: "event", event: event({
+    type: "state", sid: managedClaudeSid, seq: 45, state: "idle",
+  }), ownership: {
+    scopeKey: "machine-a:code:codex",
+    machineId: "machine-a",
+    engine: "codex",
+    space: "code",
+    surfaceEpoch: 5,
+    connectionGeneration: 7,
+  } });
+  assert.equal(wrongSurfaceTerminal.sessions[0].state, "running",
+    "a delayed lifecycle frame from another owned surface cannot clear this row");
+  const orphanBtwIdle = reduce(managedClaudeIdle, {
+    type: "event", event: event({
+      type: "state", sid: "btw-orphan", seq: 46, state: "idle",
+    }),
+  });
+  assert.deepEqual(orphanBtwIdle.sessions, managedClaudeIdle.sessions,
+    "a fork lifecycle frame cannot create a top-level sidebar row");
 
   const backgroundRunning = reduce({
     ...initialState,
@@ -3927,7 +4294,14 @@ try {
   }) });
   assert.equal(state.catalogDefault.claude, "claude-mythos-5");
   assert.equal(state.catalogDefaultEffort.claude, "max");
-  const { NewChatView } = await reducerHarness.ssrLoadModule(
+  const {
+    compatibleNewChatEffort,
+    newChatCatalogRequest,
+    newChatEfforts,
+    NewChatView,
+    reconcileNewChatSelection,
+    resolveNewChatLocalDefaults,
+  } = await reducerHarness.ssrLoadModule(
     "/src/components/NewChatView.tsx");
   const { WorkArtifactsSheet } = await reducerHarness.ssrLoadModule(
     "/src/components/WorkArtifactsSheet.tsx");
@@ -3935,13 +4309,100 @@ try {
     "/src/components/SessionsSidebar.tsx");
   const { BtwPanel } = await reducerHarness.ssrLoadModule(
     "/src/components/BtwPanel.tsx");
+  assert.deepEqual(
+    newChatCatalogRequest("claude", "code", "/repo"),
+    { engine: "claude", cwd: "/repo" },
+    "Claude Code defaults must be resolved against the new session cwd",
+  );
+  assert.equal(
+    newChatCatalogRequest("claude", "work", "/stale-code-cwd"),
+    null,
+    "Claude Work must not probe or inherit the Code cwd",
+  );
+  assert.deepEqual(
+    newChatCatalogRequest("codex", "work", "/ignored"),
+    { engine: "codex" },
+    "Codex keeps using its machine catalog without inventing a cwd scope",
+  );
+  assert.deepEqual(resolveNewChatLocalDefaults(
+    "claude", "code", "/repo",
+    { claude: "claude-sonnet-5" },
+    { claude: "high" },
+    { claude: "/repo" },
+  ), { model: "claude-sonnet-5", effort: "high" });
+  assert.deepEqual(resolveNewChatLocalDefaults(
+    "claude", "code", "/other",
+    { claude: "claude-sonnet-5" },
+    { claude: "high" },
+    { claude: "/repo" },
+  ), { model: null, effort: null },
+  "a late Claude default for another cwd must not label this form");
+  assert.deepEqual(resolveNewChatLocalDefaults(
+    "claude", "work", "/repo",
+    { claude: "claude-sonnet-5" },
+    { claude: "high" },
+    { claude: "/repo" },
+  ), { model: null, effort: null },
+  "Work ignores even a textually matching Code cwd default");
+
+  const liveNewChatCatalog = {
+    codex: [{
+      id: "gpt-future",
+      display_name: "GPT Future",
+      description: "dynamic catalog model",
+      efforts: ["low", "high"],
+      default_effort: "low",
+      is_default: true,
+    }],
+  };
+  assert.equal(compatibleNewChatEffort(
+    "codex", "gpt-future", "high", liveNewChatCatalog, null), "high");
+  assert.equal(compatibleNewChatEffort(
+    "codex", "gpt-future", "ultra", liveNewChatCatalog, null), null,
+  "switching models clears an unsupported explicit effort");
+  assert.equal(compatibleNewChatEffort(
+    "claude", null, "high", {}, "custom-provider-model"), null,
+  "an unknown local model cannot inherit a guessed effort capability");
+  assert.equal(compatibleNewChatEffort(
+    "codex", "gpt-future", null, liveNewChatCatalog, null), null,
+  "switching models never auto-selects the highest effort");
+  const zeroEffortCatalog = {
+    codex: [{
+      id: "gpt-no-effort",
+      display_name: "GPT No Effort",
+      description: "no reasoning override",
+      efforts: [],
+      default_effort: null,
+      is_default: true,
+    }],
+  };
+  assert.deepEqual(newChatEfforts(
+    "codex", "gpt-no-effort", zeroEffortCatalog), [],
+  "an authoritative empty effort list must not fall back to guessed levels");
+  assert.deepEqual(newChatEfforts("codex", null, {}), [],
+  "an unknown Codex default cannot expose unvalidated effort overrides");
+  assert.deepEqual(reconcileNewChatSelection(
+    "codex", "gpt-5.6-sol", "ultra", liveNewChatCatalog, "gpt-future",
+  ), { model: null, effort: null },
+  "an entitlement-filtered live catalog atomically clears a stale fallback selection");
+  assert.deepEqual(reconcileNewChatSelection(
+    "codex", "gpt-future", "high", liveNewChatCatalog, "gpt-future",
+  ), { model: "gpt-future", effort: "high" },
+  "an explicit selection that remains in the live catalog is preserved");
+
   const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
     cwd: "~", engine: "claude",
+    model: null, effort: null,
+    defaultModel: "claude-mythos-5", defaultEffort: "max",
+    onPickModel: () => {}, onPickEffort: () => {},
     onPickCwd: () => {},
     onSend: () => true,
   }));
   const codexNewChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
-    cwd: "~", engine: "codex",
+    cwd: "~", engine: "codex", catalog: liveNewChatCatalog,
+    model: null, effort: null,
+    defaultModel: "gpt-future", defaultEffort: "low",
+    onPickModel: () => {}, onPickEffort: () => {},
     onPickCwd: () => {},
     onSend: () => true,
   }));
@@ -3955,8 +4416,16 @@ try {
     assert.equal(
       (markup.match(/<button[^>]+aria-label="添加文件"/g) ?? []).length, 0);
     assert.match(markup, />开始</);
-    assert.doesNotMatch(markup, /本机默认|默认 ·|选择模型|思考强度/);
+    assert.match(markup, /title="选择模型"/);
+    assert.match(markup, /title="选择思考强度"/);
+    assert.match(markup, /本机默认/);
+    assert.match(markup, /默认/);
   }
+  assert.match(newChatMarkup, /本机默认 · Mythos 5/);
+  assert.match(newChatMarkup, /默认 · max/);
+  assert.match(codexNewChatMarkup, /本机默认 · GPT Future/);
+  assert.match(codexNewChatMarkup, /dynamic catalog model/,
+    "new-session selectors render the live Codex catalog when available");
   assert.doesNotMatch(codexNewChatMarkup, /不询问|Plan|标准/);
   const artifactsMarkup = renderToStaticMarkup(createElement(WorkArtifactsSheet, {
     open: true,
@@ -4024,11 +4493,12 @@ try {
     catalog: {},
     draftKey: "btw-render-draft",
     draftStore: btwDraftStore,
-    sendMode: "interrupt",
+    sendMode: "steer",
     allQueued: [{ prompt: "queued follow-up" }],
     replaceableQueued: [{ prompt: "queued follow-up" }],
     onTab: () => {},
     onSend: () => true,
+    onSteer: () => true,
     onInterrupt: () => {},
     onSetSendMode: () => {},
     onEnqueue: () => {},
@@ -4043,7 +4513,7 @@ try {
   assert.match(btwPanelMarkup, /GPT-5\.6 Terra/);
   assert.match(btwPanelMarkup, />high</);
   assert.match(btwPanelMarkup, /queued follow-up/);
-  assert.match(btwPanelMarkup, /打断并发送/);
+  assert.match(btwPanelMarkup, />引导</);
   assert.match(btwPanelMarkup, />排队</);
   assert.match(btwPanelMarkup, /aria-label="停止"/);
   state = { ...state,
@@ -5526,6 +5996,26 @@ const historyWithCwdFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(historyWithCwdFrame.type, "get_history");
 assert.equal(historyWithCwdFrame.session_id, "history-with-cwd");
 assert.equal(historyWithCwdFrame.cwd, "/project/from-list");
+assert.equal(relay.sendGetTurnDetail(
+  "history-with-cwd", "detail-turn", "detail-revision",
+  "detail-before-cursor", 48,
+), true);
+const pagedDetailFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.deepEqual({
+  type: pagedDetailFrame.type,
+  session_id: pagedDetailFrame.session_id,
+  turn_id: pagedDetailFrame.turn_id,
+  revision: pagedDetailFrame.revision,
+  before: pagedDetailFrame.before,
+  limit: pagedDetailFrame.limit,
+}, {
+  type: "get_turn_detail",
+  session_id: "history-with-cwd",
+  turn_id: "detail-turn",
+  revision: "detail-revision",
+  before: "detail-before-cursor",
+  limit: 48,
+}, "intra-turn detail paging carries its exact cursor and bounded page size");
 relay.sendGetFilePreview(
   "notes.md", "btw-preview-request", "btw-pinned",
 );
@@ -6581,5 +7071,173 @@ acceptanceReconnectSocket.receive({
 assert.equal(acceptanceRelay.pendingQueryFor("accept-wire-b"), null,
   "a matching appended native History head recovers an echo missed during reconnect");
 acceptanceRelay.stop();
+
+// Steer uses the same reliable outbox and narrative acceptance barrier as a
+// query, but always targets its explicit sid rather than the current focus.
+const steerRelay = new RelayWs({
+  onEvent: () => {},
+  onConnState: () => {},
+});
+steerRelay.start();
+const steerSocket = FakeWebSocket.instances.at(-1);
+assert.ok(steerSocket);
+steerSocket.onopen?.();
+steerRelay.setSessionEngines([
+  { session_id: "steer-target", engine: "codex", space: "code" },
+  { session_id: "steer-focused", engine: "codex", space: "code" },
+]);
+steerRelay.setFocusedSid("steer-focused", "codex", "code");
+const steerSentBeforeEmptyTarget = steerSocket.sent.length;
+assert.equal(steerRelay.sendSteerTo(
+  "", "must not follow focus", "steer-without-target"), false);
+assert.equal(steerSocket.sent.length, steerSentBeforeEmptyTarget,
+  "steer requires an explicit non-empty session id");
+assert.equal(steerRelay.sendSteerTo(
+  "steer-target",
+  "change the active task",
+  "steer-message",
+  [{ media_type: "image/png", data: "steer-wire-image" }],
+  [{ filename: "steer-wire.txt", data: "steer-wire-file" }],
+), true);
+const steerFrame = JSON.parse(steerSocket.sent.at(-1) ?? "{}");
+assert.deepEqual({
+  type: steerFrame.type,
+  sid: steerFrame.sid,
+  prompt: steerFrame.prompt,
+  msg_id: steerFrame.msg_id,
+  images: steerFrame.images,
+  files: steerFrame.files,
+}, {
+  type: "steer",
+  sid: "steer-target",
+  prompt: "change the active task",
+  msg_id: "steer-message",
+  images: [{ media_type: "image/png", data: "steer-wire-image" }],
+  files: [{ filename: "steer-wire.txt", data: "steer-wire-file" }],
+}, "sendSteerTo serializes the explicit target and complete payload");
+assert.equal(typeof steerFrame.client_id, "string");
+assert.equal(typeof steerFrame.cmd_id, "string");
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "a sent steer remains protected until its narrative acceptance arrives");
+assert.equal(steerRelay.pendingQueryFor("steer-focused"), null,
+  "the focused runtime cannot inherit another session's steer latch");
+assert.equal(steerRelay.sendSteerTo(
+  "steer-target", "must wait", "steer-message-2"), false,
+  "one target cannot queue a second direct steer before acceptance");
+
+(steerRelay as unknown as { connect: () => void }).connect();
+const steerReconnectSocket = FakeWebSocket.instances.at(-1);
+assert.ok(steerReconnectSocket && steerReconnectSocket !== steerSocket);
+steerReconnectSocket.onopen?.();
+const steerReplayFrames = steerReconnectSocket.sent.map(
+  (raw) => JSON.parse(raw) as Record<string, unknown>);
+assert.deepEqual(
+  steerReplayFrames.map((frame) => frame.type),
+  ["hello", "switch_session", "steer", "switch_session"],
+  "reconnect makes the steer target resident, replays its outbox frame, then restores focus",
+);
+assert.equal(steerReplayFrames[1].session_id, "steer-target");
+assert.equal(steerReplayFrames[2].sid, "steer-target");
+assert.equal(steerReplayFrames[2].cmd_id, steerFrame.cmd_id,
+  "outbox replay preserves the steer command identity for server deduplication");
+assert.equal(steerReplayFrames[3].session_id, "steer-focused");
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "the steer narrative latch survives automatic reconnect");
+
+steerReconnectSocket.receive({
+  type: "turn_steered",
+  sid: "steer-focused",
+  msg_id: "steer-message",
+  turn_id: "wrong-native-task",
+  prompt: "wrong target",
+});
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "a TurnSteered from another sid cannot release the target's latch");
+steerReconnectSocket.receive({
+  type: "command_ack",
+  client_id: steerFrame.client_id,
+  cmd_id: steerFrame.cmd_id,
+});
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "transport ACK removes the outbox frame but is not narrative steer acceptance");
+
+(steerRelay as unknown as { connect: () => void }).connect();
+const steerAckedReconnectSocket = FakeWebSocket.instances.at(-1);
+assert.ok(steerAckedReconnectSocket
+  && steerAckedReconnectSocket !== steerReconnectSocket);
+steerAckedReconnectSocket.onopen?.();
+assert.equal(
+  steerAckedReconnectSocket.sent.some((raw) =>
+    JSON.parse(raw).type === "steer"),
+  false,
+  "an ACKed steer is not replayed from the outbox on a later reconnect",
+);
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "the ACKed narrative latch still survives that later reconnect");
+steerAckedReconnectSocket.receive({
+  type: "turn_steered",
+  sid: "steer-target",
+  msg_id: "steer-message",
+  turn_id: "steer-native-task",
+  prompt: "change the active task",
+});
+assert.equal(steerRelay.pendingQueryFor("steer-target"), null,
+  "the exact TurnSteered echo is authoritative steer acceptance");
+steerRelay.stop();
+
+// A materialized steer alias is exact acceptance even on a cold socket with no
+// frozen History baseline. The native rollout id remains distinct from the
+// browser command id by design.
+const aliasSteerRelay = new RelayWs({
+  onEvent: () => {},
+  onConnState: () => {},
+});
+aliasSteerRelay.start();
+const aliasSteerSocket = FakeWebSocket.instances.at(-1);
+assert.ok(aliasSteerSocket);
+aliasSteerSocket.onopen?.();
+aliasSteerRelay.setFocusedSid("alias-steer", "codex", "code");
+assert.equal(aliasSteerRelay.sendSteerTo(
+  "alias-steer", "recover by alias", "alias-steer-message"), true);
+aliasSteerSocket.receive({
+  type: "history", sid: "alias-steer", session_id: "alias-steer",
+  revision: "alias-steer-revision", generation: "alias-steer-generation",
+  build_seq: 1, live_seq: 1, detail: "summary", events: [],
+  turns: [{
+    id: "native-steer-row",
+    clientMsgId: "alias-steer-message",
+    prompt: "recover by alias",
+    blocks: [],
+    done: false,
+    detailEventCount: 1,
+    detailLoaded: false,
+  }],
+  has_more: false,
+  oldest_id: "native-steer-row",
+  newest_id: "native-steer-row",
+});
+assert.equal(aliasSteerRelay.pendingQueryFor("alias-steer"), null,
+  "ConversationTurn.clientMsgId releases a cold steer acceptance latch");
+
+assert.equal(aliasSteerRelay.sendSteerTo(
+  "alias-steer", "recover from full events", "alias-event-message"), true);
+aliasSteerSocket.receive({
+  type: "history", sid: "alias-steer", session_id: "alias-steer",
+  revision: "alias-steer-revision-2", generation: "alias-steer-generation",
+  build_seq: 2, live_seq: 2, detail: "full",
+  events: [{
+    type: "user_msg",
+    msg_id: "native-event-row",
+    client_msg_id: "alias-event-message",
+    prompt: "recover from full events",
+  }],
+  turns: [],
+  has_more: false,
+  oldest_id: "native-event-row",
+  newest_id: "native-event-row",
+});
+assert.equal(aliasSteerRelay.pendingQueryFor("alias-steer"), null,
+  "UserMsg.client_msg_id releases a full-history steer acceptance latch");
+aliasSteerRelay.stop();
 
 console.log("web reliability tests passed");

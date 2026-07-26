@@ -16,6 +16,7 @@ import type {
   ProcessStatus, PlanEntry, CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, ConversationImageRef,
 } from "./protocol";
+import type { SendMode } from "./composer-submit";
 import {
   compareSessionControl, sessionControlLocksInput, sessionControlTargetsSid,
 } from "./protocol";
@@ -25,8 +26,13 @@ import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
 import { canEnqueueQuery, collectWaitingQueries, reduceTargetedRuntime } from "./runtime-drain";
 import {
-  historyContainsTurn, mergeAuthoritativeTurnDetail, mergeInitialHistory,
+  historyContainsTurn, installAuthoritativeTurnDetailPage,
+  mergeAuthoritativeTurnDetail, mergeInitialHistory,
 } from "./history-merge";
+import {
+  installTurnDetailProjectionPage,
+  type TurnDetailProjection,
+} from "./history-detail-projection";
 import {
   advanceHistoryRecovery,
   beginHistoryRecovery,
@@ -136,6 +142,8 @@ export const MAX_SESSION_NOTICES = 8;
 
 export interface Turn {
   id: string;
+  /** Codex turn/steer's browser id persisted beside a distinct history cursor. */
+  clientMsgId?: string;
   // A just-sent browser turn keeps its optimistic id so live deltas do not
   // remount. Canonical history images are addressed by the transcript's native
   // user id, which can differ until the next cold history rebuild.
@@ -149,6 +157,10 @@ export interface Turn {
   checkpointId?: string;
   /** @deprecated Read only while migrating CACHE_VER=5 entries. */
   codexTurnId?: string;
+  // Routing-only native task identity for a steered live segment. Unlike
+  // forkPointId, this must not make two user segments in one Codex task merge
+  // into one history turn. TurnEnd promotes it to the final segment's fork id.
+  liveTaskId?: string;
   prompt: string; // empty when we joined mid-turn (no user bubble rendered)
   blocks: Block[];
   done: boolean;
@@ -166,6 +178,14 @@ export interface Turn {
   detailEventCount?: number;
   detailLoaded?: boolean;
   detailLoading?: boolean;
+  detailHasMore?: boolean;
+  detailOldestCursor?: string | null;
+  detailHasNewer?: boolean;
+  detailNewerCursor?: string | null;
+  /** Heavy, cursor-paged process history; never subject to Turn.blocks caps. */
+  detailProjection?: TurnDetailProjection;
+  /** Initial disclosure click keeps fetching older pages until EOF or cap. */
+  detailAutoLoad?: boolean;
 }
 
 export interface PendingQuery {
@@ -295,6 +315,10 @@ export interface SessionRuntime {
   statusRequestId: string | null;
   statusError: string | null;
   notices: Notice[];
+  // Busy-send choice belongs to this session's composer. A choice made while
+  // reading one Codex task must not turn another session away from the default
+  // native steer behavior.
+  sendMode: SendMode;
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
   // Browser query accepted into the reliable outbox but not yet confirmed by
@@ -311,7 +335,6 @@ export interface AppState {
   artifact: Artifact | null;
   dirPicker: { path: string; parent: string | null; dirs: DirEntry[] } | null;
   cwdByScope: Record<string, string>;
-  sendMode: "interrupt" | "queue";
   // new-chat welcome page (global; only one new-chat flow at a time). model/effort
   // are the pre-selected values (null = use the wrapper's engine default).
   newChat: {
@@ -372,7 +395,7 @@ export function createRuntime(): SessionRuntime {
     pendingQuestion: null, contextReport: null,
     contextRequestId: null, contextError: null, goal: null,
     statusReport: null, statusRequestId: null, statusError: null,
-    notices: [],
+    notices: [], sendMode: "steer",
     queue: [], pendingSend: null, acceptancePending: null,
     acceptanceHistoryBaseline: null,
   };
@@ -387,7 +410,7 @@ export type Action =
   | { type: "dismiss_banner"; banner: string }
   | { type: "enqueue"; sid?: string; query: PendingQuery }
   | { type: "dequeue_at"; sid: string; i: number }
-  | { type: "set_send_mode"; mode: "interrupt" | "queue" }
+  | { type: "set_send_mode"; sid: string; mode: SendMode }
   | { type: "set_pending"; sid?: string; query: PendingQuery }
   | { type: "clear_pending"; sid: string }
   | { type: "set_model"; model: string }
@@ -410,15 +433,15 @@ export type Action =
   | { type: "restore_session_list"; sessions: SessionInfo[] }
   | { type: "set_session_pinned"; sid: string; pinned: boolean }
   | { type: "focus_session"; sid: string }
-  | { type: "turn_detail_requested"; sid: string; turnId: string }
+  | { type: "turn_detail_requested"; sid: string; turnId: string; before?: string | null }
   | { type: "begin_history_browse"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; basePageKey: string }
   | { type: "install_history_browse_page"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
   | { type: "install_history_browse_newer"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
   | { type: "history_browse_newer_settled"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; pageKey: string }
   | { type: "history_browse_newer_unavailable"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number }
   | { type: "history_browse_page_failed"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string }
-  | { type: "history_browse_detail_requested"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string }
-  | { type: "history_browse_detail"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; events: ServerEvent[] }
+  | { type: "history_browse_detail_requested"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; before?: string | null }
+  | { type: "history_browse_detail"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; events: ServerEvent[]; before?: string | null; hasMore?: boolean; oldestCursor?: string | null; hasNewer?: boolean; newerCursor?: string | null }
   | { type: "history_detail_cancelled"; context: HistoryDetailRequestContext }
   | { type: "return_to_latest"; sid: string }
   | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null }
@@ -430,6 +453,7 @@ export type Action =
   | { type: "clear_scope_cwd"; scopeKey: string }
   | { type: "set_new_chat_model"; model: string | null }
   | { type: "set_new_chat_effort"; effort: string | null }
+  | { type: "set_new_chat_selection"; model: string | null; effort: string | null }
   | { type: "exit_new_chat" };
 
 export const initialState: AppState = {
@@ -440,7 +464,6 @@ export const initialState: AppState = {
   artifact: null,
   dirPicker: null,
   cwdByScope: {},
-  sendMode: "interrupt",
   newChat: null,
   sessions: [],
   focusedSid: null,
@@ -474,7 +497,8 @@ function eventTimestampMs(ts: number | null | undefined): number | undefined {
 function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn | undefined {
   if (!id) return undefined;
   return [...turns].reverse().find((turn) =>
-    turn.id === id || turn.forkPointId === id || turn.codexTurnId === id
+    turn.id === id || turn.liveTaskId === id
+    || turn.forkPointId === id || turn.codexTurnId === id
     || turn.blocks.some((block) => block.kind === "process"
       && block.turn_id === id));
 }
@@ -746,6 +770,30 @@ function replaceWithBoundedTurns(runtime: SessionRuntime, turns: Turn[]): void {
   runtime.turns = bounded;
 }
 
+/** Translate one or more ordered detail pages without applying the live
+ * Turn.blocks count/byte window. The wrapper already bounds every wire page;
+ * the independent detail projection applies its own cumulative 4000/32 MiB
+ * guard after all retained pages have been decoded together. */
+function decodeTurnDetailEvents(
+  state: AppState,
+  sid: string,
+  turnId: string,
+  events: ServerEvent[],
+): Turn | undefined {
+  let scratch: AppState = {
+    ...state,
+    banner: undefined,
+    historyBrowse: null,
+    runtimes: { [sid]: createRuntime() },
+  };
+  for (const event of events) {
+    scratch = reduceEvent(scratch, event, false);
+  }
+  return (scratch.runtimes[sid]?.turns ?? []).find(
+    (turn) => canonicalTurnId(turn) === turnId || turn.id === turnId,
+  );
+}
+
 function turnHasUnfinishedWork(turn: Turn): boolean {
   return !turn.done || turn.blocks.some((block) => !block.done);
 }
@@ -995,7 +1043,7 @@ export function reduce(state: AppState, action: Action): AppState {
       return runtimes === state.runtimes ? state : { ...state, runtimes };
     }
     case "set_send_mode":
-      return { ...state, sendMode: action.mode };
+      return patch(state, action.sid, (rt) => { rt.sendMode = action.mode; });
     case "set_pending": {
       const targetSid = action.sid ?? state.focusedSid;
       const waiting = collectWaitingQueries(state.runtimes, targetSid);
@@ -1121,7 +1169,12 @@ export function reduce(state: AppState, action: Action): AppState {
       return patch(state, action.sid, (rt) => {
         rt.turns = rt.turns.map((turn) => (
           turn.id === action.turnId || canonicalTurnId(turn) === action.turnId)
-          ? { ...turn, detailLoading: true }
+          ? {
+              ...turn,
+              detailLoading: true,
+              detailAutoLoad: action.before == null
+                ? true : turn.detailAutoLoad,
+            }
           : turn);
       }, true);
     case "begin_history_browse": {
@@ -1139,7 +1192,13 @@ export function reduce(state: AppState, action: Action): AppState {
         revision: action.revision,
         generation: action.generation ?? runtime.historyGeneration,
         viewId: action.viewId,
-        baseTurns: runtime.turns,
+        // A runtime detail response is frozen to that target. Entering a
+        // separate browse projection must not copy its transient spinner: the
+        // response will finish the runtime row, while this view can request its
+        // own detail page later.
+        baseTurns: runtime.turns.map((turn) => turn.detailLoading
+          ? { ...turn, detailLoading: false }
+          : turn),
         basePageKey: action.basePageKey,
         hasOlder: !!runtime.hasMore,
         olderCursor: runtime.oldestId,
@@ -1283,7 +1342,7 @@ export function reduce(state: AppState, action: Action): AppState {
         browse, action.turnId, true, {
           expectedScopeKey: action.scopeKey,
           expectedViewId: action.viewId,
-        });
+        }, action.before == null ? true : undefined);
       return historyBrowse === browse ? state : { ...state, historyBrowse };
     }
     case "history_browse_detail": {
@@ -1296,32 +1355,49 @@ export function reduce(state: AppState, action: Action): AppState {
           || !browse.turns.some((turn) =>
             canonicalTurnId(turn) === action.turnId
             || turn.id === action.turnId)) return state;
-      let scratch: AppState = {
-        ...state,
-        banner: undefined,
-        historyBrowse: null,
-        runtimes: { [action.sid]: createRuntime() },
-      };
-      for (const event of action.events) {
-        scratch = reduceEvent(scratch, event, false);
+      const target = browse.turns.find((turn) =>
+        canonicalTurnId(turn) === action.turnId
+        || turn.id === action.turnId);
+      if (!target || action.events.length === 0) {
+        const historyBrowse = markBrowseDetailLoading(
+          browse, action.turnId, false, {
+            expectedScopeKey: action.scopeKey,
+            expectedViewId: action.viewId,
+          }, false);
+        return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
-      const detailed = (scratch.runtimes[action.sid]?.turns ?? []).find(
-        (turn) => canonicalTurnId(turn) === action.turnId
-          || turn.id === action.turnId,
+      const installed = installTurnDetailProjectionPage(
+        target.detailProjection,
+        {
+          before: action.before,
+          events: action.events,
+          hasMore: action.hasMore,
+          oldestCursor: action.oldestCursor,
+          hasNewer: action.hasNewer,
+          newerCursor: action.newerCursor,
+        },
+        (events) => decodeTurnDetailEvents(
+          state, action.sid, action.turnId, events),
       );
+      const detailed = installed.detail;
       if (!detailed) {
         const historyBrowse = markBrowseDetailLoading(
           browse, action.turnId, false, {
             expectedScopeKey: action.scopeKey,
             expectedViewId: action.viewId,
-          });
+          }, false);
         return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
       const historyBrowse = markBrowseDetail(
-        browse, action.turnId, withLimitedTurnBlocks(detailed), {
+        browse, action.turnId, detailed, {
+          hasMore: !!action.hasMore,
+          oldestCursor: action.oldestCursor,
+          hasNewer: !!action.hasNewer,
+          newerCursor: action.newerCursor,
+        }, {
           expectedScopeKey: action.scopeKey,
           expectedViewId: action.viewId,
-        });
+        }, installed.projection);
       return historyBrowse === browse ? state : { ...state, historyBrowse };
     }
     case "history_detail_cancelled": {
@@ -1337,7 +1413,7 @@ export function reduce(state: AppState, action: Action): AppState {
           browse, context.turnId, false, {
             expectedScopeKey: context.scopeKey,
             expectedViewId: context.viewId,
-          });
+          }, false);
         return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
       const runtime = state.runtimes[context.sid];
@@ -1346,7 +1422,7 @@ export function reduce(state: AppState, action: Action): AppState {
         rt.turns = rt.turns.map((turn) => (
           turn.id === context.turnId
             || canonicalTurnId(turn) === context.turnId)
-          ? { ...turn, detailLoading: false }
+          ? { ...turn, detailLoading: false, detailAutoLoad: false }
           : turn);
       }, true);
     }
@@ -1421,6 +1497,12 @@ export function reduce(state: AppState, action: Action): AppState {
       return state.newChat ? { ...state, newChat: { ...state.newChat, model: action.model } } : state;
     case "set_new_chat_effort":
       return state.newChat ? { ...state, newChat: { ...state.newChat, effort: action.effort } } : state;
+    case "set_new_chat_selection":
+      return state.newChat ? { ...state, newChat: {
+        ...state.newChat,
+        model: action.model,
+        effort: action.effort,
+      } } : state;
     case "exit_new_chat":
       return { ...state, newChat: null };
     case "event":
@@ -1821,6 +1903,7 @@ function reduceEvent(
       if (e.detail === "summary" && Array.isArray(e.turns)) {
         built.turns = e.turns.map((turn) => ({
           ...turn,
+          clientMsgId: turn.clientMsgId ?? undefined,
           blocks: turn.blocks as Turn["blocks"],
           forkPointId: turn.forkPointId ?? undefined,
           checkpointId: turn.checkpointId ?? undefined,
@@ -2027,7 +2110,8 @@ function reduceEvent(
         !!acceptedNativeTurnId
         || built.turns.some((turn) => turn.id === base.acceptancePending)
         || e.events.some((ev) => (
-          (ev.type === "user_msg" || ev.type === "turn_binding"
+          (ev.type === "user_msg" || ev.type === "turn_steered"
+            || ev.type === "turn_binding"
             || (ev.type === "error" && ev.code !== "wrapper_offline"))
           && ev.msg_id === base.acceptancePending
         ))
@@ -2148,23 +2232,34 @@ function reduceEvent(
         });
         return next;
       }
-      let scratch: AppState = {
-        ...state,
-        banner: undefined,
-        runtimes: { [sid]: createRuntime() },
-      };
-      for (const event of e.events) {
-        scratch = reduceEvent(scratch, event as ServerEvent, false);
+      const target = base.turns.find((turn) => turn.id === e.turn_id
+        || canonicalTurnId(turn) === e.turn_id);
+      if (!target || e.events.length === 0) {
+        return patch(state, sid, (rt) => {
+          rt.turns = rt.turns.map((turn) => (
+            turn.id === e.turn_id || canonicalTurnId(turn) === e.turn_id)
+            ? { ...turn, detailLoading: false, detailAutoLoad: false }
+            : turn);
+        });
       }
-      const detailed = (scratch.runtimes[sid]?.turns ?? []).find(
-        (turn) => turn.id === e.turn_id
-          || canonicalTurnId(turn) === e.turn_id,
+      const installed = installTurnDetailProjectionPage(
+        target.detailProjection,
+        {
+          before: e.before,
+          events: e.events as ServerEvent[],
+          hasMore: e.has_more,
+          oldestCursor: e.oldest_cursor,
+          hasNewer: e.has_newer,
+          newerCursor: e.newer_cursor,
+        },
+        (events) => decodeTurnDetailEvents(state, sid, e.turn_id, events),
       );
+      const detailed = installed.detail;
       if (!detailed) {
         return patch(state, sid, (rt) => {
           rt.turns = rt.turns.map((turn) => (
             turn.id === e.turn_id || canonicalTurnId(turn) === e.turn_id)
-            ? { ...turn, detailLoading: false }
+            ? { ...turn, detailLoading: false, detailAutoLoad: false }
             : turn);
         });
       }
@@ -2172,18 +2267,17 @@ function reduceEvent(
         rt.turns = rt.turns.map((turn) => {
           if (turn.id !== e.turn_id
               && canonicalTurnId(turn) !== e.turn_id) return turn;
-          return withLimitedTurnBlocks({
-            ...turn,
-            ...detailed,
-            id: turn.id,
-            prompt: detailed.prompt || turn.prompt,
-            images: detailed.images ?? turn.images,
-            imageRefs: detailed.imageRefs ?? turn.imageRefs,
-            files: detailed.files ?? turn.files,
-            detailEventCount: turn.detailEventCount,
-            detailLoaded: true,
-            detailLoading: false,
-          });
+          return installAuthoritativeTurnDetailPage(
+            turn,
+            detailed,
+            {
+              hasMore: !!e.has_more,
+              oldestCursor: e.oldest_cursor,
+              hasNewer: !!e.has_newer,
+              newerCursor: e.newer_cursor,
+            },
+            installed.projection,
+          );
         });
       });
     }
@@ -2324,8 +2418,8 @@ function reduceEvent(
           },
         },
       } };
-    case "state":
-      return patch(state, e.sid, (rt) => {
+    case "state": {
+      const next = patch(state, e.sid, (rt) => {
         rt.state = e.state;
         if (typeof e.seq === "number") {
           rt.lastLifecycleSeq = Math.max(rt.lastLifecycleSeq, e.seq);
@@ -2346,6 +2440,20 @@ function reduceEvent(
         }
         rt.turns = turns;
       });
+      let changed = false;
+      const sessions = next.sessions.map((session) => {
+        if (session.session_id !== e.sid || session.state === e.state) {
+          return session;
+        }
+        if (ownership && (
+          (session.engine && session.engine !== ownership.engine)
+          || (session.space && session.space !== ownership.space)
+        )) return session;
+        changed = true;
+        return { ...session, state: e.state };
+      });
+      return changed ? { ...next, sessions } : next;
+    }
     case "session_control":
       // Direct control events require an explicit runtime key. Snapshot and
       // History controls are routed by their outer envelope above.
@@ -2547,6 +2655,13 @@ function reduceEvent(
           });
         }
       }
+      if ((e.code === "not_steerable"
+          || e.code === "steer_outcome_unknown") && e.msg_id) {
+        // A rejected steer is a control failure, not the terminal state of the
+        // still-running native turn. Never fabricate an empty failed turn that
+        // would steal subsequent deltas from the active segment.
+        return { ...state, banner: presentCommandProblem(e) };
+      }
       if (!e.msg_id) {
         return { ...state, banner: presentCommandProblem(e) };
       }
@@ -2607,6 +2722,69 @@ function reduceEvent(
         : next.sessions;
       return sessions === next.sessions ? next : { ...next, sessions };
     }
+    case "turn_steered": {
+      const next = patch(state, e.sid, (rt) => {
+        if (rt.acceptancePending === e.msg_id) {
+          rt.acceptancePending = null;
+          rt.acceptanceHistoryBaseline = null;
+        }
+        markTurnAsLive(rt, e.msg_id, boundCompletedTurns, e.seq);
+        const turns = cloneTurns(rt.turns);
+        const imgs = (e.images && e.images.length) ? e.images : undefined;
+        const fileMeta = (e.files && e.files.length)
+          ? e.files.map((file) => ({ filename: file.filename, data: "" }))
+          : undefined;
+        const stamp = eventTimestampMs(e.ts);
+        const existing = turns.find((turn) =>
+          turn.id === e.msg_id || turn.clientMsgId === e.msg_id);
+        if (existing) {
+          // Reliable-command replay can deliver the correlated narrative frame
+          // again after reconnect. Refresh metadata without closing another
+          // segment or duplicating the user bubble.
+          existing.prompt ||= e.prompt;
+          existing.images ??= imgs;
+          if (fileMeta) existing.files = fileMeta;
+          existing.ts ??= stamp;
+          existing.clientMsgId ??= e.msg_id;
+          existing.liveTaskId ??= e.turn_id;
+          rt.turns = turns;
+          return;
+        }
+
+        const previous = [...turns].reverse().find((turn) => !turn.done);
+        if (previous) {
+          previous.done = true;
+          previous.durationMs = 0;
+          previous.doneTs = stamp ?? Date.now();
+          previous.progress = undefined;
+          // Before steer, TurnBinding temporarily attached the native task to
+          // the first visible segment. The task's real fork boundary belongs to
+          // the final segment after all steered input has run.
+          if (previous.forkPointId === e.turn_id) {
+            previous.forkPointId = undefined;
+          }
+          previous.liveTaskId = undefined;
+          finishOpenBlocks(previous, "succeeded", false);
+        }
+        turns.push({
+          id: e.msg_id,
+          clientMsgId: e.msg_id,
+          liveTaskId: e.turn_id,
+          prompt: e.prompt,
+          images: imgs,
+          files: fileMeta,
+          blocks: [],
+          done: false,
+          ts: stamp,
+        });
+        if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
+        else rt.turns = turns;
+      }, true);
+      const sessions = e.sid
+        ? bumpSessionActivity(next.sessions, e.sid, Math.round(e.ts * 1000))
+        : next.sessions;
+      return sessions === next.sessions ? next : { ...next, sessions };
+    }
     case "assistant_msg_start":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
@@ -2619,7 +2797,7 @@ function reduceEvent(
         else {
           t.blocks.push({ kind: "text", message_id: e.message_id, text: "",
             done: false, channel: e.channel ?? "unknown" });
-          limitTurnBlocks(t);
+          if (boundCompletedTurns) limitTurnBlocks(t);
         }
         rt.turns = turns;
       });
@@ -2634,11 +2812,11 @@ function reduceEvent(
           block = { kind: "text", message_id: e.message_id, text: "", done: false,
             channel: e.channel ?? "unknown" };
           t.blocks.push(block);
-          limitTurnBlocks(t);
+          if (boundCompletedTurns) limitTurnBlocks(t);
         }
         block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
         block.text = appendField(block.text, e.text, MAX_LIVE_TEXT_CHARS);
-        limitTurnBlocks(t);
+        if (boundCompletedTurns) limitTurnBlocks(t);
         rt.turns = turns;
       });
     case "tool_use":
@@ -2661,7 +2839,7 @@ function reduceEvent(
             tool_use_id: e.tool_use_id, tool: e.tool, input: e.input,
             category: e.category ?? "tool", title: e.title, parent_id: e.parent_id,
             server: e.server, done: false });
-          limitTurnBlocks(t);
+          if (boundCompletedTurns) limitTurnBlocks(t);
         }
         rt.turns = turns;
       });
@@ -2683,7 +2861,7 @@ function reduceEvent(
               block.output, e.delta, MAX_LIVE_TOOL_OUTPUT_CHARS);
           }
           t.progress = undefined;
-          limitTurnBlocks(t);
+          if (boundCompletedTurns) limitTurnBlocks(t);
           break;
         }
         rt.turns = turns;
@@ -2702,7 +2880,7 @@ function reduceEvent(
             if (e.diff) b.diff = e.diff;
             b.done = true;
             t.progress = undefined;
-            limitTurnBlocks(t);
+            if (boundCompletedTurns) limitTurnBlocks(t);
             break;
           }
         }
@@ -2788,7 +2966,7 @@ function reduceEvent(
         }
         block.done = e.phase === "end" || terminalProcessStatus(e.status);
         owner.progress = undefined;
-        limitTurnBlocks(owner);
+        if (boundCompletedTurns) limitTurnBlocks(owner);
         rt.turns = turns;
       });
     case "turn_plan":
@@ -2815,7 +2993,7 @@ function reduceEvent(
           ? "succeeded" : "running";
         block.done = block.status === "succeeded";
         t.progress = undefined;
-        limitTurnBlocks(t);
+        if (boundCompletedTurns) limitTurnBlocks(t);
         rt.turns = turns;
       });
     case "turn_diff":
@@ -2839,7 +3017,7 @@ function reduceEvent(
         block.diff = e.diff;
         block.truncated = e.truncated;
         t.progress = undefined;
-        limitTurnBlocks(t);
+        if (boundCompletedTurns) limitTurnBlocks(t);
         rt.turns = turns;
       });
     case "turn_binding":
@@ -2867,7 +3045,8 @@ function reduceEvent(
           turns.splice(second, 1);
           turns.splice(first, 1, merged);
         }
-        replaceWithBoundedTurns(rt, turns);
+        if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
+        else rt.turns = turns;
       });
     case "turn_end":
       return patch(state, e.sid, (rt) => {
@@ -2888,7 +3067,10 @@ function reduceEvent(
           }
           t.done = true;
           t.durationMs = e.result.duration_ms;
-          if (e.turn_id) t.forkPointId = e.turn_id;
+          if (e.turn_id) {
+            t.forkPointId = e.turn_id;
+            t.liveTaskId = undefined;
+          }
           if (e.checkpoint_id) t.checkpointId = e.checkpoint_id;
           t.progress = undefined;
           if (e.result.subtype === "error_during_execution") t.interrupted = true;

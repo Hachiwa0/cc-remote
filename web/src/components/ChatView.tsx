@@ -57,7 +57,10 @@ import {
   ScrollCoordinator,
   type ScrollCommand,
 } from "../scroll-coordinator";
-import { HISTORY_REQUEST_TIMEOUT_MS } from "../history-requests";
+import {
+  HISTORY_DETAIL_REQUEST_TIMEOUT_MS,
+  HISTORY_REQUEST_TIMEOUT_MS,
+} from "../history-requests";
 
 const WHEEL_GESTURE_IDLE_MS = 180;
 const HISTORY_VIRTUAL_ESTIMATE_PX = 280;
@@ -69,6 +72,11 @@ const USER_SCROLL_INTENT_IDLE_MS = 260;
 // local anchor just after that boundary so an unanswered command cannot lock
 // pagination forever.
 const HISTORY_PAGE_REQUEST_TIMEOUT_MS = HISTORY_REQUEST_TIMEOUT_MS + 1_000;
+// Keep the exact process edge until all synchronous and shortly-delayed
+// Markdown/image measurements settle, but never pin a huge virtual row
+// indefinitely after a successful detail response.
+const DETAIL_ANCHOR_QUIET_MS = 300;
+const DETAIL_ANCHOR_MAX_SETTLE_MS = 2_000;
 
 type UserScrollDirection = "history" | "latest" | "unknown";
 
@@ -82,6 +90,27 @@ interface RetainedMeasurementBoundary {
   viewId: string;
   turnId: string;
   anchorOffset: number;
+}
+
+type DetailPageDirection = "initial" | "older" | "newer";
+type DetailAnchorEdge = "start" | "end";
+
+interface DetailAnchorTransaction {
+  scope: string;
+  turnId: string;
+  edge: DetailAnchorEdge;
+  anchorOffset: number;
+  token: number;
+  initialFingerprint: string;
+  sawLoading: boolean;
+  responseSettled: boolean;
+  requestTimer: number | null;
+  quietTimer: number | null;
+  maxSettleTimer: number | null;
+  firstFrame: number | null;
+  secondFrame: number | null;
+  observer: ResizeObserver | null;
+  observedNode: HTMLElement | null;
 }
 
 interface HistoryPageLoadAcceptance {
@@ -104,6 +133,20 @@ function formatTime(ts: number): string {
   const d = new Date(ts);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function detailTurnFingerprint(turn: Turn): string {
+  return [
+    turn.detailLoaded ? "1" : "0",
+    turn.detailOldestCursor ?? "",
+    turn.detailNewerCursor ?? "",
+    turn.detailHasMore ? "1" : "0",
+    turn.detailHasNewer ? "1" : "0",
+    turn.detailAutoLoad ? "1" : "0",
+    turn.detailProjection?.segments.length ?? 0,
+    turn.detailProjection?.blocks.length ?? 0,
+    turn.blocks.length,
+  ].join("\u0000");
 }
 
 function HistoryUserImage({ turnId, imageId, width, height, asset, fallback, onLoad,
@@ -177,7 +220,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onLoadMore?: (anchorTurnId?: string) => HistoryPageLoadResult;
   onLoadNewer?: (anchorTurnId?: string) => HistoryPageLoadResult;
   onReturnLatest?: () => void;
-  onLoadDetail?: (turnId: string) => void;
+  onLoadDetail?: (turnId: string, before?: string | null) => boolean;
   onEdit?: (prompt: string) => void;
   onGetDiff?: (file: string) => void;
   onOpenTurnDiff?: (files: string[], diff: string) => void;
@@ -215,6 +258,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     windowEpoch: number;
   } | null>(null);
   const turnNodeRefs = useRef(new Map<string, HTMLDivElement>());
+  const detailAnchorRef = useRef<DetailAnchorTransaction | null>(null);
+  const cancelDetailAnchorFnRef = useRef<
+    ((releaseInteraction?: boolean) => void) | null
+  >(null);
   const historyReleaseFrameRef = useRef<number | null>(null);
   const historyRequestTimeoutRef = useRef<{
     generation: number | null;
@@ -318,6 +365,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       turnId: activeHistoryAnchor.anchorTurnId,
       anchorOffset: activeHistoryAnchor.anchorOffset,
     } : null);
+  const activeDetailAnchor = detailAnchorRef.current?.scope === scrollScope
+    ? detailAnchorRef.current : null;
   // Read the epoch so pointer interaction changes synchronously reconfigure
   // the virtualizer even when no other chat state changed.
   void scrollPolicyEpoch;
@@ -337,11 +386,16 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     overscan: HISTORY_VIRTUAL_OVERSCAN,
     rangeExtractor: (range) => {
       const indexes = defaultRangeExtractor(range);
-      const boundaryIndex = retainedMeasurementBoundary
+      const retainedIndexes = new Set(indexes);
+      const historyBoundaryIndex = retainedMeasurementBoundary
         ? turns.findIndex((turn) => turn.id === retainedMeasurementBoundary.turnId)
         : -1;
-      if (boundaryIndex < 0 || indexes.includes(boundaryIndex)) return indexes;
-      return [...indexes, boundaryIndex].sort((left, right) => left - right);
+      const detailBoundaryIndex = activeDetailAnchor
+        ? turns.findIndex((turn) => turn.id === activeDetailAnchor.turnId)
+        : -1;
+      if (historyBoundaryIndex >= 0) retainedIndexes.add(historyBoundaryIndex);
+      if (detailBoundaryIndex >= 0) retainedIndexes.add(detailBoundaryIndex);
+      return [...retainedIndexes].sort((left, right) => left - right);
     },
     gap: HISTORY_TURN_GAP_PX,
     paddingStart: historyTopInset,
@@ -351,7 +405,19 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   const measurementBoundaryIndex = retainedMeasurementBoundary
     ? turns.findIndex((turn) => turn.id === retainedMeasurementBoundary.turnId)
     : -1;
-  if (!virtualScrollPolicy.allowResizeAdjustment) {
+  const detailBoundaryIndex = activeDetailAnchor
+    ? turns.findIndex((turn) => turn.id === activeDetailAnchor.turnId)
+    : -1;
+  if (detailBoundaryIndex >= 0 && activeDetailAnchor) {
+    // The detail transaction owns the residual exact-edge correction. TanStack
+    // still compensates measurements wholly before a start edge, or through
+    // the replaced row for an end edge, so unrelated late image/Markdown
+    // measurements do not move the retained reading point.
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item) =>
+      activeDetailAnchor.edge === "end"
+        ? item.index <= detailBoundaryIndex
+        : item.index < detailBoundaryIndex;
+  } else if (!virtualScrollPolicy.allowResizeAdjustment) {
     virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
   } else if (!scrollState.followOutput && measurementBoundaryIndex >= 0) {
     // TanStack remains the sole scroll writer. This predicate only tells it
@@ -362,12 +428,28 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
   }
 
-  const measureTurnOffset = (turnId: string): number | null => {
+  const measureTurnOffset = useCallback((turnId: string): number | null => {
     const el = scrollRef.current;
     const node = turnNodeRefs.current.get(turnId);
     if (!el || !node) return null;
     return node.getBoundingClientRect().top - el.getBoundingClientRect().top;
-  };
+  }, []);
+
+  const measureDetailEdge = useCallback((
+    turnId: string,
+    edge: DetailAnchorEdge,
+  ): number | null => {
+    const el = scrollRef.current;
+    const turnNode = turnNodeRefs.current.get(turnId);
+    if (!el || !turnNode) return null;
+    const processNode = turnNode.querySelector<HTMLElement>(
+      "[data-process-detail-root]",
+    ) ?? turnNode;
+    const viewportRect = el.getBoundingClientRect();
+    const processRect = processNode.getBoundingClientRect();
+    return (edge === "end" ? processRect.bottom : processRect.top)
+      - viewportRect.top;
+  }, []);
 
   const captureHistoryBoundary = (): CapturedHistoryBoundary | null => {
     const el = scrollRef.current;
@@ -752,6 +834,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       wheelHistoryLoadGateRef.current.complete();
       wheelHistoryLoadGateRef.current.endGesture();
       setMeasurementBoundary(null);
+      cancelDetailAnchorFnRef.current?.(false);
       applyScrollCommand(scrollCoordinatorRef.current.reset());
       syncScrollState(browseMode
         ? controller.pause(readScrollMetrics(el))
@@ -782,12 +865,17 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       if (userScrollIntentTimerRef.current !== null) {
         window.clearTimeout(userScrollIntentTimerRef.current);
       }
+      cancelDetailAnchorFnRef.current?.(false);
     };
   }, [cancelHistoryAnchor, clearHistoryRequestTimeout]);
 
   useEffect(() => setZoom(null), [sid]);
 
   const markUserScrollIntent = (direction: UserScrollDirection) => {
+    // A real wheel/touch/key/pointer action transfers ownership back to the
+    // reader. Late detail responses and ResizeObserver callbacks must not pull
+    // the viewport back to the edge captured before that gesture.
+    cancelDetailAnchorFnRef.current?.();
     setMeasurementBoundary(null);
     userScrollIntentRef.current = true;
     userScrollDirectionRef.current = direction;
@@ -1031,6 +1119,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     const el = scrollRef.current;
     const controller = controllerRef.current;
     if (!el || !controller) return;
+    cancelDetailAnchorFnRef.current?.();
     cancelHistoryAnchor();
     historyRequestRef.current = null;
     setMeasurementBoundary(null);
@@ -1045,6 +1134,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       scrollToBottom();
       return;
     }
+    cancelDetailAnchorFnRef.current?.();
     cancelHistoryAnchor();
     historyRequestRef.current = null;
     setMeasurementBoundary(null);
@@ -1073,6 +1163,220 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     }
   }, [applyScrollCommand]);
 
+  const disposeDetailResources = useCallback((
+    transaction: DetailAnchorTransaction,
+  ): void => {
+    if (transaction.requestTimer !== null) {
+      window.clearTimeout(transaction.requestTimer);
+      transaction.requestTimer = null;
+    }
+    if (transaction.quietTimer !== null) {
+      window.clearTimeout(transaction.quietTimer);
+      transaction.quietTimer = null;
+    }
+    if (transaction.maxSettleTimer !== null) {
+      window.clearTimeout(transaction.maxSettleTimer);
+      transaction.maxSettleTimer = null;
+    }
+    if (transaction.firstFrame !== null) {
+      window.cancelAnimationFrame(transaction.firstFrame);
+      transaction.firstFrame = null;
+    }
+    if (transaction.secondFrame !== null) {
+      window.cancelAnimationFrame(transaction.secondFrame);
+      transaction.secondFrame = null;
+    }
+    transaction.observer?.disconnect();
+    transaction.observer = null;
+    transaction.observedNode = null;
+  }, []);
+
+  const releaseDetailAnchor = useCallback((
+    releaseInteraction = true,
+  ): void => {
+    const transaction = detailAnchorRef.current;
+    if (!transaction) return;
+    detailAnchorRef.current = null;
+    disposeDetailResources(transaction);
+    if (releaseInteraction) {
+      endProcessInteraction(transaction.token);
+    }
+  }, [disposeDetailResources, endProcessInteraction]);
+  cancelDetailAnchorFnRef.current = releaseDetailAnchor;
+
+  const scheduleDetailCorrection = useCallback((
+    transaction: DetailAnchorTransaction,
+  ): void => {
+    if (detailAnchorRef.current !== transaction) return;
+    if (transaction.quietTimer !== null) {
+      window.clearTimeout(transaction.quietTimer);
+      transaction.quietTimer = null;
+    }
+    if (transaction.firstFrame !== null
+        || transaction.secondFrame !== null) return;
+    transaction.firstFrame = window.requestAnimationFrame(() => {
+      transaction.firstFrame = null;
+      if (detailAnchorRef.current !== transaction) return;
+      transaction.secondFrame = window.requestAnimationFrame(() => {
+        transaction.secondFrame = null;
+        if (detailAnchorRef.current !== transaction) return;
+        if (userScrollIntentRef.current || touchYRef.current !== null) {
+          releaseDetailAnchor();
+          return;
+        }
+        const el = scrollRef.current;
+        const currentOffset = measureDetailEdge(
+          transaction.turnId, transaction.edge,
+        );
+        if (el && currentOffset != null) {
+          const delta = currentOffset - transaction.anchorOffset;
+          if (Math.abs(delta) > 0.5) {
+            applyScrollCommand(
+              scrollCoordinatorRef.current.requestInteractionOffset(
+                transaction.token,
+                el.scrollTop + delta,
+              ),
+            );
+          }
+        }
+        if (transaction.responseSettled) {
+          transaction.quietTimer = window.setTimeout(() => {
+            transaction.quietTimer = null;
+            if (detailAnchorRef.current === transaction) {
+              releaseDetailAnchor();
+            }
+          }, DETAIL_ANCHOR_QUIET_MS);
+        }
+      });
+    });
+  }, [applyScrollCommand, measureDetailEdge, releaseDetailAnchor]);
+
+  const requestProcessDetail = useCallback((
+    turnId: string,
+    before: string | null | undefined,
+    direction: DetailPageDirection,
+  ): boolean => {
+    if (!onLoadDetail) return false;
+    const edge: DetailAnchorEdge = direction === "newer" ? "end" : "start";
+    const anchorOffset = measureDetailEdge(turnId, edge);
+    const turn = turns.find((candidate) => candidate.id === turnId);
+    if (anchorOffset == null || !turn || !onLoadDetail(turnId, before)) {
+      return false;
+    }
+
+    // The request has been accepted, so this is now an explicit reading
+    // action. Freeze the exact process edge only after acceptance; rejected
+    // clicks leave the previous follow intent untouched.
+    pauseOutputFollow();
+    const token = scrollCoordinatorRef.current.beginInteraction(false);
+    const previous = detailAnchorRef.current;
+    if (previous) {
+      detailAnchorRef.current = null;
+      disposeDetailResources(previous);
+      // The new token already holds the viewport, so releasing the old token
+      // cannot replay a pending bottom command between transactions.
+      endProcessInteraction(previous.token);
+    }
+    const transaction: DetailAnchorTransaction = {
+      scope: scrollScope,
+      turnId,
+      edge,
+      anchorOffset,
+      token,
+      initialFingerprint: detailTurnFingerprint(turn),
+      sawLoading: false,
+      responseSettled: false,
+      requestTimer: null,
+      quietTimer: null,
+      maxSettleTimer: null,
+      firstFrame: null,
+      secondFrame: null,
+      observer: null,
+      observedNode: null,
+    };
+    transaction.requestTimer = window.setTimeout(() => {
+      if (detailAnchorRef.current === transaction) releaseDetailAnchor();
+    }, HISTORY_DETAIL_REQUEST_TIMEOUT_MS + 1_000);
+    detailAnchorRef.current = transaction;
+    setScrollPolicyEpoch((value) => value + 1);
+    return true;
+  }, [
+    disposeDetailResources, endProcessInteraction, measureDetailEdge,
+    onLoadDetail, pauseOutputFollow, releaseDetailAnchor, scrollScope, turns,
+  ]);
+
+  useLayoutEffect(() => {
+    const transaction = detailAnchorRef.current;
+    if (!transaction || transaction.scope !== scrollScope) return;
+    const turn = turns.find((candidate) => candidate.id === transaction.turnId);
+    if (!turn) {
+      releaseDetailAnchor();
+      return;
+    }
+    if (turn.detailLoading) {
+      transaction.sawLoading = true;
+      transaction.responseSettled = false;
+      if (transaction.quietTimer !== null) {
+        window.clearTimeout(transaction.quietTimer);
+        transaction.quietTimer = null;
+      }
+      if (transaction.maxSettleTimer !== null) {
+        window.clearTimeout(transaction.maxSettleTimer);
+        transaction.maxSettleTimer = null;
+      }
+      if (transaction.requestTimer !== null) {
+        window.clearTimeout(transaction.requestTimer);
+      }
+      // Automatic "load the whole process" may span many bounded responses.
+      // Each accepted next page refreshes this inactivity timeout.
+      transaction.requestTimer = window.setTimeout(() => {
+        if (detailAnchorRef.current === transaction) releaseDetailAnchor();
+      }, HISTORY_DETAIL_REQUEST_TIMEOUT_MS + 1_000);
+      return;
+    }
+    const fingerprint = detailTurnFingerprint(turn);
+    if (!transaction.sawLoading
+        && fingerprint === transaction.initialFingerprint) return;
+    if (fingerprint === transaction.initialFingerprint) {
+      // The correlated request ended without replacing the detail page.
+      releaseDetailAnchor();
+      return;
+    }
+    const followingOlderPage = !!turn.detailAutoLoad
+      && !!turn.detailHasMore && !!turn.detailOldestCursor;
+    if (!followingOlderPage && !transaction.responseSettled) {
+      transaction.responseSettled = true;
+      if (transaction.requestTimer !== null) {
+        window.clearTimeout(transaction.requestTimer);
+        transaction.requestTimer = null;
+      }
+      transaction.maxSettleTimer = window.setTimeout(() => {
+        transaction.maxSettleTimer = null;
+        if (detailAnchorRef.current === transaction) releaseDetailAnchor();
+      }, DETAIL_ANCHOR_MAX_SETTLE_MS);
+    }
+    const turnNode = turnNodeRefs.current.get(transaction.turnId);
+    const processNode = turnNode?.querySelector<HTMLElement>(
+      "[data-process-detail-root]",
+    ) ?? null;
+    if (processNode && transaction.observedNode !== processNode) {
+      transaction.observer?.disconnect();
+      transaction.observedNode = processNode;
+      if (typeof ResizeObserver !== "undefined") {
+        transaction.observer = new ResizeObserver(() => {
+          scheduleDetailCorrection(transaction);
+        });
+        transaction.observer.observe(processNode);
+      }
+    }
+    // Run after both React layout and TanStack's animation-frame ResizeObserver
+    // measurement. ResizeObserver refreshes a short quiet window for delayed
+    // image/Markdown growth; a hard deadline guarantees eventual unpin.
+    scheduleDetailCorrection(transaction);
+  }, [
+    releaseDetailAnchor, scheduleDetailCorrection, scrollScope, turns,
+  ]);
+
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const copyText = (id: string, text: string) => {
     navigator.clipboard?.writeText(text);
@@ -1084,7 +1388,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   // Collect engine-neutral file mutations. The helper also understands old
   // Claude file_path and Codex changes payloads already stored in browser cache.
   const fileChips = (t: Turn) => {
-    const changes = collectTurnFileChanges(t.blocks);
+    const changes = collectTurnFileChanges([
+      ...t.blocks,
+      ...(t.detailProjection?.blocks ?? []),
+    ]);
     if (!changes.paths.length) return null;
     const arr = changes.paths;
     const canOpenSummary = surface !== "work"
@@ -1170,6 +1477,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   return (
     <div className={surface === "work" ? "thread-shell work-thread-shell" : "thread-shell"}>
       <div className="thread" ref={scrollRef}
+        data-detail-anchor-active={activeDetailAnchor ? "true" : "false"}
         onScroll={onScroll} onWheel={onWheel}
         onKeyDownCapture={onKeyDown}
         onPointerDown={() => { markUserScrollIntent("unknown"); }}
@@ -1198,10 +1506,11 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
             const t = turns[virtualItem.index];
             if (!t) return null;
             const ti = virtualItem.index;
-            const activeProcess = hasActiveProcess(t.blocks);
+            const timelineBlocks = t.detailProjection?.blocks ?? t.blocks;
+            const activeProcess = hasActiveProcess(timelineBlocks);
             const finalBlocks = finalTextBlocks(t.blocks);
             const working = !t.done || activeProcess;
-            const showProcessTimeline = t.blocks.length > 0
+            const showProcessTimeline = timelineBlocks.length > 0
               || (!!t.detailEventCount && !t.detailLoaded);
             const workingLabel = t.progress
               ?? (activeProcess ? "处理中"
@@ -1303,11 +1612,13 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
               </div>
             )}
             {showProcessTimeline && (
-              <ProcessTimeline blocks={t.blocks} done={t.done} engine={engine}
+              <ProcessTimeline blocks={timelineBlocks} done={t.done} engine={engine}
                 durationMs={t.durationMs} startTs={t.ts} doneTs={t.doneTs}
                 deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
                 detailLoading={t.detailLoading}
-                onLoadDetail={onLoadDetail ? () => onLoadDetail(t.id) : undefined}
+                onLoadDetail={onLoadDetail
+                  ? () => requestProcessDetail(t.id, undefined, "initial")
+                  : undefined}
                 onOpenFile={onOpenFile} imageAssets={imageAssets}
                 onLoadImage={onLoadImage}
                 onInteractionStart={beginProcessInteraction}

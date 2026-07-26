@@ -1925,6 +1925,7 @@ def codex_translate_history(
     cur_channel = "unknown"
     last_ts = None
     pending_images: list = []   # input_image blocks seen before the next user_message
+    pending_user_message_id: str | None = None
     pending_compactions: list[
         tuple[str, float | None, str | None]
     ] = []
@@ -2294,9 +2295,10 @@ def codex_translate_history(
                     # turn, so only a real user_message creates a boundary.
                     pending_turn_id = context_turn_id
             elif t == "response_item" and p.get("type") == "message" and p.get("role") == "user":
-                # the raw user turn carries any uploaded images (input_image, a
-                # data: URI). It precedes the clean event_msg/user_message; buffer
-                # them and attach to that UserMsg so images replay on reload.
+                # The raw response item carries uploaded image bodies. Its id is
+                # a native rollout identity, not turn/steer's browser
+                # clientUserMessageId; that authoritative alias is preserved on
+                # the following event_msg/user_message as payload.client_id.
                 for it in (p.get("content") or []):
                     if isinstance(it, dict) and it.get("type") == "input_image":
                         img = _data_uri_to_img(it.get("image_url"))
@@ -2317,6 +2319,13 @@ def codex_translate_history(
                     pending_turn_id = next_turn_id
                 task_has_user = False
             elif t == "event_msg" and payload_type == "user_message":
+                raw_client_id = p.get("client_id")
+                pending_user_message_id = (
+                    raw_client_id
+                    if isinstance(raw_client_id, str)
+                    and _SAFE_WIRE_ID.fullmatch(raw_client_id)
+                    else None
+                )
                 msg = visible_codex_user_message(p.get("message"))
                 if msg:
                     next_turn_id = p.get("turn_id") or pending_turn_id
@@ -2368,7 +2377,11 @@ def codex_translate_history(
                         uid = _history_id(
                             active_turn_id, "user", line_no, raw_ts)
                     active_msg_id = uid
-                    um = UserMsg(msg_id=uid, prompt=msg)
+                    um = UserMsg(
+                        msg_id=uid,
+                        client_msg_id=pending_user_message_id,
+                        prompt=msg,
+                    )
                     if pending_images:
                         um.images = pending_images
                     if ts is not None:
@@ -2381,6 +2394,7 @@ def codex_translate_history(
                     flush_pending_compactions(active_turn_id)
                     task_has_user = True
                 pending_images = []   # consume (per user turn)
+                pending_user_message_id = None
             elif (t == "response_item"
                   and payload_type in {"function_call", "custom_tool_call"}):
                 open_assistant_only_turn()

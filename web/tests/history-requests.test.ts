@@ -216,6 +216,41 @@ assert.deepEqual(detailCoordinator.complete({
   viewId: "view-new",
   windowEpoch: 2,
 });
+const newestDetailContext = {
+  target: "runtime" as const,
+  scopeKey: "machine-a:code:codex",
+  sid: "session-browse",
+  revision: "revision-a",
+  turnId: "paged-turn",
+};
+const olderDetailContext = {
+  ...newestDetailContext,
+  before: "detail-cursor-older",
+};
+assert.equal(detailCoordinator.begin(newestDetailContext), true);
+assert.equal(detailCoordinator.begin(olderDetailContext), true,
+  "different intra-turn cursors need independent frozen request authority");
+assert.equal(detailCoordinator.begin(olderDetailContext), false,
+  "the same intra-turn cursor still deduplicates one wire read");
+assert.deepEqual(detailCoordinator.complete({
+  session_id: newestDetailContext.sid,
+  revision: newestDetailContext.revision,
+  turn_id: newestDetailContext.turnId,
+}), newestDetailContext,
+  "the newest detail response consumes only the cursorless request");
+assert.equal(detailCoordinator.complete({
+  session_id: olderDetailContext.sid,
+  revision: olderDetailContext.revision,
+  turn_id: olderDetailContext.turnId,
+  before: "another-detail-cursor",
+}), null, "a response for another detail cursor cannot consume the pending page");
+assert.deepEqual(detailCoordinator.complete({
+  session_id: olderDetailContext.sid,
+  revision: olderDetailContext.revision,
+  turn_id: olderDetailContext.turnId,
+  before: olderDetailContext.before,
+}), olderDetailContext,
+  "the response before cursor is part of the exact coordinator key");
 detailCoordinator.begin({
   target: "runtime",
   scopeKey: "machine-a:code:codex",

@@ -27,9 +27,7 @@ from cc_remote.attachments import (
 )
 
 
-_SCHEMA_VERSION = 8
-_CODEX_ONLY_MIGRATION_VERSION = 6
-_CLAUDE_EMPTY_PAGE_MIGRATION_VERSION = 7
+_SCHEMA_VERSION = 10
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -209,6 +207,23 @@ def _turn_id(group: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _turn_detail_identity(event: dict[str, Any]) -> str | None:
+    event_type = event.get("type")
+    field = (
+        "tool_use_id"
+        if event_type in {"tool_use", "tool_delta", "tool_result"}
+        else "item_id"
+        if event_type in {"process", "turn_plan", "turn_diff"}
+        else "message_id"
+        if event_type in {
+            "assistant_msg_start", "delta", "assistant_msg_end",
+        }
+        else None
+    )
+    value = event.get(field) if field is not None else None
+    return value if isinstance(value, str) else None
+
+
 def history_image_id(turn_id: str, index: int) -> str:
     digest = hashlib.sha256(
         f"{turn_id}\0{index}".encode("utf-8", "surrogatepass")
@@ -294,6 +309,7 @@ def materialize_history_turns(
             continue
         prompt = ""
         has_user = False
+        client_msg_id = None
         prompt_truncated = False
         image_refs: list[dict[str, Any]] = []
         deferred_image_count = 0
@@ -346,6 +362,8 @@ def materialize_history_turns(
                 started_ms = _event_ms(event.get("ts"))
             if event_type == "user_msg":
                 has_user = True
+                if isinstance(event.get("client_msg_id"), str):
+                    client_msg_id = event["client_msg_id"]
                 if isinstance(event.get("prompt"), str):
                     prompt = event["prompt"]
                     if len(prompt) > _SUMMARY_PROMPT_MAX_CHARS:
@@ -674,6 +692,7 @@ def materialize_history_turns(
             "detailLoaded": False,
         }
         optional = {
+            "clientMsgId": client_msg_id,
             "forkPointId": fork_point,
             "checkpointId": checkpoint_id,
             "imageRefs": image_refs or None,
@@ -725,20 +744,14 @@ class HistoryIndexStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            migrate_codex_only = current == _CODEX_ONLY_MIGRATION_VERSION
-            migrate_empty_claude = current in (
-                _CODEX_ONLY_MIGRATION_VERSION,
-                _CLAUDE_EMPTY_PAGE_MIGRATION_VERSION,
-            )
-            if current not in (
-                    0,
-                    _CODEX_ONLY_MIGRATION_VERSION,
-                    _CLAUDE_EMPTY_PAGE_MIGRATION_VERSION,
-                    _SCHEMA_VERSION,
-            ):
-                # This database is derived exclusively from engine transcripts.
-                # Rebuilding is safer than carrying migrations for stale cached
-                # projections across wire-shape changes.
+            if current not in (0, _SCHEMA_VERSION):
+                # v9 changes the invariant of history_turn_details: those rows
+                # must contain the source-complete translated turn, never the
+                # transport-compacted History frame.  Both Claude and Codex v8
+                # pages could have populated details from the wire payload, and
+                # a retained page would then prevent the source from being
+                # translated again.  This database is entirely derived, so one
+                # full rebuild is the only safe migration.
                 connection.execute("DROP TABLE IF EXISTS history_pages")
                 connection.execute("DROP TABLE IF EXISTS history_turn_details")
                 connection.execute("DROP TABLE IF EXISTS history_image_assets")
@@ -830,46 +843,6 @@ class HistoryIndexStore:
                 "CREATE INDEX IF NOT EXISTS history_image_assets_lru "
                 "ON history_image_assets(accessed_at)"
             )
-            if migrate_codex_only:
-                # Translator v7 changes Codex turn ownership and assistant
-                # message identities. Claude projections are unaffected and
-                # remain safe to serve, so avoid making every Claude session
-                # pay an unnecessary cold rebuild after this upgrade.
-                for table in (
-                    "history_pages",
-                    "history_turn_details",
-                    "history_image_assets",
-                ):
-                    connection.execute(
-                        f"DELETE FROM {table} WHERE engine='codex'")
-            if migrate_empty_claude:
-                # v7 could bind a scoped empty SDK read to the fingerprint of a
-                # real Claude transcript. Decode in Python so this migration
-                # does not depend on SQLite's optional JSON1 extension. Only
-                # the poisoned summary page is derived incorrectly; retained
-                # turn details and image assets remain source-bound and valid.
-                rows = connection.execute(
-                    """
-                    SELECT rowid, payload_json
-                    FROM history_pages
-                    WHERE engine='claude'
-                    """
-                ).fetchall()
-                empty_rowids = []
-                for row in rows:
-                    raw = row["payload_json"]
-                    try:
-                        payload = json.loads(
-                            raw if isinstance(raw, str) else bytes(raw))
-                    except (TypeError, ValueError, UnicodeDecodeError):
-                        continue
-                    if isinstance(payload, dict) and payload.get("turns") == []:
-                        empty_rowids.append((int(row["rowid"]),))
-                if empty_rowids:
-                    connection.executemany(
-                        "DELETE FROM history_pages WHERE rowid=?",
-                        empty_rowids,
-                    )
             if current != _SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
         try:
@@ -988,43 +961,24 @@ class HistoryIndexStore:
         before: str | None,
         limit: int,
         page: MaterializedHistoryPage,
+        detail_events: (
+            tuple[dict[str, Any], ...] | list[dict[str, Any]] | None
+        ) = None,
     ) -> bool:
         payload = json.dumps(
             page.as_payload(), ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
         now = time.time()
         with self._connect() as connection:
-            # Detail is indexed per turn as well as inside the full page.  This
-            # keeps expansion O(one turn) and remains available after an append
-            # changes the exact page fingerprint.  Destructive rewrites call
-            # invalidate_session(), so an old turn can never cross rollback.
-            for group in group_history_events(page.events):
-                turn_id = _turn_id(group)
-                if turn_id is None:
-                    continue
-                detail_payload = json.dumps(
-                    group, ensure_ascii=False, separators=(",", ":"),
-                ).encode("utf-8")
-                if len(detail_payload) > self.max_bytes:
-                    continue
-                connection.execute(
-                    """
-                    INSERT INTO history_turn_details (
-                        session_id, engine, source_token, source_path,
-                        turn_id, payload_json, payload_bytes,
-                        created_at, accessed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (session_id, engine, source_token, turn_id)
-                    DO UPDATE SET
-                        source_path=excluded.source_path,
-                        payload_json=excluded.payload_json,
-                        payload_bytes=excluded.payload_bytes,
-                        created_at=excluded.created_at,
-                        accessed_at=excluded.accessed_at
-                    """,
-                    (session_id, engine, source.token, source.path, turn_id,
-                     detail_payload, len(detail_payload), now, now),
-                )
+            self._put_turn_details(
+                connection,
+                session_id,
+                engine,
+                source,
+                detail_events if detail_events is not None else page.events,
+                now,
+                max_bytes=self.max_bytes,
+            )
             self._prune_details(connection)
             if len(payload) > self.max_bytes:
                 return False
@@ -1067,6 +1021,72 @@ class HistoryIndexStore:
             )
             self._prune(connection)
         return True
+
+    @staticmethod
+    def _put_turn_details(
+        connection: sqlite3.Connection,
+        session_id: str,
+        engine: str,
+        source: HistorySourceFingerprint,
+        events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+        now: float,
+        *,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Write source-complete detail independently from the wire-safe page."""
+        for group in group_history_events(events):
+            turn_id = _turn_id(group)
+            if turn_id is None:
+                continue
+            detail_payload = json.dumps(
+                group, ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            if max_bytes is not None and len(detail_payload) > max_bytes:
+                continue
+            connection.execute(
+                """
+                INSERT INTO history_turn_details (
+                    session_id, engine, source_token, source_path,
+                    turn_id, payload_json, payload_bytes,
+                    created_at, accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (session_id, engine, source_token, turn_id)
+                DO UPDATE SET
+                    source_path=excluded.source_path,
+                    payload_json=excluded.payload_json,
+                    payload_bytes=excluded.payload_bytes,
+                    created_at=excluded.created_at,
+                    accessed_at=excluded.accessed_at
+                """,
+                (session_id, engine, source.token, source.path, turn_id,
+                 detail_payload, len(detail_payload), now, now),
+            )
+
+    def put_turn_details(
+        self,
+        session_id: str,
+        engine: str,
+        source: HistorySourceFingerprint,
+        events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> None:
+        """Replace compact page detail with the full translated turn groups.
+
+        The page cache must remain bounded by the WebSocket frame budget.  Its
+        per-turn expansion rows, however, are derived from the coherent source
+        snapshot before any transport-only compaction.
+        """
+        now = time.time()
+        with self._connect() as connection:
+            self._put_turn_details(
+                connection,
+                session_id,
+                engine,
+                source,
+                events,
+                now,
+                max_bytes=self.max_bytes,
+            )
+            self._prune_details(connection)
 
     def get_turn_detail(
         self,
@@ -1152,6 +1172,25 @@ class HistoryIndexStore:
                 for group in group_history_events(page.events):
                     if _turn_id(group) != turn_id:
                         continue
+                    summary = next((
+                        turn for turn in page.turns
+                        if turn.get("id") == turn_id
+                        or turn.get("historyTurnId") == turn_id
+                    ), None)
+                    expected_detail = (
+                        summary.get("detailEventCount")
+                        if isinstance(summary, dict) else None
+                    )
+                    actual_detail = sum(
+                        _turn_detail_identity(event) is not None
+                        for event in group
+                    )
+                    if (isinstance(expected_detail, int)
+                            and expected_detail > actual_detail):
+                        # This page is intentionally transport-compacted. Its
+                        # synthetic Error/terminal envelope is not a valid
+                        # replacement for an evicted source-complete detail row.
+                        return None
                     connection.execute(
                         "UPDATE history_pages SET accessed_at=? WHERE rowid=?",
                         (now, page_row["rowid"]),

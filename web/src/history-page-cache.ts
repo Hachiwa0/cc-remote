@@ -2,7 +2,7 @@ import {
   canonicalTurnId,
   type HistoryBrowsePage,
 } from "./history-browse.ts";
-import type { Block, Turn } from "./reducer.ts";
+import type { Turn } from "./reducer.ts";
 
 /** Deliberately independent from cache.ts. Deep-history browsing is best-effort
  * page storage and must never make an upgrade/failure of the replay/session
@@ -106,29 +106,16 @@ export function historyPageCachePageKey(
   return JSON.stringify([...scopeValues(scope), scope.revision, pageKey]);
 }
 
-function sanitizeBlock(block: Block): Block {
-  const safe = { ...block } as Block & Record<string, unknown>;
-  if (block.kind === "tool") {
-    delete safe.input;
-    delete safe.output;
-    delete safe.progress;
-    delete safe.diff;
-    delete safe.result;
-  } else if (block.kind === "process") {
-    delete safe.input;
-    delete safe.detail;
-    delete safe.output;
-    delete safe.diff;
-    delete safe.progress;
-    delete safe.command;
-  }
-  return safe;
-}
-
 function sanitizeTurn(turn: Turn): Turn {
+  const summaryBlocks = turn.blocks.filter((block) =>
+    block.kind === "text" && block.channel === "final");
+  const deferredBlocks = turn.blocks.length - summaryBlocks.length;
   return {
     ...turn,
-    blocks: turn.blocks.map(sanitizeBlock),
+    // Tool/process/thinking bodies are intentionally deferred to
+    // GetTurnDetail. Keeping their stripped shells produced dozens of
+    // expandable "运行命令" rows with empty bodies after an IndexedDB paint.
+    blocks: summaryBlocks.map((block) => ({ ...block })),
     // Summary pages keep canonical metadata only. Attachment bytes are fetched
     // lazily through GetHistoryImage when this row re-enters the viewport.
     images: undefined,
@@ -137,8 +124,16 @@ function sanitizeTurn(turn: Turn): Turn {
       data: "",
     })),
     // Heavy detail is independently rebuildable and is never page-cached.
+    detailEventCount: Math.max(
+      turn.detailEventCount ?? 0, deferredBlocks),
     detailLoaded: false,
     detailLoading: false,
+    detailProjection: undefined,
+    detailHasMore: undefined,
+    detailOldestCursor: undefined,
+    detailHasNewer: undefined,
+    detailNewerCursor: undefined,
+    detailAutoLoad: false,
   };
 }
 

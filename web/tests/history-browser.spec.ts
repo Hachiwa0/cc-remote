@@ -170,6 +170,26 @@ async function readingAnchor(page: import("@playwright/test").Page): Promise<{
   });
 }
 
+async function processDetailEdge(
+  page: import("@playwright/test").Page,
+  edge: "start" | "end",
+): Promise<number> {
+  return page.locator('[data-turn-id="detail-page"]').evaluate(
+    (turn, selectedEdge) => {
+      const viewport = document.querySelector<HTMLElement>(".thread");
+      const process = turn.querySelector<HTMLElement>(
+        "[data-process-detail-root]",
+      );
+      if (!viewport || !process) throw new Error("detail process is missing");
+      const viewportRect = viewport.getBoundingClientRect();
+      const processRect = process.getBoundingClientRect();
+      return (selectedEdge === "end" ? processRect.bottom : processRect.top)
+        - viewportRect.top;
+    },
+    edge,
+  );
+}
+
 async function turnIntersectsViewport(
   page: import("@playwright/test").Page,
   turnId: string,
@@ -338,6 +358,68 @@ test("prepend preserves the exact reading row through delayed row growth", async
   const settled = await readingAnchor(page);
   expect(settled.id).toBe(before.id);
   expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
+});
+
+test("one click loads every turn-detail page without collapsing or jumping", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&delay=80&growth-delay=180",
+  );
+  const header = page.locator(".turn-process-head");
+  const initialStart = await processDetailEdge(page, "start");
+  await header.click();
+  await expect(page.locator(".thread"))
+    .toHaveAttribute("data-detail-anchor-active", "true");
+  await expect(page.getByText("较新命令 1")).toBeVisible();
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await expect(page.getByRole("button", { name: "加载更早过程" }))
+    .toHaveCount(0);
+  await expect(page.getByRole("button", { name: "返回较新过程" }))
+    .toHaveCount(0);
+  await page.waitForTimeout(500);
+  expect(Math.abs(await processDetailEdge(page, "start") - initialStart))
+    .toBeLessThan(2);
+  await expect(page.locator(".thread"))
+    .toHaveAttribute("data-detail-anchor-active", "false");
+});
+
+test("retained truncated process still fetches its authoritative first detail page", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&detail-retained-preview=1"
+      + "&delay=500&growth-delay=180",
+  );
+  const header = page.locator(".turn-process-head");
+  await header.click();
+  await expect(page.getByText("已缓存的较新命令")).toBeVisible();
+  await expect(page.getByText("较早过程已省略")).toBeVisible();
+  await expect(header).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByText("较早过程已省略")).toHaveCount(0);
+  await expect(page.getByText("较新命令 1")).toBeVisible();
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+});
+
+test("user scrolling cancels a pending turn-detail anchor", async ({ page }) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&detail-scroll-cancel=1"
+      + "&delay=250&growth-delay=180",
+  );
+  const header = page.locator(".turn-process-head");
+  await header.scrollIntoViewIfNeeded();
+  await header.click();
+  await page.waitForTimeout(40);
+  const viewport = page.locator(".thread");
+  await viewport.dispatchEvent("wheel", { deltaY: 90 });
+  await viewport.evaluate((node) => { node.scrollTop += 90; });
+  await page.waitForTimeout(40);
+  const userOffset = await processDetailEdge(page, "start");
+
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await page.waitForTimeout(450);
+  expect(Math.abs(await processDetailEdge(page, "start") - userOffset))
+    .toBeLessThan(2);
 });
 
 test("history page cache upgrades v1 and preserves pages in real IndexedDB", async ({

@@ -19,6 +19,7 @@ import {
   isComposerBusy,
   isInterruptSettling,
   isSettlingStopDisabled,
+  type SendMode,
 } from "../composer-submit";
 import { canEnqueueQuery } from "../runtime-drain";
 import { effortsFor, modelsFor, type Catalog } from "../data";
@@ -34,13 +35,14 @@ interface Props {
   catalog: Catalog;
   draftKey: string;
   draftStore: ComposerDraftStore;
-  sendMode: "interrupt" | "queue";
+  sendMode: SendMode;
   allQueued: PendingQuery[];
   replaceableQueued: PendingQuery[];
   onTab: (v: "diff" | "btw") => void;
   onSend: (prompt: string) => boolean;
+  onSteer: (prompt: string) => boolean;
   onInterrupt: () => void;
-  onSetSendMode: (mode: "interrupt" | "queue") => void;
+  onSetSendMode: (mode: SendMode) => void;
   onEnqueue: (query: PendingQuery) => void;
   onSetPending: (query: PendingQuery) => void;
   onDequeue: (index: number) => void;
@@ -154,8 +156,17 @@ export function BtwPanel(p: Props) {
     const query: PendingQuery = { prompt };
     if (runtimeBusy) {
       const action = classifyBusySubmit(
-        submitState, p.sendMode, prompt.length > 0);
+        submitState, p.sendMode,
+        p.engine === "codex" ? "codex" : "claude",
+        prompt.length > 0);
       if (action === "noop") return;
+      if (action === "steer") {
+        if (p.onSteer(prompt)) {
+          clearDraft();
+          resetTaHeight();
+        }
+        return;
+      }
       const existing = p.sendMode === "queue"
         ? p.allQueued : p.replaceableQueued;
       if (!canEnqueueQuery(existing, query)) {
@@ -205,10 +216,13 @@ export function BtwPanel(p: Props) {
     : null;
   const stopping = runtimeBusy && !hasText;
   const interruptSettling = isInterruptSettling(submitState);
+  const primaryIsInterrupt = p.engine !== "codex";
   const sendIcon = !runtimeBusy ? "send"
-    : stopping ? "stop" : p.sendMode === "interrupt" ? "bolt" : "queue";
+    : stopping ? "stop" : p.sendMode === "steer"
+      ? (primaryIsInterrupt ? "bolt" : "send") : "queue";
   const sendClass = "btw-send"
-    + ((stopping || (runtimeBusy && p.sendMode === "interrupt" && hasText))
+    + ((stopping || (runtimeBusy && p.sendMode === "steer"
+      && primaryIsInterrupt && hasText))
       ? " interrupt" : "");
   const sendDisabled = !!p.opening || !p.sid
     || (!runtimeBusy && !hasText)
@@ -266,9 +280,10 @@ export function BtwPanel(p: Props) {
         {runtimeBusy && (
           <div className="btw-runbar">
             <div className="seg">
-              <button className={p.sendMode === "interrupt" ? "on" : ""}
-                onClick={() => p.onSetSendMode("interrupt")}>
-                <Icon name="bolt" size={14} />打断并发送
+              <button className={p.sendMode === "steer" ? "on" : ""}
+                onClick={() => p.onSetSendMode("steer")}>
+                <Icon name={primaryIsInterrupt ? "bolt" : "send"} size={14} />
+                {primaryIsInterrupt ? "打断并发送" : "引导"}
               </button>
               <button className={p.sendMode === "queue" ? "on" : ""}
                 onClick={() => p.onSetSendMode("queue")}>
@@ -282,7 +297,11 @@ export function BtwPanel(p: Props) {
             ref={taRef}
             value={input}
             placeholder={p.opening ? "正在打开…"
-              : runtimeBusy ? "可输入后打断并发送或排队…" : "问点什么"}
+              : runtimeBusy
+                ? (primaryIsInterrupt
+                  ? "可输入后打断并发送或排队…"
+                  : "输入以引导当前任务，或选择排队…")
+                : "问点什么"}
             rows={1}
             disabled={!!p.opening || !p.sid}
             onChange={(event) => {

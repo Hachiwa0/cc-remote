@@ -111,6 +111,27 @@ assert.deepEqual(scrollCoordinator.requestOffset(120.5), {
   kind: "offset",
   offset: 120.5,
 });
+const detailInteraction = scrollCoordinator.beginInteraction(false);
+assert.equal(scrollCoordinator.requestOffset(125), null,
+  "ordinary offset writes remain blocked during detail replacement");
+assert.deepEqual(scrollCoordinator.requestInteractionOffset(
+  detailInteraction, 125,
+), {
+  kind: "offset",
+  offset: 125,
+});
+assert.equal(scrollCoordinator.requestInteractionOffset(
+  detailInteraction + 1, 125,
+), null, "only the active detail transaction may correct its anchor");
+assert.equal(scrollCoordinator.requestBottom("smooth"), null);
+assert.equal(scrollCoordinator.endInteraction(detailInteraction, false), null,
+  "paused detail reading must discard a bottom request queued while locked");
+const followedInteraction = scrollCoordinator.beginInteraction(false);
+assert.equal(scrollCoordinator.requestBottom("smooth"), null);
+assert.deepEqual(scrollCoordinator.endInteraction(followedInteraction, true), {
+  kind: "bottom",
+  behavior: "smooth",
+}, "a still-following viewport keeps the existing deferred-bottom behavior");
 
 const historyGate = new OlderHistoryLoadGate();
 historyGate.beginGesture();

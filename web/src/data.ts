@@ -144,7 +144,10 @@ const fromCatalog = (entries: CatalogModel[]): Model[] =>
       name: look?.name ?? e.display_name ?? e.id,
       ds: look?.ds ?? e.description ?? "",
       ic: look?.ic ?? "cpu",
-      efforts: e.efforts?.length ? e.efforts.map(effort) : undefined,
+      // The app-server's empty list is authoritative: this model accepts no
+      // reasoning override. Preserve [] instead of falling back to a generic
+      // Codex list which can fail only after turn/start reaches the model API.
+      efforts: e.efforts.map(effort),
     };
   });
 

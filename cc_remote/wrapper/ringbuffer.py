@@ -129,7 +129,9 @@ class RingBuffer:
         """Bounded replay of only the latest in-flight turn for a fresh client."""
         start = next(
             (index for index in range(len(self._buf) - 1, -1, -1)
-             if getattr(self._buf[index][1], "type", None) == "user_msg"
+             if getattr(self._buf[index][1], "type", None) in {
+                 "user_msg", "turn_steered",
+             }
              and (message_id is None
                   or getattr(self._buf[index][1], "msg_id", None) == message_id)),
             None,

@@ -196,6 +196,11 @@ assert.equal(sanitized.turns[0].detailEventCount, 8);
 assert.equal(sanitized.turns[0].detailLoaded, false);
 assert.equal(sanitized.turns[0].detailLoading, false);
 assert.equal(sanitized.turns[0].blocks.at(-1)?.kind, "text");
+assert.deepEqual(
+  sanitized.turns[0].blocks.map((block) => block.kind),
+  ["text"],
+  "deferred tool/process shells are dropped instead of cached as empty cards",
+);
 
 const storage = new MemoryStorage();
 let now = 100;
@@ -204,6 +209,13 @@ const cache = new HistoryPageCache({
   maxBytes: 1024 * 1024,
   now: () => now++,
 });
+assert.equal((await cache.putPage(scope, heavyPage)).ok, true);
+const cachedHeavy = await cache.getPage(scope, "page-heavy");
+assert.deepEqual(
+  cachedHeavy?.turns[0].blocks.map((block) => block.kind),
+  ["text"],
+  "an IndexedDB-style cache reload cannot resurrect empty command rows",
+);
 const firstWrite = await cache.putPage(scope, {
   pageKey: "page-1",
   turns: [turn("1"), turn("optimistic-2", {

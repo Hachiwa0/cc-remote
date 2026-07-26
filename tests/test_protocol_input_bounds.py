@@ -31,6 +31,7 @@ from cc_remote.protocol import (
     SetModel,
     SetPerm,
     SetServiceTier,
+    Steer,
     SwitchSession,
     deserialize,
     is_downstream,
@@ -85,6 +86,54 @@ def test_attachment_count_is_bounded_across_images_and_files():
     with pytest.raises(ValidationError, match="attachments exceed"):
         NewSession(
             prompt="inspect", msg_id="msg-1", images=images, files=files)
+    with pytest.raises(ValidationError, match="attachments exceed"):
+        Steer(
+            sid="session-1",
+            cmd_id="cmd-1",
+            client_id="client-1",
+            prompt="inspect",
+            msg_id="msg-1",
+            images=images,
+            files=files,
+        )
+
+
+def test_steer_requires_an_explicit_bounded_target_and_prompt():
+    with pytest.raises(ValidationError, match="sid"):
+        Steer(
+            cmd_id="cmd-1", client_id="client-1",
+            prompt="inspect", msg_id="msg-1")
+    with pytest.raises(ValidationError, match="cmd_id"):
+        Steer(
+            sid="session-1", client_id="client-1",
+            prompt="inspect", msg_id="msg-1")
+    with pytest.raises(ValidationError, match="client_id"):
+        Steer(
+            sid="session-1", cmd_id="cmd-1",
+            prompt="inspect", msg_id="msg-1")
+    with pytest.raises(ValidationError):
+        Steer(
+            sid="bad target", cmd_id="cmd-1", client_id="client-1",
+            prompt="inspect", msg_id="msg-1")
+    with pytest.raises(ValidationError):
+        Steer(
+            sid="session-1",
+            cmd_id="cmd-1",
+            client_id="client-1",
+            prompt="x" * (2 * 1024 * 1024 + 1),
+            msg_id="msg-1",
+        )
+
+    raw = json.dumps({
+        "v": PROTOCOL_VERSION,
+        "type": "steer",
+        "prompt": "inspect",
+        "msg_id": "msg-1",
+        "cmd_id": "cmd-1",
+        "client_id": "client-1",
+    })
+    with pytest.raises(ProtocolError, match="sid:missing"):
+        deserialize(raw)
 
 
 def test_surrogate_filename_is_a_clean_validation_error():

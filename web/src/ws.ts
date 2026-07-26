@@ -501,6 +501,33 @@ export class RelayWs {
     );
   }
 
+  /** Append input to the active Codex turn. The reliable command and the
+   *  narrative acceptance latch are separate: an ACK alone must not clear the
+   *  draft/runtime protection before the wrapper echoes the steered user row. */
+  sendSteerTo(sid: string, prompt: string, msg_id: string,
+              images?: QueryImg[], files?: QueryFile[]): boolean {
+    if (!sid) return false;
+    if (this.queryAcceptance.pendingMessageId(sid)) return false;
+    const sentAt = nowTs();
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "steer", prompt, msg_id, sid, ts: sentAt,
+    };
+    if (images && images.length) obj.images = images;
+    if (files && files.length) obj.files = files;
+    if (!this.send(obj)) return false;
+    const historyHead = this.historyHeadBySession[sid];
+    const baseline = historyHead ? {
+      ...historyHead,
+      liveSeq: Math.max(
+        historyHead.liveSeq, this.lastSeqBySession[sid] ?? 0),
+    } : null;
+    return this.queryAcceptance.begin(
+      sid, msg_id,
+      queryAcceptanceDescriptor(msg_id, prompt, images, files),
+      baseline,
+    );
+  }
+
   sendInterrupt(): void {
     this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs(), ...this.sidObj() });
   }
@@ -620,13 +647,15 @@ export class RelayWs {
 
   sendGetTurnDetail(
     sessionId: string, turnId: string, revision?: string | null,
+    before?: string | null, limit = 192,
   ): boolean {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_turn_detail",
       session_id: sessionId, turn_id: turnId,
-      client_id: this.clientId, ts: nowTs(),
+      client_id: this.clientId, limit, ts: nowTs(),
     };
     if (revision) frame.revision = revision;
+    if (before) frame.before = before;
     return this.send(frame);
   }
 
@@ -1062,7 +1091,8 @@ export class RelayWs {
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
-        if ((msg.type === "user_msg" || msg.type === "turn_binding"
+        if ((msg.type === "user_msg" || msg.type === "turn_steered"
+              || msg.type === "turn_binding"
               || msg.type === "error")
             && this.queryAcceptance.accept(msg)) {
           // Keep a runtime protected after command ACK until its narrative
@@ -1073,6 +1103,7 @@ export class RelayWs {
           let acceptedFromHistory = false;
           for (const historyEvent of msg.events) {
             if (historyEvent.type !== "user_msg"
+                && historyEvent.type !== "turn_steered"
                 && historyEvent.type !== "turn_binding"
                 && historyEvent.type !== "error") continue;
             acceptedFromHistory = this.queryAcceptance.accept({
@@ -1081,7 +1112,8 @@ export class RelayWs {
             }) || acceptedFromHistory;
           }
           const pending = this.queryAcceptance.pendingMessageId(msg.session_id);
-          if (pending && msg.turns?.some((turn) => turn.id === pending)) {
+          if (pending && msg.turns?.some((turn) =>
+            turn.id === pending || turn.clientMsgId === pending)) {
             acceptedFromHistory =
               this.queryAcceptance.completeSession(msg.session_id)
               || acceptedFromHistory;

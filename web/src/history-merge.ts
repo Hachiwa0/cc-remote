@@ -1,4 +1,5 @@
 import type { Block, TextBlock, ToolBlock, ProcessBlock, Turn } from "./reducer";
+import type { TurnDetailProjection } from "./history-detail-projection";
 
 function combineText(first: string, second: string): string {
   if (!first) return second;
@@ -15,6 +16,10 @@ function combineText(first: string, second: string): string {
 
 function textChannel(block: TextBlock): string {
   return block.channel ?? "final";
+}
+
+function isFinalTextBlock(block: Block): block is TextBlock {
+  return block.kind === "text" && block.channel === "final";
 }
 
 function canFuzzyMatchText(block: TextBlock): boolean {
@@ -129,6 +134,11 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
 
 function sameTurn(history: Turn, live: Turn): boolean {
   if (history.id === live.id) return true;
+  if (history.clientMsgId && (
+    history.clientMsgId === live.id
+    || history.clientMsgId === live.clientMsgId
+  )) return true;
+  if (live.clientMsgId && live.clientMsgId === history.id) return true;
   // Automatic/goal continuations have no user message. Live uses the app-server
   // turn id as its empty anchor, while rollout history may use the first
   // assistant item id; TurnEnd still supplies the same authoritative branch id.
@@ -150,12 +160,17 @@ export function historyContainsTurn(history: Turn[], live: Turn): boolean {
 function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
   const historyImageRefs = history.imageRefs?.length
     ? history.imageRefs : undefined;
-  const historyTurnId = historyImageRefs
-    ? (history.historyTurnId ?? history.id)
-    : (history.historyTurnId ?? live.historyTurnId);
+  // A matched transcript row keeps its native lookup identity even when the
+  // visible row adopts an optimistic browser id. Detail and image reads both
+  // target that history id; tying it only to imageRefs makes an attachment-free
+  // alias lose GetTurnDetail authority after the merge.
+  const historyTurnId = history.historyTurnId
+    ?? (history.id !== live.id ? history.id : live.historyTurnId);
+  const detailProjection = live.detailProjection ?? history.detailProjection;
   return {
     ...history,
     id: live.id,
+    clientMsgId: history.clientMsgId ?? live.clientMsgId,
     historyTurnId,
     forkPointId: history.forkPointId ?? live.forkPointId,
     checkpointId: history.checkpointId ?? live.checkpointId,
@@ -185,6 +200,26 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     durationMs: history.durationMs === 0 && (live.durationMs ?? 0) > 0
       ? live.durationMs
       : history.durationMs ?? live.durationMs,
+    // Detail is a monotonic, revision-bound local projection. A later summary
+    // may legitimately contain no heavyweight blocks; it must not erase pages
+    // which the user already expanded in this same revision.
+    detailProjection,
+    detailLoaded: !!detailProjection
+      || !!live.detailLoaded || !!history.detailLoaded,
+    detailLoading: live.detailLoading ?? history.detailLoading,
+    detailHasMore: detailProjection
+      ? detailProjection.hasMore
+      : live.detailHasMore ?? history.detailHasMore,
+    detailOldestCursor: detailProjection
+      ? detailProjection.oldestCursor
+      : live.detailOldestCursor ?? history.detailOldestCursor,
+    detailHasNewer: detailProjection
+      ? detailProjection.hasNewer
+      : live.detailHasNewer ?? history.detailHasNewer,
+    detailNewerCursor: detailProjection
+      ? detailProjection.newerCursor
+      : live.detailNewerCursor ?? history.detailNewerCursor,
+    detailAutoLoad: live.detailAutoLoad ?? history.detailAutoLoad,
   };
 }
 
@@ -207,6 +242,126 @@ export function mergeAuthoritativeTurnDetail(
     detailEventCount: summary.detailEventCount,
     detailLoaded: true,
     detailLoading: false,
+    detailProjection: detail.detailProjection ?? summary.detailProjection,
+    detailHasMore: detail.detailProjection
+      ? detail.detailProjection.hasMore
+      : detail.detailHasMore ?? summary.detailHasMore,
+    detailOldestCursor: detail.detailProjection
+      ? detail.detailProjection.oldestCursor
+      : detail.detailOldestCursor ?? summary.detailOldestCursor,
+    detailHasNewer: detail.detailProjection
+      ? detail.detailProjection.hasNewer
+      : detail.detailHasNewer ?? summary.detailHasNewer,
+    detailNewerCursor: detail.detailProjection
+      ? detail.detailProjection.newerCursor
+      : detail.detailNewerCursor ?? summary.detailNewerCursor,
+    detailAutoLoad: detail.detailAutoLoad ?? summary.detailAutoLoad,
+  };
+}
+
+/** Install one bounded intra-turn detail page.
+ *
+ * Pages are source-disjoint and may be visited in either direction, so the
+ * visible process window is replaced instead of accumulated. Keep the summary's
+ * final answer outside that window when an older page does not contain it. */
+export function installAuthoritativeTurnDetailPage(
+  summary: Turn,
+  detail: Turn,
+  page: {
+    hasMore: boolean;
+    oldestCursor?: string | null;
+    hasNewer: boolean;
+    newerCursor?: string | null;
+  },
+  projection?: TurnDetailProjection,
+): Turn {
+  const summaryFinals = summary.blocks.filter(isFinalTextBlock);
+  const pageFinals = detail.blocks.filter(isFinalTextBlock);
+
+  const alignFinalSegment = (
+    summarySegment: TextBlock[],
+    pageSegment: TextBlock[],
+  ): TextBlock[] => {
+    if (pageSegment.length === 0) return summarySegment;
+    // Without an exact id inside this source-ordered segment, older caches may
+    // have regenerated assistant ids. Align from the end: a one-to-one alias
+    // replaces instead of duplicating, while an unvisited summary prefix stays
+    // visible and page-only leading finals remain in source order.
+    if (pageSegment.length >= summarySegment.length) return pageSegment;
+    return [
+      ...summarySegment.slice(0, summarySegment.length - pageSegment.length),
+      ...pageSegment,
+    ];
+  };
+
+  const summaryIndexById = new Map(
+    summaryFinals.map((block, index) => [block.message_id, index] as const),
+  );
+  const anchors: Array<{ summaryIndex: number; pageIndex: number }> = [];
+  let nextSummaryIndex = 0;
+  pageFinals.forEach((block, pageIndex) => {
+    const summaryIndex = summaryIndexById.get(block.message_id);
+    if (summaryIndex == null || summaryIndex < nextSummaryIndex) return;
+    anchors.push({ summaryIndex, pageIndex });
+    nextSummaryIndex = summaryIndex + 1;
+  });
+
+  const canonicalFinals: TextBlock[] = [];
+  let summaryStart = 0;
+  let pageStart = 0;
+  for (const anchor of anchors) {
+    canonicalFinals.push(...alignFinalSegment(
+      summaryFinals.slice(summaryStart, anchor.summaryIndex),
+      pageFinals.slice(pageStart, anchor.pageIndex),
+    ));
+    // The detail page is authoritative for an exact native message id.
+    canonicalFinals.push(pageFinals[anchor.pageIndex]);
+    summaryStart = anchor.summaryIndex + 1;
+    pageStart = anchor.pageIndex + 1;
+  }
+  canonicalFinals.push(...alignFinalSegment(
+    summaryFinals.slice(summaryStart),
+    pageFinals.slice(pageStart),
+  ));
+  const detailWithoutFinals = detail.blocks.filter(
+    (block) => !isFinalTextBlock(block));
+  const canonicalImageRefs = detail.imageRefs ?? summary.imageRefs;
+  const detailProjection = projection ?? summary.detailProjection;
+  const hasMore = detailProjection
+    ? detailProjection.hasMore : page.hasMore;
+  const oldestCursor = detailProjection
+    ? detailProjection.oldestCursor : page.oldestCursor ?? null;
+  const hasNewer = detailProjection
+    ? detailProjection.hasNewer : page.hasNewer;
+  const newerCursor = detailProjection
+    ? detailProjection.newerCursor : page.newerCursor ?? null;
+  return {
+    ...summary,
+    prompt: detail.prompt || summary.prompt,
+    images: canonicalImageRefs?.length
+      ? undefined : detail.images ?? summary.images,
+    imageRefs: canonicalImageRefs,
+    files: detail.files ?? summary.files,
+    // Heavy process/tool/commentary pages live in detailProjection so the
+    // ordinary live-turn 256 item / 16 MiB cap cannot evict them. Legacy
+    // callers without a projection retain the pre-v21 behavior.
+    blocks: detailProjection
+      ? canonicalFinals : [...detailWithoutFinals, ...canonicalFinals],
+    done: summary.done,
+    doneTs: summary.doneTs,
+    durationMs: summary.durationMs,
+    interrupted: summary.interrupted,
+    error: summary.error,
+    progress: summary.progress,
+    detailEventCount: summary.detailEventCount,
+    detailLoaded: true,
+    detailLoading: false,
+    detailProjection,
+    detailHasMore: hasMore,
+    detailOldestCursor: oldestCursor,
+    detailHasNewer: hasNewer,
+    detailNewerCursor: newerCursor,
+    detailAutoLoad: !!summary.detailAutoLoad && hasMore,
   };
 }
 

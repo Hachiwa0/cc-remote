@@ -14,7 +14,7 @@ export interface HistoryRequestKey {
 
 /** Request-time authority for one display-only deep-history waiter.
  *
- * This metadata is deliberately local: protocol v20 already identifies the
+ * This metadata is deliberately local: protocol v21 already identifies the
  * immutable server page with sid/revision/generation/before.  Freezing the
  * browser view here prevents a delayed page from being relabelled with the
  * machine/surface/session that happens to be active when it arrives.
@@ -172,6 +172,7 @@ export type HistoryDetailRequestContext =
       sid: string;
       revision: string;
       turnId: string;
+      before?: string | null;
     }
   | {
       target: "browse";
@@ -179,13 +180,14 @@ export type HistoryDetailRequestContext =
       sid: string;
       revision: string;
       turnId: string;
+      before?: string | null;
       viewId: string;
       /** Diagnostic request-time page epoch. Detail remains valid after safe
        * pagination inside the same scope/view/revision while the row exists. */
       windowEpoch: number;
     };
 
-/** Correlate protocol-v20 TurnDetail responses with the projection that asked.
+/** Correlate protocol-v21 TurnDetail responses with the projection that asked.
  *
  * TurnDetail has no request id. The wire key is nevertheless exact because one
  * revision contains at most one canonical detail row per sid/turn. Keeping the
@@ -227,9 +229,11 @@ export class HistoryDetailRequestCoordinator {
     revision: string;
     turn_id?: string;
     turnId?: string;
+    before?: string | null;
   }): string {
     return `${input.session_id ?? input.sid ?? ""}\u0000${input.revision}`
-      + `\u0000${input.turn_id ?? input.turnId ?? ""}`;
+      + `\u0000${input.turn_id ?? input.turnId ?? ""}`
+      + `\u0000${input.before ?? ""}`;
   }
 
   begin(context: HistoryDetailRequestContext): boolean {
@@ -257,6 +261,7 @@ export class HistoryDetailRequestCoordinator {
     session_id: string;
     revision: string;
     turn_id: string;
+    before?: string | null;
   }): HistoryDetailRequestContext | null {
     const key = HistoryDetailRequestCoordinator.key(response);
     const pending = this.pending.get(key);

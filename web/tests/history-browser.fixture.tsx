@@ -1,8 +1,8 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 import "../src/index.css";
-import type { Turn } from "../src/reducer";
+import { OMITTED_PROCESS_ITEM_ID, type Turn } from "../src/reducer";
 import type { QueryImg } from "../src/protocol";
 import { ChatView } from "../src/components/ChatView";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
@@ -218,6 +218,85 @@ function compactToolsTurn(): Turn {
   };
 }
 
+type DetailFixturePage = "deferred" | "latest" | "older";
+
+function detailPagingTurn(
+  page: DetailFixturePage,
+  expanded = false,
+  retainedPreview = false,
+): Turn {
+  const finalBlock = finalTurn("detail-page", 2).blocks[0];
+  if (page === "deferred") {
+    return {
+      id: "detail-page",
+      prompt: "加载这个超长回合的过程详情",
+      blocks: retainedPreview ? [
+        {
+          kind: "process",
+          item_id: "detail-retained-preview",
+          processKind: "command",
+          phase: "end",
+          status: "succeeded",
+          title: "已缓存的较新命令",
+          command: "fixture-retained-preview",
+          output: "摘要页仍保留了一小段过程。",
+          done: true,
+        },
+        {
+          kind: "process",
+          item_id: OMITTED_PROCESS_ITEM_ID,
+          processKind: "compaction",
+          phase: "snapshot",
+          status: "succeeded",
+          title: "较早过程已省略",
+          summary: "为限制此回合的内存占用，较早的处理记录未显示。",
+          done: true,
+        },
+        finalBlock,
+      ] : [finalBlock],
+      done: true,
+      ts: Date.now(),
+      doneTs: Date.now(),
+      detailEventCount: 24,
+      detailLoaded: false,
+    };
+  }
+  const pages: Array<Exclude<DetailFixturePage, "deferred">> =
+    page === "older" ? ["older", "latest"] : ["latest"];
+  const process = pages.flatMap((detailPage) => {
+    const prefix = detailPage === "older" ? "较早" : "较新";
+    return Array.from({ length: 4 }, (_, index) => ({
+      kind: "process" as const,
+      item_id: `detail-${detailPage}-${index}`,
+      processKind: "command" as const,
+      phase: "end" as const,
+      status: "completed" as const,
+      title: `${prefix}命令 ${index + 1}`,
+      command: `fixture-${detailPage}-${index + 1}`,
+      output: Array.from(
+        { length: expanded && index === 1 ? 18 : 4 },
+        (__, line) => `${prefix}过程 ${index + 1}.${line + 1}`,
+      ).join("\n"),
+      done: true,
+    }));
+  });
+  return {
+    id: "detail-page",
+    prompt: "加载这个超长回合的过程详情",
+    blocks: [...process, finalBlock],
+    done: true,
+    ts: Date.now(),
+    doneTs: Date.now(),
+    detailEventCount: 24,
+    detailLoaded: true,
+    detailHasMore: page === "latest",
+    detailOldestCursor: page === "latest" ? "detail-older" : undefined,
+    detailHasNewer: false,
+    detailNewerCursor: undefined,
+    detailAutoLoad: page === "latest",
+  };
+}
+
 function mermaidTurn(invalid = false, source?: string): Turn {
   const text = invalid
     ? "```mermaid\nthis is not a supported diagram\n```"
@@ -273,6 +352,9 @@ export function HistoryBrowserFixture() {
   const interactiveTimeline = params.has("interactive-timeline");
   const dualImage = params.has("dual-image");
   const compactTools = params.has("compact-tools");
+  const detailPaging = params.has("detail-paging");
+  const detailRetainedPreview = params.has("detail-retained-preview");
+  const detailScrollCancel = params.has("detail-scroll-cancel");
   const mermaid = params.has("mermaid");
   const actualMermaid = params.has("actual-mermaid");
   const invalidMermaid = params.has("invalid-mermaid");
@@ -290,6 +372,15 @@ export function HistoryBrowserFixture() {
     }
     if (compactTools) {
       return [compactToolsTurn()];
+    }
+    if (detailPaging) {
+      return [
+        detailPagingTurn("deferred", false, detailRetainedPreview),
+        ...(detailScrollCancel
+          ? Array.from({ length: 6 }, (_, index) =>
+            finalTurn(`detail-after-${index + 1}`, 3))
+          : []),
+      ];
     }
     if (mermaid || invalidMermaid || actualMermaid) {
       return [mermaidTurn(
@@ -327,7 +418,9 @@ export function HistoryBrowserFixture() {
     }
     return INITIAL;
   }, [
-    actualMermaid, compactTools, dualImage, interactiveTimeline,
+    actualMermaid, compactTools, detailPaging, detailRetainedPreview,
+    detailScrollCancel, dualImage,
+    interactiveTimeline,
     deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
     timeline,
   ]);
@@ -336,7 +429,7 @@ export function HistoryBrowserFixture() {
     "history-browser-session-a": {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
-      hasMore: !compactTools && !invalidMermaid && !large && !mermaid
+      hasMore: !compactTools && !detailPaging && !invalidMermaid && !large && !mermaid
         && !mermaidHistory && !timeline && !deepBrowse,
       pagesLoaded: 0,
       hasNewer: deepBrowse,
@@ -491,6 +584,59 @@ export function HistoryBrowserFixture() {
     }, delayMs);
     return true;
   }, [browseMode, delayMs, sessions, sid]);
+
+  const loadDetail = useCallback((
+    turnId: string,
+    before?: string | null,
+  ): boolean => {
+    if (!detailPaging || turnId !== "detail-page") return false;
+    const requestSid = sid;
+    const page: DetailFixturePage = before === "detail-older"
+      ? "older" : "latest";
+    setSessions((current) => ({
+      ...current,
+      [requestSid]: {
+        ...current[requestSid],
+        turns: current[requestSid].turns.map((turn) =>
+          turn.id === turnId ? { ...turn, detailLoading: true } : turn),
+      },
+    }));
+    window.setTimeout(() => {
+      setSessions((current) => ({
+        ...current,
+        [requestSid]: {
+          ...current[requestSid],
+          turns: current[requestSid].turns.map((turn) =>
+            turn.id === turnId ? detailPagingTurn(page) : turn),
+        },
+      }));
+      window.setTimeout(() => {
+        setSessions((current) => ({
+          ...current,
+          [requestSid]: {
+            ...current[requestSid],
+            turns: current[requestSid].turns.map((turn) =>
+              turn.id === turnId
+                  && (page !== "latest"
+                    || turn.detailOldestCursor === "detail-older")
+                ? detailPagingTurn(page, true) : turn),
+          },
+        }));
+      }, growthDelayMs);
+    }, delayMs);
+    return true;
+  }, [delayMs, detailPaging, growthDelayMs, sid]);
+
+  useEffect(() => {
+    if (!detailPaging) return;
+    const turn = sessions[sid]?.turns.find((candidate) =>
+      candidate.detailAutoLoad === true
+      && candidate.detailLoading !== true
+      && candidate.detailHasMore === true
+      && !!candidate.detailOldestCursor);
+    if (!turn?.detailOldestCursor) return;
+    loadDetail(turn.id, turn.detailOldestCursor);
+  }, [detailPaging, loadDetail, sessions, sid]);
 
   const appendTurn = () => {
     if (deepBrowse) {
@@ -661,6 +807,7 @@ export function HistoryBrowserFixture() {
         onLoadMore={loadMore}
         onLoadNewer={loadNewer}
         onReturnLatest={returnLatest}
+        onLoadDetail={detailPaging ? loadDetail : undefined}
         onEdit={() => {}}
         onGetDiff={() => {}}
       />

@@ -13,6 +13,16 @@ import {
   type HistoryBrowseLimits,
   type HistoryBrowsePage,
 } from "../src/history-browse.ts";
+import {
+  installAuthoritativeTurnDetailPage,
+  mergeInitialHistory,
+} from "../src/history-merge.ts";
+import {
+  DETAIL_PROJECTION_CAP_ITEM_ID,
+  installTurnDetailProjectionPage,
+  nextAutoLoadDetailTurn,
+} from "../src/history-detail-projection.ts";
+import type { ProcessEvent, ServerEvent } from "../src/protocol.ts";
 import type { Turn } from "../src/reducer.ts";
 
 function turn(
@@ -44,6 +54,32 @@ assert.equal(canonicalTurnId(turn("optimistic", {
   historyTurnId: "native-user-message",
 })), "native-user-message");
 assert.equal(canonicalTurnId(turn("plain")), "plain");
+assert.deepEqual(nextAutoLoadDetailTurn([
+  turn("complete", {
+    detailAutoLoad: true,
+    detailHasMore: false,
+    detailOldestCursor: "ignored",
+  }),
+  turn("loading", {
+    detailAutoLoad: true,
+    detailLoading: true,
+    detailHasMore: true,
+    detailOldestCursor: "also-ignored",
+  }),
+  turn("next", {
+    detailAutoLoad: true,
+    detailHasMore: true,
+    detailOldestCursor: "detail-before",
+  }),
+]), { turnId: "next", before: "detail-before" },
+"automatic detail paging selects exactly one idle cursor-backed turn");
+assert.equal(nextAutoLoadDetailTurn([
+  turn("manual", {
+    detailAutoLoad: false,
+    detailHasMore: true,
+    detailOldestCursor: "manual-only",
+  }),
+]), null, "manual/cancelled detail cannot restart automatic paging");
 
 const olderPage: HistoryBrowsePage = {
   pageKey: "page-older",
@@ -356,7 +392,7 @@ const detailed = markBrowseDetail(overlap, "native-2", turn("native-2", {
     done: true,
   }],
   detailLoaded: true,
-}), {
+}), undefined, {
   expectedScopeKey: scopeKey,
 });
 assert.equal(detailed.windowEpoch, overlap.windowEpoch,
@@ -369,6 +405,257 @@ assert.equal(
     ? detailed.turns[1].blocks[0].text
     : "",
   "full answer",
+);
+
+const finalPage = (
+  summaryIds: string[],
+  pageIds: string[],
+): Turn => installAuthoritativeTurnDetailPage(
+  turn("final-summary", {
+    blocks: summaryIds.map((messageId) => ({
+      kind: "text" as const,
+      message_id: messageId,
+      channel: "final" as const,
+      text: `summary-${messageId}`,
+      done: true,
+    })),
+  }),
+  turn("final-detail", {
+    blocks: pageIds.map((messageId) => ({
+      kind: "text" as const,
+      message_id: messageId,
+      channel: "final" as const,
+      text: `detail-${messageId}`,
+      done: true,
+    })),
+  }),
+  {
+    hasMore: true,
+    oldestCursor: "older-final-page",
+    hasNewer: false,
+    newerCursor: null,
+  },
+);
+const finalIds = (value: Turn): string[] => value.blocks.flatMap((block) =>
+  block.kind === "text" && block.channel === "final"
+    ? [block.message_id] : []);
+assert.deepEqual(finalIds(finalPage(["A", "B"], ["B"])), ["A", "B"],
+  "an exact page final replaces B without deleting the unvisited summary A");
+assert.deepEqual(finalIds(finalPage(["A"], ["C"])), ["C"],
+  "a regenerated one-to-one final id replaces its summary alias");
+assert.deepEqual(finalIds(finalPage(["A", "B"], ["B", "C"])), ["A", "B", "C"],
+  "a page-only final after an exact anchor is appended without replacing A");
+
+const olderDetailPage = markBrowseDetail(
+  detailed,
+  "native-2",
+  turn("native-2", {
+    prompt: "same",
+    blocks: [{
+      kind: "process",
+      item_id: "older-detail-process",
+      processKind: "command",
+      phase: "end",
+      status: "succeeded",
+      title: "older detail page",
+      done: true,
+    }],
+    detailLoaded: true,
+  }),
+  {
+    hasMore: true,
+    oldestCursor: "detail-cursor-oldest",
+    hasNewer: true,
+    newerCursor: "detail-cursor-newer",
+  },
+  { expectedScopeKey: scopeKey },
+);
+assert.deepEqual(
+  olderDetailPage.turns[1].blocks.map((block) => block.kind),
+  ["process", "text"],
+  "an older intra-turn page replaces the process window but retains the summary final",
+);
+assert.equal(olderDetailPage.turns[1].detailHasMore, true);
+assert.equal(
+  olderDetailPage.turns[1].detailOldestCursor,
+  "detail-cursor-oldest",
+);
+assert.equal(olderDetailPage.turns[1].detailHasNewer, true);
+assert.equal(
+  olderDetailPage.turns[1].detailNewerCursor,
+  "detail-cursor-newer",
+);
+
+const newestDetailPage = markBrowseDetail(
+  olderDetailPage,
+  "native-2",
+  turn("native-2", {
+    prompt: "same",
+    blocks: [{
+      kind: "text",
+      message_id: "newest-answer-2",
+      channel: "final",
+      text: "newest full answer",
+      done: true,
+    }],
+    detailLoaded: true,
+  }),
+  {
+    hasMore: true,
+    oldestCursor: "detail-cursor-middle",
+    hasNewer: false,
+    newerCursor: null,
+  },
+  { expectedScopeKey: scopeKey },
+);
+assert.deepEqual(
+  newestDetailPage.turns[1].blocks.map((block) => block.kind),
+  ["text"],
+  "moving to a newer intra-turn page replaces the prior process page",
+);
+assert.equal(
+  newestDetailPage.turns[1].blocks[0].kind === "text"
+    ? newestDetailPage.turns[1].blocks[0].text
+    : "",
+  "newest full answer",
+);
+assert.equal(newestDetailPage.turns[1].detailHasNewer, false);
+assert.equal(newestDetailPage.turns[1].detailNewerCursor, null);
+
+function processEvent(itemId: string, order: number): ProcessEvent {
+  return {
+    v: 21,
+    type: "process",
+    ts: order,
+    sid: "session-a",
+    item_id: itemId,
+    kind: "command",
+    phase: "end",
+    status: "succeeded",
+    title: itemId,
+  };
+}
+
+function decodeDetailEvents(events: ServerEvent[]): Turn {
+  const blocks: Turn["blocks"] = [];
+  const indexes = new Map<string, number>();
+  for (const event of events) {
+    if (event.type !== "process") continue;
+    const existing = indexes.get(event.item_id);
+    const block = {
+      kind: "process" as const,
+      item_id: event.item_id,
+      processKind: event.kind,
+      phase: event.phase,
+      status: event.status,
+      title: event.title,
+      output: event.output ?? undefined,
+      done: event.phase === "end",
+    };
+    if (existing == null) {
+      indexes.set(event.item_id, blocks.length);
+      blocks.push(block);
+    } else {
+      blocks[existing] = { ...blocks[existing], ...block };
+    }
+  }
+  return turn("detail-projection", { blocks });
+}
+
+let cumulative = installTurnDetailProjectionPage(undefined, {
+  events: [
+    processEvent("newer-1", 30),
+    processEvent("newer-2", 31),
+  ],
+  hasMore: true,
+  oldestCursor: "cursor-middle",
+  hasNewer: false,
+}, decodeDetailEvents);
+cumulative = installTurnDetailProjectionPage(cumulative.projection, {
+  before: "cursor-middle",
+  events: [
+    processEvent("middle-1", 20),
+    processEvent("newer-1", 21),
+  ],
+  hasMore: true,
+  oldestCursor: "cursor-oldest",
+  hasNewer: true,
+  newerCursor: "cursor-newer",
+}, decodeDetailEvents);
+cumulative = installTurnDetailProjectionPage(cumulative.projection, {
+  before: "cursor-oldest",
+  events: [
+    processEvent("oldest-1", 10),
+    processEvent("middle-1", 11),
+  ],
+  hasMore: false,
+  oldestCursor: null,
+  hasNewer: true,
+  newerCursor: "cursor-middle",
+}, decodeDetailEvents);
+assert.deepEqual(
+  cumulative.projection.blocks.flatMap((block) =>
+    block.kind === "process" ? [block.item_id] : []),
+  ["oldest-1", "middle-1", "newer-1", "newer-2"],
+  "three cursor-keyed pages accumulate in source order and dedupe overlap",
+);
+assert.equal(cumulative.projection.hasMore, false);
+
+const page239 = installTurnDetailProjectionPage(undefined, {
+  events: Array.from(
+    { length: 239 },
+    (_, index) => processEvent(`item-${index}`, index),
+  ),
+  hasMore: false,
+}, decodeDetailEvents);
+assert.equal(page239.projection.blocks.length, 239,
+  "a 239-item authoritative page bypasses the live Turn.blocks=256 window");
+const loadedHeavy = installAuthoritativeTurnDetailPage(
+  turn("detail-projection"),
+  page239.detail!,
+  {
+    hasMore: false,
+    hasNewer: false,
+  },
+  page239.projection,
+);
+const summaryAfterDetail = turn("detail-projection", {
+  detailEventCount: 239,
+  blocks: [],
+});
+const monotonic = mergeInitialHistory(
+  [summaryAfterDetail], [loadedHeavy])[0];
+assert.equal(monotonic.detailProjection, page239.projection,
+  "a later empty summary cannot erase already-loaded heavyweight detail");
+assert.equal(monotonic.detailProjection?.blocks.length, 239);
+
+let capped = installTurnDetailProjectionPage(undefined, {
+  events: [
+    processEvent("new-1", 30),
+    processEvent("new-2", 31),
+    processEvent("new-3", 32),
+  ],
+  hasMore: true,
+  oldestCursor: "cap-middle",
+}, decodeDetailEvents, { maxItems: 5 });
+capped = installTurnDetailProjectionPage(capped.projection, {
+  before: "cap-middle",
+  events: [
+    processEvent("mid-1", 20),
+    processEvent("mid-2", 21),
+    processEvent("mid-3", 22),
+  ],
+  hasMore: true,
+  oldestCursor: "cap-oldest",
+  hasNewer: true,
+}, decodeDetailEvents, { maxItems: 5 });
+assert.equal(capped.projection.capped, true);
+assert.equal(capped.projection.hasMore, false,
+  "the explicit safety cap terminates automatic older-page loading");
+assert.equal(
+  capped.projection.blocks[0].kind === "process"
+    ? capped.projection.blocks[0].item_id : "",
+  DETAIL_PROJECTION_CAP_ITEM_ID,
 );
 
 const loading = markBrowseDetailLoading(

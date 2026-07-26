@@ -1,9 +1,13 @@
-import { mergeAuthoritativeTurnDetail } from "./history-merge.ts";
+import {
+  installAuthoritativeTurnDetailPage,
+  mergeAuthoritativeTurnDetail,
+} from "./history-merge.ts";
 import {
   MAX_RUNTIME_COMPLETED_UNITS,
   MAX_RUNTIME_TURNS,
 } from "./runtime-bounds.ts";
 import type { Turn } from "./reducer.ts";
+import type { TurnDetailProjection } from "./history-detail-projection.ts";
 
 export interface HistoryBrowseLimits {
   maxTurns: number;
@@ -20,7 +24,7 @@ export const DEFAULT_HISTORY_BROWSE_LIMITS: HistoryBrowseLimits = {
 };
 
 /** One canonical summary page. `newerPageKey` is a local cache link, never a
- * wire cursor: protocol v20 can fetch older pages only. */
+ * wire cursor: protocol v21 can fetch older pages only. */
 export interface HistoryBrowsePage {
   pageKey: string;
   turns: readonly Turn[];
@@ -441,7 +445,7 @@ export function prependOlderPage(
   return { projection: next, evictedPages: bounded.evictedPages };
 }
 
-/** Install one already-cached newer page. Protocol v20 has no server `after`,
+/** Install one already-cached newer page. Protocol v21 has no server `after`,
  * so a cache miss must be handled by App's explicit return-to-latest action. */
 export function appendNewerPage(
   projection: HistoryBrowseProjection,
@@ -487,7 +491,14 @@ export function markBrowseDetail(
   projection: HistoryBrowseProjection,
   turnId: string,
   detail: Turn,
+  page?: {
+    hasMore: boolean;
+    oldestCursor?: string | null;
+    hasNewer: boolean;
+    newerCursor?: string | null;
+  },
   guard: HistoryBrowseScopeGuard = {},
+  detailProjection?: TurnDetailProjection,
 ): HistoryBrowseProjection {
   if (!guardMatches(projection, guard)) return projection;
   let changed = false;
@@ -496,7 +507,10 @@ export function markBrowseDetail(
     turns: segment.turns.map((turn) => {
       if (turn.id !== turnId && canonicalTurnId(turn) !== turnId) return turn;
       changed = true;
-      return mergeAuthoritativeTurnDetail(turn, detail);
+      return page
+        ? installAuthoritativeTurnDetailPage(
+          turn, detail, page, detailProjection)
+        : mergeAuthoritativeTurnDetail(turn, detail);
     }),
   }));
   if (!changed) return projection;
@@ -511,6 +525,7 @@ export function markBrowseDetailLoading(
   turnId: string,
   loading: boolean,
   guard: HistoryBrowseScopeGuard = {},
+  autoLoad?: boolean,
 ): HistoryBrowseProjection {
   if (!guardMatches(projection, guard)) return projection;
   let changed = false;
@@ -518,15 +533,21 @@ export function markBrowseDetailLoading(
     ...segment,
     turns: segment.turns.map((turn) => {
       if (turn.id !== turnId && canonicalTurnId(turn) !== turnId) return turn;
-      if (!!turn.detailLoading === loading) return turn;
+      if (!!turn.detailLoading === loading
+          && (autoLoad === undefined
+            || !!turn.detailAutoLoad === autoLoad)) return turn;
       changed = true;
-      return { ...turn, detailLoading: loading };
+      return {
+        ...turn,
+        detailLoading: loading,
+        detailAutoLoad: autoLoad ?? turn.detailAutoLoad,
+      };
     }),
   }));
   return changed ? materializeProjection({ ...projection, segments }) : projection;
 }
 
-/** A protocol-v20 browser can fetch newer pages only from its local page
+/** A protocol-v21 browser can fetch newer pages only from its local page
  * cache. A cache miss keeps the readable window mounted and changes the
  * downward affordance to the always-safe "return to latest" action. */
 export function markBrowseNewerUnavailable(

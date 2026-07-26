@@ -482,6 +482,12 @@ body{
   border-right-color:transparent; animation:spin .75s linear infinite; }
 .process-timeline{ position:relative; display:flex; flex-direction:column; gap:3px; margin:2px 0 5px 15px;
   padding:5px 0 5px 17px; border-left:1.5px solid var(--border-strong); }
+.process-page-control{ display:flex; align-items:center; justify-content:center; gap:7px; width:100%;
+  min-height:34px; padding:5px 8px; border-radius:9px; color:var(--accent-ink);
+  font-size:12px; font-weight:600; touch-action:manipulation; }
+.process-page-control:hover{ background:var(--raised); color:var(--accent); }
+.process-page-control:disabled{ color:var(--faint); cursor:default; }
+.process-page-control.earlier > svg{ transform:rotate(180deg); }
 .process-commentary{ padding:4px 8px 5px; color:var(--text); }
 .process-commentary .prose{ font-size:13.5px; line-height:1.55; }
 .process-reasoning{ margin:1px 0; }

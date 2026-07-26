@@ -11,7 +11,13 @@ import { presentCommandProblem } from "./problem-presentation";
 import { LoginForm } from "./components/LoginForm";
 import { SessionsSidebar } from "./components/SessionsSidebar";
 import { DirPicker } from "./components/DirPicker";
-import { NewChatView } from "./components/NewChatView";
+import {
+  compatibleNewChatEffort,
+  newChatCatalogRequest,
+  NewChatView,
+  reconcileNewChatSelection,
+  resolveNewChatLocalDefaults,
+} from "./components/NewChatView";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
@@ -27,13 +33,18 @@ import { HeaderMenu } from "./components/HeaderMenu";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
-import { shouldAcceptSessionList } from "./session-list";
+import {
+  shouldAcceptSessionList,
+  updateScopedSessionLifecycle,
+} from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
+import { nextAutoLoadDetailTurn } from "./history-detail-projection";
 import {
   canEnqueueQuery,
   collectWaitingQueries,
   selectDrainCandidates,
 } from "./runtime-drain";
+import type { SendMode } from "./composer-submit";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
 import { isTerminalWorktreeForkError, matchesSessionForkRequest,
   matchesWorktreeForkRequest, type PendingSessionFork,
@@ -151,6 +162,7 @@ function summaryHistoryTurns(history: History): Turn[] | null {
   return history.turns.map((turn) => ({
     ...turn,
     blocks: turn.blocks as Turn["blocks"],
+    clientMsgId: turn.clientMsgId ?? undefined,
     forkPointId: turn.forkPointId ?? undefined,
     checkpointId: turn.checkpointId ?? undefined,
     interrupted: turn.interrupted ?? undefined,
@@ -240,7 +252,7 @@ export default function App() {
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
   const [completionReceipts, setCompletionReceipts] = useState<CompletionReceipts>({});
   const [btwSendModeBySid, setBtwSendModeBySid] = useState<
-    Record<string, "interrupt" | "queue">
+    Record<string, SendMode>
   >({});
   const [state, dispatch] = useReducer(reduce, initialState);
   const inlineImageAssetsRef = useRef(new InlineImageAssetCache());
@@ -442,6 +454,15 @@ export default function App() {
   ) as Record<string, CompletionBadgeKind>;
   const activeScopeKey = sessionScopeKey(machineId, engine, space);
   const currentCwd = state.cwdByScope[activeScopeKey] ?? "";
+  const newChatCwd = state.newChat?.cwd ?? null;
+  const newChatDefaults = resolveNewChatLocalDefaults(
+    engine,
+    space,
+    newChatCwd ?? "",
+    state.catalogDefault,
+    state.catalogDefaultEffort,
+    state.catalogDefaultCwd,
+  );
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const historyView = displayHistoryProjection(
     state.historyRecovery, focusedSid, rt, state.historyBrowse);
@@ -465,7 +486,7 @@ export default function App() {
   const btwReplaceableQueued = collectWaitingQueries(
     state.runtimes, activeBtwSid);
   const activeBtwSendMode = activeBtwSid
-    ? btwSendModeBySid[activeBtwSid] ?? "interrupt" : "interrupt";
+    ? btwSendModeBySid[activeBtwSid] ?? "steer" : "steer";
 
   useEffect(() => {
     const acknowledgeVisible = () => {
@@ -819,6 +840,38 @@ export default function App() {
     localStorage.setItem(SPACE_KEY, space);
   }, [space]);
   useEffect(() => {
+    if (newChatCwd === null || state.connState !== "connected"
+        || !state.wrapperOnline) return;
+    const request = newChatCatalogRequest(
+      engine, space, newChatCwd);
+    if (!request) return;
+    wsRef.current?.sendGetModels(request.engine, request.cwd);
+  }, [
+    engine,
+    newChatCwd,
+    space,
+    state.connState,
+    state.wrapperOnline,
+  ]);
+  useEffect(() => {
+    if (!state.newChat) return;
+    const reconciled = reconcileNewChatSelection(
+      engine,
+      state.newChat.model,
+      state.newChat.effort,
+      state.catalog,
+      newChatDefaults.model,
+    );
+    if (reconciled.model === state.newChat.model
+        && reconciled.effort === state.newChat.effort) return;
+    dispatch({ type: "set_new_chat_selection", ...reconciled });
+  }, [
+    engine,
+    newChatDefaults.model,
+    state.catalog,
+    state.newChat,
+  ]);
+  useEffect(() => {
     // TurnDetail has no request id. Any view navigation revokes the frozen
     // runtime/browse target so a delayed response cannot cross sessions.
     clearHistoryDetailRequests();
@@ -1077,7 +1130,8 @@ export default function App() {
               }
             }
           }
-          if ((msg.type === "user_msg" || msg.type === "turn_end") && msg.sid) {
+          if ((msg.type === "user_msg" || msg.type === "turn_steered"
+                || msg.type === "turn_end") && msg.sid) {
             const activityMs = Math.round(msg.ts * 1000);
             let changed = false;
             for (const [key, listed] of Object.entries(
@@ -1088,7 +1142,8 @@ export default function App() {
                 changed = true;
               }
             }
-            if (msg.type === "user_msg" && changed) {
+            if ((msg.type === "user_msg" || msg.type === "turn_steered")
+                && changed) {
               sessionActivityPendingRef.current.add(msg.sid);
             }
           }
@@ -1265,6 +1320,7 @@ export default function App() {
             if (!detailTarget) return;
             const retryKey = [
               "detail", msg.session_id, msg.revision, msg.turn_id,
+              msg.before ?? "",
             ].join("\u0000");
             if (msg.authoritative === false) {
               if (detailTarget.target === "browse") {
@@ -1277,6 +1333,7 @@ export default function App() {
                   windowEpoch: detailTarget.windowEpoch,
                   turnId: detailTarget.turnId,
                   events: [],
+                  before: detailTarget.before,
                 });
               } else {
                 dispatch({ type: "event", event: msg, ownership });
@@ -1299,12 +1356,13 @@ export default function App() {
                   const turn = runtime?.turns.find(
                     (item) => canonicalTurnId(item) === msg.turn_id
                       || item.id === msg.turn_id);
-                  if (!turn || turn.detailLoaded
+                  if (!turn || (!detailTarget.before && turn.detailLoaded)
                       || runtime.historyRevision !== detailTarget.revision) return;
                 }
                 if (!historyDetailRequestsRef.current.begin(detailTarget)) return;
                 const sent = ws.sendGetTurnDetail(
-                  msg.session_id, msg.turn_id, detailTarget.revision);
+                  msg.session_id, msg.turn_id, detailTarget.revision,
+                  detailTarget.before);
                 if (!sent) {
                   historyDetailRequestsRef.current.cancel(detailTarget);
                   return;
@@ -1318,11 +1376,13 @@ export default function App() {
                     viewId: detailTarget.viewId,
                     windowEpoch: detailTarget.windowEpoch,
                     turnId: detailTarget.turnId,
+                    before: detailTarget.before,
                   });
                 } else {
                   dispatch({
                     type: "turn_detail_requested", sid: detailTarget.sid,
                     turnId: detailTarget.turnId,
+                    before: detailTarget.before,
                   });
                 }
               });
@@ -1340,6 +1400,11 @@ export default function App() {
                 windowEpoch: detailTarget.windowEpoch,
                 turnId: detailTarget.turnId,
                 events: msg.events,
+                before: msg.before,
+                hasMore: msg.has_more,
+                oldestCursor: msg.oldest_cursor,
+                hasNewer: msg.has_newer,
+                newerCursor: msg.newer_cursor,
               });
               return;
             }
@@ -1606,6 +1671,15 @@ export default function App() {
                   : session,
               );
             }
+          }
+          if (msg.type === "state" && msg.sid && ownership) {
+            sessionListsBySurfaceRef.current = updateScopedSessionLifecycle(
+              sessionListsBySurfaceRef.current,
+              ownership.engine,
+              ownership.space,
+              msg.sid,
+              msg.state,
+            );
           }
           if (msg.type === "work_dashboard") {
             setWorkDashboards((current) => ({ ...current, [msg.engine]: msg }));
@@ -2042,6 +2116,77 @@ export default function App() {
   }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
     rt.external, focusedEngine]);
 
+  const loadHistoryTurnDetail = useCallback((
+    displayTurnId: string, before?: string | null,
+  ): boolean => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime?.historyRevision) return false;
+    const browse = current.historyBrowse?.sid === sid
+      ? current.historyBrowse : null;
+    const displayed = (browse?.turns ?? runtime.turns).find(
+      (turn) => turn.id === displayTurnId
+        || canonicalTurnId(turn) === displayTurnId);
+    if (!displayed) return false;
+    const turnId = canonicalTurnId(displayed);
+    const scope = historyPageScopeFor(
+      sid, runtime.historyRevision, focusedEngine, space);
+    const context: HistoryDetailRequestContext = browse
+      ? {
+          target: "browse",
+          scopeKey: browse.scopeKey,
+          sid,
+          revision: browse.revision,
+          turnId,
+          before,
+          viewId: browse.viewId,
+          windowEpoch: browse.windowEpoch,
+        }
+      : {
+          target: "runtime",
+          scopeKey: historyPageCacheScopeKey(scope),
+          sid,
+          revision: runtime.historyRevision,
+          turnId,
+          before,
+        };
+    if (!historyDetailRequestsRef.current.begin(context)) return false;
+    const sent = wsRef.current?.sendGetTurnDetail(
+      sid, turnId, context.revision, before) ?? false;
+    if (!sent) {
+      historyDetailRequestsRef.current.cancel(context);
+      return false;
+    }
+    if (context.target === "browse") {
+      dispatch({
+        type: "history_browse_detail_requested",
+        sid,
+        scopeKey: context.scopeKey,
+        revision: context.revision,
+        viewId: context.viewId,
+        windowEpoch: context.windowEpoch,
+        turnId,
+        before,
+      });
+    } else {
+      dispatch({ type: "turn_detail_requested", sid, turnId, before });
+    }
+    return true;
+  }, [focusedEngine, historyPageScopeFor, space]);
+  useEffect(() => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime) return;
+    const turns = current.historyBrowse?.sid === sid
+      ? current.historyBrowse.turns : runtime.turns;
+    const next = nextAutoLoadDetailTurn(turns);
+    if (!next) return;
+    loadHistoryTurnDetail(next.turnId, next.before);
+  }, [loadHistoryTurnDetail, state.historyBrowse, state.runtimes,
+    state.focusedSid]);
+
   if (!authReady) {
     return <div className="login" aria-busy="true">正在连接中继…</div>;
   }
@@ -2057,9 +2202,10 @@ export default function App() {
     const currentState = stateRef.current;
     if (ws.pendingQueryFor(focusedSid)
         || currentState.runtimes[focusedSid]?.acceptancePending) {
+      const sendMode = currentState.runtimes[focusedSid]?.sendMode ?? "steer";
       const waiting = collectWaitingQueries(
         currentState.runtimes,
-        currentState.sendMode === "interrupt" ? focusedSid : undefined,
+        sendMode === "steer" ? focusedSid : undefined,
       );
       if (!canEnqueueQuery(waiting, query)) {
         dispatch({
@@ -2068,7 +2214,7 @@ export default function App() {
         });
         return false;
       }
-      dispatch(currentState.sendMode === "queue"
+      dispatch(sendMode === "queue"
         ? { type: "enqueue", sid: focusedSid, query }
         : { type: "set_pending", sid: focusedSid, query });
       return true;
@@ -2086,6 +2232,18 @@ export default function App() {
     sessionActivityPendingRef.current.add(focusedSid);
     dispatch({ type: "query_sent", sid: focusedSid, prompt, msg_id, images, files,
       ts: activityMs });
+    return true;
+  };
+  const sendSteer = (
+    prompt: string, images?: QueryImg[], files?: QueryFile[],
+  ): boolean => {
+    const ws = wsRef.current;
+    if (!ws || !focusedSid || focusedEngine !== "codex") return false;
+    const msg_id = uuid();
+    if (!ws.sendSteerTo(focusedSid, prompt, msg_id, images, files)) return false;
+    if (stateRef.current.historyBrowse?.sid === focusedSid) {
+      dispatch({ type: "return_to_latest", sid: focusedSid });
+    }
     return true;
   };
   const loadOlderHistoryPage = (
@@ -2237,58 +2395,6 @@ export default function App() {
     const sid = stateRef.current.historyBrowse?.sid;
     if (sid) dispatch({ type: "return_to_latest", sid });
   };
-  const loadHistoryTurnDetail = (displayTurnId: string) => {
-    const current = stateRef.current;
-    const sid = current.focusedSid;
-    const runtime = sid ? current.runtimes[sid] : null;
-    if (!sid || !runtime?.historyRevision) return;
-    const browse = current.historyBrowse?.sid === sid
-      ? current.historyBrowse : null;
-    const displayed = (browse?.turns ?? runtime.turns).find(
-      (turn) => turn.id === displayTurnId
-        || canonicalTurnId(turn) === displayTurnId);
-    if (!displayed) return;
-    const turnId = canonicalTurnId(displayed);
-    const scope = historyPageScopeFor(
-      sid, runtime.historyRevision, focusedEngine, space);
-    const context: HistoryDetailRequestContext = browse
-      ? {
-          target: "browse",
-          scopeKey: browse.scopeKey,
-          sid,
-          revision: browse.revision,
-          turnId,
-          viewId: browse.viewId,
-          windowEpoch: browse.windowEpoch,
-        }
-      : {
-          target: "runtime",
-          scopeKey: historyPageCacheScopeKey(scope),
-          sid,
-          revision: runtime.historyRevision,
-          turnId,
-        };
-    if (!historyDetailRequestsRef.current.begin(context)) return;
-    const sent = wsRef.current?.sendGetTurnDetail(
-      sid, turnId, context.revision) ?? false;
-    if (!sent) {
-      historyDetailRequestsRef.current.cancel(context);
-      return;
-    }
-    if (context.target === "browse") {
-      dispatch({
-        type: "history_browse_detail_requested",
-        sid,
-        scopeKey: context.scopeKey,
-        revision: context.revision,
-        viewId: context.viewId,
-        windowEpoch: context.windowEpoch,
-        turnId,
-      });
-    } else {
-      dispatch({ type: "turn_detail_requested", sid, turnId });
-    }
-  };
   // One command creates the session and starts its first query atomically. The
   // wrapper targets the new temp-keyed ctx directly; no later focus event is used
   // to route or trigger this message.
@@ -2325,6 +2431,28 @@ export default function App() {
       setCreateError(null);
     }
     return queued;
+  };
+  const pickNewChatModel = (model: string | null) => {
+    const current = state.newChat;
+    if (!current) return;
+    const compatibleEffort = compatibleNewChatEffort(
+      engine,
+      model,
+      current.effort,
+      state.catalog,
+      newChatDefaults.model,
+    );
+    dispatch({ type: "set_new_chat_model", model });
+    if (compatibleEffort !== current.effort) {
+      dispatch({
+        type: "set_new_chat_effort",
+        effort: compatibleEffort,
+      });
+    }
+  };
+  const pickNewChatEffort = (effort: string | null) => {
+    if (!state.newChat) return;
+    dispatch({ type: "set_new_chat_effort", effort });
   };
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
@@ -2516,6 +2644,12 @@ export default function App() {
     });
     return true;
   };
+  const steerBtw = (prompt: string): boolean => {
+    const sid = activeBtwSid;
+    const ws = wsRef.current;
+    if (!sid || !ws || activeBtw?.engine !== "codex") return false;
+    return ws.sendSteerTo(sid, prompt, uuid());
+  };
   const interruptBtw = (sid: string) => {
     wsRef.current?.sendInterruptTo(sid);
   };
@@ -2526,7 +2660,7 @@ export default function App() {
     wsRef.current?.sendSetEffortTo(sid, effort);
   };
   const setBtwSendMode = (
-    sid: string, mode: "interrupt" | "queue",
+    sid: string, mode: SendMode,
   ) => {
     setBtwSendModeBySid((current) => (
       current[sid] === mode ? current : { ...current, [sid]: mode }
@@ -2765,11 +2899,18 @@ export default function App() {
             createError={createError}
             autoFocus={newChatAutoFocus}
             engine={engine}
+            catalog={state.catalog}
+            model={state.newChat.model}
+            effort={state.newChat.effort}
+            defaultModel={newChatDefaults.model}
+            defaultEffort={newChatDefaults.effort}
             workDashboard={workDashboards[engine] ?? null}
             selectedProjectId={workProjectId}
             onSelectProject={setWorkProjectId}
             onManageWork={() => setWorkManagerOpen(true)}
             onPickCwd={() => setDirPickerOpen(true)}
+            onPickModel={pickNewChatModel}
+            onPickEffort={pickNewChatEffort}
             onSend={sendFirstMessage} />
         ) : (
           <>
@@ -2835,8 +2976,10 @@ export default function App() {
           catalog={state.catalog}
           connState={state.connState}
           wrapperOnline={state.wrapperOnline}
-          sendMode={state.sendMode}
-          setSendMode={(m) => dispatch({ type: "set_send_mode", mode: m })}
+          sendMode={rt.sendMode}
+          setSendMode={(m) => focusedSid && dispatch({
+            type: "set_send_mode", sid: focusedSid, mode: m,
+          })}
           queue={rt.queue}
           allQueued={allQueued}
           replaceableQueued={replaceableQueued}
@@ -2853,6 +2996,7 @@ export default function App() {
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
           onSendQuery={sendQuery}
+          onSteerQuery={sendSteer}
           onInterrupt={interrupt}
           onEnqueue={(query) => dispatch({ type: "enqueue", query })}
           onSetPending={(query) => dispatch({ type: "set_pending", query })}
@@ -2913,6 +3057,7 @@ export default function App() {
             sendMode={activeBtwSendMode}
             allQueued={allQueued} replaceableQueued={btwReplaceableQueued}
             onSend={sendBtw}
+            onSteer={steerBtw}
             onInterrupt={() => {
               if (activeBtwSid) interruptBtw(activeBtwSid);
             }}

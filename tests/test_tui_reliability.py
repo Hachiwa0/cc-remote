@@ -323,6 +323,55 @@ def test_tui_matching_user_echo_is_removed_from_dedup_set():
     assert not any("already echoed" in line for line in lines)
 
 
+def test_tui_renders_live_turn_steered_once_before_advancing_past_it():
+    tui = Tui("ws://127.0.0.1:8765/ws", "password", "", "codex", "s1")
+    lines: list[str] = []
+    tui._line = lines.append
+
+    steered = {
+        "type": "turn_steered", "sid": "s1", "seq": 7,
+        "msg_id": "steer-message", "turn_id": "native-turn",
+        "prompt": "change direction",
+    }
+    tui._handle(steered)
+    tui._handle(steered)
+
+    assert tui.cursors["s1"] == 7
+    assert sum("change direction" in line for line in lines) == 1
+
+
+def test_tui_suppresses_replayed_turn_steered_until_history_renders_it():
+    tui = Tui("ws://127.0.0.1:8765/ws", "password", "", "codex", "s1")
+    lines: list[str] = []
+    tui._line = lines.append
+
+    tui._handle({
+        "type": "replay_start", "sid": "s1", "generation": "g1",
+        "from_seq": 4, "to_seq": 5, "truncated": True,
+        "rebuild": False,
+    })
+    tui._handle({
+        "type": "turn_steered", "sid": "s1", "seq": 5,
+        "msg_id": "steer-message", "turn_id": "native-turn",
+        "prompt": "history owns this boundary",
+    })
+    tui._handle({
+        "type": "replay_end", "sid": "s1", "to_seq": 5,
+        "truncated": True,
+    })
+    assert not any("history owns this boundary" in line for line in lines)
+
+    tui._handle({
+        "type": "history", "session_id": "s1",
+        "events": [{
+            "type": "turn_steered",
+            "prompt": "history owns this boundary",
+        }],
+    })
+
+    assert sum("history owns this boundary" in line for line in lines) == 1
+
+
 def test_tui_strips_terminal_and_bidi_controls_from_remote_text():
     dangerous = (
         "safe\nnext\tcolumn\x1b]52;c;U0VDUkVU\x07\r\b"

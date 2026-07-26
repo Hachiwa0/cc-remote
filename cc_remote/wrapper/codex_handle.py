@@ -130,6 +130,7 @@ _HTTP_PROVIDER_PERSISTING_METHODS = frozenset({
     "thread/rollback",
     "thread/settings/update",
     "turn/start",
+    "turn/steer",
 })
 _HTTP_PROVIDER_PERSISTING_NOTIFICATIONS = frozenset({
     "thread/settings/updated",
@@ -148,6 +149,81 @@ RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
 class CodexProxyProtocolError(RuntimeError):
     """The local proxy stream violated its RFC 6455 boundary."""
+
+
+class CodexAppServerError(RuntimeError):
+    """Typed JSON-RPC error returned by the official Codex app-server."""
+
+    def __init__(self, error: Any):
+        self.error = error
+        self.code = error.get("code") if isinstance(error, dict) else None
+        data = error.get("data") if isinstance(error, dict) else None
+        self.codex_error_info = (
+            data.get("codexErrorInfo")
+            if isinstance(data, dict)
+            and isinstance(data.get("codexErrorInfo"), dict)
+            else {}
+        )
+        fragments: list[str] = []
+        if isinstance(error, dict):
+            for value in (error.get("message"), error.get("data")):
+                if isinstance(value, str):
+                    fragments.append(value)
+                elif isinstance(value, dict):
+                    nested = value.get("message")
+                    if isinstance(nested, str):
+                        fragments.append(nested)
+        elif isinstance(error, str):
+            fragments.append(error)
+        self.message = " ".join(fragments)[:4096]
+        # Preserve the previous RuntimeError text for callers/tests which match
+        # native app-server diagnostics, while exposing structured fields to
+        # control paths that need an authoritative classification.
+        super().__init__(str(error))
+
+    @property
+    def no_active_turn(self) -> bool:
+        return "no active turn to interrupt" in self.message.lower()
+
+    @property
+    def active_turn_not_steerable(self) -> bool:
+        if isinstance(
+            self.codex_error_info.get("activeTurnNotSteerable"), dict
+        ):
+            return True
+        compact = re.sub(r"[^a-z]", "", self.message.lower())
+        return "activeturnnotsteerable" in compact
+
+    @property
+    def unsteerable_turn_kind(self) -> Optional[str]:
+        value = self.codex_error_info.get("activeTurnNotSteerable")
+        if not isinstance(value, dict):
+            return None
+        kind = value.get("turnKind")
+        return kind if isinstance(kind, str) else None
+
+    @property
+    def steer_turn_changed(self) -> bool:
+        text = self.message.lower()
+        return (
+            "expectedturnid" in re.sub(r"[^a-z]", "", text)
+            or ("expected turn" in text and "mismatch" in text)
+            or ("expected active turn id" in text and "but found" in text)
+            or "no active turn" in text
+        )
+
+
+class CodexNoActiveTurnError(RuntimeError):
+    """A strict interrupt target was authoritatively reported inactive."""
+
+    def __init__(self, thread_id: str, turn_id: str):
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        super().__init__("Codex app-server reports no active turn")
+
+
+class CodexSteerOutcomeUnknown(RuntimeError):
+    """turn/steer was written but no authoritative response was observed."""
 
 
 def _websocket_client_frame(
@@ -203,6 +279,85 @@ class CodexSpontaneousClosed:
         self.turn_id = turn_id
 
 
+class CodexSteerFence:
+    """In-order barrier between pre-steer and post-steer notifications."""
+
+    __slots__ = ("reached", "release")
+
+    def __init__(self):
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def release_now(self) -> None:
+        self.release.set()
+
+
+class CodexNoActiveTurnFence:
+    """In-order barrier after an authoritative inactive thread/read response."""
+
+    __slots__ = ("reached", "release")
+
+    def __init__(self):
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def release_now(self) -> None:
+        self.release.set()
+
+
+class CodexNoActiveTurnConfirmation:
+    """Exact inactive-thread proof plus its raw notification boundary."""
+
+    __slots__ = ("fence", "_queue", "authoritative_terminal")
+
+    def __init__(
+        self,
+        *,
+        fence: Optional[CodexNoActiveTurnFence],
+        queue: Optional["_SpontaneousNotificationQueue"],
+        authoritative_terminal: bool,
+    ):
+        self.fence = fence
+        self._queue = queue
+        self.authoritative_terminal = authoritative_terminal
+
+    def terminal_pending(self) -> bool:
+        return bool(
+            self._queue is not None
+            and self._queue.has_turn_completed()
+        )
+
+
+class CodexSteerAcceptance(str):
+    """String-compatible turn id carrying its raw-notification fence."""
+
+    fence: Optional[CodexSteerFence]
+
+    def __new__(
+        cls,
+        turn_id: str,
+        fence: Optional[CodexSteerFence] = None,
+    ):
+        value = super().__new__(cls, turn_id)
+        value.fence = fence
+        return value
+
+
+class _CodexSteerResponseBoundary:
+    """Mutable response-dispatch handoff for one exact turn/steer RPC."""
+
+    __slots__ = ("thread_id", "turn_id", "fence")
+
+    def __init__(self, thread_id: str, turn_id: str):
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        self.fence: Optional[CodexSteerFence] = None
+
+    def release(self) -> None:
+        if self.fence is not None:
+            self.fence.release_now()
+
+
 class _SpontaneousNotificationQueue:
     """Single-loop FIFO bounded by both parsed frames and original wire bytes.
 
@@ -229,6 +384,7 @@ class _SpontaneousNotificationQueue:
         self._ready = asyncio.Event()
         self._lossy = False
         self._post_gap_items: set[str] = set()
+        self._end_delivered = False
 
     @property
     def byte_size(self) -> int:
@@ -244,6 +400,11 @@ class _SpontaneousNotificationQueue:
             and self._end[0].get("method") == "turn/completed"
         )
 
+    @property
+    def end_delivered(self) -> bool:
+        """Whether this bridge consumer has removed its reserved end item."""
+        return self._end_delivered
+
     def put_nowait(self, item: object, size: int = 0) -> bool:
         size = max(0, size)
         if not self._can_put_live(size):
@@ -252,6 +413,11 @@ class _SpontaneousNotificationQueue:
         self._bytes += size
         self._ready.set()
         return True
+
+    def put_control_nowait(self, item: object) -> None:
+        """Insert one zero-byte ordering control outside live-frame capacity."""
+        self._items.append((item, 0))
+        self._ready.set()
 
     def _can_put_live(self, size: int) -> bool:
         return not (
@@ -288,6 +454,15 @@ class _SpontaneousNotificationQueue:
 
     def begin_gap(self, marker: object) -> None:
         """Drop one stale live tail and open a bounded loss epoch."""
+        # Control-plane ordering boundaries are not lossy live detail. Preserve
+        # them even when later output overflows before the consumer reaches the
+        # barrier.
+        controls = [
+            entry for entry in self._items
+            if isinstance(
+                entry[0], (CodexSteerFence, CodexNoActiveTurnFence)
+            )
+        ]
         self._items.clear()
         if self._end is None:
             self._bytes = 0
@@ -295,8 +470,12 @@ class _SpontaneousNotificationQueue:
             self._bytes = self._end[1]
         self._lossy = True
         self._post_gap_items.clear()
-        # A zero-byte marker always fits in the live reservation.
+        # A zero-byte marker always fits in the live reservation. It precedes
+        # the preserved fence because this gap discarded at least part of the
+        # backlog that existed before the fence was consumed; attributing the
+        # loss warning to the new user segment would be misleading.
         self._items.append((marker, 0))
+        self._items.extend(controls)
         self._ready.set()
 
     def retry_after_gap_nowait(self, message: dict, size: int) -> bool:
@@ -424,6 +603,7 @@ class _SpontaneousNotificationQueue:
             assert self._end is not None
             item, size = self._end
             self._end = None
+            self._end_delivered = True
         self._bytes = max(0, self._bytes - size)
         if not self._items and self._end is None:
             self._ready.clear()
@@ -888,6 +1068,11 @@ class CodexHandle:
         self.cfg = cfg
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
+        # A shared daemon can publish every subscribed thread immediately after
+        # initialize, before thread/resume returns and assigns ``thread_id``.
+        # Freeze the requested resume id across that bind window so only the
+        # intended thread can claim turn lifecycle state.
+        self._shared_resume_binding_thread_id: Optional[str] = None
         self.turn_id: Optional[str] = None
         self.turn_start_pending = False
         self.turn_active = False
@@ -929,6 +1114,9 @@ class CodexHandle:
         self._work_config: Optional[dict[str, Any]] = None
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
+        self._pending_response_boundaries: dict[
+            int, _CodexSteerResponseBoundary
+        ] = {}
         self._turn_q: Optional[Any] = None
         self._managed_overflow = False
         self._reader: Optional[asyncio.Task] = None
@@ -1223,6 +1411,7 @@ class CodexHandle:
                       fork: bool = False) -> None:
         if self.proc is not None:
             await self.disconnect()
+        self._shared_resume_binding_thread_id = None
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
         # version-probes subprocesses on first call; keep it off the event loop.
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
@@ -1309,6 +1498,11 @@ class CodexHandle:
             attempts = [(proxy_argv, True)]
         initialized: Any = None
         for argv, daemon_proxy in attempts:
+            self._shared_resume_binding_thread_id = (
+                resume_id
+                if daemon_proxy and resume_id and not fork
+                else None
+            )
             try:
                 await self._open_process(
                     argv, codex_bin, daemon_proxy=daemon_proxy)
@@ -1435,6 +1629,7 @@ class CodexHandle:
                         )
                 res = await self._request("thread/resume", resume_params)
                 self.thread_id = _thread_id_of(res) or resume_id
+                self._shared_resume_binding_thread_id = None
             else:
                 params: dict[str, Any] = {
                     "cwd": self._cwd,
@@ -1552,6 +1747,57 @@ class CodexHandle:
                 self.turn_id = returned_turn_id
             return returned_turn_id
         return None
+
+    async def steer(
+        self,
+        prompt,
+        images=None,
+        *,
+        client_user_message_id: Optional[str] = None,
+    ) -> str:
+        """Append input to the exact active turn without changing lifecycle."""
+        if self.thread_id and (
+            self.proc is None or self._dead or self.proc.returncode is not None
+        ):
+            raise RuntimeError("codex app-server unavailable during steer")
+        if not (
+            self.proc and self.thread_id and self.turn_active and self.turn_id
+        ):
+            raise CodexAppServerError({
+                "code": -32600,
+                "message": "active turn not steerable",
+            })
+        thread_id = self.thread_id
+        turn_id = self.turn_id
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "input": _to_input(prompt, images),
+        }
+        if client_user_message_id:
+            params["clientUserMessageId"] = client_user_message_id
+        boundary = _CodexSteerResponseBoundary(thread_id, turn_id)
+        try:
+            result = await self._request(
+                "turn/steer",
+                params,
+                response_boundary=boundary,
+            )
+        except CodexAppServerError:
+            raise
+        except Exception as exc:
+            raise CodexSteerOutcomeUnknown(
+                "Codex app-server did not confirm turn/steer") from exc
+        returned_turn_id = (
+            result.get("turnId") if isinstance(result, dict) else None
+        )
+        if returned_turn_id != turn_id:
+            boundary.release()
+            raise CodexAppServerError({
+                "code": -32600,
+                "message": "expected turn mismatch after turn/steer",
+            })
+        return CodexSteerAcceptance(turn_id, boundary.fence)
 
     def remember_owned_turn_id(self, turn_id: str) -> None:
         self._owned_turn_ids[turn_id] = None
@@ -1863,14 +2109,17 @@ class CodexHandle:
     async def interrupt(self) -> None:
         if not (self.proc and self.thread_id and self.turn_id):
             raise RuntimeError("codex turn is not running")
+        target_thread_id = self.thread_id
         target_turn_id = self._review_execution_turn_id or self.turn_id
         try:
             await self._request(
-                "turn/interrupt",
-                {"threadId": self.thread_id, "turnId": target_turn_id},
+                "turn/interrupt", {
+                    "threadId": target_thread_id,
+                    "turnId": target_turn_id,
+                },
             )
             return
-        except Exception:
+        except Exception as first_error:
             # A click can race review/start's outer response and the nested
             # turn/started notification.  app-server serializes both on stdout,
             # so a rejected outer interrupt is normally followed immediately by
@@ -1885,12 +2134,138 @@ class CodexHandle:
             retry_turn_id = self._review_execution_turn_id
             if (self._review_active and retry_turn_id
                     and retry_turn_id != target_turn_id):
-                await self._request(
-                    "turn/interrupt",
-                    {"threadId": self.thread_id, "turnId": retry_turn_id},
-                )
+                try:
+                    await self._request(
+                        "turn/interrupt", {
+                            "threadId": target_thread_id,
+                            "turnId": retry_turn_id,
+                        },
+                    )
+                except CodexAppServerError as retry_error:
+                    if retry_error.no_active_turn:
+                        raise CodexNoActiveTurnError(
+                            target_thread_id, retry_turn_id) from retry_error
+                    raise
                 return
+            if (isinstance(first_error, CodexAppServerError)
+                    and first_error.no_active_turn):
+                raise CodexNoActiveTurnError(
+                    target_thread_id, target_turn_id) from first_error
             raise
+
+    async def confirm_no_active_turn(
+        self, thread_id: str, turn_id: str,
+    ) -> Optional[CodexNoActiveTurnConfirmation]:
+        """Prove one spontaneous turn inactive at a raw-stream boundary.
+
+        ``turn/interrupt`` can report no active turn before a nearby terminal
+        notification reaches the bridge consumer. ``thread/read`` is issued on
+        the same app-server transport and its response gives the stdout reader a
+        deterministic ordering point. A zero-byte fence inserted immediately
+        after that response lets the machine drain every preceding live frame
+        before deciding whether a synthetic terminal is still necessary.
+        """
+        if self.thread_id != thread_id:
+            return None
+        queue = (
+            self._spontaneous_q
+            if (
+                self._spontaneous_queue_turn_id == turn_id
+                and isinstance(
+                    self._spontaneous_q, _SpontaneousNotificationQueue
+                )
+            )
+            else None
+        )
+        terminal_already_observed = bool(
+            self.turn_id is None
+            and not self.turn_active
+            and turn_id in self._owned_turn_ids
+        )
+        if not (
+            self.turn_id == turn_id
+            and self.turn_active
+        ) and queue is None and not terminal_already_observed:
+            return None
+
+        result = await self._request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": False},
+        )
+        raw_thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(raw_thread, dict) or raw_thread.get("id") != thread_id:
+            return None
+        raw_status = raw_thread.get("status")
+        status_type = (
+            raw_status.get("type") if isinstance(raw_status, dict) else None
+        )
+        if status_type not in {"idle", "notLoaded", "systemError"}:
+            return None
+
+        current_queue = (
+            self._spontaneous_q
+            if (
+                self._spontaneous_q is queue
+                and self._spontaneous_queue_turn_id == turn_id
+            )
+            else None
+        )
+        authoritative_terminal = bool(
+            (current_queue is not None
+             and current_queue.has_turn_completed())
+            or terminal_already_observed
+            or (
+                self.turn_id is None
+                and not self.turn_active
+                and self._spontaneous_turn_id != turn_id
+            )
+        )
+        if authoritative_terminal:
+            return CodexNoActiveTurnConfirmation(
+                fence=None,
+                queue=current_queue,
+                authoritative_terminal=True,
+            )
+
+        # A different active turn may have begun while thread/read was in flight.
+        # Never use the old interrupt miss to clear that newer lifecycle.
+        if (
+            self.thread_id != thread_id
+            or self.turn_id != turn_id
+            or not self.turn_active
+        ):
+            return None
+        fence = (
+            CodexNoActiveTurnFence()
+            if current_queue is not None
+            else None
+        )
+        if current_queue is not None and fence is not None:
+            current_queue.put_control_nowait(fence)
+        return CodexNoActiveTurnConfirmation(
+            fence=fence,
+            queue=current_queue,
+            authoritative_terminal=False,
+        )
+
+    def reconcile_no_active_turn(
+        self, thread_id: str, turn_id: str,
+    ) -> bool:
+        """Commit one previously confirmed inactive local turn."""
+        if self.thread_id != thread_id:
+            return False
+        if self.turn_id not in {None, turn_id}:
+            return False
+        if self.turn_id is None and self.turn_active:
+            return False
+        self.turn_active = False
+        self.turn_start_pending = False
+        if self.turn_id == turn_id:
+            self.turn_id = None
+        if self._spontaneous_turn_id == turn_id:
+            self._close_spontaneous_stream(turn_id)
+            self._spontaneous_turn_id = None
+        return True
 
     async def disconnect(self) -> None:
         self._http_provider_repair_stop.set()
@@ -1910,6 +2285,9 @@ class CodexHandle:
         self._server_request_tasks.clear()
         self._server_request_tasks_by_id.clear()
         self._pending_server_request_ids.clear()
+        for boundary in self._pending_response_boundaries.values():
+            boundary.release()
+        self._pending_response_boundaries.clear()
         self.proc = None
         self._process_group = None
         self._reader = None
@@ -1946,6 +2324,7 @@ class CodexHandle:
             if process_group is not None:
                 stop(signal.SIGKILL, force=True)
         self._using_daemon_proxy = False
+        self._shared_resume_binding_thread_id = None
         self._proxy_read_buffer.clear()
         self._proxy_close_sent = False
         if self._turn_q is not None:
@@ -2508,22 +2887,35 @@ class CodexHandle:
         self.last_rate_limits_by_id = remembered
 
     # ---- internals ----
-    async def _request(self, method: str, params: Optional[dict] = None):
+    async def _request(
+        self,
+        method: str,
+        params: Optional[dict] = None,
+        *,
+        response_boundary: Optional[_CodexSteerResponseBoundary] = None,
+    ):
         self._id += 1
         rid = self._id
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[rid] = fut
+        if response_boundary is not None:
+            self._pending_response_boundaries[rid] = response_boundary
         obj = {"jsonrpc": "2.0", "id": rid, "method": method}
         if params is not None:
             obj["params"] = params
-        await self._send(obj)
+        completed = False
         try:
+            await self._send(obj)
             result = await asyncio.wait_for(fut, timeout=_REQ_TIMEOUT)
             if method in _HTTP_PROVIDER_PERSISTING_METHODS:
                 await self._restore_http_provider_state()
+            completed = True
             return result
         finally:
             self._pending.pop(rid, None)
+            boundary = self._pending_response_boundaries.pop(rid, None)
+            if boundary is not None and not completed:
+                boundary.release()
 
     async def _restore_http_provider_state(
         self,
@@ -2966,16 +3358,35 @@ class CodexHandle:
         """
         method = message.get("method")
         target_thread_id = _notification_thread_id(message)
+        binding_thread_id = (
+            self._shared_resume_binding_thread_id
+            if self._using_daemon_proxy else None
+        )
+        current_thread_id = binding_thread_id or self.thread_id
         if (method in _MODEL_TURN_METHODS
-                and (target_thread_id is None or self.thread_id is None)):
+                and (target_thread_id is None or current_thread_id is None)):
             # These 0.144.1 notifications require both threadId and turnId.
             # Unlike legacy error/hook frames, there is no valid thread-scoped
             # form, so a partial payload must never be guessed into this session.
             log.warning("unattributed codex model notification dropped",
                         method=method)
             return False
-        if (target_thread_id is not None and self.thread_id is not None
-                and target_thread_id != self.thread_id):
+        if (self._using_daemon_proxy
+                and (_is_turn_notification(method)
+                     or method == "thread/compacted")
+                and target_thread_id is None):
+            # Private one-session app-servers historically omit threadId on
+            # legitimate spontaneous turns. A shared daemon has no such safe
+            # inference at any point in its connection lifetime: after resume
+            # binds, another subscribed thread can still emit an unattributed
+            # lifecycle frame.
+            log.warning(
+                "unattributed shared Codex notification dropped",
+                method=method,
+            )
+            return False
+        if (target_thread_id is not None and current_thread_id is not None
+                and target_thread_id != current_thread_id):
             log.warning("foreign codex thread notification dropped", method=method)
             return False
         target_turn_id = _notification_turn_id(message)
@@ -3062,14 +3473,56 @@ class CodexHandle:
         log.warning("unattributed codex turn notification dropped", method=method)
         return False
 
+    def _install_steer_response_boundary(
+        self,
+        boundary: _CodexSteerResponseBoundary,
+        response: dict,
+    ) -> None:
+        """Insert the steer fence at the exact JSON-RPC response boundary."""
+        if "error" in response or boundary.fence is not None:
+            return
+        result = response.get("result")
+        returned_turn_id = (
+            result.get("turnId") if isinstance(result, dict) else None
+        )
+        if returned_turn_id != boundary.turn_id:
+            return
+        if (
+            self.thread_id != boundary.thread_id
+            or self.turn_id != boundary.turn_id
+            or not self.turn_active
+            or boundary.turn_id not in self._owned_turn_ids
+        ):
+            return
+        queue = (
+            self._turn_q
+            if isinstance(self._turn_q, _SpontaneousNotificationQueue)
+            else self._spontaneous_q
+            if (
+                self._spontaneous_queue_turn_id == boundary.turn_id
+                and isinstance(
+                    self._spontaneous_q, _SpontaneousNotificationQueue
+                )
+            )
+            else None
+        )
+        if queue is None or queue.end_delivered:
+            return
+        fence = CodexSteerFence()
+        queue.put_control_nowait(fence)
+        boundary.fence = fence
+
     async def _dispatch(self, m: dict, raw_size: Optional[int] = None) -> None:
         has_id = "id" in m
         has_method = "method" in m
         if has_id and not has_method:                       # response to our request
             fut = self._pending.get(m["id"])
             if fut and not fut.done():
+                boundary = self._pending_response_boundaries.get(m["id"])
+                if boundary is not None:
+                    self._install_steer_response_boundary(boundary, m)
                 if "error" in m:
-                    fut.set_exception(RuntimeError(str(m["error"])))
+                    fut.set_exception(CodexAppServerError(m["error"]))
                 else:
                     fut.set_result(m.get("result"))
             return
