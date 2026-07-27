@@ -16,9 +16,10 @@ export type RecoveryReplayStep =
   | { type: "command"; raw: string };
 
 export interface QueryAcceptanceEvent {
-  type: "user_msg" | "turn_binding" | "error";
+  type: "user_msg" | "turn_steered" | "turn_binding" | "error";
   sid?: string | null;
   msg_id?: string | null;
+  client_msg_id?: string | null;
   code?: string;
 }
 
@@ -194,9 +195,10 @@ export class QueryAcceptanceLatch {
   }
 
   accept(event: QueryAcceptanceEvent): boolean {
-    if (!event.sid || !event.msg_id) return false;
+    const messageId = event.client_msg_id ?? event.msg_id;
+    if (!event.sid || !messageId) return false;
     if (event.type === "error" && event.code === "wrapper_offline") return false;
-    if (this.pendingMessageId(event.sid) !== event.msg_id) return false;
+    if (this.pendingMessageId(event.sid) !== messageId) return false;
     this.bySession.delete(event.sid);
     return true;
   }

@@ -21,19 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import glob
 import hashlib
 import hmac
 import json
 import os
 import re
 import signal
-import shutil
-import subprocess
-from urllib.parse import urlsplit
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
-from itertools import islice
 from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote import __version__
@@ -53,7 +47,16 @@ from cc_remote.wrapper.codex_sessions import (
     codex_model,
     codex_rollout_path,
 )
-from cc_remote.wrapper.child_env import sanitized_child_env
+from cc_remote.wrapper.codex_provider_repair import (
+    HTTP_COMPAT_PROVIDER_ID,
+    canonical_thread_provider_is_restored,
+    repair_http_provider_records,
+)
+from cc_remote.wrapper.codex_runtime import (
+    codex_env as _runtime_codex_env,
+    codex_version as _runtime_codex_version,
+    resolve_codex_bin as _runtime_resolve_codex_bin,
+)
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
@@ -64,12 +67,6 @@ log = logger("cc_remote.wrapper.codex_handle")
 _REQ_TIMEOUT = 60.0
 _APPROVAL_TIMEOUT = 5 * 60.0
 _MAX_SERVER_REQUEST_TASKS = 32
-_BIN_CACHE: Optional[str] = None
-_MAX_CODEX_CANDIDATES = 16
-_MAX_STANDALONE_CANDIDATES = 6
-_MAX_NVM_CANDIDATES = 3
-_CODEX_VERSION_TIMEOUT = 5
-_BIN_CACHE_INVENTORY: Optional[tuple[tuple[object, ...], ...]] = None
 _THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
@@ -99,7 +96,7 @@ _LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
 # sessions keep the shared daemon and its CLI <-> Remote live channel.
 _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES = 256 * 1024 * 1024
 _ROLLOUT_SESSION_META_MAX_BYTES = 1024 * 1024
-_OPENAI_HTTP_RESUME_PROVIDER_ID = "cc_remote_openai_http"
+_OPENAI_HTTP_RESUME_PROVIDER_ID = HTTP_COMPAT_PROVIDER_ID
 _OPENAI_HTTP_RESUME_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _CODEX_DESKTOP_BIN_CANDIDATES = (
     "/Applications/ChatGPT.app/Contents/Resources/codex",
@@ -117,6 +114,22 @@ _WORK_DISABLED_FEATURES = (
     "remote_plugin",
     "tool_suggest",
 )
+_HTTP_PROVIDER_PERSISTING_METHODS = frozenset({
+    "review/start",
+    "thread/compact/start",
+    "thread/goal/clear",
+    "thread/goal/set",
+    "thread/rollback",
+    "thread/settings/update",
+    "turn/start",
+    "turn/steer",
+})
+_HTTP_PROVIDER_PERSISTING_NOTIFICATIONS = frozenset({
+    "thread/settings/updated",
+    "thread/status/changed",
+    "turn/completed",
+    "turn/started",
+})
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
@@ -128,6 +141,81 @@ RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
 class CodexProxyProtocolError(RuntimeError):
     """The local proxy stream violated its RFC 6455 boundary."""
+
+
+class CodexAppServerError(RuntimeError):
+    """Typed JSON-RPC error returned by the official Codex app-server."""
+
+    def __init__(self, error: Any):
+        self.error = error
+        self.code = error.get("code") if isinstance(error, dict) else None
+        data = error.get("data") if isinstance(error, dict) else None
+        self.codex_error_info = (
+            data.get("codexErrorInfo")
+            if isinstance(data, dict)
+            and isinstance(data.get("codexErrorInfo"), dict)
+            else {}
+        )
+        fragments: list[str] = []
+        if isinstance(error, dict):
+            for value in (error.get("message"), error.get("data")):
+                if isinstance(value, str):
+                    fragments.append(value)
+                elif isinstance(value, dict):
+                    nested = value.get("message")
+                    if isinstance(nested, str):
+                        fragments.append(nested)
+        elif isinstance(error, str):
+            fragments.append(error)
+        self.message = " ".join(fragments)[:4096]
+        # Preserve the previous RuntimeError text for callers/tests which match
+        # native app-server diagnostics, while exposing structured fields to
+        # control paths that need an authoritative classification.
+        super().__init__(str(error))
+
+    @property
+    def no_active_turn(self) -> bool:
+        return "no active turn to interrupt" in self.message.lower()
+
+    @property
+    def active_turn_not_steerable(self) -> bool:
+        if isinstance(
+            self.codex_error_info.get("activeTurnNotSteerable"), dict
+        ):
+            return True
+        compact = re.sub(r"[^a-z]", "", self.message.lower())
+        return "activeturnnotsteerable" in compact
+
+    @property
+    def unsteerable_turn_kind(self) -> Optional[str]:
+        value = self.codex_error_info.get("activeTurnNotSteerable")
+        if not isinstance(value, dict):
+            return None
+        kind = value.get("turnKind")
+        return kind if isinstance(kind, str) else None
+
+    @property
+    def steer_turn_changed(self) -> bool:
+        text = self.message.lower()
+        return (
+            "expectedturnid" in re.sub(r"[^a-z]", "", text)
+            or ("expected turn" in text and "mismatch" in text)
+            or ("expected active turn id" in text and "but found" in text)
+            or "no active turn" in text
+        )
+
+
+class CodexNoActiveTurnError(RuntimeError):
+    """A strict interrupt target was authoritatively reported inactive."""
+
+    def __init__(self, thread_id: str, turn_id: str):
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        super().__init__("Codex app-server reports no active turn")
+
+
+class CodexSteerOutcomeUnknown(RuntimeError):
+    """turn/steer was written but no authoritative response was observed."""
 
 
 def _websocket_client_frame(
@@ -183,58 +271,333 @@ class CodexSpontaneousClosed:
         self.turn_id = turn_id
 
 
+class CodexSteerFence:
+    """In-order barrier between pre-steer and post-steer notifications."""
+
+    __slots__ = ("reached", "release")
+
+    def __init__(self):
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def release_now(self) -> None:
+        self.release.set()
+
+
+class CodexNoActiveTurnFence:
+    """In-order barrier after an authoritative inactive thread/read response."""
+
+    __slots__ = ("reached", "release")
+
+    def __init__(self):
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def release_now(self) -> None:
+        self.release.set()
+
+
+class CodexNoActiveTurnConfirmation:
+    """Exact inactive-thread proof plus its raw notification boundary."""
+
+    __slots__ = ("fence", "_queue", "authoritative_terminal")
+
+    def __init__(
+        self,
+        *,
+        fence: Optional[CodexNoActiveTurnFence],
+        queue: Optional["_SpontaneousNotificationQueue"],
+        authoritative_terminal: bool,
+    ):
+        self.fence = fence
+        self._queue = queue
+        self.authoritative_terminal = authoritative_terminal
+
+    def terminal_pending(self) -> bool:
+        return bool(
+            self._queue is not None
+            and self._queue.has_turn_completed()
+        )
+
+
+class CodexSteerAcceptance(str):
+    """String-compatible turn id carrying its raw-notification fence."""
+
+    fence: Optional[CodexSteerFence]
+
+    def __new__(
+        cls,
+        turn_id: str,
+        fence: Optional[CodexSteerFence] = None,
+    ):
+        value = super().__new__(cls, turn_id)
+        value.fence = fence
+        return value
+
+
+class _CodexSteerResponseBoundary:
+    """Mutable response-dispatch handoff for one exact turn/steer RPC."""
+
+    __slots__ = ("thread_id", "turn_id", "fence")
+
+    def __init__(self, thread_id: str, turn_id: str):
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        self.fence: Optional[CodexSteerFence] = None
+
+    def release(self) -> None:
+        if self.fence is not None:
+            self.fence.release_now()
+
+
 class _SpontaneousNotificationQueue:
     """Single-loop FIFO bounded by both parsed frames and original wire bytes.
 
     The app-server stdout reader must keep draining even if the relay is slow.  A
     regular ``asyncio.Queue.put`` would transfer relay backpressure all the way to
     stdout and can deadlock JSON-RPC responses/approvals.  This queue therefore has
-    a synchronous, fail-fast producer and one asynchronous consumer.
+    a synchronous, fail-fast producer and one asynchronous consumer. One item and
+    a small byte allowance are reserved for the authoritative terminal/close
+    frame, so a saturated live-detail queue can never erase turn completion.
     """
 
     def __init__(self, max_items: int, max_bytes: int):
         self.max_items = max(2, max_items)
         self.max_bytes = max(1024, max_bytes)
+        self.max_end_bytes = min(
+            4 * 1024,
+            max(512, self.max_bytes // 8),
+        )
+        self._live_max_items = self.max_items - 1
+        self._live_max_bytes = self.max_bytes - self.max_end_bytes
         self._items: deque[tuple[object, int]] = deque()
+        self._end: Optional[tuple[object, int]] = None
         self._bytes = 0
         self._ready = asyncio.Event()
+        self._lossy = False
+        self._post_gap_items: set[str] = set()
+        self._end_delivered = False
 
     @property
     def byte_size(self) -> int:
         return self._bytes
 
     def qsize(self) -> int:
-        return len(self._items)
+        return len(self._items) + (1 if self._end is not None else 0)
 
     def has_turn_completed(self) -> bool:
-        return any(
-            isinstance(item, dict) and item.get("method") == "turn/completed"
-            for item, _size in self._items
+        return bool(
+            self._end is not None
+            and isinstance(self._end[0], dict)
+            and self._end[0].get("method") == "turn/completed"
         )
+
+    @property
+    def end_delivered(self) -> bool:
+        """Whether this bridge consumer has removed its reserved end item."""
+        return self._end_delivered
 
     def put_nowait(self, item: object, size: int = 0) -> bool:
         size = max(0, size)
-        if (size > self.max_bytes or len(self._items) >= self.max_items
-                or self._bytes + size > self.max_bytes):
+        if not self._can_put_live(size):
             return False
         self._items.append((item, size))
         self._bytes += size
         self._ready.set()
         return True
 
-    def clear(self) -> None:
+    def put_control_nowait(self, item: object) -> None:
+        """Insert one zero-byte ordering control outside live-frame capacity."""
+        self._items.append((item, 0))
+        self._ready.set()
+
+    def _can_put_live(self, size: int) -> bool:
+        return not (
+            self._end is not None
+            or size > self._live_max_bytes
+            or len(self._items) >= self._live_max_items
+            or self._bytes + size > self._live_max_bytes
+        )
+
+    def put_terminal_nowait(self, item: dict, size: int) -> bool:
+        """Retain exactly one terminal in the queue's reserved end slot."""
+        size = max(0, size)
+        if self.has_turn_completed():
+            return True
+        if size > self.max_end_bytes:
+            return False
+        if self._end is not None:
+            _old_item, old_size = self._end
+            self._bytes = max(0, self._bytes - old_size)
+        self._end = (item, size)
+        self._bytes += size
+        self._ready.set()
+        return True
+
+    def put_end_nowait(self, item: object, size: int = 0) -> bool:
+        """Retain one EOF/close sentinel without competing with live detail."""
+        size = max(0, size)
+        if self._end is not None or size > self.max_end_bytes:
+            return False
+        self._end = (item, size)
+        self._bytes += size
+        self._ready.set()
+        return True
+
+    def begin_gap(self, marker: object) -> None:
+        """Drop one stale live tail and open a bounded loss epoch."""
+        # Control-plane ordering boundaries are not lossy live detail. Preserve
+        # them even when later output overflows before the consumer reaches the
+        # barrier.
+        controls = [
+            entry for entry in self._items
+            if isinstance(
+                entry[0], (CodexSteerFence, CodexNoActiveTurnFence)
+            )
+        ]
         self._items.clear()
-        self._bytes = 0
-        self._ready.clear()
+        if self._end is None:
+            self._bytes = 0
+        else:
+            self._bytes = self._end[1]
+        self._lossy = True
+        self._post_gap_items.clear()
+        # A zero-byte marker always fits in the live reservation. It precedes
+        # the preserved fence because this gap discarded at least part of the
+        # backlog that existed before the fence was consumed; attributing the
+        # loss warning to the new user segment would be misleading.
+        self._items.append((marker, 0))
+        self._items.extend(controls)
+        self._ready.set()
+
+    def retry_after_gap_nowait(self, message: dict, size: int) -> bool:
+        """Retain the overflow-triggering frame when it is safe and now fits."""
+        size = max(0, size)
+        # Check capacity before lifecycle admission mutates the tracker. A single
+        # oversized start must not authorize its later orphan deltas.
+        if not self._can_put_live(size):
+            return False
+        if not self.accepts_after_gap(message):
+            return False
+        return self.put_nowait(message, size)
+
+    def accepts_after_gap(self, message: dict) -> bool:
+        """Admit only post-gap frames whose lifecycle boundary is intact.
+
+        Normal turns retain app-server compatibility with delta-only and
+        completion-only providers. Once frames were shed, however, forwarding an
+        orphan incremental update lets the translator resurrect a tool or message
+        whose start was lost. Keep strict delta admission for the remainder of
+        that turn while allowing authoritative completion snapshots.
+        """
+        if not self._lossy:
+            return True
+
+        method = message.get("method")
+        params = (
+            message.get("params")
+            if isinstance(message.get("params"), dict)
+            else {}
+        )
+        if not isinstance(method, str):
+            return False
+        if not method.startswith(("item/", "hook/")):
+            # Turn/model/error/thread notifications are self-contained snapshots.
+            return True
+
+        if method == "item/started":
+            item = params.get("item")
+            item_id = item.get("id") if isinstance(item, dict) else None
+            return self._admit_post_gap_start("item", item_id)
+        if method == "item/reasoning/summaryPartAdded":
+            return self._admit_post_gap_start(
+                "item", params.get("itemId"))
+        if method == "item/completed":
+            item = params.get("item")
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("type"), str)
+                or not item["type"]
+            ):
+                return False
+            return self._admit_post_gap_completion("item", item_id)
+        if method == "item/autoApprovalReview/started":
+            return self._admit_post_gap_start(
+                "review", params.get("reviewId"))
+        if method == "item/autoApprovalReview/completed":
+            if not isinstance(params.get("review"), dict):
+                return False
+            return self._admit_post_gap_completion(
+                "review", params.get("reviewId"))
+        if method == "hook/started":
+            run = params.get("run")
+            run_id = run.get("id") if isinstance(run, dict) else None
+            return self._admit_post_gap_start("hook", run_id)
+        if method == "hook/completed":
+            run = params.get("run")
+            run_id = run.get("id") if isinstance(run, dict) else None
+            if not isinstance(run, dict):
+                return False
+            return self._admit_post_gap_completion("hook", run_id)
+
+        # Every other item notification is an incremental update to itemId.
+        item_id = params.get("itemId")
+        return self._post_gap_key("item", item_id) in self._post_gap_items
+
+    def _admit_post_gap_start(self, kind: str, value: Any) -> bool:
+        key = self._post_gap_key(kind, value)
+        if key is None:
+            return False
+        if key in self._post_gap_items:
+            return True
+        if len(self._post_gap_items) >= self.max_items:
+            return False
+        self._post_gap_items.add(key)
+        return True
+
+    def _admit_post_gap_completion(self, kind: str, value: Any) -> bool:
+        """Admit one authoritative, self-contained completion snapshot.
+
+        Completion-only items are part of the official app-server contract. The
+        start may have reached the consumer before the gap, been shed inside the
+        gap, or never have been emitted by this provider revision. A valid
+        completion closes a tracked lifecycle when present, but never depends on
+        that tracker for admission. Incremental deltas remain strict above.
+        """
+        key = self._post_gap_key(kind, value)
+        if key is None:
+            return False
+        self._post_gap_items.discard(key)
+        return True
+
+    @staticmethod
+    def _post_gap_key(kind: str, value: Any) -> Optional[str]:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 4096
+        ):
+            return None
+        digest = hashlib.sha256(
+            value.encode("utf-8", errors="surrogatepass"),
+        ).hexdigest()
+        return f"{kind}:{digest}"
 
     async def get(self) -> object:
-        while not self._items:
+        while not self._items and self._end is None:
             self._ready.clear()
-            if not self._items:
+            if not self._items and self._end is None:
                 await self._ready.wait()
-        item, size = self._items.popleft()
+        if self._items:
+            item, size = self._items.popleft()
+        else:
+            assert self._end is not None
+            item, size = self._end
+            self._end = None
+            self._end_delivered = True
         self._bytes = max(0, self._bytes - size)
-        if not self._items:
+        if not self._items and self._end is None:
             self._ready.clear()
         return item
 
@@ -325,47 +688,9 @@ def _is_turn_queue_notification(method: Any) -> bool:
     )
 
 
-def _codex_candidates() -> list[str]:
-    """Every codex install we can find, in tie-break order (earlier wins ties).
-    Managed standalone releases first: `codex upgrade` writes there, so it's the
-    one the user actually updates. An npm-global under nvm is often stale but
-    shadows everything else on PATH."""
-    home = os.path.expanduser("~")
-    out = list(islice(glob.iglob(
-        os.path.join(home, ".codex/packages/standalone/releases/*/bin/codex")),
-        _MAX_STANDALONE_CANDIDATES))
-    out.append(os.path.join(home, ".local/bin/codex"))
-    which = shutil.which("codex")
-    if which:
-        out.append(which)
-    out += list(islice(glob.iglob(
-        os.path.join(home, ".nvm/versions/node/*/bin/codex")),
-        _MAX_NVM_CANDIDATES))
-    out += ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/usr/bin/codex"]
-    seen, uniq = set(), []
-    for c in out:
-        if not os.path.exists(c):
-            continue
-        real = os.path.realpath(c)
-        if real in seen:
-            continue
-        seen.add(real)
-        uniq.append(c)
-        if len(uniq) >= _MAX_CODEX_CANDIDATES:
-            break
-    return uniq
-
-
 def _codex_version(path: str) -> tuple[int, ...]:
-    """`codex --version` -> (0, 144, 1). (-1,) when it can't be run/parsed, so a
-    broken install always loses to a working one."""
-    try:
-        r = subprocess.run([path, "--version"], capture_output=True, text=True,
-                           timeout=_CODEX_VERSION_TIMEOUT, env=_codex_env(path))
-    except Exception:
-        return (-1,)
-    m = re.search(r"(\d+)\.(\d+)\.(\d+)", (r.stdout or "") + (r.stderr or ""))
-    return tuple(int(g) for g in m.groups()) if m else (-1,)
+    """Compatibility seam for private-core selection and existing tests."""
+    return _runtime_codex_version(path)
 
 
 def _newer_private_core_for_oversized_resume(
@@ -491,101 +816,14 @@ def _supports_lightweight_resume(value: Optional[str]) -> bool:
     return _semantic_version(value) >= _LIGHTWEIGHT_RESUME_MIN_VERSION
 
 
-def _codex_inventory(candidates: list[str]) -> tuple[tuple[object, ...], ...]:
-    """Fingerprint candidate identities so CLI upgrades invalidate the cache.
-
-    ``codex upgrade`` can add a standalone release or retarget a stable symlink
-    while the wrapper remains alive.  Existing app-server processes keep their
-    executable; only the next process spawn re-resolves against this inventory.
-    """
-    inventory: list[tuple[object, ...]] = []
-    for path in candidates:
-        real = os.path.realpath(path)
-        try:
-            stat = os.stat(path)
-            identity: tuple[object, ...] = (
-                path, real, stat.st_dev, stat.st_ino,
-                stat.st_size, stat.st_mtime_ns,
-            )
-        except OSError:
-            # A concurrent upgrade may replace a symlink between discovery and
-            # stat.  The missing marker forces a fresh probe on the next call.
-            identity = (path, real, None, None, None, None)
-        inventory.append(identity)
-    return tuple(inventory)
-
-
 def _resolve_codex_bin() -> str:
-    """Locate the codex CLI, preferring the NEWEST install.
-
-    $CODEX_BIN short-circuits. Otherwise we version-probe every candidate and take
-    the highest — plain PATH order is wrong: a stale npm-global (nvm bin sits first
-    on the wrapper's PATH) shadowed a newer standalone release, so the wrapper kept
-    spawning an old app-server whose `model/list` predated the current model family.
-    The app-server IS our model catalog, so serving a stale one silently corrupts
-    every model/effort decision downstream. Blocking (subprocess); cached for the
-    process — call via asyncio.to_thread from async code."""
-    global _BIN_CACHE, _BIN_CACHE_INVENTORY
-    override = os.environ.get("CODEX_BIN")
-    if override:
-        return override
-    cands = _codex_candidates()
-    inventory = _codex_inventory(cands)
-    if _BIN_CACHE and inventory == _BIN_CACHE_INVENTORY:
-        return _BIN_CACHE
-    if not cands:
-        _BIN_CACHE = None
-        _BIN_CACHE_INVENTORY = inventory
-        return "codex"  # last resort — errors clearly if truly absent
-    # A broken candidate must not stall startup serially.  Keep both the list and
-    # the worker pool small; each individual probe also has a hard timeout.
-    with ThreadPoolExecutor(max_workers=min(4, len(cands))) as pool:
-        probed = list(pool.map(_codex_version, cands))
-    versions = list(zip(probed, cands))
-    best_v, best = max(versions, key=lambda p: p[0])
-    if best_v == (-1,):
-        best = cands[0]
-    _BIN_CACHE = best
-    _BIN_CACHE_INVENTORY = inventory
-    log.info("codex bin resolved", path=best, version=".".join(map(str, best_v)),
-             considered=[{"path": c, "version": ".".join(map(str, v))} for v, c in versions])
-    return best
+    """Compatibility seam for resident handle call sites."""
+    return _runtime_resolve_codex_bin()
 
 
-def _codex_env(bin_path: str) -> dict:
-    """Child env for the codex subprocess. codex.js runs via `#!/usr/bin/env
-    node`, so the child needs `node` on PATH. When codex was resolved from a
-    dir that also ships node (nvm / npm-global bin), prepend that dir so the
-    shebang resolves even if the wrapper's own PATH lacks it."""
-    env = sanitized_child_env()
-    proxy = os.environ.get("CC_REMOTE_CODEX_PROXY", "").strip()
-    if proxy:
-        # Keep the proxy scoped to wrapper-owned Codex processes.  In
-        # particular, never export it in the parent or change the user's
-        # ordinary `codex` terminal.  Local daemon/proxy sockets must bypass it.
-        scheme = urlsplit(proxy).scheme.lower()
-        if scheme in {"http", "https"}:
-            env.update({
-                "HTTP_PROXY": proxy,
-                "HTTPS_PROXY": proxy,
-                "http_proxy": proxy,
-                "https_proxy": proxy,
-            })
-        elif scheme in {"socks5", "socks5h"}:
-            env.update({"ALL_PROXY": proxy, "all_proxy": proxy})
-        bypass = [
-            value.strip()
-            for value in (env.get("NO_PROXY") or env.get("no_proxy") or "").split(",")
-            if value.strip()
-        ]
-        for local in ("127.0.0.1", "localhost", "::1"):
-            if local not in bypass:
-                bypass.append(local)
-        env["NO_PROXY"] = env["no_proxy"] = ",".join(bypass)
-    bindir = os.path.dirname(os.path.abspath(bin_path)) if os.sep in bin_path else ""
-    if bindir and os.path.exists(os.path.join(bindir, "node")):
-        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
-    return env
+def _codex_env(bin_path: str) -> dict[str, str]:
+    """Compatibility seam for wrapper-owned Codex child environments."""
+    return _runtime_codex_env(bin_path)
 
 
 def _codex_runtime_tmp() -> str:
@@ -697,6 +935,11 @@ class CodexHandle:
         self.cfg = cfg
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
+        # A shared daemon can publish every subscribed thread immediately after
+        # initialize, before thread/resume returns and assigns ``thread_id``.
+        # Freeze the requested resume id across that bind window so only the
+        # intended thread can claim turn lifecycle state.
+        self._shared_resume_binding_thread_id: Optional[str] = None
         self.turn_id: Optional[str] = None
         self.turn_start_pending = False
         self.turn_active = False
@@ -738,6 +981,9 @@ class CodexHandle:
         self._work_config: Optional[dict[str, Any]] = None
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
+        self._pending_response_boundaries: dict[
+            int, _CodexSteerResponseBoundary
+        ] = {}
         self._turn_q: Optional[Any] = None
         self._managed_overflow = False
         self._reader: Optional[asyncio.Task] = None
@@ -769,6 +1015,14 @@ class CodexHandle:
         self._runtime_event_seen: OrderedDict[str, None] = OrderedDict()
         self._runtime_rate_keys: OrderedDict[str, str] = OrderedDict()
         self._runtime_event_lock = asyncio.Lock()
+        # The process-local HTTP alias is a transport implementation detail.
+        # Codex persists it after several otherwise unrelated thread mutations;
+        # serialize the narrow durable-state repair so concurrent controls
+        # cannot race each other or expose the alias to ordinary App/CLI clients.
+        self._http_provider_root_id: Optional[str] = None
+        self._http_provider_repair_lock = asyncio.Lock()
+        self._http_provider_repair_tasks: set[asyncio.Task] = set()
+        self._http_provider_repair_stop = asyncio.Event()
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
         self.app_server_version: Optional[str] = None
@@ -1024,6 +1278,7 @@ class CodexHandle:
                       fork: bool = False) -> None:
         if self.proc is not None:
             await self.disconnect()
+        self._shared_resume_binding_thread_id = None
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
         # version-probes subprocesses on first call; keep it off the event loop.
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
@@ -1041,6 +1296,9 @@ class CodexHandle:
             )
             if private_core is not None:
                 codex_bin = private_core
+        self._http_provider_root_id = resume_id if http_only_resume else None
+        if http_only_resume:
+            self._http_provider_repair_stop.clear()
         child_env = _codex_env(codex_bin)
         stdio_argv = [codex_bin, "app-server", "--stdio"]
         if http_only_resume:
@@ -1107,6 +1365,11 @@ class CodexHandle:
             attempts = [(proxy_argv, True)]
         initialized: Any = None
         for argv, daemon_proxy in attempts:
+            self._shared_resume_binding_thread_id = (
+                resume_id
+                if daemon_proxy and resume_id and not fork
+                else None
+            )
             try:
                 await self._open_process(
                     argv, codex_bin, daemon_proxy=daemon_proxy)
@@ -1233,6 +1496,7 @@ class CodexHandle:
                         )
                 res = await self._request("thread/resume", resume_params)
                 self.thread_id = _thread_id_of(res) or resume_id
+                self._shared_resume_binding_thread_id = None
             else:
                 params: dict[str, Any] = {
                     "cwd": self._cwd,
@@ -1252,6 +1516,8 @@ class CodexHandle:
                 self.thread_id = _thread_id_of(res)
             if not self.thread_id:
                 raise RuntimeError("codex app-server did not return a thread id")
+            if http_only_resume:
+                await self._restore_http_provider_state(strict=True)
             if isinstance(res, dict):
                 authoritative = res
                 if not resume_id:
@@ -1349,6 +1615,57 @@ class CodexHandle:
             return returned_turn_id
         return None
 
+    async def steer(
+        self,
+        prompt,
+        images=None,
+        *,
+        client_user_message_id: Optional[str] = None,
+    ) -> str:
+        """Append input to the exact active turn without changing lifecycle."""
+        if self.thread_id and (
+            self.proc is None or self._dead or self.proc.returncode is not None
+        ):
+            raise RuntimeError("codex app-server unavailable during steer")
+        if not (
+            self.proc and self.thread_id and self.turn_active and self.turn_id
+        ):
+            raise CodexAppServerError({
+                "code": -32600,
+                "message": "active turn not steerable",
+            })
+        thread_id = self.thread_id
+        turn_id = self.turn_id
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "input": _to_input(prompt, images),
+        }
+        if client_user_message_id:
+            params["clientUserMessageId"] = client_user_message_id
+        boundary = _CodexSteerResponseBoundary(thread_id, turn_id)
+        try:
+            result = await self._request(
+                "turn/steer",
+                params,
+                response_boundary=boundary,
+            )
+        except CodexAppServerError:
+            raise
+        except Exception as exc:
+            raise CodexSteerOutcomeUnknown(
+                "Codex app-server did not confirm turn/steer") from exc
+        returned_turn_id = (
+            result.get("turnId") if isinstance(result, dict) else None
+        )
+        if returned_turn_id != turn_id:
+            boundary.release()
+            raise CodexAppServerError({
+                "code": -32600,
+                "message": "expected turn mismatch after turn/steer",
+            })
+        return CodexSteerAcceptance(turn_id, boundary.fence)
+
     def remember_owned_turn_id(self, turn_id: str) -> None:
         self._owned_turn_ids[turn_id] = None
         self._owned_turn_ids.move_to_end(turn_id)
@@ -1394,6 +1711,7 @@ class CodexHandle:
         q = self._turn_q
         if q is None:
             return
+        terminal_seen = False
         try:
             while True:
                 msg = await q.get()
@@ -1404,6 +1722,7 @@ class CodexHandle:
                 # spending a third queue slot on a sentinel. Legacy asyncio.Queue
                 # tests may still append one; it is harmlessly abandoned below.
                 if isinstance(msg, dict) and msg.get("method") == "turn/completed":
+                    terminal_seen = True
                     break
         finally:
             if self._turn_q is q:
@@ -1415,6 +1734,11 @@ class CodexHandle:
             # ownership (thread-scoped hooks depend on this flag).
             if self._spontaneous_turn_id is None:
                 self.turn_active = False
+            if terminal_seen:
+                await self._restore_http_provider_state(
+                    include_descendants=True,
+                )
+                self._schedule_http_provider_descendant_repair()
 
     def _notification_queue_limits(
         self, *, managed: bool,
@@ -1477,21 +1801,64 @@ class CodexHandle:
         raw_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
         turn: dict[str, Any] = {}
         turn_id = raw_turn.get("id") or params.get("turnId")
-        if isinstance(turn_id, str) and turn_id:
+        if isinstance(turn_id, str) and 0 < len(turn_id) <= 512:
             turn["id"] = turn_id
         status = raw_turn.get("status")
         if status in {"completed", "interrupted", "failed"}:
             turn["status"] = status
         duration = raw_turn.get("durationMs")
         if isinstance(duration, (int, float)) and not isinstance(duration, bool):
-            turn["durationMs"] = max(0, int(duration))
+            try:
+                turn["durationMs"] = max(0, int(duration))
+            except (OverflowError, ValueError):
+                pass
         out_params: dict[str, Any] = {"turn": turn}
         thread_id = params.get("threadId")
-        if isinstance(thread_id, str) and thread_id:
+        if isinstance(thread_id, str) and 0 < len(thread_id) <= 512:
             out_params["threadId"] = thread_id
-        if isinstance(turn_id, str) and turn_id:
+        if isinstance(turn_id, str) and 0 < len(turn_id) <= 512:
             out_params["turnId"] = turn_id
         return {"method": "turn/completed", "params": out_params}
+
+    def _retain_terminal_notification(
+        self,
+        q: _SpontaneousNotificationQueue,
+        message: dict,
+        size: int,
+    ) -> None:
+        terminal_message = message
+        terminal_size = size
+        if terminal_size > q.max_end_bytes:
+            terminal_message = self._minimal_turn_completed(message)
+            terminal_size = self._notification_wire_size(terminal_message)
+        if q.put_terminal_nowait(terminal_message, terminal_size):
+            return
+        # The bounded minimal form above is normally below 2 KiB. Keep one
+        # schema-valid status-only terminal even if untrusted ids were extreme.
+        params = (
+            message.get("params")
+            if isinstance(message.get("params"), dict)
+            else {}
+        )
+        raw_turn = (
+            params.get("turn")
+            if isinstance(params.get("turn"), dict)
+            else {}
+        )
+        status = raw_turn.get("status")
+        tiny = {
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "status": (
+                        status
+                        if status in {"completed", "interrupted", "failed"}
+                        else "failed"
+                    ),
+                },
+            },
+        }
+        q.put_terminal_nowait(tiny, self._notification_wire_size(tiny))
 
     def _queue_spontaneous_notification(
         self, message: dict, raw_size: Optional[int] = None,
@@ -1503,12 +1870,15 @@ class CodexHandle:
             return False
         method = message.get("method")
         terminal = method == "turn/completed"
-        if self._spontaneous_overflow and not terminal:
-            return True
         size = (
             raw_size if isinstance(raw_size, int) and raw_size >= 0
             else self._notification_wire_size(message)
         )
+        if terminal:
+            self._retain_terminal_notification(q, message, size)
+            return True
+        if not q.accepts_after_gap(message):
+            return True
         if q.put_nowait(message, size):
             return True
 
@@ -1520,17 +1890,8 @@ class CodexHandle:
                 queued_bytes=q.byte_size,
             )
         self._spontaneous_overflow = True
-        q.clear()
-        q.put_nowait(CodexSpontaneousOverflow(turn_id))
-        if terminal:
-            terminal_message = message
-            terminal_size = size
-            if terminal_size > q.max_bytes:
-                terminal_message = self._minimal_turn_completed(message)
-                terminal_size = self._notification_wire_size(terminal_message)
-            # The queue always reserves at least two item slots. Byte overflow is
-            # impossible for the bounded minimal fallback above.
-            q.put_nowait(terminal_message, terminal_size)
+        q.begin_gap(CodexSpontaneousOverflow(turn_id))
+        q.retry_after_gap_nowait(message, size)
         return True
 
     def _queue_managed_notification(
@@ -1541,20 +1902,24 @@ class CodexHandle:
         review/start can emit multiple item notifications before its RPC response.
         A regular bounded ``asyncio.Queue.put`` deadlocks once full because the
         response which starts the consumer is waiting behind those notifications.
-        On overflow retain one signal plus the authoritative terminal frame.
+        On overflow retain one gap signal, then admit only intact new item
+        lifecycles; the authoritative terminal has its own reserved end slot.
         """
         q = self._turn_q
         if not isinstance(q, _SpontaneousNotificationQueue):
             return False
         method = message.get("method")
         terminal = method == "turn/completed"
-        if self._managed_overflow and not terminal:
-            return True
         size = (
             raw_size if isinstance(raw_size, int) and raw_size >= 0
             else self._notification_wire_size(message)
         )
-        if not self._managed_overflow and q.put_nowait(message, size):
+        if terminal:
+            self._retain_terminal_notification(q, message, size)
+            return True
+        if not q.accepts_after_gap(message):
+            return True
+        if q.put_nowait(message, size):
             return True
 
         turn_id = self.turn_id or _notification_turn_id(message)
@@ -1566,21 +1931,8 @@ class CodexHandle:
                 queued_bytes=q.byte_size,
             )
             self._managed_overflow = True
-            q.clear()
-            q.put_nowait(CodexManagedOverflow(turn_id))
-        if terminal:
-            terminal_message = message
-            terminal_size = size
-            if terminal_size > q.max_bytes:
-                terminal_message = self._minimal_turn_completed(message)
-                terminal_size = self._notification_wire_size(terminal_message)
-            if not q.put_nowait(terminal_message, terminal_size):
-                # The queue reserves two slots (overflow + terminal). This final
-                # fallback only covers an unexpectedly tiny byte budget.
-                q.clear()
-                q.put_nowait(CodexManagedOverflow(turn_id))
-                minimal = self._minimal_turn_completed(message)
-                q.put_nowait(minimal, self._notification_wire_size(minimal))
+        q.begin_gap(CodexManagedOverflow(turn_id))
+        q.retry_after_gap_nowait(message, size)
         return True
 
     def _close_spontaneous_stream(self, turn_id: Optional[str]) -> None:
@@ -1589,19 +1941,18 @@ class CodexHandle:
         current = self._spontaneous_queue_turn_id
         if q is None or current is None or (turn_id and turn_id != current):
             return
-        closed = CodexSpontaneousClosed(current)
-        if q.put_nowait(closed):
+        if q.has_turn_completed():
             return
-        self._spontaneous_overflow = True
-        q.clear()
-        q.put_nowait(CodexSpontaneousOverflow(current))
-        q.put_nowait(closed)
+        closed = CodexSpontaneousClosed(current)
+        if q.put_end_nowait(closed):
+            return
 
     async def receive_spontaneous_response(self, turn_id: str):
         """Yield exactly one spontaneous turn's raw frames and internal signals."""
         q = self._spontaneous_q
         if q is None or self._spontaneous_queue_turn_id != turn_id:
             return
+        terminal_seen = False
         try:
             while True:
                 item = await q.get()
@@ -1609,24 +1960,33 @@ class CodexHandle:
                 if isinstance(item, CodexSpontaneousClosed):
                     break
                 if isinstance(item, dict) and item.get("method") == "turn/completed":
+                    terminal_seen = True
                     break
         finally:
             if self._spontaneous_q is q:
                 self._spontaneous_q = None
                 self._spontaneous_queue_turn_id = None
                 self._spontaneous_overflow = False
+            if terminal_seen:
+                await self._restore_http_provider_state(
+                    include_descendants=True,
+                )
+                self._schedule_http_provider_descendant_repair()
 
     async def interrupt(self) -> None:
         if not (self.proc and self.thread_id and self.turn_id):
             raise RuntimeError("codex turn is not running")
+        target_thread_id = self.thread_id
         target_turn_id = self._review_execution_turn_id or self.turn_id
         try:
             await self._request(
-                "turn/interrupt",
-                {"threadId": self.thread_id, "turnId": target_turn_id},
+                "turn/interrupt", {
+                    "threadId": target_thread_id,
+                    "turnId": target_turn_id,
+                },
             )
             return
-        except Exception:
+        except Exception as first_error:
             # A click can race review/start's outer response and the nested
             # turn/started notification.  app-server serializes both on stdout,
             # so a rejected outer interrupt is normally followed immediately by
@@ -1641,14 +2001,141 @@ class CodexHandle:
             retry_turn_id = self._review_execution_turn_id
             if (self._review_active and retry_turn_id
                     and retry_turn_id != target_turn_id):
-                await self._request(
-                    "turn/interrupt",
-                    {"threadId": self.thread_id, "turnId": retry_turn_id},
-                )
+                try:
+                    await self._request(
+                        "turn/interrupt", {
+                            "threadId": target_thread_id,
+                            "turnId": retry_turn_id,
+                        },
+                    )
+                except CodexAppServerError as retry_error:
+                    if retry_error.no_active_turn:
+                        raise CodexNoActiveTurnError(
+                            target_thread_id, retry_turn_id) from retry_error
+                    raise
                 return
+            if (isinstance(first_error, CodexAppServerError)
+                    and first_error.no_active_turn):
+                raise CodexNoActiveTurnError(
+                    target_thread_id, target_turn_id) from first_error
             raise
 
+    async def confirm_no_active_turn(
+        self, thread_id: str, turn_id: str,
+    ) -> Optional[CodexNoActiveTurnConfirmation]:
+        """Prove one spontaneous turn inactive at a raw-stream boundary.
+
+        ``turn/interrupt`` can report no active turn before a nearby terminal
+        notification reaches the bridge consumer. ``thread/read`` is issued on
+        the same app-server transport and its response gives the stdout reader a
+        deterministic ordering point. A zero-byte fence inserted immediately
+        after that response lets the machine drain every preceding live frame
+        before deciding whether a synthetic terminal is still necessary.
+        """
+        if self.thread_id != thread_id:
+            return None
+        queue = (
+            self._spontaneous_q
+            if (
+                self._spontaneous_queue_turn_id == turn_id
+                and isinstance(
+                    self._spontaneous_q, _SpontaneousNotificationQueue
+                )
+            )
+            else None
+        )
+        terminal_already_observed = bool(
+            self.turn_id is None
+            and not self.turn_active
+            and turn_id in self._owned_turn_ids
+        )
+        if not (
+            self.turn_id == turn_id
+            and self.turn_active
+        ) and queue is None and not terminal_already_observed:
+            return None
+
+        result = await self._request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": False},
+        )
+        raw_thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(raw_thread, dict) or raw_thread.get("id") != thread_id:
+            return None
+        raw_status = raw_thread.get("status")
+        status_type = (
+            raw_status.get("type") if isinstance(raw_status, dict) else None
+        )
+        if status_type not in {"idle", "notLoaded", "systemError"}:
+            return None
+
+        current_queue = (
+            self._spontaneous_q
+            if (
+                self._spontaneous_q is queue
+                and self._spontaneous_queue_turn_id == turn_id
+            )
+            else None
+        )
+        authoritative_terminal = bool(
+            (current_queue is not None
+             and current_queue.has_turn_completed())
+            or terminal_already_observed
+            or (
+                self.turn_id is None
+                and not self.turn_active
+                and self._spontaneous_turn_id != turn_id
+            )
+        )
+        if authoritative_terminal:
+            return CodexNoActiveTurnConfirmation(
+                fence=None,
+                queue=current_queue,
+                authoritative_terminal=True,
+            )
+
+        # A different active turn may have begun while thread/read was in flight.
+        # Never use the old interrupt miss to clear that newer lifecycle.
+        if (
+            self.thread_id != thread_id
+            or self.turn_id != turn_id
+            or not self.turn_active
+        ):
+            return None
+        fence = (
+            CodexNoActiveTurnFence()
+            if current_queue is not None
+            else None
+        )
+        if current_queue is not None and fence is not None:
+            current_queue.put_control_nowait(fence)
+        return CodexNoActiveTurnConfirmation(
+            fence=fence,
+            queue=current_queue,
+            authoritative_terminal=False,
+        )
+
+    def reconcile_no_active_turn(
+        self, thread_id: str, turn_id: str,
+    ) -> bool:
+        """Commit one previously confirmed inactive local turn."""
+        if self.thread_id != thread_id:
+            return False
+        if self.turn_id not in {None, turn_id}:
+            return False
+        if self.turn_id is None and self.turn_active:
+            return False
+        self.turn_active = False
+        self.turn_start_pending = False
+        if self.turn_id == turn_id:
+            self.turn_id = None
+        if self._spontaneous_turn_id == turn_id:
+            self._close_spontaneous_stream(turn_id)
+            self._spontaneous_turn_id = None
+        return True
+
     async def disconnect(self) -> None:
+        self._http_provider_repair_stop.set()
         proc = self.proc
         process_group = self._process_group
         daemon_proxy = self._using_daemon_proxy
@@ -1665,6 +2152,9 @@ class CodexHandle:
         self._server_request_tasks.clear()
         self._server_request_tasks_by_id.clear()
         self._pending_server_request_ids.clear()
+        for boundary in self._pending_response_boundaries.values():
+            boundary.release()
+        self._pending_response_boundaries.clear()
         self.proc = None
         self._process_group = None
         self._reader = None
@@ -1701,6 +2191,7 @@ class CodexHandle:
             if process_group is not None:
                 stop(signal.SIGKILL, force=True)
         self._using_daemon_proxy = False
+        self._shared_resume_binding_thread_id = None
         self._proxy_read_buffer.clear()
         self._proxy_close_sent = False
         if self._turn_q is not None:
@@ -1717,6 +2208,15 @@ class CodexHandle:
         if spontaneous_turn_id is not None:
             await self._publish_turn_lifecycle(
                 "completed", spontaneous_turn_id)
+        await self._restore_http_provider_state(include_descendants=True)
+        self._http_provider_root_id = None
+        repair_tasks = [
+            task for task in self._http_provider_repair_tasks
+            if task is not asyncio.current_task()
+        ]
+        if repair_tasks:
+            await asyncio.gather(*repair_tasks, return_exceptions=True)
+        self._http_provider_repair_tasks.clear()
         if daemon_proxy:
             log.debug("codex daemon proxy disconnected")
 
@@ -1763,6 +2263,7 @@ class CodexHandle:
                     self._thread_settings_updated.wait(),
                     timeout=_THREAD_SETTINGS_NOTIFY_TIMEOUT,
                 )
+                await self._restore_http_provider_state()
                 return True
             except asyncio.TimeoutError:
                 log.warning("codex thread settings notification timed out")
@@ -2253,19 +2754,136 @@ class CodexHandle:
         self.last_rate_limits_by_id = remembered
 
     # ---- internals ----
-    async def _request(self, method: str, params: Optional[dict] = None):
+    async def _request(
+        self,
+        method: str,
+        params: Optional[dict] = None,
+        *,
+        response_boundary: Optional[_CodexSteerResponseBoundary] = None,
+    ):
         self._id += 1
         rid = self._id
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[rid] = fut
+        if response_boundary is not None:
+            self._pending_response_boundaries[rid] = response_boundary
         obj = {"jsonrpc": "2.0", "id": rid, "method": method}
         if params is not None:
             obj["params"] = params
-        await self._send(obj)
+        completed = False
         try:
-            return await asyncio.wait_for(fut, timeout=_REQ_TIMEOUT)
+            await self._send(obj)
+            result = await asyncio.wait_for(fut, timeout=_REQ_TIMEOUT)
+            if method in _HTTP_PROVIDER_PERSISTING_METHODS:
+                await self._restore_http_provider_state()
+            completed = True
+            return result
         finally:
             self._pending.pop(rid, None)
+            boundary = self._pending_response_boundaries.pop(rid, None)
+            if boundary is not None and not completed:
+                boundary.release()
+
+    async def _restore_http_provider_state(
+        self,
+        *,
+        include_descendants: bool = False,
+        strict: bool = False,
+    ) -> None:
+        root_id = self._http_provider_root_id
+        if root_id is None:
+            return
+        include_ids = {
+            value for value in (root_id, self.thread_id)
+            if isinstance(value, str) and value
+        }
+        roots = {root_id} if include_descendants else set()
+        async with self._http_provider_repair_lock:
+            try:
+                report = await asyncio.to_thread(
+                    repair_http_provider_records,
+                    apply=True,
+                    roots=roots,
+                    include_thread_ids=include_ids,
+                )
+                restored = await asyncio.to_thread(
+                    canonical_thread_provider_is_restored,
+                    root_id,
+                )
+                if strict and not restored:
+                    raise RuntimeError(
+                        "Codex HTTP compatibility provider was not restored")
+                if report.changed_db_thread_ids or report.changed_rollout_thread_ids:
+                    log.info(
+                        "Codex HTTP provider durable state canonicalized",
+                        db_rows=len(report.changed_db_thread_ids),
+                        rollout_rows=len(report.changed_rollout_thread_ids),
+                    )
+                if report.deferred_thread_ids:
+                    log.info(
+                        "Codex HTTP provider child repair deferred",
+                        rows=len(report.deferred_thread_ids),
+                    )
+            except Exception as exc:
+                log.warning(
+                    "Codex HTTP provider durable state repair failed",
+                    error_type=type(exc).__name__,
+                )
+                if strict:
+                    raise
+
+    def _schedule_http_provider_descendant_repair(self) -> None:
+        root_id = self._http_provider_root_id
+        if root_id is None:
+            return
+        # Codex can flush/archive subagent rollouts after the parent terminal.
+        # Retry in the background without delaying the visible TurnEnd.  A later
+        # disconnect performs one final synchronous pass before clearing root_id.
+        live = {
+            task for task in self._http_provider_repair_tasks
+            if not task.done()
+        }
+        self._http_provider_repair_tasks = live
+        if live:
+            return
+        for delay in (1.0, 5.0, 20.0):
+            task = asyncio.create_task(
+                self._delayed_http_provider_descendant_repair(
+                    root_id, delay),
+            )
+            self._http_provider_repair_tasks.add(task)
+            task.add_done_callback(self._http_provider_repair_done)
+
+    async def _delayed_http_provider_descendant_repair(
+        self,
+        root_id: str,
+        delay: float,
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                self._http_provider_repair_stop.wait(),
+                timeout=delay,
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        if self._http_provider_root_id != root_id:
+            return
+        await self._restore_http_provider_state(include_descendants=True)
+
+    def _http_provider_repair_done(self, task: asyncio.Task) -> None:
+        self._http_provider_repair_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            log.warning(
+                "delayed Codex HTTP provider repair failed",
+                error_type=type(error).__name__,
+            )
 
     async def _notify(self, method: str, params: Optional[dict] = None) -> None:
         obj = {"jsonrpc": "2.0", "method": method}
@@ -2607,16 +3225,35 @@ class CodexHandle:
         """
         method = message.get("method")
         target_thread_id = _notification_thread_id(message)
+        binding_thread_id = (
+            self._shared_resume_binding_thread_id
+            if self._using_daemon_proxy else None
+        )
+        current_thread_id = binding_thread_id or self.thread_id
         if (method in _MODEL_TURN_METHODS
-                and (target_thread_id is None or self.thread_id is None)):
+                and (target_thread_id is None or current_thread_id is None)):
             # These 0.144.1 notifications require both threadId and turnId.
             # Unlike legacy error/hook frames, there is no valid thread-scoped
             # form, so a partial payload must never be guessed into this session.
             log.warning("unattributed codex model notification dropped",
                         method=method)
             return False
-        if (target_thread_id is not None and self.thread_id is not None
-                and target_thread_id != self.thread_id):
+        if (self._using_daemon_proxy
+                and (_is_turn_notification(method)
+                     or method == "thread/compacted")
+                and target_thread_id is None):
+            # Private one-session app-servers historically omit threadId on
+            # legitimate spontaneous turns. A shared daemon has no such safe
+            # inference at any point in its connection lifetime: after resume
+            # binds, another subscribed thread can still emit an unattributed
+            # lifecycle frame.
+            log.warning(
+                "unattributed shared Codex notification dropped",
+                method=method,
+            )
+            return False
+        if (target_thread_id is not None and current_thread_id is not None
+                and target_thread_id != current_thread_id):
             log.warning("foreign codex thread notification dropped", method=method)
             return False
         target_turn_id = _notification_turn_id(message)
@@ -2703,14 +3340,56 @@ class CodexHandle:
         log.warning("unattributed codex turn notification dropped", method=method)
         return False
 
+    def _install_steer_response_boundary(
+        self,
+        boundary: _CodexSteerResponseBoundary,
+        response: dict,
+    ) -> None:
+        """Insert the steer fence at the exact JSON-RPC response boundary."""
+        if "error" in response or boundary.fence is not None:
+            return
+        result = response.get("result")
+        returned_turn_id = (
+            result.get("turnId") if isinstance(result, dict) else None
+        )
+        if returned_turn_id != boundary.turn_id:
+            return
+        if (
+            self.thread_id != boundary.thread_id
+            or self.turn_id != boundary.turn_id
+            or not self.turn_active
+            or boundary.turn_id not in self._owned_turn_ids
+        ):
+            return
+        queue = (
+            self._turn_q
+            if isinstance(self._turn_q, _SpontaneousNotificationQueue)
+            else self._spontaneous_q
+            if (
+                self._spontaneous_queue_turn_id == boundary.turn_id
+                and isinstance(
+                    self._spontaneous_q, _SpontaneousNotificationQueue
+                )
+            )
+            else None
+        )
+        if queue is None or queue.end_delivered:
+            return
+        fence = CodexSteerFence()
+        queue.put_control_nowait(fence)
+        boundary.fence = fence
+
     async def _dispatch(self, m: dict, raw_size: Optional[int] = None) -> None:
         has_id = "id" in m
         has_method = "method" in m
         if has_id and not has_method:                       # response to our request
             fut = self._pending.get(m["id"])
             if fut and not fut.done():
+                boundary = self._pending_response_boundaries.get(m["id"])
+                if boundary is not None:
+                    self._install_steer_response_boundary(boundary, m)
                 if "error" in m:
-                    fut.set_exception(RuntimeError(str(m["error"])))
+                    fut.set_exception(CodexAppServerError(m["error"]))
                 else:
                     fut.set_result(m.get("result"))
             return
@@ -2908,6 +3587,8 @@ class CodexHandle:
                      or completed_turn_id == spontaneous_turn_id)
             ):
                 completed_spontaneous_turn_id = spontaneous_turn_id
+        if method in _HTTP_PROVIDER_PERSISTING_NOTIFICATIONS:
+            await self._restore_http_provider_state()
         if self._turn_q is not None and _is_turn_queue_notification(method):
             queue = self._turn_q
             if not self._queue_managed_notification(m, raw_size):
@@ -2934,11 +3615,13 @@ class CodexHandle:
     @staticmethod
     def _force_turn_sentinel(queue: Any) -> None:
         """Wake a consumer during disconnect even when the bounded queue is full."""
-        if (isinstance(queue, _SpontaneousNotificationQueue)
-                and queue.has_turn_completed()):
-            # receive_response terminates on this authoritative frame. Replacing
-            # a full [Overflow, turn/completed] bridge with None would erase the
-            # only terminal evidence during an EOF/disconnect race.
+        if isinstance(queue, _SpontaneousNotificationQueue):
+            # The reserved end slot never competes with live frames. An existing
+            # authoritative terminal wins over EOF; otherwise one sentinel wakes
+            # the consumer after its retained live tail drains.
+            if queue.has_turn_completed():
+                return
+            queue.put_end_nowait(None)
             return
         try:
             offered = queue.put_nowait(None)

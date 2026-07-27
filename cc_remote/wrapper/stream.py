@@ -28,6 +28,7 @@ from claude_agent_sdk.types import (
     TaskNotificationMessage, HookEventMessage,
 )
 
+from cc_remote.claude_paths import claude_projects_dir
 from cc_remote.protocol import (
     AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
     ToolDelta, ProcessEvent, TurnPlan,
@@ -57,6 +58,8 @@ _MAX_DIFF_SOURCE_LINES = 4096
 _MAX_LIVE_TOOL_ITEMS = 4096
 _LIVE_TOOL_ITEMS_OMITTED_ID = "cc-remote-live-tools-omitted"
 _SYNTHETIC_NO_RESPONSE_TEXT = "No response requested."
+_INTERRUPTED_USER_TEXT = "[Request interrupted by user]"
+_SYNTHETIC_API_ERROR_PREFIX = "API Error:"
 _DIFF_LINE_BREAK = re.compile(
     r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
@@ -1031,7 +1034,10 @@ def transcript_path(session_id: str) -> str | None:
         return None
     try:
         safe_id = glob.escape(session_id)
-        root = os.path.realpath(os.path.expanduser("~/.claude/projects"))
+        # The SDK deliberately preserves a relative CLAUDE_CONFIG_DIR. Resolve
+        # it at the point of filesystem access so containment compares two
+        # absolute paths while retaining the SDK's literal "~" semantics.
+        root = str(claude_projects_dir().resolve())
         matches = glob.iglob(os.path.join(root, "*", f"{safe_id}.jsonl"))
         for index, match in enumerate(matches):
             if index >= _MAX_TRANSCRIPT_MATCHES:
@@ -1209,6 +1215,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     history_plan_id: str | None = None
     ambiguous_final_mid: str | None = None
     ambiguous_final_start: int | None = None
+    turn_failed = False
 
     def _history_id(value, kind: str, position: str) -> str:
         """Keep valid engine ids; deterministically repair malformed legacy rows.
@@ -1236,10 +1243,13 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
             um.ts = t   # question time, not load time
         return um
 
-    def close_turn():
+    def close_turn(
+        subtype: str | None = None,
+        is_error: bool | None = None,
+    ):
         nonlocal turn_open, last_assistant_uuid, current_turn_id, history_plan_id
         nonlocal ambiguous_final_mid, ambiguous_final_start
-        nonlocal turn_start_ts
+        nonlocal turn_start_ts, turn_failed
         if turn_open:
             # SessionMessage rows can omit stop_reason. Live must conservatively
             # treat such text as commentary, but history has the next user/EOF as
@@ -1260,7 +1270,16 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                     0, round((last_ts - turn_start_ts) * 1000))
             te = TurnEnd(
                 result=TurnResult(
-                    subtype="success", duration_ms=duration_ms, is_error=False),
+                    subtype=(
+                        subtype
+                        or ("error" if turn_failed else "success")
+                    ),
+                    duration_ms=duration_ms,
+                    is_error=(
+                        is_error
+                        if is_error is not None else turn_failed
+                    ),
+                ),
                 turn_id=last_assistant_uuid,
                 checkpoint_id=current_turn_id,
             )
@@ -1274,6 +1293,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
             ambiguous_final_mid = None
             ambiguous_final_start = None
             turn_start_ts = None
+            turn_failed = False
 
     for message_index, m in enumerate(messages):
         msg = m.message
@@ -1304,6 +1324,12 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                     turn_open = True
                     current_turn_id = message_uid
             elif isinstance(content, list):
+                if _is_interrupted_user_content(content):
+                    marker_ts = _ts(source_uid)
+                    if marker_ts is not None:
+                        last_ts = marker_ts
+                    close_turn("interrupted", False)
+                    continue
                 # collect any uploaded images up front so they attach to this turn's
                 # UserMsg (replay on reload — the transcript stores the base64).
                 imgs = []
@@ -1364,6 +1390,8 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                 continue
             if _is_synthetic_no_response(msg):
                 continue
+            if _is_synthetic_api_error(msg):
+                turn_failed = True
             if _CLAUDE_MESSAGE_UUID.fullmatch(source_uid):
                 last_assistant_uuid = source_uid
             mid = message_uid
@@ -1777,6 +1805,38 @@ def _is_synthetic_no_response(message: dict[str, Any]) -> bool:
     )
 
 
+def _is_interrupted_user_content(content: Any) -> bool:
+    """Recognize Claude's persisted SDK interrupt marker.
+
+    This row is lifecycle metadata for the preceding prompt, not a second
+    human-authored message. Claude currently persists it as one text block.
+    """
+    return (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+        and content[0]["text"].strip() == _INTERRUPTED_USER_TEXT
+    )
+
+
+def _is_synthetic_api_error(message: dict[str, Any]) -> bool:
+    """Keep Claude's provider error text visible while marking the turn failed."""
+    if message.get("model") != "<synthetic>":
+        return False
+    content = message.get("content")
+    return (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+        and content[0]["text"].lstrip().startswith(
+            _SYNTHETIC_API_ERROR_PREFIX)
+    )
+
+
 def last_assistant_model(messages) -> str | None:
     """Most recent assistant message's model id, for restoring the model readout
     when loading a switched session's history."""
@@ -1785,6 +1845,8 @@ def last_assistant_model(messages) -> str | None:
             if _is_synthetic_no_response(m.message):
                 continue
             mdl = m.message.get("model")
+            if mdl == "<synthetic>":
+                continue
             if mdl:
                 return mdl
     return None

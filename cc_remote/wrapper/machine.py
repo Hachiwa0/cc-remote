@@ -51,6 +51,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import unicodedata
 from collections import OrderedDict
 from pathlib import Path
 from uuid import uuid4
@@ -72,6 +73,7 @@ from cc_remote.attachments import (
     image_dimensions,
     validate_attachments,
 )
+from cc_remote.claude_paths import claude_config_dir
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.workspaces import WorkStores
@@ -82,16 +84,17 @@ from cc_remote.protocol import (
     CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
     ConversationTurn, History, TurnDetail, HistoryImage,
-    HistoryInvalidated, ArtifactInvalidated, AskUser,
-    GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
-    UserMsg,
-    ToolUse, ToolResult, TurnBinding, TurnEnd, TurnResult, is_downstream,
+    HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
+    GoalState, Snapshot, StateEvent, State, TakeoverState, SessionControl,
+    UserMsg, TurnSteered,
+    ToolUse, ToolResult, TurnBinding, TurnEnd, TurnNotificationContext,
+    TurnResult, is_downstream,
     is_reliable_command,
     SessionInfo, SessionList, SessionActivity, ListSessions, SessionFocus, SessionRekey, SessionForked, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_INVALID_CWD, ERR_AUTH, ERR_PROTOCOL,
-    ERR_FORK_RECONCILING,
+    ERR_FORK_RECONCILING, ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
@@ -110,7 +113,18 @@ from cc_remote.wrapper.claude_broker_history import (
     parse_claude_broker_lifecycle,
 )
 from cc_remote.wrapper.ask import make_ask_server
-from cc_remote.wrapper.sdk import CLAUDE_DEFAULT_EFFORT, SdkHandle
+from cc_remote.wrapper.claude_questions import (
+    AskCancelled,
+    AskSuperseded,
+    AskTimeout,
+    AskUnavailable,
+    normalize_claude_questions,
+)
+from cc_remote.wrapper.sdk import (
+    CLAUDE_DEFAULT_EFFORT,
+    CLAUDE_DEFAULT_MODEL,
+    SdkHandle,
+)
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
 from cc_remote.wrapper.rollback_commands import (
     RollbackCommandJournal,
@@ -132,8 +146,10 @@ from cc_remote.wrapper.stream import (
     translate_subagent_history, merge_subagent_history,
 )
 from cc_remote.wrapper.codex_handle import (
-    CodexHandle, CodexManagedOverflow,
-    CodexSpontaneousClosed, CodexSpontaneousOverflow,
+    CodexAppServerError, CodexHandle, CodexManagedOverflow,
+    CodexNoActiveTurnError, CodexNoActiveTurnFence,
+    CodexSteerOutcomeUnknown,
+    CodexSpontaneousClosed, CodexSpontaneousOverflow, CodexSteerFence,
 )
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator, codex_session_id, is_turn_terminal,
@@ -151,6 +167,10 @@ from cc_remote.wrapper.codex_rpc import (
 from cc_remote.wrapper.engine_capabilities import (
     engine_capabilities, manage_engine_plugin, manage_engine_skill,
     manage_engine_hook,
+)
+from cc_remote.wrapper.git_diff import (
+    bounded_process_output,
+    read_git_diff,
 )
 from cc_remote.wrapper.source_fetch import capture_public_source
 from cc_remote.wrapper.work_context import (
@@ -186,6 +206,7 @@ from cc_remote.wrapper.process_scan import (
     process_identity,
     process_owner_uid,
 )
+from cc_remote.wrapper.command_router import CommandRouter, UNHANDLED_COMMAND
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -196,6 +217,21 @@ CLAUDE_PERMISSION_MODES = frozenset({
 CODEX_PERMISSION_MODES = frozenset({"never", "on-request", "untrusted"})
 CODEX_COLLABORATION_MODES = frozenset({"default", "plan"})
 CODEX_FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
+_CLAUDE_OPUS_5_1M_ALIASES = frozenset({
+    "opus",
+    "opus[1m]",
+    "claude-opus-5",
+    "claude-opus-5[1m]",
+})
+
+
+def _normalize_claude_new_session_model(model: Optional[str]) -> Optional[str]:
+    """Pin only fresh-session Opus 5 aliases to the explicit 1M model."""
+    if model is None:
+        return None
+    if model.strip().lower() in _CLAUDE_OPUS_5_1M_ALIASES:
+        return CLAUDE_DEFAULT_MODEL
+    return model
 
 
 def _codex_fast_on(value: Optional[str]) -> bool:
@@ -227,6 +263,333 @@ def _codex_success_terminal(message: dict, fallback_turn_id: str) -> TurnEnd:
             subtype="success", duration_ms=duration_ms, is_error=False),
         turn_id=turn_id,
     )
+
+
+def _codex_user_message_identity(
+    message: dict,
+) -> tuple[str, str] | None:
+    """Return the official client/turn identity for one userMessage item."""
+    if message.get("method") not in {"item/started", "item/completed"}:
+        return None
+    params = message.get("params")
+    item = params.get("item") if isinstance(params, dict) else None
+    if not isinstance(item, dict) or item.get("type") != "userMessage":
+        return None
+    client_id = item.get("clientId")
+    turn_id = params.get("turnId")
+    if (
+        not isinstance(client_id, str)
+        or not client_id
+        or len(client_id) > 128
+        or not isinstance(turn_id, str)
+        or not turn_id
+        or len(turn_id) > 128
+    ):
+        return None
+    return client_id, turn_id
+
+
+def _turn_detail_event_group(event: dict) -> str | None:
+    """Return the display-block identity used for intra-turn pagination."""
+    event_type = event.get("type")
+    if event_type in {"assistant_msg_start", "delta", "assistant_msg_end"}:
+        identity = event.get("message_id")
+        return f"message:{identity}" if isinstance(identity, str) else None
+    if event_type in {"tool_use", "tool_delta", "tool_result"}:
+        identity = event.get("tool_use_id")
+        return f"tool:{identity}" if isinstance(identity, str) else None
+    if event_type in {"process", "turn_plan", "turn_diff"}:
+        identity = event.get("item_id")
+        return f"item:{identity}" if isinstance(identity, str) else None
+    # Control/user/terminal frames reconstruct the turn envelope but do not
+    # consume one visible process slot.
+    return None
+
+
+def _coalesce_turn_detail_group(rows: list[dict]) -> list[dict]:
+    """Fold repeated live snapshots without changing the rendered block.
+
+    A display block is the atomic pagination unit.  Some app-server activities
+    emit thousands of snapshots for one item id; replaying every snapshot makes
+    that single atomic group larger than the WebSocket frame even though the UI
+    ultimately retains only the last merged block.
+    """
+    if not rows:
+        return []
+    event_types = {row.get("type") for row in rows}
+    if event_types == {"process"}:
+        merged = dict(rows[0])
+        for row in rows[1:]:
+            append_to = row.get("append_to")
+            delta = row.get("delta")
+            if isinstance(append_to, str) and isinstance(delta, str):
+                field = "progress" if append_to == "progress" else append_to
+                current = merged.get(field)
+                merged[field] = (
+                    (current if isinstance(current, str) else "") + delta
+                )
+            else:
+                for key, value in row.items():
+                    if value is not None and key not in {"append_to", "delta"}:
+                        merged[key] = value
+        merged["append_to"] = None
+        merged["delta"] = None
+        return [merged]
+    if event_types == {"turn_plan"} or event_types == {"turn_diff"}:
+        return [dict(rows[-1])]
+    if event_types <= {
+        "assistant_msg_start", "delta", "assistant_msg_end",
+    }:
+        start = next(
+            (dict(row) for row in rows
+             if row.get("type") == "assistant_msg_start"),
+            None,
+        )
+        deltas = [
+            row.get("text") for row in rows
+            if row.get("type") == "delta"
+            and isinstance(row.get("text"), str)
+        ]
+        end = next(
+            (dict(row) for row in reversed(rows)
+             if row.get("type") == "assistant_msg_end"),
+            None,
+        )
+        result: list[dict] = []
+        if start is not None:
+            result.append(start)
+        if deltas:
+            template = next(
+                dict(row) for row in rows if row.get("type") == "delta")
+            template["text"] = "".join(deltas)
+            result.append(template)
+        if end is not None:
+            result.append(end)
+        return result
+    if event_types <= {"tool_use", "tool_delta", "tool_result"}:
+        result = []
+        use = next(
+            (dict(row) for row in rows if row.get("type") == "tool_use"),
+            None,
+        )
+        if use is not None:
+            result.append(use)
+        deltas: dict[str, dict] = {}
+        delta_order: list[str] = []
+        for row in rows:
+            if row.get("type") != "tool_delta":
+                continue
+            stream = row.get("stream")
+            if not isinstance(stream, str):
+                continue
+            if stream not in deltas:
+                deltas[stream] = dict(row)
+                deltas[stream]["delta"] = ""
+                delta_order.append(stream)
+            value = row.get("delta")
+            if isinstance(value, str):
+                deltas[stream]["delta"] += value
+        result.extend(deltas[stream] for stream in delta_order)
+        completed = next(
+            (dict(row) for row in reversed(rows)
+             if row.get("type") == "tool_result"),
+            None,
+        )
+        if completed is not None:
+            result.append(completed)
+        return result
+    # Mixed legacy groups are uncommon and already bounded per event. Preserve
+    # their exact order; the final budget guard below still prevents an
+    # oversized frame.
+    return [dict(row) for row in rows]
+
+
+def _bound_turn_detail_group(rows: list[dict], max_bytes: int) -> list[dict]:
+    """Last-resort field compaction for one otherwise oversized atomic group."""
+    if len(json.dumps(
+        rows, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")) <= max_bytes:
+        return rows
+    bounded = []
+    for row in rows:
+        item = dict(row)
+        if item.get("type") == "tool_use":
+            item["input"] = {
+                "_cc_remote_notice": "工具输入过大，已在此详情页截断",
+            }
+        elif item.get("type") == "process" and item.get("input") is not None:
+            item["input"] = {
+                "_cc_remote_notice": "处理输入过大，已在此详情页截断",
+            }
+        for key in (
+            "text", "delta", "content", "summary", "detail", "output",
+            "diff", "progress", "command", "explanation",
+        ):
+            value = item.get(key)
+            if isinstance(value, str) and len(value) > 256 * 1024:
+                item[key] = value[:256 * 1024] + "\n…（内容过大，已截断）"
+                item["truncated"] = True
+        bounded.append(item)
+    if len(json.dumps(
+        bounded, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")) <= max_bytes:
+        return bounded
+
+    template = rows[-1]
+    base = {
+        key: template[key] for key in ("v", "ts", "sid", "seq")
+        if key in template
+    }
+    message = "此处理项本身超过单帧上限，已在本页显式截断。"
+    group = _turn_detail_event_group(template)
+    if group and group.startswith("message:"):
+        message_id = group.removeprefix("message:")
+        return [
+            {**base, "type": "assistant_msg_start",
+             "message_id": message_id, "channel": "unknown"},
+            {**base, "type": "delta", "message_id": message_id,
+             "text": message, "channel": "unknown"},
+            {**base, "type": "assistant_msg_end",
+             "message_id": message_id, "channel": "unknown"},
+        ]
+    if group and group.startswith("tool:"):
+        tool_id = group.removeprefix("tool:")
+        return [
+            {**base, "type": "tool_use", "message_id": tool_id,
+             "tool_use_id": tool_id, "tool": "oversized_detail",
+             "input": {"notice": message}},
+            {**base, "type": "tool_result", "tool_use_id": tool_id,
+             "content": message, "is_error": False, "truncated": True},
+        ]
+    item_id = (
+        group.removeprefix("item:")
+        if group and group.startswith("item:")
+        else f"oversized-detail-{hashlib.sha256(message.encode()).hexdigest()[:16]}"
+    )
+    return [{
+        **base,
+        "type": "process",
+        "item_id": item_id,
+        "kind": "task",
+        "phase": "snapshot",
+        "status": "succeeded",
+        "title": "处理项过大",
+        "summary": message,
+        "truncated": True,
+    }]
+
+
+def _turn_detail_page(
+    rows: tuple[dict, ...] | list[dict],
+    *,
+    before: str | None,
+    limit: int,
+    max_bytes: int | None = None,
+) -> tuple[list[dict], bool, str | None, bool, str | None]:
+    """Select a source-ordered, block-complete detail window."""
+    grouped_rows: dict[str, list[dict]] = {}
+    for row in rows:
+        group = _turn_detail_event_group(row)
+        if group is not None:
+            grouped_rows.setdefault(group, []).append(row)
+    coalesced_groups = {
+        group: _bound_turn_detail_group(
+            _coalesce_turn_detail_group(group_rows),
+            max_bytes or 8 * 1024 * 1024,
+        )
+        for group, group_rows in grouped_rows.items()
+    }
+
+    event_groups: list[str | None] = []
+    wire_rows: list[dict] = []
+    ordered_groups: list[str] = []
+    seen: set[str] = set()
+    group_bytes: dict[str, int] = {}
+    envelope_bytes = 0
+    emitted_groups: set[str] = set()
+    source_rows: list[dict] = []
+    for row in rows:
+        group = _turn_detail_event_group(row)
+        if group is None:
+            source_rows.append(row)
+        elif group not in emitted_groups:
+            emitted_groups.add(group)
+            source_rows.extend(coalesced_groups[group])
+    for row in source_rows:
+        group = _turn_detail_event_group(row)
+        event_groups.append(group)
+        wire_row = {
+            **row,
+            # Conversation images already have source-bound thumbnail/full
+            # endpoints. Never put their base64 bodies back into a heavy detail
+            # frame; the summary row retains canonical imageRefs in the browser.
+            **({"images": None} if row.get("type") == "user_msg"
+               and row.get("images") else {}),
+        }
+        wire_rows.append(wire_row)
+        row_bytes = len(json.dumps(
+            wire_row, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8"))
+        if group is None:
+            envelope_bytes += row_bytes
+        else:
+            group_bytes[group] = group_bytes.get(group, 0) + row_bytes
+        if group is not None and group not in seen:
+            seen.add(group)
+            ordered_groups.append(group)
+
+    total = len(ordered_groups)
+    requested_end: int | None = None
+    if before is not None:
+        if not before.isascii() or not before.isdigit():
+            raise ValueError("invalid turn detail cursor")
+        requested_end = int(before)
+        if requested_end < 0 or requested_end > total:
+            raise ValueError("turn detail cursor is out of range")
+    page_limit = max(1, limit)
+
+    def page_start(end: int) -> int:
+        start = end
+        page_bytes = envelope_bytes
+        while start > 0 and end - start < page_limit:
+            candidate = ordered_groups[start - 1]
+            candidate_bytes = group_bytes.get(candidate, 0)
+            if (max_bytes is not None and start < end
+                    and page_bytes + candidate_bytes > max_bytes):
+                break
+            start -= 1
+            page_bytes += candidate_bytes
+        return start
+
+    # Derive one canonical page chain from newest to oldest. Byte-bounded pages
+    # can contain fewer than ``limit`` groups, so adding ``limit`` to the current
+    # cursor can skip a whole intermediate page. Only advertise exact adjacent
+    # boundaries from this chain in either direction.
+    boundaries = [total]
+    while boundaries[-1] > 0:
+        boundaries.append(page_start(boundaries[-1]))
+    end = total if requested_end is None else requested_end
+    try:
+        boundary_index = boundaries.index(end)
+    except ValueError as exc:
+        raise ValueError("turn detail cursor is not a page boundary") from exc
+    start = (
+        boundaries[boundary_index + 1]
+        if boundary_index + 1 < len(boundaries)
+        else end
+    )
+    selected = set(ordered_groups[start:end])
+    page = [
+        dict(row) for row, group in zip(wire_rows, event_groups)
+        if group is None or group in selected
+    ]
+    has_more = start > 0
+    oldest_cursor = str(start) if has_more else None
+    has_newer = boundary_index > 0
+    newer_cursor = (
+        str(boundaries[boundary_index - 1]) if has_newer else None
+    )
+    return page, has_more, oldest_cursor, has_newer, newer_cursor
 
 
 def _render_history_image(
@@ -345,6 +708,7 @@ class WrapperMachine:
     # cached one-shot responses must not become an unbounded second history store.
     COMMAND_IDS_PER_CLIENT = 512
     COMMAND_CLIENTS = 64
+    COMMAND_RESPONSE_BYTES = 24 * 1024 * 1024
     SESSION_ALIAS_CAP = 256
     SESSION_ALIAS_TTL = 7 * 24 * 3600
     SESSION_ALIAS_FILE_MAX_BYTES = 2 * 1024 * 1024
@@ -355,6 +719,8 @@ class WrapperMachine:
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
     PREVIEW_EXTERNAL_PATH_CAP = 256
     PREVIEW_WRITE_CANDIDATE_CAP = 64
+    NOTIFICATION_TITLE_CAP = 512
+    NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
         "write", "edit", "multiedit", "notebookedit", "editfile",
         "apply_patch", "filechange",
@@ -374,6 +740,8 @@ class WrapperMachine:
     })
     OFFICE_PREVIEW_INPUT_MAX_BYTES = 32 * 1024 * 1024
     OFFICE_PREVIEW_TIMEOUT_SECONDS = 45
+    HISTORY_REFRESH_MIN_INTERVAL_SECONDS = 1.0
+    HISTORY_REFRESH_MAX_INTERVAL_SECONDS = 10.0
     PREVIEW_ASSET_MEDIA_TYPES = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -396,7 +764,7 @@ class WrapperMachine:
     # the client that created it, so every operation against that sid must pass
     # the owner check before its handler is allowed to read or mutate state.
     BTW_SID_COMMANDS = frozenset({
-        "query", "interrupt", "takeover", "set_model", "set_effort",
+        "query", "steer", "interrupt", "takeover", "set_model", "set_effort",
         "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw", "set_perm",
         "get_context", "get_status", "get_diff", "get_file_preview", "save_markdown",
         "get_preview_asset", "answer_question", "get_goal", "set_goal", "clear_goal",
@@ -413,6 +781,7 @@ class WrapperMachine:
     def __init__(self, cfg: WrapperConfig, transport: WrapperTransport):
         self.cfg = cfg
         self.transport = transport
+        self._command_router = CommandRouter(self)
         self.instance_id = uuid4().hex
         # One lifecycle gate coordinates the official process-global Codex
         # daemon. Each resident Code handle still owns only its short-lived
@@ -451,6 +820,11 @@ class WrapperMachine:
         # explicit History/resident watches.  Keep them bounded so a long-lived
         # wrapper never accumulates one transcript watcher per historical thread.
         self._codex_sidebar_watches: OrderedDict[str, None] = OrderedDict()
+        # Display metadata is populated by catalog reads and successful local
+        # mutations. Keep it bounded and memory-only: transcripts remain the
+        # authority, and a terminal event must never synchronously reread a
+        # multi-gigabyte history merely to format an OS notification.
+        self._notification_titles: OrderedDict[str, str] = OrderedDict()
         self._watch_task: Optional[asyncio.Task] = None
         self._work_schedule_task: Optional[asyncio.Task] = None
         self._work_schedule_runs: set[asyncio.Task] = set()
@@ -510,6 +884,8 @@ class WrapperMachine:
         self._processed_commands: OrderedDict[
             str, OrderedDict[str, tuple[object, ...]]
         ] = OrderedDict()
+        self._processed_command_sizes: dict[tuple[str, str], int] = {}
+        self._processed_command_bytes = 0
         # Durable temp-key -> real-id recovery. SessionRekey is a control frame;
         # if its one live send is lost after NewSession was ACKed, the next Hello
         # uses this map to replay the rekey before cursor catch-up.
@@ -583,6 +959,49 @@ class WrapperMachine:
         )
 
     # ---- pool helpers ----
+
+    @classmethod
+    def _clean_notification_title(cls, value: object) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        # Newlines become word boundaries; other control/format characters are
+        # removed. A small input cap prevents a first prompt from turning title
+        # formatting into another large-history path.
+        cleaned = "".join(
+            " " if char.isspace()
+            else "" if unicodedata.category(char).startswith("C")
+            else char
+            for char in value[:2048]
+        )
+        normalized = " ".join(cleaned.split())
+        return normalized[:cls.NOTIFICATION_TITLE_LENGTH].strip() or None
+
+    def _remember_notification_title(self, sid: Optional[str], value: object) -> None:
+        if not sid:
+            return
+        title = self._clean_notification_title(value)
+        if not title:
+            return
+        self._notification_titles[sid] = title
+        self._notification_titles.move_to_end(sid)
+        while len(self._notification_titles) > self.NOTIFICATION_TITLE_CAP:
+            self._notification_titles.popitem(last=False)
+
+    def _notification_context(
+        self,
+        ctx: SessionContext,
+    ) -> TurnNotificationContext:
+        route_sid = (
+            ctx.parent_sid if ctx.btw and ctx.parent_sid
+            else (ctx.session_id or ctx.key)
+        )
+        display_name = self._notification_titles.get(route_sid or "")
+        return TurnNotificationContext(
+            engine="codex" if ctx.engine == "codex" else "claude",
+            space="work" if ctx.space == "work" else "code",
+            display_name=display_name,
+            parent_session_id=ctx.parent_sid if ctx.btw else None,
+        )
 
     def _history_revision(self, sid: str) -> str:
         return f"{self.instance_id}-{self._history_revision_epochs.get(sid, 0)}"
@@ -855,7 +1274,7 @@ class WrapperMachine:
     ) -> None:
         """Install the complete per-session Claude bridge on one SDK handle."""
         sdk.ask_server = make_ask_server(
-            lambda q, o: self._on_ask(ctx, q, o),
+            lambda q, o: self._on_mcp_ask(ctx, q, o),
             lambda m: self._on_set_mode(ctx, m),
         )
         sdk.permission_callback = (
@@ -1830,6 +2249,12 @@ class WrapperMachine:
                 if cmd.type == "get_models":
                     self._start_models_command(cmd)
                     continue
+                if cmd.type == "steer":
+                    # turn/steer is a short app-server RPC, but it must not
+                    # monopolize the serial command lane and delay an explicit
+                    # Stop arriving from another client.
+                    self._start_interactive_control_command(cmd)
+                    continue
                 if cmd.type in {
                     "get_engine_capabilities", "manage_engine_plugin",
                     "manage_engine_skill", "manage_engine_hook",
@@ -1937,6 +2362,8 @@ class WrapperMachine:
                     disconnected = True
                 except Exception:
                     pass
+                finally:
+                    await self._cleanup_codex_steer_attachments(c)
                 if c.btw and c.engine != "codex" and c.btw_real_id:
                     await self._delete_private_btw(
                         c.btw_real_id, c.cwd, forget=disconnected)
@@ -2257,10 +2684,21 @@ class WrapperMachine:
                           type=getattr(msg, "type", None))
                 return
             msg.to = ctx.owner_client_id
+        if isinstance(msg, TurnEnd):
+            # The replayable object is deliberately notification-free. Only a
+            # copy sent on this live call receives presentation metadata.
+            msg.notification_context = None
         if is_downstream(msg):
             msg.seq = ctx.next_seq()
             ctx.buffer.append(msg)
-        await self.transport.send(msg)
+        live = (
+            msg.model_copy(update={
+                "notification_context": self._notification_context(ctx),
+            })
+            if isinstance(msg, TurnEnd)
+            else msg
+        )
+        await self.transport.send(live)
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
         self._observe_preview_path_event(ctx, msg)
@@ -2322,23 +2760,72 @@ class WrapperMachine:
 
     def _remember_command(self, client_id: str, cmd_id: str,
                           responses: tuple[object, ...] = ()) -> None:
+        response_bytes = self._command_response_bytes(responses)
+        if response_bytes > self.COMMAND_RESPONSE_BYTES:
+            # The command identity still suppresses a duplicate mutation. Its
+            # oversized narrative remains available from the session ring or
+            # canonical history instead of monopolizing the global retry cache.
+            responses = ()
+            response_bytes = 0
         bucket = self._processed_commands.get(client_id)
         if bucket is None:
             bucket = OrderedDict()
             self._processed_commands[client_id] = bucket
+        previous_size = self._processed_command_sizes.pop(
+            (client_id, cmd_id), 0)
+        self._processed_command_bytes -= previous_size
         bucket[cmd_id] = responses
+        self._processed_command_sizes[(client_id, cmd_id)] = response_bytes
+        self._processed_command_bytes += response_bytes
         bucket.move_to_end(cmd_id)
         self._processed_commands.move_to_end(client_id)
         while len(bucket) > self.COMMAND_IDS_PER_CLIENT:
-            bucket.popitem(last=False)
+            dropped_id, _ = bucket.popitem(last=False)
+            self._processed_command_bytes -= self._processed_command_sizes.pop(
+                (client_id, dropped_id), 0)
         while len(self._processed_commands) > self.COMMAND_CLIENTS:
-            self._processed_commands.popitem(last=False)
+            dropped_client, dropped_bucket = (
+                self._processed_commands.popitem(last=False))
+            for dropped_id in dropped_bucket:
+                self._processed_command_bytes -= (
+                    self._processed_command_sizes.pop(
+                        (dropped_client, dropped_id), 0))
+        while (self._processed_command_bytes > self.COMMAND_RESPONSE_BYTES
+               and self._processed_commands):
+            dropped = False
+            for oldest_client, oldest_bucket in self._processed_commands.items():
+                for oldest_id in oldest_bucket:
+                    key = (oldest_client, oldest_id)
+                    size = self._processed_command_sizes.get(key, 0)
+                    if size <= 0:
+                        continue
+                    # Preserve the at-most-once identity as an empty tombstone;
+                    # only the replay payload is evicted under byte pressure.
+                    oldest_bucket[oldest_id] = ()
+                    self._processed_command_sizes[key] = 0
+                    self._processed_command_bytes -= size
+                    dropped = True
+                    break
+                if dropped:
+                    break
+            if not dropped:
+                break
+
+    @staticmethod
+    def _command_response_bytes(responses: tuple[object, ...]) -> int:
+        total = 0
+        for response in responses:
+            try:
+                total += len(response.model_dump_json().encode("utf-8"))
+            except Exception:
+                total += 1024
+        return total
 
     def _rekey_cached_create_responses(self, old_key: str, session_id: str,
                                        cwd: str) -> None:
         """Keep a cached create response usable if id capture happened while its
         original Focus/ACK were lost. Replay re-key first, then focus the real id."""
-        for bucket in self._processed_commands.values():
+        for client_id, bucket in self._processed_commands.items():
             for cmd_id, responses in list(bucket.items()):
                 updated: list[object] = []
                 changed = False
@@ -2370,6 +2857,11 @@ class WrapperMachine:
                         updated.append(response)
                 if changed:
                     bucket[cmd_id] = tuple(updated)
+                    key = (client_id, cmd_id)
+                    previous_size = self._processed_command_sizes.get(key, 0)
+                    next_size = self._command_response_bytes(bucket[cmd_id])
+                    self._processed_command_sizes[key] = next_size
+                    self._processed_command_bytes += next_size - previous_size
 
     async def _send_command_ack(self, client_id: str, cmd_id: str) -> None:
         await self.transport.send(CommandAck(
@@ -2532,6 +3024,18 @@ class WrapperMachine:
             # nothing and can multiply memory by clients × commands.
             if cmd.type in self.SAFE_RETRY_COMMANDS:
                 responses = ()
+            elif cmd.type == "steer":
+                candidates = (
+                    result if isinstance(result, (tuple, list)) else (result,))
+                # Successful narrative is already in the bounded turn ring and
+                # canonical history (with clientMsgId). Cache only correlated
+                # failures; copying a legal multi-megabyte steer into the global
+                # command LRU would duplicate user payloads.
+                responses = tuple(
+                    response.model_copy(deep=True)
+                    for response in candidates
+                    if isinstance(response, Error)
+                )
             else:
                 candidates = (
                     result if isinstance(result, (tuple, list)) else (result,))
@@ -2547,107 +3051,15 @@ class WrapperMachine:
         rejected = await self._reject_nonowner_btw_command(cmd)
         if rejected is not None:
             return rejected
-        t = cmd.type
-        if t == "hello" and cmd.role == "client":
-            await self._handle_client_hello(cmd)
-        elif t == "query":
-            return await self._handle_query(cmd)
-        elif t == "interrupt":
-            return await self._handle_interrupt(cmd)
-        elif t == "takeover":
-            return await self._handle_takeover(cmd)
-        elif t == "set_model":
-            return await self._handle_set_model(cmd)
-        elif t == "set_effort":
-            return await self._handle_set_effort(cmd)
-        elif t == "set_service_tier":
-            return await self._handle_set_service_tier(cmd)
-        elif t == "set_collaboration_mode":
-            return await self._handle_set_collaboration_mode(cmd)
-        elif t == "open_btw":
-            return await self._handle_open_btw(cmd)
-        elif t == "close_btw":
-            return await self._handle_close_btw(cmd)
-        elif t == "set_perm":
-            return await self._handle_set_perm(cmd)
-        elif t == "get_context":
-            return await self._handle_get_context(cmd)
-        elif t == "get_status":
-            return await self._handle_get_status(cmd)
-        elif t == "get_diff":
-            return await self._handle_get_diff(cmd)
-        elif t == "get_file_preview":
-            return await self._handle_get_file_preview(cmd)
-        elif t == "save_markdown":
-            return await self._handle_save_markdown(cmd)
-        elif t == "get_preview_asset":
-            return await self._handle_get_preview_asset(cmd)
-        elif t == "get_history":
-            return await self._handle_get_history(cmd)
-        elif t == "get_turn_detail":
-            return await self._handle_get_turn_detail(cmd)
-        elif t == "get_history_image":
-            return await self._handle_get_history_image(cmd)
-        elif t == "get_models":
-            return await self._handle_get_models(cmd)
-        elif t == "get_engine_capabilities":
-            return await self._handle_get_engine_capabilities(cmd)
-        elif t == "manage_engine_plugin":
-            return await self._handle_manage_engine_plugin(cmd)
-        elif t == "manage_engine_skill":
-            return await self._handle_manage_engine_skill(cmd)
-        elif t == "manage_engine_hook":
-            return await self._handle_manage_engine_hook(cmd)
-        elif t == "answer_question":
-            return await self._handle_answer_question(cmd)
-        elif t == "get_goal":
-            return await self._handle_get_goal(cmd)
-        elif t == "set_goal":
-            return await self._handle_set_goal(cmd)
-        elif t == "clear_goal":
-            return await self._handle_clear_goal(cmd)
-        elif t == "list_sessions":
-            return await self._handle_list_sessions(cmd)
-        elif t == "switch_session":
-            return await self._handle_switch_session(cmd)
-        elif t == "new_session":
-            return await self._handle_new_session(cmd)
-        elif t == "list_dir":
-            return await self._handle_list_dir(cmd)
-        elif t == "rename_session":
-            return await self._handle_rename_session(cmd)
-        elif t == "archive_session":
-            return await self._handle_archive_session(cmd)
-        elif t == "pin_session":
-            return await self._handle_pin_session(cmd)
-        elif t == "delete_work_session":
-            return await self._handle_delete_work_session(cmd)
-        elif t == "delete_session":
-            return await self._handle_delete_session(cmd)
-        elif t == "rollback_session":
-            return await self._handle_rollback_session(cmd)
-        elif t == "compact_session":
-            return await self._handle_compact_session(cmd)
-        elif t == "start_review":
-            return await self._handle_start_review(cmd)
-        elif t == "get_work_dashboard":
-            return await self._handle_get_work_dashboard(cmd)
-        elif t == "get_work_artifacts":
-            return await self._handle_get_work_artifacts(cmd)
-        elif t in {
-            "create_work_project", "delete_work_project", "add_work_source",
-            "delete_work_source", "create_work_plugin", "delete_work_plugin",
-            "create_work_schedule", "delete_work_schedule",
-        }:
-            return await self._handle_work_mutation(cmd)
-        elif t == "fork_session":
-            return await self._handle_fork_session(cmd)
-        elif t == "fork_session_worktree":
-            return await self._handle_fork_session_worktree(cmd)
-        elif t == "ping":
-            await self._emit_focused(Pong(n=cmd.n))
-        else:
-            log.warning("unexpected command", type=t, role=getattr(cmd, "role", None))
+        result = await self._command_router.dispatch(cmd)
+        if result is UNHANDLED_COMMAND:
+            log.warning(
+                "unexpected command",
+                type=cmd.type,
+                role=getattr(cmd, "role", None),
+            )
+            return None
+        return result
 
     async def _handle_client_hello(self, cmd) -> None:
         # A fresh client (no cursor for a sid) gets exactly one lightweight
@@ -3912,6 +4324,7 @@ class WrapperMachine:
             (ctx is not None and ctx.engine == "codex") or watched_engine == "codex")
         source_path = None
         source_fingerprint = None
+        source_snapshot_stable: bool | None = None
         indexed_page = None
         stale_indexed_page = False
         source_too_large = False
@@ -3928,10 +4341,20 @@ class WrapperMachine:
             )
         except OSError:
             source_path = None
-        if source_path and self._history_index is not None:
+        if source_path:
             try:
                 source_fingerprint = await asyncio.to_thread(
                     HistorySourceFingerprint.capture, source_path)
+            except OSError:
+                source_snapshot_stable = False
+            except Exception as exc:
+                source_snapshot_stable = False
+                log.warning(
+                    "history source fingerprint failed", session_id=sid,
+                    error=str(exc),
+                )
+        if source_fingerprint is not None and self._history_index is not None:
+            try:
                 indexed_page = await asyncio.to_thread(
                     self._history_index.get_page,
                     sid,
@@ -3941,25 +4364,59 @@ class WrapperMachine:
                     limit=int(limit) if isinstance(limit, int) else 0,
                 )
                 if (indexed_page is None and allow_stale
-                        and not is_codex_hist and before is None):
+                        and before is None):
                     indexed_page = await asyncio.to_thread(
                         self._history_index.get_append_page,
                         sid,
-                        "claude",
+                        "codex" if is_codex_hist else "claude",
                         source_fingerprint,
                         before=None,
                         limit=int(limit) if isinstance(limit, int) else 0,
                     )
                     stale_indexed_page = indexed_page is not None
             except OSError:
-                source_fingerprint = None
+                indexed_page = None
             except Exception as exc:
                 log.warning(
                     "history index read failed", session_id=sid,
                     error=str(exc),
                 )
+        cached_full_events: list[dict] | None = None
+        if (indexed_page is not None and detail == "full"
+                and source_fingerprint is not None
+                and self._history_index is not None):
+            # Page rows intentionally omit inline image bodies. Compatibility
+            # full-history callers hydrate each bounded turn from the
+            # source-complete detail table instead of reparsing the rollout or
+            # receiving a silently lossy summary page.
+            cached_full_events = [
+                dict(row) for row in indexed_page.events
+                if row.get("type") in {"model", "effort"}
+            ]
+            for turn in indexed_page.turns:
+                turn_id = turn.get("id")
+                if not isinstance(turn_id, str):
+                    cached_full_events = None
+                    break
+                detail_rows = await asyncio.to_thread(
+                    self._history_index.get_turn_detail,
+                    sid,
+                    "codex" if is_codex_hist else "claude",
+                    source_fingerprint,
+                    turn_id,
+                )
+                if detail_rows is None:
+                    cached_full_events = None
+                    break
+                cached_full_events.extend(dict(row) for row in detail_rows)
+            if cached_full_events is None:
+                # The page can outlive a tighter detail LRU. Rebuild from the
+                # canonical source rather than returning an incomplete page.
+                indexed_page = None
         if indexed_page is not None:
-            cached_events = [dict(row) for row in indexed_page.events]
+            cached_events = cached_full_events or [
+                dict(row) for row in indexed_page.events
+            ]
             if ctx is not None:
                 # Rebuild exact preview capabilities from the materialized
                 # ToolUse/ToolResult pairs.  A wrapper restart must not make a
@@ -4019,6 +4476,28 @@ class WrapperMachine:
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
             )
+            if stale_indexed_page:
+                # A sampled append-prefix page is useful for first paint, but it
+                # is not the exact current rollout/transcript projection. The
+                # browser keeps it display-only until the refresh below commits
+                # a matching authoritative page.
+                cached_history.authoritative = False
+            cached_source_stable = True
+            try:
+                cached_source_stable = (
+                    await asyncio.to_thread(
+                        HistorySourceFingerprint.capture,
+                        source_fingerprint.path,
+                    )
+                    == source_fingerprint
+                )
+            except Exception:
+                cached_source_stable = False
+            if not cached_source_stable:
+                # The source grew after the exact cache lookup but before this
+                # response was assembled. Treat it like any other sampled first
+                # paint instead of letting a stale cache hit replace live rows.
+                cached_history.authoritative = False
             if detail == "summary":
                 cached_history.turns = [
                     ConversationTurn.model_validate(turn)
@@ -4029,7 +4508,11 @@ class WrapperMachine:
                     row for row in cached_events
                     if row.get("type") in {"model", "effort"}
                 ]
-            if stale_indexed_page and not source_too_large:
+            if (
+                (stale_indexed_page or not cached_source_stable)
+                and not source_too_large
+                and before is None
+            ):
                 self._schedule_history_refresh(
                     sid,
                     before=before,
@@ -4115,12 +4598,39 @@ class WrapperMachine:
             # not a read failure banner.
             events = []
         else:
-            directory = (ctx.cwd if ctx else None) or cwd_hint or self.cfg.cc_cwd
+            # Existing Claude sessions must never inherit the wrapper's current
+            # default cwd. Resolve their immutable transcript directory from
+            # resident state or SDK metadata. The browser hint comes only from
+            # an accepted SessionInfo and remains non-authoritative: a scoped
+            # miss is retried through the SDK's all-project lookup below.
+            directory = (ctx.cwd if ctx else None) or None
+            if directory is None:
+                try:
+                    info = await asyncio.to_thread(get_session_info, sid)
+                except Exception as exc:
+                    log.warning(
+                        "Claude history session metadata unavailable",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+                    info = None
+                info_cwd = getattr(info, "cwd", None)
+                if isinstance(info_cwd, str) and info_cwd:
+                    directory = info_cwd
+            if directory is None and isinstance(cwd_hint, str) and cwd_hint:
+                expanded_hint = os.path.expanduser(cwd_hint)
+                if os.path.isabs(expanded_hint) and "\x00" not in expanded_hint:
+                    directory = os.path.realpath(expanded_hint)
             try:
                 def _read():
-                    return (get_session_messages(sid, directory=directory),
-                            transcript_timestamps(sid),
-                            transcript_internal_user_events(sid))
+                    messages = get_session_messages(sid, directory=directory)
+                    if not messages and directory is not None:
+                        messages = get_session_messages(sid, directory=None)
+                    return (
+                        messages,
+                        transcript_timestamps(sid),
+                        transcript_internal_user_events(sid),
+                    )
                 msgs, tss, internal_events = await asyncio.to_thread(_read)
                 if internal_events:
                     events = translate_history(
@@ -4311,6 +4821,20 @@ class WrapperMachine:
             history = best_history
             frame_size = len(history.model_dump_json().encode())
 
+        # Keep the coherent source-complete projection before applying
+        # transport/cache-only image compaction. GetTurnDetail/GetHistoryImage
+        # read this independent row; the lightweight page stores only opaque
+        # image metadata and therefore never reparses base64 on every switch.
+        detail_source_events = tuple(
+            dict(row)
+            for row in history.events
+        )
+        detail_source_turns = materialize_history_turns(
+            detail_source_events,
+            include_live_detail=bool(
+                is_codex_hist and in_progress and before is None),
+        )
+
         if frame_size > frame_budget:
             # A single legacy turn may predate today's attachment limits. First
             # omit historical image bodies. If it is still too large, preserve a
@@ -4356,19 +4880,24 @@ class WrapperMachine:
             history.events = [notice.model_dump(mode="json")]
             history.oldest_id = None
             history.newest_id = None
+        page_events = tuple(
+            {
+                **row,
+                **({"images": None} if row.get("type") == "user_msg"
+                   and row.get("images") else {}),
+            }
+            for row in history.events
+        )
         materialized = MaterializedHistoryPage(
-            events=tuple(history.events),
+            events=page_events,
             has_more=history.has_more,
             oldest_id=history.oldest_id,
             newest_id=history.newest_id,
-            turns=materialize_history_turns(
-                history.events,
-                include_live_detail=bool(
-                    is_codex_hist and in_progress and before is None),
-            ),
+            turns=detail_source_turns,
         )
-        if source_fingerprint is not None and self._history_index is not None:
-            if (indexed_page is not None
+        if source_fingerprint is not None:
+            if (self._history_index is not None
+                    and indexed_page is not None
                     and not indexed_page.semantically_equals(materialized)):
                 # Shadow mismatches never affect the response.  Remove the row
                 # and refresh it below so corruption or a missed source change
@@ -4382,7 +4911,19 @@ class WrapperMachine:
             try:
                 current_fingerprint = await asyncio.to_thread(
                     HistorySourceFingerprint.capture, source_fingerprint.path)
-                if current_fingerprint == source_fingerprint:
+                source_snapshot_stable = (
+                    current_fingerprint == source_fingerprint
+                )
+            except OSError:
+                source_snapshot_stable = False
+            except Exception as exc:
+                source_snapshot_stable = False
+                log.warning(
+                    "history source verification failed", session_id=sid,
+                    error=str(exc),
+                )
+            if source_snapshot_stable and self._history_index is not None:
+                try:
                     await asyncio.to_thread(
                         self._history_index.put_page,
                         sid,
@@ -4391,13 +4932,28 @@ class WrapperMachine:
                         before=before,
                         limit=int(limit) if isinstance(limit, int) else 0,
                         page=materialized,
+                        detail_events=detail_source_events,
                     )
-            except OSError:
-                pass
-            except Exception as exc:
-                log.warning(
-                    "history index write failed", session_id=sid,
-                    error=str(exc),
+                except Exception as exc:
+                    # The index is a rebuildable acceleration layer. A failed
+                    # write cannot make an otherwise coherent source snapshot
+                    # non-authoritative or trigger an endless refresh loop.
+                    log.warning(
+                        "history index write failed", session_id=sid,
+                        error=str(exc),
+                    )
+        if source_snapshot_stable is False:
+            # The translator did not observe one coherent source snapshot. It
+            # may still provide a useful first paint, but it cannot replace the
+            # canonical transcript or clear a replay/rollback barrier.
+            history.authoritative = False
+            if allow_stale and before is None:
+                self._schedule_history_refresh(
+                    sid,
+                    before=before,
+                    limit=limit,
+                    cwd=cwd_hint,
+                    detail=detail,
                 )
         if detail == "summary":
             history.turns = [
@@ -4420,44 +4976,86 @@ class WrapperMachine:
         cwd: str | None,
         detail: str,
     ) -> None:
-        """Refresh one append-stale Claude page without delaying first paint."""
-        key = (sid, before or "", limit or 0, f"{cwd or ''}\0{detail}")
+        """Refresh one provisional moving-source page off the first-paint path."""
+        ctx = self._ctx_by_sid(sid)
+        watch = self._watch.get(sid) or {}
+        is_codex = bool(
+            (ctx is not None and ctx.engine == "codex")
+            or watch.get("engine") == "codex"
+        )
+        # Codex rollouts are addressed by sid and never use cwd. Normalizing it
+        # prevents clients carrying different cwd hints from starting parallel
+        # scans of the same multi-gigabyte rollout.
+        refresh_cwd = None if is_codex else cwd
+        key = (
+            sid,
+            before or "",
+            limit or 0,
+            f"{refresh_cwd or ''}\0{detail}",
+        )
         current = self._history_refresh_tasks.get(key)
         if current is not None and not current.done():
             self._history_refresh_dirty.add(key)
             return
 
         async def refresh() -> None:
+            provisional_attempts = 0
             try:
                 while True:
                     self._history_refresh_dirty.discard(key)
+                    scan_started = time.monotonic()
                     history = await self._build_history(
                         sid,
                         before=before,
                         limit=limit,
-                        cwd_hint=cwd,
+                        cwd_hint=refresh_cwd,
                         detail=detail,
                         allow_stale=False,
                     )
+                    scan_elapsed = time.monotonic() - scan_started
                     if history.authoritative is not False:
                         history.sid = sid
                         await self.transport.send(history)
                         log.info(
-                            "stale Claude history refreshed",
+                            "stale history refreshed",
                             session_id=sid,
                             turns=len(history.turns),
                             before=bool(before),
                         )
                     # Coalesce every append observed during the scan into one
                     # final exact rebuild. This converges at turn completion
-                    # without launching one full Claude parse per tool delta.
-                    if key not in self._history_refresh_dirty:
+                    # without launching one full transcript/rollout parse per
+                    # tool delta. Rate-limit a continuously moving source scan
+                    # so one long-running turn cannot monopolize disk and CPU.
+                    needs_rescan = (
+                        key in self._history_refresh_dirty
+                        or (
+                            history.authoritative is False
+                            and history.error is None
+                        )
+                    )
+                    source_still_moving = (
+                        history.authoritative is False
+                        and history.error is None
+                    )
+                    provisional_attempts = (
+                        provisional_attempts + 1
+                        if source_still_moving
+                        else 0
+                    )
+                    if not needs_rescan:
                         return
+                    if (
+                        self._history_refresh_in_progress(sid)
+                        or provisional_attempts > 1
+                    ):
+                        await asyncio.sleep(
+                            self._history_refresh_backoff_seconds(scan_elapsed))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning(
-                    "stale Claude history refresh failed",
+                    "stale history refresh failed",
                     session_id=sid,
                     error_type=type(exc).__name__,
                 )
@@ -4471,6 +5069,25 @@ class WrapperMachine:
             self._history_refresh_dirty.discard(key)
 
         task.add_done_callback(forget)
+
+    def _history_refresh_in_progress(self, sid: str) -> bool:
+        ctx = self._ctx_by_sid(sid)
+        active_external_turns = (
+            (self._watch.get(sid) or {}).get("active_external_turns")
+        )
+        return bool(
+            (ctx is not None and ctx.state != "idle")
+            or (
+                isinstance(active_external_turns, dict)
+                and active_external_turns
+            )
+        )
+
+    def _history_refresh_backoff_seconds(self, scan_elapsed: float) -> float:
+        return min(
+            max(self.HISTORY_REFRESH_MIN_INTERVAL_SECONDS, scan_elapsed),
+            self.HISTORY_REFRESH_MAX_INTERVAL_SECONDS,
+        )
 
     async def _build_requested_history(
         self,
@@ -4549,6 +5166,10 @@ class WrapperMachine:
             events: list[dict] | None = None,
             *,
             error: str | None = None,
+            has_more: bool = False,
+            oldest_cursor: str | None = None,
+            has_newer: bool = False,
+            newer_cursor: str | None = None,
         ) -> TurnDetail:
             detail = TurnDetail(
                 session_id=sid,
@@ -4557,6 +5178,11 @@ class WrapperMachine:
                 authoritative=error is None,
                 error=error,
                 events=events or [],
+                has_more=has_more,
+                oldest_cursor=oldest_cursor,
+                has_newer=has_newer,
+                newer_cursor=newer_cursor,
+                before=getattr(cmd, "before", None),
                 sid=sid,
                 to=client_id,
             )
@@ -4569,6 +5195,8 @@ class WrapperMachine:
                 events=len(detail.events),
                 frame_bytes=frame_bytes,
                 authoritative=detail.authoritative,
+                has_more=detail.has_more,
+                has_newer=detail.has_newer,
                 client_id=client_id,
                 elapsed_ms=round((time.perf_counter() - started_at) * 1000),
             )
@@ -4613,7 +5241,25 @@ class WrapperMachine:
             rows = None
         if rows is None:
             return await send(error="详细过程已过期，请刷新会话后重试")
-        return await send([dict(row) for row in rows])
+        try:
+            page, has_more, oldest, has_newer, newer = _turn_detail_page(
+                rows,
+                before=getattr(cmd, "before", None),
+                limit=getattr(cmd, "limit", 192),
+                max_bytes=min(
+                    8 * 1024 * 1024,
+                    max(512 * 1024, self.cfg.ws_max_size_bytes // 2),
+                ),
+            )
+        except ValueError:
+            return await send(error="详细过程分页位置已失效，请重新展开该轮")
+        return await send(
+            page,
+            has_more=has_more,
+            oldest_cursor=oldest,
+            has_newer=has_newer,
+            newer_cursor=newer,
+        )
 
     async def _handle_get_history_image(self, cmd) -> HistoryImage:
         """Return one source-bound historical image without resuming an engine."""
@@ -5075,6 +5721,17 @@ class WrapperMachine:
                 )
                 await self._emit(ctx, error)
                 return error
+        # All synchronous rejection paths have passed. A new conversation may
+        # now finish before the next sidebar catalog read, so remember its first
+        # accepted prompt under the temporary key; capture migrates it to the
+        # real engine session id.
+        title_sid = ctx.session_id or ctx.key
+        if (
+            ctx.session_id is None
+            and title_sid
+            and title_sid not in self._notification_titles
+        ):
+            self._remember_notification_title(title_sid, cmd.prompt)
         # claim synchronously so a concurrent query on THIS ctx can't race in
         ctx.interrupt_event.clear()
         ctx.interrupt_deadline = None
@@ -5087,6 +5744,405 @@ class WrapperMachine:
         ctx.turn_task = asyncio.create_task(
             runner(ctx, cmd.prompt, getattr(cmd, "images", None),
                    getattr(cmd, "files", None)))
+
+    async def _handle_steer(self, cmd):
+        """Append one user instruction to the exact active Codex turn.
+
+        Steering is neither a new engine turn nor an interrupt.  The successful
+        narrative echo is replayable so every browser splits the visible task at
+        the same point, while command failures remain correlated to the sender.
+        """
+        sid = getattr(cmd, "sid", None)
+        ctx = self._ctx_for(sid)
+
+        async def reject(code: str, message: str) -> Error:
+            error = Error(
+                code=code,
+                message=message,
+                msg_id=getattr(cmd, "msg_id", None),
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+                sid=(ctx.session_id or ctx.key) if ctx is not None else sid,
+            )
+            # This is a correlated control rejection, not shared session
+            # narrative. Buffering it would let a later client replay A's
+            # targeted failure as its own after hello rewrites the recipient.
+            await self.transport.send(error)
+            return error
+
+        if ctx is None:
+            return await reject(
+                ERR_NOT_STEERABLE, "该会话未启动，无法引导当前任务")
+        if ctx.engine != "codex":
+            return await reject(
+                ERR_NOT_STEERABLE,
+                "Claude 当前不支持无打断引导；请使用打断并发送或排队。",
+            )
+        if ctx.state != "running":
+            return await reject(
+                ERR_NOT_STEERABLE, "当前没有可引导的 Codex 任务")
+        if ctx.write_state != "writable":
+            return await reject(
+                ERR_NOT_STEERABLE,
+                "该会话当前为只读状态，无法从 Remote 引导")
+        if ctx.codex_uncertain_steer is not None:
+            return await reject(
+                ERR_STEER_UNKNOWN,
+                "上一条 Codex 引导结果仍未确认，请等待当前任务结束或刷新历史。",
+            )
+        if not cmd.prompt and not cmd.images and not cmd.files:
+            return await reject(
+                ERR_NOT_STEERABLE,
+                "消息内容为空，请输入内容或添加附件。")
+        attachment_error = validate_attachments(
+            getattr(cmd, "images", None), getattr(cmd, "files", None))
+        if attachment_error:
+            return await reject(
+                ERR_NOT_STEERABLE,
+                "附件不符合要求，请调整后重试。")
+
+        original_prompt = cmd.prompt
+        prompt = original_prompt
+        images = getattr(cmd, "images", None)
+        files = getattr(cmd, "files", None)
+        file_meta = ([{"filename": item.get("filename", "attachment")}
+                      for item in (files or [])] or None)
+        temp_dir: str | None = None
+        persistent_attachments = False
+        accepted = False
+        steer_gate_held = False
+        steer_fence: Optional[CodexSteerFence] = None
+        sdk_turn_id: str | None = None
+
+        def retain_attachments() -> None:
+            nonlocal accepted
+            accepted = True
+            if (temp_dir is not None and not persistent_attachments
+                    and temp_dir not in ctx.codex_steer_attachment_dirs):
+                ctx.codex_steer_attachment_dirs.append(temp_dir)
+
+        try:
+            if files or images:
+                if ctx.space == "work":
+                    upload_root = Path(ctx.cwd).parent / "uploads"
+                    upload_dir = upload_root / cmd.msg_id
+                    upload_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+                    temp_dir = str(upload_dir)
+                    persistent_attachments = True
+                else:
+                    temp_dir = tempfile.mkdtemp(prefix="cc-remote-turn-")
+                    os.chmod(temp_dir, 0o700)
+            if files:
+                prompt = self._stash_files(
+                    prompt, files, temp_dir, ctx.engine)
+            image_paths = (
+                self._stash_images(images, temp_dir) if images else [])
+
+            # Multiple clients may steer concurrently. Serialize steer requests
+            # per session, but do not take launch_lock: Stop must be able to send
+            # turn/interrupt even when an app-server steer response is delayed.
+            async with ctx.steer_lock:
+                if ctx.state != "running":
+                    return await reject(
+                        ERR_NOT_STEERABLE,
+                        "Codex 任务已结束，本次引导未发送。",
+                    )
+                sdk_turn_id = getattr(ctx.sdk, "turn_id", None)
+                sdk_turn_active = bool(
+                    getattr(ctx.sdk, "turn_active", False))
+                if not sdk_turn_id or not sdk_turn_active:
+                    return await reject(
+                        ERR_NOT_STEERABLE,
+                        "Codex 当前回合不支持引导，请等待后重试。",
+                    )
+                ctx.codex_steer_gate.clear()
+                steer_gate_held = True
+                steer_acceptance = await ctx.sdk.steer(
+                    prompt,
+                    images=image_paths,
+                    client_user_message_id=cmd.msg_id,
+                )
+                turn_id = str(steer_acceptance)
+                candidate_fence = getattr(
+                    steer_acceptance, "fence", None)
+                if isinstance(candidate_fence, CodexSteerFence):
+                    steer_fence = candidate_fence
+                    # Drain every raw frame admitted before the app-server RPC
+                    # response. The in-band fence then pauses the consumer while
+                    # this coroutine publishes the new user boundary.
+                    ctx.codex_steer_gate.set()
+                    await steer_fence.reached.wait()
+                retain_attachments()
+                ctx.active_msg_id = cmd.msg_id
+                event = TurnSteered(
+                    msg_id=cmd.msg_id,
+                    turn_id=turn_id,
+                    prompt=original_prompt,
+                    images=images,
+                    files=file_meta,
+                )
+                try:
+                    await self._emit(ctx, event)
+                except Exception as exc:
+                    # _emit buffers before transport.send. Even if the live
+                    # socket disappeared at that boundary, the native mutation
+                    # is accepted and must never be retried.
+                    log.warning(
+                        "accepted Codex steer live echo delayed",
+                        session_id=ctx.session_id,
+                        error_type=type(exc).__name__,
+                    )
+                return event
+        except CodexSteerOutcomeUnknown:
+            # JSON-RPC timeout is not a rejection: app-server may accept and
+            # route turn/steer after the client-side deadline. Keep attachment
+            # paths valid through the native terminal and do not tell the user
+            # to retry a mutation whose outcome is unknown.
+            retain_attachments()
+            ctx.codex_uncertain_steer = TurnSteered(
+                msg_id=cmd.msg_id,
+                turn_id=getattr(ctx.sdk, "turn_id", None) or sdk_turn_id,
+                prompt=original_prompt,
+                images=images,
+                files=file_meta,
+            )
+            error = Error(
+                code=ERR_STEER_UNKNOWN,
+                message=(
+                    "Codex 尚未确认本次引导是否生效；请先观察后续输出或"
+                    "刷新历史，确认前不要重复发送。"
+                ),
+                msg_id=cmd.msg_id,
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+                sid=ctx.session_id or ctx.key,
+            )
+            try:
+                await self.transport.send(error)
+            except Exception as exc:
+                log.warning(
+                    "Codex steer uncertainty notice delayed",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+            log.warning(
+                "Codex steer outcome unknown after transport wait failure",
+                session_id=ctx.session_id,
+            )
+            return error
+        except CodexAppServerError as exc:
+            if exc.active_turn_not_steerable or exc.steer_turn_changed:
+                kind = exc.unsteerable_turn_kind
+                stage = (
+                    "Review"
+                    if kind and "review" in kind.lower()
+                    else "自动压缩"
+                    if kind and "compact" in kind.lower()
+                    else "当前阶段"
+                )
+                return await reject(
+                    ERR_NOT_STEERABLE,
+                    f"Codex {stage}不支持引导，或任务已经切换；本次未发送。",
+                )
+            log.warning(
+                "Codex steer rejected",
+                session_id=ctx.session_id,
+                error_code=exc.code,
+            )
+            return await reject(
+                ERR_NOT_STEERABLE,
+                "Codex 引导暂时失败，本次未发送；请重试。",
+            )
+        except Exception as exc:
+            log.warning(
+                "Codex steer failed",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            return await reject(
+                ERR_NOT_STEERABLE,
+                "Codex 引导暂时失败，本次未发送；请重试。",
+            )
+        finally:
+            if steer_fence is not None:
+                steer_fence.release_now()
+            if temp_dir is not None and not accepted:
+                try:
+                    shutil.rmtree(temp_dir)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:
+                    log.warning(
+                        "steer attachment cleanup failed",
+                        error_type=type(exc).__name__,
+                    )
+            if steer_gate_held:
+                ctx.codex_steer_gate.set()
+
+    async def _reconcile_codex_no_active_turn(
+        self, ctx: SessionContext, error: CodexNoActiveTurnError,
+    ) -> bool:
+        """Unlock one proven-dead spontaneous turn without touching managed I/O."""
+        if ctx.engine != "codex" or ctx.turn_task is not None:
+            return False
+
+        def settled() -> bool:
+            return bool(
+                ctx.state == "idle"
+                and ctx.codex_spontaneous_turn_id != error.turn_id
+                and ctx.codex_spontaneous_task is None
+                and ctx.active_msg_id != error.turn_id
+            )
+
+        if settled():
+            return True
+        spontaneous_id = ctx.codex_spontaneous_turn_id
+        spontaneous_task = ctx.codex_spontaneous_task
+        if (spontaneous_id is not None
+                and spontaneous_id != error.turn_id):
+            return False
+        if (
+            spontaneous_id is None
+            and spontaneous_task is not None
+            and ctx.active_msg_id not in {None, error.turn_id}
+        ):
+            return False
+
+        confirm = getattr(ctx.sdk, "confirm_no_active_turn", None)
+        reconcile = getattr(ctx.sdk, "reconcile_no_active_turn", None)
+        if confirm is None or reconcile is None:
+            return False
+        try:
+            confirmation = await confirm(error.thread_id, error.turn_id)
+        except Exception as exc:
+            log.warning(
+                "Codex inactive-turn confirmation failed",
+                session_id=ctx.session_id,
+                turn_id=error.turn_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+        if confirmation is None:
+            return settled()
+        if (
+            ctx.codex_spontaneous_task not in {None, spontaneous_task}
+            or (
+                ctx.codex_spontaneous_turn_id is not None
+                and ctx.codex_spontaneous_turn_id != error.turn_id
+            )
+        ):
+            return False
+
+        # If app-server resolved turn/steer immediately before the interrupt
+        # miss, its reader may have delivered both responses before the steer
+        # coroutine emitted the user boundary. Preserve that boundary ordering.
+        await ctx.codex_steer_gate.wait()
+
+        emit_synthetic = not confirmation.authoritative_terminal
+        fence = confirmation.fence
+        if confirmation.authoritative_terminal:
+            # A terminal admitted before thread/read remains authoritative. Wait
+            # for the exact consumer without a time guess so its final tail and
+            # status cannot be replaced by a synthetic interruption.
+            if spontaneous_task is not None:
+                await asyncio.gather(
+                    spontaneous_task, return_exceptions=True)
+            if settled():
+                return True
+            # If the consumer died before dequeuing the retained terminal, there
+            # is no remaining owner which can publish it. The history projection
+            # repair below recovers its durable tail after the synthetic close.
+            emit_synthetic = bool(
+                spontaneous_task is None
+                or confirmation.terminal_pending()
+            )
+        elif isinstance(fence, CodexNoActiveTurnFence):
+            if spontaneous_task is not None and not spontaneous_task.done():
+                reached_task = asyncio.create_task(fence.reached.wait())
+                try:
+                    await asyncio.wait(
+                        {spontaneous_task, reached_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not reached_task.done():
+                        reached_task.cancel()
+                        await asyncio.gather(
+                            reached_task, return_exceptions=True)
+            if fence.reached.is_set() and confirmation.terminal_pending():
+                # A terminal may occupy the reserved end slot immediately after
+                # the thread/read response. It follows this fence in FIFO order;
+                # release the consumer and let the real terminal win.
+                fence.release_now()
+                if spontaneous_task is not None:
+                    await asyncio.gather(
+                        spontaneous_task, return_exceptions=True)
+                if settled():
+                    return True
+                emit_synthetic = bool(
+                    spontaneous_task is None
+                    or confirmation.terminal_pending()
+                )
+
+        if settled():
+            if fence is not None:
+                fence.release_now()
+            return True
+        if (
+            ctx.codex_spontaneous_task not in {None, spontaneous_task}
+            or (
+                ctx.codex_spontaneous_turn_id is not None
+                and ctx.codex_spontaneous_turn_id != error.turn_id
+            )
+        ):
+            if fence is not None:
+                fence.release_now()
+            return False
+        if not reconcile(error.thread_id, error.turn_id):
+            if fence is not None:
+                fence.release_now()
+            return False
+
+        # Detach the routing identity before cancellation. The real spontaneous
+        # consumer's finally block then observes that this turn was already
+        # reconciled and cannot emit a second terminal or overwrite newer state.
+        ctx.codex_spontaneous_turn_id = None
+        ctx.codex_spontaneous_task = None
+        if spontaneous_task is not None and not spontaneous_task.done():
+            spontaneous_task.cancel()
+        if fence is not None:
+            fence.release_now()
+        if spontaneous_task is not None:
+            await asyncio.gather(spontaneous_task, return_exceptions=True)
+        if emit_synthetic:
+            await self._emit(ctx, TurnEnd(
+                result=TurnResult(
+                    subtype="interrupted", duration_ms=0, is_error=False),
+                turn_id=error.turn_id,
+            ))
+        ctx.active_msg_id = None
+        ctx.interrupt_deadline = None
+        ctx.interrupt_event.clear()
+        await self._cleanup_codex_steer_attachments(ctx)
+        await self._set_state(ctx, "idle")
+        if emit_synthetic:
+            try:
+                await self._push_mirrored_history(
+                    ctx.session_id or ctx.key)
+            except Exception as exc:
+                log.warning(
+                    "inactive Codex projection repair failed",
+                    session_id=ctx.session_id,
+                    turn_id=error.turn_id,
+                    error_type=type(exc).__name__,
+                )
+        log.warning(
+            "reconciled inactive Codex spontaneous turn",
+            session_id=ctx.session_id,
+            turn_id=error.turn_id,
+            synthetic_terminal=emit_synthetic,
+        )
+        return True
 
     async def _handle_interrupt(self, cmd) -> None:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -5107,6 +6163,7 @@ class WrapperMachine:
             )
             await self._emit(ctx, error)
             return error
+        self._cancel_pending_asks(ctx)
         # Set the deadline and wake the turn consumer before entering any await:
         # it may already be blocked in the queue.get() that began while running.
         ctx.interrupt_deadline = (
@@ -5114,6 +6171,13 @@ class WrapperMachine:
         )
         ctx.state = "interrupting"
         ctx.interrupt_event.set()
+        log.info(
+            "interrupt accepted",
+            session_id=ctx.session_id or ctx.key,
+            engine=ctx.engine,
+            client_id=getattr(cmd, "client_id", None),
+            cmd_id=getattr(cmd, "cmd_id", None),
+        )
         await self._emit(ctx, StateEvent(state="interrupting"))
         # A turn can still be reconnecting to apply effort/tier changes and may
         # not have submitted its query yet.  Serialize against that final launch
@@ -5125,6 +6189,15 @@ class WrapperMachine:
                 return
             try:
                 await ctx.sdk.interrupt()
+            except CodexNoActiveTurnError as error:
+                if await self._reconcile_codex_no_active_turn(ctx, error):
+                    return
+                log.warning(
+                    "Codex no-active-turn could not be reconciled safely",
+                    session_id=ctx.session_id,
+                    has_managed_turn=ctx.turn_task is not None,
+                    has_spontaneous_turn=ctx.codex_spontaneous_task is not None,
+                )
             except Exception as e:
                 log.exception("interrupt call failed", error=str(e))
                 # The stream is still authoritative: a very fast turn may have
@@ -5198,17 +6271,11 @@ class WrapperMachine:
         """Resolve an explicit new-session model without starting Claude CLI.
 
         Claude's account/organization runtime Default cannot be read without a
-        live CLI, so an absent explicit value deliberately returns None. The UI
-        then keeps the honest generic "local default" label.
+        live CLI, so an absent explicit value returns None. The caller then uses
+        cc-remote's curated new-session default.
         """
         root = cls._claude_project_root(cwd)
-        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        if config_dir:
-            user_settings = os.path.join(
-                os.path.realpath(os.path.expanduser(config_dir)),
-                "settings.json")
-        else:
-            user_settings = os.path.expanduser("~/.claude/settings.json")
+        user_settings = str(claude_config_dir() / "settings.json")
         ordinary_paths = [
             user_settings,
             os.path.join(root, ".claude", "settings.json"),
@@ -5261,19 +6328,19 @@ class WrapperMachine:
                 managed_env_model_set = True
                 managed_env_model = candidate
 
-        # Managed policy cannot be overridden. Otherwise the launch environment
-        # wins over settings, and settings-provided ANTHROPIC_MODEL wins over the
-        # scalar model field just as it does in Claude Code.
+        # Managed policy cannot be overridden. Claude then applies an `env`
+        # value from settings over the process environment inherited at launch;
+        # the scalar model field remains the lowest-precedence explicit source.
         external_model_set, external_model = explicit_model(
             os.environ.get("ANTHROPIC_MODEL"))
         if managed_env_model_set:
             return managed_env_model
         if managed_model_set:
             return managed_model
-        if external_model_set:
-            return external_model
         if settings_env_model_set:
             return settings_env_model
+        if external_model_set:
+            return external_model
         return model if model_set else None
 
     async def _claude_new_session_defaults(
@@ -5282,18 +6349,26 @@ class WrapperMachine:
         raw_cwd = cwd or self.cfg.cc_cwd
         target_cwd = os.path.realpath(os.path.expanduser(raw_cwd))
         if not os.path.isdir(target_cwd):
-            return None, CLAUDE_DEFAULT_EFFORT
+            return CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_EFFORT
         model = await asyncio.to_thread(
             self._claude_configured_model, target_cwd)
-        return model, CLAUDE_DEFAULT_EFFORT
+        # Claude's generic Opus aliases intentionally track the current Opus.
+        # Pin cc-remote's new-session choice to the context-qualified id so a
+        # provider cannot silently drop the requested 1M window. Exact custom
+        # and non-Opus ids remain provider-owned and pass through unchanged.
+        return (
+            _normalize_claude_new_session_model(model)
+            or CLAUDE_DEFAULT_MODEL,
+            CLAUDE_DEFAULT_EFFORT,
+        )
 
     async def _handle_get_models(self, cmd) -> None:
         """Answer with the engine's catalog and effective new-session defaults.
 
         Codex exposes its catalog through app-server. Claude has no side-effect-
         free catalog/default RPC, so its list stays empty while bounded settings
-        reads resolve an explicit cwd-aware model; the client keeps its static
-        presentation table.
+        reads resolve a cwd-aware model and fall back to the curated default;
+        the client keeps its static presentation table.
         """
         engine = getattr(cmd, "engine", None) or "cc"
         models = await codex_catalog() if engine == "codex" else []
@@ -5557,49 +6632,42 @@ class WrapperMachine:
         if previous_ask_id:
             previous = ctx.pending_asks.get(previous_ask_id)
             if previous is not None and not previous.done():
-                previous.set_result("(已被新的模型选择替代)")
+                previous.set_exception(AskSuperseded())
 
         ask_id = f"ask-{uuid4().hex}"
         accept_label = f"是，切换到 {target}"
-        event = AskUser(
-            ask_id=ask_id,
-            header="切换模型",
-            question=(
-                f"当前会话已为现有模型建立缓存。切换到 {target} 后，"
-                "下一次回复会重新读取完整历史，因此速度更慢并消耗更多 token。"
-                "是否继续？"
-            ),
-            options=[
-                {"label": accept_label,
-                 "ds": "确认切换；下一次回复会重新读取完整历史"},
-                {"label": "不，返回", "ds": "保留当前模型"},
-            ],
-            to=client_id,
-        )
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        ctx.pending_asks[ask_id] = future
         ctx.pending_model_ask_id = ask_id
-        await self._emit(ctx, event)
-        log.info(
-            "Claude model switch confirmation emitted",
-            session_id=ctx.session_id,
-            ask_id=ask_id,
-            current=current,
-            target=target,
-        )
         try:
-            answer = await asyncio.wait_for(future, timeout=30 * 60)
+            async with ctx.ask_lock:
+                # Another SetModel may supersede this request while it waits
+                # behind a different question batch. Never show the stale one.
+                if ctx.pending_model_ask_id != ask_id:
+                    return False
+                answer = await self._on_ask_locked(
+                    ctx,
+                    (
+                        f"当前会话已为现有模型建立缓存。切换到 {target} 后，"
+                        "下一次回复会重新读取完整历史，因此速度更慢并消耗更多 token。"
+                        "是否继续？"
+                    ),
+                    [
+                        {"label": accept_label,
+                         "ds": "确认切换；下一次回复会重新读取完整历史"},
+                        {"label": "不，返回", "ds": "保留当前模型"},
+                    ],
+                    header="切换模型",
+                    ask_id=ask_id,
+                    to=client_id,
+                )
             return answer == accept_label
-        except asyncio.TimeoutError:
+        except AskUnavailable:
             log.warning(
-                "Claude model switch confirmation timed out",
+                "Claude model switch confirmation ended without approval",
                 session_id=ctx.session_id,
                 ask_id=ask_id,
             )
             return False
         finally:
-            ctx.pending_asks.pop(ask_id, None)
             if ctx.pending_model_ask_id == ask_id:
                 ctx.pending_model_ask_id = None
 
@@ -5914,6 +6982,18 @@ class WrapperMachine:
         if cid:
             snap.to = cid
         await self.transport.send(snap)
+        # Model and effort are mutable fork settings. Publish their current
+        # authoritative values through the normal owner-only sequenced ring so
+        # reconnect replay can recover them without freezing an initial value
+        # into OpenBtw's static command-response cache.
+        model = _session_model(btw)
+        if model:
+            btw.announced_model = model
+            await self._emit(btw, Model(model=model))
+        effort = _session_effort(btw)
+        if effort:
+            btw.announced_effort = effort
+            await self._emit(btw, Effort(effort=effort))
         permission_mode = _session_permission_mode(btw)
         btw.announced_perm = permission_mode
         permission = Perm(mode=permission_mode, sid=btw.key, to=cid)
@@ -5947,6 +7027,8 @@ class WrapperMachine:
             disconnected = True
         except Exception as e:
             log.warning("btw close disconnect failed", error=str(e))
+        finally:
+            await self._cleanup_codex_steer_attachments(ctx)
         # Codex forks are ephemeral (no rollout). Claude fork_session persists a
         # transcript under btw_real_id; keep its tombstone on deletion failure so
         # it stays hidden and cannot be cold-resumed.
@@ -6312,6 +7394,7 @@ class WrapperMachine:
         ctx.active_msg_id = None
         ctx.interrupt_deadline = None
         ctx.interrupt_event.clear()
+        await self._cleanup_codex_steer_attachments(ctx)
         # If this continuation began while the previous managed consumer was
         # still unwinding, that task performs the final unlock after it releases
         # translator/queue ownership. Unlocking here would admit a second
@@ -6359,6 +7442,14 @@ class WrapperMachine:
             await self._emit(ctx, UserMsg(msg_id=turn_id, prompt=""))
 
             async for raw in ctx.sdk.receive_spontaneous_response(turn_id):
+                if isinstance(raw, CodexSteerFence):
+                    raw.reached.set()
+                    await raw.release.wait()
+                    continue
+                if isinstance(raw, CodexNoActiveTurnFence):
+                    raw.reached.set()
+                    await raw.release.wait()
+                    continue
                 if isinstance(raw, CodexSpontaneousOverflow):
                     overflowed = True
                     continue
@@ -6368,6 +7459,8 @@ class WrapperMachine:
                 if not isinstance(raw, dict):
                     continue
 
+                await ctx.codex_steer_gate.wait()
+                await self._confirm_uncertain_codex_steer(ctx, raw)
                 events = translator.feed(raw)
                 terminal = is_turn_terminal(raw)
                 completed_after_overflow = (
@@ -6514,11 +7607,17 @@ class WrapperMachine:
                         raise reader_exc[0]
                     raise RuntimeError(
                         "codex review stream ended without turn/completed")
+                if isinstance(raw, CodexSteerFence):
+                    raw.reached.set()
+                    await raw.release.wait()
+                    continue
                 if isinstance(raw, CodexManagedOverflow):
                     overflowed = True
                     continue
                 if not isinstance(raw, dict):
                     continue
+                await ctx.codex_steer_gate.wait()
+                await self._confirm_uncertain_codex_steer(ctx, raw)
                 terminal = is_turn_terminal(raw)
                 events = translator.feed(raw)
                 completed_after_overflow = (
@@ -6594,9 +7693,55 @@ class WrapperMachine:
     async def _set_idle_after_managed_turn(self, ctx: SessionContext) -> None:
         """Do not unlock a thread already claimed by an automatic continuation."""
         await self._finish_codex_checkpoint(ctx)
+        await self._cleanup_codex_steer_attachments(ctx)
         if ctx.engine == "codex" and ctx.codex_spontaneous_turn_id is not None:
             return
         await self._set_state(ctx, "idle")
+
+    async def _cleanup_codex_steer_attachments(
+        self, ctx: SessionContext,
+    ) -> None:
+        """Remove accepted Code steer attachments after the native terminal."""
+        ctx.codex_uncertain_steer = None
+        directories = ctx.codex_steer_attachment_dirs
+        if not directories:
+            return
+        ctx.codex_steer_attachment_dirs = []
+        for directory in directories:
+            try:
+                await asyncio.to_thread(shutil.rmtree, directory)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                log.warning(
+                    "accepted steer attachment cleanup failed",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+
+    async def _confirm_uncertain_codex_steer(
+        self, ctx: SessionContext, raw: dict,
+    ) -> bool:
+        """Publish a timed-out steer once app-server proves its client identity."""
+        pending = ctx.codex_uncertain_steer
+        if not isinstance(pending, TurnSteered):
+            return False
+        identity = _codex_user_message_identity(raw)
+        if identity != (pending.msg_id, pending.turn_id):
+            return False
+        # Clear before relay I/O so item/started + item/completed cannot create
+        # two boundaries if the first live send loses its socket.
+        ctx.codex_uncertain_steer = None
+        ctx.active_msg_id = pending.msg_id
+        try:
+            await self._emit(ctx, pending)
+        except Exception as exc:
+            log.warning(
+                "confirmed Codex steer live echo delayed",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+        return True
 
     @staticmethod
     def _clear_codex_checkpoint_tracking(ctx: SessionContext) -> None:
@@ -7327,34 +8472,139 @@ class WrapperMachine:
 
     # ---- ask_user MCP tool (agent asks the user a multiple-choice question) ----
 
-    async def _on_ask(self, ctx: SessionContext, question: str,
-                      options: list[dict[str, str]], *, header: str | None = None,
-                      allow_text: bool = False, secret: bool = False) -> str:
+    @staticmethod
+    def _cancel_pending_asks(ctx: SessionContext) -> None:
+        """Wake prompt handlers so interrupt can drain instead of waiting 30m."""
+        for future in tuple(ctx.pending_asks.values()):
+            if not future.done():
+                future.set_exception(AskCancelled())
+
+    async def _on_mcp_ask(
+        self,
+        ctx: SessionContext,
+        question: str,
+        options: list[dict[str, str]],
+    ) -> str:
+        """Keep the in-process MCP tool's historical textual timeout contract."""
+        try:
+            answer = await self._on_ask(ctx, question, options)
+        except AskTimeout:
+            return "(用户未回答，已超时)"
+        except (AskCancelled, AskSuperseded):
+            return "(用户未回答，问题已取消)"
+        return answer if isinstance(answer, str) else ", ".join(answer)
+
+    async def _on_ask(
+        self,
+        ctx: SessionContext,
+        question: str,
+        options: list[dict[str, str]],
+        *,
+        header: str | None = None,
+        allow_text: bool = False,
+        secret: bool = False,
+        multi_select: bool = False,
+        timeout: float = 30 * 60,
+        ask_id: str | None = None,
+        to: str | None = None,
+    ) -> str | list[str]:
         """Called by THIS ctx's in-process MCP server when the agent invokes
         `ask_user`. Emits AskUser on the ctx and blocks until AnswerQuestion.
         Runs in the ctx's reader task while its turn loop is blocked on
         receive_response(); other ctxs' turns are unaffected."""
+        async with ctx.ask_lock:
+            return await self._on_ask_locked(
+                ctx,
+                question,
+                options,
+                header=header,
+                allow_text=allow_text,
+                secret=secret,
+                multi_select=multi_select,
+                timeout=timeout,
+                ask_id=ask_id,
+                to=to,
+            )
+
+    async def _on_ask_locked(
+        self,
+        ctx: SessionContext,
+        question: str,
+        options: list[dict[str, str]],
+        *,
+        header: str | None = None,
+        allow_text: bool = False,
+        secret: bool = False,
+        multi_select: bool = False,
+        timeout: float = 30 * 60,
+        ask_id: str | None = None,
+        to: str | None = None,
+    ) -> str | list[str]:
+        """Run one question while the caller owns ``ctx.ask_lock``."""
         # ask_id is an identity, not a downstream sequence.  Consuming next_seq
         # here would leave an invisible hole before _emit assigns AskUser.seq;
         # reconnect replay would then appear to have lost a frame.
-        ask_id = f"ask-{uuid4().hex}"
+        ask_id = ask_id or f"ask-{uuid4().hex}"
         # Validate model-originated text before registering a pending Future.
         # Otherwise a malformed/oversized AskUser raises during emit and leaves
         # an unreachable entry in pending_asks for the life of the session.
         event = AskUser(ask_id=ask_id, question=question, options=options,
-                        header=header, allow_text=allow_text, secret=secret)
-        loop = asyncio.get_event_loop()
+                        header=header, allow_text=allow_text, secret=secret,
+                        multi_select=multi_select, to=to)
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         ctx.pending_asks[ask_id] = fut
-        await self._emit(ctx, event)
-        log.info("ask_user emitted", sid=ctx.session_id, ask_id=ask_id, options=len(options))
+        ctx.pending_ask_specs[ask_id] = {
+            "labels": frozenset(option["label"] for option in options),
+            "allow_text": allow_text,
+            "multi_select": multi_select,
+        }
+        reason = "cancelled"
         try:
-            return await asyncio.wait_for(fut, timeout=30 * 60)
+            await self._emit(ctx, event)
+            log.info(
+                "ask_user emitted",
+                sid=ctx.session_id,
+                ask_id=ask_id,
+                options=len(options),
+                multi_select=multi_select,
+            )
+            answer = await asyncio.wait_for(fut, timeout=timeout)
+            reason = "answered"
+            return answer
         except asyncio.TimeoutError:
+            reason = "timeout"
             log.warning("ask_user timed out", ask_id=ask_id)
-            return "(用户未回答，已超时)"
+            raise AskTimeout from None
+        except AskSuperseded:
+            reason = "superseded"
+            raise
+        except asyncio.CancelledError:
+            reason = "cancelled"
+            raise
         finally:
-            ctx.pending_asks.pop(ask_id, None)
+            if ctx.pending_asks.get(ask_id) is fut:
+                ctx.pending_asks.pop(ask_id, None)
+                ctx.pending_ask_specs.pop(ask_id, None)
+            try:
+                await self._emit(
+                    ctx,
+                    AskUserClosed(ask_id=ask_id, reason=reason, to=to),
+                )
+            except Exception as exc:
+                log.warning(
+                    "ask_user close event delayed",
+                    ask_id=ask_id,
+                    reason=reason,
+                    error_type=type(exc).__name__,
+                )
+
+    async def _on_ask_optional(self, *args, **kwargs) -> str | list[str] | None:
+        """Map a structured no-answer outcome for fail-closed integrations."""
+        try:
+            return await self._on_ask(*args, **kwargs)
+        except AskUnavailable:
+            return None
 
     async def _on_codex_approval(self, ctx: SessionContext, method: str,
                                  params: dict) -> str:
@@ -7402,7 +8652,7 @@ class WrapperMachine:
             {"label": "拒绝", "ds": "拒绝这次操作"},
             {"label": "取消", "ds": "取消当前操作或回合"},
         ]
-        answer = await self._on_ask(ctx, "\n".join(lines), options)
+        answer = await self._on_ask_optional(ctx, "\n".join(lines), options)
         return {
             "允许一次": "accept",
             "本会话允许": "acceptForSession",
@@ -7421,7 +8671,7 @@ class WrapperMachine:
             prompt = "Codex 请求额外权限：\n" + detail[:12000]
             if reason:
                 prompt += "\n原因：" + reason[:1000]
-            answer = await self._on_ask(ctx, prompt, [
+            answer = await self._on_ask_optional(ctx, prompt, [
                 {"label": "允许本回合", "ds": "仅在当前回合授予这些权限"},
                 {"label": "允许本会话", "ds": "本会话后续保留这些权限"},
                 {"label": "拒绝", "ds": "不授予额外权限"},
@@ -7459,10 +8709,16 @@ class WrapperMachine:
             # The wire question card requires either 2+ choices or a text box.
             # A one-option server payload is still answerable through text.
             allow_text = bool(question.get("isOther")) or len(options) < 2
-            answer = await self._on_ask(
+            answer = await self._on_ask_optional(
                 ctx, prompt, options, header=str(question.get("header") or "")[:512] or None,
                 allow_text=allow_text, secret=bool(question.get("isSecret")))
-            answers[question_id] = {"answers": [answer]}
+            if answer is None:
+                return {"answers": {}}
+            if isinstance(answer, list):
+                answer_values = answer
+            else:
+                answer_values = [answer]
+            answers[question_id] = {"answers": answer_values}
         return {"answers": answers}
 
     async def _on_codex_mcp_elicitation(self, ctx: SessionContext,
@@ -7472,7 +8728,7 @@ class WrapperMachine:
         server = str(params.get("serverName") or "MCP")[:512]
         if mode == "url":
             url = str(params.get("url") or "")[:4096]
-            answer = await self._on_ask(ctx, f"{message}\n\n{url}", [
+            answer = await self._on_ask_optional(ctx, f"{message}\n\n{url}", [
                 {"label": "已完成并继续", "ds": "我已在链接页面完成操作"},
                 {"label": "拒绝", "ds": "不继续这次 MCP 请求"},
                 {"label": "取消", "ds": "取消当前操作"},
@@ -7483,7 +8739,7 @@ class WrapperMachine:
         if not isinstance(schema, dict):
             # openai/form schemas may be intentionally opaque. Preserve a usable
             # accept/decline path instead of rejecting the server request.
-            answer = await self._on_ask(ctx, message, [
+            answer = await self._on_ask_optional(ctx, message, [
                 {"label": "接受", "ds": "继续此 MCP 表单请求"},
                 {"label": "拒绝", "ds": "拒绝此 MCP 表单请求"},
             ], header=f"{server} 请求输入")
@@ -7505,9 +8761,13 @@ class WrapperMachine:
                  "ds": str(value)[:2048]}
                 for i, value in enumerate(values[:5])
             ]
-            answer = await self._on_ask(
+            answer = await self._on_ask_optional(
                 ctx, question, options, header=f"{server} · {title}",
                 allow_text=len(options) < 2, secret=bool(spec.get("format") == "password"))
+            if answer is None:
+                return {"action": "cancel"}
+            if isinstance(answer, list):
+                return {"action": "cancel"}
             if not answer and name in required:
                 return {"action": "cancel"}
             field_type = spec.get("type")
@@ -7525,10 +8785,53 @@ class WrapperMachine:
                     content[name] = answer
         return {"action": "accept", "content": content}
 
+    async def _on_claude_ask_user_question(
+        self,
+        ctx: SessionContext,
+        tool_input: dict,
+    ):
+        """Answer Claude's built-in question tool instead of approving it."""
+        try:
+            questions = normalize_claude_questions(tool_input)
+        except ValueError as exc:
+            log.warning(
+                "invalid Claude AskUserQuestion input",
+                session_id=ctx.session_id,
+                error=str(exc),
+            )
+            return PermissionResultDeny(
+                message="Claude 的确认问题格式无效，已安全取消")
+
+        answers: dict[str, str | list[str]] = {}
+        try:
+            # Hold the session-wide slot for the whole batch so a concurrent
+            # approval/subagent question cannot interleave between its pages.
+            async with ctx.ask_lock:
+                for question in questions:
+                    answer = await self._on_ask_locked(
+                        ctx,
+                        question.question,
+                        list(question.options),
+                        header=question.header,
+                        multi_select=question.multi_select,
+                    )
+                    answers[question.question] = answer
+        except AskUnavailable:
+            return PermissionResultDeny(
+                message="用户未完成 Claude 的确认问题")
+
+        return PermissionResultAllow(updated_input={
+            **tool_input,
+            "answers": answers,
+        })
+
     async def _on_claude_tool_permission(self, ctx: SessionContext,
                                          tool_name: str, tool_input: dict,
                                          permission_context):
         """Bridge Claude Agent SDK can_use_tool to the remote client."""
+        if tool_name == "AskUserQuestion":
+            return await self._on_claude_ask_user_question(ctx, tool_input)
+
         def short(value, limit: int = 1200) -> str:
             text = str(value or "").strip()
             return text if len(text) <= limit else text[:limit] + "…"
@@ -7542,10 +8845,13 @@ class WrapperMachine:
             lines.append(short(detail))
         if getattr(permission_context, "suggestions", None):
             lines.append("SDK 提供了可选权限建议；本次仅处理单次授权。")
-        answer = await self._on_ask(ctx, "\n".join(lines), [
-            {"label": "允许一次", "ds": "仅批准这一次工具调用"},
-            {"label": "拒绝", "ds": "拒绝这次工具调用"},
-        ])
+        try:
+            answer = await self._on_ask(ctx, "\n".join(lines), [
+                {"label": "允许一次", "ds": "仅批准这一次工具调用"},
+                {"label": "拒绝", "ds": "拒绝这次工具调用"},
+            ])
+        except AskUnavailable:
+            return PermissionResultDeny(message="远程工具授权未完成")
         if answer == "允许一次":
             return PermissionResultAllow()
         return PermissionResultDeny(message="用户拒绝了远程工具授权")
@@ -7554,22 +8860,52 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "回答交互问题")
-        fut = ctx.pending_asks.get(cmd.ask_id)
-        if fut is None:
-            log.warning("answer for unknown ask_id", ask_id=cmd.ask_id)
+
+        async def reject(code: str, message: str):
             error = Error(
-                code=ERR_NOT_RUNNING,
-                message="该交互问题已经结束或不存在",
+                code=code,
+                message=message,
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
             await self._emit(ctx, error)
             return error
-        if not fut.done():
-            fut.set_result(cmd.answer)
-            log.info("ask_user answered", ask_id=cmd.ask_id)
-        else:
+
+        fut = ctx.pending_asks.get(cmd.ask_id)
+        if fut is None:
+            log.warning("answer for unknown ask_id", ask_id=cmd.ask_id)
+            return await reject(
+                ERR_NOT_RUNNING, "该交互问题已经结束或不存在")
+        if fut.done():
             log.warning("answer for already-done ask_id", ask_id=cmd.ask_id)
+            return await reject(
+                ERR_NOT_RUNNING, "该交互问题已经由其他客户端回答")
+
+        spec = ctx.pending_ask_specs.get(cmd.ask_id)
+        if spec is None:
+            return await reject(ERR_INTERNAL, "交互问题状态不完整，请重新操作")
+        answer = cmd.answer
+        labels = spec["labels"]
+        if isinstance(answer, list):
+            if not spec["multi_select"]:
+                return await reject(ERR_BAD_PROMPT, "该问题不支持多选")
+            if len(set(answer)) != len(answer):
+                return await reject(ERR_BAD_PROMPT, "多选答案不能包含重复选项")
+            normalized: str | list[str] = answer
+            values = answer
+        else:
+            if not answer.strip():
+                return await reject(ERR_BAD_PROMPT, "回答不能为空")
+            normalized = [answer] if spec["multi_select"] else answer
+            values = [answer]
+        if not spec["allow_text"] and any(value not in labels for value in values):
+            return await reject(ERR_BAD_PROMPT, "回答不属于该问题的可选项")
+
+        # No await occurs between the done check and set_result: the event loop
+        # makes this the single atomic winner when multiple clients race.
+        fut.set_result(normalized)
+        log.info("ask_user answered", ask_id=cmd.ask_id)
+        return None
 
     @staticmethod
     def _read_session_file(
@@ -8120,245 +9456,23 @@ class WrapperMachine:
         self, cwd: str, file: str,
         allowed_external_paths: frozenset[str] = frozenset(),
     ) -> str:
-        """Raw `git diff` (vs HEAD) text for a cwd. Empty file => all files; a
-        single untracked file falls back to --no-index (full-add diff)."""
         max_bytes = max(64 * 1024, min(4 * 1024 * 1024,
                                        self.cfg.ws_max_size_bytes // 2))
-        if not file:
-            tracked = await self._bounded_process_output(
-                ("git", "-C", cwd, "diff", "--no-ext-diff", "--no-textconv",
-                 "HEAD"), max_bytes)
-            if "[diff truncated at transport safety limit]" in tracked:
-                return tracked
-
-            # `git diff HEAD` deliberately omits untracked files. Work sessions
-            # commonly create their deliverables from scratch, so append a
-            # bounded no-index diff for each regular, non-ignored new file.
-            root_text = await self._bounded_process_output(
-                ("git", "-C", cwd, "rev-parse", "--show-toplevel"), 4096)
-            root = os.path.realpath(
-                root_text.strip().splitlines()[0] if root_text.strip() else cwd)
-            untracked_text = await self._bounded_process_output(
-                ("git", "-C", root, "ls-files", "-z", "--others",
-                 "--exclude-standard"), min(max_bytes, 512 * 1024))
-            # A bounded path list can end midway through a name. Only consume
-            # NUL-terminated entries so a partial path is never opened.
-            untracked_paths = untracked_text.split("\0")
-            if not untracked_text.endswith("\0"):
-                untracked_paths = untracked_paths[:-1]
-
-            parts = [tracked]
-            used = len(tracked.encode(errors="replace"))
-            source_cap = getattr(
-                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
-            for rel_file in untracked_paths:
-                if not rel_file or used >= max_bytes:
-                    continue
-                candidate = os.path.join(root, rel_file)
-                parent = os.path.realpath(os.path.dirname(candidate))
-                contained = os.path.join(parent, os.path.basename(candidate))
-                try:
-                    if os.path.commonpath((root, contained)) != root:
-                        continue
-                    file_stat = os.lstat(contained)
-                except (OSError, ValueError):
-                    continue
-                if (not stat.S_ISREG(file_stat.st_mode)
-                        or file_stat.st_size > source_cap):
-                    continue
-                separator = "\n" if parts[-1] and not parts[-1].endswith("\n") else ""
-                remaining = max_bytes - used - len(separator.encode())
-                if remaining <= 0:
-                    break
-                addition = await self._bounded_process_output(
-                    ("git", "-C", root, "diff", "--no-ext-diff",
-                     "--no-textconv", "--no-index", "--", "/dev/null",
-                     rel_file),
-                    remaining,
-                )
-                if not addition:
-                    continue
-                if separator:
-                    parts.append(separator)
-                    used += len(separator.encode())
-                parts.append(addition)
-                used += len(addition.encode(errors="replace"))
-                if "[diff truncated at transport safety limit]" in addition:
-                    break
-            return "".join(parts)
-
-        root_text = await self._bounded_process_output(
-            ("git", "-C", cwd, "rev-parse", "--show-toplevel"), 4096)
-        in_repository = bool(root_text.strip())
-        root = os.path.realpath(
-            root_text.strip().splitlines()[0] if in_repository else cwd)
-        candidate = os.path.abspath(
-            os.path.expanduser(file) if os.path.isabs(os.path.expanduser(file))
-            else os.path.join(cwd, os.path.expanduser(file)))
-        # Resolve parent symlinks, but not the final component: a tracked symlink
-        # can be diffed safely by git, while a path through a symlinked directory
-        # must not escape the repository.
-        parent = os.path.realpath(os.path.dirname(candidate))
-        contained = os.path.join(parent, os.path.basename(candidate))
-        try:
-            below_root = os.path.commonpath((root, contained)) == root
-        except ValueError:
-            below_root = False
-        if not below_root:
-            resolved = os.path.realpath(contained)
-            if resolved not in allowed_external_paths:
-                raise ValueError("diff path is outside the session repository")
-            try:
-                file_stat = os.lstat(resolved)
-            except OSError:
-                return ""
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise ValueError("external diff target must be a regular file")
-            source_cap = getattr(
-                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
-            if file_stat.st_size > source_cap:
-                raise ValueError("external diff target exceeds the source size limit")
-            return await self._bounded_process_output(
-                ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
-                 "--no-index", "--", "/dev/null", resolved),
-                max_bytes,
-            )
-        rel_file = os.path.relpath(contained, root)
-
-        # Work uses a private plain directory rather than a Git repository. A
-        # newly generated deliverable still has a meaningful diff: the whole
-        # regular file is an addition from /dev/null. Keep the same containment
-        # and source-size guards as the repository-backed untracked path.
-        if not in_repository:
-            try:
-                file_stat = os.lstat(contained)
-            except OSError:
-                return ""
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise ValueError("diff target outside Git must be a regular file")
-            source_cap = getattr(
-                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
-            if file_stat.st_size > source_cap:
-                raise ValueError("diff target exceeds the source size limit")
-            return await self._bounded_process_output(
-                ("git", "-C", root, "diff", "--no-ext-diff",
-                 "--no-textconv", "--no-index", "--", "/dev/null",
-                 rel_file),
-                max_bytes,
-            )
-
-        diff = await self._bounded_process_output(
-            ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
-             "HEAD", "--", rel_file), max_bytes)
-        if diff.strip():
-            return diff
-
-        # An empty tracked-file diff means "unchanged", not "show its complete
-        # contents". Reject untracked special files even when `git ls-files
-        # --others` omits them; an explicit FIFO/device must never be opened by a
-        # later no-index diff.
-        try:
-            file_stat = os.lstat(contained)
-        except OSError:
-            return ""
-        if not stat.S_ISREG(file_stat.st_mode):
-            tracked = await self._bounded_process_output(
-                ("git", "-C", root, "ls-files", "--stage", "--", rel_file),
-                64 * 1024,
-            )
-            if tracked:
-                return ""  # unchanged tracked symlink
-            raise ValueError("untracked diff target must be a regular file")
-        # Only an actual, non-ignored untracked regular file gets no-index.
-        untracked = await self._bounded_process_output(
-            ("git", "-C", root, "ls-files", "--others", "--exclude-standard",
-             "--", rel_file), 64 * 1024)
-        if not untracked:
-            return ""
-        source_cap = getattr(self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
-        if file_stat.st_size > source_cap:
-            raise ValueError("untracked diff target exceeds the source size limit")
-        return await self._bounded_process_output(
-            ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
-             "--no-index", "--", "/dev/null", rel_file),
-            max_bytes,
+        return await read_git_diff(
+            cwd,
+            file,
+            allowed_external_paths=allowed_external_paths,
+            max_bytes=max_bytes,
+            source_max_bytes=getattr(
+                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024),
+            run_command=self._bounded_process_output,
         )
 
     @staticmethod
     async def _bounded_process_output(
         argv: tuple[str, ...], max_bytes: int, timeout: float = 10.0,
     ) -> str:
-        """Capture stdout up to a hard byte limit without buffering stderr."""
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        assert proc.stdout is not None
-        chunks: list[bytes] = []
-        total = 0
-        truncated = False
-
-        async def read_stdout() -> None:
-            nonlocal total, truncated
-            while True:
-                chunk = await proc.stdout.read(min(64 * 1024, max_bytes - total + 1))
-                if not chunk:
-                    break
-                remaining = max_bytes - total
-                if len(chunk) > remaining:
-                    if remaining > 0:
-                        chunks.append(chunk[:remaining])
-                    truncated = True
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-
-        async def discard_stdout_and_wait() -> None:
-            """Reap without asking communicate() to accumulate residual stdout."""
-            async def discard_stdout() -> None:
-                while await proc.stdout.read(64 * 1024):
-                    pass
-
-            await asyncio.gather(proc.wait(), discard_stdout())
-
-        timed_out = False
-
-        def stop_group(sig: signal.Signals) -> None:
-            try:
-                os.killpg(proc.pid, sig)
-            except ProcessLookupError:
-                pass
-
-        reaped = False
-        try:
-            try:
-                await asyncio.wait_for(read_stdout(), timeout=timeout)
-            except asyncio.TimeoutError:
-                timed_out = True
-            if timed_out:
-                stop_group(signal.SIGKILL)
-            elif truncated:
-                stop_group(signal.SIGTERM)
-            try:
-                # Discard residual bytes incrementally. communicate() would collect
-                # them all and defeat the hard output cap while SIGTERM is draining.
-                await asyncio.wait_for(discard_stdout_and_wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                stop_group(signal.SIGKILL)
-                await discard_stdout_and_wait()
-            reaped = True
-        finally:
-            if not reaped:
-                stop_group(signal.SIGKILL)
-                await discard_stdout_and_wait()
-        if timed_out:
-            raise asyncio.TimeoutError("diff command exceeded its time limit")
-        text = b"".join(chunks).decode(errors="replace")
-        if truncated:
-            text += "\n\n[diff truncated at transport safety limit]\n"
-        return text
+        return await bounded_process_output(argv, max_bytes, timeout)
 
     # ---- sessions (list / switch / new) ----
 
@@ -8463,6 +9577,9 @@ class WrapperMachine:
                                 space="code",
                             ))
                             known.add(broker_sid)
+            for session in sessions:
+                self._remember_notification_title(
+                    session.session_id, session.summary or session.first_prompt)
             event = SessionList(
                 engine="claude",
                 space=space,
@@ -8610,6 +9727,9 @@ class WrapperMachine:
                     forked_from_id=row.get("forked_from_id"),
                     codex_status=row.get("status"),
                 ))
+            for session in sessions:
+                self._remember_notification_title(
+                    session.session_id, session.summary or session.first_prompt)
             event = SessionList(
                 engine="codex",
                 space=space,
@@ -8653,6 +9773,28 @@ class WrapperMachine:
         ctx = self.sessions.get(sid)
         if ctx is None:
             ctx = next((c for c in self.sessions.values() if c.session_id == sid), None)
+        if ctx is None and engine == "claude" and actual_space == "code":
+            # Claude's catalog accepts metadata-only JSONL files (for example,
+            # an ai-title row) even though the native CLI cannot resume them:
+            # there is no message cwd or conversation chain to restore.  Catch
+            # that exact on-disk state before _spawn so one click produces one
+            # session-scoped error instead of both _spawn's focused error and
+            # this handler's fallback error.
+            info = await asyncio.to_thread(get_session_info, sid)
+            if (info is not None and not getattr(info, "cwd", None)
+                    and transcript_path(sid) is not None):
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message=(
+                        "Claude 会话历史不完整，无法恢复；"
+                        "可从会话菜单删除该条目。"
+                    ),
+                    request_id=getattr(cmd, "cmd_id", None),
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
         if (ctx is not None
                 and getattr(ctx.sdk, "is_claude_broker", False)):
             # Terminal exit recovery is an in-place SDK handoff. Transport
@@ -8813,6 +9955,9 @@ class WrapperMachine:
             return
         old_key = ctx.key
         ctx.session_id = sid
+        old_title = self._notification_titles.pop(old_key, None) if old_key else None
+        if old_title:
+            self._remember_notification_title(sid, old_title)
         if ctx.space == "work" and ctx.work_id:
             store = self._work.for_engine(ctx.engine)
             await asyncio.to_thread(store.bind_session, ctx.work_id, sid)
@@ -8861,6 +10006,10 @@ class WrapperMachine:
             return error
         engine = getattr(cmd, "engine", "claude")
         space = getattr(cmd, "space", "code")
+        requested_model = getattr(cmd, "model", None)
+        if engine == "claude":
+            requested_model = _normalize_claude_new_session_model(
+                requested_model)
         work_record = None
         target_cwd = getattr(cmd, "cwd", None)
         if space == "work":
@@ -8886,7 +10035,7 @@ class WrapperMachine:
                 resume_id=None,
                 cwd=target_cwd,
                 engine=engine,
-                model=getattr(cmd, "model", None),
+                model=requested_model,
                 effort=getattr(cmd, "effort", None),
                 collaboration_mode=getattr(cmd, "collaboration_mode", None),
                 permission_mode=getattr(cmd, "permission_mode", None),
@@ -9035,6 +10184,7 @@ class WrapperMachine:
                     await asyncio.to_thread(
                         self._work.for_engine(engine).update_title,
                         sid, cmd.title)
+                self._remember_notification_title(sid, cmd.title)
                 log.info("codex session renamed", session_id=sid,
                          title_length=len(cmd.title))
                 return await self._list_codex_sessions(cmd)
@@ -9053,6 +10203,7 @@ class WrapperMachine:
                 await asyncio.to_thread(
                     self._work.for_engine(engine).update_title,
                     sid, cmd.title)
+            self._remember_notification_title(sid, cmd.title)
             # our own append -> re-baseline, else the watcher calls it an external write
             self._resync_watch(sid)
             log.info("session renamed", session_id=sid,
@@ -9297,7 +10448,12 @@ class WrapperMachine:
         if engine == "claude" and cwd is None:
             info = await asyncio.to_thread(get_session_info, sid)
             cwd = info.cwd if info is not None else None
-            if not cwd:
+            # A metadata-only Claude transcript has no cwd but is still a real
+            # exact-SID file in the SDK catalog. delete_session(directory=None)
+            # safely searches all project roots for that UUID and deletes only
+            # the matching transcript. Preserve the old not-found rejection
+            # when no exact transcript exists.
+            if not cwd and transcript_path(sid) is None:
                 error = Error(
                     code=ERR_NOT_RUNNING,
                     message="Claude 会话不存在",
@@ -11503,7 +12659,7 @@ class WrapperMachine:
     @staticmethod
     def _bg_blocked_session_ids() -> set[str]:
         ids: set[str] = set()
-        jobs = os.path.expanduser("~/.claude/jobs")
+        jobs = str(claude_config_dir() / "jobs")
         if not os.path.isdir(jobs):
             return ids
         try:
@@ -11559,8 +12715,11 @@ class WrapperMachine:
         retries resume→fresh on connect failure. `model`/`effort` (new_session
         only) pre-select those at spawn: effort BEFORE connect so the first turn
         runs at that strength with no respawn; cc model via a live set_model
-        after connect; codex model as a per-turn field. Omitted => engine
-        defaults (unchanged behavior)."""
+        after connect; codex model as a per-turn field. An omitted Claude model
+        resolves from current settings, then falls back to the curated default;
+        omitted Codex controls retain native defaults."""
+        explicit_claude_model = engine == "claude" and model is not None
+
         async def reject(
             code: str,
             message: str,
@@ -11729,6 +12888,13 @@ class WrapperMachine:
             effort = effort or saved_controls.effort
             permission_mode = (
                 permission_mode or saved_controls.permission_mode)
+        elif engine == "claude" and resume_id is None and model is None:
+            # Resolve the cwd-aware default at spawn time so a fresh session
+            # starts on the model shown by Remote. The browser still sends null
+            # for an implicit choice; this read is local, current, and cannot be
+            # stale across a settings/provider change.
+            model, _default_effort = await self._claude_new_session_defaults(
+                target_cwd)
 
         sdk = (
             (CodexHandle(
@@ -11962,8 +13128,24 @@ class WrapperMachine:
                 await ctx.sdk.set_model(model)
             except Exception as e:
                 log.warning("spawn set_model failed", model=model, error=str(e))
+                if explicit_claude_model and raise_on_failure:
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception:
+                        log.warning(
+                            "disconnect after explicit model failure failed")
+                    await reject(
+                        ERR_INTERNAL,
+                        "所选 Claude 模型暂不可用，请检查 Provider 配置后重试。",
+                    )
+                    return None
+                # An implicit curated default is a preference, not a reason to
+                # discard an otherwise healthy provider connection. Report only
+                # the model proven by the connect-time control probe.
+                model = getattr(ctx.sdk, "model", None)
             else:
                 await self._refresh_pending_claude_work_baseline(ctx)
+                model = getattr(ctx.sdk, "model", None) or model
         if (engine == "claude" and space == "code" and resume_id
                 and broker_handle is None):
             # Seed a migrated/existing SDK-owned session as soon as its native
@@ -12944,6 +14126,10 @@ class WrapperMachine:
             reader_task = asyncio.create_task(reader())
             while True:
                 msg = await next_turn_message()
+                if isinstance(msg, CodexSteerFence):
+                    msg.reached.set()
+                    await msg.release.wait()
+                    continue
                 if notice_active:
                     # Any raw app-server frame is fresh activity, even when the
                     # translator intentionally skips it (reasoning/token usage).
@@ -12974,6 +14160,8 @@ class WrapperMachine:
                             msg_id=ctx.active_msg_id,
                         ))
                         continue
+                    await ctx.codex_steer_gate.wait()
+                    await self._confirm_uncertain_codex_steer(ctx, msg)
                     sid = codex_session_id(msg)
                     if sid and not ctx.session_id:
                         await self._capture_session_id(ctx, sid)

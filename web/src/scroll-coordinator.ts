@@ -59,13 +59,23 @@ export class ScrollCoordinator {
     return { kind: "offset", offset: Math.max(0, offset) };
   }
 
+  requestInteractionOffset(token: number, offset: number): ScrollCommand | null {
+    if (!this.interactions.has(token) || !Number.isFinite(offset)) return null;
+    return { kind: "offset", offset: Math.max(0, offset) };
+  }
+
   endInteraction(token: number, followOutput: boolean): ScrollCommand | null {
     const resumeAtBottom = this.interactions.get(token) ?? false;
     if (!this.interactions.delete(token) || this.interactions.size > 0) {
       return null;
     }
-    const behavior = this.pendingBottom
-      ?? (followOutput && resumeAtBottom ? "auto" : null);
+    // Explicit history/detail reading pauses follow output. Never replay a
+    // bottom request that arrived while the viewport was frozen after that
+    // intent changed, or the eventual interaction release steals the reader's
+    // position.
+    const behavior = followOutput
+      ? this.pendingBottom ?? (resumeAtBottom ? "auto" : null)
+      : null;
     this.pendingBottom = null;
     return behavior ? { kind: "bottom", behavior } : null;
   }

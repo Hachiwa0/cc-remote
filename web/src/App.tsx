@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
-import { reduce, initialState, createRuntime, type Turn } from "./reducer";
+import { reduce, initialState, createRuntime } from "./reducer";
+import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
 import { Icon } from "./icons";
 import { ChatView } from "./components/ChatView";
@@ -11,7 +12,13 @@ import { presentCommandProblem } from "./problem-presentation";
 import { LoginForm } from "./components/LoginForm";
 import { SessionsSidebar } from "./components/SessionsSidebar";
 import { DirPicker } from "./components/DirPicker";
-import { NewChatView } from "./components/NewChatView";
+import {
+  compatibleNewChatEffort,
+  newChatCatalogRequest,
+  NewChatView,
+  reconcileNewChatSelection,
+  resolveNewChatLocalDefaults,
+} from "./components/NewChatView";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
@@ -23,16 +30,22 @@ import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
 import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
+import { HeaderMenu } from "./components/HeaderMenu";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
-import { shouldAcceptSessionList } from "./session-list";
+import {
+  shouldAcceptSessionList,
+  updateScopedSessionLifecycle,
+} from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
+import { nextAutoLoadDetailTurn } from "./history-detail-projection";
 import {
   canEnqueueQuery,
   collectWaitingQueries,
   selectDrainCandidates,
 } from "./runtime-drain";
+import type { SendMode } from "./composer-submit";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
 import { isTerminalWorktreeForkError, matchesSessionForkRequest,
   matchesWorktreeForkRequest, type PendingSessionFork,
@@ -42,7 +55,7 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexServiceTier, type CollaborationModeName,
   type DiffTheme, type Engine, type Space,
-  type SessionControl, sessionControlLocksInput } from "./protocol";
+  type SessionControl, type History, sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { parseGitDiff } from "./diff";
@@ -54,24 +67,92 @@ import {
   sessionCommandTarget,
   setSessionPinned,
 } from "./session-order";
-import { disableRemotePush, enableRemotePush } from "./push";
-import { turnNotificationBody, turnNotificationTag } from "./turn-notification";
-import { HistoryRequestCoordinator } from "./history-requests";
+import {
+  disableRemotePush,
+  enableRemotePush,
+  PushBindingCoordinator,
+  type PushBindingSnapshot,
+} from "./push";
+import {
+  protectedHistoryTurnIds,
+  type TextSelectionGuard,
+} from "./history-selection-guard";
+import {
+  readNotificationMode,
+  writeNotificationMode,
+  type NotificationMode,
+} from "./notification-mode";
+import {
+  captureNotificationFragment,
+  consumeNotificationTarget,
+  encodeNotificationRoute,
+  NOTIFICATION_TARGET_KEY,
+  parseNotificationRoute,
+  storeNotificationTarget,
+  type NotificationRoute,
+} from "./notification-route";
+import {
+  resolveNotificationNavigation,
+  type NotificationOrigin,
+} from "./notification-navigation";
+import {
+  turnNotificationPresentation,
+  turnNotificationTag,
+} from "./turn-notification";
+import {
+  HistoryRequestCoordinator,
+  HistoryDetailRequestCoordinator,
+  resolveHistoryCwdHint,
+  type HistoryBrowseRequestContext,
+  type HistoryDetailRequestContext,
+} from "./history-requests";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
 import { HistoryImageAssetCache } from "./history-image-assets";
+import {
+  displayHistoryProjection,
+  historyConfirmsRecovery,
+  historyConfirmsRuntimeRecovery,
+  historyNeedsConfirmationRequest,
+  isHistoryRecoveryPending,
+  isRuntimeHistoryRecoveryPending,
+} from "./history-recovery";
+import {
+  acceptsCachedNewerPage,
+  appendNewerPage,
+  canonicalTurnId,
+  prependOlderPage,
+  type HistoryBrowsePage,
+} from "./history-browse";
+import {
+  HistoryPageCache,
+  historyPageCacheScopeKey,
+  type HistoryPageCacheScope,
+  type HistoryPageCacheSessionScope,
+} from "./history-page-cache";
+import {
+  HISTORY_INITIAL_PAGE,
+  HISTORY_LATEST_PAGE_KEY,
+  HISTORY_MORE_PAGE,
+  HISTORY_PROVISIONAL_WATCHDOG_MS,
+  historyPageKey,
+  summaryHistoryTurns,
+} from "./history-summary";
 import { ComposerDraftStore, composerDraftKey } from "./composer-drafts";
+import {
+  acknowledgeCompletion,
+  completionBadgeKind,
+  discardBtwCompletionReceipts,
+  markCompletionUnread,
+  rekeyCompletionReceipts,
+  type CompletionBadgeKind,
+  type CompletionReceipts,
+} from "./completion-badges";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const SPACE_KEY = "cc_remote_space";
-const NOTIFY_KEY = "cc_remote_notifications";
 const MACHINE_KEY = "cc_remote_machine";
-// Paint the newest few turns first. Older history is intentionally fetched in
-// follow-up pages so one tool-heavy conversation cannot monopolize the socket,
-// reducer, and main thread before the current answer becomes usable.
-const HISTORY_INITIAL_PAGE = 4;
-const HISTORY_MORE_PAGE = 12;
 
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
@@ -96,7 +177,7 @@ export default function App() {
   const [rightView, setRightView] = useState<"diff" | "btw">("diff");
   // true from the moment /btw is clicked until the fork's btw_opened arrives — so
   // the panel appears instantly (spinner) instead of waiting ~1s for the fork.
-  const [btwOpening, setBtwOpening] = useState(false);
+  const [btwOpeningByParentSid, setBtwOpeningByParentSid] = useState<Record<string, boolean>>({});
   // Goal is deliberately opt-in UI: no empty bar and no RPC until /goal runs.
   // Keep reveal/editor state per session so switching sessions never leaks it.
   const [goalUiBySid, setGoalUiBySid] = useState<Record<string, { revealed: boolean; open: boolean }>>({});
@@ -112,42 +193,100 @@ export default function App() {
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
   const [deviceSheetOpen, setDeviceSheetOpen] = useState(false);
   const [capabilitiesBySurface, setCapabilitiesBySurface] = useState<Record<string, EngineCapabilities>>({});
-  const [notificationsEnabled, setNotificationsEnabled] = useState(
-    () => localStorage.getItem(NOTIFY_KEY) === "1"
-      && typeof Notification !== "undefined" && Notification.permission === "granted");
+  const [notificationMode, setNotificationMode] = useState<NotificationMode>(
+    () => readNotificationMode(localStorage));
+  const [pushBinding, setPushBinding] = useState<PushBindingSnapshot>({
+    state: "off", target: null, bound: null,
+  });
   const [machineId, setMachineId] = useState(
     () => localStorage.getItem(MACHINE_KEY) || "default");
   const [remoteDevices, setRemoteDevices] = useState<RemoteDevice[]>([]);
+  const [devicesLoadState, setDevicesLoadState] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [pendingNotificationTarget, setPendingNotificationTarget] = useState<
+    NotificationRoute | null
+  >(() => {
+    let captured: NotificationRoute | null = null;
+    try {
+      captured = captureNotificationFragment(
+        window.location, sessionStorage, window.history);
+    } catch {
+      // Keep trying the in-memory capture below.
+    }
+    try {
+      return consumeNotificationTarget(sessionStorage) ?? captured;
+    } catch {
+      return captured;
+    }
+  });
+  const [notificationListRevision, bumpNotificationListRevision] = useReducer(
+    (value: number) => value + 1, 0);
   const [devicePairing, setDevicePairing] = useState<PairingState>({
     enabled: false, expires_at: null,
   });
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
   const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
+  const [completionReceipts, setCompletionReceipts] = useState<CompletionReceipts>({});
+  const [btwSendModeBySid, setBtwSendModeBySid] = useState<
+    Record<string, SendMode>
+  >({});
   const [state, dispatch] = useReducer(reduce, initialState);
   const inlineImageAssetsRef = useRef(new InlineImageAssetCache());
   const [, bumpInlineImageRevision] = useReducer((value: number) => value + 1, 0);
   const historyImageAssetsRef = useRef(new HistoryImageAssetCache());
   const composerDraftsRef = useRef(new ComposerDraftStore());
+  const btwDraftsRef = useRef(new ComposerDraftStore());
   const [, bumpHistoryImageRevision] = useReducer((value: number) => value + 1, 0);
   const dismissBanner = useCallback((banner: string) => {
     dispatch({ type: "dismiss_banner", banner });
   }, []);
-  const remotePushActiveRef = useRef(false);
+  const pushCoordinatorRef = useRef<PushBindingCoordinator | null>(null);
+  if (pushCoordinatorRef.current === null) {
+    pushCoordinatorRef.current = new PushBindingCoordinator(async (target) => (
+      target
+        ? enableRemotePush(target.machineId, target.mode)
+        : disableRemotePush()
+    ));
+  }
   const stateRef = useRef(state);
   stateRef.current = state;
+  const rightViewRef = useRef(rightView);
+  rightViewRef.current = rightView;
   const wsRef = useRef<RelayWs | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
+  const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
+    (context) => {
+      dispatch({ type: "history_detail_cancelled", context });
+    },
+  ));
+  const clearHistoryDetailRequests = useCallback(() => {
+    for (const context of historyDetailRequestsRef.current.clear()) {
+      dispatch({ type: "history_detail_cancelled", context });
+    }
+  }, []);
+  const historyPageCacheRef = useRef(new HistoryPageCache());
+  const historyPageScopesRef =
+    useRef(new Map<string, HistoryPageCacheScope>());
+  const textSelectionGuardRef = useRef<TextSelectionGuard | null>(null);
+  const updateTextSelectionGuard = useCallback(
+    (guard: TextSelectionGuard | null) => {
+      textSelectionGuardRef.current = guard;
+    },
+    [],
+  );
   const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
   const createRequestsRef = useRef<Map<string, {
     scopeKey: string;
     cwdSource: "default" | "inherited" | "explicit";
   }>>(new Map());
-  const pendingBtwRef = useRef<string | null>(null);
+  const pendingBtwByParentRef = useRef<Map<string, string>>(new Map());
   const pendingSessionForkRef = useRef<PendingSessionFork | null>(null);
   const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
   const sessionListsBySurfaceRef = useRef<Record<string, SessionInfo[]>>({});
+  const historySessionListsRef = useRef<Record<string, SessionInfo[]>>({});
   // Cached lists are paint-only during a surface switch. A surface may choose
   // its remembered/latest focus only after a fresh wrapper list is accepted.
   const authoritativeSurfaceListsRef = useRef<Set<string>>(new Set());
@@ -155,11 +294,13 @@ export default function App() {
   const prefetchedSurfacesRef = useRef<Set<string>>(new Set());
   const lastFocusBySurfaceRef = useRef<Record<string, string>>({});
   const preferredSurfaceFocusRef = useRef<{ key: string; sid: string } | null>(null);
-  const activeBtwRef = useRef<{ requestId: string; sid: string } | null>(null);
+  const activeBtwByParentRef = useRef<Map<
+    string, { requestId: string; sid: string }
+  >>(new Map());
   // Retain recently cancelled ids so a late response can be identified and
   // discarded (and a late successful fork can be closed) without disturbing a
   // newer opening spinner. Bounded because a peer may disappear permanently.
-  const btwRequestIdsRef = useRef<Set<string>>(new Set());
+  const btwRequestParentsRef = useRef<Map<string, string>>(new Map());
   const discardedBtwSidsRef = useRef<Set<string>>(new Set());
   // A marker may arrive while its session is in the background and while an
   // IndexedDB read is already in flight. The set blocks new cache use; the
@@ -167,8 +308,13 @@ export default function App() {
   // sid -> exact revision required by a rollback marker. null means a replay
   // gap hid the revision, so the next authoritative first page may satisfy it.
   const historyInvalidationsRef = useRef<Map<string, string | null>>(new Map());
+  const historyInvalidationGenerationsRef =
+    useRef<Map<string, string | null>>(new Map());
   const historyCacheEpochRef = useRef<Map<string, number>>(new Map());
   const previousMachineRef = useRef(machineId);
+  const notificationListRequestRef = useRef<string | null>(null);
+  const notificationOriginRef = useRef<NotificationOrigin | null>(null);
+  const pendingNotificationErrorRef = useRef<string | null>(null);
   const touchStartX = useRef(0);
   const touchStartY = useRef(0);
   const touchSwipeLocked = useRef(false);
@@ -182,12 +328,24 @@ export default function App() {
     artifactDirtyRef.current = false;
     return true;
   }, []);
+  const setBtwOpeningFor = useCallback((parentSid: string, opening: boolean) => {
+    setBtwOpeningByParentSid((current) => {
+      if (opening) {
+        return current[parentSid] ? current : { ...current, [parentSid]: true };
+      }
+      if (!current[parentSid]) return current;
+      const next = { ...current };
+      delete next[parentSid];
+      return next;
+    });
+  }, []);
   const requestHistory = useCallback((
     sid: string,
     before: string | null | undefined,
     limit: number,
     generation?: string | null,
     revision?: string | null,
+    browse?: HistoryBrowseRequestContext,
   ) => {
     const ws = wsRef.current;
     if (!ws) return false;
@@ -195,7 +353,20 @@ export default function App() {
       sid, before, limit,
       generation: generation ?? ws.generationFor(sid),
       revision,
-    }, () => ws.sendGetHistory(sid, before, limit));
+      browse,
+    }, () => ws.sendGetHistory(
+      sid,
+      before,
+      limit,
+      resolveHistoryCwdHint(historySessionListsRef.current, sid),
+    ));
+  }, []);
+  const cancelPendingNotificationTarget = useCallback(() => {
+    setPendingNotificationTarget(null);
+    notificationListRequestRef.current = null;
+    notificationOriginRef.current = null;
+    try { sessionStorage.removeItem(NOTIFICATION_TARGET_KEY); }
+    catch { /* private browsing storage may be unavailable */ }
   }, []);
   // guards the once-per-connection "land on the latest session" auto-focus below
   const didInitFocusRef = useRef(false);
@@ -216,33 +387,79 @@ export default function App() {
     localStorage.setItem(MACHINE_KEY, machineId);
     pendingCreateRef.current = null;
     createRequestsRef.current.clear();
-    pendingBtwRef.current = null;
-    activeBtwRef.current = null;
+    pendingBtwByParentRef.current.clear();
+    activeBtwByParentRef.current.clear();
+    btwRequestParentsRef.current.clear();
+    discardedBtwSidsRef.current.clear();
+    setBtwOpeningByParentSid({});
+    setBtwSendModeBySid({});
+    btwDraftsRef.current.clear();
+    setCompletionReceipts({});
     sessionListsBySurfaceRef.current = {};
+    historySessionListsRef.current = {};
     authoritativeSurfaceListsRef.current.clear();
+    notificationListRequestRef.current = null;
     sessionActivityPendingRef.current.clear();
     historyRequestsRef.current.clear();
+    clearHistoryDetailRequests();
+    historyPageScopesRef.current.clear();
     prefetchedSurfacesRef.current.clear();
     historyInvalidationsRef.current.clear();
+    historyInvalidationGenerationsRef.current.clear();
     historyCacheEpochRef.current.clear();
     inlineImageAssetsRef.current.clear();
     historyImageAssetsRef.current.clear();
     bumpInlineImageRevision();
     bumpHistoryImageRevision();
     dispatch({ type: "reset" });
+    if (pendingNotificationErrorRef.current) {
+      dispatch({
+        type: "command_error",
+        detail: pendingNotificationErrorRef.current,
+      });
+      pendingNotificationErrorRef.current = null;
+    }
     void import("./cache").then((module) => module.clearCache());
-  }, [machineId]);
+    void historyPageCacheRef.current.clear();
+  }, [clearHistoryDetailRequests, machineId]);
 
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
   const focusedSid = state.focusedSid;
+  const visibleParentSid = state.newChat ? null : focusedSid;
+  const activeBtw = visibleParentSid ? state.btwByParentSid[visibleParentSid] : undefined;
+  const activeBtwSid = activeBtw?.sid ?? null;
+  const btwOpening = visibleParentSid
+    ? !!btwOpeningByParentSid[visibleParentSid] : false;
+  const completionBadges = Object.fromEntries(
+    Object.entries(completionReceipts).flatMap(([sid, receipt]) => {
+      const kind = completionBadgeKind(receipt);
+      return kind ? [[sid, kind]] : [];
+    }),
+  ) as Record<string, CompletionBadgeKind>;
   const activeScopeKey = sessionScopeKey(machineId, engine, space);
   const currentCwd = state.cwdByScope[activeScopeKey] ?? "";
+  const newChatCwd = state.newChat?.cwd ?? null;
+  const newChatDefaults = resolveNewChatLocalDefaults(
+    engine,
+    space,
+    newChatCwd ?? "",
+    state.catalogDefault,
+    state.catalogDefaultEffort,
+    state.catalogDefaultCwd,
+  );
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
+  const historyView = displayHistoryProjection(
+    state.historyRecovery, focusedSid, rt, state.historyBrowse);
   const focusedEngine = (state.sessions.find(
     (session) => session.session_id === focusedSid)?.engine ?? engine) as "claude" | "codex";
   const focusedComposerDraftKey = composerDraftKey(
     machineId, space, focusedEngine, focusedSid ?? "",
+  );
+  const activeBtwDraftKey = composerDraftKey(
+    machineId, space,
+    (activeBtw?.engine === "codex" ? "codex" : "claude"),
+    `btw:${activeBtwSid ?? visibleParentSid ?? "opening"}`,
   );
   const inlineImageAssets = focusedSid
     ? inlineImageAssetsRef.current.forSession(focusedSid) : {};
@@ -251,6 +468,34 @@ export default function App() {
   const currentWorkArtifacts = focusedSid ? (workArtifactsBySid[focusedSid] ?? []) : [];
   const allQueued = collectWaitingQueries(state.runtimes);
   const replaceableQueued = collectWaitingQueries(state.runtimes, focusedSid);
+  const btwReplaceableQueued = collectWaitingQueries(
+    state.runtimes, activeBtwSid);
+  const activeBtwSendMode = activeBtwSid
+    ? btwSendModeBySid[activeBtwSid] ?? "steer" : "steer";
+
+  useEffect(() => {
+    const acknowledgeVisible = () => {
+      if (document.hidden) return;
+      const current = stateRef.current;
+      const parentSid = current.newChat ? null : current.focusedSid;
+      if (!parentSid) return;
+      const binding = current.btwByParentSid[parentSid];
+      setCompletionReceipts((receipts) => {
+        let next = acknowledgeCompletion(
+          receipts, parentSid, { main: true });
+        if (binding
+            && (rightViewRef.current === "btw" || !current.artifact)) {
+          next = acknowledgeCompletion(
+            next, parentSid, { btwSid: binding.sid });
+        }
+        return next;
+      });
+    };
+    acknowledgeVisible();
+    document.addEventListener("visibilitychange", acknowledgeVisible);
+    return () => document.removeEventListener(
+      "visibilitychange", acknowledgeVisible);
+  }, [visibleParentSid, activeBtwSid, rightView, state.artifact]);
 
   const goalUi = focusedSid ? goalUiBySid[focusedSid] : undefined;
   const loadMessageImage = useCallback((sid: string, path: string): boolean => {
@@ -334,13 +579,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!authed) { setRemoteDevices([]); return; }
+    if (!authed) {
+      setRemoteDevices([]);
+      setDevicesLoadState("idle");
+      return;
+    }
+    setDevicesLoadState("loading");
     let cancelled = false;
     void fetch("/api/devices", {
       credentials: "same-origin", cache: "no-store",
     }).then(async (response) => response.ok ? response.json() : null)
       .then((payload) => {
-        if (cancelled || !payload || !Array.isArray(payload.devices)) return;
+        if (cancelled) return;
+        if (!payload || !Array.isArray(payload.devices)) {
+          setDevicesLoadState("error");
+          return;
+        }
         const validDevices: RemoteDevice[] = (payload.devices as unknown[]).filter((value: unknown): value is RemoteDevice => {
           if (!value || typeof value !== "object") return false;
           const item = value as Partial<RemoteDevice>;
@@ -350,25 +604,45 @@ export default function App() {
         });
         const available = validDevices.map((device) => device.machine_id);
         setRemoteDevices(validDevices);
+        setDevicesLoadState("ready");
         setDevicePairing(payload.pairing ?? { enabled: false, expires_at: null });
         if (available.length && !available.includes(machineId)) {
           setMachineId(available[0]);
         }
-      }).catch(() => undefined);
+      }).catch(() => {
+        if (!cancelled) setDevicesLoadState("error");
+      });
     return () => { cancelled = true; };
   }, [authed, machineId]);
 
   useEffect(() => {
-    let cancelled = false;
-    if (!authed || !notificationsEnabled) {
-      remotePushActiveRef.current = false;
-      return;
-    }
-    void enableRemotePush(machineId).then((enabled) => {
-      if (!cancelled) remotePushActiveRef.current = enabled;
-    });
-    return () => { cancelled = true; };
-  }, [authed, machineId, notificationsEnabled]);
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (event: MessageEvent) => {
+      if (event.data?.type !== "cc-remote-notification") return;
+      const target = parseNotificationRoute(event.data.route);
+      if (!target) return;
+      notificationListRequestRef.current = null;
+      notificationOriginRef.current = null;
+      try { storeNotificationTarget(sessionStorage, target); }
+      catch { /* retain the in-memory route below */ }
+      setPendingNotificationTarget(target);
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, []);
+
+  useEffect(() => pushCoordinatorRef.current?.subscribe(setPushBinding), []);
+
+  useEffect(() => {
+    const enabled = notificationMode !== "off"
+      && typeof Notification !== "undefined"
+      && Notification.permission === "granted";
+    void pushCoordinatorRef.current?.setTarget(
+      authed && enabled
+        ? { machineId, mode: notificationMode }
+        : null,
+    );
+  }, [authed, machineId, notificationMode]);
 
   // Swipe right -> open sidebar, swipe left -> close (mobile). Interactive
   // vertical scrollers opt out so a diagonal scroll never becomes navigation.
@@ -405,6 +679,148 @@ export default function App() {
   engineRef.current = engine;
   const spaceRef = useRef(space);
   spaceRef.current = space;
+  const historyPageScopeFor = useCallback((
+    sid: string,
+    revision: string,
+    fallbackEngine: Engine = engineRef.current,
+    fallbackSpace: Space = spaceRef.current,
+  ): HistoryPageCacheScope => {
+    const listed = stateRef.current.sessions.find(
+      (session) => session.session_id === sid)
+      ?? Object.values(historySessionListsRef.current)
+        .flat()
+        .find((session) => session.session_id === sid);
+    const scope: HistoryPageCacheScope = {
+      machineId,
+      engine: listed?.engine === "codex" || listed?.engine === "claude"
+        ? listed.engine : fallbackEngine,
+      space: listed?.space === "work" || listed?.space === "code"
+        ? listed.space : fallbackSpace,
+      sid,
+      revision,
+    };
+    historyPageScopesRef.current.set(historyPageCacheScopeKey(scope), scope);
+    return scope;
+  }, [machineId]);
+  const invalidateHistoryPageScopes = useCallback((sid: string) => {
+    const scopes = new Map<string, HistoryPageCacheSessionScope>();
+    for (const scope of historyPageScopesRef.current.values()) {
+      if (scope.machineId !== machineId || scope.sid !== sid) continue;
+      const sessionScope: HistoryPageCacheSessionScope = {
+        machineId: scope.machineId,
+        engine: scope.engine,
+        space: scope.space,
+        sid: scope.sid,
+      };
+      scopes.set(JSON.stringify(sessionScope), sessionScope);
+    }
+    for (const [surfaceKey, sessions] of Object.entries(
+      historySessionListsRef.current)) {
+      if (!sessions.some((session) => session.session_id === sid)) continue;
+      const [listedSpace, listedEngine] = surfaceKey.split(":");
+      if ((listedEngine !== "claude" && listedEngine !== "codex")
+          || (listedSpace !== "code" && listedSpace !== "work")) continue;
+      const sessionScope: HistoryPageCacheSessionScope = {
+        machineId,
+        engine: listedEngine,
+        space: listedSpace,
+        sid,
+      };
+      scopes.set(JSON.stringify(sessionScope), sessionScope);
+    }
+    if (stateRef.current.focusedSid === sid) {
+      const sessionScope: HistoryPageCacheSessionScope = {
+        machineId,
+        engine: engineRef.current,
+        space: spaceRef.current,
+        sid,
+      };
+      scopes.set(JSON.stringify(sessionScope), sessionScope);
+    }
+    for (const scope of scopes.values()) {
+      void historyPageCacheRef.current.invalidateScope(scope);
+    }
+    for (const [key, scope] of historyPageScopesRef.current) {
+      if (scope.machineId === machineId && scope.sid === sid) {
+        historyPageScopesRef.current.delete(key);
+      }
+    }
+  }, [machineId]);
+  const installBrowseHistoryPage = useCallback((
+    history: History,
+    waiters: readonly HistoryBrowseRequestContext[],
+  ) => {
+    const turns = summaryHistoryTurns(history);
+    if (!history.before || !turns) return;
+    for (const waiter of waiters) {
+      const browse = stateRef.current.historyBrowse;
+      if (!browse
+          || stateRef.current.focusedSid !== history.session_id
+          || browse.sid !== history.session_id
+          || browse.scopeKey !== waiter.scopeKey
+          || browse.revision !== history.revision
+          || browse.viewId !== waiter.viewId
+          || browse.windowEpoch !== waiter.windowEpoch
+          || browse.olderCursor !== waiter.pendingBefore
+          || waiter.pendingBefore !== history.before
+          || (history.generation != null
+            && browse.generation !== history.generation)) continue;
+      const scope = historyPageScopesRef.current.get(waiter.scopeKey);
+      if (!scope) continue;
+      const page: HistoryBrowsePage = {
+        pageKey: historyPageKey(history.before),
+        turns,
+        hasOlder: history.has_more,
+        olderCursor: history.oldest_id
+          ?? (turns[0] ? canonicalTurnId(turns[0]) : null),
+        hasNewer: !!waiter.sourcePageKey,
+        newerPageKey: waiter.sourcePageKey,
+        isLatest: false,
+      };
+      const protectedTurnIds = protectedHistoryTurnIds(
+        waiter.anchorTurnId,
+        textSelectionGuardRef.current,
+        {
+          sid: history.session_id,
+          revision: history.revision,
+          viewId: waiter.viewId,
+          scopeKey: waiter.scopeKey,
+        },
+      );
+      const mutation = prependOlderPage(browse, page, {
+        expectedScopeKey: waiter.scopeKey,
+        expectedViewId: waiter.viewId,
+        expectedWindowEpoch: waiter.windowEpoch,
+        expectedOlderCursor: waiter.pendingBefore,
+        protectedTurnIds,
+      });
+      if (mutation.projection === browse) continue;
+      // Paint the received page immediately. Page-cache writes are best-effort
+      // acceleration and must never hold the visible history response behind
+      // IndexedDB quota/LRU work. A later cache miss keeps this readable window
+      // mounted and degrades the downward affordance to "return to latest".
+      void historyPageCacheRef.current.putPage(scope, page);
+      for (const evicted of mutation.evictedPages) {
+        void historyPageCacheRef.current.putPage(scope, evicted);
+      }
+      dispatch({
+        type: "install_history_browse_page",
+        sid: history.session_id,
+        scopeKey: waiter.scopeKey,
+        revision: history.revision,
+        generation: history.generation,
+        viewId: waiter.viewId,
+        windowEpoch: waiter.windowEpoch,
+        before: waiter.pendingBefore,
+        page,
+        protectedTurnIds,
+        prepared: {
+          from: browse,
+          to: mutation.projection,
+        },
+      });
+    }
+  }, []);
   useEffect(() => {
     document.documentElement.setAttribute("data-engine", engine);
     localStorage.setItem(ENGINE_KEY, engine);
@@ -416,24 +832,74 @@ export default function App() {
     document.documentElement.setAttribute("data-space", space);
     localStorage.setItem(SPACE_KEY, space);
   }, [space]);
-  const rememberSurfaceFocus = (currentEngine: Engine, currentSpace: Space) => {
+  useEffect(() => {
+    if (newChatCwd === null || state.connState !== "connected"
+        || !state.wrapperOnline) return;
+    const request = newChatCatalogRequest(
+      engine, space, newChatCwd);
+    if (!request) return;
+    wsRef.current?.sendGetModels(request.engine, request.cwd);
+  }, [
+    engine,
+    newChatCwd,
+    space,
+    state.connState,
+    state.wrapperOnline,
+  ]);
+  useEffect(() => {
+    if (!state.newChat) return;
+    const reconciled = reconcileNewChatSelection(
+      engine,
+      state.newChat.model,
+      state.newChat.effort,
+      state.catalog,
+      newChatDefaults.model,
+    );
+    if (reconciled.model === state.newChat.model
+        && reconciled.effort === state.newChat.effort) return;
+    dispatch({ type: "set_new_chat_selection", ...reconciled });
+  }, [
+    engine,
+    newChatDefaults.model,
+    state.catalog,
+    state.newChat,
+  ]);
+  useEffect(() => {
+    // TurnDetail has no request id. Any view navigation revokes the frozen
+    // runtime/browse target so a delayed response cannot cross sessions.
+    clearHistoryDetailRequests();
+  }, [
+    clearHistoryDetailRequests,
+    machineId, engine, space, focusedSid, state.newChat,
+  ]);
+  const rememberSurfaceFocus = useCallback((
+    currentEngine: Engine,
+    currentSpace: Space,
+  ) => {
     if (focusedSid && !state.newChat) {
       lastFocusBySurfaceRef.current[`${currentSpace}:${currentEngine}`] = focusedSid;
     }
-  };
+  }, [focusedSid, state.newChat]);
 
-  const prepareSurfaceSwitch = (nextEngine: Engine, nextSpace: Space) => {
+  const prepareSurfaceSwitch = useCallback((
+    nextEngine: Engine,
+    nextSpace: Space,
+    preserveAuthority = false,
+  ) => {
     rememberSurfaceFocus(engine, space);
     const surfaceKey = `${nextSpace}:${nextEngine}`;
-    authoritativeSurfaceListsRef.current.delete(surfaceKey);
+    if (!preserveAuthority) {
+      authoritativeSurfaceListsRef.current.delete(surfaceKey);
+    }
     dispatch({
       type: "restore_session_list",
       sessions: sessionListsBySurfaceRef.current[surfaceKey] ?? [],
     });
     const remembered = lastFocusBySurfaceRef.current[surfaceKey];
-    preferredSurfaceFocusRef.current = remembered
-      ? { key: surfaceKey, sid: remembered } : null;
-    didInitFocusRef.current = false;
+    preferredSurfaceFocusRef.current = preserveAuthority
+      ? null
+      : remembered ? { key: surfaceKey, sid: remembered } : null;
+    didInitFocusRef.current = preserveAuthority;
     wsRef.current?.setSurface(nextEngine, nextSpace);
     wsRef.current?.setFocusedSid(null);
     // Keep the previous surface's transcript out of view while its accepted
@@ -441,11 +907,133 @@ export default function App() {
     // soon as the remembered (or latest valid) session is available.
     dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
     setNewChatAutoFocus(false);
-  };
+  }, [engine, rememberSurfaceFocus, space]);
+
+  const focusListedSession = useCallback((selected: SessionInfo) => {
+    const selectedEngine: Engine = selected.engine === "codex"
+      || selected.engine === "claude"
+      ? selected.engine : engineRef.current;
+    const selectedSpace: Space = selected.space === "work"
+      || selected.space === "code"
+      ? selected.space : spaceRef.current;
+    const id = selected.session_id;
+    pendingCreateRef.current = null;
+    setCreateError(null);
+    setStatusOpenSid(null);
+    setWorkArtifactsOpen(false);
+    dispatch({ type: "exit_new_chat" });
+    dispatch({ type: "focus_session", sid: id });
+    wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
+    requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
+    wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
+    if (selectedSpace === "work") {
+      wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
+    }
+    if (isMobile()) setSidebarOpen(false);
+  }, [requestHistory]);
+
+  useEffect(() => {
+    const target = pendingNotificationTarget;
+    if (!target || !authed) return;
+    const surfaceKey = `${target.space}:${target.engine}`;
+    if (notificationOriginRef.current === null) {
+      notificationOriginRef.current = {
+        machineId,
+        engine,
+        space,
+        sid: state.focusedSid,
+      };
+      // A cached/preloaded catalog is paint-only here. Resolve every click
+      // against a list requested after that click so a deleted or revoked
+      // target cannot move focus.
+      authoritativeSurfaceListsRef.current.delete(surfaceKey);
+      notificationListRequestRef.current = null;
+    }
+    const navigation = resolveNotificationNavigation({
+      target,
+      origin: notificationOriginRef.current,
+      deviceState: devicesLoadState,
+      authorizedMachineIds: remoteDevices.map((device) => device.machine_id),
+      machineId,
+      engine,
+      space,
+      authoritativeSessions: authoritativeSurfaceListsRef.current.has(surfaceKey)
+        ? sessionListsBySurfaceRef.current[surfaceKey] ?? []
+        : null,
+    });
+    if (navigation.kind === "wait") return;
+    if (navigation.kind === "fail") {
+      const detail = navigation.reason === "devices_unavailable"
+        ? "无法验证通知对应的设备，当前会话没有切换。"
+        : navigation.reason === "device_missing"
+          ? "通知对应的设备不存在或当前账号无权访问。"
+          : "通知对应的会话已删除或不属于当前设备。";
+      if (navigation.restore) {
+        const origin = navigation.restore;
+        pendingNotificationErrorRef.current = detail;
+        setPendingNotificationTarget(null);
+        notificationListRequestRef.current = null;
+        notificationOriginRef.current = null;
+        try { sessionStorage.removeItem(NOTIFICATION_TARGET_KEY); }
+        catch { /* best-effort stale route cleanup */ }
+        preferredSurfaceFocusRef.current = origin.sid
+          ? { key: `${origin.space}:${origin.engine}`, sid: origin.sid }
+          : null;
+        didInitFocusRef.current = false;
+        setEngine(origin.engine);
+        setSpace(origin.space);
+        setMachineId(origin.machineId);
+      } else {
+        dispatch({ type: "command_error", detail });
+        cancelPendingNotificationTarget();
+      }
+      return;
+    }
+    if (navigation.kind === "switch_machine") {
+      setMachineId(navigation.machineId);
+      return;
+    }
+    if (navigation.kind === "request_list") {
+      const ws = wsRef.current;
+      if (!ws) return;
+      const requestKey = `${machineId}:${surfaceKey}`;
+      if (notificationListRequestRef.current !== requestKey) {
+        if (ws.sendListSessions(navigation.engine, navigation.space)) {
+          notificationListRequestRef.current = requestKey;
+        }
+      }
+      return;
+    }
+    if (navigation.kind === "switch_surface") {
+      pendingCreateRef.current = null;
+      setCreateError(null);
+      prepareSurfaceSwitch(navigation.engine, navigation.space, true);
+      setEngine(navigation.engine);
+      setSpace(navigation.space);
+      return;
+    }
+    didInitFocusRef.current = true;
+    focusListedSession(navigation.session);
+    cancelPendingNotificationTarget();
+  }, [
+    authed,
+    cancelPendingNotificationTarget,
+    devicesLoadState,
+    engine,
+    focusListedSession,
+    machineId,
+    notificationListRevision,
+    pendingNotificationTarget,
+    prepareSurfaceSwitch,
+    remoteDevices,
+    space,
+    state.focusedSid,
+  ]);
 
   // Engine and Work/Code switches are navigation. Each surface restores the
   // session that was last open there instead of silently starting a new one.
   const toggleEngine = () => {
+    cancelPendingNotificationTarget();
     const nextEngine: Engine = engine === "codex" ? "claude" : "codex";
     pendingCreateRef.current = null;
     setCreateError(null);
@@ -459,6 +1047,7 @@ export default function App() {
 
   const switchSpace = (next: Space) => {
     if (next === space || !confirmArtifactDiscard()) return;
+    cancelPendingNotificationTarget();
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
@@ -507,7 +1096,35 @@ export default function App() {
               && historyImageAssetsRef.current.accept(msg)) {
             bumpHistoryImageRevision();
           }
-          if ((msg.type === "user_msg" || msg.type === "turn_end") && msg.sid) {
+          if (msg.type === "turn_end" && msg.sid && !msg.result.is_error) {
+            const current = stateRef.current;
+            const btwOwner = Object.entries(current.btwByParentSid).find(
+              ([, binding]) => binding.sid === msg.sid,
+            );
+            const isBtw = !!btwOwner;
+            // A closed/stale fork can still drain one final terminal frame.
+            // Without an owner it must not appear as a fake top-level session.
+            if (!msg.sid.startsWith("btw-") || isBtw) {
+              const parentSid = btwOwner?.[0] ?? msg.sid;
+              const sameVisibleParent = !document.hidden
+                && !current.newChat
+                && current.focusedSid === parentSid;
+              const btwPanelVisible = isBtw
+                && sameVisibleParent
+                && (rightViewRef.current === "btw" || !current.artifact);
+              const alreadySeen = isBtw ? btwPanelVisible : sameVisibleParent;
+              if (!alreadySeen) {
+                setCompletionReceipts((receipts) => markCompletionUnread(
+                  receipts,
+                  parentSid,
+                  msg.sid!,
+                  isBtw ? "btw" : "main",
+                ));
+              }
+            }
+          }
+          if ((msg.type === "user_msg" || msg.type === "turn_steered"
+                || msg.type === "turn_end") && msg.sid) {
             const activityMs = Math.round(msg.ts * 1000);
             let changed = false;
             for (const [key, listed] of Object.entries(
@@ -518,12 +1135,15 @@ export default function App() {
                 changed = true;
               }
             }
-            if (msg.type === "user_msg" && changed) {
+            if ((msg.type === "user_msg" || msg.type === "turn_steered")
+                && changed) {
               sessionActivityPendingRef.current.add(msg.sid);
             }
           }
           if (msg.type === "history_invalidated") {
             const sid = msg.session_id;
+            clearHistoryDetailRequests();
+            invalidateHistoryPageScopes(sid);
             if (inlineImageAssetsRef.current.dropSession(sid)) {
               bumpInlineImageRevision();
             }
@@ -532,6 +1152,9 @@ export default function App() {
             }
             if (historyInvalidationsRef.current.get(sid) !== msg.revision) {
               historyInvalidationsRef.current.set(sid, msg.revision);
+              if (!historyInvalidationGenerationsRef.current.has(sid)) {
+                historyInvalidationGenerationsRef.current.set(sid, null);
+              }
               historyCacheEpochRef.current.set(
                 sid, (historyCacheEpochRef.current.get(sid) ?? 0) + 1);
               void import("./cache").then((module) =>
@@ -566,6 +1189,10 @@ export default function App() {
           } else if (msg.type === "replay_start" && msg.sid
               && (msg.truncated || msg.rebuild)) {
             const sid = msg.sid;
+            clearHistoryDetailRequests();
+            invalidateHistoryPageScopes(sid);
+            historyInvalidationGenerationsRef.current.set(
+              sid, msg.generation ?? null);
             // If a marker is still retained inside this replay it will follow
             // ReplayStart and replace null with its exact revision.
             if (!historyInvalidationsRef.current.has(sid)) {
@@ -588,52 +1215,191 @@ export default function App() {
           } else if (msg.type === "history" && msg.authoritative !== false && !msg.before
               && historyInvalidationsRef.current.has(msg.session_id)) {
             const expected = historyInvalidationsRef.current.get(msg.session_id);
-            if (expected === null || expected === msg.revision) {
+            const expectedGeneration =
+              historyInvalidationGenerationsRef.current.get(msg.session_id) ?? null;
+            const recovery = stateRef.current.historyRecovery;
+            const currentRuntime =
+              stateRef.current.runtimes[msg.session_id];
+            const displayRecoveryMatches = !isHistoryRecoveryPending(
+              recovery, msg.session_id)
+              || historyConfirmsRecovery(recovery, msg);
+            const runtimeRecoveryMatches =
+              !isRuntimeHistoryRecoveryPending(currentRuntime)
+              || historyConfirmsRuntimeRecovery(currentRuntime, msg);
+            const sameBuildGeneration = msg.generation != null
+              ? currentRuntime?.historyGeneration === msg.generation
+              : currentRuntime?.historyGeneration == null
+                && currentRuntime?.historyRevision === msg.revision;
+            const buildIsCurrent = msg.build_seq == null
+              || !sameBuildGeneration
+              || msg.build_seq >= (currentRuntime?.historyBuildSeq ?? 0);
+            if ((expected === null || expected === msg.revision)
+                && (expectedGeneration === null
+                  || expectedGeneration === msg.generation)
+                && displayRecoveryMatches
+                && runtimeRecoveryMatches
+                && buildIsCurrent) {
               // A late first page from an older revision must not re-enable the
               // cache behind a newer destructive marker.
               historyInvalidationsRef.current.delete(msg.session_id);
+              historyInvalidationGenerationsRef.current.delete(msg.session_id);
               void import("./cache").then((module) =>
                 module.allowSessionCache(msg.session_id));
             }
           }
           if (msg.type === "history") {
-            historyRequestsRef.current.complete(msg);
+            const browseWaiters =
+              historyRequestsRef.current.complete(msg);
             const retryKey = ["history", msg.session_id, msg.before ?? "",
               msg.revision ?? ""].join("\u0000");
+            let retryScheduled = false;
             if (msg.authoritative === false) {
-              recoverableReads.retry(retryKey, () => {
+              const retryDelay = msg.error == null && !msg.before
+                ? HISTORY_PROVISIONAL_WATCHDOG_MS
+                : undefined;
+              retryScheduled = recoverableReads.retry(retryKey, () => {
                 if (cancelled) return;
                 if (stateRef.current.focusedSid !== msg.session_id) return;
-                requestHistory(
-                  msg.session_id, msg.before,
-                  msg.before ? HISTORY_MORE_PAGE : HISTORY_INITIAL_PAGE,
-                  msg.generation, msg.revision,
-                );
-              });
+                if (msg.before) {
+                  for (const browse of browseWaiters) {
+                    requestHistory(
+                      msg.session_id, msg.before, HISTORY_MORE_PAGE,
+                      msg.generation, msg.revision, browse);
+                  }
+                } else {
+                  requestHistory(
+                    msg.session_id, undefined, HISTORY_INITIAL_PAGE,
+                    msg.generation, msg.revision);
+                }
+              }, retryDelay);
             } else {
               recoverableReads.complete(retryKey);
             }
+            if (msg.before) {
+              if (msg.authoritative !== false) {
+                void installBrowseHistoryPage(msg, browseWaiters);
+              } else if (!retryScheduled) {
+                for (const browse of browseWaiters) {
+                  dispatch({
+                    type: "history_browse_page_failed",
+                    sid: msg.session_id,
+                    scopeKey: browse.scopeKey,
+                    revision: msg.revision,
+                    generation: msg.generation,
+                    viewId: browse.viewId,
+                    windowEpoch: browse.windowEpoch,
+                    before: browse.pendingBefore,
+                  });
+                }
+              }
+              // History.before is display-only and requester-correlated. It
+              // must never fall through to the generic runtime reducer.
+              return;
+            }
+            const needsRecoveryConfirmation =
+              historyNeedsConfirmationRequest(
+                stateRef.current.runtimes[msg.session_id], msg);
+            if (needsRecoveryConfirmation
+                && stateRef.current.focusedSid === msg.session_id
+                && msg.generation) {
+              requestHistory(
+                msg.session_id, undefined, HISTORY_INITIAL_PAGE,
+                msg.generation);
+            }
           }
           if (msg.type === "turn_detail") {
-            const retryKey = ["detail", msg.session_id, msg.turn_id].join("\u0000");
+            const detailTarget =
+              historyDetailRequestsRef.current.complete(msg);
+            if (!detailTarget) return;
+            const retryKey = [
+              "detail", msg.session_id, msg.revision, msg.turn_id,
+              msg.before ?? "",
+            ].join("\u0000");
             if (msg.authoritative === false) {
+              if (detailTarget.target === "browse") {
+                dispatch({
+                  type: "history_browse_detail",
+                  sid: detailTarget.sid,
+                  scopeKey: detailTarget.scopeKey,
+                  revision: detailTarget.revision,
+                  viewId: detailTarget.viewId,
+                  windowEpoch: detailTarget.windowEpoch,
+                  turnId: detailTarget.turnId,
+                  events: [],
+                  before: detailTarget.before,
+                });
+              } else {
+                dispatch({ type: "event", event: msg, ownership });
+              }
               recoverableReads.retry(retryKey, () => {
                 if (cancelled) return;
                 if (stateRef.current.focusedSid !== msg.session_id) return;
-                const current = stateRef.current.runtimes[msg.session_id];
-                const turn = current?.turns.find((item) => item.id === msg.turn_id);
-                if (!turn || turn.detailLoaded) return;
+                const current = stateRef.current;
+                if (detailTarget.target === "browse") {
+                  const browse = current.historyBrowse;
+                  if (!browse
+                      || browse.scopeKey !== detailTarget.scopeKey
+                      || browse.viewId !== detailTarget.viewId
+                      || browse.revision !== detailTarget.revision
+                      || !browse.turns.some((turn) =>
+                        canonicalTurnId(turn) === detailTarget.turnId
+                        || turn.id === detailTarget.turnId)) return;
+                } else {
+                  const runtime = current.runtimes[msg.session_id];
+                  const turn = runtime?.turns.find(
+                    (item) => canonicalTurnId(item) === msg.turn_id
+                      || item.id === msg.turn_id);
+                  if (!turn || (!detailTarget.before && turn.detailLoaded)
+                      || runtime.historyRevision !== detailTarget.revision) return;
+                }
+                if (!historyDetailRequestsRef.current.begin(detailTarget)) return;
                 const sent = ws.sendGetTurnDetail(
-                  msg.session_id, msg.turn_id,
-                  current.historyRevision ?? msg.revision,
-                );
-                if (sent) dispatch({
-                  type: "turn_detail_requested", sid: msg.session_id,
-                  turnId: msg.turn_id,
-                });
+                  msg.session_id, msg.turn_id, detailTarget.revision,
+                  detailTarget.before);
+                if (!sent) {
+                  historyDetailRequestsRef.current.cancel(detailTarget);
+                  return;
+                }
+                if (detailTarget.target === "browse") {
+                  dispatch({
+                    type: "history_browse_detail_requested",
+                    sid: detailTarget.sid,
+                    scopeKey: detailTarget.scopeKey,
+                    revision: detailTarget.revision,
+                    viewId: detailTarget.viewId,
+                    windowEpoch: detailTarget.windowEpoch,
+                    turnId: detailTarget.turnId,
+                    before: detailTarget.before,
+                  });
+                } else {
+                  dispatch({
+                    type: "turn_detail_requested", sid: detailTarget.sid,
+                    turnId: detailTarget.turnId,
+                    before: detailTarget.before,
+                  });
+                }
               });
+              return;
             } else {
               recoverableReads.complete(retryKey);
+            }
+            if (detailTarget.target === "browse") {
+              dispatch({
+                type: "history_browse_detail",
+                sid: detailTarget.sid,
+                scopeKey: detailTarget.scopeKey,
+                revision: detailTarget.revision,
+                viewId: detailTarget.viewId,
+                windowEpoch: detailTarget.windowEpoch,
+                turnId: detailTarget.turnId,
+                events: msg.events,
+                before: msg.before,
+                hasMore: msg.has_more,
+                oldestCursor: msg.oldest_cursor,
+                hasNewer: msg.has_newer,
+                newerCursor: msg.newer_cursor,
+              });
+              return;
             }
           }
           if (msg.type === "rollback_result" && msg.files === "succeeded"
@@ -647,9 +1413,20 @@ export default function App() {
             setEditPrompt(msg.prefill_text);
           }
           if (msg.type === "btw_opened") {
+            const requestedParent = btwRequestParentsRef.current.get(
+              msg.request_id) ?? null;
+            const pendingRequestId = requestedParent
+              ? pendingBtwByParentRef.current.get(requestedParent) ?? null
+              : null;
+            const activeRequest = activeBtwByParentRef.current.get(
+              msg.parent_sid)
+              ?? (requestedParent
+                ? activeBtwByParentRef.current.get(requestedParent) : undefined)
+              ?? null;
             const disposition = classifyBtwOpened(
-              pendingBtwRef.current, activeBtwRef.current, msg);
+              pendingRequestId, activeRequest, msg);
             if (disposition === "duplicate") {
+              btwRequestParentsRef.current.delete(msg.request_id);
               return; // cached replay after a lost ACK; the fork is already open
             }
             if (disposition === "stale") {
@@ -663,22 +1440,31 @@ export default function App() {
                 if (!oldest) break;
                 discarded.delete(oldest);
               }
+              btwRequestParentsRef.current.delete(msg.request_id);
               ws.sendCloseBtw(msg.btw_sid);
               return;
             }
-            pendingBtwRef.current = null;
-            activeBtwRef.current = {
+            if (requestedParent) {
+              pendingBtwByParentRef.current.delete(requestedParent);
+              activeBtwByParentRef.current.delete(requestedParent);
+              setBtwOpeningFor(requestedParent, false);
+            }
+            btwRequestParentsRef.current.delete(msg.request_id);
+            activeBtwByParentRef.current.set(msg.parent_sid, {
               requestId: msg.request_id,
               sid: msg.btw_sid,
-            };
-            setBtwOpening(false);
+            });
+            setBtwOpeningFor(msg.parent_sid, false);
           } else if (msg.type === "error" && msg.request_id
-              && btwRequestIdsRef.current.has(msg.request_id)) {
+              && btwRequestParentsRef.current.has(msg.request_id)) {
+            const parentSid = btwRequestParentsRef.current.get(msg.request_id)!;
             const matches = matchesBtwRequest(
-              pendingBtwRef.current, msg.request_id);
+              pendingBtwByParentRef.current.get(parentSid) ?? null,
+              msg.request_id);
             if (!matches) return; // obsolete /btw failure; keep any newer spinner
-            pendingBtwRef.current = null;
-            setBtwOpening(false);
+            pendingBtwByParentRef.current.delete(parentSid);
+            btwRequestParentsRef.current.delete(msg.request_id);
+            setBtwOpeningFor(parentSid, false);
           }
           if (msg.type === "session_forked") {
             const pendingMessageFork = pendingSessionForkRef.current;
@@ -771,6 +1557,39 @@ export default function App() {
             return;
           }
           if (msg.type === "session_rekey") {
+            setCompletionReceipts((current) => rekeyCompletionReceipts(
+              current, msg.old_key, msg.session_id));
+            const pendingBtwRequest = pendingBtwByParentRef.current.get(
+              msg.old_key);
+            if (pendingBtwRequest) {
+              pendingBtwByParentRef.current.delete(msg.old_key);
+              if (!pendingBtwByParentRef.current.has(msg.session_id)) {
+                pendingBtwByParentRef.current.set(
+                  msg.session_id, pendingBtwRequest);
+                btwRequestParentsRef.current.set(
+                  pendingBtwRequest, msg.session_id);
+              }
+              setBtwOpeningByParentSid((current) => {
+                if (!current[msg.old_key]) return current;
+                const next = { ...current };
+                if (!next[msg.session_id]) next[msg.session_id] = true;
+                delete next[msg.old_key];
+                return next;
+              });
+            }
+            const activeParentBtw = activeBtwByParentRef.current.get(
+              msg.old_key);
+            if (activeParentBtw) {
+              activeBtwByParentRef.current.delete(msg.old_key);
+              const targetParentBtw = activeBtwByParentRef.current.get(
+                msg.session_id);
+              if (!targetParentBtw) {
+                activeBtwByParentRef.current.set(
+                  msg.session_id, activeParentBtw);
+              } else if (targetParentBtw.sid !== activeParentBtw.sid) {
+                ws.sendCloseBtw(activeParentBtw.sid);
+              }
+            }
             if (ownership) {
               composerDraftsRef.current.rekey(
                 composerDraftKey(
@@ -810,12 +1629,19 @@ export default function App() {
               return next;
             });
           }
+          if (msg.type === "session_list" && ownership) {
+            const listedSpace = msg.space ?? "code";
+            historySessionListsRef.current[
+              `${listedSpace}:${msg.engine}`
+            ] = msg.sessions;
+          }
           if (msg.type === "session_list") {
             ws.setSessionEngines(msg.sessions);
             const listedSpace = msg.space ?? "code";
             const surfaceKey = `${listedSpace}:${msg.engine}`;
             sessionListsBySurfaceRef.current[surfaceKey] = msg.sessions;
             authoritativeSurfaceListsRef.current.add(surfaceKey);
+            bumpNotificationListRevision();
             prefetchedSurfacesRef.current.add(surfaceKey);
             // Warm the sibling Work/Code surface once per page lifetime. Codex
             // reuses the just-read native catalog in the wrapper, so this does
@@ -839,6 +1665,15 @@ export default function App() {
               );
             }
           }
+          if (msg.type === "state" && msg.sid && ownership) {
+            sessionListsBySurfaceRef.current = updateScopedSessionLifecycle(
+              sessionListsBySurfaceRef.current,
+              ownership.engine,
+              ownership.space,
+              msg.sid,
+              msg.state,
+            );
+          }
           if (msg.type === "work_dashboard") {
             setWorkDashboards((current) => ({ ...current, [msg.engine]: msg }));
             setWorkProjectId((current) => current && msg.projects.some(
@@ -857,20 +1692,35 @@ export default function App() {
               setCapabilitiesLoading(false);
             }
           }
-          if (msg.type === "turn_end" && msg.sid && document.hidden
-              && localStorage.getItem(NOTIFY_KEY) === "1"
-              && !remotePushActiveRef.current
+          if (msg.type === "turn_end" && msg.sid && msg.notification_context
+              && document.hidden
               && typeof Notification !== "undefined"
               && Notification.permission === "granted") {
-            const session = stateRef.current.sessions.find(
-              (candidate) => candidate.session_id === msg.sid);
-            const label = session?.engine === "codex" ? "Codex" : "Claude";
-            const body = turnNotificationBody(label, msg.result);
-            void navigator.serviceWorker?.ready.then((registration) =>
-              registration.showNotification("cc-remote", {
-                body, icon: "/icon-192.png", badge: "/favicon.svg",
-                tag: turnNotificationTag(msg), data: { url: "/" },
-              })).catch(() => undefined);
+            const mode = readNotificationMode(localStorage);
+            const remoteWillNotify = !msg.to
+              && !!pushCoordinatorRef.current?.isRemoteActive(machineId);
+            if (mode === "off" || remoteWillNotify) {
+              // Web Push owns broadcast completions while /btw's owner-routed
+              // TurnEnd remains a local-only notification.
+            } else {
+              const presentation = turnNotificationPresentation(msg, mode);
+              const route = presentation.sessionId
+                && presentation.engine && presentation.space
+                ? {
+                    machine_id: machineId,
+                    session_id: presentation.sessionId,
+                    engine: presentation.engine,
+                    space: presentation.space,
+                  }
+                : null;
+              const url = route ? encodeNotificationRoute(route) : "/";
+              void navigator.serviceWorker?.ready.then((registration) =>
+                registration.showNotification(presentation.title, {
+                  body: presentation.body,
+                  icon: "/icon-192.png", badge: "/favicon.svg",
+                  tag: turnNotificationTag(msg), data: { url, route },
+                })).catch(() => undefined);
+            }
           }
           if (msg.type === "session_focus" && spaceRef.current === "work"
               && !msg.session_id.startsWith("tmp-")) {
@@ -927,6 +1777,9 @@ export default function App() {
           if (s === "connected") {
             recoverableReads.clear();
             historyRequestsRef.current.beginConnection();
+            clearHistoryDetailRequests();
+            notificationListRequestRef.current = null;
+            bumpNotificationListRevision();
             ws.sendListSessions(engineRef.current, spaceRef.current);
             if (spaceRef.current === "work") {
               ws.sendGetWorkDashboard(engineRef.current);
@@ -944,20 +1797,27 @@ export default function App() {
           clearLegacyAuthMarkers(localStorage);
           pendingCreateRef.current = null;
           createRequestsRef.current.clear();
-          pendingBtwRef.current = null;
+          pendingBtwByParentRef.current.clear();
           pendingSessionForkRef.current = null;
           pendingWorktreeForkRef.current = null;
-          activeBtwRef.current = null;
-          btwRequestIdsRef.current.clear();
+          activeBtwByParentRef.current.clear();
+          btwRequestParentsRef.current.clear();
           discardedBtwSidsRef.current.clear();
           historyInvalidationsRef.current.clear();
+          historyInvalidationGenerationsRef.current.clear();
           historyCacheEpochRef.current.clear();
+          historySessionListsRef.current = {};
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
           bumpInlineImageRevision();
           bumpHistoryImageRevision();
           historyRequestsRef.current.clear();
-          setBtwOpening(false);
+          clearHistoryDetailRequests();
+          historyPageScopesRef.current.clear();
+          void historyPageCacheRef.current.clear();
+          setBtwOpeningByParentSid({});
+          setBtwSendModeBySid({});
+          btwDraftsRef.current.clear();
           setForkingPointId(null);
           setForkWorktreeSession(null);
           setForkWorktreeCreating(false);
@@ -966,6 +1826,7 @@ export default function App() {
           setStatusOpenSid(null);
           setWorkArtifactsOpen(false);
           setWorkArtifactsBySid({});
+          setCompletionReceipts({});
           dispatch({ type: "reset" });
           setAuthed(false);
           void (async () => {
@@ -979,17 +1840,24 @@ export default function App() {
           dispatch({ type: "prune_runtimes", protectedSids });
         },
         onWrapperGenerationChanged: () => {
+          clearHistoryDetailRequests();
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
           bumpInlineImageRevision();
           bumpHistoryImageRevision();
           discardedBtwSidsRef.current.clear();
-          if (stateRef.current.btwSid || pendingBtwRef.current
-              || activeBtwRef.current) {
-            pendingBtwRef.current = null;
-            activeBtwRef.current = null;
-            setBtwOpening(false);
-            if (stateRef.current.btwSid) dispatch({ type: "clear_btw" });
+          setCompletionReceipts(discardBtwCompletionReceipts);
+          setBtwSendModeBySid({});
+          btwDraftsRef.current.clear();
+          if (Object.keys(stateRef.current.btwByParentSid).length > 0
+              || pendingBtwByParentRef.current.size > 0
+              || activeBtwByParentRef.current.size > 0
+              || btwRequestParentsRef.current.size > 0) {
+            pendingBtwByParentRef.current.clear();
+            activeBtwByParentRef.current.clear();
+            btwRequestParentsRef.current.clear();
+            setBtwOpeningByParentSid({});
+            dispatch({ type: "clear_all_btw" });
             dispatch({ type: "command_error",
               detail: "服务已重新连接，临时 /btw 会话已关闭，请重新打开。" });
           }
@@ -1015,14 +1883,24 @@ export default function App() {
       wsRef.current?.stop();
       wsRef.current = null;
       historyRequests.clear();
+      clearHistoryDetailRequests();
       recoverableReads.clear();
       draining.clear();
     };
-  }, [authed, machineId, requestHistory]);
+  }, [
+    authed,
+    clearHistoryDetailRequests,
+    installBrowseHistoryPage,
+    invalidateHistoryPageScopes,
+    machineId,
+    requestHistory,
+    setBtwOpeningFor,
+  ]);
 
   // Land on the preferred/recent session only after an accepted list for the
   // active engine+space arrives. Background snapshots never pick focus.
   useEffect(() => {
+    if (pendingNotificationTarget) return;
     if (didInitFocusRef.current || !wsRef.current) return;
     const surfaceKey = `${spaceRef.current}:${engineRef.current}`;
     if (!authoritativeSurfaceListsRef.current.has(surfaceKey)) return;
@@ -1053,7 +1931,12 @@ export default function App() {
         latest.session_id, undefined, HISTORY_INITIAL_PAGE);
       wsRef.current.sendSwitchSession(latest.session_id, latestEngine, spaceRef.current);
     }
-  }, [state.sessions, state.focusedSid, requestHistory]);
+  }, [
+    pendingNotificationTarget,
+    state.sessions,
+    state.focusedSid,
+    requestHistory,
+  ]);
 
   // Direct sidebar selection and newly-created sessions both update the
   // per-surface bookmark. A later Work/Code or engine toggle can therefore
@@ -1107,7 +1990,7 @@ export default function App() {
       type: "prune_runtimes",
       protectedSids: wsRef.current?.pendingSessionIds() ?? [],
     });
-  }, [state.runtimes, focusedSid, state.btwSid, state.artifact?.sid]);
+  }, [state.runtimes, focusedSid, state.btwByParentSid, state.artifact?.sid]);
 
   // Persist the focused session's turns to IndexedDB (Phase-2 will write through
   // background sessions too). Coalesced in cache.ts.
@@ -1115,7 +1998,8 @@ export default function App() {
     const sid = rt.ccSessionId;
     const revision = rt.historyRevision;
     if (!sid || !revision
-        || historyInvalidationsRef.current.has(sid)) return;
+        || historyInvalidationsRef.current.has(sid)
+        || isHistoryRecoveryPending(state.historyRecovery, sid)) return;
     import("./cache").then(({ saveSession }) => {
       const live = wsRef.current?.lastSeqFor(sid) || 0;
       saveSession(
@@ -1124,20 +2008,30 @@ export default function App() {
         rt.control,
       );
     });
-  }, [focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control]);
+  }, [
+    focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control,
+    state.historyRecovery,
+  ]);
 
-  // Paint IndexedDB before starting the newest-page network read.  A browser
-  // can otherwise receive a very fast summary response in the same task that
-  // opened the session, leaving no frame in which the local projection is
-  // visible.  The next animation frame is the cache-first boundary; the wrapper
-  // then validates/replaces it in the background. A 6s fallback clears the
-  // spinner only when both cache and wrapper stay silent.
+  // Race the small authoritative newest page with IndexedDB. A healthy local
+  // projection still paints immediately, but a slow/blocked IDB open must never
+  // delay the wrapper's four-turn response. hydrate_cache only fills an empty
+  // runtime, so whichever source wins cannot clobber the other. A 6s fallback
+  // clears the spinner only when both cache and wrapper stay silent.
   useEffect(() => {
     const sid = focusedSid;
     if (!sid) return;
     let cancelled = false;
     let requestFrame: number | null = null;
     const cacheEpoch = historyCacheEpochRef.current.get(sid) ?? 0;
+    if (state.connState === "connected") {
+      requestFrame = window.requestAnimationFrame(() => {
+        requestFrame = null;
+        if (!cancelled) {
+          requestHistory(sid, undefined, HISTORY_INITIAL_PAGE);
+        }
+      });
+    }
     void import("./cache").then(({ loadSession }) => loadSession(sid)).then((cached) => {
       const valid = !cancelled
           && cacheEpoch === (historyCacheEpochRef.current.get(sid) ?? 0)
@@ -1153,14 +2047,6 @@ export default function App() {
           revision: cached.revision,
           generation: cached.generation ?? cached.control?.generation,
           control: cached.control,
-        });
-      }
-      if (!cancelled && state.connState === "connected") {
-        requestFrame = window.requestAnimationFrame(() => {
-          requestFrame = null;
-          if (!cancelled) {
-            requestHistory(sid, undefined, HISTORY_INITIAL_PAGE);
-          }
         });
       }
     });
@@ -1223,28 +2109,76 @@ export default function App() {
   }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
     rt.external, focusedEngine]);
 
-  // ---- /btw effects ----
-  // These MUST stay ABOVE the `!authed` early return below. Hooks have to run
-  // unconditionally and in the same order on every render; putting them after the
-  // return meant logging out (authed -> false) rendered fewer hooks than the
-  // previous render, and React blew up with #300 ("rendered fewer hooks than
-  // expected"). Logging back in tripped the mirror image. Refreshing "fixed" it
-  // only because a fresh mount has no previous render to disagree with.
-  //
-  // A /btw fork belongs to the session it was forked from. When you switch session
-  // or toggle engine, discard it — else a codex btw would linger while you view a
-  // cc session ("cc shows codex btw"). Read via ref so opening btw (no focus
-  // change) doesn't trip this, and it only fires on actual navigation.
-  const btwSidRef = useRef<string | null>(null);
-  btwSidRef.current = state.btwSid;
+  const loadHistoryTurnDetail = useCallback((
+    displayTurnId: string, before?: string | null,
+  ): boolean => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime?.historyRevision) return false;
+    const browse = current.historyBrowse?.sid === sid
+      ? current.historyBrowse : null;
+    const displayed = (browse?.turns ?? runtime.turns).find(
+      (turn) => turn.id === displayTurnId
+        || canonicalTurnId(turn) === displayTurnId);
+    if (!displayed) return false;
+    const turnId = canonicalTurnId(displayed);
+    const scope = historyPageScopeFor(
+      sid, runtime.historyRevision, focusedEngine, space);
+    const context: HistoryDetailRequestContext = browse
+      ? {
+          target: "browse",
+          scopeKey: browse.scopeKey,
+          sid,
+          revision: browse.revision,
+          turnId,
+          before,
+          viewId: browse.viewId,
+          windowEpoch: browse.windowEpoch,
+        }
+      : {
+          target: "runtime",
+          scopeKey: historyPageCacheScopeKey(scope),
+          sid,
+          revision: runtime.historyRevision,
+          turnId,
+          before,
+        };
+    if (!historyDetailRequestsRef.current.begin(context)) return false;
+    const sent = wsRef.current?.sendGetTurnDetail(
+      sid, turnId, context.revision, before) ?? false;
+    if (!sent) {
+      historyDetailRequestsRef.current.cancel(context);
+      return false;
+    }
+    if (context.target === "browse") {
+      dispatch({
+        type: "history_browse_detail_requested",
+        sid,
+        scopeKey: context.scopeKey,
+        revision: context.revision,
+        viewId: context.viewId,
+        windowEpoch: context.windowEpoch,
+        turnId,
+        before,
+      });
+    } else {
+      dispatch({ type: "turn_detail_requested", sid, turnId, before });
+    }
+    return true;
+  }, [focusedEngine, historyPageScopeFor, space]);
   useEffect(() => {
-    pendingBtwRef.current = null;
-    activeBtwRef.current = null;
-    setBtwOpening(false);
-    const s = btwSidRef.current;
-    if (s) { wsRef.current?.sendCloseBtw(s); dispatch({ type: "clear_btw" }); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusedSid, engine]);
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime) return;
+    const turns = current.historyBrowse?.sid === sid
+      ? current.historyBrowse.turns : runtime.turns;
+    const next = nextAutoLoadDetailTurn(turns);
+    if (!next) return;
+    loadHistoryTurnDetail(next.turnId, next.before);
+  }, [loadHistoryTurnDetail, state.historyBrowse, state.runtimes,
+    state.focusedSid]);
 
   if (!authReady) {
     return <div className="login" aria-busy="true">正在连接中继…</div>;
@@ -1261,9 +2195,10 @@ export default function App() {
     const currentState = stateRef.current;
     if (ws.pendingQueryFor(focusedSid)
         || currentState.runtimes[focusedSid]?.acceptancePending) {
+      const sendMode = currentState.runtimes[focusedSid]?.sendMode ?? "steer";
       const waiting = collectWaitingQueries(
         currentState.runtimes,
-        currentState.sendMode === "interrupt" ? focusedSid : undefined,
+        sendMode === "steer" ? focusedSid : undefined,
       );
       if (!canEnqueueQuery(waiting, query)) {
         dispatch({
@@ -1272,7 +2207,7 @@ export default function App() {
         });
         return false;
       }
-      dispatch(currentState.sendMode === "queue"
+      dispatch(sendMode === "queue"
         ? { type: "enqueue", sid: focusedSid, query }
         : { type: "set_pending", sid: focusedSid, query });
       return true;
@@ -1291,6 +2226,175 @@ export default function App() {
     dispatch({ type: "query_sent", sid: focusedSid, prompt, msg_id, images, files,
       ts: activityMs });
     return true;
+  };
+  const sendSteer = (
+    prompt: string, images?: QueryImg[], files?: QueryFile[],
+  ): boolean => {
+    const ws = wsRef.current;
+    if (!ws || !focusedSid || focusedEngine !== "codex") return false;
+    const msg_id = uuid();
+    if (!ws.sendSteerTo(focusedSid, prompt, msg_id, images, files)) return false;
+    if (stateRef.current.historyBrowse?.sid === focusedSid) {
+      dispatch({ type: "return_to_latest", sid: focusedSid });
+    }
+    return true;
+  };
+  const loadOlderHistoryPage = (
+    anchorTurnId?: string,
+  ): boolean | { accepted: true; viewId: string } => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime?.historyRevision || !wsRef.current
+        || runtime.historyInvalidated
+        || isHistoryRecoveryPending(current.historyRecovery, sid)) return false;
+    const existing = current.historyBrowse?.sid === sid
+      ? current.historyBrowse : null;
+    if (existing) {
+      if (!existing.hasOlder || !existing.olderCursor
+          || !historyPageScopesRef.current.has(existing.scopeKey)) return false;
+      const context: HistoryBrowseRequestContext = {
+        scopeKey: existing.scopeKey,
+        viewId: existing.viewId,
+        windowEpoch: existing.windowEpoch,
+        pendingBefore: existing.olderCursor,
+        sourcePageKey: existing.oldestPageKey,
+        anchorTurnId: anchorTurnId ?? null,
+      };
+      return requestHistory(
+        sid, existing.olderCursor, HISTORY_MORE_PAGE,
+        existing.generation, existing.revision, context);
+    }
+    if (!runtime.hasMore || !runtime.oldestId) return false;
+    const scope = historyPageScopeFor(
+      sid, runtime.historyRevision, focusedEngine, space);
+    const scopeKey = historyPageCacheScopeKey(scope);
+    const viewId = uuid();
+    const basePageKey = `${HISTORY_LATEST_PAGE_KEY}:${viewId}`;
+    const browseGeneration = runtime.historyGeneration
+      ?? wsRef.current.generationFor(sid)
+      ?? null;
+    const basePage: HistoryBrowsePage = {
+      pageKey: basePageKey,
+      turns: runtime.turns,
+      hasOlder: true,
+      olderCursor: runtime.oldestId,
+      hasNewer: false,
+      newerPageKey: null,
+      isLatest: true,
+    };
+    void historyPageCacheRef.current.putPage(scope, basePage);
+    dispatch({
+      type: "begin_history_browse",
+      sid,
+      scopeKey,
+      revision: runtime.historyRevision,
+      generation: browseGeneration,
+      viewId,
+      basePageKey,
+    });
+    const accepted = requestHistory(
+      sid, runtime.oldestId, HISTORY_MORE_PAGE,
+      browseGeneration, runtime.historyRevision, {
+        scopeKey,
+        viewId,
+        windowEpoch: 0,
+        pendingBefore: runtime.oldestId,
+        sourcePageKey: basePageKey,
+        anchorTurnId: anchorTurnId ?? null,
+      });
+    return accepted ? { accepted: true, viewId } : false;
+  };
+  const loadNewerHistoryPage = (anchorTurnId?: string): boolean => {
+    const browse = stateRef.current.historyBrowse;
+    if (!browse || !browse.hasNewer || !browse.newerPageKey) return false;
+    const scope = historyPageScopesRef.current.get(browse.scopeKey);
+    if (!scope) return false;
+    const frozen = {
+      sid: browse.sid,
+      scopeKey: browse.scopeKey,
+      revision: browse.revision,
+      generation: browse.generation,
+      viewId: browse.viewId,
+      windowEpoch: browse.windowEpoch,
+      pageKey: browse.newerPageKey,
+      anchorTurnId: anchorTurnId ?? null,
+    };
+    void (async () => {
+      const page = await historyPageCacheRef.current.getPage(
+        scope, frozen.pageKey);
+      const currentState = stateRef.current;
+      const current = currentState.historyBrowse;
+      if (currentState.focusedSid !== frozen.sid
+          || !current
+          || !acceptsCachedNewerPage(current, frozen)) return;
+      if (page?.isLatest && current.latestDirty) {
+        dispatch({
+          type: "history_browse_newer_settled",
+          sid: frozen.sid,
+          scopeKey: frozen.scopeKey,
+          revision: frozen.revision,
+          generation: frozen.generation,
+          viewId: frozen.viewId,
+          windowEpoch: frozen.windowEpoch,
+          pageKey: frozen.pageKey,
+        });
+        return;
+      }
+      if (!page) {
+        dispatch({
+          type: "history_browse_newer_unavailable",
+          sid: frozen.sid,
+          scopeKey: frozen.scopeKey,
+          revision: frozen.revision,
+          generation: frozen.generation,
+          viewId: frozen.viewId,
+          windowEpoch: frozen.windowEpoch,
+        });
+        return;
+      }
+      const protectedTurnIds = protectedHistoryTurnIds(
+        frozen.anchorTurnId,
+        textSelectionGuardRef.current,
+        {
+          sid: frozen.sid,
+          revision: frozen.revision,
+          viewId: frozen.viewId,
+          scopeKey: frozen.scopeKey,
+        },
+      );
+      const mutation = appendNewerPage(current, page, {
+        expectedScopeKey: frozen.scopeKey,
+        expectedViewId: frozen.viewId,
+        expectedWindowEpoch: frozen.windowEpoch,
+        expectedNewerPageKey: frozen.pageKey,
+        protectedTurnIds,
+      });
+      if (mutation.projection === current) return;
+      for (const evicted of mutation.evictedPages) {
+        void historyPageCacheRef.current.putPage(scope, evicted);
+      }
+      dispatch({
+        type: "install_history_browse_newer",
+        sid: frozen.sid,
+        scopeKey: frozen.scopeKey,
+        revision: frozen.revision,
+        generation: frozen.generation,
+        viewId: frozen.viewId,
+        windowEpoch: frozen.windowEpoch,
+        page,
+        protectedTurnIds,
+        prepared: {
+          from: current,
+          to: mutation.projection,
+        },
+      });
+    })();
+    return true;
+  };
+  const returnToLatestHistory = () => {
+    const sid = stateRef.current.historyBrowse?.sid;
+    if (sid) dispatch({ type: "return_to_latest", sid });
   };
   // One command creates the session and starts its first query atomically. The
   // wrapper targets the new temp-keyed ctx directly; no later focus event is used
@@ -1328,6 +2432,28 @@ export default function App() {
       setCreateError(null);
     }
     return queued;
+  };
+  const pickNewChatModel = (model: string | null) => {
+    const current = state.newChat;
+    if (!current) return;
+    const compatibleEffort = compatibleNewChatEffort(
+      engine,
+      model,
+      current.effort,
+      state.catalog,
+      newChatDefaults.model,
+    );
+    dispatch({ type: "set_new_chat_model", model });
+    if (compatibleEffort !== current.effort) {
+      dispatch({
+        type: "set_new_chat_effort",
+        effort: compatibleEffort,
+      });
+    }
+  };
+  const pickNewChatEffort = (effort: string | null) => {
+    if (!state.newChat) return;
+    dispatch({ type: "set_new_chat_effort", effort });
   };
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
@@ -1441,57 +2567,130 @@ export default function App() {
       sections: parseGitDiff(diff),
     } });
   };
-  const previewFile = (file: string, line?: number) => {
-    if (!focusedSid) return;
+  const previewFileForSid = (
+    targetSid: string | null,
+    file: string,
+    line?: number,
+  ) => {
+    if (!targetSid) return;
     if (!confirmArtifactDiscard()) return;
-    const requestId = wsRef.current?.sendGetFilePreview(file) ?? null;
-    if (!requestId) return;
+    const requestId = uuid();
+    if (!wsRef.current?.sendGetFilePreview(file, requestId, targetSid)) return;
     setRightView("diff");
     dispatch({
       type: "open_file_loading",
       file,
-      sid: focusedSid,
+      sid: targetSid,
       requestId,
       kind: isMarkdownPath(file) ? "md" : "file",
       line,
     });
   };
+  const previewFile = (file: string, line?: number) =>
+    previewFileForSid(focusedSid, file, line);
+  const previewBtwFile = (file: string, line?: number) =>
+    previewFileForSid(activeBtwSid, file, line);
+  const previewArtifactFile = (file: string, line?: number) =>
+    previewFileForSid(state.artifact?.sid ?? focusedSid, file, line);
   const previewMarkdown = (file: string) => previewFile(file);
-  const loadPreviewAsset = (file: string, previewId: string): boolean =>
-    !!wsRef.current?.sendGetPreviewAsset(file, previewId);
+  const loadPreviewAsset = (file: string, previewId: string): boolean => {
+    const targetSid = state.artifact?.sid ?? focusedSid;
+    return !!targetSid && !!wsRef.current?.sendGetPreviewAsset(
+      file, previewId, uuid(), targetSid);
+  };
   const saveMarkdown = (file: string, content: string, expectedSize: number,
                         expectedMtimeNs: string, expectedRevision: string): string | null => {
-    const requestId = wsRef.current?.sendSaveMarkdown(
-      file, content, expectedSize, expectedMtimeNs, expectedRevision) ?? null;
-    if (requestId) dispatch({ type: "start_file_save", requestId, content });
+    const targetSid = state.artifact?.sid ?? focusedSid;
+    if (!targetSid) return null;
+    const requestId = uuid();
+    if (!wsRef.current?.sendSaveMarkdown(
+      file, content, expectedSize, expectedMtimeNs, expectedRevision,
+      requestId, targetSid)) return null;
+    dispatch({ type: "start_file_save", requestId, content });
     return requestId;
   };
-  // /btw: fork the focused session into an ephemeral side panel (wrapper replies
-  // BtwOpened → reducer opens the panel). Send/close target the fork by its sid.
+  // Each /btw stays pinned to its parent session. Navigation hides it without
+  // destroying the fork; returning to that parent restores it. Other sessions
+  // can open their own independent side conversations.
   const openBtw = () => {
     if (!confirmArtifactDiscard()) return;
     setRightView("btw");
-    if (!focusedSid || state.btwSid || pendingBtwRef.current) return;
-    const requestId = wsRef.current?.sendOpenBtw(focusedSid) ?? null;
-    if (!requestId) { setBtwOpening(false); return; }
-    pendingBtwRef.current = requestId;
-    const requestIds = btwRequestIdsRef.current;
-    requestIds.add(requestId);
-    while (requestIds.size > 64) {
-      const oldest = requestIds.values().next().value as string | undefined;
-      if (!oldest) break;
-      requestIds.delete(oldest);
+    const parentSid = visibleParentSid;
+    if (!parentSid || activeBtw
+        || pendingBtwByParentRef.current.has(parentSid)) return;
+    const requestId = wsRef.current?.sendOpenBtw(parentSid) ?? null;
+    if (!requestId) {
+      setBtwOpeningFor(parentSid, false);
+      return;
     }
-    setBtwOpening(true);
+    pendingBtwByParentRef.current.set(parentSid, requestId);
+    const requestParents = btwRequestParentsRef.current;
+    requestParents.set(requestId, parentSid);
+    while (requestParents.size > 64) {
+      const oldest = requestParents.keys().next().value as string | undefined;
+      if (!oldest) break;
+      requestParents.delete(oldest);
+    }
+    setBtwOpeningFor(parentSid, true);
   };
-  const sendBtw = (prompt: string) => { if (state.btwSid) wsRef.current?.sendQueryTo(state.btwSid, prompt, uuid()); };
+  const sendBtw = (prompt: string): boolean => {
+    const sid = activeBtwSid;
+    const ws = wsRef.current;
+    if (!sid || !ws) return false;
+    const msg_id = uuid();
+    if (!ws.sendQueryTo(sid, prompt, msg_id)) return false;
+    drainingRef.current.add(sid);
+    dispatch({
+      type: "query_sent", sid, prompt, msg_id, ts: Date.now(),
+    });
+    return true;
+  };
+  const steerBtw = (prompt: string): boolean => {
+    const sid = activeBtwSid;
+    const ws = wsRef.current;
+    if (!sid || !ws || activeBtw?.engine !== "codex") return false;
+    return ws.sendSteerTo(sid, prompt, uuid());
+  };
+  const interruptBtw = (sid: string) => {
+    wsRef.current?.sendInterruptTo(sid);
+  };
+  const setBtwModel = (sid: string, model: string) => {
+    wsRef.current?.sendSetModelTo(sid, model);
+  };
+  const setBtwEffort = (sid: string, effort: string) => {
+    wsRef.current?.sendSetEffortTo(sid, effort);
+  };
+  const setBtwSendMode = (
+    sid: string, mode: SendMode,
+  ) => {
+    setBtwSendModeBySid((current) => (
+      current[sid] === mode ? current : { ...current, [sid]: mode }
+    ));
+  };
   const closeBtw = () => {
-    pendingBtwRef.current = null;
-    activeBtwRef.current = null;
-    setBtwOpening(false);
-    if (state.btwSid) {
-      wsRef.current?.sendCloseBtw(state.btwSid);
-      dispatch({ type: "clear_btw" });
+    const parentSid = visibleParentSid;
+    if (!parentSid) return;
+    const pendingRequestId = pendingBtwByParentRef.current.get(parentSid);
+    pendingBtwByParentRef.current.delete(parentSid);
+    activeBtwByParentRef.current.delete(parentSid);
+    setBtwOpeningFor(parentSid, false);
+    if (pendingRequestId) {
+      // Keep the request -> parent tombstone. A late success is classified as
+      // stale and its newly-created fork is closed immediately.
+      btwRequestParentsRef.current.set(pendingRequestId, parentSid);
+    }
+    if (activeBtw) {
+      btwDraftsRef.current.delete(activeBtwDraftKey);
+      setBtwSendModeBySid((current) => {
+        if (!(activeBtw.sid in current)) return current;
+        const next = { ...current };
+        delete next[activeBtw.sid];
+        return next;
+      });
+      setCompletionReceipts((receipts) => acknowledgeCompletion(
+        receipts, parentSid, { btwSid: activeBtw.sid }));
+      wsRef.current?.sendCloseBtw(activeBtw.sid);
+      dispatch({ type: "clear_btw", parentSid });
     }
   };
   // Header tab switch between the two right-slot views (opening the target lazily).
@@ -1502,7 +2701,7 @@ export default function App() {
     } else openBtw();
   };
   shortcutRef.current = {
-    artifact: state.artifact, btwSid: state.btwSid, rightView,
+    artifact: state.artifact, btwSid: activeBtwSid, rightView,
     getDiff, openBtw, closeBtw,
   };
   const logout = async () => {
@@ -1512,29 +2711,55 @@ export default function App() {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       await import("./cache").then((module) => module.clearCache());
+      await historyPageCacheRef.current.clear();
       wsRef.current?.stop();
       pendingCreateRef.current = null;
       createRequestsRef.current.clear();
-      pendingBtwRef.current = null;
+      pendingBtwByParentRef.current.clear();
       pendingSessionForkRef.current = null;
       pendingWorktreeForkRef.current = null;
       sessionActivityPendingRef.current.clear();
-      activeBtwRef.current = null;
-      btwRequestIdsRef.current.clear();
+      activeBtwByParentRef.current.clear();
+      btwRequestParentsRef.current.clear();
       discardedBtwSidsRef.current.clear();
       historyInvalidationsRef.current.clear();
+      historyInvalidationGenerationsRef.current.clear();
       historyCacheEpochRef.current.clear();
+      historyRequestsRef.current.clear();
+      clearHistoryDetailRequests();
+      historyPageScopesRef.current.clear();
       composerDraftsRef.current.clear();
+      btwDraftsRef.current.clear();
+      setBtwSendModeBySid({});
       setCreateError(null);
       setForkingPointId(null);
       setForkWorktreeSession(null);
       setForkWorktreeCreating(false);
       setForkWorktreeError(null);
+      setBtwOpeningByParentSid({});
+      setCompletionReceipts({});
       dispatch({ type: "reset" });
       setAuthed(false);
     } catch {
       dispatch({ type: "command_error", detail: "退出失败：服务暂不可用，请稍后重试" });
     }
+  };
+  const updateNotificationMode = async (mode: NotificationMode): Promise<boolean> => {
+    if (mode !== "off") {
+      if (typeof Notification === "undefined") {
+        dispatch({ type: "command_error", detail: "当前浏览器不支持系统通知。" });
+        return false;
+      }
+      const permission = Notification.permission === "granted"
+        ? "granted" : await Notification.requestPermission();
+      if (permission !== "granted") {
+        dispatch({ type: "command_error", detail: "通知权限未开启，设置没有更改。" });
+        return false;
+      }
+    }
+    writeNotificationMode(localStorage, mode);
+    setNotificationMode(mode);
+    return true;
   };
   const activeDevice = remoteDevices.find(
     (device) => device.machine_id === machineId);
@@ -1550,7 +2775,7 @@ export default function App() {
   ) ?? rt.state;
 
   return (
-    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || state.btwSid || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       <SessionsSidebar
         open={sidebarOpen}
         space={space}
@@ -1564,28 +2789,16 @@ export default function App() {
             runtime?.mirroredRunning,
           ) ?? "idle"];
         }))}
+        completionBadges={completionBadges}
         activeSessionId={focusedSid}
         onSelect={(id) => {
           if (!confirmArtifactDiscard()) return;
-          pendingCreateRef.current = null;
-          setCreateError(null);
-          setStatusOpenSid(null);
-          setWorkArtifactsOpen(false);
+          cancelPendingNotificationTarget();
           const selected = state.sessions.find((s) => s.session_id === id);
-          const selectedEngine = (selected?.engine as "claude" | "codex") || engine;
-          const selectedSpace = selected?.space === "work" ? "work" : space;
-          dispatch({ type: "exit_new_chat" });
-          dispatch({ type: "focus_session", sid: id });
-          wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
-          requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
-          wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
-          if (selectedSpace === "work") {
-            wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
-          }
-          if (isMobile()) setSidebarOpen(false);
+          if (selected) focusListedSession(selected);
         }}
-        onNew={() => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit" }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={() => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit" }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -1614,6 +2827,8 @@ export default function App() {
           composerDraftsRef.current.delete(composerDraftKey(
             machineId, target.space, target.engine, id,
           ));
+          invalidateHistoryPageScopes(id);
+          if (focusedSid === id) clearHistoryDetailRequests();
           if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
           wsRef.current?.sendDeleteSession(id, engine, space);
         }}
@@ -1658,37 +2873,22 @@ export default function App() {
           </button>
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
-          {typeof Notification !== "undefined" && <button
-            className={`iconbtn header-notify${notificationsEnabled ? " notify-on" : ""}`}
-            onClick={() => { void (async () => {
-              if (notificationsEnabled) {
-                localStorage.removeItem(NOTIFY_KEY);
-                setNotificationsEnabled(false);
-                remotePushActiveRef.current = false;
-                await disableRemotePush();
-                return;
-              }
-              const permission = await Notification.requestPermission();
-              const enabled = permission === "granted";
-              if (enabled) localStorage.setItem(NOTIFY_KEY, "1");
-              else localStorage.removeItem(NOTIFY_KEY);
-              setNotificationsEnabled(enabled);
-              remotePushActiveRef.current = enabled
-                ? await enableRemotePush(machineId) : false;
-            })(); }} aria-label="完成提醒"
-            title={notificationsEnabled ? "后台完成提醒已开启" : "开启后台完成提醒"}>
-            <Icon name="notify" />
-          </button>}
-          <button className="iconbtn header-theme" onClick={toggleTheme} aria-label="切换主题">
-            <Icon name={theme === "dark" ? "sun" : "moon"} />
-          </button>
-          <button className="iconbtn" onClick={() => void logout()}
-            aria-label="退出登录" title="退出登录"><Icon name="logout" /></button>
+          <HeaderMenu
+            theme={theme}
+            notificationMode={notificationMode}
+            notificationBinding={pushBinding.state}
+            notificationAvailable={typeof Notification !== "undefined"}
+            onNotificationMode={updateNotificationMode}
+            onToggleTheme={toggleTheme}
+            onLogout={() => void logout()}
+          />
         </header>
 
-        <ReconnectBanner banner={state.banner} replaying={rt.replaying}
+        <ReconnectBanner banner={state.banner}
+          replaying={rt.replaying || historyView.recovering}
           truncated={rt.truncated}
-          busy={state.connState !== "connected" || !state.wrapperOnline || rt.replaying}
+          busy={state.connState !== "connected" || !state.wrapperOnline
+            || rt.replaying || historyView.recovering}
           onDismiss={dismissBanner} />
         <NoticeStack notices={rt.notices}
           onDismiss={(noticeId) => {
@@ -1700,45 +2900,67 @@ export default function App() {
             createError={createError}
             autoFocus={newChatAutoFocus}
             engine={engine}
+            catalog={state.catalog}
+            model={state.newChat.model}
+            effort={state.newChat.effort}
+            defaultModel={newChatDefaults.model}
+            defaultEffort={newChatDefaults.effort}
             workDashboard={workDashboards[engine] ?? null}
             selectedProjectId={workProjectId}
             onSelectProject={setWorkProjectId}
             onManageWork={() => setWorkManagerOpen(true)}
             onPickCwd={() => setDirPickerOpen(true)}
+            onPickModel={pickNewChatModel}
+            onPickEffort={pickNewChatEffort}
             onSend={sendFirstMessage} />
         ) : (
           <>
-            <ChatView sid={focusedSid} turns={rt.turns} loading={!!rt.loading}
+            <ChatView sid={focusedSid} turns={historyView.turns}
+              loading={!!rt.loading}
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
-              hasMore={!!rt.hasMore}
+              hasMore={historyView.hasMore}
               historyRevision={rt.historyRevision}
-              historyCursor={rt.oldestId}
-              onLoadMore={() => focusedSid ? requestHistory(
-                focusedSid, rt.oldestId, HISTORY_MORE_PAGE) : false}
-              onLoadDetail={(turnId) => {
-                if (!focusedSid) return;
-                const sent = wsRef.current?.sendGetTurnDetail(
-                  focusedSid, turnId, rt.historyRevision) ?? false;
-                if (sent) dispatch({
-                  type: "turn_detail_requested", sid: focusedSid, turnId,
-                });
-              }}
-              onEdit={(prompt) => setEditPrompt(prompt)} onGetDiff={getDiff}
-              onOpenTurnDiff={openTurnDiff}
-              onPreviewMarkdown={previewMarkdown}
-              onOpenFile={previewFile}
-              onOpenArtifacts={() => {
+              historyViewRevision={historyView.viewRevision}
+              historyViewId={historyView.viewId}
+              historyScopeKey={
+                historyView.browsing
+                  && state.historyBrowse?.sid === focusedSid
+                  ? state.historyBrowse.scopeKey
+                  : activeScopeKey
+              }
+              historyWindowEpoch={historyView.windowEpoch}
+              historyCursor={historyView.oldestId}
+              browseMode={historyView.browsing}
+              hasNewer={historyView.hasNewer}
+              onLoadMore={loadOlderHistoryPage}
+              onLoadNewer={loadNewerHistoryPage}
+              onReturnLatest={returnToLatestHistory}
+              onLoadDetail={historyView.recovering
+                ? undefined : loadHistoryTurnDetail}
+              onEdit={historyView.recovering
+                ? undefined : (prompt) => setEditPrompt(prompt)}
+              onGetDiff={historyView.recovering ? undefined : getDiff}
+              onOpenTurnDiff={historyView.recovering
+                ? undefined : openTurnDiff}
+              onPreviewMarkdown={historyView.recovering
+                ? undefined : previewMarkdown}
+              onOpenFile={historyView.recovering ? undefined : previewFile}
+              onOpenArtifacts={historyView.recovering ? undefined : () => {
                 if (focusedSid) {
                   wsRef.current?.sendGetWorkArtifacts(focusedEngine, focusedSid);
                 }
                 setWorkArtifactsOpen(true);
               }}
               imageAssets={inlineImageAssets}
-              onLoadImage={loadFocusedMessageImage}
+              onLoadImage={historyView.recovering
+                ? undefined : loadFocusedMessageImage}
               historyImageAssets={historyImageAssets}
-              onLoadHistoryImage={loadHistoryImage}
-              onFork={space === "code" ? forkFromTurn : undefined} />
+              onLoadHistoryImage={historyView.recovering
+                ? undefined : loadHistoryImage}
+              onTextSelectionGuardChange={updateTextSelectionGuard}
+              onFork={!historyView.recovering && space === "code"
+                ? forkFromTurn : undefined} />
 
             <GoalPanel engine={engine} goal={rt.goal}
               revealed={!!goalUi?.revealed} open={!!goalUi?.open}
@@ -1762,8 +2984,10 @@ export default function App() {
           catalog={state.catalog}
           connState={state.connState}
           wrapperOnline={state.wrapperOnline}
-          sendMode={state.sendMode}
-          setSendMode={(m) => dispatch({ type: "set_send_mode", mode: m })}
+          sendMode={rt.sendMode}
+          setSendMode={(m) => focusedSid && dispatch({
+            type: "set_send_mode", sid: focusedSid, mode: m,
+          })}
           queue={rt.queue}
           allQueued={allQueued}
           replaceableQueued={replaceableQueued}
@@ -1780,6 +3004,7 @@ export default function App() {
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
           onSendQuery={sendQuery}
+          onSteerQuery={sendSteer}
           onInterrupt={interrupt}
           onEnqueue={(query) => dispatch({ type: "enqueue", query })}
           onSetPending={(query) => dispatch({ type: "set_pending", query })}
@@ -1828,35 +3053,79 @@ export default function App() {
       </section>
       {/* Shared right slot: diff and /btw take turns; header tabs switch. */}
       {(() => {
-        const btwShowing = !!state.btwSid || btwOpening;
+        const btwShowing = !!activeBtw || btwOpening;
         const view = rightView === "btw" && btwShowing ? "btw"
           : state.artifact ? "diff" : btwShowing ? "btw" : null;
         if (view === "btw")
-          return <BtwPanel sid={state.btwSid ?? undefined} rt={state.btwSid ? state.runtimes[state.btwSid] : undefined}
-            engine={state.btwEngine} opening={btwOpening && !state.btwSid}
+          return <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
+            engine={activeBtw?.engine} opening={btwOpening && !activeBtw}
             active="btw" hasArtifact={!!state.artifact} artifactKind={state.artifact?.kind} onTab={switchRight}
-            onSend={sendBtw} onOpenFile={previewFile} onClose={closeBtw}
+            catalog={state.catalog}
+            draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
+            sendMode={activeBtwSendMode}
+            allQueued={allQueued} replaceableQueued={btwReplaceableQueued}
+            onSend={sendBtw}
+            onSteer={steerBtw}
+            onInterrupt={() => {
+              if (activeBtwSid) interruptBtw(activeBtwSid);
+            }}
+            onSetSendMode={(mode) => {
+              if (activeBtwSid) setBtwSendMode(activeBtwSid, mode);
+            }}
+            onEnqueue={(query) => {
+              if (activeBtwSid) {
+                dispatch({ type: "enqueue", sid: activeBtwSid, query });
+              }
+            }}
+            onSetPending={(query) => {
+              if (activeBtwSid) {
+                dispatch({ type: "set_pending", sid: activeBtwSid, query });
+              }
+            }}
+            onDequeue={(index) => {
+              if (activeBtwSid) {
+                dispatch({
+                  type: "dequeue_at", sid: activeBtwSid, i: index,
+                });
+              }
+            }}
+            onSetModel={(model) => {
+              if (activeBtwSid) setBtwModel(activeBtwSid, model);
+            }}
+            onSetEffort={(effort) => {
+              if (activeBtwSid) setBtwEffort(activeBtwSid, effort);
+            }}
+            onOpenFile={previewBtwFile} onClose={closeBtw}
             onDismissNotice={(noticeId) => {
-              if (state.btwSid) dispatch({ type: "dismiss_notice", sid: state.btwSid, noticeId });
+              if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
             }} />;
         if (view === "diff" && state.artifact)
-          return <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!state.btwSid}
-            onTab={switchRight} onRefresh={previewFile}
-            onOpenFile={previewFile} onLoadPreviewAsset={loadPreviewAsset}
+          return <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
+            onTab={switchRight} onRefresh={previewArtifactFile}
+            onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
             onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
             onClose={() => dispatch({ type: "clear_artifact" })} />;
         return null;
       })()}
       {rt.pendingQuestion && (
         <QuestionSheet
+          key={rt.pendingQuestion.ask_id}
           header={rt.pendingQuestion.header}
           question={rt.pendingQuestion.question}
           options={rt.pendingQuestion.options}
           allowText={rt.pendingQuestion.allow_text}
           secret={rt.pendingQuestion.secret}
+          multiSelect={rt.pendingQuestion.multi_select}
           onAnswer={(answer) => {
-            wsRef.current?.sendAnswerQuestion(rt.pendingQuestion!.ask_id, answer);
-            dispatch({ type: "answer_question" });
+            const question = rt.pendingQuestion;
+            if (!focusedSid || !question) return;
+            if (!wsRef.current?.sendAnswerQuestion(
+              focusedSid, question.ask_id, answer)) return;
+            dispatch({
+              type: "answer_question",
+              sid: focusedSid,
+              ask_id: question.ask_id,
+            });
           }}
         />
       )}
@@ -1946,6 +3215,7 @@ export default function App() {
           setDevicePairing(nextPairing);
         }}
         onSelect={(nextMachineId) => {
+          cancelPendingNotificationTarget();
           if (nextMachineId !== machineId) setMachineId(nextMachineId);
           setDeviceSheetOpen(false);
         }}

@@ -3,15 +3,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cc_remote.config import RelayConfig
 from cc_remote.protocol import TurnResult
+from cc_remote.relay import server
 from cc_remote.relay.push import (
     PushDispatcher, PushSubscription, PushSubscriptionStore,
 )
 from cc_remote.relay.server import _turn_push_outcome, create_app
+
+
+@pytest.fixture(autouse=True)
+def _reset_login_limiter():
+    server._login_limiter.reset()
+    yield
+    server._login_limiter.reset()
 
 
 def _cfg(tmp_path, **overrides) -> RelayConfig:
@@ -30,12 +40,18 @@ def _cfg(tmp_path, **overrides) -> RelayConfig:
     return RelayConfig(**values)
 
 
-def _subscription(machine_id: str = "nono") -> dict[str, object]:
-    return {
+def _subscription(
+    machine_id: str = "nono",
+    notification_mode: str | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
         "machine_id": machine_id,
         "endpoint": "https://push.example/send/token",
         "keys": {"p256dh": "p" * 87, "auth": "a" * 22},
     }
+    if notification_mode is not None:
+        value["notification_mode"] = notification_mode
+    return value
 
 
 def test_push_subscription_requires_auth_and_machine_scope(tmp_path):
@@ -67,12 +83,68 @@ def test_push_subscription_requires_auth_and_machine_scope(tmp_path):
         stored = asyncio.run(app.state.push_store.for_machine("nono"))
         assert len(stored) == 1
         assert stored[0].subject == "alice"
+        assert stored[0].notification_mode == "generic"
         assert stored[0].session_jti
         assert stored[0].expires_at > 0
         assert client.post("/api/push/unsubscribe", json={
             "endpoint": "https://push.example/send/token",
         }).json() == {"ok": True}
         assert asyncio.run(app.state.push_store.for_machine("nono")) == []
+
+
+def test_push_subscription_modes_are_validated(tmp_path):
+    cfg = _cfg(tmp_path)
+    app = create_app(cfg)
+    with TestClient(app, base_url=cfg.public_origin) as client:
+        assert client.post("/api/login", json={
+            "password": cfg.login_password,
+        }).status_code == 200
+        for mode in ("generic", "session"):
+            payload = _subscription(notification_mode=mode)
+            payload["endpoint"] = f"https://push.example/send/{mode}"
+            assert client.post(
+                "/api/push/subscribe", json=payload,
+            ).status_code == 200
+        for index, invalid_mode in enumerate(("everything", {"session": True})):
+            invalid = _subscription()
+            invalid["notification_mode"] = invalid_mode
+            invalid["endpoint"] = f"https://push.example/send/invalid-{index}"
+            assert client.post(
+                "/api/push/subscribe", json=invalid,
+            ).status_code == 400
+
+
+def test_legacy_push_database_migrates_to_generic_mode(tmp_path):
+    path = tmp_path / "push.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            CREATE TABLE push_subscriptions (
+                subject TEXT NOT NULL,
+                machine_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                session_jti TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (subject, machine_id, endpoint)
+            )
+            """
+        )
+        db.execute(
+            "INSERT INTO push_subscriptions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "alice", "nono", "https://push.example/send/legacy",
+                "p" * 87, "a" * 22, "j" * 24, 4_102_444_800, 1, 1,
+            ),
+        )
+
+    store = PushSubscriptionStore(str(path))
+    subscriptions = asyncio.run(store.for_machine("nono"))
+    assert len(subscriptions) == 1
+    assert subscriptions[0].notification_mode == "generic"
 
 
 def test_dispatcher_payload_is_generic_and_prunes_expired_endpoint(tmp_path):
@@ -149,6 +221,101 @@ def test_dispatcher_distinguishes_terminal_outcomes_without_tag_collisions(tmp_p
         serialized = json.dumps(payloads, ensure_ascii=False).lower()
         assert "session" not in serialized
         assert "nono" not in serialized
+
+    asyncio.run(run())
+
+
+def test_dispatcher_separates_generic_and_session_payloads(tmp_path):
+    async def run():
+        store = PushSubscriptionStore(str(tmp_path / "push.sqlite3"))
+        for mode in ("generic", "session"):
+            await store.upsert(PushSubscription(
+                subject="alice",
+                machine_id="nono",
+                endpoint=f"https://push.example/send/{mode}",
+                p256dh="p" * 87,
+                auth="a" * 22,
+                session_jti=f"{mode}-" + "j" * 24,
+                expires_at=4_102_444_800,
+                notification_mode=mode,
+            ))
+        payloads: dict[str, dict[str, object]] = {}
+
+        async def sender(subscription, payload):
+            payloads[subscription.notification_mode] = json.loads(payload)
+            return 201
+
+        dispatcher = PushDispatcher(
+            store,
+            vapid_private_key="unused",
+            vapid_subject="mailto:admin@example.com",
+            sender=sender,
+        )
+        await dispatcher.notify_turn_end(
+            "nono",
+            outcome="success",
+            context={
+                "sid": "session-1",
+                "engine": "codex",
+                "space": "work",
+                "display_name": "  Release\ncheck\u0000  ",
+            },
+        )
+
+        generic = payloads["generic"]
+        serialized_generic = json.dumps(generic, ensure_ascii=False)
+        assert generic["body"] == "远程会话已经完成"
+        assert "route" not in generic
+        assert "session-1" not in serialized_generic
+        assert "nono" not in serialized_generic
+        assert "Release" not in serialized_generic
+
+        session = payloads["session"]
+        assert session["title"] == "Release check"
+        assert session["route"] == {
+            "machine_id": "nono",
+            "session_id": "session-1",
+            "engine": "codex",
+            "space": "work",
+        }
+        assert session["url"].startswith("/#notification=")
+
+    asyncio.run(run())
+
+
+def test_session_mode_without_context_falls_back_to_generic_payload(tmp_path):
+    async def run():
+        store = PushSubscriptionStore(str(tmp_path / "push.sqlite3"))
+        await store.upsert(PushSubscription(
+            subject="alice",
+            machine_id="nono",
+            endpoint="https://push.example/send/session",
+            p256dh="p" * 87,
+            auth="a" * 22,
+            session_jti="j" * 24,
+            expires_at=4_102_444_800,
+            notification_mode="session",
+        ))
+        payloads: list[dict[str, object]] = []
+
+        async def sender(_subscription, payload):
+            payloads.append(json.loads(payload))
+            return 201
+
+        dispatcher = PushDispatcher(
+            store,
+            vapid_private_key="unused",
+            vapid_subject="mailto:admin@example.com",
+            sender=sender,
+        )
+        await dispatcher.notify_turn_end(
+            "nono", outcome="failed", context=None)
+        assert payloads == [{
+            "title": "cc-remote",
+            "body": "远程会话执行失败",
+            "tag": payloads[0]["tag"],
+            "url": "/",
+        }]
 
     asyncio.run(run())
 

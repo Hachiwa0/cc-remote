@@ -25,7 +25,10 @@ from typing import Optional
 
 from cc_remote import __version__
 from cc_remote.log import logger
-from cc_remote.wrapper.codex_handle import _codex_env, _resolve_codex_bin
+from cc_remote.wrapper.codex_runtime import (
+    codex_env as _codex_env,
+    resolve_codex_bin as _resolve_codex_bin,
+)
 
 log = logger("cc_remote.wrapper.codex_models")
 

@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from cc_remote.protocol import Delta, Hello, Query, TurnEnd, TurnResult, serialize
+from cc_remote.protocol import (
+    Delta, Hello, Query, TurnEnd, TurnNotificationContext, TurnResult, serialize,
+)
 from cc_remote.relay.forward import ClientConn, SlowClientError
 from cc_remote.relay import pairing
 from cc_remote.relay.pairing import RelayHub
@@ -131,11 +133,23 @@ def test_only_live_turn_end_triggers_relay_event_hook():
 
         hub = RelayHub(SimpleNamespace(), on_live_turn_end=on_turn_end)
         result = TurnResult(subtype="success", duration_ms=1, is_error=False)
-        await hub._on_wrapper_msg(TurnEnd(result=result, to="replay-client"), "nono")
+        context = TurnNotificationContext(engine="codex", space="code")
+        await hub._on_wrapper_msg(TurnEnd(
+            result=result,
+            notification_context=context,
+            to="replay-client",
+        ), "nono")
         await asyncio.sleep(0)
         assert notified == [], "a client replay must not emit a second push"
 
         await hub._on_wrapper_msg(TurnEnd(result=result), "nono")
+        await asyncio.sleep(0)
+        assert notified == [], "a context-free buffered terminal must not emit push"
+
+        await hub._on_wrapper_msg(TurnEnd(
+            result=result,
+            notification_context=context,
+        ), "nono")
         await asyncio.wait_for(ready.wait(), timeout=1)
         assert notified[0][0] == "nono"
 

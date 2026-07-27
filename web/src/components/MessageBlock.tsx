@@ -8,6 +8,8 @@ import {
   classifyMessageImageTarget,
   type InlineImageAsset,
 } from "../inline-image-assets";
+import { isMermaidFenceClass } from "../mermaid";
+import { MermaidBlock } from "./MermaidBlock";
 
 const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
   "git-stage": "Git 变更已暂存",
@@ -91,6 +93,7 @@ function CopyableCodeBlock({ children }: { children?: ReactNode }) {
 }
 
 interface MessageMarkdownContextValue {
+  done?: boolean;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string) => boolean;
   onOpenFile?: (path: string, line?: number) => void;
@@ -214,11 +217,35 @@ function MarkdownLink({
     title="该链接无法在当前会话中打开">{children}</span>;
 }
 
+function fenceClassName(children: ReactNode): string | undefined {
+  const items = Array.isArray(children) ? children : [children];
+  const code = items.find((child) => isValidElement<{ className?: string }>(child));
+  return isValidElement<{ className?: string }>(code)
+    ? code.props.className
+    : undefined;
+}
+
+function MarkdownPre({ children }: ComponentPropsWithoutRef<"pre">) {
+  const { done } = useContext(MessageMarkdownContext);
+  if (done && isMermaidFenceClass(fenceClassName(children))) return <>{children}</>;
+  return <CopyableCodeBlock>{children}</CopyableCodeBlock>;
+}
+
+function MarkdownCode({
+  className, children,
+}: ComponentPropsWithoutRef<"code">) {
+  const { done } = useContext(MessageMarkdownContext);
+  if (done && isMermaidFenceClass(className)) {
+    return <MermaidBlock source={nodeText(children).replace(/\n$/, "")} />;
+  }
+  return <code className={className}>{children}</code>;
+}
+
 /** Module-stable renderer identities keep React from remounting decoded images
  * whenever a streaming block receives a new asset snapshot. */
 const MESSAGE_MARKDOWN_COMPONENTS: Components = Object.freeze({
-  pre: ({ children }: ComponentPropsWithoutRef<"pre">) =>
-    <CopyableCodeBlock>{children}</CopyableCodeBlock>,
+  pre: MarkdownPre,
+  code: MarkdownCode,
   img: MarkdownImage,
   a: MarkdownLink,
 });
@@ -259,8 +286,8 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
   }, []);
 
   const markdownContext = useMemo<MessageMarkdownContextValue>(() => ({
-    imageAssets, onLoadImage, onOpenFile, onPreviewImage,
-  }), [imageAssets, onLoadImage, onOpenFile, onPreviewImage]);
+    done, imageAssets, onLoadImage, onOpenFile, onPreviewImage,
+  }), [done, imageAssets, onLoadImage, onOpenFile, onPreviewImage]);
   const parts = useMemo(() => splitCodexDirectives(shown), [shown]);
 
   if (!shown) return null;

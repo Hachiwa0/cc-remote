@@ -1,4 +1,4 @@
-import type { ToolBlock } from "./reducer";
+import type { ToolBlock } from "./domain/conversation";
 import { mutatedFilePaths } from "./file-changes";
 
 function value(input: Record<string, unknown>, ...keys: string[]): string {

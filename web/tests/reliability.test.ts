@@ -18,6 +18,29 @@ import {
   selectDrainCandidates,
 } from "../src/runtime-drain.ts";
 import { mergeInitialHistory } from "../src/history-merge.ts";
+import {
+  HISTORY_INITIAL_PAGE,
+  HISTORY_MORE_PAGE,
+} from "../src/history-summary.ts";
+import {
+  displayHistoryProjection,
+  historyConfirmsRecovery,
+  historyConfirmsRuntimeRecovery,
+  historyNeedsConfirmationRequest,
+  isHistoryRecoveryPending,
+  isRuntimeHistoryRecoveryPending,
+} from "../src/history-recovery.ts";
+import {
+  acceptsCachedNewerPage,
+  appendNewerPage,
+} from "../src/history-browse.ts";
+import {
+  acknowledgeCompletion,
+  completionBadgeKind,
+  discardBtwCompletionReceipts,
+  markCompletionUnread,
+  rekeyCompletionReceipts,
+} from "../src/completion-badges.ts";
 import { imageDimensions } from "../src/img.ts";
 import {
   historyImageDisplaySource,
@@ -44,6 +67,8 @@ import {
   commandsFor,
   isKnownCodeOnlySlash,
   matchCommands,
+  matchModelId,
+  MODELS,
   modelsFor,
   permsFor,
 } from "../src/data.ts";
@@ -53,14 +78,32 @@ import {
   type MobileViewportEvent,
   type ViewportReading,
 } from "../src/use-mobile-viewport.ts";
-import type { ServerEvent, SessionControl } from "../src/protocol.ts";
-import type { Block } from "../src/reducer.ts";
+import type { History, ServerEvent, SessionControl } from "../src/protocol.ts";
+import type { Block, Turn } from "../src/reducer.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
 import {
   classifyTurnNotification,
   turnNotificationBody,
+  turnNotificationPresentation,
   turnNotificationTag,
 } from "../src/turn-notification.ts";
+import {
+  NOTIFICATION_MODE_KEY,
+  readNotificationMode,
+  writeNotificationMode,
+} from "../src/notification-mode.ts";
+import {
+  captureNotificationFragment,
+  encodeNotificationRoute,
+  parseNotificationFragment,
+} from "../src/notification-route.ts";
+import {
+  resolveNotificationNavigation,
+} from "../src/notification-navigation.ts";
+import {
+  PushBindingCoordinator,
+  type PushBindingTarget,
+} from "../src/push.ts";
 import {
   classifyBusySubmit,
   isComposerBusy,
@@ -74,6 +117,7 @@ import {
   constrainImageTransform,
   panImageTransform,
   pinchImageTransform,
+  zoomImageTransform,
 } from "../src/image-gesture.ts";
 import {
   bumpSessionActivity,
@@ -89,6 +133,7 @@ import {
   ComposerDraftStore,
   composerDraftKey,
 } from "../src/composer-drafts.ts";
+import { updateScopedSessionLifecycle } from "../src/session-list.ts";
 
 const composerDrafts = new ComposerDraftStore();
 const draftA = composerDraftKey("machine-a", "code", "codex", "session-a");
@@ -126,11 +171,59 @@ assert.equal(composerDrafts.get(realDraft).input,
   "typed while the first turn was running",
   "session id capture must move a temp session draft atomically");
 assert.equal(composerDrafts.get(tempDraft).input, "");
+const btwDraftA = composerDraftKey(
+  "machine-a", "code", "codex", "btw:btw-a");
+const btwDraftB = composerDraftKey(
+  "machine-a", "code", "codex", "btw:btw-b");
+composerDrafts.set(btwDraftA, {
+  input: "unfinished side question",
+  images: [],
+  files: [],
+});
+assert.equal(composerDrafts.get(btwDraftB).input, "",
+  "BTW drafts must not follow another fork");
+assert.equal(composerDrafts.get(btwDraftA).input,
+  "unfinished side question",
+  "returning to the same BTW restores only its draft");
+composerDrafts.delete(btwDraftA);
+assert.equal(composerDrafts.get(btwDraftA).input, "",
+  "explicit BTW close discards its private draft");
 
 assert.equal(sessionActivityTime("2026-07-17T10:00:00Z"),
   Date.parse("2026-07-17T10:00:00Z"), "ISO Claude activity timestamps must sort correctly");
 assert.ok(sessionActivityTime("1752746400000") > sessionActivityTime("1752746399"),
   "millisecond and second timestamps must share one ordering scale");
+
+let completionReceipts = markCompletionUnread(
+  {}, "parent-a", "parent-a", "main");
+completionReceipts = markCompletionUnread(
+  completionReceipts, "parent-a", "btw-a", "btw");
+completionReceipts = markCompletionUnread(
+  completionReceipts, "parent-b", "btw-b", "btw");
+assert.equal(completionBadgeKind(completionReceipts["parent-a"]), "both");
+assert.equal(completionBadgeKind(completionReceipts["parent-b"]), "btw");
+completionReceipts = acknowledgeCompletion(
+  completionReceipts, "parent-a", { main: true });
+assert.equal(completionBadgeKind(completionReceipts["parent-a"]), "btw",
+  "opening the main session must not acknowledge an unseen BTW result");
+completionReceipts = acknowledgeCompletion(
+  completionReceipts, "parent-a", { btwSid: "btw-a" });
+assert.equal(completionReceipts["parent-a"], undefined,
+  "opening the matching BTW clears the final completion receipt");
+completionReceipts = rekeyCompletionReceipts(
+  completionReceipts, "parent-b", "parent-real");
+assert.equal(completionReceipts["parent-b"], undefined);
+assert.deepEqual(completionReceipts["parent-real"], {
+  main: false, btwSids: ["btw-b"],
+});
+completionReceipts = markCompletionUnread(
+  completionReceipts, "parent-main", "parent-main", "main");
+completionReceipts = discardBtwCompletionReceipts(completionReceipts);
+assert.equal(completionReceipts["parent-real"], undefined,
+  "a wrapper restart removes receipts for destroyed ephemeral BTW forks");
+assert.deepEqual(completionReceipts["parent-main"], {
+  main: true, btwSids: [],
+}, "main-session completion receipts survive a wrapper restart");
 
 const processTap = new PointerTapGuard(8);
 processTap.pointerDown(1, 20, 20);
@@ -173,12 +266,37 @@ assert.deepEqual(constrainImageTransform(
   { width: 300, height: 200 }, { width: 300, height: 300 },
 ), { scale: 1, x: 0, y: 0 },
 "returning to fit scale resets stale translation");
+assert.deepEqual(zoomImageTransform(
+  { scale: 1, x: 0, y: 0 }, 2, { x: 225, y: 150 },
+  { width: 300, height: 300 }, { width: 300, height: 300 },
+), { scale: 2, x: -75, y: 0 },
+"wheel zoom keeps the content beneath the trackpad focal point");
 assert.equal(mergeSessionActivityState("running", "idle"), "running",
   "catalog-native activity must not be overwritten by an idle resident runtime");
 assert.equal(mergeSessionActivityState("idle", "running"), "running",
   "a locally running resident runtime remains authoritative");
 assert.equal(mergeSessionActivityState("running", "interrupting"), "interrupting",
   "an explicit local transition overrides catalog activity");
+const scopedLifecycleCatalog = {
+  "code:claude": [{
+    session_id: "same-session", engine: "claude" as const,
+    space: "code" as const, state: "running" as const,
+  }],
+  "work:claude": [{
+    session_id: "same-session", engine: "claude" as const,
+    space: "work" as const, state: "running" as const,
+  }],
+  "code:codex": [{
+    session_id: "same-session", engine: "codex" as const,
+    space: "code" as const, state: "running" as const,
+  }],
+};
+const scopedLifecycleIdle = updateScopedSessionLifecycle(
+  scopedLifecycleCatalog, "claude", "code", "same-session", "idle");
+assert.equal(scopedLifecycleIdle["code:claude"][0].state, "idle");
+assert.equal(scopedLifecycleIdle["work:claude"][0].state, "running");
+assert.equal(scopedLifecycleIdle["code:codex"][0].state, "running",
+  "a terminal lifecycle frame updates only its frozen engine/space catalog");
 
 assert.deepEqual(
   permsFor("claude").map(({ id, name, short }) => ({ id, name, short })),
@@ -261,7 +379,7 @@ assert.deepEqual(visibleAgentTimeline.map((block) => block.kind), ["process"],
   "a dedicated live agent row must replace the duplicate generic ToolUse row");
 
 const legacyWorkContext = workContextMetrics({
-  v: 19, ts: 0, type: "context_report",
+  v: 20, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, categories: [],
 });
@@ -271,7 +389,7 @@ assert.equal(legacyWorkContext.sessionTokens, 25_572,
 assert.equal(legacyWorkContext.sessionPercentage, 2.5572);
 
 const freshWorkContext = workContextMetrics({
-  v: 19, ts: 0, type: "context_report",
+  v: 20, ts: 0, type: "context_report",
   total_tokens: 25_572, max_tokens: 1_000_000,
   percentage: 2.5572, session_tokens: 72, fixed_tokens: 25_500,
   session_percentage: 0.0072, categories: [],
@@ -283,7 +401,7 @@ assert.equal(freshWorkContext.sessionPercentage, 0.0072);
 assert.equal(freshWorkContext.totalPercentage, 2.5572);
 
 const derivedWorkContext = workContextMetrics({
-  v: 19, ts: 0, type: "context_report",
+  v: 20, ts: 0, type: "context_report",
   total_tokens: 11_194, max_tokens: 353_400,
   percentage: 3.1675, fixed_tokens: 11_000, categories: [],
 });
@@ -311,15 +429,28 @@ assert.equal(isSettlingStopDisabled("running", false), false);
 assert.equal(isSettlingStopDisabled("interrupting", false), true);
 assert.equal(isSettlingStopDisabled("draining", false), true);
 assert.equal(isSettlingStopDisabled("interrupting", true), false);
-assert.equal(classifyBusySubmit("running", "interrupt", false), "noop",
-  "empty Enter must not implicitly interrupt a running turn");
-assert.equal(classifyBusySubmit("interrupting", "interrupt", false), "noop");
-assert.equal(classifyBusySubmit("draining", "interrupt", false), "noop");
+assert.equal(classifyBusySubmit("running", "steer", "codex", true), "steer",
+  "the default Codex busy submit appends input to its active native turn");
+assert.equal(
+  classifyBusySubmit("running", "steer", "claude", true),
+  "interrupt-and-replace",
+  "Claude retains interrupt-and-replace because it cannot steer an active turn",
+);
 assert.equal(classifyBusySubmit(
-  "running", "interrupt", true), "interrupt-and-replace");
-assert.equal(classifyBusySubmit("interrupting", "interrupt", true), "replace");
-assert.equal(classifyBusySubmit("draining", "interrupt", true), "replace");
-assert.equal(classifyBusySubmit("interrupting", "queue", true), "enqueue");
+  "interrupting", "steer", "codex", true), "replace",
+  "input submitted while an interrupt settles replaces the pending follow-up");
+assert.equal(classifyBusySubmit(
+  "draining", "steer", "claude", true), "replace",
+  "the settling replacement contract is engine-independent");
+assert.equal(classifyBusySubmit(
+  "running", "queue", "codex", true), "enqueue",
+  "explicit queue mode remains an enqueue even when Codex could steer");
+for (const engine of ["claude", "codex"] as const) {
+  for (const state of ["running", "interrupting", "draining"] as const) {
+    assert.equal(classifyBusySubmit(state, "steer", engine, false), "noop",
+      "empty Enter is a no-op; Stop remains a separate explicit control");
+  }
+}
 
 const loginFormSource = readFileSync(resolve(
   process.cwd(), "src/components/LoginForm.tsx"), "utf8");
@@ -350,15 +481,21 @@ assert.ok(reconnectBannerSource.includes('busy && <span className="sp"'),
 
 const historyAppSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 const cacheSource = readFileSync(resolve(process.cwd(), "src/cache.ts"), "utf8");
-assert.match(historyAppSource, /HISTORY_INITIAL_PAGE\s*=\s*4/,
+assert.equal(HISTORY_INITIAL_PAGE, 4,
   "the newest history page must stay small enough for an immediate first paint");
-assert.match(historyAppSource, /HISTORY_MORE_PAGE\s*=\s*12/,
+assert.equal(HISTORY_MORE_PAGE, 12,
   "older history must be delivered in bounded follow-up pages");
 const historyBeforeResume = historyAppSource.match(
   /requestHistory\([\s\S]{0,160}?HISTORY_INITIAL_PAGE\);\s*(?:ws\.|wsRef\.current(?:\?\.|\.))sendSwitchSession/g,
 ) ?? [];
 assert.equal(historyBeforeResume.length, 3,
   "every existing-session activation must request first paint before engine resume");
+assert.match(historyAppSource,
+  /msg\.type === "session_list" && ownership[\s\S]*historySessionListsRef/,
+  "only an ownership-accepted SessionList may seed a Claude history cwd hint");
+assert.match(historyAppSource,
+  /resolveHistoryCwdHint\(historySessionListsRef\.current, sid\)/,
+  "every initial, reconnect, invalidation and pagination read shares the accepted cwd hint");
 assert.match(historyAppSource, /history_invalidated[\s\S]*invalidateSessionCache/,
   "history invalidation must evict the matching IndexedDB row");
 assert.match(historyAppSource, /historyCacheEpochRef[\s\S]*loadSession/,
@@ -368,6 +505,23 @@ assert.match(historyAppSource, /history_invalidated[\s\S]*requestHistory/,
 assert.match(historyAppSource,
   /msg\.type === "history" && msg\.authoritative !== false[\s\S]*allowSessionCache/,
   "a failed non-authoritative History must not reopen the IndexedDB cache barrier");
+assert.match(historyAppSource,
+  /const displayRecoveryMatches = !isHistoryRecoveryPending\([\s\S]{0,240}historyConfirmsRecovery/,
+  "cache recovery must distinguish a display candidate from a confirmation");
+assert.match(historyAppSource,
+  /const runtimeRecoveryMatches =[\s\S]{0,240}!isRuntimeHistoryRecoveryPending\([\s\S]{0,240}historyConfirmsRuntimeRecovery/,
+  "cache recovery must preserve the per-runtime barrier across focus changes");
+assert.match(historyAppSource,
+  /displayRecoveryMatches[\s\S]{0,240}runtimeRecoveryMatches[\s\S]{0,240}buildIsCurrent[\s\S]{0,500}allowSessionCache/,
+  "the first matching recovery build must remain behind both cache barriers");
+assert.match(historyAppSource,
+  /historyRequestsRef\.current\.complete\(msg\)[\s\S]{0,4000}historyNeedsConfirmationRequest\([\s\S]{0,500}requestHistory\(\s*msg\.session_id,\s*undefined,\s*HISTORY_INITIAL_PAGE,\s*msg\.generation/,
+  "a candidate must release coordinator dedupe before requesting its generation-bound confirmation");
+assert.match(historyAppSource,
+  /msg\.error == null && !msg\.before[\s\S]{0,180}HISTORY_PROVISIONAL_WATCHDOG_MS[\s\S]{0,600}recoverableReads\.retry\([\s\S]{0,700}retryDelay\)/,
+  "a moving newest-page preview must use one slow fallback instead of a parallel 250ms rescan");
+assert.match(historyAppSource, /buildIsCurrent[\s\S]{0,900}allowSessionCache/,
+  "a lower same-generation build must not reopen cache before reducer acceptance");
 assert.match(historyAppSource, /artifact_invalidated[\s\S]*sendGetWorkArtifacts/,
   "file rollback must refresh the Work artifact inventory");
 assert.match(historyAppSource,
@@ -426,6 +580,56 @@ assert.match(historyAppSource, /replay_start[\s\S]*requestHistory/,
   "a replay gap must request authoritative history instead of ending on an empty view");
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
   "a replay gap must discard a possibly stale Work artifact inventory");
+assert.match(historyAppSource,
+  /displayHistoryProjection\(\s*state\.historyRecovery,\s*focusedSid,\s*rt,\s*state\.historyBrowse\s*\)/,
+  "ChatView must select recovery, browse, then live runtime without rebuilding rt.turns");
+assert.match(historyAppSource,
+  /new HistoryPageCache\(\)/,
+  "deep-history pages must use their independent best-effort IndexedDB");
+assert.match(historyAppSource,
+  /new HistoryDetailRequestCoordinator\([\s\S]{0,200}history_detail_cancelled/,
+  "turn detail responses need a frozen target with bounded loading recovery");
+assert.match(historyAppSource,
+  /Any view navigation revokes[\s\S]{0,220}clearHistoryDetailRequests\(\);[\s\S]{0,180}focusedSid/,
+  "surface/session navigation must release frozen detail loading rows");
+assert.match(historyAppSource,
+  /return \(\) => \{[\s\S]{0,260}historyRequests\.clear\(\);\s*clearHistoryDetailRequests\(\);/,
+  "WebSocket cleanup must release frozen detail loading rows");
+assert.match(historyAppSource,
+  /const browseWaiters\s*=\s*historyRequestsRef\.current\.complete\(msg\)/,
+  "History.before must consume request-time browse authority instead of current UI state");
+assert.match(historyAppSource,
+  /await historyPageCacheRef\.current\.getPage[\s\S]{0,400}acceptsCachedNewerPage\(current, frozen\)/,
+  "a deferred cached-newer read must revalidate the current browse authority");
+assert.match(historyAppSource,
+  /if \(msg\.before\)[\s\S]{0,1600}return;/,
+  "every History.before path must terminate before the generic live reducer");
+assert.match(historyAppSource,
+  /browseMode=\{historyView\.browsing\}/);
+assert.match(historyAppSource,
+  /historyViewId=\{historyView\.viewId\}/);
+assert.match(historyAppSource,
+  /onLoadNewer=\{loadNewerHistoryPage\}/);
+assert.match(historyAppSource,
+  /onReturnLatest=\{returnToLatestHistory\}/);
+assert.match(historyAppSource,
+  /historyInvalidationsRef\.current\.has\(sid\)[\s\S]{0,160}isHistoryRecoveryPending/,
+  "cache writes must remain blocked while a display recovery is pending");
+assert.match(historyAppSource,
+  /historyViewRevision=\{historyView\.viewRevision\}/,
+  "an atomic recovery replacement must retain the prior virtual-scroll scope");
+assert.match(historyAppSource,
+  /replaying=\{rt\.replaying \|\| historyView\.recovering\}/,
+  "the retained projection must remain visibly marked as synchronizing");
+assert.match(historyAppSource,
+  /onEdit=\{historyView\.recovering\s*\? undefined/,
+  "display-only recovery turns must not expose edit/resend callbacks");
+assert.match(historyAppSource,
+  /onOpenFile=\{historyView\.recovering \? undefined/,
+  "display-only recovery turns must not issue file reads");
+assert.match(historyAppSource,
+  /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
+  "display-only recovery turns must not issue history-image reads");
 assert.match(cacheSource, /const CACHE_VER = 9/,
   "open-turn merge repair must invalidate duplicate IndexedDB projections");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
@@ -730,6 +934,8 @@ const mergedHistory = mergeInitialHistory(
 assert.deepEqual(mergedHistory.map((turn) => turn.id), ["client-id", "client-lag"]);
 assert.equal(mergedHistory[0].done, true);
 assert.equal(mergedHistory[0].blocks.length, 1);
+assert.equal(mergedHistory[0].historyTurnId, "engine-id",
+  "an attachment-free optimistic alias retains its native history lookup id");
 assert.equal(mergedHistory[1].prompt, "not flushed");
 
 const repeatedOld = {
@@ -1117,8 +1323,63 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 19, ts: 10, ...body,
+    v: 22, ts: 10, ...body,
   } as ServerEvent);
+  assert.equal(createRuntime().sendMode, "steer",
+    "Codex running input uses steer mode by default");
+  const sendModeA = "send-mode-a";
+  const sendModeB = "send-mode-b";
+  const isolatedSendModes = reduce({
+    ...initialState,
+    focusedSid: sendModeA,
+    runtimes: {
+      [sendModeA]: createRuntime(),
+      [sendModeB]: createRuntime(),
+    },
+  }, {
+    type: "set_send_mode",
+    sid: sendModeA,
+    mode: "queue",
+  });
+  assert.equal(isolatedSendModes.runtimes[sendModeA].sendMode, "queue");
+  assert.equal(isolatedSendModes.runtimes[sendModeB].sendMode, "steer",
+    "busy-send selection must not leak between sessions");
+  const questionA = "question-session-a";
+  const questionB = "question-session-b";
+  let questionState = {
+    ...initialState,
+    focusedSid: questionA,
+    runtimes: {
+      [questionA]: createRuntime(),
+      [questionB]: createRuntime(),
+    },
+  };
+  questionState = reduce(questionState, { type: "event", event: event({
+    type: "ask_user", sid: questionA, ask_id: "ask-a",
+    question: "A?", options: [{ label: "Yes" }, { label: "No" }],
+  }) });
+  questionState = { ...questionState, focusedSid: questionB };
+  questionState = reduce(questionState, {
+    type: "answer_question", sid: questionA, ask_id: "ask-a",
+  });
+  assert.equal(questionState.runtimes[questionA].pendingQuestion, null,
+    "answering after navigation must clear the originating session");
+  assert.equal(questionState.runtimes[questionB].pendingQuestion, null);
+  questionState = reduce(questionState, { type: "event", event: event({
+    type: "ask_user", sid: questionA, ask_id: "ask-new",
+    question: "New?", options: [{ label: "Yes" }, { label: "No" }],
+  }) });
+  questionState = reduce(questionState, { type: "event", event: event({
+    type: "ask_user_closed", sid: questionA, ask_id: "ask-old",
+    reason: "superseded",
+  }) });
+  assert.equal(questionState.runtimes[questionA].pendingQuestion?.ask_id, "ask-new",
+    "a delayed close for an older prompt must not close the current prompt");
+  questionState = reduce(questionState, { type: "event", event: event({
+    type: "ask_user_closed", sid: questionA, ask_id: "ask-new",
+    reason: "answered",
+  }) });
+  assert.equal(questionState.runtimes[questionA].pendingQuestion, null);
   const problemSid = "safe-problem-presentation";
   let problemState = reduce({
     ...initialState, focusedSid: problemSid,
@@ -1141,6 +1402,15 @@ try {
     message: "Traceback: secret path /private/token",
   }) });
   assert.equal(commandProblem.banner, "操作未完成，请稍后重试。");
+  const incompleteClaudeSession = reduce(
+    commandProblem,
+    { type: "event", event: event({
+      type: "error", sid: problemSid, code: "not_running",
+      message: "Claude 会话历史不完整，无法恢复；可从会话菜单删除该条目。",
+    }) },
+  );
+  assert.equal(incompleteClaudeSession.banner,
+    "Claude 会话历史不完整，无法恢复；可从会话菜单删除该条目。");
   // Work/Code and engine switches restore the target surface's last accepted
   // list immediately. The authoritative refresh may take ~1s for Codex because
   // app-server is started on demand, but it must not blank the sidebar meanwhile.
@@ -1477,6 +1747,253 @@ try {
   );
   assert.equal(exactEndState.runtimes[exactEndSid].acceptancePending, null);
 
+  const steeredTurnSid = "codex-turn-steered";
+  const steeredNativeTurnId = "native-task-steered";
+  let steeredTurnState = {
+    ...initialState,
+    focusedSid: steeredTurnSid,
+    runtimes: {
+      [steeredTurnSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        acceptancePending: "steered-follow-up",
+        turns: [{
+          id: "steered-original",
+          forkPointId: steeredNativeTurnId,
+          prompt: "start the task",
+          blocks: [{
+            kind: "text" as const,
+            message_id: "steered-original-commentary",
+            channel: "commentary" as const,
+            text: "working",
+            done: false,
+          }, {
+            kind: "process" as const,
+            item_id: "steered-original-process",
+            processKind: "command" as const,
+            phase: "start" as const,
+            status: "running" as const,
+            turn_id: steeredNativeTurnId,
+            title: "original native work",
+            done: false,
+          }],
+          done: false,
+          ts: 1_000,
+        }],
+      },
+    },
+  };
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      sid: steeredTurnSid,
+      msg_id: "steered-follow-up",
+      turn_id: steeredNativeTurnId,
+      prompt: "change direction",
+      images: [{ media_type: "image/png", data: "steered-image" }],
+      files: [{ filename: "steered.txt" }],
+      ts: 11,
+    }),
+  });
+  const firstSteeredTurns = steeredTurnState.runtimes[steeredTurnSid].turns;
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].acceptancePending,
+    null,
+    "TurnSteered is the narrative acceptance boundary for the steer command",
+  );
+  assert.deepEqual(firstSteeredTurns.map((turn: Turn) => ({
+    id: turn.id,
+    prompt: turn.prompt,
+    done: turn.done,
+    forkPointId: turn.forkPointId,
+    liveTaskId: turn.liveTaskId,
+  })), [{
+    id: "steered-original",
+    prompt: "start the task",
+    done: true,
+    forkPointId: undefined,
+    liveTaskId: undefined,
+  }, {
+    id: "steered-follow-up",
+    prompt: "change direction",
+    done: false,
+    forkPointId: undefined,
+    liveTaskId: steeredNativeTurnId,
+  }], "TurnSteered atomically closes the prior segment and opens the steered one");
+  assert.equal(firstSteeredTurns[0].durationMs, 0);
+  assert.equal(firstSteeredTurns[0].doneTs, 11_000);
+  assert.ok(firstSteeredTurns[0].blocks.every((block: Block) => block.done),
+    "closing the old segment also settles every open block it owned");
+  assert.equal(firstSteeredTurns[1].images?.[0]?.data, "steered-image");
+  assert.deepEqual(firstSteeredTurns[1].files, [{
+    filename: "steered.txt", data: "",
+  }]);
+
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "process",
+      sid: steeredTurnSid,
+      item_id: "steered-native-process",
+      kind: "command",
+      phase: "start",
+      status: "running",
+      turn_id: steeredNativeTurnId,
+      title: "native work after steer",
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "assistant_msg_start",
+      sid: steeredTurnSid,
+      message_id: "steered-final",
+      channel: "final",
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "delta",
+      sid: steeredTurnSid,
+      message_id: "steered-final",
+      channel: "final",
+      text: "finished after steering",
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "assistant_msg_end",
+      sid: steeredTurnSid,
+      message_id: "steered-final",
+      channel: "final",
+    }),
+  });
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks.some(
+      (block: Block) => block.kind === "process"
+        && block.item_id === "steered-native-process"),
+    false,
+    "native task events after a steer must not route back to the old segment",
+  );
+  const latestSteered = steeredTurnState.runtimes[steeredTurnSid].turns[1];
+  assert.ok(latestSteered.blocks.some(
+    (block: Block) => block.kind === "process"
+      && block.item_id === "steered-native-process"));
+  assert.ok(latestSteered.blocks.some(
+    (block: Block) => block.kind === "text"
+      && block.channel === "final"
+      && block.text === "finished after steering"),
+  "the final answer after a steer belongs to the latest visible segment");
+
+  const beforeDuplicateSteer = JSON.stringify(
+    steeredTurnState.runtimes[steeredTurnSid].turns);
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      sid: steeredTurnSid,
+      msg_id: "steered-follow-up",
+      turn_id: steeredNativeTurnId,
+      prompt: "change direction",
+      images: [{ media_type: "image/png", data: "steered-image" }],
+      files: [{ filename: "steered.txt" }],
+      ts: 11,
+    }),
+  });
+  assert.equal(
+    JSON.stringify(steeredTurnState.runtimes[steeredTurnSid].turns),
+    beforeDuplicateSteer,
+    "a reliable duplicate TurnSteered cannot close or duplicate a segment",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: steeredTurnSid,
+      turn_id: steeredNativeTurnId,
+      result: { subtype: "success", duration_ms: 42, is_error: false },
+      ts: 12,
+    }),
+  });
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].forkPointId,
+    undefined,
+  );
+  assert.deepEqual(
+    {
+      done: steeredTurnState.runtimes[steeredTurnSid].turns[1].done,
+      forkPointId:
+        steeredTurnState.runtimes[steeredTurnSid].turns[1].forkPointId,
+      liveTaskId:
+        steeredTurnState.runtimes[steeredTurnSid].turns[1].liveTaskId,
+    },
+    { done: true, forkPointId: steeredNativeTurnId, liveTaskId: undefined },
+    "the native TurnEnd closes and binds only the latest steered segment",
+  );
+
+  const rejectedSteerSid = "codex-steer-rejected";
+  const rejectedSteerBefore: Turn = {
+    id: "still-running-after-rejection",
+    prompt: "keep working",
+    blocks: [{
+      kind: "text",
+      message_id: "still-running-message",
+      channel: "commentary",
+      text: "before rejection",
+      done: false,
+    }],
+    done: false,
+  };
+  let rejectedSteerState = {
+    ...initialState,
+    focusedSid: rejectedSteerSid,
+    runtimes: {
+      [rejectedSteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [rejectedSteerBefore],
+      },
+    },
+  };
+  rejectedSteerState = reduce(rejectedSteerState, {
+    type: "event", event: event({
+      type: "error",
+      sid: rejectedSteerSid,
+      msg_id: "rejected-steer-message",
+      code: "not_steerable",
+      message: "active turn cannot be steered",
+    }),
+  });
+  assert.deepEqual(
+    rejectedSteerState.runtimes[rejectedSteerSid].turns,
+    [rejectedSteerBefore],
+    "a rejected steer is a command problem and cannot close the active turn",
+  );
+  assert.equal(
+    rejectedSteerState.runtimes[rejectedSteerSid].state,
+    "running",
+  );
+  assert.ok(rejectedSteerState.banner);
+  rejectedSteerState = reduce(rejectedSteerState, {
+    type: "event", event: event({
+      type: "delta",
+      sid: rejectedSteerSid,
+      message_id: "still-running-message",
+      channel: "commentary",
+      text: " and after rejection",
+    }),
+  });
+  assert.equal(
+    rejectedSteerState.runtimes[rejectedSteerSid].turns.length,
+    1,
+  );
+  assert.equal(
+    rejectedSteerState.runtimes[rejectedSteerSid].turns[0].blocks[0].kind
+      === "text"
+      ? rejectedSteerState.runtimes[rejectedSteerSid].turns[0].blocks[0].text
+      : "",
+    "before rejection and after rejection",
+    "subsequent native deltas continue on the still-running segment",
+  );
+
   const duplicateSid = "duplicate-first-message";
   let duplicateState = reduce({
     ...initialState, focusedSid: duplicateSid,
@@ -1578,8 +2095,11 @@ try {
   assert.equal(detailState.runtimes[summarySid].turns.length, 1);
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoaded, true);
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, false);
-  assert.ok(detailState.runtimes[summarySid].turns[0].blocks.some(
+  assert.ok(detailState.runtimes[summarySid].turns[0].detailProjection?.blocks.some(
     (block: Block) => block.kind === "tool"));
+  assert.deepEqual(detailState.runtimes[summarySid].turns[0].blocks.map(
+    (block: Block) => block.kind), ["text"],
+  "heavy process blocks stay outside the bounded canonical summary");
   assert.equal(detailState.runtimes[summarySid].turns[0].blocks.filter(
     (block: Block) => block.kind === "text" && block.channel === "final").length, 1,
   "detail replaces the summary projection instead of duplicating its final text");
@@ -1603,9 +2123,71 @@ try {
     }],
   }) });
   assert.equal(refreshedSummary.runtimes[summarySid].turns[0].detailLoaded, true);
-  assert.ok(refreshedSummary.runtimes[summarySid].turns[0].blocks.some(
-    (block: Block) => block.kind === "tool"),
+  assert.ok(refreshedSummary.runtimes[summarySid].turns[0]
+    .detailProjection?.blocks.some((block: Block) => block.kind === "tool"),
   "a same-revision head refresh must not collapse detail the user opened");
+
+  const managedClaudeSid = "managed-claude-session";
+  const managedClaudeIdle = reduce({
+    ...initialState,
+    sessions: [{
+      session_id: managedClaudeSid,
+      engine: "claude",
+      space: "code",
+      summary: "managed Claude",
+      state: "running",
+    }],
+    runtimes: {
+      [managedClaudeSid]: {
+        ...createRuntime(),
+        state: "running",
+      },
+    },
+  }, { type: "event", event: event({
+    type: "state",
+    sid: managedClaudeSid,
+    seq: 44,
+    state: "idle",
+  }), ownership: {
+    scopeKey: "machine-a:code:claude",
+    machineId: "machine-a",
+    engine: "claude",
+    space: "code",
+    surfaceEpoch: 4,
+    connectionGeneration: 7,
+  } });
+  assert.equal(managedClaudeIdle.runtimes[managedClaudeSid].state, "idle");
+  assert.equal(managedClaudeIdle.sessions[0].state, "idle");
+  assert.equal(mergeSessionActivityState(
+    managedClaudeIdle.sessions[0].state,
+    managedClaudeIdle.runtimes[managedClaudeSid].state,
+  ), "idle",
+  "an authoritative managed-turn terminal clears a stale catalog running badge");
+  const wrongSurfaceTerminal = reduce({
+    ...managedClaudeIdle,
+    sessions: [{
+      ...managedClaudeIdle.sessions[0],
+      state: "running",
+    }],
+  }, { type: "event", event: event({
+    type: "state", sid: managedClaudeSid, seq: 45, state: "idle",
+  }), ownership: {
+    scopeKey: "machine-a:code:codex",
+    machineId: "machine-a",
+    engine: "codex",
+    space: "code",
+    surfaceEpoch: 5,
+    connectionGeneration: 7,
+  } });
+  assert.equal(wrongSurfaceTerminal.sessions[0].state, "running",
+    "a delayed lifecycle frame from another owned surface cannot clear this row");
+  const orphanBtwIdle = reduce(managedClaudeIdle, {
+    type: "event", event: event({
+      type: "state", sid: "btw-orphan", seq: 46, state: "idle",
+    }),
+  });
+  assert.deepEqual(orphanBtwIdle.sessions, managedClaudeIdle.sessions,
+    "a fork lifecycle frame cannot create a top-level sidebar row");
 
   const backgroundRunning = reduce({
     ...initialState,
@@ -1667,6 +2249,8 @@ try {
   const claudeModelsMarkup = renderToStaticMarkup(createElement(ModelCommandSheet, {
     open: true, kind: "models", engine: "claude", onClose: () => undefined,
   }));
+  assert.match(claudeModelsMarkup, /Opus 5/);
+  assert.match(claudeModelsMarkup, /1M 上下文/);
   assert.doesNotMatch(claudeModelsMarkup, /自定义 \/ Provider 模型 ID|custom-claude-model/,
     "Claude's ordinary model sheet must not expose raw provider ids");
   const codexModelsMarkup = renderToStaticMarkup(createElement(ModelCommandSheet, {
@@ -2392,6 +2976,10 @@ try {
   }) });
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
     (turn: { id: string }) => turn.id), ["new"]);
+  const orderedRuntimeBeforePage = structuredClone(
+    orderedHistory.runtimes[orderedHistorySid]);
+  // Uncorrelated protocol pages have no request-time scope/view authority and
+  // therefore cannot touch either runtime or browse state.
   orderedHistory = reduce(orderedHistory, { type: "event", event: event({
     type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
     revision: "ordered-rev-new", generation: "wrapper-one",
@@ -2403,7 +2991,44 @@ try {
         result: { subtype: "success", duration_ms: 1, is_error: false } }),
     ],
   }) });
+  assert.deepEqual(
+    orderedHistory.runtimes[orderedHistorySid],
+    orderedRuntimeBeforePage,
+    "an uncorrelated before page must leave every live runtime field unchanged");
+  assert.equal(orderedHistory.historyBrowse, null);
+  orderedHistory = reduce(orderedHistory, {
+    type: "begin_history_browse",
+    sid: orderedHistorySid,
+    scopeKey: "machine-a:code:codex",
+    revision: "ordered-rev-new",
+    generation: "wrapper-one",
+    viewId: "ordered-view",
+    basePageKey: "ordered-head",
+  });
+  assert.ok(orderedHistory.historyBrowse);
+  orderedHistory = reduce(orderedHistory, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: "machine-a:code:codex",
+    revision: "ordered-rev-new",
+    generation: "wrapper-one",
+    viewId: "ordered-view",
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    before: "new",
+    page: {
+      pageKey: "ordered-older",
+      turns: [{
+        id: "older-page", prompt: "older", blocks: [], done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "older-page",
+      newerPageKey: "ordered-head",
+    },
+  });
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
+    (turn: { id: string }) => turn.id), ["new"],
+  "correlated pagination is display-only and never prepends into runtime");
+  assert.deepEqual(orderedHistory.historyBrowse?.turns.map(
     (turn: { id: string }) => turn.id), ["older-page", "new"]);
   orderedHistory = reduce(orderedHistory, { type: "event", event: event({
     type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
@@ -2417,7 +3042,373 @@ try {
     ],
   }) });
   assert.deepEqual(orderedHistory.runtimes[orderedHistorySid].turns.map(
-    (turn: { id: string }) => turn.id), ["stale-page", "older-page", "new"]);
+    (turn: { id: string }) => turn.id), ["new"]);
+  assert.deepEqual(orderedHistory.historyBrowse?.turns.map(
+    (turn: { id: string }) => turn.id), ["older-page", "new"],
+  "a late uncorrelated page cannot extend the active browse epoch");
+
+  const browseBeforeLive = orderedHistory.historyBrowse!;
+  const runtimeBeforeLive = orderedHistory.runtimes[orderedHistorySid].turns;
+  const browseAfterLive = reduce(orderedHistory, {
+    type: "event",
+    event: event({
+      type: "state", sid: orderedHistorySid, seq: 91, state: "running",
+    }),
+  });
+  assert.equal(browseAfterLive.historyBrowse?.turns, browseBeforeLive.turns,
+    "live lifecycle state is owned by runtime and cannot rewrite browse rows");
+  assert.deepEqual(browseAfterLive.runtimes[orderedHistorySid].turns,
+    runtimeBeforeLive);
+  const browseAfterDelta = reduce(browseAfterLive, {
+    type: "event",
+    event: event({
+      type: "delta", sid: orderedHistorySid, seq: 92,
+      message_id: "background-live", text: "new live output",
+    }),
+  });
+  assert.equal(browseAfterDelta.historyBrowse?.latestDirty, true);
+  assert.equal(browseAfterDelta.historyBrowse?.turns,
+    browseAfterLive.historyBrowse?.turns,
+    "live narrative marks the browse stale without appending into its window");
+
+  const cacheRaceBrowse = {
+    ...browseBeforeLive,
+    hasNewer: true,
+    newerPageKey: "ordered-head",
+    latestDirty: false,
+  };
+  let cacheRaceState = {
+    ...orderedHistory,
+    historyBrowse: cacheRaceBrowse,
+  };
+  let resolveCachedLatest!: (page: {
+    pageKey: string;
+    turns: Turn[];
+    isLatest: boolean;
+  }) => void;
+  const deferredCachedLatest = new Promise<{
+    pageKey: string;
+    turns: Turn[];
+    isLatest: boolean;
+  }>((resolvePage) => {
+    resolveCachedLatest = resolvePage;
+  });
+  const frozenCachedLatest = {
+    sid: cacheRaceBrowse.sid,
+    scopeKey: cacheRaceBrowse.scopeKey,
+    revision: cacheRaceBrowse.revision,
+    generation: cacheRaceBrowse.generation,
+    viewId: cacheRaceBrowse.viewId,
+    windowEpoch: cacheRaceBrowse.windowEpoch,
+    pageKey: cacheRaceBrowse.newerPageKey!,
+  };
+  const deferredInstall = (async () => {
+    const page = await deferredCachedLatest;
+    const current = cacheRaceState.historyBrowse;
+    if (!current || !acceptsCachedNewerPage(current, frozenCachedLatest)) {
+      return "discarded" as const;
+    }
+    if (page.isLatest && current.latestDirty) {
+      return "settle" as const;
+    }
+    return appendNewerPage(current, page, {
+      expectedScopeKey: frozenCachedLatest.scopeKey,
+      expectedViewId: frozenCachedLatest.viewId,
+      expectedWindowEpoch: frozenCachedLatest.windowEpoch,
+      expectedNewerPageKey: frozenCachedLatest.pageKey,
+    }).projection;
+  })();
+  cacheRaceState = reduce(cacheRaceState, {
+    type: "event",
+    event: event({
+      type: "delta", sid: orderedHistorySid, seq: 93,
+      message_id: "cache-race-live", text: "arrived during IndexedDB read",
+    }),
+  });
+  resolveCachedLatest({
+    pageKey: "ordered-head",
+    turns: runtimeBeforeLive,
+    isLatest: true,
+  });
+  const deferredOutcome = await deferredInstall;
+  assert.equal(deferredOutcome, "settle",
+    "a live delta during the cache read must revoke the frozen latest page");
+  cacheRaceState = reduce(cacheRaceState, {
+    type: "history_browse_newer_settled",
+    sid: frozenCachedLatest.sid,
+    scopeKey: frozenCachedLatest.scopeKey,
+    revision: frozenCachedLatest.revision,
+    generation: frozenCachedLatest.generation,
+    viewId: frozenCachedLatest.viewId,
+    windowEpoch: frozenCachedLatest.windowEpoch,
+    pageKey: frozenCachedLatest.pageKey,
+  });
+  assert.equal(cacheRaceState.historyBrowse?.latestDirty, true);
+  assert.equal(cacheRaceState.historyBrowse?.hasNewer, true);
+  assert.equal(cacheRaceState.historyBrowse?.newerPageKey, "ordered-head",
+    "rejecting stale cached latest must not clear the newer affordance");
+  assert.equal(
+    cacheRaceState.historyBrowse?.windowEpoch,
+    frozenCachedLatest.windowEpoch + 1,
+    "settling stale cached latest must release ChatView's accepted page request");
+
+  const browseAfterOtherSidSend = reduce({
+    ...orderedHistory,
+    runtimes: {
+      ...orderedHistory.runtimes,
+      "background-send": createRuntime(),
+    },
+  }, {
+    type: "query_sent", sid: "background-send",
+    prompt: "background", msg_id: "background-message", ts: 99,
+  });
+  assert.equal(browseAfterOtherSidSend.historyBrowse,
+    orderedHistory.historyBrowse,
+    "a background or /btw send cannot close the focused parent browse");
+
+  const successfulQueuedBrowse = reduce(orderedHistory, {
+    type: "enqueue", sid: orderedHistorySid, query: { prompt: "later" },
+  });
+  assert.equal(successfulQueuedBrowse.historyBrowse, null,
+    "a successfully accepted queued send atomically returns to latest");
+  const successfulPendingBrowse = reduce(orderedHistory, {
+    type: "set_pending", sid: orderedHistorySid,
+    query: { prompt: "interrupt after drain" },
+  });
+  assert.equal(successfulPendingBrowse.historyBrowse, null,
+    "a successfully accepted interrupt-send atomically returns to latest");
+  assert.equal(
+    successfulPendingBrowse.runtimes[orderedHistorySid].pendingSend?.prompt,
+    "interrupt after drain");
+  const fullQueue = Array.from({ length: 32 }, (_, index) => ({
+    prompt: `queued-${index}`,
+  }));
+  const capacityState = {
+    ...orderedHistory,
+    runtimes: {
+      ...orderedHistory.runtimes,
+      [orderedHistorySid]: {
+        ...orderedHistory.runtimes[orderedHistorySid],
+        queue: fullQueue,
+      },
+    },
+  };
+  assert.equal(reduce(capacityState, {
+    type: "enqueue", sid: orderedHistorySid,
+    query: { prompt: "must fail capacity" },
+  }), capacityState,
+  "a rejected queue mutation must preserve the user's browse window");
+
+  const directSendBrowse = reduce(orderedHistory, {
+    type: "query_sent", sid: orderedHistorySid,
+    prompt: "new live question", msg_id: "new-live-question", ts: 100,
+  });
+  assert.equal(directSendBrowse.historyBrowse, null);
+  assert.equal(
+    directSendBrowse.runtimes[orderedHistorySid].turns.at(-1)?.id,
+    "new-live-question",
+    "the same reducer commit installs the optimistic turn and exits browse");
+
+  const detailRequestedBrowse = reduce(orderedHistory, {
+    type: "history_browse_detail_requested",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    viewId: orderedHistory.historyBrowse!.viewId,
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    turnId: "older-page",
+  });
+  assert.equal(detailRequestedBrowse.historyBrowse?.turns[0].detailLoading, true);
+  const cancelledBrowseDetail = reduce(detailRequestedBrowse, {
+    type: "history_detail_cancelled",
+    context: {
+      target: "browse",
+      scopeKey: detailRequestedBrowse.historyBrowse!.scopeKey,
+      sid: orderedHistorySid,
+      revision: detailRequestedBrowse.historyBrowse!.revision,
+      turnId: "older-page",
+      viewId: detailRequestedBrowse.historyBrowse!.viewId,
+      windowEpoch: detailRequestedBrowse.historyBrowse!.windowEpoch,
+    },
+  });
+  assert.equal(cancelledBrowseDetail.historyBrowse?.turns.find(
+    (turn: Turn) => turn.id === "older-page")?.detailLoading, false,
+  "navigation/reconnect cancellation must make browse detail retryable");
+  const detailRequestEpoch = detailRequestedBrowse.historyBrowse!.windowEpoch;
+  const detailPagedBrowse = reduce(detailRequestedBrowse, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: detailRequestedBrowse.historyBrowse!.scopeKey,
+    revision: detailRequestedBrowse.historyBrowse!.revision,
+    generation: detailRequestedBrowse.historyBrowse!.generation,
+    viewId: detailRequestedBrowse.historyBrowse!.viewId,
+    windowEpoch: detailRequestEpoch,
+    before: detailRequestedBrowse.historyBrowse!.olderCursor!,
+    page: {
+      pageKey: "detail-older-page",
+      turns: [{
+        id: "ancient-detail-page", prompt: "ancient", blocks: [], done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "ancient-detail-page",
+      newerPageKey: detailRequestedBrowse.historyBrowse!.oldestPageKey,
+    },
+  });
+  assert.ok(detailPagedBrowse.historyBrowse!.windowEpoch > detailRequestEpoch);
+  assert.equal(detailPagedBrowse.historyBrowse?.turns.find(
+    (turn: Turn) => turn.id === "older-page")?.detailLoading, true,
+  "pagination retains the requested row while advancing the display window");
+  const runtimeBeforeBrowseDetail =
+    detailPagedBrowse.runtimes[orderedHistorySid];
+  const detailedBrowse = reduce(detailPagedBrowse, {
+    type: "history_browse_detail",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    viewId: orderedHistory.historyBrowse!.viewId,
+    // The response carries the request-time epoch. It remains authoritative
+    // inside this same scope/revision/view while the canonical row still exists.
+    windowEpoch: detailRequestEpoch,
+    turnId: "older-page",
+    events: [
+      event({
+        type: "user_msg", sid: orderedHistorySid,
+        msg_id: "older-page", prompt: "older",
+      }),
+      event({
+        type: "assistant_msg_start", sid: orderedHistorySid,
+        message_id: "older-answer", channel: "final",
+      }),
+      event({
+        type: "delta", sid: orderedHistorySid,
+        message_id: "older-answer", text: "full older answer",
+      }),
+      event({
+        type: "assistant_msg_end", sid: orderedHistorySid,
+        message_id: "older-answer",
+      }),
+      event({
+        type: "turn_end", sid: orderedHistorySid,
+        result: { subtype: "success", duration_ms: 1, is_error: false },
+      }),
+    ],
+  });
+  assert.equal(detailedBrowse.runtimes[orderedHistorySid],
+    runtimeBeforeBrowseDetail,
+    "browse detail hydration cannot mutate the authoritative live runtime");
+  const hydratedOlderTurn = detailedBrowse.historyBrowse?.turns.find(
+    (turn: Turn) => turn.id === "older-page");
+  assert.equal(hydratedOlderTurn?.detailLoaded, true);
+  assert.equal(hydratedOlderTurn?.detailLoading, false);
+  assert.equal(hydratedOlderTurn?.blocks[0]?.kind, "text");
+
+  const runtimeDetailRequested = reduce(orderedHistory, {
+    type: "turn_detail_requested",
+    sid: orderedHistorySid,
+    turnId: "new",
+  });
+  assert.equal(
+    runtimeDetailRequested.runtimes[orderedHistorySid].turns[0].detailLoading,
+    true);
+  const runtimeDetailCancelled = reduce(runtimeDetailRequested, {
+    type: "history_detail_cancelled",
+    context: {
+      target: "runtime",
+      scopeKey: orderedHistory.historyBrowse!.scopeKey,
+      sid: orderedHistorySid,
+      revision: "ordered-rev-new",
+      turnId: "new",
+    },
+  });
+  assert.equal(
+    runtimeDetailCancelled.runtimes[orderedHistorySid].turns[0].detailLoading,
+    false,
+    "reconnect cancellation must make runtime detail retryable");
+
+  const noNewerCache = reduce(detailedBrowse, {
+    type: "history_browse_newer_unavailable",
+    sid: orderedHistorySid,
+    scopeKey: detailedBrowse.historyBrowse!.scopeKey,
+    revision: detailedBrowse.historyBrowse!.revision,
+    viewId: detailedBrowse.historyBrowse!.viewId,
+    windowEpoch: detailedBrowse.historyBrowse!.windowEpoch,
+  });
+  assert.equal(noNewerCache.historyBrowse?.hasNewer, false);
+  assert.equal(noNewerCache.historyBrowse?.newerPageKey, null);
+
+  const invalidatedBrowse = reduce(orderedHistory, {
+    type: "event",
+    event: event({
+      type: "history_invalidated", sid: orderedHistorySid,
+      session_id: orderedHistorySid,
+      revision: "ordered-rev-after-rollback", reason: "rollback",
+    }),
+  });
+  assert.equal(invalidatedBrowse.historyBrowse, null);
+  const delayedBrowsePage = reduce(invalidatedBrowse, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    generation: "wrapper-one",
+    viewId: orderedHistory.historyBrowse!.viewId,
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    before: orderedHistory.historyBrowse!.olderCursor!,
+    page: {
+      pageKey: "must-not-revive",
+      turns: [{ id: "ancient", prompt: "ancient", blocks: [], done: true }],
+      hasOlder: false,
+      olderCursor: "ancient",
+    },
+  });
+  assert.equal(delayedBrowsePage.historyBrowse, null,
+    "a delayed pre-rollback page cannot revive a cleared browse projection");
+
+  let abaBrowse = reduce({
+    ...orderedHistory,
+    runtimes: {
+      ...orderedHistory.runtimes,
+      "browse-session-b": createRuntime(),
+    },
+  }, { type: "focus_session", sid: "browse-session-b" });
+  abaBrowse = reduce(abaBrowse, {
+    type: "focus_session", sid: orderedHistorySid,
+  });
+  abaBrowse = reduce(abaBrowse, {
+    type: "begin_history_browse",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    generation: orderedHistory.historyBrowse!.generation,
+    viewId: "ordered-view-after-aba",
+    basePageKey: "ordered-head-after-aba",
+  });
+  const abaBeforeDelayedPage = structuredClone(abaBrowse.historyBrowse);
+  abaBrowse = reduce(abaBrowse, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    generation: orderedHistory.historyBrowse!.generation,
+    viewId: orderedHistory.historyBrowse!.viewId,
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    before: orderedHistory.historyBrowse!.olderCursor!,
+    page: {
+      pageKey: "delayed-old-view-page",
+      turns: [{
+        id: "must-not-enter-new-view", prompt: "stale", blocks: [], done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "must-not-enter-new-view",
+    },
+  });
+  assert.deepEqual(abaBrowse.historyBrowse, abaBeforeDelayedPage,
+    "A to B to A creates a new viewId which rejects A's delayed old page");
+
+  assert.equal(reduce(orderedHistory, {
+    type: "conn", connState: "reconnecting",
+  }).historyBrowse, null,
+  "a new socket generation revokes every frozen browse-page waiter");
 
   // A targeted newest-page refresh is only the moving head window. Once this
   // browser has explicitly paged backwards, that refresh must retain the older
@@ -2436,17 +3427,35 @@ try {
       ],
     }),
   });
-  pagedHead = reduce(pagedHead, { type: "event", event: event({
-    type: "history", sid: pagedHeadSid, session_id: pagedHeadSid,
-    revision: "paged-rev", generation: "wrapper-one", build_seq: 1,
-    before: "head-cursor", has_more: false, oldest_id: "history-floor",
-    events: [
-      event({ type: "user_msg", sid: pagedHeadSid,
-        msg_id: "older-one", prompt: "older one", ts: 10 }),
-      event({ type: "turn_end", sid: pagedHeadSid,
-        result: { subtype: "success", duration_ms: 1, is_error: false } }),
-    ],
-  }) });
+  pagedHead = reduce(pagedHead, {
+    type: "begin_history_browse",
+    sid: pagedHeadSid,
+    scopeKey: "machine-a:code:codex",
+    revision: "paged-rev",
+    generation: "wrapper-one",
+    viewId: "paged-view",
+    basePageKey: "paged-head",
+  });
+  pagedHead = reduce(pagedHead, {
+    type: "install_history_browse_page",
+    sid: pagedHeadSid,
+    scopeKey: "machine-a:code:codex",
+    revision: "paged-rev",
+    generation: "wrapper-one",
+    viewId: "paged-view",
+    windowEpoch: pagedHead.historyBrowse!.windowEpoch,
+    before: "head-cursor",
+    page: {
+      pageKey: "paged-older",
+      turns: [{
+        id: "older-one", prompt: "older one", blocks: [], done: true,
+        ts: 10_000,
+      }],
+      hasOlder: false,
+      olderCursor: "history-floor",
+      newerPageKey: "paged-head",
+    },
+  });
   pagedHead = reduce(pagedHead, { type: "event", event: event({
     type: "history", sid: pagedHeadSid, session_id: pagedHeadSid,
     revision: "paged-rev", generation: "wrapper-one", build_seq: 2,
@@ -2458,11 +3467,13 @@ try {
     ],
   }) });
   assert.deepEqual(pagedHead.runtimes[pagedHeadSid].turns.map(
-    (turn: { id: string }) => turn.id), ["older-one", "head-one", "head-two"]);
-  assert.equal(pagedHead.runtimes[pagedHeadSid].hasMore, false,
-    "a head refresh cannot reopen pagination after the browser reached the floor");
-  assert.equal(pagedHead.runtimes[pagedHeadSid].oldestId, "history-floor");
-  assert.equal(pagedHead.runtimes[pagedHeadSid].hasLoadedOlderHistory, true);
+    (turn: { id: string }) => turn.id), ["head-one", "head-two"]);
+  assert.deepEqual(pagedHead.historyBrowse?.turns.map(
+    (turn: { id: string }) => turn.id), ["older-one", "head-one"],
+  "a moving head refresh cannot rewrite the user's display-only reading window");
+  assert.equal(pagedHead.historyBrowse?.hasOlder, false);
+  assert.equal(pagedHead.historyBrowse?.olderCursor, "history-floor");
+  assert.equal(pagedHead.historyBrowse?.latestDirty, true);
 
   // Even before the user explicitly paginates, a same-revision compact/head
   // refresh is only a suffix. It must not erase rows already rendered from the
@@ -2603,10 +3614,35 @@ try {
   assert.equal(
     boundedCursorState.runtimes[boundedCursorSid].turns.length,
     MAX_RUNTIME_TURNS);
-  assert.equal(boundedCursorState.runtimes[boundedCursorSid].hasMore, true);
+  assert.equal(boundedCursorState.runtimes[boundedCursorSid].hasMore, true,
+    "a full newest-biased runtime must keep server pagination available to the browse window");
   assert.equal(boundedCursorState.runtimes[boundedCursorSid].oldestId,
-    "server-byte-cursor");
+    "bounded-40",
+    "local retention must page from the first retained native turn");
   assert.equal(boundedCursorState.runtimes[boundedCursorSid].truncated, true);
+
+  const liveBoundSid = "live-bound-keeps-native-cursor";
+  const liveBoundTurns = Array.from(
+    { length: MAX_RUNTIME_TURNS + 1 },
+    (_, index) => ({
+      id: `optimistic-${index}`,
+      historyTurnId: `native-${index}`,
+      prompt: `question ${index}`,
+      blocks: [],
+      done: true,
+    }),
+  );
+  const liveBoundState = reduce({
+    ...initialState, focusedSid: liveBoundSid,
+  }, {
+    type: "set_turns", sid: liveBoundSid, turns: liveBoundTurns,
+  });
+  assert.equal(liveBoundState.runtimes[liveBoundSid].hasMore, true,
+    "a locally full runtime must keep older history available to the browse window");
+  assert.equal(
+    liveBoundState.runtimes[liveBoundSid].oldestId,
+    "native-1",
+    "a local trim must expose the first retained authoritative history id");
 
   const failedHistorySid = "non-authoritative-history";
   const preservedTurn = {
@@ -2632,6 +3668,127 @@ try {
   assert.equal(failedHistory.runtimes[failedHistorySid].loading, false);
   assert.equal(failedHistory.banner, undefined,
     "a recoverable history read must stay silent while preserving the projection");
+
+  const coldPrefixSid = "cold-append-prefix-preview";
+  const sampledPrefixTurn = {
+    id: "sampled-prefix", prompt: "sampled stale prefix",
+    blocks: [], done: true,
+  };
+  const coldPrefixState = reduce({
+    ...initialState,
+    focusedSid: coldPrefixSid,
+    runtimes: {
+      [coldPrefixSid]: { ...createRuntime(), loading: true },
+    },
+  }, {
+    type: "event", event: event({
+      type: "history", sid: coldPrefixSid, session_id: coldPrefixSid,
+      revision: "prefix-revision", generation: "prefix-generation",
+      build_seq: 11, authoritative: false, error: null,
+      detail: "summary", turns: [sampledPrefixTurn],
+      has_more: true, oldest_id: "sampled-prefix", events: [],
+    }),
+  });
+  assert.deepEqual(coldPrefixState.runtimes[coldPrefixSid].turns, [],
+    "a sampled append prefix must never enter the canonical runtime");
+  assert.deepEqual(
+    displayHistoryProjection(
+      coldPrefixState.historyRecovery,
+      coldPrefixSid,
+      coldPrefixState.runtimes[coldPrefixSid],
+    ).turns.map((turn: { id: string }) => turn.id),
+    ["sampled-prefix"],
+    "an empty cold first screen may use the sampled prefix as display-only preview");
+  assert.equal(coldPrefixState.historyRecovery?.candidateBuildSeq, 11,
+    "the sampled prefix build must seed confirmation without another exact scan");
+  assert.equal(
+    isRuntimeHistoryRecoveryPending(coldPrefixState.runtimes[coldPrefixSid]),
+    false,
+    "a sampled prefix preview is not a replay-gap runtime recovery");
+  const coldExactHistory = event({
+    type: "history", sid: coldPrefixSid, session_id: coldPrefixSid,
+    revision: "exact-revision", generation: "prefix-generation",
+    build_seq: 12, authoritative: true,
+    detail: "summary", turns: [{
+      id: "exact-current", prompt: "exact current history",
+      blocks: [], done: true,
+    }],
+    has_more: false, events: [],
+  }) as History;
+  assert.equal(
+    historyNeedsConfirmationRequest(
+      coldPrefixState.runtimes[coldPrefixSid], coldExactHistory),
+    false,
+    "prefix recovery must not request a second potentially multi-GB exact scan");
+  assert.equal(
+    historyConfirmsRecovery(coldPrefixState.historyRecovery, coldExactHistory),
+    true,
+    "the first newer exact build must confirm a sampled prefix");
+  const coldExactState = reduce(coldPrefixState, {
+    type: "event", event: coldExactHistory,
+  });
+  assert.equal(coldExactState.historyRecovery?.turns, null);
+  assert.deepEqual(
+    coldExactState.runtimes[coldPrefixSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["exact-current"]);
+
+  const trustedPrefixSid = "trusted-live-beats-append-prefix";
+  const trustedLiveTurn = {
+    id: "trusted-live", prompt: "current live question",
+    blocks: [], done: false,
+  };
+  const trustedPrefixState = reduce({
+    ...initialState,
+    focusedSid: trustedPrefixSid,
+    runtimes: {
+      [trustedPrefixSid]: {
+        ...createRuntime(),
+        turns: [trustedLiveTurn],
+        state: "running" as const,
+        historyRevision: "trusted-revision",
+        historyGeneration: "prefix-generation",
+        historyBuildSeq: 10,
+        lastLiveSeq: 42,
+        loading: true,
+      },
+    },
+  }, {
+    type: "event", event: event({
+      type: "history", sid: trustedPrefixSid, session_id: trustedPrefixSid,
+      revision: "prefix-revision", generation: "prefix-generation",
+      build_seq: 11, authoritative: false, error: null,
+      detail: "summary", turns: [sampledPrefixTurn],
+      has_more: true, oldest_id: "sampled-prefix", events: [],
+    }),
+  });
+  assert.deepEqual(
+    trustedPrefixState.runtimes[trustedPrefixSid].turns,
+    [trustedLiveTurn],
+    "a sampled append prefix must not mutate trusted live/current turns");
+  assert.equal(
+    isHistoryRecoveryPending(
+      trustedPrefixState.historyRecovery, trustedPrefixSid),
+    false,
+    "a trusted base must not enter recovery or lock ordinary interactions");
+  assert.equal(trustedPrefixState.runtimes[trustedPrefixSid].loading, false,
+    "a stale prefix must not leave a trusted live runtime synchronizing");
+  const trustedQueryAfterPrefix = reduce(trustedPrefixState, {
+    type: "query_sent", sid: trustedPrefixSid,
+    prompt: "continue from trusted head",
+    msg_id: "trusted-query-after-prefix", ts: 123,
+  });
+  assert.deepEqual(
+    trustedQueryAfterPrefix.runtimes[trustedPrefixSid]
+      .acceptanceHistoryBaseline,
+    {
+      revision: "trusted-revision",
+      generation: "prefix-generation",
+      buildSeq: 10,
+      liveSeq: 42,
+      newestId: null,
+    },
+    "a sampled prefix must not hide the trusted acceptance watermark");
 
   // Even when the revision is unchanged, a first page is authoritative for
   // completed rows. This prevents generic stale-cache resurrection, not only
@@ -2669,29 +3826,344 @@ try {
     runtimes: {
       [gapSid]: {
         ...createRuntime(), turns: staleTurns,
-        historyRevision: "boot-old:9", syncReady: true,
+        historyRevision: "boot-old:9",
+        historyGeneration: "gap-generation-new",
+        historyBuildSeq: 4,
+        syncReady: true,
       },
     },
   };
   gapState = reduce(gapState, { type: "event", event: event({
     type: "replay_start", sid: gapSid, from_seq: 20, to_seq: 30,
-    truncated: true, rebuild: false,
+    truncated: true, rebuild: false, generation: "gap-generation-new",
   }) });
   assert.equal(gapState.artifact, null);
   assert.deepEqual(gapState.runtimes[gapSid].turns, []);
+  assert.deepEqual(
+    (gapState as typeof gapState & {
+      historyRecovery?: { sid: string; turns: unknown[] | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "a focused replay gap must retain the last projection for display only");
+  assert.equal(isHistoryRecoveryPending(gapState.historyRecovery, gapSid), true);
+  assert.deepEqual(
+    displayHistoryProjection(
+      gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+    ).turns,
+    staleTurns,
+  );
+  assert.equal(
+    displayHistoryProjection(
+      gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+    ).hasMore,
+    false,
+    "a retained projection must never paginate with its old generation cursor");
+  const queryDuringGapState = reduce(gapState, {
+    type: "query_sent", sid: gapSid, prompt: "new live question",
+    msg_id: "new-live-question", ts: 123,
+  });
+  assert.deepEqual(
+    queryDuringGapState.runtimes[gapSid].turns.map(
+      (turn: { id: string }) => turn.id),
+    ["new-live-question"],
+    "display-only recovery turns must never enter the active query runtime");
+  assert.equal(
+    queryDuringGapState.runtimes[gapSid].acceptanceHistoryBaseline,
+    null,
+    "a query racing recovery must not freeze stale history watermarks");
+  assert.deepEqual(
+    (queryDuringGapState as typeof queryDuringGapState & {
+      historyRecovery?: { turns: unknown[] | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "query_sent must not mutate the retained display-only projection");
   assert.equal(gapState.runtimes[gapSid].historyInvalidated, true);
   assert.equal(gapState.runtimes[gapSid].loading, true);
+  const staleGenerationGapState = reduce(gapState, {
+    type: "event", event: event({
+      type: "history", sid: gapSid, session_id: gapSid,
+      revision: "boot-stale:9", generation: "gap-generation-old",
+      has_more: false, events: [],
+    }),
+  });
+  assert.deepEqual(
+    (staleGenerationGapState as typeof staleGenerationGapState & {
+      historyRecovery?: { turns: unknown[] | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "an older wrapper generation cannot retire the retained display projection");
+  assert.equal(
+    staleGenerationGapState.runtimes[gapSid].historyInvalidated,
+    true,
+  );
+  const staleBuildGapState = reduce(gapState, {
+    type: "event", event: event({
+      type: "history", sid: gapSid, session_id: gapSid,
+      revision: "boot-old:9", generation: "gap-generation-new",
+      build_seq: 3, has_more: false, events: [],
+    }),
+  });
+  assert.equal(
+    isHistoryRecoveryPending(staleBuildGapState.historyRecovery, gapSid),
+    true,
+    "a lower same-generation build cannot retire the recovery projection");
+  const failedGapReadState = reduce(gapState, {
+    type: "event", event: event({
+      type: "history", sid: gapSid, session_id: gapSid,
+      revision: "boot-new:9", generation: "gap-generation-new",
+      authoritative: false, has_more: false, events: [],
+    }),
+  });
+  assert.deepEqual(
+    (failedGapReadState as typeof failedGapReadState & {
+      historyRecovery?: { turns: unknown[] | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "a failed History read cannot replace the visible projection with an empty page");
   gapState = reduce(gapState, { type: "event", event: event({
     type: "replay_end", sid: gapSid, to_seq: 30, truncated: true,
   }) });
   assert.equal(gapState.runtimes[gapSid].loading, true,
     "ReplayEnd cannot satisfy a transcript gap");
-  gapState = reduce(gapState, { type: "event", event: event({
+  const recoveryBeforeCandidate = gapState.historyRecovery;
+  const runtimeBeforeCandidate = gapState.runtimes[gapSid];
+  const firstRecoveryCandidate = event({
     type: "history", sid: gapSid, session_id: gapSid,
-    revision: "boot-new:9", has_more: false, events: [],
-  }) });
+    revision: "boot-new:9", generation: "gap-generation-new",
+    build_seq: 5, has_more: false, detail: "summary",
+    turns: [{
+      id: "candidate-only", prompt: "must stay provisional",
+      blocks: [], done: true,
+    }],
+    events: [],
+  }) as History;
+  assert.equal(
+    historyNeedsConfirmationRequest(
+      runtimeBeforeCandidate, firstRecoveryCandidate),
+    true,
+    "the first matching build must explicitly request a second newest page");
+  assert.equal(
+    historyNeedsConfirmationRequest(runtimeBeforeCandidate, event({
+      ...firstRecoveryCandidate, generation: "gap-generation-old",
+    }) as History),
+    false,
+    "an older generation cannot trigger or satisfy confirmation");
+  assert.equal(
+    historyNeedsConfirmationRequest(runtimeBeforeCandidate, event({
+      ...firstRecoveryCandidate, generation: undefined,
+    }) as History),
+    false,
+    "a generation-less response cannot trigger or satisfy confirmation");
+  assert.equal(
+    historyConfirmsRecovery(recoveryBeforeCandidate, firstRecoveryCandidate),
+    false,
+    "the first matching build is only a candidate and cannot clear cache");
+  assert.equal(
+    historyConfirmsRuntimeRecovery(
+      runtimeBeforeCandidate, firstRecoveryCandidate),
+    false,
+    "the first matching build cannot clear the per-runtime gap barrier");
+  let delayedCandidateRoundTripState = reduce(gapState, {
+    type: "focus_session", sid: "delayed-candidate-other-session",
+  });
+  assert.equal(delayedCandidateRoundTripState.historyRecovery, null);
+  delayedCandidateRoundTripState = reduce(delayedCandidateRoundTripState, {
+    type: "event", event: firstRecoveryCandidate,
+  });
+  assert.deepEqual(
+    delayedCandidateRoundTripState.runtimes[gapSid].turns,
+    [],
+    "a background first candidate must not install canonical narrative");
+  assert.equal(
+    delayedCandidateRoundTripState.runtimes[gapSid]
+      .pendingHistoryCandidateBuildSeq,
+    5,
+    "the background runtime must retain the lightweight candidate watermark");
+  assert.equal(
+    isRuntimeHistoryRecoveryPending(
+      delayedCandidateRoundTripState.runtimes[gapSid]),
+    true,
+    "clearing the focused display recovery must not clear the runtime barrier");
+  delayedCandidateRoundTripState = reduce(delayedCandidateRoundTripState, {
+    type: "focus_session", sid: gapSid,
+  });
+  assert.deepEqual(
+    displayHistoryProjection(
+      delayedCandidateRoundTripState.historyRecovery,
+      gapSid,
+      delayedCandidateRoundTripState.runtimes[gapSid],
+    ).turns,
+    [],
+    "ReplayStart A to focus B to first History A to focus A stays empty/loading");
+  assert.equal(
+    delayedCandidateRoundTripState.runtimes[gapSid].historyInvalidated,
+    true);
+  gapState = reduce(gapState, {
+    type: "event", event: firstRecoveryCandidate,
+  });
+  assert.deepEqual(gapState.runtimes[gapSid].turns, [],
+    "the first candidate must not enter the canonical runtime");
+  assert.equal(gapState.runtimes[gapSid].historyInvalidated, true,
+    "the first candidate must not clear the invalidation barrier");
+  assert.equal(gapState.runtimes[gapSid].pendingHistoryGeneration,
+    "gap-generation-new",
+    "the first candidate must keep the generation barrier");
+  assert.equal(gapState.runtimes[gapSid].loading, true,
+    "the first candidate must keep loading until confirmation");
+  assert.equal(
+    gapState.historyRecovery?.candidateBuildSeq,
+    5,
+    "the first matching build must remain pending as a candidate");
+  assert.equal(
+    (gapState as typeof gapState & {
+      historyRecovery?: { turns: unknown[] | null; acceptedRevision?: string | null };
+    }).historyRecovery?.turns,
+    staleTurns,
+    "the candidate must not replace the retained projection");
+  let candidateRoundTripState = reduce(gapState, {
+    type: "focus_session", sid: "candidate-other-session",
+  });
+  assert.equal(candidateRoundTripState.historyRecovery, null,
+    "switching away releases only the display copy");
+  candidateRoundTripState = reduce(candidateRoundTripState, {
+    type: "focus_session", sid: gapSid,
+  });
+  assert.deepEqual(candidateRoundTripState.runtimes[gapSid].turns, [],
+    "switching back before confirmation must not expose candidate narrative");
+  assert.deepEqual(
+    displayHistoryProjection(
+      candidateRoundTripState.historyRecovery,
+      gapSid,
+      candidateRoundTripState.runtimes[gapSid],
+    ).turns,
+    [],
+    "A to B to A must show an empty loading runtime, never gap-era history");
+  assert.equal(
+    candidateRoundTripState.runtimes[gapSid].historyInvalidated,
+    true,
+    "A to B to A must remain behind the cache invalidation barrier");
+  const recoveryConfirmation = event({
+    type: "history", sid: gapSid, session_id: gapSid,
+    revision: "boot-new:9", generation: "gap-generation-new",
+    build_seq: 6, has_more: false, detail: "summary",
+    turns: [{
+      id: "confirmed-current", prompt: "confirmed current history",
+      blocks: [], done: true,
+    }],
+    events: [],
+  }) as History;
+  assert.equal(
+    historyConfirmsRuntimeRecovery(
+      gapState.runtimes[gapSid], recoveryConfirmation),
+    true,
+    "only a newer build from the bound generation clears the runtime barrier");
+  assert.equal(
+    historyConfirmsRecovery(gapState.historyRecovery, recoveryConfirmation),
+    true,
+    "only that newer build can also clear the focused cache/display barrier");
+  gapState = reduce(gapState, {
+    type: "event", event: recoveryConfirmation,
+  });
   assert.equal(gapState.runtimes[gapSid].historyInvalidated, false);
+  assert.equal(gapState.runtimes[gapSid].pendingHistoryGeneration, null);
   assert.equal(gapState.runtimes[gapSid].loading, false);
+  assert.deepEqual(
+    gapState.runtimes[gapSid].turns.map((turn: { id: string }) => turn.id),
+    ["confirmed-current"],
+    "only the newer confirmation may install canonical narrative");
+  assert.equal(gapState.historyRecovery?.turns, null,
+    "the explicit newer confirmation commits the projection atomically");
+  assert.equal(
+    (gapState as typeof gapState & {
+      historyRecovery?: { acceptedRevision?: string | null };
+    }).historyRecovery?.acceptedRevision,
+    "boot-new:9",
+  );
+  assert.deepEqual(
+    displayHistoryProjection(
+      gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+    ).turns,
+    gapState.runtimes[gapSid].turns,
+    "after commit the selector must expose only the authoritative runtime");
+  const laterRevisionState = reduce(gapState, {
+    type: "event", event: event({
+      type: "history", sid: gapSid, session_id: gapSid,
+      revision: "boot-new:10", generation: "gap-generation-new",
+      has_more: false, events: [],
+    }),
+  });
+  assert.equal(laterRevisionState.historyRecovery, null,
+    "a later independent revision must release the retained scroll scope");
+
+  const backgroundGapSid = "background-replay-gap";
+  let backgroundGapState = {
+    ...initialState,
+    focusedSid: gapSid,
+    runtimes: {
+      [gapSid]: { ...createRuntime(), turns: staleTurns },
+      [backgroundGapSid]: { ...createRuntime(), turns: staleTurns },
+    },
+  };
+  backgroundGapState = reduce(backgroundGapState, {
+    type: "event", event: event({
+      type: "replay_start", sid: backgroundGapSid,
+      from_seq: 1, to_seq: 2, truncated: true,
+      rebuild: false, generation: "background-generation",
+    }),
+  });
+  assert.equal(
+    (backgroundGapState as typeof backgroundGapState & {
+      historyRecovery?: unknown;
+    }).historyRecovery,
+    null,
+    "background replay gaps must not duplicate a full display projection");
+  const staleBackgroundHistory = reduce(backgroundGapState, {
+    type: "event", event: event({
+      type: "history", sid: backgroundGapSid,
+      session_id: backgroundGapSid, revision: "background-stale-revision",
+      generation: "older-background-generation",
+      has_more: false, events: [],
+    }),
+  });
+  assert.equal(
+    staleBackgroundHistory.runtimes[backgroundGapSid].historyInvalidated,
+    true,
+    "generation matching must also protect rebuilding background runtimes");
+  const switchedAwayFromRecovery = reduce(failedGapReadState, {
+    type: "focus_session", sid: backgroundGapSid,
+  });
+  assert.equal(switchedAwayFromRecovery.historyRecovery, null,
+    "switching sessions must release the former visible projection");
+
+  let rollbackDuringRecoveryState = {
+    ...initialState,
+    focusedSid: gapSid,
+    runtimes: {
+      [gapSid]: {
+        ...createRuntime(), turns: staleTurns,
+        historyRevision: "before-rollback",
+      },
+    },
+  };
+  rollbackDuringRecoveryState = reduce(rollbackDuringRecoveryState, {
+    type: "event", event: event({
+      type: "replay_start", sid: gapSid, from_seq: 10, to_seq: 20,
+      truncated: true, rebuild: false, generation: "rollback-generation",
+    }),
+  });
+  rollbackDuringRecoveryState = reduce(rollbackDuringRecoveryState, {
+    type: "event", event: event({
+      type: "history_invalidated", sid: gapSid, session_id: gapSid,
+      revision: "after-rollback", reason: "rollback",
+    }),
+  });
+  assert.deepEqual(rollbackDuringRecoveryState.runtimes[gapSid].turns, []);
+  assert.equal(
+    (rollbackDuringRecoveryState as typeof rollbackDuringRecoveryState & {
+      historyRecovery?: unknown;
+    }).historyRecovery,
+    null,
+    "rollback must clear both the rebuilding runtime and retained display");
 
   // A truncated live-tail replay can begin in the middle of an older turn.
   // Without its UserMsg/TurnEnd, that fragment looks like a new unfinished
@@ -2702,7 +4174,7 @@ try {
     ...initialState, focusedSid: replayFragmentSid,
   }, { type: "event", event: event({
     type: "replay_start", sid: replayFragmentSid, from_seq: 70, to_seq: 74,
-    truncated: true, rebuild: false,
+    truncated: true, rebuild: false, generation: "wrapper-one",
   }) });
   replayFragmentState = reduce(replayFragmentState, {
     type: "event", event: event({
@@ -2736,30 +4208,37 @@ try {
       truncated: true,
     }),
   });
+  const replayFragmentCandidate = event({
+    type: "history", sid: replayFragmentSid,
+    session_id: replayFragmentSid, revision: "fragment-rev",
+    generation: "wrapper-one", build_seq: 1, live_seq: 74,
+    has_more: true, oldest_id: "authoritative-old",
+    in_progress: true, detail: "summary", events: [],
+    turns: [
+      {
+        id: "authoritative-old", prompt: "real older question",
+        blocks: [], done: true, detailEventCount: 0,
+        detailLoaded: false, ts: 5_000, doneTs: 6_000,
+      },
+      {
+        id: "current-turn", prompt: "current question",
+        blocks: [{
+          kind: "text", message_id: "current-commentary",
+          text: "current work", done: false, channel: "commentary",
+        }],
+        done: false, detailEventCount: 1,
+        detailLoaded: false, ts: 9_000,
+      },
+    ],
+  }) as History;
+  replayFragmentState = reduce(replayFragmentState, {
+    type: "event", event: replayFragmentCandidate,
+  });
+  assert.equal(replayFragmentState.historyRecovery?.candidateBuildSeq, 1);
   replayFragmentState = reduce(replayFragmentState, {
     type: "event", event: event({
-      type: "history", sid: replayFragmentSid,
-      session_id: replayFragmentSid, revision: "fragment-rev",
-      generation: "wrapper-one", build_seq: 1, live_seq: 74,
-      has_more: true, oldest_id: "authoritative-old",
-      in_progress: true, detail: "summary", events: [],
-      turns: [
-        {
-          id: "authoritative-old", prompt: "real older question",
-          blocks: [], done: true, detailEventCount: 0,
-          detailLoaded: false, ts: 5_000, doneTs: 6_000,
-        },
-        {
-          id: "current-turn", prompt: "current question",
-          blocks: [{
-            kind: "text", message_id: "current-commentary",
-            text: "current work", done: false, channel: "commentary",
-          }],
-          done: false, detailEventCount: 1,
-          detailLoaded: false, ts: 9_000,
-        },
-      ],
-    }),
+      ...replayFragmentCandidate, build_seq: 2,
+    }) as History,
   });
   assert.deepEqual(
     replayFragmentState.runtimes[replayFragmentSid].turns.map(
@@ -2780,7 +4259,7 @@ try {
     ...initialState, focusedSid: unflushedTailSid,
   }, { type: "event", event: event({
     type: "replay_start", sid: unflushedTailSid, from_seq: 80, to_seq: 83,
-    truncated: true, rebuild: false,
+    truncated: true, rebuild: false, generation: "wrapper-one",
   }) });
   for (const replayEvent of [
     event({
@@ -2800,18 +4279,24 @@ try {
       type: "event", event: replayEvent,
     });
   }
+  const unflushedCandidate = event({
+    type: "history", sid: unflushedTailSid,
+    session_id: unflushedTailSid, revision: "unflushed-rev",
+    generation: "wrapper-one", build_seq: 1, live_seq: 83,
+    has_more: true, in_progress: true, detail: "summary", events: [],
+    turns: [{
+      id: "last-flushed", prompt: "last flushed question",
+      blocks: [], done: true, detailEventCount: 0,
+      detailLoaded: false, ts: 5_000, doneTs: 6_000,
+    }],
+  }) as History;
+  unflushedTailState = reduce(unflushedTailState, {
+    type: "event", event: unflushedCandidate,
+  });
   unflushedTailState = reduce(unflushedTailState, {
     type: "event", event: event({
-      type: "history", sid: unflushedTailSid,
-      session_id: unflushedTailSid, revision: "unflushed-rev",
-      generation: "wrapper-one", build_seq: 1, live_seq: 83,
-      has_more: true, in_progress: true, detail: "summary", events: [],
-      turns: [{
-        id: "last-flushed", prompt: "last flushed question",
-        blocks: [], done: true, detailEventCount: 0,
-        detailLoaded: false, ts: 5_000, doneTs: 6_000,
-      }],
-    }),
+      ...unflushedCandidate, build_seq: 2,
+    }) as History,
   });
   assert.deepEqual(
     unflushedTailState.runtimes[unflushedTailSid].turns.map(
@@ -2849,17 +4334,115 @@ try {
   }) });
   assert.equal(state.catalogDefault.claude, "claude-mythos-5");
   assert.equal(state.catalogDefaultEffort.claude, "max");
-  const { NewChatView } = await reducerHarness.ssrLoadModule(
+  const {
+    compatibleNewChatEffort,
+    newChatCatalogRequest,
+    newChatEfforts,
+    NewChatView,
+    reconcileNewChatSelection,
+    resolveNewChatLocalDefaults,
+  } = await reducerHarness.ssrLoadModule(
     "/src/components/NewChatView.tsx");
   const { WorkArtifactsSheet } = await reducerHarness.ssrLoadModule(
     "/src/components/WorkArtifactsSheet.tsx");
+  const { SessionsSidebar } = await reducerHarness.ssrLoadModule(
+    "/src/components/SessionsSidebar.tsx");
+  const { BtwPanel } = await reducerHarness.ssrLoadModule(
+    "/src/components/BtwPanel.tsx");
+  assert.deepEqual(
+    newChatCatalogRequest("claude", "code", "/repo"),
+    { engine: "claude", cwd: "/repo" },
+    "Claude Code defaults must be resolved against the new session cwd",
+  );
+  assert.equal(
+    newChatCatalogRequest("claude", "work", "/stale-code-cwd"),
+    null,
+    "Claude Work must not probe or inherit the Code cwd",
+  );
+  assert.deepEqual(
+    newChatCatalogRequest("codex", "work", "/ignored"),
+    { engine: "codex" },
+    "Codex keeps using its machine catalog without inventing a cwd scope",
+  );
+  assert.deepEqual(resolveNewChatLocalDefaults(
+    "claude", "code", "/repo",
+    { claude: "claude-sonnet-5" },
+    { claude: "high" },
+    { claude: "/repo" },
+  ), { model: "claude-sonnet-5", effort: "high" });
+  assert.deepEqual(resolveNewChatLocalDefaults(
+    "claude", "code", "/other",
+    { claude: "claude-sonnet-5" },
+    { claude: "high" },
+    { claude: "/repo" },
+  ), { model: null, effort: null },
+  "a late Claude default for another cwd must not label this form");
+  assert.deepEqual(resolveNewChatLocalDefaults(
+    "claude", "work", "/repo",
+    { claude: "claude-sonnet-5" },
+    { claude: "high" },
+    { claude: "/repo" },
+  ), { model: null, effort: null },
+  "Work ignores even a textually matching Code cwd default");
+
+  const liveNewChatCatalog = {
+    codex: [{
+      id: "gpt-future",
+      display_name: "GPT Future",
+      description: "dynamic catalog model",
+      efforts: ["low", "high"],
+      default_effort: "low",
+      is_default: true,
+    }],
+  };
+  assert.equal(compatibleNewChatEffort(
+    "codex", "gpt-future", "high", liveNewChatCatalog, null), "high");
+  assert.equal(compatibleNewChatEffort(
+    "codex", "gpt-future", "ultra", liveNewChatCatalog, null), null,
+  "switching models clears an unsupported explicit effort");
+  assert.equal(compatibleNewChatEffort(
+    "claude", null, "high", {}, "custom-provider-model"), null,
+  "an unknown local model cannot inherit a guessed effort capability");
+  assert.equal(compatibleNewChatEffort(
+    "codex", "gpt-future", null, liveNewChatCatalog, null), null,
+  "switching models never auto-selects the highest effort");
+  const zeroEffortCatalog = {
+    codex: [{
+      id: "gpt-no-effort",
+      display_name: "GPT No Effort",
+      description: "no reasoning override",
+      efforts: [],
+      default_effort: null,
+      is_default: true,
+    }],
+  };
+  assert.deepEqual(newChatEfforts(
+    "codex", "gpt-no-effort", zeroEffortCatalog), [],
+  "an authoritative empty effort list must not fall back to guessed levels");
+  assert.deepEqual(newChatEfforts("codex", null, {}), [],
+  "an unknown Codex default cannot expose unvalidated effort overrides");
+  assert.deepEqual(reconcileNewChatSelection(
+    "codex", "gpt-5.6-sol", "ultra", liveNewChatCatalog, "gpt-future",
+  ), { model: null, effort: null },
+  "an entitlement-filtered live catalog atomically clears a stale fallback selection");
+  assert.deepEqual(reconcileNewChatSelection(
+    "codex", "gpt-future", "high", liveNewChatCatalog, "gpt-future",
+  ), { model: "gpt-future", effort: "high" },
+  "an explicit selection that remains in the live catalog is preserved");
+
   const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
     cwd: "~", engine: "claude",
+    model: null, effort: null,
+    defaultModel: "claude-mythos-5", defaultEffort: "max",
+    onPickModel: () => {}, onPickEffort: () => {},
     onPickCwd: () => {},
     onSend: () => true,
   }));
   const codexNewChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
-    cwd: "~", engine: "codex",
+    cwd: "~", engine: "codex", catalog: liveNewChatCatalog,
+    model: null, effort: null,
+    defaultModel: "gpt-future", defaultEffort: "low",
+    onPickModel: () => {}, onPickEffort: () => {},
     onPickCwd: () => {},
     onSend: () => true,
   }));
@@ -2873,8 +4456,16 @@ try {
     assert.equal(
       (markup.match(/<button[^>]+aria-label="添加文件"/g) ?? []).length, 0);
     assert.match(markup, />开始</);
-    assert.doesNotMatch(markup, /本机默认|默认 ·|选择模型|思考强度/);
+    assert.match(markup, /title="选择模型"/);
+    assert.match(markup, /title="选择思考强度"/);
+    assert.match(markup, /本机默认/);
+    assert.match(markup, /默认/);
   }
+  assert.match(newChatMarkup, /本机默认 · Mythos 5/);
+  assert.match(newChatMarkup, /默认 · max/);
+  assert.match(codexNewChatMarkup, /本机默认 · GPT Future/);
+  assert.match(codexNewChatMarkup, /dynamic catalog model/,
+    "new-session selectors render the live Codex catalog when available");
   assert.doesNotMatch(codexNewChatMarkup, /不询问|Plan|标准/);
   const artifactsMarkup = renderToStaticMarkup(createElement(WorkArtifactsSheet, {
     open: true,
@@ -2889,6 +4480,82 @@ try {
   assert.match(artifactsMarkup, /report\.md/);
   assert.match(artifactsMarkup, /slides\/deck\.pptx/);
   assert.doesNotMatch(artifactsMarkup, /暂不可预览|disabled=""/);
+  const sidebarProps = {
+    open: true,
+    space: "code" as const,
+    onSpaceChange: () => {},
+    sessions: [
+      { session_id: "done-main", summary: "Main", state: "idle" },
+      { session_id: "done-btw", summary: "BTW", state: "idle" },
+      { session_id: "running", summary: "Running", state: "running" },
+    ],
+    liveStates: { running: "running" as const },
+    completionBadges: {
+      "done-main": "main" as const,
+      "done-btw": "btw" as const,
+      running: "main" as const,
+    },
+    activeSessionId: null,
+    onSelect: () => {},
+    onNew: () => {},
+    onNewInDir: () => {},
+    onClose: () => {},
+    onRename: () => {},
+    onArchive: () => {},
+    onPin: () => {},
+    onDelete: () => {},
+    onForkWorktree: () => {},
+  };
+  const completionSidebarMarkup = renderToStaticMarkup(createElement(
+    SessionsSidebar, sidebarProps));
+  assert.match(completionSidebarMarkup, />已完成</);
+  assert.match(completionSidebarMarkup, />BTW 完成</);
+  assert.equal(
+    (completionSidebarMarkup.match(/class="pill completed"/g) ?? []).length,
+    2,
+    "a newly running turn must hide an older completion label",
+  );
+  const btwDraftStore = new ComposerDraftStore();
+  const btwPanelMarkup = renderToStaticMarkup(createElement(BtwPanel, {
+    sid: "btw-render",
+    rt: {
+      ...createRuntime(),
+      state: "running",
+      syncReady: true,
+      model: "gpt-5.6-terra",
+      effort: "high",
+      queue: [{ prompt: "queued follow-up" }],
+    },
+    engine: "codex",
+    opening: false,
+    active: "btw",
+    hasArtifact: false,
+    catalog: {},
+    draftKey: "btw-render-draft",
+    draftStore: btwDraftStore,
+    sendMode: "steer",
+    allQueued: [{ prompt: "queued follow-up" }],
+    replaceableQueued: [{ prompt: "queued follow-up" }],
+    onTab: () => {},
+    onSend: () => true,
+    onSteer: () => true,
+    onInterrupt: () => {},
+    onSetSendMode: () => {},
+    onEnqueue: () => {},
+    onSetPending: () => {},
+    onDequeue: () => {},
+    onSetModel: () => {},
+    onSetEffort: () => {},
+    onOpenFile: () => {},
+    onClose: () => {},
+    onDismissNotice: () => {},
+  }));
+  assert.match(btwPanelMarkup, /GPT-5\.6 Terra/);
+  assert.match(btwPanelMarkup, />high</);
+  assert.match(btwPanelMarkup, /queued follow-up/);
+  assert.match(btwPanelMarkup, />引导</);
+  assert.match(btwPanelMarkup, />排队</);
+  assert.match(btwPanelMarkup, /aria-label="停止"/);
   state = { ...state,
     newChat: { cwd: "/other", model: null, effort: null } };
   state = reduce(state, { type: "event", event: event({
@@ -3992,6 +5659,128 @@ try {
   [{ sid: progressSid, source: "pending" }],
   "the authoritative idle lifecycle frame releases the pending replacement");
 
+  const pinnedBtwSid = "btw-pinned";
+  const pinnedBtwTurn = {
+    id: "btw-turn", prompt: "侧边问题", blocks: [], done: true, ts: 1,
+  };
+  let pinnedBtwState = {
+    ...initialState,
+    focusedSid: "parent-a",
+    btwByParentSid: {
+      "parent-a": { sid: pinnedBtwSid, engine: "codex" },
+    },
+    runtimes: {
+      "parent-a": createRuntime(),
+      "parent-b": createRuntime(),
+      [pinnedBtwSid]: {
+        ...createRuntime(),
+        turns: [pinnedBtwTurn],
+      },
+    },
+  };
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "focus_session", sid: "parent-b",
+  });
+  assert.equal(pinnedBtwState.btwByParentSid["parent-b"], undefined,
+    "a session without its own BTW must not show another session's fork");
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "event", event: event({
+      type: "btw_opened",
+      sid: "btw-parent-b",
+      request_id: "request-parent-b",
+      btw_sid: "btw-parent-b",
+      parent_sid: "parent-b",
+      engine: "claude",
+    }),
+  });
+  assert.deepEqual(pinnedBtwState.btwByParentSid["parent-b"], {
+    sid: "btw-parent-b", engine: "claude",
+  }, "each parent session keeps an independent BTW binding");
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "restore_session_list",
+    sessions: [{ session_id: "claude-session", engine: "claude" }],
+  });
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "enter_new_chat", cwd: "~", cwdSource: "default",
+  });
+  assert.deepEqual(pinnedBtwState.btwByParentSid["parent-a"], {
+    sid: pinnedBtwSid, engine: "codex",
+  });
+  assert.deepEqual(
+    pinnedBtwState.runtimes[pinnedBtwSid]?.turns,
+    [pinnedBtwTurn],
+    "session and harness navigation must retain the pinned btw transcript",
+  );
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "enqueue",
+    sid: pinnedBtwSid,
+    query: { prompt: "queued in btw" },
+  });
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "set_pending",
+    sid: pinnedBtwSid,
+    query: { prompt: "replace after interrupt" },
+  });
+  assert.deepEqual(
+    pinnedBtwState.runtimes[pinnedBtwSid]?.queue.map(
+      (query: { prompt: string }) => query.prompt),
+    ["queued in btw"],
+  );
+  assert.equal(
+    pinnedBtwState.runtimes[pinnedBtwSid]?.pendingSend?.prompt,
+    "replace after interrupt",
+  );
+  assert.deepEqual(pinnedBtwState.runtimes["parent-a"]?.queue, [],
+    "BTW queue updates must not mutate the parent runtime");
+  const btwDrainState = {
+    ...pinnedBtwState,
+    runtimes: {
+      ...pinnedBtwState.runtimes,
+      [pinnedBtwSid]: {
+        ...pinnedBtwState.runtimes[pinnedBtwSid],
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  };
+  assert.deepEqual(selectDrainCandidates<{ prompt: string }>(
+    btwDrainState.runtimes, new Set(), true, true,
+  ).filter((candidate) => candidate.sid === pinnedBtwSid)
+    .map(({ sid, source, query }) => ({ sid, source, prompt: query.prompt })),
+  [{
+    sid: pinnedBtwSid,
+    source: "pending",
+    prompt: "replace after interrupt",
+  }], "the BTW pending replacement wins only within its own runtime");
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "clear_btw", parentSid: "parent-a",
+  });
+  assert.equal(pinnedBtwState.btwByParentSid["parent-a"], undefined);
+  assert.equal(pinnedBtwSid in pinnedBtwState.runtimes, false,
+    "explicit close discards only that parent's ephemeral BTW runtime");
+  assert.deepEqual(pinnedBtwState.btwByParentSid["parent-b"], {
+    sid: "btw-parent-b", engine: "claude",
+  }, "closing one session's BTW must not close a sibling session's BTW");
+  assert.equal("btw-parent-b" in pinnedBtwState.runtimes, true);
+
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "event", event: event({
+      type: "session_rekey",
+      sid: "parent-real",
+      old_key: "parent-b",
+      session_id: "parent-real",
+    }),
+  });
+  assert.equal(pinnedBtwState.btwByParentSid["parent-b"], undefined);
+  assert.deepEqual(pinnedBtwState.btwByParentSid["parent-real"], {
+    sid: "btw-parent-b", engine: "claude",
+  }, "a parent id capture must carry its BTW binding to the real session id");
+
+  pinnedBtwState = reduce(pinnedBtwState, { type: "clear_all_btw" });
+  assert.deepEqual(pinnedBtwState.btwByParentSid, {});
+  assert.equal("btw-parent-b" in pinnedBtwState.runtimes, false,
+    "wrapper lifecycle reset must discard every ephemeral BTW runtime");
+
   const { CommandSheet } = await reducerHarness.ssrLoadModule(
     "/src/components/CommandSheet.tsx");
   const picked: string[] = [];
@@ -4185,7 +5974,7 @@ class FakeWebSocket {
   }
 
   receive(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 19, ts: 1, ...frame }) });
+    this.onmessage?.({ data: JSON.stringify({ v: 20, ts: 1, ...frame }) });
   }
 }
 
@@ -4231,7 +6020,7 @@ assert.equal("sid" in JSON.parse(socket.sent.at(-1) ?? "{}"), false);
 socket.receive({ type: "session_focus", session_id: "surface-work" });
 relay.sendGetContext();
 assert.equal(JSON.parse(socket.sent.at(-1) ?? "{}").sid, "surface-work");
-relay.setSurface("codex", "code");
+  relay.setSurface("codex", "code");
 
 relay.sendGetWorkArtifacts("claude", "surface-work");
 const artifactsFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
@@ -4240,7 +6029,92 @@ assert.equal(artifactsFrame.engine, "claude");
 assert.equal(artifactsFrame.session_id, "surface-work");
 assert.equal(typeof artifactsFrame.client_id, "string");
 
+  relay.setFocusedSid("main-after-navigation", "claude", "code");
+  assert.equal(relay.sendGetHistory(
+    "history-with-cwd", null, 4, "/project/from-list"), true);
+const historyWithCwdFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(historyWithCwdFrame.type, "get_history");
+assert.equal(historyWithCwdFrame.session_id, "history-with-cwd");
+assert.equal(historyWithCwdFrame.cwd, "/project/from-list");
+assert.equal(relay.sendGetTurnDetail(
+  "history-with-cwd", "detail-turn", "detail-revision",
+  "detail-before-cursor", 48,
+), true);
+const pagedDetailFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.deepEqual({
+  type: pagedDetailFrame.type,
+  session_id: pagedDetailFrame.session_id,
+  turn_id: pagedDetailFrame.turn_id,
+  revision: pagedDetailFrame.revision,
+  before: pagedDetailFrame.before,
+  limit: pagedDetailFrame.limit,
+}, {
+  type: "get_turn_detail",
+  session_id: "history-with-cwd",
+  turn_id: "detail-turn",
+  revision: "detail-revision",
+  before: "detail-before-cursor",
+  limit: 48,
+}, "intra-turn detail paging carries its exact cursor and bounded page size");
+relay.sendGetFilePreview(
+  "notes.md", "btw-preview-request", "btw-pinned",
+);
+const btwPreviewFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwPreviewFrame.type, "get_file_preview");
+assert.equal(btwPreviewFrame.sid, "btw-pinned",
+  "a pinned BTW file preview must not follow the newly focused main session");
+relay.sendSaveMarkdown(
+  "notes.md", "updated", 7, "8", "revision",
+  "btw-save-request", "btw-pinned",
+);
+const btwSaveFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwSaveFrame.type, "save_markdown");
+assert.equal(btwSaveFrame.sid, "btw-pinned");
+relay.sendGetPreviewAsset(
+  "image.png", "btw-preview-request",
+  "btw-asset-request", "btw-pinned",
+);
+const btwAssetFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwAssetFrame.type, "get_preview_asset");
+assert.equal(btwAssetFrame.sid, "btw-pinned");
+relay.sendInterruptTo("btw-pinned");
+const btwInterruptFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwInterruptFrame.type, "interrupt");
+assert.equal(btwInterruptFrame.sid, "btw-pinned");
+assert.equal(typeof btwInterruptFrame.client_id, "string");
+relay.sendSetModelTo("btw-pinned", "gpt-5.6-terra");
+const btwModelFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwModelFrame.type, "set_model");
+assert.equal(btwModelFrame.sid, "btw-pinned");
+assert.equal(btwModelFrame.model, "gpt-5.6-terra");
+relay.sendSetEffortTo("btw-pinned", "high");
+const btwEffortFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(btwEffortFrame.type, "set_effort");
+assert.equal(btwEffortFrame.sid, "btw-pinned");
+assert.equal(btwEffortFrame.effort, "high");
+
 const codexModels = modelsFor("codex");
+const opus5 = MODELS.find((model) => model.id === "claude-opus-5[1m]");
+assert.ok(opus5, "Claude's curated model sheet must expose Opus 5 with 1M context");
+assert.equal(MODELS[0].id, "claude-opus-5[1m]",
+  "Opus 5 with 1M context must be the default curated Claude card");
+assert.equal(opus5.name, "Opus 5");
+assert.match(opus5.ds, /1M 上下文/);
+assert.equal(matchModelId("claude-opus-5[1m]", "claude"),
+  "claude-opus-5[1m]",
+  "an exact context-qualified Claude model id must not be reduced to its base alias");
+assert.equal(matchModelId("claude-opus-5", "claude"),
+  "claude-opus-5[1m]",
+  "the legacy unqualified Opus 5 alias must resolve to the curated 1M model");
+assert.equal(matchModelId("claude-mythos-5[1m]", "claude"),
+  "claude-mythos-5",
+  "context suffix compatibility must remain for existing Claude cards");
+assert.equal(matchModelId("claude-opus-5-custom", "claude"),
+  "claude-opus-5-custom",
+  "a provider-specific model id must not be swallowed by the curated Opus alias");
+assert.equal(matchModelId("claude-opus-5[provider]", "claude"),
+  "claude-opus-5[provider]",
+  "only the literal 1M suffix may participate in curated model compatibility");
 assert.equal(clientSlashesFor("codex").has("plan"), true);
 assert.equal(clientSlashesFor("codex").has("normal"), true);
 assert.equal(commandsFor("codex").some((command) => (
@@ -4315,9 +6189,58 @@ assert.match(appSource, /prepareSurfaceSwitch\(nextEngine, space\)/,
   "engine switches must restore their own remembered surface session");
 assert.match(appSource, /prepareSurfaceSwitch\(engine, next\)/,
   "Work/Code switches must share the remembered-session restoration path");
+assert.match(appSource,
+  /authoritativeSurfaceListsRef\.current\.has\(surfaceKey\)/,
+  "notification navigation must wait for an authoritative surface list");
+assert.match(appSource,
+  /notificationOriginRef\.current === null[\s\S]*?authoritativeSurfaceListsRef\.current\.delete\(surfaceKey\)/,
+  "each notification click must invalidate a pre-click target catalog");
+assert.match(appSource, /resolveNotificationNavigation\(\{/,
+  "notification navigation must pass through the fail-closed resolver");
+assert.match(appSource, /focusListedSession\(navigation\.session\)/,
+  "notification and sidebar navigation must share the exact focus path");
+assert.match(appSource,
+  /msg\.type === "turn_end" && msg\.sid && msg\.notification_context/,
+  "buffered or historical TurnEnd frames must never create a local notification");
+assert.match(appSource, /cancelPendingNotificationTarget\(\)/,
+  "manual navigation must be able to cancel a pending notification target");
+assert.match(appSource,
+  /authoritativeSurfaceListsRef\.current\.clear\(\);\s*notificationListRequestRef\.current = null;/,
+  "a machine change must clear the prior socket's list request marker");
+assert.match(appSource,
+  /const ws = wsRef\.current;\s*if \(!ws\) return;[\s\S]*?if \(ws\.sendListSessions/,
+  "a target list is marked requested only after the current socket accepts it");
+assert.match(appSource,
+  /if \(s === "connected"\) \{[\s\S]*?notificationListRequestRef\.current = null;[\s\S]*?bumpNotificationListRevision\(\)/,
+  "each underlying socket connection must retry an unresolved target list");
+assert.doesNotMatch(appSource,
+  /sendCloseBtw\(s\); dispatch\(\{ type: "clear_btw" \}\); \}\s*[\s\S]{0,120}\}, \[focusedSid, engine\]\)/,
+  "session and harness navigation must retain a session-scoped BTW");
+assert.match(appSource,
+  /const activeBtw = visibleParentSid \? state\.btwByParentSid\[visibleParentSid\] : undefined/,
+  "only the focused parent session may expose its BTW binding");
+assert.match(appSource,
+  /const closeBtw = \(\) => \{[\s\S]*?sendCloseBtw\(activeBtw\.sid\)/,
+  "the explicit close action must target only the visible session's BTW");
+assert.match(appSource,
+  /const previewBtwFile = [\s\S]{0,120}previewFileForSid\(activeBtwSid/,
+  "BTW file actions must stay bound to the visible session's fork");
+assert.match(appSource, /sendInterruptTo\(sid\)/,
+  "BTW stop must target the captured fork sid");
+assert.match(appSource, /sendSetModelTo\(sid, model\)/,
+  "BTW model changes must never follow focusedSid");
+assert.match(appSource, /sendSetEffortTo\(sid, effort\)/,
+  "BTW effort changes must never follow focusedSid");
+assert.match(appSource, /btwSendModeBySid/,
+  "BTW send mode must not reuse the main composer's global mode");
 assert.match(appSource, /if \(latest && latest\.session_id !== state\.focusedSid\) \{\s*dispatch\(\{ type: "exit_new_chat" \}\)/,
   "restored focus must replace the temporary new-session page");
-assert.match(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/);
+assert.match(appSource, /<HeaderMenu[\s\S]*notificationMode=\{notificationMode\}/,
+  "authenticated header actions must be grouped behind the three-dot menu");
+assert.doesNotMatch(appSource, /className="iconbtn header-theme"/,
+  "the authenticated header must not retain a separate theme shortcut");
+assert.doesNotMatch(appSource, /aria-label="退出登录" title="退出登录"><Icon name="logout"/,
+  "the authenticated header must not retain a separate logout shortcut");
 assert.match(appSource, /rt\.replaying \|\| !rt\.syncReady \? "syncing" : "online"/,
   "cached terminal state must be downgraded until the focused session is authoritative");
 assert.match(appSource, /legacyExternal=\{!rt\.control && !!rt\.external\}/,
@@ -4432,16 +6355,274 @@ assert.match(composerSource, /case "skills": p\.onOpenExtensions\?\.\("skill"\)/
   "Skills remain reachable from the composer on mobile");
 assert.match(composerSource, /case "hooks": p\.onOpenExtensions\?\.\("hook"\)/,
   "Hooks remain reachable from the composer on mobile");
-assert.match(appSource, /className=\{`iconbtn header-notify/,
-  "notification settings remain reachable on mobile");
-assert.match(layoutCss, /\.header-theme\{ display:none; \}/,
-  "only the non-essential theme shortcut may collapse on the narrowest header");
+const headerMenuSource = readFileSync(
+  resolve(process.cwd(), "src/components/HeaderMenu.tsx"), "utf8");
+assert.match(headerMenuSource, /createPortal\(/,
+  "the desktop menu must escape the clipped header");
+assert.match(headerMenuSource, /event\.key === "Escape"/);
+assert.match(headerMenuSource, /document\.contains\(trigger\).*trigger\.focus\(\)/s,
+  "closing the menu restores focus to the three-dot trigger");
+assert.match(headerMenuSource, /data-lock-horizontal-swipe/,
+  "the menu trigger and portal must opt out of global horizontal navigation");
+assert.match(headerMenuSource,
+  /<div className="header-menu-scrim"[^>]*onClick=/s,
+  "outside taps must close only after the complete click to prevent touch-through");
+assert.doesNotMatch(headerMenuSource,
+  /<div className="header-menu-scrim"[^>]*onPointerDown=/s,
+  "pointerdown must not unmount the scrim before the tap click is dispatched");
+assert.doesNotMatch(headerMenuSource, /header-menu-close/,
+  "the anchored menu closes through its trigger, outside tap, or Escape without an extra X");
+assert.match(headerMenuSource,
+  /top: Math\.min\(rect\.bottom \+ 8, window\.innerHeight - 24\)/,
+  "the header menu must stay anchored below its trigger within the viewport");
+assert.match(layoutCss, /\.header-menu-card\{[^}]*position:fixed/s);
+assert.match(layoutCss,
+  /\.header-menu-card\{[^}]*right:max\(var\(--header-menu-right\),env\(safe-area-inset-right\)\)/s,
+  "the anchored header menu must respect the iPhone right safe area");
+assert.doesNotMatch(layoutCss,
+  /\.header-menu-card\{ top:auto!important; right:0!important; bottom:/,
+  "mobile header actions must remain anchored to the three-dot trigger");
+assert.match(layoutCss, /env\(safe-area-inset-bottom\)/,
+  "mobile overlays and composers must preserve the home-indicator safe area");
+const serviceWorkerSource = readFileSync(
+  resolve(process.cwd(), "public/sw.js"), "utf8");
+assert.match(serviceWorkerSource, /existing\.postMessage\(\{[\s\S]*cc-remote-notification/,
+  "an already-open page must receive the exact notification target");
+assert.match(serviceWorkerSource, /self\.clients\.openWindow\(target\)/,
+  "cold notification clicks must retain the fragment route");
 assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\)/,
-  "the mobile sheet height accounts for the virtual keyboard inset");
+  "keyboard-aware mobile sheets must account for the virtual keyboard inset");
+
+class MemoryStorage {
+  readonly values = new Map<string, string>();
+  getItem(key: string) { return this.values.get(key) ?? null; }
+  setItem(key: string, value: string) { this.values.set(key, value); }
+  removeItem(key: string) { this.values.delete(key); }
+}
+const legacyNotifications = new MemoryStorage();
+legacyNotifications.setItem("cc_remote_notifications", "1");
+assert.equal(readNotificationMode(legacyNotifications), "generic");
+assert.equal(legacyNotifications.getItem(NOTIFICATION_MODE_KEY), "generic",
+  "legacy enabled users must migrate to the privacy-preserving generic mode");
+writeNotificationMode(legacyNotifications, "session");
+assert.equal(legacyNotifications.getItem("cc_remote_notifications"), "1",
+  "the rollback-compatible enabled marker remains set for both active modes");
+writeNotificationMode(legacyNotifications, "off");
+assert.equal(legacyNotifications.getItem("cc_remote_notifications"), null);
+
+const notificationRoute = {
+  machine_id: "nono",
+  session_id: "session-a",
+  engine: "codex" as const,
+  space: "work" as const,
+};
+const notificationUrl = encodeNotificationRoute(notificationRoute);
+assert.match(notificationUrl, /^\/#notification=/);
+assert.deepEqual(
+  parseNotificationFragment(new URL(notificationUrl, "https://remote.example").hash),
+  notificationRoute,
+);
+assert.equal(parseNotificationFragment(
+  `#notification=${encodeURIComponent(JSON.stringify({
+    ...notificationRoute, injected: "value",
+  }))}`), null, "unknown notification-route fields must fail closed");
+assert.equal(parseNotificationFragment(
+  `#notification=${encodeURIComponent(JSON.stringify({
+    ...notificationRoute, session_id: "../../other",
+  }))}`), null, "notification routes accept only protocol-safe session ids");
+assert.equal(parseNotificationFragment(
+  `?notification=${encodeURIComponent(JSON.stringify(notificationRoute))}`), null,
+  "notification routing must never use a query string");
+let replacedNotificationUrl = "";
+assert.deepEqual(captureNotificationFragment({
+  hash: new URL(notificationUrl, "https://remote.example").hash,
+  pathname: "/",
+  search: "",
+}, {
+  setItem() { throw new Error("storage unavailable"); },
+}, {
+  replaceState(_data, _unused, url) {
+    replacedNotificationUrl = String(url);
+  },
+}), notificationRoute,
+"a valid route remains usable in memory when sessionStorage is unavailable");
+assert.equal(replacedNotificationUrl, "/",
+  "notification fragments must be cleared even when storage is unavailable");
+
+const notificationOrigin = {
+  machineId: "mac",
+  engine: "claude" as const,
+  space: "code" as const,
+  sid: "origin-session",
+};
+const navigationBase = {
+  target: notificationRoute,
+  origin: notificationOrigin,
+  deviceState: "ready" as const,
+  authorizedMachineIds: ["mac", "nono"],
+  machineId: "nono",
+  engine: "claude" as const,
+  space: "code" as const,
+};
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  authoritativeSessions: null,
+}), {
+  kind: "request_list",
+  engine: "codex",
+  space: "work",
+}, "the authoritative target list must arrive before focus");
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  authoritativeSessions: [],
+}), {
+  kind: "fail",
+  reason: "session_missing",
+  restore: notificationOrigin,
+}, "an unknown cross-device sid must restore the exact origin");
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  origin: { ...notificationOrigin, machineId: "nono" },
+  authoritativeSessions: [],
+}), {
+  kind: "fail",
+  reason: "session_missing",
+  restore: null,
+}, "an unknown sid on another surface must not switch that surface");
+const listedNotificationSession = {
+  session_id: notificationRoute.session_id,
+  summary: "Release prep",
+};
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  authoritativeSessions: [listedNotificationSession],
+}), {
+  kind: "switch_surface",
+  engine: "codex",
+  space: "work",
+  session: {
+    ...listedNotificationSession,
+    engine: "codex",
+    space: "work",
+  },
+});
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  machineId: "mac",
+  authoritativeSessions: null,
+}), {
+  kind: "switch_machine",
+  machineId: "nono",
+}, "a validated cross-device target switches only the machine first");
+assert.deepEqual(resolveNotificationNavigation({
+  ...navigationBase,
+  deviceState: "error",
+  authoritativeSessions: null,
+}), {
+  kind: "fail",
+  reason: "devices_unavailable",
+  restore: notificationOrigin,
+}, "device-list failure after a cross-device switch restores the origin");
+
+type DeferredBinding = {
+  target: PushBindingTarget | null;
+  resolve: (enabled: boolean) => void;
+};
+const bindingCalls: DeferredBinding[] = [];
+const bindingCoordinator = new PushBindingCoordinator(
+  (target) => new Promise<boolean>((resolveBinding) => {
+    bindingCalls.push({ target, resolve: resolveBinding });
+  }),
+);
+const bindingA = { machineId: "machine-a", mode: "generic" as const };
+const bindingB = { machineId: "machine-b", mode: "session" as const };
+const bindA = bindingCoordinator.setTarget(bindingA);
+const bindB = bindingCoordinator.setTarget(bindingB);
+await Promise.resolve();
+assert.deepEqual(bindingCalls.map((entry) => entry.target), [bindingA],
+  "machine rebinds must be serialized");
+bindingCalls[0].resolve(true);
+await Promise.resolve();
+await Promise.resolve();
+assert.deepEqual(bindingCalls.map((entry) => entry.target), [bindingA, bindingB]);
+assert.equal(bindingCoordinator.isRemoteActive("machine-b"), false,
+  "an old machine binding must not masquerade as the new target");
+bindingCalls[1].resolve(true);
+await Promise.all([bindA, bindB]);
+assert.equal(bindingCoordinator.snapshot().state, "remote");
+assert.equal(bindingCoordinator.isRemoteActive("machine-b"), true);
+assert.equal(bindingCoordinator.isRemoteActive("machine-a"), false);
+
+const reboundCalls: DeferredBinding[] = [];
+const reboundCoordinator = new PushBindingCoordinator(
+  (target) => new Promise<boolean>((resolveBinding) => {
+    reboundCalls.push({ target, resolve: resolveBinding });
+  }),
+);
+const reboundA1 = reboundCoordinator.setTarget(bindingA);
+const reboundB = reboundCoordinator.setTarget(bindingB);
+const reboundA2 = reboundCoordinator.setTarget(bindingA);
+await Promise.resolve();
+reboundCalls[0].resolve(true);
+await Promise.all([reboundA1, reboundB, reboundA2]);
+assert.deepEqual(reboundCalls.map((entry) => entry.target), [bindingA],
+  "A to B to A coalesces to the latest binding without stale completion");
+assert.equal(reboundCoordinator.isRemoteActive("machine-a"), true);
+
+const recoveryCalls: DeferredBinding[] = [];
+const recoveryCoordinator = new PushBindingCoordinator(
+  (target) => new Promise<boolean>((resolveBinding) => {
+    recoveryCalls.push({ target, resolve: resolveBinding });
+  }),
+);
+const recoveryA = recoveryCoordinator.setTarget(bindingA);
+await Promise.resolve();
+recoveryCalls[0].resolve(true);
+await recoveryA;
+const recoveryB = recoveryCoordinator.setTarget(bindingB);
+await Promise.resolve();
+assert.equal(recoveryCoordinator.isRemoteActive("machine-b"), false);
+recoveryCalls[1].resolve(false);
+await recoveryB;
+assert.equal(recoveryCoordinator.snapshot().state, "local");
+assert.equal(recoveryCoordinator.isRemoteActive("machine-a"), false,
+  "a failed machine-B bind cannot report the stale machine-A endpoint as active");
+await recoveryCoordinator.setTarget(bindingA);
+assert.equal(recoveryCoordinator.snapshot().state, "remote",
+  "returning to the last confirmed binding recovers without another mutation");
+
+const modeCalls: DeferredBinding[] = [];
+const modeCoordinator = new PushBindingCoordinator(
+  (target) => new Promise<boolean>((resolveBinding) => {
+    modeCalls.push({ target, resolve: resolveBinding });
+  }),
+);
+const genericA = modeCoordinator.setTarget(bindingA);
+await Promise.resolve();
+modeCalls[0].resolve(true);
+await genericA;
+const sessionA = {
+  machineId: bindingA.machineId,
+  mode: "session" as const,
+};
+const modeUpdate = modeCoordinator.setTarget(sessionA);
+await Promise.resolve();
+assert.equal(modeCoordinator.snapshot().state, "binding");
+assert.equal(modeCoordinator.isRemoteActive(bindingA.machineId), true,
+  "same-machine privacy-mode updates retain remote ownership while binding");
+modeCalls[1].resolve(false);
+await modeUpdate;
+assert.equal(modeCoordinator.isRemoteActive(bindingA.machineId), true,
+  "a failed same-machine update must not add a duplicate local notification");
 
 const successfulTurn = {
-  v: 19, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
+  v: 20, type: "turn_end" as const, ts: 1, sid: "session-a", turn_id: "turn-a",
   result: { subtype: "success", duration_ms: 1, is_error: false },
+  notification_context: {
+    engine: "codex" as const,
+    space: "work" as const,
+    display_name: "Release prep",
+  },
 };
 const interruptedTurn = {
   ...successfulTurn, ts: 2, turn_id: "turn-b",
@@ -4452,6 +6633,22 @@ assert.equal(classifyTurnNotification(interruptedTurn.result), "interrupted");
 assert.equal(turnNotificationBody("Codex", interruptedTurn.result), "Codex 会话已中断");
 assert.notEqual(turnNotificationTag(successfulTurn), turnNotificationTag(interruptedTurn),
   "successive turns in one session must not replace each other's notifications");
+assert.deepEqual(turnNotificationPresentation(successfulTurn, "session"), {
+  title: "Release prep",
+  body: "Codex 会话已经完成",
+  sessionId: "session-a",
+  engine: "codex",
+  space: "work",
+});
+assert.equal(
+  turnNotificationPresentation(interruptedTurn, "session").body,
+  "Codex 会话已中断",
+);
+assert.equal(
+  turnNotificationPresentation(successfulTurn, "generic").sessionId,
+  null,
+  "generic notifications must not retain an exact route",
+);
 const chatViewSource = readFileSync(
   resolve(process.cwd(), "src/components/ChatView.tsx"), "utf8");
 assert.match(chatViewSource, /surface !== "work"/);
@@ -4581,7 +6778,7 @@ controlSocket.onopen?.();
 const wireControlSid = "wire-control-revision";
 controlRelay.seedReplayState({}, {}, {
   [wireControlSid]: {
-    v: 19, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 20, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation", revision: 10,
   },
@@ -4599,7 +6796,7 @@ controlSocket.receive({
   revision: "wire-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 19, ts: 1, type: "session_control", sid: wireControlSid,
+    v: 20, ts: 1, type: "session_control", sid: wireControlSid,
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 9,
   },
@@ -4613,7 +6810,7 @@ controlSocket.receive({
   revision: "wire-cross-session-history", generation: "wire-generation",
   has_more: false, events: [],
   control: {
-    v: 19, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 20, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -4627,7 +6824,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation",
   control: {
-    v: 19, ts: 1, type: "session_control", sid: "wire-other-session",
+    v: 20, ts: 1, type: "session_control", sid: "wire-other-session",
     control_mode: "external_cli", write_state: "read_only",
     terminal_attached: true, generation: "wire-generation", revision: 100,
   },
@@ -4656,7 +6853,7 @@ controlSocket.receive({
   type: "snapshot", sid: wireControlSid, cc_session_id: wireControlSid,
   state: "idle", tail_text: "", generation: "wire-generation-next",
   control: {
-    v: 19, ts: 2, type: "session_control", sid: wireControlSid,
+    v: 20, ts: 2, type: "session_control", sid: wireControlSid,
     control_mode: "remote", write_state: "writable",
     terminal_attached: false, generation: "wire-generation-next", revision: 0,
   },
@@ -4690,12 +6887,12 @@ controlRelay.seedReplayState(
   { [aliasOld]: "wire-alias-live", [aliasReal]: "wire-alias-cache" },
   {
     [aliasOld]: {
-      v: 19, ts: 3, type: "session_control", sid: aliasOld,
+      v: 20, ts: 3, type: "session_control", sid: aliasOld,
       control_mode: "remote", write_state: "writable",
       terminal_attached: false, generation: "wire-alias-live", revision: 2,
     },
     [aliasReal]: {
-      v: 19, ts: 2, type: "session_control", sid: aliasReal,
+      v: 20, ts: 2, type: "session_control", sid: aliasReal,
       control_mode: "desktop", write_state: "read_only",
       terminal_attached: true, generation: "wire-alias-cache", revision: 50,
     },
@@ -4914,5 +7111,173 @@ acceptanceReconnectSocket.receive({
 assert.equal(acceptanceRelay.pendingQueryFor("accept-wire-b"), null,
   "a matching appended native History head recovers an echo missed during reconnect");
 acceptanceRelay.stop();
+
+// Steer uses the same reliable outbox and narrative acceptance barrier as a
+// query, but always targets its explicit sid rather than the current focus.
+const steerRelay = new RelayWs({
+  onEvent: () => {},
+  onConnState: () => {},
+});
+steerRelay.start();
+const steerSocket = FakeWebSocket.instances.at(-1);
+assert.ok(steerSocket);
+steerSocket.onopen?.();
+steerRelay.setSessionEngines([
+  { session_id: "steer-target", engine: "codex", space: "code" },
+  { session_id: "steer-focused", engine: "codex", space: "code" },
+]);
+steerRelay.setFocusedSid("steer-focused", "codex", "code");
+const steerSentBeforeEmptyTarget = steerSocket.sent.length;
+assert.equal(steerRelay.sendSteerTo(
+  "", "must not follow focus", "steer-without-target"), false);
+assert.equal(steerSocket.sent.length, steerSentBeforeEmptyTarget,
+  "steer requires an explicit non-empty session id");
+assert.equal(steerRelay.sendSteerTo(
+  "steer-target",
+  "change the active task",
+  "steer-message",
+  [{ media_type: "image/png", data: "steer-wire-image" }],
+  [{ filename: "steer-wire.txt", data: "steer-wire-file" }],
+), true);
+const steerFrame = JSON.parse(steerSocket.sent.at(-1) ?? "{}");
+assert.deepEqual({
+  type: steerFrame.type,
+  sid: steerFrame.sid,
+  prompt: steerFrame.prompt,
+  msg_id: steerFrame.msg_id,
+  images: steerFrame.images,
+  files: steerFrame.files,
+}, {
+  type: "steer",
+  sid: "steer-target",
+  prompt: "change the active task",
+  msg_id: "steer-message",
+  images: [{ media_type: "image/png", data: "steer-wire-image" }],
+  files: [{ filename: "steer-wire.txt", data: "steer-wire-file" }],
+}, "sendSteerTo serializes the explicit target and complete payload");
+assert.equal(typeof steerFrame.client_id, "string");
+assert.equal(typeof steerFrame.cmd_id, "string");
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "a sent steer remains protected until its narrative acceptance arrives");
+assert.equal(steerRelay.pendingQueryFor("steer-focused"), null,
+  "the focused runtime cannot inherit another session's steer latch");
+assert.equal(steerRelay.sendSteerTo(
+  "steer-target", "must wait", "steer-message-2"), false,
+  "one target cannot queue a second direct steer before acceptance");
+
+(steerRelay as unknown as { connect: () => void }).connect();
+const steerReconnectSocket = FakeWebSocket.instances.at(-1);
+assert.ok(steerReconnectSocket && steerReconnectSocket !== steerSocket);
+steerReconnectSocket.onopen?.();
+const steerReplayFrames = steerReconnectSocket.sent.map(
+  (raw) => JSON.parse(raw) as Record<string, unknown>);
+assert.deepEqual(
+  steerReplayFrames.map((frame) => frame.type),
+  ["hello", "switch_session", "steer", "switch_session"],
+  "reconnect makes the steer target resident, replays its outbox frame, then restores focus",
+);
+assert.equal(steerReplayFrames[1].session_id, "steer-target");
+assert.equal(steerReplayFrames[2].sid, "steer-target");
+assert.equal(steerReplayFrames[2].cmd_id, steerFrame.cmd_id,
+  "outbox replay preserves the steer command identity for server deduplication");
+assert.equal(steerReplayFrames[3].session_id, "steer-focused");
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "the steer narrative latch survives automatic reconnect");
+
+steerReconnectSocket.receive({
+  type: "turn_steered",
+  sid: "steer-focused",
+  msg_id: "steer-message",
+  turn_id: "wrong-native-task",
+  prompt: "wrong target",
+});
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "a TurnSteered from another sid cannot release the target's latch");
+steerReconnectSocket.receive({
+  type: "command_ack",
+  client_id: steerFrame.client_id,
+  cmd_id: steerFrame.cmd_id,
+});
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "transport ACK removes the outbox frame but is not narrative steer acceptance");
+
+(steerRelay as unknown as { connect: () => void }).connect();
+const steerAckedReconnectSocket = FakeWebSocket.instances.at(-1);
+assert.ok(steerAckedReconnectSocket
+  && steerAckedReconnectSocket !== steerReconnectSocket);
+steerAckedReconnectSocket.onopen?.();
+assert.equal(
+  steerAckedReconnectSocket.sent.some((raw) =>
+    JSON.parse(raw).type === "steer"),
+  false,
+  "an ACKed steer is not replayed from the outbox on a later reconnect",
+);
+assert.equal(steerRelay.pendingQueryFor("steer-target"), "steer-message",
+  "the ACKed narrative latch still survives that later reconnect");
+steerAckedReconnectSocket.receive({
+  type: "turn_steered",
+  sid: "steer-target",
+  msg_id: "steer-message",
+  turn_id: "steer-native-task",
+  prompt: "change the active task",
+});
+assert.equal(steerRelay.pendingQueryFor("steer-target"), null,
+  "the exact TurnSteered echo is authoritative steer acceptance");
+steerRelay.stop();
+
+// A materialized steer alias is exact acceptance even on a cold socket with no
+// frozen History baseline. The native rollout id remains distinct from the
+// browser command id by design.
+const aliasSteerRelay = new RelayWs({
+  onEvent: () => {},
+  onConnState: () => {},
+});
+aliasSteerRelay.start();
+const aliasSteerSocket = FakeWebSocket.instances.at(-1);
+assert.ok(aliasSteerSocket);
+aliasSteerSocket.onopen?.();
+aliasSteerRelay.setFocusedSid("alias-steer", "codex", "code");
+assert.equal(aliasSteerRelay.sendSteerTo(
+  "alias-steer", "recover by alias", "alias-steer-message"), true);
+aliasSteerSocket.receive({
+  type: "history", sid: "alias-steer", session_id: "alias-steer",
+  revision: "alias-steer-revision", generation: "alias-steer-generation",
+  build_seq: 1, live_seq: 1, detail: "summary", events: [],
+  turns: [{
+    id: "native-steer-row",
+    clientMsgId: "alias-steer-message",
+    prompt: "recover by alias",
+    blocks: [],
+    done: false,
+    detailEventCount: 1,
+    detailLoaded: false,
+  }],
+  has_more: false,
+  oldest_id: "native-steer-row",
+  newest_id: "native-steer-row",
+});
+assert.equal(aliasSteerRelay.pendingQueryFor("alias-steer"), null,
+  "ConversationTurn.clientMsgId releases a cold steer acceptance latch");
+
+assert.equal(aliasSteerRelay.sendSteerTo(
+  "alias-steer", "recover from full events", "alias-event-message"), true);
+aliasSteerSocket.receive({
+  type: "history", sid: "alias-steer", session_id: "alias-steer",
+  revision: "alias-steer-revision-2", generation: "alias-steer-generation",
+  build_seq: 2, live_seq: 2, detail: "full",
+  events: [{
+    type: "user_msg",
+    msg_id: "native-event-row",
+    client_msg_id: "alias-event-message",
+    prompt: "recover from full events",
+  }],
+  turns: [],
+  has_more: false,
+  oldest_id: "native-event-row",
+  newest_id: "native-event-row",
+});
+assert.equal(aliasSteerRelay.pendingQueryFor("alias-steer"), null,
+  "UserMsg.client_msg_id releases a full-history steer acceptance latch");
+aliasSteerRelay.stop();
 
 console.log("web reliability tests passed");

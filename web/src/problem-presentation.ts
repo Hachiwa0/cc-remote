@@ -1,6 +1,8 @@
 import type { ErrorMsg } from "./protocol";
 
 const OWNERSHIP_GUIDANCE = /(本机终端|原生 .*CLI|Codex App|Claude TUI)/;
+const INCOMPLETE_CLAUDE_SESSION =
+  "Claude 会话历史不完整，无法恢复；可从会话菜单删除该条目。";
 
 function ownershipMessage(message: string): string | null {
   if (!OWNERSHIP_GUIDANCE.test(message)) return null;
@@ -41,6 +43,9 @@ export function presentCommandProblem(
       return ownershipMessage(error.message)
         ?? "当前操作暂时无法执行，请稍后重试。";
     case "not_running":
+      if (error.message === INCOMPLETE_CLAUDE_SESSION) {
+        return INCOMPLETE_CLAUDE_SESSION;
+      }
       return "当前会话暂时不可用，请重新进入后重试。";
     case "bad_prompt":
       return "输入内容无效，请检查后重试。";

@@ -21,6 +21,7 @@ from typing import Any
 from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
+from cc_remote.claude_paths import claude_config_dir
 from cc_remote.wrapper.child_env import sanitized_child_env
 from cc_remote.wrapper.claude_runtime import resolve_claude_cli
 from cc_remote.wrapper.codex_rpc import CodexRpcOutcomeUnknown, codex_rpc
@@ -64,9 +65,9 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def _skill_roots(engine: str, cwd: str) -> dict[str, tuple[Path, ...]]:
-    home = Path.home()
     project = Path(cwd)
     if engine == "codex":
+        home = Path.home()
         return {
             "user": (home / ".codex" / "skills",),
             "project": (
@@ -75,15 +76,23 @@ def _skill_roots(engine: str, cwd: str) -> dict[str, tuple[Path, ...]]:
             ),
         }
     return {
-        "user": (home / ".claude" / "skills",),
+        "user": (claude_config_dir() / "skills",),
         "project": (project / ".claude" / "skills",),
     }
+
+
+def _skill_containment_base(engine: str, scope: str, cwd: str) -> Path:
+    if scope == "user":
+        return claude_config_dir() if engine == "claude" else Path.home()
+    return Path(cwd)
 
 
 def _skill_scope(path: Path, engine: str, cwd: str) -> str | None:
     resolved = path.resolve(strict=False)
     for scope, roots in _skill_roots(engine, cwd).items():
-        base = (Path.home() if scope == "user" else Path(cwd)).resolve(strict=False)
+        base = _skill_containment_base(
+            engine, scope, cwd
+        ).resolve(strict=False)
         for root in roots:
             resolved_root = root.resolve(strict=False)
             if (_inside(resolved_root, base)
@@ -294,45 +303,52 @@ def _manifest_metadata(path: Path) -> tuple[str | None, str | None]:
 
 
 def _claude_skills(cwd: str) -> list[dict]:
-    roots = [Path.home() / ".claude" / "skills", Path(cwd) / ".claude" / "skills"]
     items: list[dict] = []
     seen: set[str] = set()
-    for root, scope in ((roots[0], "user"), (roots[1], "project")):
-        base = (Path.home() if scope == "user" else Path(cwd)).resolve(strict=False)
-        if (root.is_symlink()
-                or not _inside(root.resolve(strict=False), base)):
-            continue
-        try:
-            candidates = list(root.iterdir())[:_MAX_ITEMS]
-        except OSError:
-            continue
-        for candidate in candidates:
-            manifest = candidate / "SKILL.md"
-            name, description = _manifest_metadata(manifest)
-            name = name or _text(candidate.name, 512)
-            if not name or name in seen:
+    for scope, roots in _skill_roots("claude", cwd).items():
+        base = _skill_containment_base(
+            "claude", scope, cwd
+        ).resolve(strict=False)
+        for root in roots:
+            if (root.is_symlink()
+                    or not _inside(root.resolve(strict=False), base)):
                 continue
-            seen.add(name)
-            items.append({
-                "kind": "skill", "id": _opaque_id("skill", candidate.resolve()),
-                "name": name,
-                "description": description, "enabled": True, "scope": scope,
-                "actions": ["remove"],
-            })
+            try:
+                candidates = list(root.iterdir())[:_MAX_ITEMS]
+            except OSError:
+                continue
+            for candidate in candidates:
+                manifest = candidate / "SKILL.md"
+                name, description = _manifest_metadata(manifest)
+                name = name or _text(candidate.name, 512)
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                items.append({
+                    "kind": "skill",
+                    "id": _opaque_id("skill", candidate.resolve()),
+                    "name": name,
+                    "description": description,
+                    "enabled": True,
+                    "scope": scope,
+                    "actions": ["remove"],
+                })
     return items
 
 
 def _claude_settings_files(cwd: str) -> tuple[tuple[Path, str], ...]:
     project = Path(cwd) / ".claude"
     return (
-        (Path.home() / ".claude" / "settings.json", "user"),
+        (claude_config_dir() / "settings.json", "user"),
         (project / "settings.json", "project"),
         (project / "settings.local.json", "project-local"),
     )
 
 
 def _settings_path_safe(path: Path, cwd: str, scope: str) -> bool:
-    base = (Path.home() if scope == "user" else Path(cwd)).resolve(strict=False)
+    base = (
+        claude_config_dir() if scope == "user" else Path(cwd)
+    ).resolve(strict=False)
     try:
         return (not path.parent.is_symlink()
                 and _inside(path.parent.resolve(strict=False), base))
@@ -514,7 +530,9 @@ async def _manage_claude_plugin(
 def _local_skill_path(engine: str, skill_id: str, cwd: str) -> Path:
     for scope, roots in _skill_roots(engine, cwd).items():
         for root in roots:
-            base = (Path.home() if scope == "user" else Path(cwd)).resolve(strict=False)
+            base = _skill_containment_base(
+                engine, scope, cwd
+            ).resolve(strict=False)
             if root.is_symlink() or not _inside(root.resolve(strict=False), base):
                 continue
             try:
@@ -575,7 +593,9 @@ def _create_skill(
     if root.is_symlink() or not root.is_dir():
         raise ValueError("Skill 根目录不安全")
     root = root.resolve(strict=True)
-    base = (Path.home() if scope == "user" else Path(cwd)).resolve(strict=True)
+    base = _skill_containment_base(
+        engine, scope, cwd
+    ).resolve(strict=True)
     if not _inside(root, base):
         raise ValueError("Skill 根目录不能指向用户或项目目录之外")
     target = root / name
@@ -718,8 +738,10 @@ def _atomic_update_json(path: Path, mutate) -> None:
 
 
 def _claude_hook_path(cwd: str, scope: str) -> Path:
-    base = (Path.home() if scope == "user" else Path(cwd)).resolve(strict=True)
-    directory = base / ".claude"
+    base = (
+        claude_config_dir() if scope == "user" else Path(cwd)
+    ).resolve(strict=False)
+    directory = base if scope == "user" else base / ".claude"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if directory.is_symlink() or not _inside(directory.resolve(strict=True), base):
         raise ValueError("Hook 配置目录不能指向用户或项目目录之外")

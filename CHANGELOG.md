@@ -2,6 +2,26 @@
 
 [中文](CHANGELOG_zh.md)
 
+## Unreleased
+
+- Upgrade Claude Agent SDK to `0.2.128` and make wrappers explicitly run the
+  user's daily `~/.local/bin/claude` instead of silently selecting the SDK
+  bundle, keeping Remote and terminal credentials and CLI updates aligned.
+- Preserve the user's Claude subscription OAuth setting inside isolated Work
+  policies, and render the built-in `AskUserQuestion` flow as its original
+  single- or multi-select questions instead of a generic tool approval.
+- Align busy Codex input with the official client: sending defaults to native
+  `turn/steer`, queue remains available, and Stop stays an explicit separate
+  action. Claude keeps its interrupt-and-send behavior.
+- Page heavyweight detail from the configured safe source window inside a
+  single very long turn, so the browser's 256-block presentation cap no longer
+  replaces otherwise available process rows with a synthetic omission marker.
+- Reject foreign shared-daemon lifecycle frames during resume binding and
+  reconcile a proven inactive spontaneous turn without leaving a phantom
+  running state.
+- Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v22, with
+  replay-safe user-question close events and multi-select answers.
+
 ## v3.0.0 — 2026-07-24
 
 cc-remote v3 adds an isolated Cowork-style Work surface to the established
@@ -76,7 +96,9 @@ operations.
 - Add shared Darwin/Linux process identity scanning for native Claude ownership
   while keeping takeover limited to an exact same-user process.
 - Add privacy-preserving Web Push for background completion/failure state,
-  scoped by user and machine and containing no conversation text.
+  scoped by user and machine. Existing users migrate to generic notices; an
+  explicit session mode adds a bounded display name and an exact validated
+  device/surface/session route, never prompt, answer, path, or tool content.
 
 ### Mobile and artifact experience
 
@@ -90,6 +112,8 @@ operations.
   sandbox-converted Office previews inside the wrapper security boundary.
 - Refresh PWA and notification assets and fix narrow-screen sheets, process
   timelines, and persistent error presentation.
+- Group authenticated notification, theme, and logout actions behind an
+  accessible three-dot popover on desktop and safe-area-aware sheet on mobile.
 - Keep running indicators above queue/interrupt controls, preserve Claude turn
   durations, and compact repeated tool activity without hiding final replies.
 
@@ -97,7 +121,7 @@ operations.
 
 - Align Python, Codex `clientInfo`, Web package metadata, and the public build
   manifest on product version `3.0.0`.
-- Upgrade the strict wire gate to protocol v19.
+- Upgrade the strict wire gate to protocol v20.
 - Publish reproducible, checksummed Relay/Wrapper archives for Linux x86_64,
   Linux arm64, macOS Intel, and macOS Apple Silicon, with GitHub artifact
   attestations.
@@ -111,10 +135,10 @@ operations.
 
 ### Upgrade notes
 
-- v3.0.0 uses wire protocol v19. Wrapper, relay, and Web must be upgraded
+- v3.0.0 uses wire protocol v20. Wrapper, relay, and Web must be upgraded
   together; mixed protocol versions are rejected.
 - Hard-refresh already-open browser tabs after deployment so they load the v3
-  hashed assets and rebuild their local projection against protocol v19.
+  hashed assets and rebuild their local projection against protocol v20.
 - Keep runtime secrets and machine state outside release directories. Do not
   replace `.env`, `~/.cc-remote`, Claude transcripts, or Codex rollouts.
 - Claude integration remains pinned to `claude-agent-sdk==0.2.119`.

@@ -349,11 +349,14 @@ def _parse_push_subscription(
         return None
     p256dh = keys.get("p256dh")
     auth = keys.get("auth")
+    notification_mode = body.get("notification_mode", "generic")
     if (
         not isinstance(p256dh, str)
         or not _PUSH_KEY_RE.fullmatch(p256dh)
         or not isinstance(auth, str)
         or not _PUSH_KEY_RE.fullmatch(auth)
+        or not isinstance(notification_mode, str)
+        or notification_mode not in {"generic", "session"}
     ):
         return None
     return PushSubscription(
@@ -364,6 +367,7 @@ def _parse_push_subscription(
         auth=auth,
         session_jti=claims.jti,
         expires_at=claims.expires_at,
+        notification_mode=notification_mode,
     )
 
 
@@ -439,9 +443,18 @@ def create_app(
         if push_dispatcher is None:
             return
         result = getattr(msg, "result", None)
+        raw_context = getattr(msg, "notification_context", None)
+        context = (
+            raw_context.model_dump()
+            if hasattr(raw_context, "model_dump")
+            else None
+        )
+        if context is not None:
+            context["sid"] = getattr(msg, "sid", None)
         await push_dispatcher.notify_turn_end(
             machine_id,
             outcome=_turn_push_outcome(result),
+            context=context,
         )
 
     hub = RelayHub(cfg, on_live_turn_end=on_live_turn_end)

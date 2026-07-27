@@ -23,14 +23,18 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **cwd must match resume**: a session's jsonl lives at
   `~/.claude/projects/<cwd-with-/-as->/<uuid>.jsonl`. `ClaudeAgentOptions.cwd`
   MUST equal the original session's cwd or `resume` can't find it.
-- **SDK pinned to `claude-agent-sdk==0.2.119`**: message-type shapes and the
+- **SDK pinned to `claude-agent-sdk==0.2.128`**: message-type shapes and the
   interrupt/drain contract can shift between minor versions. Re-run the
   interrupt+drain verification after any upgrade (`SdkHandle.preflight()` guards
   the major/minor at startup).
+- **Claude Code is the user's daily CLI, not the SDK bundle**: the wrapper
+  defaults `CLAUDE_BIN` to `~/.local/bin/claude` and passes that path explicitly
+  to the SDK. An empty value keeps this default; only another absolute path may
+  override it. Keep that CLI updated and signed in before starting the wrapper.
 - **`include_partial_messages`** is a `ClaudeAgentOptions` field (set at
   construction, not on `query()`). Streaming events arrive as `StreamEvent`
   (`.event` = raw Anthropic API stream-event dict) — NOT
-  `SDKPartialAssistantMessage` (doesn't exist in 0.2.119). Extract
+  `SDKPartialAssistantMessage` (doesn't exist in 0.2.128). Extract
   `content_block_delta` → `delta.text` from `StreamEvent.event`.
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.
@@ -77,7 +81,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   shared sessions stay on the daemon; only the guarded oversized-resume path may
   select a newer official private app-server for compatibility.
 - **History = local projection + materialized summary pages; reconnect = live-tail replay**
-  (protocol v19): IndexedDB paints the browser's last projection before network
+  (protocol v22): IndexedDB paints the browser's last projection before network
   validation. `GetHistory(detail="summary")` returns a small canonical turn page
   (newest four, then `before`/`limit` pagination), while the wrapper's rebuildable
   SQLite index avoids retranslating unchanged transcript/rollout bytes. Heavy
@@ -106,9 +110,10 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - `cc_remote/wrapper/` — `sdk.py` / `stream.py` and `claude_*` implement Claude;
   `codex_handle.py` / `codex_stream.py` / `codex_daemon.py` / `codex_external.py`
   implement the official Codex app-server paths; `history_store.py` owns the
-  rebuildable SQLite projection; `machine.py`, `session_ctx.py`,
-  `ringbuffer.py`, `transport.py`, and `session.py` provide the shared session
-  pool, routing, live replay, relay transport, and persistence.
+  rebuildable SQLite projection; `machine.py`, `command_router.py`,
+  `session_ctx.py`, `ringbuffer.py`, `transport.py`, and `session.py` provide
+  the shared session pool, command dispatch, live replay, relay transport, and
+  persistence.
 - `cc_remote/relay/` — server.py (FastAPI `/ws` + `/api/login` + static), auth.py
   (wrapper bearer + HMAC cookie session), `devices.py` (pairing and enrolled
   machine ownership), `pairing.py` (machine-scoped wrapper/client routing), and
@@ -117,6 +122,51 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - `web/src/` — `reducer.ts` and `history-merge.ts` own per-session runtime and
   paged history merging; `ws.ts` is the relay client; `protocol.ts` mirrors
   `protocol.py`; `components/DeviceSheet.tsx` manages enrolled machines.
+
+## Commit and PR gate
+
+- Keep every commit coherent and reviewable. Before staging, inspect
+  `git status --short --branch` and preserve unrelated user changes. Stage only
+  the intended scope, then review `git diff --cached --stat`,
+  `git diff --cached`, and `git diff --cached --check`.
+- Use an English Conventional Commit subject (`type(scope): summary`). Do not
+  add tool prefixes such as `[Codex]` / `[Claude]`, generated-by trailers, or
+  `Co-Authored-By` unless the user explicitly requests one.
+- For a multiline message, use `git commit -F <message-file>` with exactly one
+  blank line after the subject and consecutive direct `- ` bullets. After
+  committing, verify the stored message and scope with
+  `git log -1 --format=raw --stat`, then recheck
+  `git status --short --branch`.
+- Before opening or updating **every** PR, run the complete local gate below;
+  a docs-only or apparently narrow change does not skip it unless the user
+  explicitly accepts that exception. Every command must exit zero. Expected
+  platform-defined test skips are allowed, but failures or missing tools must
+  be reported rather than silently bypassed.
+
+```bash
+.venv/bin/python -m pytest
+uvx --from ruff==0.15.13 ruff check cc_remote tests deploy
+npm --prefix web run build
+npm --prefix web run test:reliability
+npm --prefix web run test:history-browser
+npm --prefix web run lint
+bash -n \
+  deploy/install.sh \
+  deploy/install-relay.sh \
+  deploy/install-wrapper.sh \
+  deploy/setup-vps.sh
+shellcheck -x \
+  deploy/install.sh \
+  deploy/install-relay.sh \
+  deploy/install-wrapper.sh \
+  deploy/setup-vps.sh \
+  deploy/setup_transaction.sh
+git diff --check
+```
+
+- `.github/workflows/ci.yml` repeats this gate for pushes and PRs. A local pass
+  is required before PR publication and does not replace green remote CI before
+  merge. These checks are zero-token; do not substitute a live model probe.
 
 ## Run / test
 ```bash

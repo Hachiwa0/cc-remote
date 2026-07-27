@@ -4,7 +4,7 @@
 
 自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web
 
-**当前版本：v3.0.0** · Wire protocol v19
+**当前版本：v3.0.0** · Wire protocol v22
 
 [English](README_en.md) ·
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
@@ -58,7 +58,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
 | **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
 | **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
-| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v19。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
+| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v22。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
 
 > **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在
 > wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
@@ -75,7 +75,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **Code / Work 双空间** | Code 继续面向代码仓库；Work 是完全独立的 Cowork 工作区，用于文档、表格、演示、资料整理和临时协作，不混入代码会话列表。 |
 | **Work 项目与资料库** | 为 Claude/Codex 分别建立私有项目、文件/链接/笔记资料库和可复用工作模板；创建工作时会把选定上下文物化到专属目录。 |
 | **Work 定时任务与隔离** | 支持一次、每日、每周任务；执行记录、租约、失败重试和防重叠状态均持久化。每个工作默认只能访问自己的私有目录，需要的资料通过会话附件或项目资料库显式加入。 |
-| **远程操作** | 手机、平板或桌面浏览器实时看流式回复，发送附件，排队下一条消息，随时打断当前回合。 |
+| **远程操作** | 手机、平板或桌面浏览器实时看流式回复并发送附件。Codex 忙碌时默认把新输入作为原生引导追加到当前任务，也可改为排队；Claude 保留打断并发送。停止始终是独立操作。 |
 | **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
 | **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。 |
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
@@ -83,7 +83,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 通过 `/permissions` 控制审批并继承本机 Sandbox 配置；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
 | **真实扩展目录** | 通过 `/extensions`、`/skills`、`/plugins`、`/apps`、`/mcp`、`/hooks` 按需读取当前引擎目录。Code 中可按引擎能力管理 Skills、插件和 Claude Hooks；Codex Hooks 受官方接口限制为只读。Work 为避免改变私有工作环境，只读展示全部扩展。 |
 | **连续性** | 后台会话继续运行，多端实时同步；浏览器本地投影先绘制，wrapper 从 Claude transcript / Codex rollout 的物化摘要索引分页校验，断线后只按游标补实时尾巴。 |
-| **多机器与 PWA** | 一个 relay 可连接多个具名 wrapper；可选账号策略把用户限制到指定机器。网页可安装为 PWA，并在后台回合完成/失败时发送不含对话正文的系统通知。 |
+| **多机器与 PWA** | 一个 relay 可连接多个具名 wrapper；可选账号策略把用户限制到指定机器。网页可安装为 PWA；通知默认使用不含会话信息的通用模式，也可由用户主动开启安全截断的会话名称与精确跳转。 |
 | **自托管** | wrapper 只出站连接；会话、Work 数据和预览转换都留在本机，VPS 只做无状态中继且可替换；网页认证使用 HttpOnly cookie，CLI 凭据与 API key 不进入前端。 |
 
 > 不同引擎可用的模型、服务档位和运行控制以本机 CLI 及其 SDK/app-server 能力为准。
@@ -176,14 +176,14 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### Codex 会话级控制：模型、思考、权限与状态
 
-模型、思考强度、服务档位和权限都绑定当前会话；可以在不改本机全局配置的情况下调整下一回合。输入区同时提供附件、排队/打断、上下文占用以及 `/goal`、`/status` 等命令入口。
+模型、思考强度、服务档位和权限都绑定当前会话；可以在不改本机全局配置的情况下调整下一回合。Codex 运行中按 Enter 默认引导当前任务，仍可切换为排队，空输入时的停止按钮不会隐式发送；输入区同时提供附件、上下文占用以及 `/goal`、`/status` 等命令入口。
 
 ![Codex 模型选择和会话控制](assets/readme-model-controls.jpg)
 
 ### 常用操作速查
 
 - **会话**：新建、搜索、后台运行、重命名、归档、删除、派生、Codex compact、Review 和独立 worktree。
-- **回合**：流式输出、排队、打断、复制、编辑重发、从指定消息派生。
+- **回合**：流式输出、Codex 原生引导、排队、停止/打断、复制、编辑重发、从指定消息派生。
 - **工具**：命令输出、文件修改与 diff、MCP、协作代理、Hook、审批和用户输入回传。
 - **终端协同**：Codex Code 共享官方 daemon 并支持双向控制；Claude 原生 CLI、Desktop
   和 Agent View 在 Remote 中实时只读镜像，需要写入时由用户明确接管。
@@ -191,7 +191,7 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 - **扩展**：通过斜杠命令实时查看 Skills、Plugins、Apps、MCP 和 Hooks；Code
   可按引擎能力安全增删本地 Skills、管理 Claude Hooks，并通过原生管理器安装/卸载插件。
   Codex Hooks 和 Work 中的全部扩展保持只读。
-- **设备**：响应式手机界面、深浅主题、多浏览器/多机器同步、PWA、后台完成提醒与断线重连。
+- **设备**：响应式手机界面、深浅主题、多浏览器/多机器同步、PWA、可选通用/会话级后台完成提醒与断线重连。登录后的通知、主题和退出登录统一收在 Header 三点菜单中。
 
 ## 本地快速开始（一台机器，5 分钟）
 
@@ -199,7 +199,7 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### 前置
 
-- 一台已完成 **Claude Code** 或支持 `app-server` 的 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器；Claude 默认使用锁定 SDK 自带并经过回归的官方 CLI，Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个都可用即可在网页中切换引擎。
+- 一台已完成 **Claude Code** 或支持 `app-server` 的 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器。Claude wrapper 会显式启动日常使用的 `~/.local/bin/claude`，而不是 SDK 内置副本；Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个都可用即可在网页中切换引擎。
 - **Python 3.10+**、**Node 20.19+**（用来构建网页）。
 - 可选：要预览 DOCX/XLSX/PPTX 等 Office 文件，Linux wrapper 主机需安装
   **LibreOffice + bubblewrap**（例如 `sudo apt install libreoffice bubblewrap`）；VPS 不需要。
@@ -237,13 +237,18 @@ PUBLIC_ORIGIN=http://127.0.0.1:8765
 WEB_STATIC_DIR=web/dist
 # agent 会话的默认工作目录（你要让它操作的项目目录）
 CC_CWD=/path/to/your/project
-# systemd/PATH 找不到 Claude CLI 时可显式指定；否则留空
-CLAUDE_BIN=/absolute/path/to/claude
+# 与日常终端共用同一个 Claude Code 安装；仅在安装位置不同时覆盖
+CLAUDE_BIN=~/.local/bin/claude
 ```
 
 > 本地 loopback 快速体验时，中继和 wrapper 可读同一个 `.env`；它不适合生产。
 > 公网 wrapper 必须按下文使用 root-only `/etc/cc-remote/wrapper.env`，避免
 > `bypassPermissions` 模型/工具直接读取控制面密钥。
+>
+> Python SDK 仍固定为仓库验证过的版本，负责消息协议和 interrupt/drain；
+> 真正执行会话的是 `CLAUDE_BIN` 指向的日常 Claude Code。这样 Remote 与终端
+> 共用同一套 CLI 更新、Keychain/登录状态和 `~/.claude/settings.json`。
+> `CLAUDE_BIN` 为空时也会回到 `~/.local/bin/claude`，不会静默改用 SDK bundle。
 
 ### 3）跑起来（两个终端）
 
@@ -375,12 +380,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v19**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v22**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v19 relay 和
-> v19 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v22 relay 和
+> v22 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
 
 ### 3）上传 staging，由原子 release 安装器发布
 
@@ -434,7 +439,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v19 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v22 wrapper。
 
 验证：
 
@@ -534,7 +539,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `SESSION_TTL_SECONDS` | `604800` | 会话 token 有效期（默认 7 天）。 |
 | `LOGIN_BODY_MAX_BYTES` / `LOGIN_READ_TIMEOUT` / `LOGIN_INFLIGHT_CAP` | `4096` / `10` / `32` | 登录请求体字节数、总读取秒数和并发读取数的硬上限。 |
 | `SESSION_REGISTRY_CAP` | `1024` | 进程内可撤销浏览器会话注册表的硬上限。 |
-| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` / `PUSH_VAPID_SUBJECT` | 空 | 可选真实 Web Push；三项必须同时配置。私钥建议填写 relay 用户可读的 PEM 绝对路径。通知只含完成/失败状态，不含对话内容。 |
+| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` / `PUSH_VAPID_SUBJECT` | 空 | 可选真实 Web Push；三项必须同时配置。私钥建议填写 relay 用户可读的 PEM 绝对路径。旧用户和默认模式只发送完成/失败状态；用户主动选择“显示会话名称”后，Push 才携带安全截断的名称和设备内精确路由，始终不含 prompt、回复、路径或工具输出。 |
 | `PUSH_DB_PATH` | `~/.cc-remote/relay-push.sqlite3` | 持久化、按用户和机器隔离的浏览器 Push 订阅库。 |
 | `DEVICE_DB_PATH` | `~/.cc-remote/relay-devices.sqlite3` | 持久设备注册、显示名、最近在线时间和凭据哈希；不保存会话或 Artifact。 |
 | `DEVICE_PAIRING_TTL_SECONDS` | `600` | 一次性配对码有效秒数，允许 60–3600。 |
@@ -556,7 +561,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `WRAPPER_TOKEN` | `change-me-wrapper` | 同中继。 |
 | `CC_REMOTE_MACHINE_ID` | `default` | 多机器 relay 中的稳定路由 id；使用 `WRAPPER_TOKENS_JSON` 时必须匹配对应键。 |
 | `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | 交互配对凭据路径；文件必须仅当前用户可读。显式的 `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` 优先。 |
-| `CLAUDE_BIN` | 空 | 可选的 Claude CLI 绝对路径；systemd/PATH 找不到 `claude` 时设置。 |
+| `CLAUDE_BIN` | `~/.local/bin/claude` | wrapper 实际启动的日常 Claude Code；空值仍使用该默认路径。只有 CLI 安装在别处时才设为另一个绝对路径。 |
 | `CC_REMOTE_CODEX_PROXY` | 空 | 仅注入 wrapper 启动的 Codex 子进程的 HTTP(S)/SOCKS5 代理；不改 wrapper 到 relay 的连接，也不影响用户终端里的 `codex`。例如 nono 可填 `http://127.0.0.1:7897`。 |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server。Work 始终私有，不受此项影响。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |

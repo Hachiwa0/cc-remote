@@ -9,10 +9,12 @@ import {
   HistoryAnchorController,
   historyPageStatus,
   isAtHistoryEdge,
+  isAtLatestEdge,
   OlderHistoryLoadGate,
   measureBottom,
   NEAR_BOTTOM_PX,
   shouldAutoLoadOlderHistory,
+  shouldAutoLoadNewerHistory,
   ScrollFollowController,
 } from "../src/scroll-follow.ts";
 import { ScrollCoordinator } from "../src/scroll-coordinator.ts";
@@ -37,6 +39,12 @@ assert.equal(HISTORY_ANCHOR_EPSILON_PX, 0.5);
 assert.equal(isAtHistoryEdge({ scrollHeight: 1_200, scrollTop: 0, clientHeight: 600}), true);
 assert.equal(isAtHistoryEdge({ scrollHeight: 1_200, scrollTop: 2, clientHeight: 600}), false,
   "wheel/touch preflight must wait for the browser to reach the real top");
+assert.equal(isAtLatestEdge({
+  scrollHeight: 1_200, scrollTop: 600, clientHeight: 600,
+}), true);
+assert.equal(isAtLatestEdge({
+  scrollHeight: 1_200, scrollTop: 598, clientHeight: 600,
+}), false, "cached-newer preflight must wait for the real bottom");
 
 const firstTurnKeySnapshot = updateTurnKeySnapshot(null, [
   { id: "old-1" },
@@ -103,6 +111,27 @@ assert.deepEqual(scrollCoordinator.requestOffset(120.5), {
   kind: "offset",
   offset: 120.5,
 });
+const detailInteraction = scrollCoordinator.beginInteraction(false);
+assert.equal(scrollCoordinator.requestOffset(125), null,
+  "ordinary offset writes remain blocked during detail replacement");
+assert.deepEqual(scrollCoordinator.requestInteractionOffset(
+  detailInteraction, 125,
+), {
+  kind: "offset",
+  offset: 125,
+});
+assert.equal(scrollCoordinator.requestInteractionOffset(
+  detailInteraction + 1, 125,
+), null, "only the active detail transaction may correct its anchor");
+assert.equal(scrollCoordinator.requestBottom("smooth"), null);
+assert.equal(scrollCoordinator.endInteraction(detailInteraction, false), null,
+  "paused detail reading must discard a bottom request queued while locked");
+const followedInteraction = scrollCoordinator.beginInteraction(false);
+assert.equal(scrollCoordinator.requestBottom("smooth"), null);
+assert.deepEqual(scrollCoordinator.endInteraction(followedInteraction, true), {
+  kind: "bottom",
+  behavior: "smooth",
+}, "a still-following viewport keeps the existing deferred-bottom behavior");
 
 const historyGate = new OlderHistoryLoadGate();
 historyGate.beginGesture();
@@ -140,6 +169,22 @@ assert.equal(shouldAutoLoadOlderHistory({
   scrollTop: 0,
   clientHeight: 600,
 }, true, false), false);
+assert.equal(shouldAutoLoadNewerHistory({
+  scrollHeight: 1_200,
+  scrollTop: 528,
+  clientHeight: 600,
+}, true, true), true);
+assert.equal(shouldAutoLoadNewerHistory({
+  scrollHeight: 1_200,
+  scrollTop: 527,
+  clientHeight: 600,
+}, true, true), false);
+assert.equal(shouldAutoLoadNewerHistory({
+  scrollHeight: 1_200,
+  scrollTop: 600,
+  clientHeight: 600,
+}, false, true), false,
+  "painting a browse window at the bottom must not cascade through cached pages");
 
 const historyAnchor = new HistoryAnchorController();
 const firstAnchorGeneration = historyAnchor.begin({
@@ -178,6 +223,36 @@ assert.equal(historyAnchor.rebase(firstAnchorGeneration + 1, {
   oldestTurnId: "turn-1",
   anchorOffset: 12,
 }), false, "a stale gesture cannot rebase a newer transaction");
+historyAnchor.cancel();
+
+const newerAnchorGeneration = historyAnchor.begin({
+  sid: "session-a",
+  revision: "revision-a",
+  viewId: "browse-a",
+  before: null,
+  windowEpoch: 7,
+  direction: "newer",
+  source: "local",
+  anchorTurnId: "turn-18",
+  oldestTurnId: "turn-1",
+  anchorOffset: 22,
+});
+const pendingNewerPage = historyAnchor.current()!;
+assert.equal(historyPageStatus(pendingNewerPage, {
+  sid: "session-a", revision: "revision-a", viewId: "browse-a",
+  cursor: "turn-1", hasMore: true, windowEpoch: 7, hasNewer: true,
+}), "pending");
+assert.equal(historyPageStatus(pendingNewerPage, {
+  sid: "session-a", revision: "revision-a", viewId: "browse-a",
+  cursor: "turn-9", hasMore: true, windowEpoch: 8, hasNewer: true,
+}), "complete",
+  "a cached-newer append/head-eviction completes only after its window epoch commits");
+assert.equal(historyPageStatus(pendingNewerPage, {
+  sid: "session-a", revision: "revision-a", viewId: "browse-b",
+  cursor: "turn-9", hasMore: true, windowEpoch: 8, hasNewer: true,
+}), "stale",
+  "a delayed cached page from a retired browse view cannot move its replacement");
+assert.equal(historyAnchor.markApplied(newerAnchorGeneration), true);
 historyAnchor.cancel();
 
 const abandonedAnchorGeneration = historyAnchor.begin({
@@ -229,6 +304,13 @@ assert.equal(historyPageStatus(pendingPage, {
   sid: "session-a", revision: "revision-a",
   cursor: "cursor-b", hasMore: false,
 }), "complete");
+assert.equal(historyPageStatus({
+  ...pendingPage, windowEpoch: 7,
+}, {
+  sid: "session-a", revision: "revision-a",
+  cursor: "cursor-b", hasMore: true, windowEpoch: 8,
+}), "complete",
+"a terminal page failure advances the window epoch so the same cursor can retry");
 assert.equal(historyPageStatus(pendingPage, {
   sid: "session-a", revision: "revision-b",
   cursor: "cursor-c", hasMore: true,
@@ -278,6 +360,19 @@ assert.deepEqual(controller.observeScroll({
   scrollTop: 598,
   clientHeight: 600,
 }), { followOutput: true, nearBottom: true });
+
+const browseController = new ScrollFollowController();
+browseController.pause({
+  scrollHeight: 1_200,
+  scrollTop: 500,
+  clientHeight: 600,
+});
+assert.deepEqual(browseController.observeScroll({
+  scrollHeight: 1_200,
+  scrollTop: 600,
+  clientHeight: 600,
+}, false), { followOutput: false, nearBottom: true },
+"reaching a browse window's bottom must not silently resume live following");
 
 // Moving toward history pauses immediately even if the new position remains
 // inside the 80px near-bottom range.
@@ -432,7 +527,19 @@ assert.doesNotMatch(css, /content-visibility:auto/,
 assert.doesNotMatch(chatViewSource, /requestedOlderRef.*length/,
   "page completion must use revision/cursor identity, never runtime length");
 assert.match(appSource, /historyRevision=\{rt\.historyRevision\}/);
-assert.match(appSource, /historyCursor=\{rt\.oldestId\}/);
+assert.match(appSource, /historyViewRevision=\{historyView\.viewRevision\}/,
+  "recovery commit must keep the old scroll scope across its atomic replacement");
+assert.match(appSource, /historyCursor=\{historyView\.oldestId\}/);
+assert.match(chatViewSource,
+  /const enteringBrowse = browseMode[\s\S]*request\.revision === historyRevision[\s\S]*anchor\.revision === historyRevision/,
+  "runtime-to-browse must preserve an active first-page anchor within one revision");
+assert.match(
+  chatViewSource,
+  /controller\.observeScroll\(\s*metrics,\s*!browseMode && !textSelectionDragging,\s*\)/,
+  "browse windows and active text drags must never re-enable live following",
+);
+assert.match(chatViewSource, /onClick=\{returnToLatest\}/);
+assert.match(chatViewSource, /onLoadNewer/);
 assert.match(chatViewSource, /turnNodeRefs/,
   "history placement must use the retained keyed turn node instead of scanning the DOM");
 const threadShellRule = css.match(/\.thread-shell\{[^}]+\}/)?.[0] ?? "";

@@ -23,6 +23,8 @@ export const HISTORY_ANCHOR_EPSILON_PX = 0.5;
 
 const SCROLL_DIRECTION_EPSILON_PX = 0.5;
 
+export type HistoryPageDirection = "older" | "newer";
+
 export function measureBottom(metrics: ScrollMetrics): BottomMeasurement {
   const distance = Math.max(
     0,
@@ -44,7 +46,10 @@ export interface HistoryAnchorPoint {
 export interface HistoryAnchorTransaction extends HistoryAnchorPoint {
   sid: string | null;
   revision: string | null;
+  viewId?: string | null;
   before: string | null;
+  windowEpoch?: number;
+  direction?: HistoryPageDirection;
   source: "local" | "server";
   generation: number;
   phase: "pending" | "rendering" | "applied";
@@ -53,8 +58,11 @@ export interface HistoryAnchorTransaction extends HistoryAnchorPoint {
 export interface HistoryPageBoundary {
   sid: string | null;
   revision: string | null;
+  viewId?: string | null;
   cursor: string | null;
   hasMore: boolean;
+  windowEpoch?: number;
+  hasNewer?: boolean;
 }
 
 export type HistoryPageStatus = "pending" | "complete" | "stale";
@@ -67,7 +75,15 @@ export function historyPageStatus(
   boundary: HistoryPageBoundary,
 ): HistoryPageStatus {
   if (transaction.sid !== boundary.sid
-      || transaction.revision !== boundary.revision) return "stale";
+      || transaction.revision !== boundary.revision
+      || (transaction.viewId ?? null) !== (boundary.viewId ?? null)) return "stale";
+  if (transaction.direction === "newer") {
+    return (transaction.windowEpoch ?? 0) !== (boundary.windowEpoch ?? 0)
+        || !boundary.hasNewer
+      ? "complete" : "pending";
+  }
+  if (transaction.windowEpoch != null && boundary.windowEpoch != null
+      && transaction.windowEpoch !== boundary.windowEpoch) return "complete";
   if (transaction.source !== "server") return "complete";
   return transaction.before !== boundary.cursor || !boundary.hasMore
     ? "complete" : "pending";
@@ -179,6 +195,22 @@ export function isAtHistoryEdge(metrics: ScrollMetrics): boolean {
   return metrics.scrollTop <= HISTORY_EDGE_PX;
 }
 
+/** The symmetric edge check used by cached-newer browse pages. */
+export function isAtLatestEdge(metrics: ScrollMetrics): boolean {
+  return measureBottom(metrics).distance <= HISTORY_EDGE_PX;
+}
+
+/** Browse-window pagination mirrors older-page loading at the lower edge. */
+export function shouldAutoLoadNewerHistory(
+  metrics: ScrollMetrics,
+  movingTowardLatest: boolean,
+  canLoadNewer: boolean,
+): boolean {
+  return canLoadNewer
+    && movingTowardLatest
+    && measureBottom(metrics).distance <= AUTO_LOAD_HISTORY_TOP_PX;
+}
+
 /**
  * Keeps output-follow intent separate from the current geometric position.
  * Being close to the bottom must never re-enable following after the user has
@@ -248,7 +280,10 @@ export class ScrollFollowController {
   }
 
   /** Handle a real viewport movement, including scrollbar and keyboard scrolls. */
-  observeScroll(metrics: ScrollMetrics): ScrollFollowSnapshot {
+  observeScroll(
+    metrics: ScrollMetrics,
+    allowResumeAtBottom = true,
+  ): ScrollFollowSnapshot {
     const movingTowardHistory =
       metrics.scrollTop < this.lastScrollTop - SCROLL_DIRECTION_EPSILON_PX;
     const movingTowardLatest =
@@ -260,7 +295,8 @@ export class ScrollFollowController {
     // at the real bottom. That is geometry, not an upward reading gesture.
     if (movingTowardHistory && !measurement.atBottom) {
       followOutput = false;
-    } else if (!followOutput && movingTowardLatest && measurement.atBottom) {
+    } else if (allowResumeAtBottom
+        && !followOutput && movingTowardLatest && measurement.atBottom) {
       followOutput = true;
     }
 

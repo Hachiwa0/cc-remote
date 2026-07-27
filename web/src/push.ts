@@ -1,4 +1,109 @@
+import type { RemoteNotificationMode } from "./notification-mode";
+
 type PushConfig = { enabled: boolean; public_key: string };
+
+export interface PushBindingTarget {
+  machineId: string;
+  mode: RemoteNotificationMode;
+}
+
+export type PushBindingState = "off" | "binding" | "remote" | "local";
+
+export interface PushBindingSnapshot {
+  state: PushBindingState;
+  target: PushBindingTarget | null;
+  bound: PushBindingTarget | null;
+}
+
+type PushBindingApply = (target: PushBindingTarget | null) => Promise<boolean>;
+type PushBindingListener = (snapshot: PushBindingSnapshot) => void;
+
+function sameTarget(
+  left: PushBindingTarget | null,
+  right: PushBindingTarget | null,
+): boolean {
+  return left?.machineId === right?.machineId && left?.mode === right?.mode;
+}
+
+export class PushBindingCoordinator {
+  private readonly apply: PushBindingApply;
+  private desired: PushBindingTarget | null = null;
+  private bound: PushBindingTarget | null = null;
+  private state: PushBindingState = "off";
+  private drain: Promise<void> | null = null;
+  private listener: PushBindingListener | null = null;
+
+  constructor(apply: PushBindingApply) {
+    this.apply = apply;
+  }
+
+  subscribe(listener: PushBindingListener): () => void {
+    this.listener = listener;
+    listener(this.snapshot());
+    return () => {
+      if (this.listener === listener) this.listener = null;
+    };
+  }
+
+  snapshot(): PushBindingSnapshot {
+    return {
+      state: this.state,
+      target: this.desired ? { ...this.desired } : null,
+      bound: this.bound ? { ...this.bound } : null,
+    };
+  }
+
+  isRemoteActive(machineId: string): boolean {
+    if (!this.desired || this.desired.machineId !== machineId) return false;
+    return this.bound?.machineId === machineId
+      && (this.state === "remote" || this.state === "binding");
+  }
+
+  async setTarget(target: PushBindingTarget | null): Promise<PushBindingSnapshot> {
+    this.desired = target ? { ...target } : null;
+    if (!this.drain) {
+      this.drain = this.run().finally(() => {
+        this.drain = null;
+      });
+    }
+    await this.drain;
+    return this.snapshot();
+  }
+
+  private publish(state: PushBindingState): void {
+    this.state = state;
+    this.listener?.(this.snapshot());
+  }
+
+  private async run(): Promise<void> {
+    while (true) {
+      const target = this.desired ? { ...this.desired } : null;
+      if (sameTarget(target, this.bound)) {
+        this.publish(target ? "remote" : "off");
+        return;
+      }
+      this.publish("binding");
+      const enabled = await this.apply(target);
+      if (enabled) this.bound = target;
+
+      // A newer request arrived while the network mutation was in flight.
+      // Continue from the actual binding that just completed; never publish the
+      // stale target as the current machine.
+      if (!sameTarget(target, this.desired)) continue;
+      if (!target) {
+        if (enabled) this.bound = null;
+        this.publish("off");
+      } else if (enabled || this.bound?.machineId === target.machineId) {
+        // During a same-machine mode update the prior remote subscription still
+        // delivers. Treat it as remote to avoid a duplicate local notification.
+        this.publish("remote");
+      } else {
+        this.publish("local");
+      }
+      return;
+    }
+  }
+}
 
 function applicationServerKey(value: string): Uint8Array<ArrayBuffer> {
   const padded = value.replace(/-/g, "+").replace(/_/g, "/")
@@ -23,7 +128,10 @@ async function config(): Promise<PushConfig | null> {
   }
 }
 
-export async function enableRemotePush(machineId: string): Promise<boolean> {
+export async function enableRemotePush(
+  machineId: string,
+  mode: RemoteNotificationMode = "generic",
+): Promise<boolean> {
   if (!("serviceWorker" in navigator) || !("PushManager" in window)) return false;
   const pushConfig = await config();
   if (!pushConfig?.enabled || !pushConfig.public_key) return false;
@@ -44,6 +152,7 @@ export async function enableRemotePush(machineId: string): Promise<boolean> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         machine_id: machineId,
+        notification_mode: mode,
         endpoint: serialized.endpoint,
         keys: serialized.keys,
       }),
@@ -54,21 +163,34 @@ export async function enableRemotePush(machineId: string): Promise<boolean> {
   }
 }
 
-export async function disableRemotePush(): Promise<void> {
-  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+export async function disableRemotePush(): Promise<boolean> {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return true;
+  let subscription: PushSubscription | null;
   try {
     const registration = await navigator.serviceWorker.ready;
-    const subscription = await registration.pushManager.getSubscription();
-    if (!subscription) return;
-    await fetch("/api/push/unsubscribe", {
+    subscription = await registration.pushManager.getSubscription();
+  } catch {
+    return false;
+  }
+  if (!subscription) return true;
+  let relayRemoved = false;
+  let browserRemoved = false;
+  try {
+    const response = await fetch("/api/push/unsubscribe", {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ endpoint: subscription.endpoint }),
     });
-    await subscription.unsubscribe();
+    relayRemoved = response.ok;
   } catch {
-    // Permission state remains the user's source of truth; a later enable will
-    // upsert the endpoint and stale push providers are pruned on 404/410.
+    // Still invalidate the browser endpoint below. The push service will then
+    // return 404/410 to a stale relay row, which prunes it durably.
   }
+  try {
+    browserRemoved = await subscription.unsubscribe();
+  } catch {
+    // A successful relay removal is already sufficient to stop delivery.
+  }
+  return relayRemoved || browserRemoved;
 }

@@ -543,31 +543,38 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v19_layout():
+def test_release_docs_and_examples_describe_one_atomic_v22_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
     claude = (ROOT / "CLAUDE.md").read_text()
     wrapper_env = (ROOT / "deploy" / "env.wrapper.example").read_text()
+    wrapper_plist = (
+        ROOT / "deploy" / "com.muggle.cc-remote.wrapper.plist.in"
+    ).read_text()
+    wrapper_installer = (ROOT / "deploy" / "install-wrapper.sh").read_text()
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v19" in deploy_readme
+    assert "Protocol v22" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v19" in document
+        assert "v22" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
         assert "/opt/cc-remote/current" in document
         assert "/opt/cc-remote/releases" in document
-    assert "CLAUDE_BIN=\n" in wrapper_env
-    assert "CLAUDE_BIN=/" not in wrapper_env
+    assert "CLAUDE_BIN=/home/youruser/.local/bin/claude" in wrapper_env
+    assert "<key>CLAUDE_BIN</key>" in wrapper_plist
+    assert "<string>__HOME__/.local/bin/claude</string>" in wrapper_plist
+    assert "printf 'CLAUDE_BIN=%s/.local/bin/claude" in wrapper_installer
+    assert "daily Claude Code executable is missing" in wrapper_installer
     assert "WEB_STATIC_DIR=/opt/cc-remote/current/web/dist" in relay_env
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
-    assert "claude-agent-sdk==0.2.119" in claude
-    assert "protocol v19" in claude
+    assert "claude-agent-sdk==0.2.128" in claude
+    assert "protocol v22" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 
@@ -740,3 +747,21 @@ def test_caddy_site_sets_browser_security_headers():
     assert "request_body @login" in source
     assert "max_size 4KB" in source
     assert " ws:" not in source
+
+
+@pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
+def test_caddy_image_policy_allows_only_image_blob_urls(template):
+    source = (ROOT / "deploy" / template).read_text()
+    match = re.search(r'Content-Security-Policy "([^"]+)"', source)
+    assert match is not None
+    directives = {
+        parts[0]: parts[1:]
+        for directive in match.group(1).split(";")
+        if (parts := directive.strip().split())
+    }
+    assert "blob:" in directives["img-src"]
+    assert all(
+        "blob:" not in sources
+        for name, sources in directives.items()
+        if name != "img-src"
+    )

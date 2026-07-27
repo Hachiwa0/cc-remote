@@ -14,6 +14,7 @@ from cc_remote.protocol import (
     BtwOpened,
     CloseBtw,
     CommandAck,
+    DeleteSession,
     Effort,
     Error,
     GetContext,
@@ -638,6 +639,11 @@ def test_open_btw_success_response_is_correlated_and_replayed_without_refork():
         fork.key = "btw-fork-1"
         fork.btw = True
         fork.parent_sid = parent.session_id
+        fork.sdk = SimpleNamespace(
+            model="gpt-btw",
+            effort="high",
+            approval="never",
+        )
         machine.sessions[parent.key] = parent
         machine.focused_sid = parent.key
         spawn_calls = 0
@@ -646,6 +652,9 @@ def test_open_btw_success_response_is_correlated_and_replayed_without_refork():
             nonlocal spawn_calls
             spawn_calls += 1
             assert owner_client_id == "client-1"
+            # Mirror _spawn_btw(): every live fork must be owner-bound before
+            # its first sequenced frame is emitted.
+            fork.owner_client_id = owner_client_id
             return fork
 
         machine._spawn_btw = fake_spawn
@@ -687,6 +696,23 @@ def test_open_btw_success_response_is_correlated_and_replayed_without_refork():
             and message.mode == "bypassPermissions"
             for message in permissions
         )
+        models = [message for message in transport.sent
+                  if isinstance(message, Model)]
+        efforts = [message for message in transport.sent
+                   if isinstance(message, Effort)]
+        assert [(message.model, message.sid, message.to)
+                for message in models] == [
+                    ("gpt-btw", fork.key, "client-1")]
+        assert [(message.effort, message.sid, message.to)
+                for message in efforts] == [
+                    ("high", fork.key, "client-1")]
+        assert models[0].seq == 1 and efforts[0].seq == 2
+        # Model/effort are mutable after the fork opens. They belong to the
+        # sequenced owner-only ring, not the static OpenBtw response cache:
+        # replaying the latter after an ACK loss must not roll current settings
+        # back to their initial values.
+        assert [entry[1].type for entry in fork.buffer._buf] == [
+            "model", "effort"]
         assert len([message for message in transport.sent
                     if isinstance(message, CommandAck)]) == 2
 
@@ -713,7 +739,7 @@ def test_btw_live_frames_are_routed_and_buffered_for_owner_only():
     asyncio.run(run())
 
 
-def test_nonowner_cannot_query_close_or_focus_btw_runtime():
+def test_nonowner_cannot_control_query_close_or_focus_btw_runtime():
     async def run():
         machine, transport = _mk_machine()
         normal = _mk_ctx("normal", session_id="normal")
@@ -729,6 +755,18 @@ def test_nonowner_cannot_query_close_or_focus_btw_runtime():
                 sid=fork.key, prompt="steal", msg_id="private-query",
                 cmd_id="query-command", client_id="other-client",
             ),
+            Interrupt(
+                sid=fork.key, cmd_id="interrupt-command",
+                client_id="other-client",
+            ),
+            SetModel(
+                sid=fork.key, model="gpt-stolen",
+                cmd_id="model-command", client_id="other-client",
+            ),
+            SetEffort(
+                sid=fork.key, effort="high",
+                cmd_id="effort-command", client_id="other-client",
+            ),
             CloseBtw(
                 sid=fork.key, cmd_id="close-command",
                 client_id="other-client",
@@ -743,7 +781,7 @@ def test_nonowner_cannot_query_close_or_focus_btw_runtime():
 
         errors = [message for message in transport.sent
                   if isinstance(message, Error)]
-        assert len(errors) == 3
+        assert len(errors) == 6
         assert all(
             message.code == "auth"
             and message.sid == fork.key
@@ -751,10 +789,72 @@ def test_nonowner_cannot_query_close_or_focus_btw_runtime():
             for message in errors
         )
         assert len([message for message in transport.sent
-                    if isinstance(message, CommandAck)]) == 3
+                    if isinstance(message, CommandAck)]) == 6
         assert machine.sessions[fork.key] is fork
         assert fork.state == "idle" and fork.turn_task is None
         assert machine.focused_sid == normal.key
+
+    asyncio.run(run())
+
+
+def test_owner_controls_and_interrupts_only_its_btw_runtime():
+    class OwnerSdk:
+        model = "claude-before"
+        effort = "low"
+        applied_effort = "low"
+        permission_mode = "bypassPermissions"
+
+        def __init__(self):
+            self.interrupts = 0
+
+        async def set_model(self, model):
+            self.model = model
+
+        async def interrupt(self):
+            self.interrupts += 1
+
+    async def run():
+        machine, transport = _mk_machine()
+        parent = _mk_ctx("parent", session_id="parent")
+        parent.sdk = SimpleNamespace(model="parent-model", effort="max")
+        fork = _mk_ctx("btw-private", session_id=None)
+        fork.btw = True
+        fork.parent_sid = parent.session_id
+        fork.owner_client_id = "owner-client"
+        fork.sdk = OwnerSdk()
+        machine.sessions = {parent.key: parent, fork.key: fork}
+        machine.focused_sid = parent.key
+
+        await machine._process_command(SetModel(
+            sid=fork.key, model="claude-after",
+            cmd_id="model-command", client_id="owner-client",
+        ))
+        await machine._process_command(SetEffort(
+            sid=fork.key, effort="high",
+            cmd_id="effort-command", client_id="owner-client",
+        ))
+        fork.state = "running"
+        await machine._process_command(Interrupt(
+            sid=fork.key, cmd_id="interrupt-command",
+            client_id="owner-client",
+        ))
+
+        assert fork.sdk.model == "claude-after"
+        assert fork.sdk.effort == "high"
+        assert fork.sdk.interrupts == 1
+        assert fork.state == "interrupting"
+        assert parent.sdk.model == "parent-model"
+        assert parent.sdk.effort == "max"
+        assert parent.state == "idle"
+        emitted = [
+            message for message in transport.sent
+            if isinstance(message, (Model, Effort))
+        ]
+        assert [(message.type, message.sid, message.to)
+                for message in emitted] == [
+                    ("model", fork.key, "owner-client"),
+                    ("effort", fork.key, "owner-client"),
+                ]
 
     asyncio.run(run())
 
@@ -818,6 +918,130 @@ def test_claude_btw_real_id_is_hidden_and_cannot_be_cold_resumed(monkeypatch):
                   and message.sid in {fork.key, real_id}]
         assert len(denied) == 3
         assert all(message.code == "auth" for message in denied)
+
+    asyncio.run(run())
+
+
+def test_metadata_only_claude_session_switch_fails_once_without_spawn(
+        monkeypatch, tmp_path):
+    async def run():
+        machine, transport = _mk_machine()
+        session_id = "11111111-2222-4333-8444-555555555555"
+        claude_root = tmp_path / "claude-root"
+        transcript = (
+            claude_root / "projects" / "-metadata-only"
+            / f"{session_id}.jsonl"
+        )
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            '{"type":"ai-title","aiTitle":"orphan",'
+            f'"sessionId":"{session_id}"' '}\n'
+            '{"type":"mode","mode":"normal",'
+            f'"sessionId":"{session_id}"' '}\n'
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_root))
+
+        async def forbidden_spawn(*_args, **_kwargs):
+            raise AssertionError("metadata-only session must not be resumed")
+
+        machine._spawn = forbidden_spawn
+        result = await machine._handle_switch_session(SwitchSession(
+            session_id=session_id,
+            engine="claude",
+            space="code",
+            cmd_id="switch-metadata-only",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == "not_running"
+        assert "历史不完整" in result.message
+        assert result.sid == session_id
+        assert result.to == "client-1"
+        assert result.request_id == "switch-metadata-only"
+        assert transport.sent == [result]
+
+    asyncio.run(run())
+
+
+def test_metadata_only_claude_session_can_be_deleted_by_exact_global_id(
+        monkeypatch, tmp_path):
+    async def run():
+        machine, transport = _mk_machine()
+        session_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        claude_root = tmp_path / "claude-root"
+        transcript = (
+            claude_root / "projects" / "-metadata-only"
+            / f"{session_id}.jsonl"
+        )
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            '{"type":"ai-title","aiTitle":"orphan",'
+            f'"sessionId":"{session_id}"' '}\n'
+            '{"type":"mode","mode":"normal",'
+            f'"sessionId":"{session_id}"' '}\n'
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_root))
+
+        async def not_codex(_sid):
+            return False
+
+        async def listed(_cmd):
+            return None
+
+        machine._is_codex_session = not_codex
+        machine._handle_list_sessions = listed
+
+        result = await machine._handle_delete_session(DeleteSession(
+            session_id=session_id,
+            engine="claude",
+            space="code",
+            cmd_id="delete-metadata-only",
+            client_id="client-1",
+        ))
+
+        assert result is None
+        assert not transcript.exists()
+        assert not [message for message in transport.sent
+                    if isinstance(message, Error)]
+
+    asyncio.run(run())
+
+
+def test_cwdless_claude_delete_still_rejects_unknown_transcript(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        session_id = "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb"
+        deleted = []
+
+        async def not_codex(_sid):
+            return False
+
+        machine._is_codex_session = not_codex
+        monkeypatch.setattr(
+            machine_module,
+            "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=None),
+        )
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: None)
+        monkeypatch.setattr(
+            machine_module,
+            "delete_session",
+            lambda sid, directory=None: deleted.append((sid, directory)),
+        )
+
+        result = await machine._handle_delete_session(DeleteSession(
+            session_id=session_id,
+            engine="claude",
+            space="code",
+            cmd_id="delete-unknown",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == "not_running"
+        assert deleted == []
 
     asyncio.run(run())
 

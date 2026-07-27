@@ -421,8 +421,9 @@ export class RelayWs {
     return ownership;
   }
 
-  private sidObj(): Record<string, unknown> {
-    return this.focusedSid ? { sid: this.focusedSid } : {};
+  private sidObj(targetSid?: string | null): Record<string, unknown> {
+    const sid = targetSid ?? this.focusedSid;
+    return sid ? { sid } : {};
   }
 
   sendQuery(prompt: string, msg_id: string, images?: QueryImg[], files?: QueryFile[]): boolean {
@@ -500,8 +501,39 @@ export class RelayWs {
     );
   }
 
+  /** Append input to the active Codex turn. The reliable command and the
+   *  narrative acceptance latch are separate: an ACK alone must not clear the
+   *  draft/runtime protection before the wrapper echoes the steered user row. */
+  sendSteerTo(sid: string, prompt: string, msg_id: string,
+              images?: QueryImg[], files?: QueryFile[]): boolean {
+    if (!sid) return false;
+    if (this.queryAcceptance.pendingMessageId(sid)) return false;
+    const sentAt = nowTs();
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "steer", prompt, msg_id, sid, ts: sentAt,
+    };
+    if (images && images.length) obj.images = images;
+    if (files && files.length) obj.files = files;
+    if (!this.send(obj)) return false;
+    const historyHead = this.historyHeadBySession[sid];
+    const baseline = historyHead ? {
+      ...historyHead,
+      liveSeq: Math.max(
+        historyHead.liveSeq, this.lastSeqBySession[sid] ?? 0),
+    } : null;
+    return this.queryAcceptance.begin(
+      sid, msg_id,
+      queryAcceptanceDescriptor(msg_id, prompt, images, files),
+      baseline,
+    );
+  }
+
   sendInterrupt(): void {
     this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs(), ...this.sidObj() });
+  }
+
+  sendInterruptTo(sid: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "interrupt", sid, ts: nowTs() });
   }
 
   sendTakeover(sid: string): boolean {
@@ -512,8 +544,16 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_model", model, ts: nowTs(), ...this.sidObj() });
   }
 
+  sendSetModelTo(sid: string, model: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_model", sid, model, ts: nowTs() });
+  }
+
   sendSetEffort(effort: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", effort, ts: nowTs(), ...this.sidObj() });
+  }
+
+  sendSetEffortTo(sid: string, effort: string): void {
+    this.send({ v: PROTOCOL_VERSION, type: "set_effort", sid, effort, ts: nowTs() });
   }
 
   sendSetServiceTier(service_tier: string): void {
@@ -545,17 +585,22 @@ export class RelayWs {
     });
   }
 
-  sendGetFilePreview(path: string, requestId = uuid()): string | null {
+  sendGetFilePreview(
+    path: string,
+    requestId = uuid(),
+    targetSid?: string | null,
+  ): string | null {
     const queued = this.send({
       v: PROTOCOL_VERSION, type: "get_file_preview", path, request_id: requestId,
-      ts: nowTs(), ...this.sidObj(),
+      ts: nowTs(), ...this.sidObj(targetSid),
     });
     return queued ? requestId : null;
   }
 
   sendSaveMarkdown(path: string, content: string, expectedSize: number,
                    expectedMtimeNs: string, expectedRevision: string,
-                   requestId = uuid()): string | null {
+                   requestId = uuid(),
+                   targetSid?: string | null): string | null {
     const queued = this.send({
       v: PROTOCOL_VERSION,
       type: "save_markdown",
@@ -566,42 +611,51 @@ export class RelayWs {
       expected_revision: expectedRevision,
       request_id: requestId,
       ts: nowTs(),
-      ...this.sidObj(),
+      ...this.sidObj(targetSid),
     });
     return queued ? requestId : null;
   }
 
   sendGetPreviewAsset(path: string, previewId: string,
-                      requestId = uuid()): string | null {
+                      requestId = uuid(),
+                      targetSid?: string | null): string | null {
     const queued = this.send({
       v: PROTOCOL_VERSION, type: "get_preview_asset", path,
       preview_id: previewId, request_id: requestId,
-      ts: nowTs(), ...this.sidObj(),
+      ts: nowTs(), ...this.sidObj(targetSid),
     });
     return queued ? requestId : null;
   }
 
   /** Fetch a small canonical conversation page. Heavy per-turn detail remains
    *  in the wrapper materialized index until the user expands it. */
-  sendGetHistory(sessionId: string, before?: string | null, limit?: number | null): void {
+  sendGetHistory(
+    sessionId: string,
+    before?: string | null,
+    limit?: number | null,
+    cwd?: string | null,
+  ): boolean {
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_history", session_id: sessionId,
       client_id: this.clientId, detail: "summary", ts: nowTs(),
     };
+    if (cwd) obj.cwd = cwd;
     if (before) obj.before = before;
     if (limit) obj.limit = limit;
-    this.send(obj);
+    return this.send(obj);
   }
 
   sendGetTurnDetail(
     sessionId: string, turnId: string, revision?: string | null,
+    before?: string | null, limit = 192,
   ): boolean {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_turn_detail",
       session_id: sessionId, turn_id: turnId,
-      client_id: this.clientId, ts: nowTs(),
+      client_id: this.clientId, limit, ts: nowTs(),
     };
     if (revision) frame.revision = revision;
+    if (before) frame.before = before;
     return this.send(frame);
   }
 
@@ -699,8 +753,13 @@ export class RelayWs {
     return this.send(frame);
   }
 
-  sendAnswerQuestion(askId: string, answer: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
+  sendAnswerQuestion(
+    sid: string, askId: string, answer: string | string[],
+  ): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "answer_question",
+      ask_id: askId, answer, sid, ts: nowTs(),
+    });
   }
 
   sendGetGoal(): void {
@@ -726,16 +785,18 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...this.sidObj() });
   }
 
-  sendListSessions(engine?: "claude" | "codex", space: Space = "code"): void {
+  sendListSessions(engine?: "claude" | "codex", space: Space = "code"): boolean {
     const targetEngine = engine ?? "claude";
     const scopeKey = sessionScopeKey(this.machineId, targetEngine, space);
     const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    if (this.send(obj)) {
+    const queued = this.send(obj);
+    if (queued) {
       this.queueOwnership(this.pendingListOwnership, scopeKey, ownership);
     }
+    return queued;
   }
 
   sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
@@ -1035,7 +1096,8 @@ export class RelayWs {
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
-        if ((msg.type === "user_msg" || msg.type === "turn_binding"
+        if ((msg.type === "user_msg" || msg.type === "turn_steered"
+              || msg.type === "turn_binding"
               || msg.type === "error")
             && this.queryAcceptance.accept(msg)) {
           // Keep a runtime protected after command ACK until its narrative
@@ -1046,6 +1108,7 @@ export class RelayWs {
           let acceptedFromHistory = false;
           for (const historyEvent of msg.events) {
             if (historyEvent.type !== "user_msg"
+                && historyEvent.type !== "turn_steered"
                 && historyEvent.type !== "turn_binding"
                 && historyEvent.type !== "error") continue;
             acceptedFromHistory = this.queryAcceptance.accept({
@@ -1054,7 +1117,8 @@ export class RelayWs {
             }) || acceptedFromHistory;
           }
           const pending = this.queryAcceptance.pendingMessageId(msg.session_id);
-          if (pending && msg.turns?.some((turn) => turn.id === pending)) {
+          if (pending && msg.turns?.some((turn) =>
+            turn.id === pending || turn.clientMsgId === pending)) {
             acceptedFromHistory =
               this.queryAcceptance.completeSession(msg.session_id)
               || acceptedFromHistory;

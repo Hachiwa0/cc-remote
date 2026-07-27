@@ -7,6 +7,10 @@ import os
 from typing import Any, Optional
 
 from cc_remote import __version__
+from cc_remote.wrapper.codex_runtime import (
+    codex_env as _codex_env,
+    resolve_codex_bin as _resolve_codex_bin,
+)
 
 
 _RPC_TIMEOUT = 30.0
@@ -19,20 +23,6 @@ class CodexRpcRejected(RuntimeError):
 
 class CodexRpcOutcomeUnknown(RuntimeError):
     """The mutating request may have committed before transport failure."""
-
-
-def _resolve_codex_bin() -> str:
-    # Lazy imports avoid a cycle: CodexHandle imports codex_sessions, which uses
-    # this module for thread/list.
-    from cc_remote.wrapper.codex_handle import _resolve_codex_bin as resolve
-
-    return resolve()
-
-
-def _codex_env(bin_path: str) -> dict[str, str]:
-    from cc_remote.wrapper.codex_handle import _codex_env as build_env
-
-    return build_env(bin_path)
 
 
 def _rpc_error(error: Any) -> CodexRpcRejected:

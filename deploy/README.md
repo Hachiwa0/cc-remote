@@ -21,7 +21,9 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   Linux Wrapper bundles. It builds the immutable release before pairing and
   activation, stores device authority outside the release, atomically switches
   `current`, installs a per-user LaunchAgent or root-managed systemd unit, and
-  restores the previous release/service definition on failure.
+  restores the previous release/service definition on failure. The installer
+  requires and explicitly selects the service user's daily
+  `~/.local/bin/claude`; it never silently falls back to the SDK-bundled CLI.
 - `setup-vps.sh` — atomic VPS release installer. It validates a user-owned
   upload, copies it to a new root-owned
   `/opt/cc-remote/releases/release-*` directory, builds that release's own
@@ -55,11 +57,11 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   template. The runtime reads the current user's mode-0600 device JSON instead
   of embedding control credentials in the plist.
 
-Protocol v19 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v22 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v19 relay/web release; then start the v19 wrapper.
+activate the v22 relay/web release; then start the v22 wrapper.
 
 ## Native terminal coordination
 

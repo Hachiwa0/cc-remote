@@ -72,8 +72,8 @@ export interface Model { id: string; name: string; ds: string; ic: string; effor
 // advanced user may still type `/model <id>` for a hidden/provider model; the
 // ordinary model sheet stays limited to curated choices.
 export const MODELS: Model[] = [
-  { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "crown" },
-  { id: "claude-opus-4-8", name: "Opus 4.8", ds: "最强推理", ic: "gem" },
+  { id: "claude-opus-5[1m]", name: "Opus 5", ds: "最强推理 · 1M 上下文", ic: "crown" },
+  { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "gem" },
   { id: "claude-sonnet-5", name: "Sonnet 5", ds: "均衡 · 更快", ic: "balance" },
   { id: "claude-haiku-4-5", name: "Haiku 4.5", ds: "轻量 · 极速", ic: "bolt" },
   { id: "claude-fable-5", name: "Fable 5", ds: "实验模型", ic: "book" },
@@ -144,7 +144,10 @@ const fromCatalog = (entries: CatalogModel[]): Model[] =>
       name: look?.name ?? e.display_name ?? e.id,
       ds: look?.ds ?? e.description ?? "",
       ic: look?.ic ?? "cpu",
-      efforts: e.efforts?.length ? e.efforts.map(effort) : undefined,
+      // The app-server's empty list is authoritative: this model accepts no
+      // reasoning override. Preserve [] instead of falling back to a generic
+      // Codex list which can fail only after turn/start reaches the model API.
+      efforts: e.efforts.map(effort),
     };
   });
 
@@ -190,8 +193,15 @@ export const permsFor = (engine?: string): Perm[] => (engine === "codex" ? CODEX
 // An id we don't know (any codex model) passes through verbatim — the codex chips
 // resolve it against the live catalog themselves.
 export function matchModelId(m: string, engine?: string): string {
-  const base = m.replace(/\[.*\]$/, "");
-  const hit = modelsFor(engine).find((x) => base === x.id || base.startsWith(x.id));
+  const models = modelsFor(engine);
+  const exact = models.find((x) => m === x.id);
+  if (exact) return exact.id;
+
+  const base = m.replace(/\[1m\]$/i, "");
+  const hit = models.find((x) => {
+    const candidateBase = x.id.replace(/\[1m\]$/i, "");
+    return base === candidateBase;
+  });
   return hit ? hit.id : m;
 }
 

@@ -19,6 +19,8 @@
     <string>1</string>
     <key>CC_CWD</key>
     <string>__HOME__</string>
+    <key>CLAUDE_BIN</key>
+    <string>__HOME__/.local/bin/claude</string>
     <key>CC_REMOTE_CODEX_DAEMON</key>
     <string>auto</string>
     <key>PATH</key>

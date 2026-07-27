@@ -14,8 +14,13 @@ from cc_remote.protocol import (
     ASK_QUESTION_MAX_CHARS,
     AnswerQuestion,
     AskUser,
+    AskUserClosed,
     UserMsg,
+    deserialize,
+    is_downstream,
+    serialize,
 )
+from cc_remote.wrapper.claude_questions import AskCancelled, AskTimeout
 from cc_remote.wrapper.ask import _normalize_ask_arguments
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -24,6 +29,16 @@ def test_protocol_bounds_question_options_and_answer():
     valid_options = [{"label": "one"}, {"label": "two", "ds": "details"}]
     assert AskUser(
         ask_id="ask-1", question="pick", options=valid_options).options == valid_options
+    assert AskUser(
+        ask_id="ask-1", question="pick", options=valid_options,
+        multi_select=True,
+    ).multi_select is True
+    assert AnswerQuestion(ask_id="ask-1", answer=["one", "two"]).answer == [
+        "one", "two",
+    ]
+    closed = AskUserClosed(ask_id="ask-1", reason="answered")
+    assert deserialize(serialize(closed)) == closed
+    assert is_downstream(closed) is True
 
     invalid = [
         {"ask_id": "ask-1", "question": "x" * (ASK_QUESTION_MAX_CHARS + 1),
@@ -47,6 +62,13 @@ def test_protocol_bounds_question_options_and_answer():
     with pytest.raises(ValidationError):
         AnswerQuestion(
             ask_id="ask-1", answer="x" * (ASK_ANSWER_MAX_CHARS + 1))
+    with pytest.raises(ValidationError):
+        AnswerQuestion(ask_id="ask-1", answer=[])
+    with pytest.raises(ValidationError):
+        AnswerQuestion(
+            ask_id="ask-1",
+            answer=["x"] * (ASK_OPTION_MAX_COUNT + 1),
+        )
 
 
 @pytest.mark.parametrize(
@@ -119,5 +141,77 @@ def test_machine_ask_identity_does_not_consume_a_wire_sequence():
 
         ctx.pending_asks[ask.ask_id].set_result("A")
         assert await task == "A"
+        assert transport.sent[-1].type == "ask_user_closed"
+        assert transport.sent[-1].ask_id == ask.ask_id
+        assert transport.sent[-1].reason == "answered"
+
+        replay = ctx.buffer.replay_from(
+            1, cc_session_id="sid-1", state="running", generation="g")
+        assert [frame.type for frame in replay[1:-1]] == [
+            "ask_user", "ask_user_closed",
+        ]
+
+    asyncio.run(run())
+
+
+def test_machine_ask_timeout_closes_and_does_not_leak_pending_future():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid-1", "sid-1")
+        with pytest.raises(AskTimeout):
+            await machine._on_ask(
+                ctx,
+                "Choose",
+                [{"label": "A"}, {"label": "B"}],
+                timeout=0.01,
+            )
+        assert ctx.pending_asks == {}
+        assert transport.sent[-1].type == "ask_user_closed"
+        assert transport.sent[-1].reason == "timeout"
+
+    asyncio.run(run())
+
+
+def test_machine_serializes_concurrent_asks_per_session():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid-1", "sid-1")
+        first = asyncio.create_task(machine._on_ask(
+            ctx, "First?", [{"label": "A"}, {"label": "B"}],
+        ))
+        second = asyncio.create_task(machine._on_ask(
+            ctx, "Second?", [{"label": "C"}, {"label": "D"}],
+        ))
+        while not ctx.pending_asks:
+            await asyncio.sleep(0)
+        assert [message.type for message in transport.sent].count("ask_user") == 1
+        first_id = next(iter(ctx.pending_asks))
+        ctx.pending_asks[first_id].set_result("A")
+        assert await first == "A"
+        while not ctx.pending_asks:
+            await asyncio.sleep(0)
+        assert [message.type for message in transport.sent].count("ask_user") == 2
+        second_id = next(iter(ctx.pending_asks))
+        ctx.pending_asks[second_id].set_result("D")
+        assert await second == "D"
+
+    asyncio.run(run())
+
+
+def test_machine_interrupt_cancellation_closes_pending_ask():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid-1", "sid-1")
+        task = asyncio.create_task(machine._on_ask(
+            ctx, "Continue?", [{"label": "Yes"}, {"label": "No"}],
+        ))
+        while not ctx.pending_asks:
+            await asyncio.sleep(0)
+        machine._cancel_pending_asks(ctx)
+        with pytest.raises(AskCancelled):
+            await task
+        assert ctx.pending_asks == {}
+        assert transport.sent[-1].type == "ask_user_closed"
+        assert transport.sent[-1].reason == "cancelled"
 
     asyncio.run(run())

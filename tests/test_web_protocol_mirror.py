@@ -30,6 +30,7 @@ from cc_remote.protocol import (
     _TYPE_MAP,
     PROTOCOL_VERSION,
     SessionInfo,
+    TurnNotificationContext,
 )
 
 
@@ -143,8 +144,12 @@ def test_client_command_requiredness_matches_pydantic_acceptance():
             )
 
 
-def test_nested_session_and_goal_models_keep_fields_and_requiredness():
-    for ts_name, model in (("SessionInfo", SessionInfo), ("ThreadGoal", ThreadGoal)):
+def test_nested_session_goal_and_notification_models_keep_fields_and_requiredness():
+    for ts_name, model in (
+        ("SessionInfo", SessionInfo),
+        ("ThreadGoal", ThreadGoal),
+        ("TurnNotificationContext", TurnNotificationContext),
+    ):
         for field, definition in model.model_fields.items():
             optional = _field_optional(ts_name, field)
             assert optional is not None, f"{ts_name} is missing {field!r}"

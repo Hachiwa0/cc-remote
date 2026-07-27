@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sqlite3
 
+import pytest
+
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
@@ -12,11 +14,13 @@ from cc_remote.wrapper.history_store import (
 
 
 def _page(label: str, *, more: bool = False) -> MaterializedHistoryPage:
+    events = ({"type": "user_msg", "msg_id": label, "prompt": label},)
     return MaterializedHistoryPage(
-        events=({"type": "user_msg", "msg_id": label, "prompt": label},),
+        events=events,
         has_more=more,
         oldest_id=label,
         newest_id=label,
+        turns=materialize_history_turns(events),
     )
 
 
@@ -171,7 +175,9 @@ def test_history_index_is_bounded_and_invalidatable(tmp_path):
     assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
 
 
-def test_v6_migration_invalidates_only_codex_derived_rows(tmp_path):
+@pytest.mark.parametrize("old_version", [6, 7, 8])
+def test_v9_migration_rebuilds_all_derived_history_rows(
+        tmp_path, old_version):
     source_path = tmp_path / "transcript.jsonl"
     source_path.write_text("{}\n")
     source = HistorySourceFingerprint.capture(source_path)
@@ -190,7 +196,7 @@ def test_v6_migration_invalidates_only_codex_derived_rows(tmp_path):
         )
 
     with sqlite3.connect(store.path) as connection:
-        connection.execute("PRAGMA user_version=6")
+        connection.execute(f"PRAGMA user_version={old_version}")
         for table in (
             "history_pages",
             "history_turn_details",
@@ -205,32 +211,28 @@ def test_v6_migration_invalidates_only_codex_derived_rows(tmp_path):
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         for table in (
             "history_pages",
             "history_turn_details",
             "history_image_assets",
         ):
             assert connection.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
-            ).fetchone()[0] == 1
-            assert connection.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+                f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0] == 0
 
-    assert migrated.get_page(
-        "claude-session", "claude", source, before=None, limit=4,
-    ) == _page("claude-session")
-    assert migrated.get_turn_detail(
-        "claude-session", "claude", source, "claude-session",
-    ) is not None
-    assert migrated.get_image_asset(
-        "claude-session", "claude", source, "claude-session",
-        "claude-image", "thumbnail",
-    ) == ("image/png", 1, 1, b"claude")
-    assert migrated.get_page(
-        "codex-session", "codex", source, before=None, limit=4,
-    ) is None
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert migrated.get_page(
+            session_id, engine, source, before=None, limit=4,
+        ) is None
+        assert migrated.get_turn_detail(
+            session_id, engine, source, session_id,
+        ) is None
+        assert migrated.get_image_asset(
+            session_id, engine, source, session_id, f"{engine}-image",
+            "thumbnail",
+        ) is None
 
 
 def test_history_index_rejects_one_page_larger_than_total_budget(tmp_path):

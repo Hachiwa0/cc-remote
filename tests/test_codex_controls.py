@@ -13,11 +13,14 @@ from pydantic import ValidationError
 
 from cc_remote import __version__
 from cc_remote.protocol import (
-    CollaborationMode, Error, GoalState, Model, NewSession, PinSession, StateEvent,
-    ThreadGoal, TurnBinding, TurnEnd, UserMsg,
+    ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
+    CollaborationMode, CommandAck, Delta, Error, GoalState, Interrupt, Model,
+    NewSession, PinSession, StateEvent, Steer, ThreadGoal, TurnBinding, TurnEnd,
+    TurnSteered, UserMsg,
 )
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
+from cc_remote.wrapper import codex_runtime as codex_runtime_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_handle import (
@@ -56,6 +59,32 @@ def test_provider_error_diagnostic_keeps_only_safe_classification():
         "http_status": 503,
     }
     assert "SECRET" not in repr(diagnostic)
+
+
+def test_codex_json_rpc_error_preserves_typed_no_active_turn_signal():
+    async def run():
+        handle = CodexHandle(_Cfg())
+
+        async def send(request):
+            await handle._dispatch({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {
+                    "code": -32600,
+                    "message": "invalid request",
+                    "data": "no active turn to interrupt",
+                },
+            })
+
+        handle._send = send
+        with pytest.raises(
+            codex_handle_module.CodexAppServerError,
+        ) as caught:
+            await handle._request("turn/interrupt", {})
+        assert caught.value.code == -32600
+        assert caught.value.no_active_turn is True
+
+    asyncio.run(run())
 
 
 def test_codex_initialize_declares_experimental_api_for_collaboration_mode():
@@ -530,13 +559,475 @@ def test_codex_review_pre_response_burst_never_blocks_rpc_reader():
                 "turn": {"id": "review-outer", "status": "completed"},
             },
         })
+        queue_cap = handle._turn_q.max_items
         # EOF/disconnect racing the consumer must not replace the already
         # retained authoritative terminal with a bare sentinel.
         handle._force_turn_sentinel(handle._turn_q)
         frames = [frame async for frame in handle.receive_response()]
-        assert len(frames) == 2
+        assert len(frames) == 4
         assert isinstance(frames[0], CodexManagedOverflow)
-        assert frames[1]["method"] == "turn/completed"
+        assert [
+            frame["params"]["item"]["id"] for frame in frames[1:-1]
+        ] == [
+            f"early-{queue_cap - 1}",
+            f"early-{queue_cap}",
+        ]
+        assert frames[-1]["method"] == "turn/completed"
+
+    asyncio.run(run())
+
+
+def test_codex_managed_bridge_recovers_after_consumed_gap_at_item_boundary():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "managed-gap"
+        handle.turn_id = "managed-gap-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+
+        # One pathological frame creates a loss epoch without blocking the sole
+        # app-server reader.  Machine consumes this marker and keeps its sticky
+        # overflow flag solely for the terminal history repair.
+        await asyncio.wait_for(handle._dispatch({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "managed-gap",
+                "turnId": "managed-gap-turn",
+                "itemId": "lost-answer",
+                "delta": "lost",
+            },
+        }, raw_size=queue.max_bytes + 1), timeout=0.1)
+        marker = await asyncio.wait_for(queue.get(), timeout=0.1)
+        assert isinstance(marker, CodexManagedOverflow)
+
+        # A delta whose start was lost must not be resurrected after the gap.
+        # Its later complete snapshot is authoritative and independently safe.
+        await handle._dispatch({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "managed-gap",
+                "turnId": "managed-gap-turn",
+                "itemId": "lost-answer",
+                "delta": "orphan",
+            },
+        })
+        recovered = {
+            "method": "item/completed",
+            "params": {
+                "threadId": "managed-gap",
+                "turnId": "managed-gap-turn",
+                "item": {
+                    "id": "lost-answer",
+                    "type": "agentMessage",
+                    "text": "orphan result",
+                },
+            },
+        }
+        await handle._dispatch(recovered)
+        fresh = [
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "managed-gap",
+                    "turnId": "managed-gap-turn",
+                    "item": {
+                        "id": "fresh-answer",
+                        "type": "agentMessage",
+                    },
+                },
+            },
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "managed-gap",
+                    "turnId": "managed-gap-turn",
+                    "itemId": "fresh-answer",
+                    "delta": "still live",
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-gap",
+                    "turnId": "managed-gap-turn",
+                    "item": {
+                        "id": "fresh-answer",
+                        "type": "agentMessage",
+                        "text": "still live",
+                    },
+                },
+            },
+        ]
+        for message in fresh:
+            await handle._dispatch(message)
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "managed-gap",
+                "turn": {
+                    "id": "managed-gap-turn",
+                    "status": "completed",
+                },
+            },
+        })
+
+        frames = [frame async for frame in handle.receive_response()]
+        assert frames[:-1] == [recovered, *fresh]
+        assert frames[-1]["method"] == "turn/completed"
+        assert all(
+            (frame.get("params") or {}).get("delta") != "orphan"
+            for frame in frames
+            if isinstance(frame, dict)
+        )
+
+    asyncio.run(run())
+
+
+def test_codex_managed_bridge_keeps_complete_snapshots_across_gap():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "managed-completions"
+        handle.turn_id = "managed-completions-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+
+        # The consumer already rendered this start before a later frame opened
+        # the loss epoch. Its authoritative completion must still close the item.
+        before_gap_start = {
+            "method": "item/started",
+            "params": {
+                "threadId": "managed-completions",
+                "turnId": "managed-completions-turn",
+                "item": {
+                    "id": "started-before-gap",
+                    "type": "commandExecution",
+                    "command": "true",
+                    "status": "inProgress",
+                },
+            },
+        }
+        await handle._dispatch(before_gap_start)
+        assert await queue.get() == before_gap_start
+
+        await handle._dispatch({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "managed-completions",
+                "turnId": "managed-completions-turn",
+                "itemId": "lost-delta",
+                "delta": "must stay dropped",
+            },
+        }, raw_size=queue.max_bytes + 1)
+        assert isinstance(await queue.get(), CodexManagedOverflow)
+
+        malformed = [
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {"id": "missing-type"},
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {"type": "agentMessage", "text": "missing id"},
+                },
+            },
+            {
+                "method": "hook/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "run": {"eventName": "postToolUse"},
+                },
+            },
+            {
+                "method": "item/autoApprovalReview/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "reviewId": "missing-review-snapshot",
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": "x" * 4097,
+                        "type": "agentMessage",
+                        "text": "oversized id",
+                    },
+                },
+            },
+        ]
+        for message in malformed:
+            await handle._dispatch(message)
+
+        snapshots = [
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": "started-before-gap",
+                        "type": "commandExecution",
+                        "command": "true",
+                        "status": "completed",
+                        "aggregatedOutput": "",
+                        "exitCode": 0,
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": "completion-only-answer",
+                        "type": "agentMessage",
+                        "text": "authoritative answer",
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": "completion-only-image",
+                        "type": "imageGeneration",
+                        "status": "completed",
+                        "savedPath": "/tmp/generated.png",
+                    },
+                },
+            },
+            {
+                "method": "hook/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "run": {
+                        "id": "completion-only-hook",
+                        "eventName": "postToolUse",
+                        "status": "completed",
+                    },
+                },
+            },
+            {
+                "method": "item/autoApprovalReview/completed",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "reviewId": "completion-only-review",
+                    "review": {"status": "approved"},
+                },
+            },
+        ]
+        # Fill the post-gap live reservation so the first completion itself is
+        # the frame that opens a second gap. The bridge must retry and retain
+        # that current self-contained snapshot after installing the marker.
+        for index in range(queue.max_items - 1):
+            await handle._dispatch({
+                "method": "item/started",
+                "params": {
+                    "threadId": "managed-completions",
+                    "turnId": "managed-completions-turn",
+                    "item": {
+                        "id": f"filler-{index}",
+                        "type": "reasoning",
+                    },
+                },
+            })
+        assert queue.qsize() == queue.max_items - 1
+        await handle._dispatch(snapshots[0])
+        assert isinstance(await queue.get(), CodexManagedOverflow)
+
+        for message in snapshots[1:]:
+            await handle._dispatch(message)
+        terminal = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "managed-completions",
+                "turn": {
+                    "id": "managed-completions-turn",
+                    "status": "completed",
+                },
+            },
+        }
+        await handle._dispatch(terminal)
+
+        frames = [frame async for frame in handle.receive_response()]
+        assert frames == [*snapshots, terminal]
+
+    asyncio.run(run())
+
+
+def test_codex_overflow_does_not_block_approval_or_interaction_requests():
+    async def run():
+        approvals = []
+        interactions = []
+        sent = []
+
+        async def approve(method, params):
+            approvals.append((method, params))
+            return "accept"
+
+        async def interact(method, params):
+            interactions.append((method, params))
+            return {"answers": {"choice": {"answers": ["yes"]}}}
+
+        handle = CodexHandle(
+            _Cfg(),
+            approval_callback=approve,
+            interaction_callback=interact,
+        )
+        handle.approval = "on-request"
+        handle.thread_id = "overflow-requests"
+        handle.turn_id = "overflow-requests-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+
+        async def send(message):
+            sent.append(message)
+
+        handle._send = send
+        await handle._dispatch({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "overflow-requests",
+                "turnId": "overflow-requests-turn",
+                "itemId": "lost",
+                "delta": "lost",
+            },
+        }, raw_size=queue.max_bytes + 1)
+        assert isinstance(await queue.get(), CodexManagedOverflow)
+
+        await handle._dispatch({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "overflow-requests",
+                "turnId": "overflow-requests-turn",
+                "itemId": "command",
+                "command": "true",
+            },
+        })
+        await handle._dispatch({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "overflow-requests",
+                "turnId": "overflow-requests-turn",
+                "itemId": "question",
+                "questions": [],
+            },
+        })
+        await asyncio.gather(*list(handle._server_request_tasks))
+
+        assert [message["id"] for message in sent] == [41, 42]
+        assert sent[0]["result"] == {"decision": "accept"}
+        assert sent[1]["result"] == {
+            "answers": {"choice": {"answers": ["yes"]}},
+        }
+        assert len(approvals) == len(interactions) == 1
+        assert queue.qsize() == 0
+        assert queue.byte_size == 0
+
+    asyncio.run(run())
+
+
+def test_codex_managed_bridge_repeated_overflow_is_bounded_and_terminal_unique():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "managed-repeat"
+        handle.turn_id = "managed-repeat-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+
+        markers = []
+        for epoch in range(8):
+            # Each consumed gap opens a new loss epoch. Fill the complete live
+            # reservation again so this is eight real overflows, not one sticky
+            # flag suppressing seven later bursts.
+            for index in range(queue.max_items):
+                await asyncio.wait_for(handle._dispatch({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "managed-repeat",
+                        "turnId": "managed-repeat-turn",
+                        "item": {
+                            "id": f"epoch-{epoch}-item-{index}",
+                            "type": "reasoning",
+                        },
+                    },
+                }), timeout=0.1)
+                assert queue.qsize() <= queue.max_items
+                assert queue.byte_size <= queue.max_bytes
+            if epoch == 0:
+                # Overflow again before the first marker is consumed. The stale
+                # post-gap tail is replaced. Exactly one marker remains before
+                # the two newest complete starts retained around that gap.
+                for index in range(queue.max_items - 1):
+                    await asyncio.wait_for(handle._dispatch({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "managed-repeat",
+                            "turnId": "managed-repeat-turn",
+                            "item": {
+                                "id": f"merged-gap-item-{index}",
+                                "type": "reasoning",
+                            },
+                        },
+                    }), timeout=0.1)
+                    assert queue.qsize() <= queue.max_items
+                    assert queue.byte_size <= queue.max_bytes
+                assert queue.qsize() == 3
+            marker = await asyncio.wait_for(queue.get(), timeout=0.1)
+            assert isinstance(marker, CodexManagedOverflow)
+            markers.append(marker)
+
+        terminal = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "managed-repeat",
+                "turn": {
+                    "id": "managed-repeat-turn",
+                    "status": "completed",
+                },
+            },
+        }
+        # The bridge itself owns terminal de-duplication. This also covers an
+        # EOF/dispatch race before receive_response() has detached the queue.
+        assert handle._queue_managed_notification(
+            terminal, raw_size=queue.max_bytes + 1)
+        assert handle._queue_managed_notification(
+            terminal, raw_size=queue.max_bytes + 1)
+        assert len(markers) == 8
+        assert queue.qsize() <= queue.max_items
+        assert queue.byte_size <= queue.max_bytes
+        assert queue.has_turn_completed()
+
+        frames = [frame async for frame in handle.receive_response()]
+        assert sum(
+            isinstance(frame, dict)
+            and frame.get("method") == "turn/completed"
+            for frame in frames
+        ) == 1
 
     asyncio.run(run())
 
@@ -867,6 +1358,35 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
             async def receive_response(self):
                 yield CodexManagedOverflow("managed-overflow-turn")
                 yield {
+                    "method": "item/started",
+                    "params": {
+                        "turnId": "managed-overflow-turn",
+                        "item": {
+                            "id": "after-gap",
+                            "type": "agentMessage",
+                        },
+                    },
+                }
+                yield {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "turnId": "managed-overflow-turn",
+                        "itemId": "after-gap",
+                        "delta": "still streaming",
+                    },
+                }
+                yield {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "managed-overflow-turn",
+                        "item": {
+                            "id": "after-gap",
+                            "type": "agentMessage",
+                            "text": "still streaming",
+                        },
+                    },
+                }
+                yield {
                     "method": "turn/completed",
                     "params": {"turn": {
                         "id": "managed-overflow-turn", "status": "completed",
@@ -880,6 +1400,10 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
 
         assert not [event for event in transport.sent
                     if isinstance(event, Error)]
+        assert any(
+            isinstance(event, Delta) and event.text == "still streaming"
+            for event in transport.sent
+        )
         terminal = [event for event in transport.sent
                     if isinstance(event, TurnEnd)]
         assert len(terminal) == 1
@@ -1096,6 +1620,114 @@ def test_private_codex_keeps_legacy_unattributed_provider_error():
     asyncio.run(run())
 
 
+def test_shared_resume_prebinding_drops_foreign_turn_before_rpc_response(
+        monkeypatch):
+    class Manager:
+        mode = "auto"
+        strict_shared_affinity = True
+
+        async def proxy_args(self, _bin, _env):
+            return ["/usr/bin/codex", "app-server", "proxy"]
+
+        def invalidate(self):
+            pass
+
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module, "_resolve_codex_bin",
+            lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_newer_private_core_for_oversized_resume",
+            lambda _bin, _sid: None,
+        )
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_oversized_desktop_openai_resume_requires_http",
+            lambda _sid: False,
+        )
+        lifecycle = []
+        handle = CodexHandle(
+            _Cfg(),
+            daemon_mode="auto",
+            daemon_manager=Manager(),
+            turn_lifecycle_callback=(
+                lambda phase, turn_id: asyncio.sleep(
+                    0, result=lifecycle.append((phase, turn_id)))),
+        )
+
+        async def open_process(_argv, _bin, *, daemon_proxy):
+            assert daemon_proxy is True
+            handle.proc = SimpleNamespace(returncode=None)
+            handle._using_daemon_proxy = True
+            handle._dead = False
+
+        async def request(method, _params=None):
+            if method == "initialize":
+                return {"userAgent": "codex_cli_rs/0.145.0 (test)"}
+            assert method == "thread/resume"
+            # A shared app-server can publish another subscribed thread between
+            # initialize and this resume response. It must not claim this handle.
+            await handle._dispatch({
+                "method": "turn/started",
+                "params": {"turn": {"id": "unattributed-turn"}},
+            })
+            await handle._dispatch({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "foreign-thread",
+                    "turn": {"id": "foreign-turn"},
+                },
+            })
+            await handle._dispatch({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "resume-thread",
+                    "turn": {"id": "current-turn"},
+                },
+            })
+            return {"thread": {"id": "resume-thread"}}
+
+        handle._open_process = open_process
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+        await handle.connect(resume_id="resume-thread", cwd="/tmp")
+
+        assert handle.thread_id == "resume-thread"
+        assert handle.turn_id == "current-turn"
+        assert handle.turn_active is True
+        assert lifecycle == [("started", "current-turn")]
+        handle.proc = None
+
+    asyncio.run(run())
+
+
+def test_shared_resume_postbinding_drops_unattributed_turn_from_other_thread():
+    async def run():
+        lifecycle = []
+        handle = CodexHandle(
+            _Cfg(),
+            turn_lifecycle_callback=(
+                lambda phase, turn_id: asyncio.sleep(
+                    0, result=lifecycle.append((phase, turn_id)))),
+        )
+        handle._using_daemon_proxy = True
+        handle.thread_id = "bound-thread"
+        handle._shared_resume_binding_thread_id = None
+
+        await handle._dispatch({
+            "method": "turn/started",
+            "params": {"turn": {"id": "unattributed-foreign-turn"}},
+        })
+
+        assert lifecycle == []
+        assert handle.turn_id is None
+        assert handle.turn_active is False
+        assert handle._spontaneous_turn_id is None
+
+    asyncio.run(run())
+
+
 def test_codex_spontaneous_lifecycle_detaches_old_queue_and_filters_local_turn():
     async def run():
         seen = []
@@ -1199,16 +1831,17 @@ def test_codex_catalog_normalization_is_structurally_bounded(monkeypatch):
 
 def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
         monkeypatch):
-    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE", None)
-    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE_INVENTORY", None)
+    monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE", None)
+    monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE_INVENTORY", None)
     monkeypatch.delenv("CODEX_BIN", raising=False)
     monkeypatch.setattr(
-        codex_handle_module, "_codex_candidates", lambda: ["old", "new", "broken"])
+        codex_runtime_module, "codex_candidates",
+        lambda: ["old", "new", "broken"])
     versions = {"old": (0, 140, 0), "new": (0, 144, 1), "broken": (-1,)}
     monkeypatch.setattr(
-        codex_handle_module, "_codex_version", lambda path: versions[path])
+        codex_runtime_module, "codex_version", lambda path: versions[path])
 
-    assert codex_handle_module._resolve_codex_bin() == "new"
+    assert codex_runtime_module.resolve_codex_bin() == "new"
 
 
 def test_oversized_resume_prefers_only_a_newer_official_desktop_core(
@@ -1315,11 +1948,11 @@ def test_codex_binary_resolution_reprobes_after_symlink_upgrade(
     current = tmp_path / "codex"
     current.symlink_to(old)
 
-    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE", None)
-    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE_INVENTORY", None)
+    monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE", None)
+    monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE_INVENTORY", None)
     monkeypatch.delenv("CODEX_BIN", raising=False)
     monkeypatch.setattr(
-        codex_handle_module, "_codex_candidates", lambda: [str(current)])
+        codex_runtime_module, "codex_candidates", lambda: [str(current)])
     probed = []
 
     def version(path):
@@ -1327,15 +1960,15 @@ def test_codex_binary_resolution_reprobes_after_symlink_upgrade(
         return ((0, 144, 4) if os.path.realpath(path) == str(new)
                 else (0, 144, 1))
 
-    monkeypatch.setattr(codex_handle_module, "_codex_version", version)
-    assert codex_handle_module._resolve_codex_bin() == str(current)
+    monkeypatch.setattr(codex_runtime_module, "codex_version", version)
+    assert codex_runtime_module.resolve_codex_bin() == str(current)
     assert probed == [str(old)]
-    assert codex_handle_module._resolve_codex_bin() == str(current)
+    assert codex_runtime_module.resolve_codex_bin() == str(current)
     assert probed == [str(old)]
 
     current.unlink()
     current.symlink_to(new)
-    assert codex_handle_module._resolve_codex_bin() == str(current)
+    assert codex_runtime_module.resolve_codex_bin() == str(current)
     assert probed == [str(old), str(new)]
 
 
@@ -1568,6 +2201,16 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
 
     async def run():
         process = FakeProcess()
+        repair_calls = []
+
+        def repair_provider_records(**kwargs):
+            repair_calls.append(kwargs)
+            return SimpleNamespace(
+                changed_db_thread_ids=(),
+                changed_rollout_thread_ids=(),
+                deferred_thread_ids=(),
+            )
+
         monkeypatch.setattr(
             codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
@@ -1578,6 +2221,16 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
+        monkeypatch.setattr(
+            codex_handle_module,
+            "repair_http_provider_records",
+            repair_provider_records,
+        )
+        monkeypatch.setattr(
+            codex_handle_module,
+            "canonical_thread_provider_is_restored",
+            lambda _sid: True,
+        )
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
         calls = []
@@ -1635,6 +2288,86 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
             "persisted-model", "ultra",
             "never" if work_mode else "on-request", "fast")
         await handle.disconnect()
+        assert bool(repair_calls) is http_only
+
+    asyncio.run(run())
+
+
+def test_http_provider_guard_runs_after_every_persisting_request(monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._http_provider_root_id = "root-thread"
+        handle.thread_id = "root-thread"
+        restored = []
+
+        async def restore(**kwargs):
+            restored.append(kwargs)
+
+        async def send(message):
+            handle._pending[message["id"]].set_result({"ok": True})
+
+        monkeypatch.setattr(handle, "_restore_http_provider_state", restore)
+        monkeypatch.setattr(handle, "_send", send)
+
+        for method in sorted(
+            codex_handle_module._HTTP_PROVIDER_PERSISTING_METHODS
+        ):
+            await handle._request(method, {"threadId": "root-thread"})
+        await handle._request(
+            "thread/read",
+            {"threadId": "root-thread", "includeTurns": False},
+        )
+
+        assert restored == [
+            {} for _ in codex_handle_module._HTTP_PROVIDER_PERSISTING_METHODS
+        ]
+
+    asyncio.run(run())
+
+
+def test_http_provider_guard_runs_for_late_persisting_notification(monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._http_provider_root_id = "root-thread"
+        handle.thread_id = "root-thread"
+        restored = []
+
+        async def restore(**kwargs):
+            restored.append(kwargs)
+
+        monkeypatch.setattr(handle, "_restore_http_provider_state", restore)
+        await handle._dispatch({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "root-thread",
+                "status": {"type": "idle"},
+            },
+        })
+
+        assert restored == [{}]
+
+    asyncio.run(run())
+
+
+def test_http_provider_delayed_repair_stops_cleanly(monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._http_provider_root_id = "root-thread"
+        calls = []
+
+        async def restore(**kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr(handle, "_restore_http_provider_state", restore)
+        handle._schedule_http_provider_descendant_repair()
+        tasks = set(handle._http_provider_repair_tasks)
+        assert len(tasks) == 3
+
+        handle._http_provider_repair_stop.set()
+        await asyncio.gather(*tasks)
+
+        assert calls == []
+        assert handle._http_provider_repair_tasks == set()
 
     asyncio.run(run())
 
@@ -2215,6 +2948,105 @@ def test_machine_claude_tool_permission_allows_or_denies_once():
     asyncio.run(run())
 
 
+def test_machine_claude_ask_user_question_preserves_input_and_collects_answers():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-question", "claude-question")
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Which target?",
+                    "header": "Target",
+                    "options": [
+                        {"label": "Mac", "description": "Local wrapper"},
+                        {"label": "Linux", "description": "Remote wrapper"},
+                    ],
+                    "multiSelect": False,
+                },
+                {
+                    "question": "Which checks?",
+                    "header": "Checks",
+                    "options": [
+                        {"label": "Tests", "description": "Run tests"},
+                        {"label": "Lint", "description": "Run lint"},
+                    ],
+                    "multiSelect": True,
+                },
+            ],
+            "preview": "preserve-this-unknown-sdk-field",
+        }
+        task = asyncio.create_task(machine._on_claude_tool_permission(
+            ctx, "AskUserQuestion", tool_input, SimpleNamespace(suggestions=[])))
+
+        while not ctx.pending_asks:
+            await asyncio.sleep(0)
+        first_id = next(iter(ctx.pending_asks))
+        first_event = next(
+            message for message in transport.sent
+            if message.type == "ask_user" and message.ask_id == first_id)
+        assert first_event.header == "Target"
+        assert first_event.multi_select is False
+        assert [option["label"] for option in first_event.options] == ["Mac", "Linux"]
+        ctx.pending_asks[first_id].set_result("Mac")
+
+        while not ctx.pending_asks or first_id in ctx.pending_asks:
+            await asyncio.sleep(0)
+        second_id = next(iter(ctx.pending_asks))
+        second_event = next(
+            message for message in transport.sent
+            if message.type == "ask_user" and message.ask_id == second_id)
+        assert second_event.header == "Checks"
+        assert second_event.multi_select is True
+        ctx.pending_asks[second_id].set_result(["Tests", "Lint"])
+
+        result = await task
+        assert isinstance(result, PermissionResultAllow)
+        assert result.updated_input == {
+            **tool_input,
+            "answers": {
+                "Which target?": "Mac",
+                "Which checks?": ["Tests", "Lint"],
+            },
+        }
+        assert not any(
+            message.type == "ask_user"
+            and [option["label"] for option in message.options] == ["允许一次", "拒绝"]
+            for message in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_machine_duplicate_answer_returns_correlated_error_to_second_client():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-question", "claude-question")
+        machine.sessions[ctx.key] = ctx
+        task = asyncio.create_task(machine._on_ask(
+            ctx, "Choose", [{"label": "A"}, {"label": "B"}],
+        ))
+        while not ctx.pending_asks:
+            await asyncio.sleep(0)
+        ask_id = next(iter(ctx.pending_asks))
+        first = SimpleNamespace(
+            sid=ctx.key, ask_id=ask_id, answer="A",
+            cmd_id="cmd-first", client_id="client-first",
+        )
+        second = SimpleNamespace(
+            sid=ctx.key, ask_id=ask_id, answer="B",
+            cmd_id="cmd-second", client_id="client-second",
+        )
+        assert await machine._handle_answer_question(first) is None
+        duplicate = await machine._handle_answer_question(second)
+        assert duplicate.type == "error"
+        assert duplicate.request_id == "cmd-second"
+        assert duplicate.to == "client-second"
+        assert await task == "A"
+        assert any(message.type == "ask_user_closed" for message in transport.sent)
+
+    asyncio.run(run())
+
+
 def test_claude_sdk_permission_callback_fails_closed_without_bridge():
     async def run():
         result = await SdkHandle(_Cfg())._can_use_tool(
@@ -2438,6 +3270,479 @@ def test_codex_goal_auto_turn_claims_session_interrupts_and_completes():
                 if isinstance(event, StateEvent)][-3:] == [
                     "running", "interrupting", "idle",
                 ]
+
+    asyncio.run(run())
+
+
+def test_codex_no_active_turn_interrupt_clears_only_phantom_spontaneous_state():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("phantom-running", "phantom-running")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "phantom-turn"
+        ctx.codex_spontaneous_turn_id = "phantom-turn"
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = ctx.session_id
+        handle.turn_id = "phantom-turn"
+        handle.turn_active = True
+        handle._spontaneous_turn_id = "phantom-turn"
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+
+        stalled = asyncio.Event()
+        task = asyncio.create_task(stalled.wait())
+        ctx.codex_spontaneous_task = task
+        requests = []
+        repairs = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "turn/interrupt":
+                raise codex_handle_module.CodexAppServerError({
+                    "code": -32600,
+                    "message": "no active turn to interrupt",
+                })
+            assert method == "thread/read"
+            return {"thread": {
+                "id": ctx.session_id,
+                "status": {"type": "idle"},
+            }}
+
+        async def repair(sid):
+            repairs.append(sid)
+
+        handle._request = request
+        machine._push_mirrored_history = repair
+        await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
+
+        assert requests == [
+            (
+                "turn/interrupt",
+                {"threadId": ctx.session_id, "turnId": "phantom-turn"},
+            ),
+            (
+                "thread/read",
+                {"threadId": ctx.session_id, "includeTurns": False},
+            ),
+        ]
+        assert task.done() and task.cancelled()
+        assert ctx.state == "idle"
+        assert ctx.codex_spontaneous_task is None
+        assert ctx.codex_spontaneous_turn_id is None
+        assert ctx.active_msg_id is None
+        assert ctx.interrupt_deadline is None
+        assert not ctx.interrupt_event.is_set()
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+        assert handle._spontaneous_turn_id is None
+        assert repairs == [ctx.session_id]
+        terminals = [
+            event for event in transport.sent if isinstance(event, TurnEnd)
+        ]
+        assert len(terminals) == 1
+        assert terminals[0].turn_id == "phantom-turn"
+        assert terminals[0].result.subtype == "interrupted"
+        assert [event.state for event in transport.sent
+                if isinstance(event, StateEvent)][-2:] == [
+                    "interrupting", "idle",
+                ]
+
+    asyncio.run(run())
+
+
+def test_codex_no_active_turn_interrupt_does_not_unlock_managed_consumer():
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("managed-running", "managed-running")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "managed-turn"
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = ctx.session_id
+        handle.turn_id = "managed-turn"
+        handle.turn_active = True
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+
+        stalled = asyncio.Event()
+        task = asyncio.create_task(stalled.wait())
+        ctx.turn_task = task
+
+        async def request(_method, _params=None):
+            raise codex_handle_module.CodexAppServerError({
+                "code": -32600,
+                "message": "no active turn to interrupt",
+            })
+
+        handle._request = request
+        await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
+
+        assert ctx.state == "interrupting"
+        assert ctx.turn_task is task and not task.done()
+        assert handle.turn_active is True
+        assert handle.turn_id == "managed-turn"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_codex_no_active_turn_waits_for_adjacent_real_terminal_without_duplicate():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("fast-terminal", "fast-terminal")
+        ctx.engine = "codex"
+        ctx.state = "interrupting"
+        ctx.active_msg_id = "fast-turn"
+        ctx.codex_spontaneous_turn_id = "fast-turn"
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = ctx.session_id
+        handle.turn_id = "fast-turn"
+        handle.turn_active = True
+        handle._spontaneous_turn_id = "fast-turn"
+        handle._open_spontaneous_stream("fast-turn")
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+
+        async def consume_real_turn():
+            async for raw in handle.receive_spontaneous_response("fast-turn"):
+                if not (
+                    isinstance(raw, dict)
+                    and raw.get("method") == "turn/completed"
+                ):
+                    continue
+                await machine._emit(ctx, Delta(
+                    message_id="final-message",
+                    text="authoritative tail",
+                    channel="final",
+                ))
+                await machine._emit(ctx, TurnEnd(
+                    result={
+                        "subtype": "success",
+                        "duration_ms": 12,
+                        "is_error": False,
+                    },
+                    turn_id="fast-turn",
+                ))
+                ctx.codex_spontaneous_turn_id = None
+                ctx.codex_spontaneous_task = None
+                ctx.active_msg_id = None
+                await machine._set_state(ctx, "idle")
+
+        task = asyncio.create_task(consume_real_turn())
+        ctx.codex_spontaneous_task = task
+
+        async def request(method, params=None):
+            assert method == "thread/read"
+            assert params == {
+                "threadId": ctx.session_id,
+                "includeTurns": False,
+            }
+            # This deliberately exceeds the removed 250 ms guess. The exact
+            # terminal is still retained and must win without a duplicate end.
+            await asyncio.sleep(0.35)
+            await handle._dispatch({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": ctx.session_id,
+                    "turn": {
+                        "id": "fast-turn",
+                        "status": "completed",
+                    },
+                },
+            })
+            return {"thread": {
+                "id": ctx.session_id,
+                "status": {"type": "idle"},
+            }}
+
+        handle._request = request
+
+        reconciled = await machine._reconcile_codex_no_active_turn(
+            ctx,
+            codex_handle_module.CodexNoActiveTurnError(
+                ctx.session_id, "fast-turn"),
+        )
+
+        assert reconciled is True
+        assert task.done()
+        assert ctx.state == "idle"
+        assert [
+            event.text for event in transport.sent
+            if isinstance(event, Delta)
+        ] == ["authoritative tail"]
+        terminals = [
+            event for event in transport.sent if isinstance(event, TurnEnd)
+        ]
+        assert len(terminals) == 1
+        assert terminals[0].turn_id == "fast-turn"
+        assert terminals[0].result.subtype == "success"
+
+    asyncio.run(run())
+
+
+def test_codex_no_active_turn_fence_yields_to_terminal_queued_behind_response():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("fence-terminal", "fence-terminal")
+        ctx.engine = "codex"
+        ctx.state = "interrupting"
+        ctx.active_msg_id = "fence-turn"
+        ctx.codex_spontaneous_turn_id = "fence-turn"
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = ctx.session_id
+        handle.turn_id = "fence-turn"
+        handle.turn_active = True
+        handle._spontaneous_turn_id = "fence-turn"
+        handle._open_spontaneous_stream("fence-turn")
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+
+        queue = handle._spontaneous_q
+        assert queue is not None
+        blocker = object()
+        queue.put_control_nowait(blocker)
+        blocker_seen = asyncio.Event()
+        release_blocker = asyncio.Event()
+        read_responded = asyncio.Event()
+        repairs = []
+
+        async def consume_real_turn():
+            async for raw in handle.receive_spontaneous_response("fence-turn"):
+                if raw is blocker:
+                    blocker_seen.set()
+                    await release_blocker.wait()
+                    continue
+                if isinstance(
+                    raw, codex_handle_module.CodexNoActiveTurnFence
+                ):
+                    raw.reached.set()
+                    await raw.release.wait()
+                    continue
+                if not (
+                    isinstance(raw, dict)
+                    and raw.get("method") == "turn/completed"
+                ):
+                    continue
+                await machine._emit(ctx, Delta(
+                    message_id="fence-final",
+                    text="terminal after read response",
+                    channel="final",
+                ))
+                await machine._emit(ctx, TurnEnd(
+                    result={
+                        "subtype": "success",
+                        "duration_ms": 9,
+                        "is_error": False,
+                    },
+                    turn_id="fence-turn",
+                ))
+                ctx.codex_spontaneous_turn_id = None
+                ctx.codex_spontaneous_task = None
+                ctx.active_msg_id = None
+                await machine._set_state(ctx, "idle")
+
+        consumer = asyncio.create_task(consume_real_turn())
+        ctx.codex_spontaneous_task = consumer
+
+        async def request(method, params=None):
+            assert method == "thread/read"
+            assert params == {
+                "threadId": ctx.session_id,
+                "includeTurns": False,
+            }
+            await blocker_seen.wait()
+            read_responded.set()
+            return {"thread": {
+                "id": ctx.session_id,
+                "status": {"type": "idle"},
+            }}
+
+        async def repair(sid):
+            repairs.append(sid)
+
+        handle._request = request
+        machine._push_mirrored_history = repair
+        reconcile_task = asyncio.create_task(
+            machine._reconcile_codex_no_active_turn(
+                ctx,
+                codex_handle_module.CodexNoActiveTurnError(
+                    ctx.session_id, "fence-turn"),
+            ),
+        )
+        await read_responded.wait()
+        while not any(
+            isinstance(item, codex_handle_module.CodexNoActiveTurnFence)
+            for item, _size in queue._items
+        ):
+            await asyncio.sleep(0)
+
+        # This terminal is read after thread/read's response, but occupies the
+        # reserved end slot before the consumer reaches the inserted fence.
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": ctx.session_id,
+                "turn": {
+                    "id": "fence-turn",
+                    "status": "completed",
+                },
+            },
+        })
+        release_blocker.set()
+        assert await reconcile_task is True
+
+        assert consumer.done()
+        assert ctx.state == "idle"
+        assert repairs == []
+        assert [
+            event.text for event in transport.sent
+            if isinstance(event, Delta)
+        ] == ["terminal after read response"]
+        terminals = [
+            event for event in transport.sent if isinstance(event, TurnEnd)
+        ]
+        assert len(terminals) == 1
+        assert terminals[0].turn_id == "fence-turn"
+        assert terminals[0].result.subtype == "success"
+
+    asyncio.run(run())
+
+
+def test_codex_no_active_turn_reconciles_done_consumer_with_residual_state():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("cleanup-residual", "cleanup-residual")
+        ctx.engine = "codex"
+        ctx.state = "interrupting"
+        ctx.active_msg_id = "residual-turn"
+        ctx.codex_spontaneous_turn_id = "residual-turn"
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = ctx.session_id
+        handle.turn_id = None
+        handle.turn_active = False
+        handle.remember_owned_turn_id("residual-turn")
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+
+        task = asyncio.create_task(asyncio.sleep(0))
+        await task
+        ctx.codex_spontaneous_task = task
+        repairs = []
+        await machine._emit(ctx, TurnEnd(
+            result={
+                "subtype": "success",
+                "duration_ms": 7,
+                "is_error": False,
+            },
+            turn_id="residual-turn",
+        ))
+
+        async def request(method, params=None):
+            assert method == "thread/read"
+            assert params == {
+                "threadId": ctx.session_id,
+                "includeTurns": False,
+            }
+            return {"thread": {
+                "id": ctx.session_id,
+                "status": {"type": "idle"},
+            }}
+
+        async def repair(sid):
+            repairs.append(sid)
+
+        handle._request = request
+        machine._push_mirrored_history = repair
+        reconciled = await machine._reconcile_codex_no_active_turn(
+            ctx,
+            codex_handle_module.CodexNoActiveTurnError(
+                ctx.session_id, "residual-turn"),
+        )
+
+        assert reconciled is True
+        assert ctx.state == "idle"
+        assert ctx.codex_spontaneous_turn_id is None
+        assert ctx.codex_spontaneous_task is None
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+        assert repairs == []
+        terminals = [
+            event for event in transport.sent if isinstance(event, TurnEnd)
+        ]
+        assert len(terminals) == 1
+        assert terminals[0].turn_id == "residual-turn"
+        assert terminals[0].result.subtype == "success"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "thread_id,status",
+    [
+        ("other-thread", "idle"),
+        ("status-active", "active"),
+    ],
+)
+def test_codex_no_active_turn_rejects_wrong_thread_or_active_status(
+    thread_id, status,
+):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("status-active", "status-active")
+        ctx.engine = "codex"
+        ctx.state = "interrupting"
+        ctx.active_msg_id = "status-turn"
+        ctx.codex_spontaneous_turn_id = "status-turn"
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = ctx.session_id
+        handle.turn_id = "status-turn"
+        handle.turn_active = True
+        handle._spontaneous_turn_id = "status-turn"
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+
+        stalled = asyncio.Event()
+        task = asyncio.create_task(stalled.wait())
+        ctx.codex_spontaneous_task = task
+
+        async def request(method, params=None):
+            assert method == "thread/read"
+            assert params == {
+                "threadId": ctx.session_id,
+                "includeTurns": False,
+            }
+            return {"thread": {
+                "id": thread_id,
+                "status": {"type": status},
+            }}
+
+        handle._request = request
+        reconciled = await machine._reconcile_codex_no_active_turn(
+            ctx,
+            codex_handle_module.CodexNoActiveTurnError(
+                ctx.session_id, "status-turn"),
+        )
+
+        assert reconciled is False
+        assert ctx.state == "interrupting"
+        assert ctx.codex_spontaneous_turn_id == "status-turn"
+        assert ctx.codex_spontaneous_task is task
+        assert not task.done()
+        assert handle.turn_active is True
+        assert handle.turn_id == "status-turn"
+        assert not [
+            event for event in transport.sent if isinstance(event, TurnEnd)
+        ]
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(run())
 
@@ -3226,5 +4531,852 @@ def test_failed_claude_preflight_does_not_evict_codex(monkeypatch):
         assert spawned is None
         assert machine.sessions == {"codex-id": codex}
         assert codex.sdk.disconnected is False
+
+    asyncio.run(run())
+
+
+def test_codex_steer_targets_exact_active_turn_and_runs_provider_guard(
+        monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "thread-1"
+        handle.turn_id = "turn-1"
+        handle.turn_active = True
+        requests = []
+        restored = []
+
+        async def send(request):
+            requests.append(request)
+            handle._pending[request["id"]].set_result({"turnId": "turn-1"})
+
+        async def restore(**kwargs):
+            restored.append(kwargs)
+
+        monkeypatch.setattr(handle, "_send", send)
+        monkeypatch.setattr(handle, "_restore_http_provider_state", restore)
+
+        result = await handle.steer(
+            "keep checking",
+            images=["/tmp/diagram.png"],
+            client_user_message_id="message-2",
+        )
+
+        assert result == "turn-1"
+        assert requests == [{
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "turn/steer",
+            "params": {
+                "threadId": "thread-1",
+                "expectedTurnId": "turn-1",
+                "input": [
+                    {"type": "text", "text": "keep checking"},
+                    {"type": "localImage", "path": "/tmp/diagram.png"},
+                ],
+                "clientUserMessageId": "message-2",
+            },
+        }]
+        assert restored == [{}]
+        assert handle.thread_id == "thread-1"
+        assert handle.turn_id == "turn-1"
+        assert handle.turn_active is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stream_kind", ["managed", "spontaneous"])
+def test_codex_handle_inserts_steer_fence_at_response_before_provider_repair(
+    monkeypatch, stream_kind,
+):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "thread-1"
+        handle.turn_id = "turn-1"
+        handle.turn_active = True
+        handle.remember_owned_turn_id("turn-1")
+        if stream_kind == "managed":
+            handle._open_managed_stream()
+            queue = handle._turn_q
+        else:
+            handle._spontaneous_turn_id = "turn-1"
+            handle._open_spontaneous_stream("turn-1")
+            queue = handle._spontaneous_q
+        assert queue is not None
+        before = {"method": "before-steer"}
+        after = {"method": "after-steer"}
+        assert queue.put_nowait(before)
+        repair_started = asyncio.Event()
+        release_repair = asyncio.Event()
+
+        async def send(request):
+            assert request["method"] == "turn/steer"
+            assert request["params"]["expectedTurnId"] == "turn-1"
+            await handle._dispatch({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"turnId": "turn-1"},
+            })
+
+        async def restore(**_kwargs):
+            repair_started.set()
+            await release_repair.wait()
+
+        monkeypatch.setattr(handle, "_send", send)
+        monkeypatch.setattr(handle, "_restore_http_provider_state", restore)
+        steer_task = asyncio.create_task(handle.steer(
+            "new constraint", client_user_message_id="message-2",
+        ))
+        await repair_started.wait()
+        boundary = next(iter(handle._pending_response_boundaries.values()))
+        assert isinstance(boundary.fence, codex_handle_module.CodexSteerFence)
+        assert queue.put_nowait(after)
+
+        # Provider repair is still blocked, but the response-dispatch fence is
+        # already ahead of every post-response notification.
+        assert await queue.get() is before
+        assert await queue.get() is boundary.fence
+        assert await queue.get() is after
+
+        release_repair.set()
+        acceptance = await steer_task
+        assert isinstance(
+            acceptance, codex_handle_module.CodexSteerAcceptance)
+        assert acceptance.fence is boundary.fence
+        assert handle._pending_response_boundaries == {}
+
+        # A later live-detail overflow may shed frames, never the ordering
+        # control. The gap belongs before the retained user boundary.
+        assert queue.put_nowait(before)
+        queue.put_control_nowait(acceptance.fence)
+        queue.begin_gap(CodexManagedOverflow("turn-1"))
+        assert isinstance(await queue.get(), CodexManagedOverflow)
+        assert await queue.get() is acceptance.fence
+        acceptance.fence.release_now()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stream_kind", ["managed", "spontaneous"])
+def test_wrapper_steer_does_not_wait_for_fence_after_end_was_dequeued(
+    stream_kind,
+):
+    async def run():
+        machine, transport = _mk_machine()
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "steer-session"
+        handle.turn_id = "native-turn"
+        handle.turn_active = True
+        handle.remember_owned_turn_id("native-turn")
+        if stream_kind == "managed":
+            handle._open_managed_stream()
+            queue = handle._turn_q
+        else:
+            handle._spontaneous_turn_id = "native-turn"
+            handle._open_spontaneous_stream("native-turn")
+            queue = handle._spontaneous_q
+        assert queue is not None
+        ctx = _install_running_steer_context(machine, handle)
+        end_dequeued = asyncio.Event()
+        gate_released = asyncio.Event()
+
+        async def consume_terminal():
+            raw = await queue.get()
+            assert isinstance(raw, dict)
+            assert raw.get("method") == "turn/completed"
+            assert queue.end_delivered is True
+            end_dequeued.set()
+            await ctx.codex_steer_gate.wait()
+            gate_released.set()
+
+        consumer = asyncio.create_task(consume_terminal())
+
+        async def send(request):
+            assert request["method"] == "turn/steer"
+            await handle._dispatch({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": handle.thread_id,
+                    "turn": {
+                        "id": "native-turn",
+                        "status": "completed",
+                    },
+                },
+            })
+            await end_dequeued.wait()
+            await handle._dispatch({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"turnId": "native-turn"},
+            })
+
+        handle._send = send
+        result = await asyncio.wait_for(
+            machine._handle_steer(Steer(
+                sid=ctx.key,
+                cmd_id="steer-command",
+                client_id="client-1",
+                prompt="one final constraint",
+                msg_id="steer-message",
+            )),
+            timeout=0.5,
+        )
+        await consumer
+
+        assert isinstance(result, TurnSteered)
+        assert transport.sent[-1] is result
+        assert gate_released.is_set()
+        assert queue.end_delivered is True
+        assert handle._pending_response_boundaries == {}
+        assert not any(
+            isinstance(item, codex_handle_module.CodexSteerFence)
+            for item, _size in queue._items
+        )
+
+    asyncio.run(run())
+
+
+def test_codex_steer_releases_response_fence_when_provider_repair_fails(
+    monkeypatch,
+):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "thread-1"
+        handle.turn_id = "turn-1"
+        handle.turn_active = True
+        handle.remember_owned_turn_id("turn-1")
+        handle._open_managed_stream()
+        queue = handle._turn_q
+        assert queue is not None
+        captured = []
+
+        async def send(request):
+            await handle._dispatch({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"turnId": "turn-1"},
+            })
+            captured.extend(handle._pending_response_boundaries.values())
+
+        async def fail_repair(**_kwargs):
+            raise RuntimeError("repair failed")
+
+        monkeypatch.setattr(handle, "_send", send)
+        monkeypatch.setattr(
+            handle, "_restore_http_provider_state", fail_repair)
+        with pytest.raises(codex_handle_module.CodexSteerOutcomeUnknown):
+            await handle.steer("continue")
+
+        assert len(captured) == 1
+        fence = captured[0].fence
+        assert isinstance(fence, codex_handle_module.CodexSteerFence)
+        assert fence.release.is_set()
+        assert handle._pending_response_boundaries == {}
+        assert await queue.get() is fence
+
+    asyncio.run(run())
+
+
+def test_codex_request_timeout_cleans_pending_steer_boundary(monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        boundary = codex_handle_module._CodexSteerResponseBoundary(
+            "thread-1", "turn-1")
+
+        async def send(_request):
+            return None
+
+        monkeypatch.setattr(codex_handle_module, "_REQ_TIMEOUT", 0.01)
+        monkeypatch.setattr(handle, "_send", send)
+        with pytest.raises(asyncio.TimeoutError):
+            await handle._request(
+                "turn/steer",
+                {},
+                response_boundary=boundary,
+            )
+
+        assert handle._pending == {}
+        assert handle._pending_response_boundaries == {}
+
+    asyncio.run(run())
+
+
+def test_codex_disconnect_releases_pending_steer_boundary():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        boundary = codex_handle_module._CodexSteerResponseBoundary(
+            "thread-1", "turn-1")
+        boundary.fence = codex_handle_module.CodexSteerFence()
+        handle._pending_response_boundaries[7] = boundary
+
+        await handle.disconnect()
+
+        assert boundary.fence.release.is_set()
+        assert handle._pending_response_boundaries == {}
+
+    asyncio.run(run())
+
+
+def test_codex_steer_rejects_a_result_for_another_turn_without_rebinding():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "thread-1"
+        handle.turn_id = "turn-1"
+        handle.turn_active = True
+
+        async def request(method, params, *, response_boundary=None):
+            assert method == "turn/steer"
+            assert params["expectedTurnId"] == "turn-1"
+            return {"turnId": "turn-2"}
+
+        handle._request = request
+        with pytest.raises(
+            codex_handle_module.CodexAppServerError,
+        ) as caught:
+            await handle.steer("continue")
+
+        assert caught.value.steer_turn_changed is True
+        assert handle.turn_id == "turn-1"
+        assert handle.turn_active is True
+
+    asyncio.run(run())
+
+
+def test_codex_steer_transport_failure_is_outcome_unknown():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "thread-1"
+        handle.turn_id = "turn-1"
+        handle.turn_active = True
+
+        async def request(method, params, *, response_boundary=None):
+            assert method == "turn/steer"
+            assert params["expectedTurnId"] == "turn-1"
+            raise RuntimeError("response channel closed after write")
+
+        handle._request = request
+        with pytest.raises(codex_handle_module.CodexSteerOutcomeUnknown):
+            await handle.steer(
+                "continue",
+                client_user_message_id="message-2",
+            )
+
+        assert handle.turn_id == "turn-1"
+        assert handle.turn_active is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("turn_kind", ["review", "compact"])
+def test_codex_structured_active_turn_not_steerable_error_is_preserved(
+        turn_kind):
+    error = codex_handle_module.CodexAppServerError({
+        "code": -32600,
+        "message": "invalid request",
+        "data": {
+            "codexErrorInfo": {
+                "activeTurnNotSteerable": {"turnKind": turn_kind},
+            },
+        },
+    })
+
+    assert error.code == -32600
+    assert error.active_turn_not_steerable is True
+    assert error.unsteerable_turn_kind == turn_kind
+    assert error.steer_turn_changed is False
+
+
+def _install_running_steer_context(machine, sdk):
+    ctx = _mk_ctx("steer-session", "steer-session")
+    ctx.engine = "codex"
+    ctx.sdk = sdk
+    ctx.state = "running"
+    ctx.active_msg_id = "original-message"
+    ctx.turn_task = object()
+    ctx.codex_checkpoint_turn_id = "native-turn"
+    ctx.codex_checkpoint_ready = True
+    ctx.codex_checkpoint_accepted = True
+    machine.sessions[ctx.key] = ctx
+    return ctx
+
+
+def test_wrapper_steer_success_echoes_without_mutating_turn_lifecycle():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def steer(
+            self, prompt, images=None, *, client_user_message_id=None,
+        ):
+            self.calls.append((prompt, images, client_user_message_id))
+            return self.turn_id
+
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        original_task = ctx.turn_task
+
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            prompt="check the other branch",
+            msg_id="steer-message",
+        ))
+
+        assert isinstance(result, TurnSteered)
+        assert result.msg_id == "steer-message"
+        assert result.turn_id == "native-turn"
+        assert result.prompt == "check the other branch"
+        assert result.sid == ctx.key
+        assert sdk.calls == [
+            ("check the other branch", [], "steer-message"),
+        ]
+        assert transport.sent[-1] is result
+        assert ctx.state == "running"
+        assert ctx.turn_task is original_task
+        assert ctx.active_msg_id == "steer-message"
+        assert ctx.interrupt_deadline is None
+        assert not ctx.interrupt_event.is_set()
+        assert sdk.turn_id == "native-turn"
+        assert sdk.turn_active is True
+        assert ctx.codex_checkpoint_turn_id == "native-turn"
+        assert ctx.codex_checkpoint_ready is True
+        assert ctx.codex_checkpoint_accepted is True
+
+    asyncio.run(run())
+
+
+def test_wrapper_steer_failure_is_correlated_without_lifecycle_mutation():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        async def steer(self, *_args, **_kwargs):
+            raise codex_handle_module.CodexAppServerError({
+                "code": -32600,
+                "message": "invalid request",
+                "data": {
+                    "codexErrorInfo": {
+                        "activeTurnNotSteerable": {"turnKind": "review"},
+                    },
+                },
+            })
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _install_running_steer_context(machine, Sdk())
+        original_task = ctx.turn_task
+
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            prompt="continue",
+            msg_id="steer-message",
+            cmd_id="steer-command",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_STEERABLE
+        assert result.msg_id == "steer-message"
+        assert result.request_id == "steer-command"
+        assert result.to == "client-1"
+        assert transport.sent[-1] is result
+        assert not any(isinstance(event, TurnSteered)
+                       for event in transport.sent)
+        assert ctx.state == "running"
+        assert ctx.turn_task is original_task
+        assert ctx.active_msg_id == "original-message"
+        assert ctx.interrupt_deadline is None
+        assert not ctx.interrupt_event.is_set()
+        assert ctx.sdk.turn_id == "native-turn"
+        assert ctx.sdk.turn_active is True
+        assert ctx.codex_checkpoint_turn_id == "native-turn"
+        assert ctx.codex_checkpoint_ready is True
+        assert ctx.codex_checkpoint_accepted is True
+
+    asyncio.run(run())
+
+
+def test_wrapper_rejects_new_steer_after_interrupt_has_started():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.turn_id
+
+    async def run():
+        machine, _transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        ctx.state = "interrupting"
+
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            prompt="too late",
+            msg_id="steer-message",
+            cmd_id="steer-command",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_STEERABLE
+        assert sdk.calls == 0
+        assert ctx.state == "interrupting"
+
+    asyncio.run(run())
+
+
+def test_wrapper_uncertain_steer_waits_for_exact_native_user_identity():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            raise codex_handle_module.CodexSteerOutcomeUnknown(
+                "response lost")
+
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        command = Steer(
+            sid=ctx.key,
+            prompt="continue",
+            msg_id="steer-message",
+            cmd_id="steer-command",
+            client_id="client-1",
+        )
+
+        result = await machine._handle_steer(command)
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_STEER_UNKNOWN
+        assert result.request_id == "steer-command"
+        assert ctx.codex_uncertain_steer is not None
+        assert ctx.codex_steer_gate.is_set()
+        assert sdk.calls == 1
+        assert not any(
+            isinstance(event, TurnSteered) for event in transport.sent)
+
+        duplicate = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            prompt="do not duplicate",
+            msg_id="steer-message-2",
+            cmd_id="steer-command-2",
+            client_id="client-1",
+        ))
+        assert isinstance(duplicate, Error)
+        assert duplicate.code == ERR_STEER_UNKNOWN
+        assert sdk.calls == 1
+
+        foreign = {
+            "method": "item/started",
+            "params": {
+                "threadId": ctx.session_id,
+                "turnId": "native-turn",
+                "item": {
+                    "id": "foreign-user",
+                    "type": "userMessage",
+                    "clientId": "another-message",
+                },
+            },
+        }
+        assert await machine._confirm_uncertain_codex_steer(
+            ctx, foreign) is False
+
+        exact = {
+            "method": "item/started",
+            "params": {
+                "threadId": ctx.session_id,
+                "turnId": "native-turn",
+                "item": {
+                    "id": "steered-user",
+                    "type": "userMessage",
+                    "clientId": "steer-message",
+                },
+            },
+        }
+        assert await machine._confirm_uncertain_codex_steer(
+            ctx, exact) is True
+        assert ctx.codex_uncertain_steer is None
+        assert ctx.active_msg_id == "steer-message"
+        steered = [
+            event for event in transport.sent
+            if isinstance(event, TurnSteered)
+        ]
+        assert len(steered) == 1
+        assert steered[0].msg_id == "steer-message"
+
+        completed = {
+            **exact,
+            "method": "item/completed",
+        }
+        assert await machine._confirm_uncertain_codex_steer(
+            ctx, completed) is False
+        assert len([
+            event for event in transport.sent
+            if isinstance(event, TurnSteered)
+        ]) == 1
+
+    asyncio.run(run())
+
+
+def test_wrapper_reliable_steer_retry_replays_echo_without_second_rpc():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.turn_id
+
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        command = Steer(
+            sid=ctx.key,
+            prompt="continue",
+            msg_id="steer-message",
+            cmd_id="steer-command",
+            client_id="client-1",
+        )
+
+        await machine._process_command(command)
+        await machine._process_command(command)
+
+        steered = [
+            event for event in transport.sent
+            if isinstance(event, TurnSteered)
+        ]
+        acks = [
+            event for event in transport.sent
+            if isinstance(event, CommandAck)
+        ]
+        assert sdk.calls == 1
+        assert len(steered) == 1
+        assert steered[0].to is None
+        assert [event.msg_id for event in steered] == ["steer-message"]
+        assert len(acks) == 2
+        assert all(event.cmd_id == "steer-command" for event in acks)
+
+    asyncio.run(run())
+
+
+def test_wrapper_stop_is_not_blocked_by_pending_steer():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.steer_started = asyncio.Event()
+            self.release_steer = asyncio.Event()
+            self.interrupted = asyncio.Event()
+
+        async def steer(self, *_args, **_kwargs):
+            self.steer_started.set()
+            await self.release_steer.wait()
+            return self.turn_id
+
+        async def interrupt(self):
+            self.interrupted.set()
+
+    async def run():
+        machine, _transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        steer_task = asyncio.create_task(machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            prompt="continue",
+            msg_id="steer-message",
+        )))
+        await asyncio.wait_for(sdk.steer_started.wait(), timeout=1)
+
+        await asyncio.wait_for(
+            machine._handle_interrupt(Interrupt(sid=ctx.key)),
+            timeout=1,
+        )
+
+        assert sdk.interrupted.is_set()
+        assert not steer_task.done()
+        assert ctx.state == "interrupting"
+        sdk.release_steer.set()
+        await asyncio.wait_for(steer_task, timeout=1)
+
+    asyncio.run(run())
+
+
+def test_codex_stream_terminal_waits_for_accepted_steer_boundary():
+    class Sdk:
+        async def receive_spontaneous_response(self, turn_id):
+            assert turn_id == "native-turn"
+            yield {
+                "method": "turn/completed",
+                "params": {"turn": {
+                    "id": turn_id,
+                    "status": "completed",
+                }},
+            }
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("steer-order", "steer-order")
+        ctx.engine = "codex"
+        ctx.sdk = Sdk()
+        ctx.state = "running"
+        ctx.codex_spontaneous_turn_id = "native-turn"
+        ctx.codex_steer_gate.clear()
+        machine.sessions[ctx.key] = ctx
+        machine._record_codex_unavailable_turn = (
+            lambda *_args, **_kwargs: asyncio.sleep(0))
+
+        task = asyncio.create_task(machine._run_codex_spontaneous_turn(
+            ctx, "native-turn", announce_running=False))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not any(
+            isinstance(event, TurnEnd) for event in transport.sent)
+
+        await machine._emit(ctx, TurnSteered(
+            msg_id="steer-message",
+            turn_id="native-turn",
+            prompt="one more constraint",
+        ))
+        ctx.codex_steer_gate.set()
+        await asyncio.wait_for(task, timeout=1)
+
+        narrative = [
+            event.type for event in transport.sent
+            if isinstance(event, (TurnSteered, TurnEnd))
+        ]
+        assert narrative == ["turn_steered", "turn_end"]
+        assert ctx.state == "idle"
+
+    asyncio.run(run())
+
+
+def test_codex_steer_fence_drains_old_backlog_before_new_user_boundary():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.queue = asyncio.Queue()
+
+        async def receive_spontaneous_response(self, turn_id):
+            assert turn_id == self.turn_id
+            while True:
+                value = await self.queue.get()
+                yield value
+                if (
+                    isinstance(value, dict)
+                    and value.get("method") == "turn/completed"
+                ):
+                    return
+
+        async def steer(
+            self, prompt, images=None, *, client_user_message_id=None,
+        ):
+            assert prompt == "new constraint"
+            assert images == []
+            assert client_user_message_id == "steer-message"
+            await self.queue.put({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "steer-backlog",
+                    "turnId": self.turn_id,
+                    "itemId": "old-output",
+                    "delta": "old backlog",
+                },
+            })
+            fence = codex_handle_module.CodexSteerFence()
+            await self.queue.put(fence)
+            return codex_handle_module.CodexSteerAcceptance(
+                self.turn_id, fence)
+
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _mk_ctx("steer-backlog", "steer-backlog")
+        ctx.engine = "codex"
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "original-message"
+        ctx.codex_spontaneous_turn_id = sdk.turn_id
+        machine.sessions[ctx.key] = ctx
+        machine._record_codex_unavailable_turn = (
+            lambda *_args, **_kwargs: asyncio.sleep(0))
+
+        consumer = asyncio.create_task(machine._run_codex_spontaneous_turn(
+            ctx, sdk.turn_id, announce_running=False))
+        await asyncio.sleep(0)
+        steer = asyncio.create_task(machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            prompt="new constraint",
+            msg_id="steer-message",
+        )))
+        result = await asyncio.wait_for(steer, timeout=1)
+        assert isinstance(result, TurnSteered)
+
+        await sdk.queue.put({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "steer-backlog",
+                "turnId": sdk.turn_id,
+                "itemId": "new-output",
+                "delta": "new output",
+            },
+        })
+        await sdk.queue.put({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "steer-backlog",
+                "turn": {
+                    "id": sdk.turn_id,
+                    "status": "completed",
+                },
+            },
+        })
+        await asyncio.wait_for(consumer, timeout=1)
+
+        narrative = [
+            ("delta", event.text)
+            if isinstance(event, Delta)
+            else (event.type, getattr(event, "msg_id", None))
+            for event in transport.sent
+            if isinstance(event, (Delta, TurnSteered, TurnEnd))
+        ]
+        assert narrative == [
+            ("delta", "old backlog"),
+            ("turn_steered", "steer-message"),
+            ("delta", "new output"),
+            ("turn_end", None),
+        ]
 
     asyncio.run(run())

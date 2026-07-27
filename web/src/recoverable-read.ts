@@ -23,7 +23,7 @@ export class RecoverableReadCoordinator {
     this.delayMs = delayMs;
   }
 
-  retry(key: string, read: () => void): boolean {
+  retry(key: string, read: () => void, delayMs = this.delayMs): boolean {
     const state = this.state.get(key);
     if (state === "scheduled") return false;
     if (state === "attempted") {
@@ -36,7 +36,7 @@ export class RecoverableReadCoordinator {
       if (this.state.get(key) !== "scheduled") return;
       this.state.set(key, "attempted");
       read();
-    }, this.delayMs);
+    }, delayMs);
     this.timers.set(key, timer);
     return true;
   }

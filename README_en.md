@@ -4,7 +4,7 @@
 
 Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web
 
-**Current release: v3.0.0** · Wire protocol v19
+**Current release: v3.0.0** · Wire protocol v22
 
 [中文](README.md) ·
 [5-minute quick start](#quick-start-local-one-machine-5-min) ·
@@ -62,7 +62,7 @@ with the previous public release, the major changes are:
 | **Native App / CLI coordination** | Claude CLI/Desktop/Agent View and Codex shared daemon/App/CLI retain engine-specific ownership models. v3 reconciles running, read-only, interrupt, steer, compact, turn binding, and terminal state so sibling sessions do not lock each other, old turns do not move to the tail, and interrupted work does not leave ghost activity. |
 | **Multi-device isolation** | Device Center adds single-use pairing, independently revocable machine credentials, and presence. The relay routes only an account's allowed `machine_id` values. Device, Code / Work, engine, connection generation, and session ownership are isolated so delayed frames cannot mutate the active view. |
 | **Mobile and artifact UX** | Loading older history preserves the scroll anchor. Images load on demand and support a lightbox, tap-to-close, and pinch zoom. Markdown, source, HTML, PDF, and Office previews remain within the local security boundary. PWA icons, narrow-screen sheets, error presentation, and process timelines are also aligned. |
-| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v19. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
+| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v22. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
 
 > **The trust boundary has not changed:** model accounts, API keys, session
 > sources, and tool execution stay on the wrapper machine. The VPS relay stores
@@ -81,7 +81,7 @@ requirements.
 | **Code / Work spaces** | Code remains repository-oriented. Work is an independent Cowork surface for documents, spreadsheets, presentations, research, and temporary collaboration, with a separate session list. |
 | **Work projects and knowledge** | Keep provider-scoped projects, file/link/note sources, and reusable work templates. Starting a Work session materializes the selected context into its private directory. |
 | **Work schedules and isolation** | Run one-shot, daily, or weekly tasks with persisted run records, leases, retries, and overlap prevention. Each work item can access only its private directory; add required material explicitly through attachments or the project knowledge collection. |
-| **Remote operation** | Watch streaming replies from a phone, tablet, or desktop browser; send attachments, queue the next message, and interrupt the current turn at any time. |
+| **Remote operation** | Watch streaming replies and send attachments from a phone, tablet, or desktop browser. While Codex is busy, new input defaults to native steering of the active task, with queue still available; Claude retains interrupt-and-send. Stop remains a separate action. |
 | **Complete process** | Expand the reasoning summaries, plans, command output, file diffs, MCP calls, collaboration agents, Hooks, and terminal interaction events exposed by each engine. |
 | **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. |
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
@@ -89,7 +89,7 @@ requirements.
 | **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses `/permissions` for approval control while inheriting the local Sandbox configuration. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
 | **Real extension catalog** | Open `/extensions`, `/skills`, `/plugins`, `/apps`, `/mcp`, or `/hooks` against the current engine. Code can manage Skills, plugins, and Claude Hooks where the engine allows it; Codex Hooks remain read-only because the official API has no write path. Work presents every extension category read-only to preserve its private environment. |
 | **Continuity** | Let background sessions keep running and synchronize them across clients. Paint the browser projection first, validate paged materialized summaries from Claude transcripts or Codex rollouts, and resume only the live tail after reconnecting. |
-| **Multi-machine and PWA** | Connect multiple named wrappers to one relay and optionally restrict accounts to selected machines. Install the web client as a PWA and receive generic background completion/failure notifications without conversation content. |
+| **Multi-machine and PWA** | Connect multiple named wrappers to one relay and optionally restrict accounts to selected machines. Install the web client as a PWA; notifications default to a generic privacy mode, with an explicit opt-in for a safely truncated session name and exact navigation. |
 | **Self-hosted** | The wrapper only makes outbound connections. Sessions, Work data, and preview conversion stay on that machine; the replaceable VPS remains a stateless relay. Web auth uses an HttpOnly cookie, and CLI credentials or API keys never enter the frontend. |
 
 > Available models, service tiers, and runtime controls depend on the local CLI and the capabilities exposed by its SDK or app-server.
@@ -215,15 +215,17 @@ separate.
 
 The model, reasoning effort, service tier, and permissions belong to the current
 session, so you can change the next turn without editing the machine's global
-configuration. The composer also provides attachments, queue/interrupt controls,
-context usage, and command entry points such as `/goal` and `/status`.
+configuration. While Codex is running, Enter steers the active task by default;
+queue remains selectable, and an empty composer exposes Stop as a separate
+action. The composer also provides attachments, context usage, and command
+entry points such as `/goal` and `/status`.
 
 ![Codex model selection and per-session controls](assets/readme-model-controls.jpg)
 
 ### Common operations at a glance
 
 - **Sessions:** create, search, run in the background, rename, archive, delete, fork, compact Codex context, run native Review, and create an isolated Codex worktree.
-- **Turns:** stream, queue, interrupt, copy, edit and resend, or fork from a specific message.
+- **Turns:** stream, steer Codex natively, queue, stop/interrupt, copy, edit and resend, or fork from a specific message.
 - **Tools:** inspect command output, file changes and diffs, MCP, collaboration agents, Hooks, approvals, and user-input requests.
 - **Terminal coordination:** Codex Code shares the official daemon with native
   bidirectional control. Native Claude CLI, Desktop, and Agent View sessions are
@@ -233,7 +235,7 @@ context usage, and command entry points such as `/goal` and `/status`.
   Code can create/remove local Skills, manage Claude Hooks, and install/uninstall
   plugins through native managers where supported. Codex Hooks and every Work
   extension category remain read-only.
-- **Devices:** use a responsive mobile UI, light or dark themes, multi-browser/multi-machine synchronization, PWA installation, background completion alerts, and reconnect recovery.
+- **Devices:** use a responsive mobile UI, light or dark themes, multi-browser/multi-machine synchronization, PWA installation, generic or session-aware completion alerts, and reconnect recovery. After login, notification, theme, and logout actions share the Header three-dot menu.
 
 ## Quick start (local, one machine, 5 min)
 
@@ -241,7 +243,7 @@ First get the relay + wrapper + web running on the **machine where the agent CLI
 
 ### Prerequisites
 
-- A machine signed in to **Claude Code** or to a **Codex CLI** that supports `app-server`, with the CLI itself already **able to chat**. Claude uses the official CLI bundled with the locked and regression-tested SDK by default; each new Codex app-server reselects the newest usable local install. Make both available to switch engines in the web UI.
+- A machine signed in to **Claude Code** or to a **Codex CLI** that supports `app-server`, with the CLI itself already **able to chat**. The Claude wrapper explicitly launches the daily `~/.local/bin/claude` rather than the SDK-bundled copy; each new Codex app-server reselects the newest usable local install. Make both available to switch engines in the web UI.
 - **Python 3.10+**, **Node 20.19+** (to build the web client).
 - Optional: Office artifact preview requires **LibreOffice + bubblewrap** on the
   Linux wrapper host (for example, `sudo apt install libreoffice bubblewrap`).
@@ -280,14 +282,21 @@ PUBLIC_ORIGIN=http://127.0.0.1:8765
 WEB_STATIC_DIR=web/dist
 # default working directory of the agent session (the project you want it to work on)
 CC_CWD=/path/to/your/project
-# optional explicit Claude CLI path when systemd/PATH cannot find it
-CLAUDE_BIN=/absolute/path/to/claude
+# share the same Claude Code install used by the normal terminal
+CLAUDE_BIN=~/.local/bin/claude
 ```
 
 > For a local loopback quick start, the relay and wrapper may share this `.env`;
 > it is not a production secret store. A public deployment must use the
 > root-only `/etc/cc-remote/wrapper.env` below so bypass-permissions model/tools
 > cannot read control-plane credentials directly.
+>
+> The Python SDK remains pinned to the repository-tested version and owns the
+> message protocol plus interrupt/drain behavior. `CLAUDE_BIN` is the Claude
+> Code executable that actually runs each session, so Remote and the terminal
+> share CLI updates, Keychain/login state, and `~/.claude/settings.json`.
+> An empty `CLAUDE_BIN` still resolves to `~/.local/bin/claude`; it does not
+> silently switch back to the SDK bundle.
 
 ### 3) Run (two terminals)
 
@@ -430,14 +439,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v19:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v22:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v19 relay and v19 wrapper so the old wrapper cannot occupy the
+> then start the v22 relay and v22 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`.
 
 ### 3) Upload staging, then publish it as an atomic release
@@ -495,7 +504,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v19 wrapper after success.
+release's `/healthz` is verified. Start the v22 wrapper after success.
 
 Verify:
 
@@ -598,7 +607,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `SESSION_TTL_SECONDS` | `604800` | Session token lifetime (default 7 days). |
 | `LOGIN_BODY_MAX_BYTES` / `LOGIN_READ_TIMEOUT` / `LOGIN_INFLIGHT_CAP` | `4096` / `10` / `32` | Hard limits for login body bytes, total read seconds, and concurrent body reads. |
 | `SESSION_REGISTRY_CAP` | `1024` | Hard limit for process-local revocable browser sessions. |
-| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` / `PUSH_VAPID_SUBJECT` | empty | Optional real Web Push; all three must be configured. Prefer an absolute PEM path readable by the relay user. Payloads contain only completion/failure state, never conversation content. |
+| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` / `PUSH_VAPID_SUBJECT` | empty | Optional real Web Push; all three must be configured. Prefer an absolute PEM path readable by the relay user. Existing users and the default mode send only completion/failure state. Only explicit session mode adds a safely truncated name and an exact device-local route; prompts, answers, paths, and tool output are never included. |
 | `PUSH_DB_PATH` | `~/.cc-remote/relay-push.sqlite3` | Durable browser subscription store, isolated by user and machine. |
 | `DEVICE_DB_PATH` | `~/.cc-remote/relay-devices.sqlite3` | Durable device names, last-seen metadata, and credential hashes; never sessions or artifacts. |
 | `DEVICE_PAIRING_TTL_SECONDS` | `600` | Lifetime of a single-use pairing code in seconds; allowed range 60–3600. |
@@ -620,7 +629,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `WRAPPER_TOKEN` | `change-me-wrapper` | Same as relay. |
 | `CC_REMOTE_MACHINE_ID` | `default` | Stable route id on a multi-machine relay; must match its `WRAPPER_TOKENS_JSON` key when that policy is enabled. |
 | `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | Interactive pairing credential; the file must be private to the current user. Explicit `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` values take precedence. |
-| `CLAUDE_BIN` | empty | Optional absolute Claude CLI path; set it when systemd/PATH cannot find `claude`. |
+| `CLAUDE_BIN` | `~/.local/bin/claude` | Daily Claude Code executable launched by the wrapper. Empty still selects this default; use another absolute path only when the CLI is installed elsewhere. |
 | `CC_REMOTE_CODEX_PROXY` | empty | Optional HTTP(S)/SOCKS5 proxy injected only into Codex subprocesses launched by the wrapper. It does not change the wrapper-to-relay connection or the user's terminal `codex`. |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server. Work is always private and ignores this setting. |
 | `CC_CWD` | cwd | Default working directory for new sessions. Claude `--resume` needs it to locate `~/.claude/projects/` — **it must be correct**; Codex resume first recovers the original cwd from its rollout. |

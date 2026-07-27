@@ -22,6 +22,7 @@ import {
   isComposerBusy,
   isInterruptSettling,
   isSettlingStopDisabled,
+  type SendMode,
 } from "../composer-submit";
 import { workContextMetrics } from "../work-context";
 import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
@@ -34,8 +35,8 @@ interface Props {
   state: State;
   connState: ConnState;
   wrapperOnline: boolean;
-  sendMode: "interrupt" | "queue";
-  setSendMode: (m: "interrupt" | "queue") => void;
+  sendMode: SendMode;
+  setSendMode: (m: SendMode) => void;
   queue: PendingQuery[];
   allQueued: PendingQuery[];
   replaceableQueued: PendingQuery[];
@@ -56,6 +57,7 @@ interface Props {
   editPrompt: string | null;
   onEditConsumed: () => void;
   onSendQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
+  onSteerQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
   onInterrupt: () => void;
   onEnqueue: (query: PendingQuery) => void;
   onSetPending: (query: PendingQuery) => void;
@@ -346,8 +348,18 @@ export function Composer(p: Props) {
     };
     if (busy) {
       const action = classifyBusySubmit(
-        p.state, p.sendMode, !!prompt || hasAttachments);
+        p.state, p.sendMode, p.engine ?? "claude",
+        !!prompt || hasAttachments);
       if (action === "noop") return;
+      if (action === "steer") {
+        if (p.onSteerQuery(
+            prompt,
+            images.length ? images : undefined,
+            files.length ? files : undefined)) {
+          clearDraft(); resetTaHeight();
+        }
+        return;
+      }
       const existing = p.sendMode === "queue" ? p.allQueued : p.replaceableQueued;
       if (!canEnqueueQuery(existing, query)) {
         flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
@@ -508,8 +520,13 @@ export function Composer(p: Props) {
 
   const stopping = busy && !hasText && !hasAttachments;
   const interruptSettling = isInterruptSettling(p.state);
-  const sendIcon = !busy ? "send" : stopping ? "stop" : p.sendMode === "interrupt" ? "bolt" : "queue";
-  const sendClass = "sendbtn" + ((stopping || (busy && p.sendMode === "interrupt" && (hasText || hasAttachments))) ? " interrupt" : "");
+  const primaryIsInterrupt = (p.engine ?? "claude") !== "codex";
+  const sendIcon = !busy ? "send" : stopping ? "stop"
+    : p.sendMode === "steer" ? (primaryIsInterrupt ? "bolt" : "send")
+      : "queue";
+  const sendClass = "sendbtn" + ((stopping
+    || (busy && p.sendMode === "steer" && primaryIsInterrupt
+      && (hasText || hasAttachments))) ? " interrupt" : "");
   const disabled = locked || importing || (!busy && !hasText && !hasAttachments)
     || isSettlingStopDisabled(p.state, hasText || hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
@@ -547,7 +564,10 @@ export function Composer(p: Props) {
       value={input}
       placeholder={importing ? "正在安全导入附件…"
         : offline ? "机器离线 — 等待重连…"
-        : (controlUi?.placeholder ?? placeholder)}
+        : (controlUi?.placeholder
+          ?? (busy && (p.engine ?? "claude") === "codex"
+            ? "输入以引导当前任务，或选择排队…"
+            : placeholder))}
       disabled={locked}
       onChange={(e) => onInput(e.target.value)}
       onCompositionStart={() => imeSubmitRef.current.startComposition()}
@@ -633,8 +653,10 @@ export function Composer(p: Props) {
         {busy && (
           <div className="runbar show">
             <div className="seg">
-              <button className={p.sendMode === "interrupt" ? "on" : ""} onClick={() => p.setSendMode("interrupt")}>
-                <Icon name="bolt" size={14} />打断并发送
+              <button className={p.sendMode === "steer" ? "on" : ""}
+                onClick={() => p.setSendMode("steer")}>
+                <Icon name={primaryIsInterrupt ? "bolt" : "send"} size={14} />
+                {primaryIsInterrupt ? "打断并发送" : "引导"}
               </button>
               <button className={p.sendMode === "queue" ? "on" : ""} onClick={() => p.setSendMode("queue")}>
                 <Icon name="queue" size={14} />排队

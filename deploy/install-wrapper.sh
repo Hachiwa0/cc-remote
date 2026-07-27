@@ -159,6 +159,10 @@ else
   log_dir=""
 fi
 
+claude_bin="$target_home/.local/bin/claude"
+[ -x "$claude_bin" ] || \
+  die "daily Claude Code executable is missing: $claude_bin"
+
 releases="$appdir/releases"
 current="$appdir/current"
 runtimes="$appdir/runtimes"
@@ -374,6 +378,7 @@ else
     env_stage="$(mktemp "$config_dir/.wrapper.env.XXXXXX")"
     {
       printf 'CC_CWD=%s\n' "$target_home"
+      printf 'CLAUDE_BIN=%s/.local/bin/claude\n' "$target_home"
       printf 'CLAUDE_WORK_ROOT=%s/.claude/cc-remote/work\n' "$target_home"
       printf 'CODEX_WORK_ROOT=%s/.codex/cc-remote/work\n' "$target_home"
       printf '%s\n' \

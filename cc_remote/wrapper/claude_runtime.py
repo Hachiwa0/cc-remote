@@ -1,8 +1,8 @@
 """Version policy and effective Claude CLI discovery.
 
-The Agent SDK bundles a Claude Code executable and prefers it whenever
-``ClaudeAgentOptions.cli_path`` is omitted.  Preflight must inspect that actual
-runtime instead of requiring an unrelated ``claude`` entry on ``PATH``.
+The Agent SDK bundles a Claude Code executable, but the wrapper explicitly
+passes the user's daily ``~/.local/bin/claude`` (or ``CLAUDE_BIN`` override).
+Preflight inspects that exact executable before a session can start.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import subprocess
 import claude_agent_sdk
 
 
-VERIFIED_SDK_VERSION = "0.2.119"
+VERIFIED_SDK_VERSION = "0.2.128"
 _CLI_VERSION_TIMEOUT = 3.0
 _VERSION_RE = re.compile(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)")
 

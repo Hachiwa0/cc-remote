@@ -5,7 +5,12 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
-import type { Block, ProcessBlock, TextBlock, ToolBlock } from "../reducer";
+import type {
+  Block,
+  ProcessBlock,
+  TextBlock,
+  ToolBlock,
+} from "../domain/conversation";
 import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
@@ -340,13 +345,14 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
     interactionTokens.current.clear();
   }, [onInteractionEnd]);
 
-  const hasDeferredDetail = items.length === 0 && deferredCount > 0;
-  if (!items.length && !hasDeferredDetail) return null;
+  const needsAuthoritativeDetail = deferredCount > 0;
+  const hasDeferredOnly = items.length === 0 && needsAuthoritativeDetail;
+  if (!items.length && !hasDeferredOnly) return null;
   // A completed timeline is collapsed. Do not allocate/group hundreds of
   // historical rows until the user actually opens it.
   const rows = open ? groupTimelineRows(items) : [];
   const toolCount = items.reduce((count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
-  const countLabel = hasDeferredDetail
+  const countLabel = needsAuthoritativeDetail
     ? `${deferredCount} 项`
     : engine === "codex" && toolCount === items.length
       ? `${toolCount} 个工具调用`
@@ -360,7 +366,7 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
     : Math.max(0, now - (startTs ?? now));
   const toggle = () => {
     manuallyToggled.current = true;
-    if (hasDeferredDetail) {
+    if (needsAuthoritativeDetail) {
       if (!detailLoading) onLoadDetail?.();
       setUncontrolledOpen(true);
       onOpenChange?.(true);
@@ -404,9 +410,10 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
     });
   };
   return (
-    <section className={`turn-process${open && !hasDeferredDetail ? " open" : ""}`}>
+    <section data-process-detail-root
+      className={`turn-process${open && !hasDeferredOnly ? " open" : ""}`}>
       <button type="button" className="turn-process-head"
-        aria-expanded={open && !hasDeferredDetail} aria-busy={detailLoading}
+        aria-expanded={open && !hasDeferredOnly} aria-busy={detailLoading}
         onPointerDown={pointerDown} onPointerMove={pointerMove}
         onPointerUp={pointerUp} onPointerCancel={pointerCancel}
         onClick={(event) => {
@@ -425,18 +432,20 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
         <span className="turn-process-count">{countLabel}</span>
         <Icon name="chev" size={15} />
       </button>
-      {open && !hasDeferredDetail && <div className="process-timeline">{rows.map((row) => (
-        row.kind === "tools"
-          ? <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools} />
-          : <TimelineItem key={row.block.kind === "text"
-              ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}
-              block={row.block} onOpenFile={onOpenFile}
-              imageAssets={imageAssets} onLoadImage={onLoadImage}
-              onPreviewImage={onPreviewImage}
-              itemOpen={itemOpen} onItemOpenChange={onItemOpenChange}
-              onInteractionStart={onInteractionStart}
-              onInteractionEnd={onInteractionEnd} />
-      ))}</div>}
+      {open && !hasDeferredOnly && <div className="process-timeline">
+        {rows.map((row) => (
+          row.kind === "tools"
+            ? <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools} />
+            : <TimelineItem key={row.block.kind === "text"
+                ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}
+                block={row.block} onOpenFile={onOpenFile}
+                imageAssets={imageAssets} onLoadImage={onLoadImage}
+                onPreviewImage={onPreviewImage}
+                itemOpen={itemOpen} onItemOpenChange={onItemOpenChange}
+                onInteractionStart={onInteractionStart}
+                onInteractionEnd={onInteractionEnd} />
+        ))}
+      </div>}
     </section>
   );
 }

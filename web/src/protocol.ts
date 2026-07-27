@@ -53,6 +53,7 @@ export interface Hello extends Base {
 export interface QueryImg { media_type: "image/png" | "image/jpeg" | "image/jpg" | "image/webp"; data: string }
 export interface QueryFile { filename: string; data: string }
 export interface Query extends Base { type: "query"; prompt: string; msg_id: string; images?: QueryImg[] | null; files?: QueryFile[] | null }
+export interface Steer extends Base { type: "steer"; sid: string; cmd_id: string; client_id: string; prompt: string; msg_id: string; images?: QueryImg[] | null; files?: QueryFile[] | null }
 export interface Interrupt extends Base { type: "interrupt" }
 export interface Takeover extends Base { type: "takeover"; sid: string; cmd_id: string }
 export interface TakeoverState extends Base { type: "takeover_state"; pending: boolean; message?: string | null }
@@ -114,7 +115,8 @@ export interface SessionForked extends Base {
   last_turn_id?: string | null;
   target: "same_cwd" | "worktree";
 }
-export interface UserMsg extends Base { type: "user_msg"; msg_id: string; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
+export interface UserMsg extends Base { type: "user_msg"; msg_id: string; client_msg_id?: string | null; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
+export interface TurnSteered extends Base { type: "turn_steered"; msg_id: string; turn_id: string; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string; channel?: AssistantChannel }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string; channel?: AssistantChannel }
 export interface ToolUse extends Base {
@@ -177,7 +179,8 @@ export interface TurnPlan extends Base { type: "turn_plan"; item_id: string; tur
 export interface TurnDiff extends Base { type: "turn_diff"; item_id: string; turn_id?: string | null; diff: string; truncated?: boolean | null }
 export interface TurnBinding extends Base { type: "turn_binding"; msg_id: string; turn_id: string }
 export interface TurnResult { subtype: string; duration_ms: number; is_error: boolean; total_cost_usd?: number | null; num_turns?: number | null }
-export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null; checkpoint_id?: string | null }
+export interface TurnNotificationContext { engine: Engine; space: Space; display_name?: string | null; parent_session_id?: string | null }
+export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null; checkpoint_id?: string | null; notification_context?: TurnNotificationContext | null }
 export interface ErrorMsg extends Base {
   type: "error";
   code: string;
@@ -297,10 +300,10 @@ export interface GetHistory extends Base { type: "get_history"; session_id: stri
 // `codex` in the user's terminal. The wrapper mirrors those appends by broadcasting
 // a fresh History; we render the session read-only (a cc session has one owner).
 export interface ConversationImageRef { image_id: string; media_type: QueryImg["media_type"]; width: number; height: number; byte_size: number }
-export interface ConversationTurn { id: string; prompt: string; blocks: unknown[]; done: boolean; forkPointId?: string | null; checkpointId?: string | null; interrupted?: boolean | null; error?: string | null; images?: QueryImg[] | null; imageRefs?: ConversationImageRef[] | null; files?: QueryFile[] | null; ts?: number | null; doneTs?: number | null; durationMs?: number | null; detailEventCount: number; detailLoaded: boolean }
+export interface ConversationTurn { id: string; clientMsgId?: string | null; prompt: string; blocks: unknown[]; done: boolean; forkPointId?: string | null; checkpointId?: string | null; interrupted?: boolean | null; error?: string | null; images?: QueryImg[] | null; imageRefs?: ConversationImageRef[] | null; files?: QueryFile[] | null; ts?: number | null; doneTs?: number | null; durationMs?: number | null; detailEventCount: number; detailLoaded: boolean }
 export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; turns?: ConversationTurn[]; detail?: "summary" | "full"; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; control?: SessionControl | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; reset?: boolean }
-export interface GetTurnDetail extends Base { type: "get_turn_detail"; session_id: string; turn_id: string; client_id?: string | null; revision?: string | null }
-export interface TurnDetail extends Base { type: "turn_detail"; session_id: string; turn_id: string; revision: string; authoritative?: boolean; error?: string | null; events: ServerEvent[] }
+export interface GetTurnDetail extends Base { type: "get_turn_detail"; session_id: string; turn_id: string; client_id?: string | null; revision?: string | null; before?: string | null; limit?: number | null }
+export interface TurnDetail extends Base { type: "turn_detail"; session_id: string; turn_id: string; revision: string; authoritative?: boolean; error?: string | null; events: ServerEvent[]; has_more?: boolean; oldest_cursor?: string | null; has_newer?: boolean; newer_cursor?: string | null; before?: string | null }
 export interface GetHistoryImage extends Base { type: "get_history_image"; session_id: string; turn_id: string; image_id: string; variant: "thumbnail" | "full"; request_id: string; client_id?: string | null; revision?: string | null }
 export interface HistoryImage extends Base { type: "history_image"; session_id: string; turn_id: string; image_id: string; variant: "thumbnail" | "full"; request_id: string; revision: string; media_type?: QueryImg["media_type"] | null; width?: number | null; height?: number | null; data?: string | null; error?: string | null }
 // Replayable barrier for a destructive history mutation. The full History
@@ -335,8 +338,9 @@ export type EngineCapabilityAction = "install" | "uninstall" | "enable" | "disab
 export interface EngineCapabilityItem { kind: EngineCapabilityKind; id: string; name: string; description?: string | null; enabled?: boolean | null; installed?: boolean | null; status?: string | null; scope?: string | null; source?: string | null; tool_count?: number | null; resource_count?: number | null; install_url?: string | null; actions?: EngineCapabilityAction[]; event?: string | null; matcher?: string | null; handler_type?: string | null; detail?: string | null }
 export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[] }
 export interface AskOption { label: string; ds?: string }
-export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean }
-export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }
+export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
+export interface AskUserClosed extends Base { type: "ask_user_closed"; ask_id: string; reason: "answered" | "cancelled" | "timeout" | "superseded" }
+export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string | string[] }
 export type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
 export interface GetGoal extends Base { type: "get_goal" }
 export interface SetGoal extends Base {
@@ -441,14 +445,14 @@ export interface ContextReport extends Base {
 
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
-  | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
+  | AskUser | AskUserClosed | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionActivity | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
-  | UserMsg | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
+  | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 19;
+export const PROTOCOL_VERSION = 22;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

@@ -13,6 +13,12 @@ import {
 } from "../src/inline-image-assets.ts";
 import { imageDimensionsFromBase64, queryImageDimensions } from "../src/img.ts";
 import { collectTurnFileChanges, filePathsFromInput, mutatedFilePaths } from "../src/file-changes.ts";
+import {
+  MAX_MERMAID_SOURCE_CHARS,
+  MAX_MERMAID_SOURCE_LINES,
+  isMermaidFenceClass,
+  mermaidSourceProblem,
+} from "../src/mermaid.ts";
 import type { ServerEvent } from "../src/protocol.ts";
 
 assert.deepEqual(classifyPreviewTarget("docs/README.md", "./img/a.png"), {
@@ -45,6 +51,22 @@ assert.deepEqual(parseLocalFileTarget("file:///tmp/a%20b.py:9"), {
 });
 assert.equal(parseLocalFileTarget("https://example.com/a.py:9"), null);
 assert.equal(parseLocalFileTarget("#L9"), null);
+assert.equal(isMermaidFenceClass("language-mermaid"), true);
+assert.equal(isMermaidFenceClass("foo language-mermaid bar"), true);
+assert.equal(isMermaidFenceClass("language-mermaid-extra"), false);
+assert.equal(isMermaidFenceClass("mermaid"), false);
+assert.equal(isMermaidFenceClass(undefined), false);
+assert.equal(mermaidSourceProblem("flowchart LR\nA --> B"), null);
+assert.match(
+  mermaidSourceProblem("x".repeat(MAX_MERMAID_SOURCE_CHARS + 1)) || "",
+  /过长/,
+);
+assert.match(
+  mermaidSourceProblem(
+    Array.from({ length: MAX_MERMAID_SOURCE_LINES + 1 }, () => "A").join("\n"),
+  ) || "",
+  /行数/,
+);
 assert.deepEqual(classifyMessageImageTarget(
   "/Volumes/MuggleSSD/workspace/project/tmp-auth.png"), {
   kind: "local", value: "/Volumes/MuggleSSD/workspace/project/tmp-auth.png",
@@ -66,12 +88,12 @@ assert.equal(inlineAssets.begin({
   sid: "session-1", path: "qr.png", previewId: "preview-2", requestId: "request-2",
 }), false, "one visible local image must have at most one in-flight request");
 assert.equal(inlineAssets.accept({
-  v: 19, type: "preview_asset", ts: 1, sid: "other-session",
+  v: 20, type: "preview_asset", ts: 1, sid: "other-session",
   path: "qr.png", preview_id: "preview-1", request_id: "request-1",
   media_type: "image/png", data: "cG5n",
 }), false, "a response from another session must not satisfy the request");
 assert.equal(inlineAssets.accept({
-  v: 19, type: "preview_asset", ts: 2, sid: "session-1",
+  v: 20, type: "preview_asset", ts: 2, sid: "session-1",
   path: "qr.png", preview_id: "preview-1", request_id: "request-1",
   media_type: "image/png", data: "cG5n",
 }), true);
@@ -109,7 +131,7 @@ assert.equal(sizedInlineAssets.begin({
   previewId: "preview-sized", requestId: "request-sized",
 }), true);
 assert.equal(sizedInlineAssets.accept({
-  v: 19, type: "preview_asset", ts: 3, sid: "session-1",
+  v: 20, type: "preview_asset", ts: 3, sid: "session-1",
   path: "sized-qr.png", preview_id: "preview-sized",
   request_id: "request-sized", media_type: "image/png", data: pngHeaderBase64,
 }), true);
@@ -166,6 +188,22 @@ try {
   assert.match(codeCopyMarkup, /aria-label="复制代码"/,
     "fenced commands need a local copy action without scrolling to turn end");
   assert.match(codeCopyMarkup, /echo ready/);
+  const streamingMermaidMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "```mermaid\nflowchart LR\nA --> B\n```",
+    done: false,
+  }));
+  assert.match(streamingMermaidMarkup, /message-code-block/);
+  assert.match(streamingMermaidMarkup, /aria-label="复制代码"/);
+  assert.doesNotMatch(streamingMermaidMarkup, /data-mermaid-state=/,
+    "streaming Mermaid stays source-only until the turn is terminal");
+  const completedMermaidMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "```mermaid\nflowchart LR\nA --> B\n```",
+    done: true,
+  }));
+  assert.match(completedMermaidMarkup, /data-mermaid-state="idle"/);
+  assert.match(completedMermaidMarkup, /class="mermaid-source"/);
+  assert.match(completedMermaidMarkup, /flowchart LR/);
+  assert.match(completedMermaidMarkup, /aria-label="复制 Mermaid 源码"/);
   const codexDirectiveMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "提交完成。\n\n::git-commit{cwd=\"/tmp/private-project\"}",
     done: true,
@@ -403,6 +441,27 @@ try {
   assert.match(markup, />保存</);
   assert.match(markup, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.doesNotMatch(markup, /<script>/);
+  const mermaidPreviewMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: {
+      file: "docs/diagram.md",
+      sid: "session-1",
+      requestId: "preview-mermaid",
+      kind: "md",
+      content: "```mermaid\nsequenceDiagram\nA->>B: Hello\n```",
+      size: 48,
+      mtimeNs: "3",
+      revision: "b".repeat(64),
+      assets: {},
+    },
+    active: "diff",
+    hasBtw: false,
+    onTab: () => {},
+    onClose: () => {},
+  }));
+  assert.match(mermaidPreviewMarkup, /data-mermaid-state="idle"/);
+  assert.match(mermaidPreviewMarkup, /sequenceDiagram/);
+  assert.doesNotMatch(mermaidPreviewMarkup, /<pre><div/,
+    "the Mermaid component must not be nested inside an invalid pre element");
 
   const messageMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "[codex_stream.py](/home/nancy/project/codex_stream.py:731)",
@@ -441,7 +500,7 @@ try {
     kind: "file",
   });
   state = reduce(state, { type: "event", event: {
-    v: 19,
+    v: 20,
     type: "file_preview",
     ts: 6,
     sid: "session-1",

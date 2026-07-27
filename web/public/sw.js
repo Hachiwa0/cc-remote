@@ -1,4 +1,4 @@
-const CACHE = "cc-remote-shell-v2";
+const CACHE = "cc-remote-shell-v3";
 const SHELL = [
   "/", "/manifest.webmanifest", "/favicon.svg", "/apple-touch-icon.png",
   "/icon-192.png", "/icon-512.png", "/icon-maskable-512.png",
@@ -52,7 +52,12 @@ self.addEventListener("notificationclick", (event) => {
   event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true })
     .then((clients) => {
       const existing = clients.find((client) => "focus" in client);
-      return existing ? existing.focus() : self.clients.openWindow(target);
+      if (!existing) return self.clients.openWindow(target);
+      existing.postMessage({
+        type: "cc-remote-notification",
+        route: event.notification.data?.route,
+      });
+      return existing.focus();
     }));
 });
 
@@ -64,6 +69,7 @@ self.addEventListener("push", (event) => {
   const tag = typeof payload.tag === "string" ? payload.tag : "cc-remote-turn";
   const url = typeof payload.url === "string" ? payload.url : "/";
   event.waitUntil(self.registration.showNotification(title, {
-    body, tag, icon: "/icon-192.png", badge: "/favicon.svg", data: { url },
+    body, tag, icon: "/icon-192.png", badge: "/favicon.svg",
+    data: { url, route: payload.route },
   }));
 });
