@@ -7,13 +7,16 @@
 - Claude Agent SDK 升级到 `0.2.128`，同时让 wrapper 显式运行用户日常使用的
   `~/.local/bin/claude`，不再静默选择 SDK 内置副本，使 Remote 与终端的凭据和
   CLI 更新保持一致。
+- 在隔离的 Work 策略中保留用户的 Claude 订阅 OAuth 设置，并将内置
+  `AskUserQuestion` 按原始单选/多选问题展示，不再误显示为通用工具权限审批。
 - Codex 忙碌时发送默认与官方客户端一致，使用原生 `turn/steer` 引导当前任务；
   排队仍可选，停止保持为独立操作。Claude 继续使用原有打断并发送语义。
 - 对配置的安全源窗口内、单个超长回合的重型过程做回合内分页，不再仅因浏览器
   256 块展示上限而用“较早过程已省略”替换本可读取的真实过程。
 - shared daemon 恢复绑定期间拒绝其他 thread 的生命周期帧，并在服务端明确确认
   自动回合已不存在时安全解除假运行状态。
-- Wrapper、Relay 与 Web 的协同 wire gate 升级到 protocol v21。
+- Wrapper、Relay 与 Web 的协同 wire gate 升级到 protocol v22，增加可安全重放的
+  用户问题关闭事件与多选回答。
 
 ## v3.0.0 — 2026-07-24
 

@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 21
+PROTOCOL_VERSION = 22
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -132,6 +132,13 @@ AskOptionDescription = Annotated[
 ]
 AskAnswerText = Annotated[
     str, StringConstraints(min_length=1, max_length=ASK_ANSWER_MAX_CHARS),
+]
+AskAnswer = Union[
+    AskAnswerText,
+    Annotated[
+        list[AskAnswerText],
+        Field(min_length=1, max_length=ASK_OPTION_MAX_COUNT),
+    ],
 ]
 PreviewPath = Annotated[
     str, StringConstraints(min_length=1, max_length=4096),
@@ -1828,12 +1835,22 @@ class AskUser(_Base):
     options: list[AskOption] = Field(default_factory=list, max_length=ASK_OPTION_MAX_COUNT)
     allow_text: bool = False
     secret: bool = False
+    multi_select: bool = False
 
     @model_validator(mode="after")
     def choices_or_text(self):
         if not self.allow_text and len(self.options) < ASK_OPTION_MIN_COUNT:
             raise ValueError("ask_user requires 2-5 options unless text input is enabled")
+        if self.multi_select and len(self.options) < ASK_OPTION_MIN_COUNT:
+            raise ValueError("multi-select ask_user requires 2-5 options")
         return self
+
+
+class AskUserClosed(_Base):
+    """wrapper -> client: replayable terminal boundary for an AskUser card."""
+    type: Literal["ask_user_closed"] = "ask_user_closed"
+    ask_id: WireId
+    reason: Literal["answered", "cancelled", "timeout", "superseded"]
 
 
 class AnswerQuestion(_Command):
@@ -1841,7 +1858,7 @@ class AnswerQuestion(_Command):
     selected option's label (or free text if the agent allowed it)."""
     type: Literal["answer_question"] = "answer_question"
     ask_id: WireId
-    answer: AskAnswerText
+    answer: AskAnswer
 
 
 class GetGoal(_Command):
@@ -1903,7 +1920,7 @@ class GoalState(_Base):
 
 AnyMessage = Union[
     Hello, Query, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AnswerQuestion,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
@@ -1921,7 +1938,7 @@ DOWNSTREAM_TYPES = frozenset({
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_binding",
     "turn_end",
-    "error", "ask_user", "history_invalidated", "artifact_invalidated",
+    "error", "ask_user", "ask_user_closed", "history_invalidated", "artifact_invalidated",
 })
 
 _TYPE_MAP: dict[str, type[BaseModel]] = {
@@ -2010,6 +2027,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "history_invalidated": HistoryInvalidated,
     "artifact_invalidated": ArtifactInvalidated,
     "ask_user": AskUser,
+    "ask_user_closed": AskUserClosed,
     "answer_question": AnswerQuestion,
     "get_goal": GetGoal,
     "set_goal": SetGoal,

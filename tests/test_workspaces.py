@@ -308,6 +308,7 @@ class WorkRegistryTests(unittest.TestCase):
                 "ANTHROPIC_BASE_URL": "https://provider.example/v1",
                 "ANTHROPIC_AUTH_TOKEN": "provider-token",
                 "ANTHROPIC_MODEL": "provider-model",
+                "CLAUDE_CODE_OAUTH_TOKEN": "subscription-oauth-token",
                 "UNRELATED_SECRET": "must-not-cross",
             },
             "hooks": {"UserPromptSubmit": [{"hooks": [{"command": "inject-memory"}]}]},
@@ -326,6 +327,7 @@ class WorkRegistryTests(unittest.TestCase):
             "ANTHROPIC_BASE_URL": "https://provider.example/v1",
             "ANTHROPIC_AUTH_TOKEN": "provider-token",
             "ANTHROPIC_MODEL": "provider-model",
+            "CLAUDE_CODE_OAUTH_TOKEN": "subscription-oauth-token",
         })
         self.assertNotIn("hooks", payload)
         self.assertNotIn("enabledPlugins", payload)
@@ -349,6 +351,35 @@ class WorkRegistryTests(unittest.TestCase):
         payload = json.loads(policy.read_text(encoding="utf-8"))
         self.assertNotIn("model", payload)
         self.assertNotIn("env", payload)
+
+    def test_claude_policy_refreshes_a_rotated_oauth_token(self):
+        config_dir = Path(self.tmp.name) / "claude-config"
+        config_dir.mkdir()
+        settings = config_dir / "settings.json"
+        settings.write_text(json.dumps({
+            "env": {"CLAUDE_CODE_OAUTH_TOKEN": "old-token"},
+        }), encoding="utf-8")
+        record = self.store.create_session()
+
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config_dir)}):
+            policy = Path(self.store.ensure_claude_policy(record))
+            self.assertEqual(
+                json.loads(policy.read_text(encoding="utf-8"))["env"][
+                    "CLAUDE_CODE_OAUTH_TOKEN"
+                ],
+                "old-token",
+            )
+            settings.write_text(json.dumps({
+                "env": {"CLAUDE_CODE_OAUTH_TOKEN": "rotated-token"},
+            }), encoding="utf-8")
+            self.store.ensure_claude_policy(record)
+
+        payload = json.loads(policy.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"],
+            "rotated-token",
+        )
+        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

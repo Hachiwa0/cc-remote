@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { ToolBlock } from "../reducer";
+import type { ToolBlock } from "../domain/conversation";
 import { Icon } from "../icons";
 import { buildEditDiffPreview } from "../diff";
 import { isToolFailure, presentTool } from "../tool-presentation";

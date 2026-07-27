@@ -2,7 +2,7 @@ import {
   canonicalTurnId,
   type HistoryBrowsePage,
 } from "./history-browse.ts";
-import type { Turn } from "./reducer.ts";
+import type { Turn } from "./domain/conversation.ts";
 
 /** Deliberately independent from cache.ts. Deep-history browsing is best-effort
  * page storage and must never make an upgrade/failure of the replay/session

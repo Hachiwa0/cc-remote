@@ -5,7 +5,12 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
-import type { Block, ProcessBlock, TextBlock, ToolBlock } from "../reducer";
+import type {
+  Block,
+  ProcessBlock,
+  TextBlock,
+  ToolBlock,
+} from "../domain/conversation";
 import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";

@@ -1,4 +1,4 @@
-import type { Block, TextBlock } from "./reducer";
+import type { Block, TextBlock } from "./domain/conversation";
 
 export function processBlocks(blocks: Block[]): Block[] {
   const dedicatedAgents = new Set(blocks.flatMap((block) => (

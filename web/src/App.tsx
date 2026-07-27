@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
-import { reduce, initialState, createRuntime, type Turn } from "./reducer";
+import { reduce, initialState, createRuntime } from "./reducer";
+import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
 import { Icon } from "./icons";
 import { ChatView } from "./components/ChatView";
@@ -129,6 +130,14 @@ import {
   type HistoryPageCacheScope,
   type HistoryPageCacheSessionScope,
 } from "./history-page-cache";
+import {
+  HISTORY_INITIAL_PAGE,
+  HISTORY_LATEST_PAGE_KEY,
+  HISTORY_MORE_PAGE,
+  HISTORY_PROVISIONAL_WATCHDOG_MS,
+  historyPageKey,
+  summaryHistoryTurns,
+} from "./history-summary";
 import { ComposerDraftStore, composerDraftKey } from "./composer-drafts";
 import {
   acknowledgeCompletion,
@@ -144,41 +153,6 @@ const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
-// Paint the newest few turns first. Older history is intentionally fetched in
-// follow-up pages so one tool-heavy conversation cannot monopolize the socket,
-// reducer, and main thread before the current answer becomes usable.
-const HISTORY_INITIAL_PAGE = 4;
-const HISTORY_MORE_PAGE = 12;
-// A source-drift preview already starts one wrapper-owned exact rebuild. Keep
-// one slow client watchdog for a transient background failure, but do not start
-// another multi-gigabyte scan in parallel on the ordinary 250ms retry path.
-const HISTORY_PROVISIONAL_WATCHDOG_MS = 60_000;
-const HISTORY_LATEST_PAGE_KEY = "latest";
-
-function historyPageKey(before: string): string {
-  return `before:${before}`;
-}
-
-function summaryHistoryTurns(history: History): Turn[] | null {
-  if (history.detail !== "summary" || !Array.isArray(history.turns)) {
-    return null;
-  }
-  return history.turns.map((turn) => ({
-    ...turn,
-    blocks: turn.blocks as Turn["blocks"],
-    clientMsgId: turn.clientMsgId ?? undefined,
-    forkPointId: turn.forkPointId ?? undefined,
-    checkpointId: turn.checkpointId ?? undefined,
-    interrupted: turn.interrupted ?? undefined,
-    error: turn.error ?? undefined,
-    images: turn.images ?? undefined,
-    imageRefs: turn.imageRefs ?? undefined,
-    files: turn.files ?? undefined,
-    ts: turn.ts ?? undefined,
-    doneTs: turn.doneTs ?? undefined,
-    durationMs: turn.durationMs ?? undefined,
-  }));
-}
 
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
@@ -3135,14 +3109,23 @@ export default function App() {
       })()}
       {rt.pendingQuestion && (
         <QuestionSheet
+          key={rt.pendingQuestion.ask_id}
           header={rt.pendingQuestion.header}
           question={rt.pendingQuestion.question}
           options={rt.pendingQuestion.options}
           allowText={rt.pendingQuestion.allow_text}
           secret={rt.pendingQuestion.secret}
+          multiSelect={rt.pendingQuestion.multi_select}
           onAnswer={(answer) => {
-            wsRef.current?.sendAnswerQuestion(rt.pendingQuestion!.ask_id, answer);
-            dispatch({ type: "answer_question" });
+            const question = rt.pendingQuestion;
+            if (!focusedSid || !question) return;
+            if (!wsRef.current?.sendAnswerQuestion(
+              focusedSid, question.ask_id, answer)) return;
+            dispatch({
+              type: "answer_question",
+              sid: focusedSid,
+              ask_id: question.ask_id,
+            });
           }}
         />
       )}

@@ -338,8 +338,9 @@ export type EngineCapabilityAction = "install" | "uninstall" | "enable" | "disab
 export interface EngineCapabilityItem { kind: EngineCapabilityKind; id: string; name: string; description?: string | null; enabled?: boolean | null; installed?: boolean | null; status?: string | null; scope?: string | null; source?: string | null; tool_count?: number | null; resource_count?: number | null; install_url?: string | null; actions?: EngineCapabilityAction[]; event?: string | null; matcher?: string | null; handler_type?: string | null; detail?: string | null }
 export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[] }
 export interface AskOption { label: string; ds?: string }
-export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean }
-export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string }
+export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
+export interface AskUserClosed extends Base { type: "ask_user_closed"; ask_id: string; reason: "answered" | "cancelled" | "timeout" | "superseded" }
+export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string | string[] }
 export type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
 export interface GetGoal extends Base { type: "get_goal" }
 export interface SetGoal extends Base {
@@ -444,14 +445,14 @@ export interface ContextReport extends Base {
 
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
-  | AskUser | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
+  | AskUser | AskUserClosed | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionActivity | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 21;
+export const PROTOCOL_VERSION = 22;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

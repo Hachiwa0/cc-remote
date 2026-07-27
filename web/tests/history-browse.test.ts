@@ -559,7 +559,7 @@ assert.equal(newestDetailPage.turns[1].detailNewerCursor, null);
 
 function processEvent(itemId: string, order: number): ProcessEvent {
   return {
-    v: 21,
+    v: 22,
     type: "process",
     ts: order,
     sid: "session-a",

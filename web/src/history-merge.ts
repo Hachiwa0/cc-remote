@@ -1,5 +1,11 @@
-import type { Block, TextBlock, ToolBlock, ProcessBlock, Turn } from "./reducer";
-import type { TurnDetailProjection } from "./history-detail-projection";
+import type {
+  Block,
+  ProcessBlock,
+  TextBlock,
+  ToolBlock,
+  Turn,
+  TurnDetailProjection,
+} from "./domain/conversation";
 
 function combineText(first: string, second: string): string {
   if (!first) return second;

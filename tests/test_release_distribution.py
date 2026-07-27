@@ -27,15 +27,21 @@ FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 def test_release_workflow_materializes_web_before_python_bundle_tests():
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-    verify_job = workflow.split("\n  build:\n", 1)[0]
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    python_job = workflow.split("\n  python:\n", 1)[1].split(
+        "\n  web:\n", 1)[0]
+    web_job = workflow.split("\n  web:\n", 1)[1].split(
+        "\n  deploy:\n", 1)[0]
 
-    install = verify_job.index("npm --prefix web ci")
-    build = verify_job.index("npm --prefix web run build")
-    python_tests = verify_job.index(".venv/bin/python -m pytest")
-
-    assert install < build < python_tests
-    assert verify_job.count("npm --prefix web run build") == 1
+    assert "uses: ./.github/workflows/ci.yml" in release
+    assert "needs: web" in python_job
+    assert web_job.index("npm --prefix web ci") < web_job.index(
+        "npm --prefix web run build")
+    assert web_job.index("npm --prefix web run build") < web_job.index(
+        "name: ci-web-dist")
+    assert python_job.index("name: ci-web-dist") < python_job.index(
+        ".venv/bin/python -m pytest")
 
 
 def _fake_uv(tmp_path: Path) -> Path:
@@ -430,15 +436,21 @@ def test_role_locks_and_release_workflow_are_versioned_inputs():
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
+    source_workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
     assert "tags:" in workflow
     assert "v*.*.*" in workflow
     assert "npm --prefix web run build" in workflow
-    assert "pytest" in workflow
-    assert "test:reliability" in workflow
+    assert "uses: ./.github/workflows/ci.yml" in workflow
+    assert "pytest" in source_workflow
+    assert "test:reliability" in source_workflow
     assert "actions/attest" in workflow
     assert "gh release upload" in workflow
     uv_version = (ROOT / "deploy" / "uv-version.txt").read_text().strip()
-    assert workflow.count(f'version: "{uv_version}"') == 2
+    assert (
+        workflow + source_workflow
+    ).count(f'version: "{uv_version}"') == 2
     python_version = (
         ROOT / "deploy" / "python-version.txt"
     ).read_text().strip()

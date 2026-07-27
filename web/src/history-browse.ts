@@ -6,8 +6,10 @@ import {
   MAX_RUNTIME_COMPLETED_UNITS,
   MAX_RUNTIME_TURNS,
 } from "./runtime-bounds.ts";
-import type { Turn } from "./reducer.ts";
-import type { TurnDetailProjection } from "./history-detail-projection.ts";
+import type {
+  Turn,
+  TurnDetailProjection,
+} from "./domain/conversation.ts";
 
 export interface HistoryBrowseLimits {
   maxTurns: number;

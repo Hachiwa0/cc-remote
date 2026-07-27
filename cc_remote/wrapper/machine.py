@@ -84,7 +84,7 @@ from cc_remote.protocol import (
     CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
     ConversationTurn, History, TurnDetail, HistoryImage,
-    HistoryInvalidated, ArtifactInvalidated, AskUser,
+    HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
     GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg, TurnSteered,
     ToolUse, ToolResult, TurnBinding, TurnEnd, TurnNotificationContext,
@@ -113,6 +113,13 @@ from cc_remote.wrapper.claude_broker_history import (
     parse_claude_broker_lifecycle,
 )
 from cc_remote.wrapper.ask import make_ask_server
+from cc_remote.wrapper.claude_questions import (
+    AskCancelled,
+    AskSuperseded,
+    AskTimeout,
+    AskUnavailable,
+    normalize_claude_questions,
+)
 from cc_remote.wrapper.sdk import (
     CLAUDE_DEFAULT_EFFORT,
     CLAUDE_DEFAULT_MODEL,
@@ -160,6 +167,10 @@ from cc_remote.wrapper.codex_rpc import (
 from cc_remote.wrapper.engine_capabilities import (
     engine_capabilities, manage_engine_plugin, manage_engine_skill,
     manage_engine_hook,
+)
+from cc_remote.wrapper.git_diff import (
+    bounded_process_output,
+    read_git_diff,
 )
 from cc_remote.wrapper.source_fetch import capture_public_source
 from cc_remote.wrapper.work_context import (
@@ -1261,7 +1272,7 @@ class WrapperMachine:
     ) -> None:
         """Install the complete per-session Claude bridge on one SDK handle."""
         sdk.ask_server = make_ask_server(
-            lambda q, o: self._on_ask(ctx, q, o),
+            lambda q, o: self._on_mcp_ask(ctx, q, o),
             lambda m: self._on_set_mode(ctx, m),
         )
         sdk.permission_callback = (
@@ -6244,6 +6255,7 @@ class WrapperMachine:
             )
             await self._emit(ctx, error)
             return error
+        self._cancel_pending_asks(ctx)
         # Set the deadline and wake the turn consumer before entering any await:
         # it may already be blocked in the queue.get() that began while running.
         ctx.interrupt_deadline = (
@@ -6712,49 +6724,42 @@ class WrapperMachine:
         if previous_ask_id:
             previous = ctx.pending_asks.get(previous_ask_id)
             if previous is not None and not previous.done():
-                previous.set_result("(已被新的模型选择替代)")
+                previous.set_exception(AskSuperseded())
 
         ask_id = f"ask-{uuid4().hex}"
         accept_label = f"是，切换到 {target}"
-        event = AskUser(
-            ask_id=ask_id,
-            header="切换模型",
-            question=(
-                f"当前会话已为现有模型建立缓存。切换到 {target} 后，"
-                "下一次回复会重新读取完整历史，因此速度更慢并消耗更多 token。"
-                "是否继续？"
-            ),
-            options=[
-                {"label": accept_label,
-                 "ds": "确认切换；下一次回复会重新读取完整历史"},
-                {"label": "不，返回", "ds": "保留当前模型"},
-            ],
-            to=client_id,
-        )
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        ctx.pending_asks[ask_id] = future
         ctx.pending_model_ask_id = ask_id
-        await self._emit(ctx, event)
-        log.info(
-            "Claude model switch confirmation emitted",
-            session_id=ctx.session_id,
-            ask_id=ask_id,
-            current=current,
-            target=target,
-        )
         try:
-            answer = await asyncio.wait_for(future, timeout=30 * 60)
+            async with ctx.ask_lock:
+                # Another SetModel may supersede this request while it waits
+                # behind a different question batch. Never show the stale one.
+                if ctx.pending_model_ask_id != ask_id:
+                    return False
+                answer = await self._on_ask_locked(
+                    ctx,
+                    (
+                        f"当前会话已为现有模型建立缓存。切换到 {target} 后，"
+                        "下一次回复会重新读取完整历史，因此速度更慢并消耗更多 token。"
+                        "是否继续？"
+                    ),
+                    [
+                        {"label": accept_label,
+                         "ds": "确认切换；下一次回复会重新读取完整历史"},
+                        {"label": "不，返回", "ds": "保留当前模型"},
+                    ],
+                    header="切换模型",
+                    ask_id=ask_id,
+                    to=client_id,
+                )
             return answer == accept_label
-        except asyncio.TimeoutError:
+        except AskUnavailable:
             log.warning(
-                "Claude model switch confirmation timed out",
+                "Claude model switch confirmation ended without approval",
                 session_id=ctx.session_id,
                 ask_id=ask_id,
             )
             return False
         finally:
-            ctx.pending_asks.pop(ask_id, None)
             if ctx.pending_model_ask_id == ask_id:
                 ctx.pending_model_ask_id = None
 
@@ -8559,34 +8564,139 @@ class WrapperMachine:
 
     # ---- ask_user MCP tool (agent asks the user a multiple-choice question) ----
 
-    async def _on_ask(self, ctx: SessionContext, question: str,
-                      options: list[dict[str, str]], *, header: str | None = None,
-                      allow_text: bool = False, secret: bool = False) -> str:
+    @staticmethod
+    def _cancel_pending_asks(ctx: SessionContext) -> None:
+        """Wake prompt handlers so interrupt can drain instead of waiting 30m."""
+        for future in tuple(ctx.pending_asks.values()):
+            if not future.done():
+                future.set_exception(AskCancelled())
+
+    async def _on_mcp_ask(
+        self,
+        ctx: SessionContext,
+        question: str,
+        options: list[dict[str, str]],
+    ) -> str:
+        """Keep the in-process MCP tool's historical textual timeout contract."""
+        try:
+            answer = await self._on_ask(ctx, question, options)
+        except AskTimeout:
+            return "(用户未回答，已超时)"
+        except (AskCancelled, AskSuperseded):
+            return "(用户未回答，问题已取消)"
+        return answer if isinstance(answer, str) else ", ".join(answer)
+
+    async def _on_ask(
+        self,
+        ctx: SessionContext,
+        question: str,
+        options: list[dict[str, str]],
+        *,
+        header: str | None = None,
+        allow_text: bool = False,
+        secret: bool = False,
+        multi_select: bool = False,
+        timeout: float = 30 * 60,
+        ask_id: str | None = None,
+        to: str | None = None,
+    ) -> str | list[str]:
         """Called by THIS ctx's in-process MCP server when the agent invokes
         `ask_user`. Emits AskUser on the ctx and blocks until AnswerQuestion.
         Runs in the ctx's reader task while its turn loop is blocked on
         receive_response(); other ctxs' turns are unaffected."""
+        async with ctx.ask_lock:
+            return await self._on_ask_locked(
+                ctx,
+                question,
+                options,
+                header=header,
+                allow_text=allow_text,
+                secret=secret,
+                multi_select=multi_select,
+                timeout=timeout,
+                ask_id=ask_id,
+                to=to,
+            )
+
+    async def _on_ask_locked(
+        self,
+        ctx: SessionContext,
+        question: str,
+        options: list[dict[str, str]],
+        *,
+        header: str | None = None,
+        allow_text: bool = False,
+        secret: bool = False,
+        multi_select: bool = False,
+        timeout: float = 30 * 60,
+        ask_id: str | None = None,
+        to: str | None = None,
+    ) -> str | list[str]:
+        """Run one question while the caller owns ``ctx.ask_lock``."""
         # ask_id is an identity, not a downstream sequence.  Consuming next_seq
         # here would leave an invisible hole before _emit assigns AskUser.seq;
         # reconnect replay would then appear to have lost a frame.
-        ask_id = f"ask-{uuid4().hex}"
+        ask_id = ask_id or f"ask-{uuid4().hex}"
         # Validate model-originated text before registering a pending Future.
         # Otherwise a malformed/oversized AskUser raises during emit and leaves
         # an unreachable entry in pending_asks for the life of the session.
         event = AskUser(ask_id=ask_id, question=question, options=options,
-                        header=header, allow_text=allow_text, secret=secret)
-        loop = asyncio.get_event_loop()
+                        header=header, allow_text=allow_text, secret=secret,
+                        multi_select=multi_select, to=to)
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         ctx.pending_asks[ask_id] = fut
-        await self._emit(ctx, event)
-        log.info("ask_user emitted", sid=ctx.session_id, ask_id=ask_id, options=len(options))
+        ctx.pending_ask_specs[ask_id] = {
+            "labels": frozenset(option["label"] for option in options),
+            "allow_text": allow_text,
+            "multi_select": multi_select,
+        }
+        reason = "cancelled"
         try:
-            return await asyncio.wait_for(fut, timeout=30 * 60)
+            await self._emit(ctx, event)
+            log.info(
+                "ask_user emitted",
+                sid=ctx.session_id,
+                ask_id=ask_id,
+                options=len(options),
+                multi_select=multi_select,
+            )
+            answer = await asyncio.wait_for(fut, timeout=timeout)
+            reason = "answered"
+            return answer
         except asyncio.TimeoutError:
+            reason = "timeout"
             log.warning("ask_user timed out", ask_id=ask_id)
-            return "(用户未回答，已超时)"
+            raise AskTimeout from None
+        except AskSuperseded:
+            reason = "superseded"
+            raise
+        except asyncio.CancelledError:
+            reason = "cancelled"
+            raise
         finally:
-            ctx.pending_asks.pop(ask_id, None)
+            if ctx.pending_asks.get(ask_id) is fut:
+                ctx.pending_asks.pop(ask_id, None)
+                ctx.pending_ask_specs.pop(ask_id, None)
+            try:
+                await self._emit(
+                    ctx,
+                    AskUserClosed(ask_id=ask_id, reason=reason, to=to),
+                )
+            except Exception as exc:
+                log.warning(
+                    "ask_user close event delayed",
+                    ask_id=ask_id,
+                    reason=reason,
+                    error_type=type(exc).__name__,
+                )
+
+    async def _on_ask_optional(self, *args, **kwargs) -> str | list[str] | None:
+        """Map a structured no-answer outcome for fail-closed integrations."""
+        try:
+            return await self._on_ask(*args, **kwargs)
+        except AskUnavailable:
+            return None
 
     async def _on_codex_approval(self, ctx: SessionContext, method: str,
                                  params: dict) -> str:
@@ -8634,7 +8744,7 @@ class WrapperMachine:
             {"label": "拒绝", "ds": "拒绝这次操作"},
             {"label": "取消", "ds": "取消当前操作或回合"},
         ]
-        answer = await self._on_ask(ctx, "\n".join(lines), options)
+        answer = await self._on_ask_optional(ctx, "\n".join(lines), options)
         return {
             "允许一次": "accept",
             "本会话允许": "acceptForSession",
@@ -8653,7 +8763,7 @@ class WrapperMachine:
             prompt = "Codex 请求额外权限：\n" + detail[:12000]
             if reason:
                 prompt += "\n原因：" + reason[:1000]
-            answer = await self._on_ask(ctx, prompt, [
+            answer = await self._on_ask_optional(ctx, prompt, [
                 {"label": "允许本回合", "ds": "仅在当前回合授予这些权限"},
                 {"label": "允许本会话", "ds": "本会话后续保留这些权限"},
                 {"label": "拒绝", "ds": "不授予额外权限"},
@@ -8691,10 +8801,16 @@ class WrapperMachine:
             # The wire question card requires either 2+ choices or a text box.
             # A one-option server payload is still answerable through text.
             allow_text = bool(question.get("isOther")) or len(options) < 2
-            answer = await self._on_ask(
+            answer = await self._on_ask_optional(
                 ctx, prompt, options, header=str(question.get("header") or "")[:512] or None,
                 allow_text=allow_text, secret=bool(question.get("isSecret")))
-            answers[question_id] = {"answers": [answer]}
+            if answer is None:
+                return {"answers": {}}
+            if isinstance(answer, list):
+                answer_values = answer
+            else:
+                answer_values = [answer]
+            answers[question_id] = {"answers": answer_values}
         return {"answers": answers}
 
     async def _on_codex_mcp_elicitation(self, ctx: SessionContext,
@@ -8704,7 +8820,7 @@ class WrapperMachine:
         server = str(params.get("serverName") or "MCP")[:512]
         if mode == "url":
             url = str(params.get("url") or "")[:4096]
-            answer = await self._on_ask(ctx, f"{message}\n\n{url}", [
+            answer = await self._on_ask_optional(ctx, f"{message}\n\n{url}", [
                 {"label": "已完成并继续", "ds": "我已在链接页面完成操作"},
                 {"label": "拒绝", "ds": "不继续这次 MCP 请求"},
                 {"label": "取消", "ds": "取消当前操作"},
@@ -8715,7 +8831,7 @@ class WrapperMachine:
         if not isinstance(schema, dict):
             # openai/form schemas may be intentionally opaque. Preserve a usable
             # accept/decline path instead of rejecting the server request.
-            answer = await self._on_ask(ctx, message, [
+            answer = await self._on_ask_optional(ctx, message, [
                 {"label": "接受", "ds": "继续此 MCP 表单请求"},
                 {"label": "拒绝", "ds": "拒绝此 MCP 表单请求"},
             ], header=f"{server} 请求输入")
@@ -8737,9 +8853,13 @@ class WrapperMachine:
                  "ds": str(value)[:2048]}
                 for i, value in enumerate(values[:5])
             ]
-            answer = await self._on_ask(
+            answer = await self._on_ask_optional(
                 ctx, question, options, header=f"{server} · {title}",
                 allow_text=len(options) < 2, secret=bool(spec.get("format") == "password"))
+            if answer is None:
+                return {"action": "cancel"}
+            if isinstance(answer, list):
+                return {"action": "cancel"}
             if not answer and name in required:
                 return {"action": "cancel"}
             field_type = spec.get("type")
@@ -8757,10 +8877,53 @@ class WrapperMachine:
                     content[name] = answer
         return {"action": "accept", "content": content}
 
+    async def _on_claude_ask_user_question(
+        self,
+        ctx: SessionContext,
+        tool_input: dict,
+    ):
+        """Answer Claude's built-in question tool instead of approving it."""
+        try:
+            questions = normalize_claude_questions(tool_input)
+        except ValueError as exc:
+            log.warning(
+                "invalid Claude AskUserQuestion input",
+                session_id=ctx.session_id,
+                error=str(exc),
+            )
+            return PermissionResultDeny(
+                message="Claude 的确认问题格式无效，已安全取消")
+
+        answers: dict[str, str | list[str]] = {}
+        try:
+            # Hold the session-wide slot for the whole batch so a concurrent
+            # approval/subagent question cannot interleave between its pages.
+            async with ctx.ask_lock:
+                for question in questions:
+                    answer = await self._on_ask_locked(
+                        ctx,
+                        question.question,
+                        list(question.options),
+                        header=question.header,
+                        multi_select=question.multi_select,
+                    )
+                    answers[question.question] = answer
+        except AskUnavailable:
+            return PermissionResultDeny(
+                message="用户未完成 Claude 的确认问题")
+
+        return PermissionResultAllow(updated_input={
+            **tool_input,
+            "answers": answers,
+        })
+
     async def _on_claude_tool_permission(self, ctx: SessionContext,
                                          tool_name: str, tool_input: dict,
                                          permission_context):
         """Bridge Claude Agent SDK can_use_tool to the remote client."""
+        if tool_name == "AskUserQuestion":
+            return await self._on_claude_ask_user_question(ctx, tool_input)
+
         def short(value, limit: int = 1200) -> str:
             text = str(value or "").strip()
             return text if len(text) <= limit else text[:limit] + "…"
@@ -8774,10 +8937,13 @@ class WrapperMachine:
             lines.append(short(detail))
         if getattr(permission_context, "suggestions", None):
             lines.append("SDK 提供了可选权限建议；本次仅处理单次授权。")
-        answer = await self._on_ask(ctx, "\n".join(lines), [
-            {"label": "允许一次", "ds": "仅批准这一次工具调用"},
-            {"label": "拒绝", "ds": "拒绝这次工具调用"},
-        ])
+        try:
+            answer = await self._on_ask(ctx, "\n".join(lines), [
+                {"label": "允许一次", "ds": "仅批准这一次工具调用"},
+                {"label": "拒绝", "ds": "拒绝这次工具调用"},
+            ])
+        except AskUnavailable:
+            return PermissionResultDeny(message="远程工具授权未完成")
         if answer == "允许一次":
             return PermissionResultAllow()
         return PermissionResultDeny(message="用户拒绝了远程工具授权")
@@ -8786,22 +8952,52 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "回答交互问题")
-        fut = ctx.pending_asks.get(cmd.ask_id)
-        if fut is None:
-            log.warning("answer for unknown ask_id", ask_id=cmd.ask_id)
+
+        async def reject(code: str, message: str):
             error = Error(
-                code=ERR_NOT_RUNNING,
-                message="该交互问题已经结束或不存在",
+                code=code,
+                message=message,
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
             await self._emit(ctx, error)
             return error
-        if not fut.done():
-            fut.set_result(cmd.answer)
-            log.info("ask_user answered", ask_id=cmd.ask_id)
-        else:
+
+        fut = ctx.pending_asks.get(cmd.ask_id)
+        if fut is None:
+            log.warning("answer for unknown ask_id", ask_id=cmd.ask_id)
+            return await reject(
+                ERR_NOT_RUNNING, "该交互问题已经结束或不存在")
+        if fut.done():
             log.warning("answer for already-done ask_id", ask_id=cmd.ask_id)
+            return await reject(
+                ERR_NOT_RUNNING, "该交互问题已经由其他客户端回答")
+
+        spec = ctx.pending_ask_specs.get(cmd.ask_id)
+        if spec is None:
+            return await reject(ERR_INTERNAL, "交互问题状态不完整，请重新操作")
+        answer = cmd.answer
+        labels = spec["labels"]
+        if isinstance(answer, list):
+            if not spec["multi_select"]:
+                return await reject(ERR_BAD_PROMPT, "该问题不支持多选")
+            if len(set(answer)) != len(answer):
+                return await reject(ERR_BAD_PROMPT, "多选答案不能包含重复选项")
+            normalized: str | list[str] = answer
+            values = answer
+        else:
+            if not answer.strip():
+                return await reject(ERR_BAD_PROMPT, "回答不能为空")
+            normalized = [answer] if spec["multi_select"] else answer
+            values = [answer]
+        if not spec["allow_text"] and any(value not in labels for value in values):
+            return await reject(ERR_BAD_PROMPT, "回答不属于该问题的可选项")
+
+        # No await occurs between the done check and set_result: the event loop
+        # makes this the single atomic winner when multiple clients race.
+        fut.set_result(normalized)
+        log.info("ask_user answered", ask_id=cmd.ask_id)
+        return None
 
     @staticmethod
     def _read_session_file(
@@ -9352,245 +9548,23 @@ class WrapperMachine:
         self, cwd: str, file: str,
         allowed_external_paths: frozenset[str] = frozenset(),
     ) -> str:
-        """Raw `git diff` (vs HEAD) text for a cwd. Empty file => all files; a
-        single untracked file falls back to --no-index (full-add diff)."""
         max_bytes = max(64 * 1024, min(4 * 1024 * 1024,
                                        self.cfg.ws_max_size_bytes // 2))
-        if not file:
-            tracked = await self._bounded_process_output(
-                ("git", "-C", cwd, "diff", "--no-ext-diff", "--no-textconv",
-                 "HEAD"), max_bytes)
-            if "[diff truncated at transport safety limit]" in tracked:
-                return tracked
-
-            # `git diff HEAD` deliberately omits untracked files. Work sessions
-            # commonly create their deliverables from scratch, so append a
-            # bounded no-index diff for each regular, non-ignored new file.
-            root_text = await self._bounded_process_output(
-                ("git", "-C", cwd, "rev-parse", "--show-toplevel"), 4096)
-            root = os.path.realpath(
-                root_text.strip().splitlines()[0] if root_text.strip() else cwd)
-            untracked_text = await self._bounded_process_output(
-                ("git", "-C", root, "ls-files", "-z", "--others",
-                 "--exclude-standard"), min(max_bytes, 512 * 1024))
-            # A bounded path list can end midway through a name. Only consume
-            # NUL-terminated entries so a partial path is never opened.
-            untracked_paths = untracked_text.split("\0")
-            if not untracked_text.endswith("\0"):
-                untracked_paths = untracked_paths[:-1]
-
-            parts = [tracked]
-            used = len(tracked.encode(errors="replace"))
-            source_cap = getattr(
-                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
-            for rel_file in untracked_paths:
-                if not rel_file or used >= max_bytes:
-                    continue
-                candidate = os.path.join(root, rel_file)
-                parent = os.path.realpath(os.path.dirname(candidate))
-                contained = os.path.join(parent, os.path.basename(candidate))
-                try:
-                    if os.path.commonpath((root, contained)) != root:
-                        continue
-                    file_stat = os.lstat(contained)
-                except (OSError, ValueError):
-                    continue
-                if (not stat.S_ISREG(file_stat.st_mode)
-                        or file_stat.st_size > source_cap):
-                    continue
-                separator = "\n" if parts[-1] and not parts[-1].endswith("\n") else ""
-                remaining = max_bytes - used - len(separator.encode())
-                if remaining <= 0:
-                    break
-                addition = await self._bounded_process_output(
-                    ("git", "-C", root, "diff", "--no-ext-diff",
-                     "--no-textconv", "--no-index", "--", "/dev/null",
-                     rel_file),
-                    remaining,
-                )
-                if not addition:
-                    continue
-                if separator:
-                    parts.append(separator)
-                    used += len(separator.encode())
-                parts.append(addition)
-                used += len(addition.encode(errors="replace"))
-                if "[diff truncated at transport safety limit]" in addition:
-                    break
-            return "".join(parts)
-
-        root_text = await self._bounded_process_output(
-            ("git", "-C", cwd, "rev-parse", "--show-toplevel"), 4096)
-        in_repository = bool(root_text.strip())
-        root = os.path.realpath(
-            root_text.strip().splitlines()[0] if in_repository else cwd)
-        candidate = os.path.abspath(
-            os.path.expanduser(file) if os.path.isabs(os.path.expanduser(file))
-            else os.path.join(cwd, os.path.expanduser(file)))
-        # Resolve parent symlinks, but not the final component: a tracked symlink
-        # can be diffed safely by git, while a path through a symlinked directory
-        # must not escape the repository.
-        parent = os.path.realpath(os.path.dirname(candidate))
-        contained = os.path.join(parent, os.path.basename(candidate))
-        try:
-            below_root = os.path.commonpath((root, contained)) == root
-        except ValueError:
-            below_root = False
-        if not below_root:
-            resolved = os.path.realpath(contained)
-            if resolved not in allowed_external_paths:
-                raise ValueError("diff path is outside the session repository")
-            try:
-                file_stat = os.lstat(resolved)
-            except OSError:
-                return ""
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise ValueError("external diff target must be a regular file")
-            source_cap = getattr(
-                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
-            if file_stat.st_size > source_cap:
-                raise ValueError("external diff target exceeds the source size limit")
-            return await self._bounded_process_output(
-                ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
-                 "--no-index", "--", "/dev/null", resolved),
-                max_bytes,
-            )
-        rel_file = os.path.relpath(contained, root)
-
-        # Work uses a private plain directory rather than a Git repository. A
-        # newly generated deliverable still has a meaningful diff: the whole
-        # regular file is an addition from /dev/null. Keep the same containment
-        # and source-size guards as the repository-backed untracked path.
-        if not in_repository:
-            try:
-                file_stat = os.lstat(contained)
-            except OSError:
-                return ""
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise ValueError("diff target outside Git must be a regular file")
-            source_cap = getattr(
-                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
-            if file_stat.st_size > source_cap:
-                raise ValueError("diff target exceeds the source size limit")
-            return await self._bounded_process_output(
-                ("git", "-C", root, "diff", "--no-ext-diff",
-                 "--no-textconv", "--no-index", "--", "/dev/null",
-                 rel_file),
-                max_bytes,
-            )
-
-        diff = await self._bounded_process_output(
-            ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
-             "HEAD", "--", rel_file), max_bytes)
-        if diff.strip():
-            return diff
-
-        # An empty tracked-file diff means "unchanged", not "show its complete
-        # contents". Reject untracked special files even when `git ls-files
-        # --others` omits them; an explicit FIFO/device must never be opened by a
-        # later no-index diff.
-        try:
-            file_stat = os.lstat(contained)
-        except OSError:
-            return ""
-        if not stat.S_ISREG(file_stat.st_mode):
-            tracked = await self._bounded_process_output(
-                ("git", "-C", root, "ls-files", "--stage", "--", rel_file),
-                64 * 1024,
-            )
-            if tracked:
-                return ""  # unchanged tracked symlink
-            raise ValueError("untracked diff target must be a regular file")
-        # Only an actual, non-ignored untracked regular file gets no-index.
-        untracked = await self._bounded_process_output(
-            ("git", "-C", root, "ls-files", "--others", "--exclude-standard",
-             "--", rel_file), 64 * 1024)
-        if not untracked:
-            return ""
-        source_cap = getattr(self.cfg, "history_source_max_bytes", 64 * 1024 * 1024)
-        if file_stat.st_size > source_cap:
-            raise ValueError("untracked diff target exceeds the source size limit")
-        return await self._bounded_process_output(
-            ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
-             "--no-index", "--", "/dev/null", rel_file),
-            max_bytes,
+        return await read_git_diff(
+            cwd,
+            file,
+            allowed_external_paths=allowed_external_paths,
+            max_bytes=max_bytes,
+            source_max_bytes=getattr(
+                self.cfg, "history_source_max_bytes", 64 * 1024 * 1024),
+            run_command=self._bounded_process_output,
         )
 
     @staticmethod
     async def _bounded_process_output(
         argv: tuple[str, ...], max_bytes: int, timeout: float = 10.0,
     ) -> str:
-        """Capture stdout up to a hard byte limit without buffering stderr."""
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        assert proc.stdout is not None
-        chunks: list[bytes] = []
-        total = 0
-        truncated = False
-
-        async def read_stdout() -> None:
-            nonlocal total, truncated
-            while True:
-                chunk = await proc.stdout.read(min(64 * 1024, max_bytes - total + 1))
-                if not chunk:
-                    break
-                remaining = max_bytes - total
-                if len(chunk) > remaining:
-                    if remaining > 0:
-                        chunks.append(chunk[:remaining])
-                    truncated = True
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-
-        async def discard_stdout_and_wait() -> None:
-            """Reap without asking communicate() to accumulate residual stdout."""
-            async def discard_stdout() -> None:
-                while await proc.stdout.read(64 * 1024):
-                    pass
-
-            await asyncio.gather(proc.wait(), discard_stdout())
-
-        timed_out = False
-
-        def stop_group(sig: signal.Signals) -> None:
-            try:
-                os.killpg(proc.pid, sig)
-            except ProcessLookupError:
-                pass
-
-        reaped = False
-        try:
-            try:
-                await asyncio.wait_for(read_stdout(), timeout=timeout)
-            except asyncio.TimeoutError:
-                timed_out = True
-            if timed_out:
-                stop_group(signal.SIGKILL)
-            elif truncated:
-                stop_group(signal.SIGTERM)
-            try:
-                # Discard residual bytes incrementally. communicate() would collect
-                # them all and defeat the hard output cap while SIGTERM is draining.
-                await asyncio.wait_for(discard_stdout_and_wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                stop_group(signal.SIGKILL)
-                await discard_stdout_and_wait()
-            reaped = True
-        finally:
-            if not reaped:
-                stop_group(signal.SIGKILL)
-                await discard_stdout_and_wait()
-        if timed_out:
-            raise asyncio.TimeoutError("diff command exceeded its time limit")
-        text = b"".join(chunks).decode(errors="replace")
-        if truncated:
-            text += "\n\n[diff truncated at transport safety limit]\n"
-        return text
+        return await bounded_process_output(argv, max_bytes, timeout)
 
     # ---- sessions (list / switch / new) ----
 

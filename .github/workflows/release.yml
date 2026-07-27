@@ -10,8 +10,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  source:
+    name: Verify source
+    uses: ./.github/workflows/ci.yml
+
   verify:
-    name: Verify source release
+    name: Verify release tag
+    needs: source
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -22,15 +27,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-        with:
-          version: "0.11.16"
       - name: Verify tag and product versions
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -53,42 +49,6 @@ jobs:
           if lock["version"] != __version__:
               raise SystemExit("web/package-lock.json version does not match backend")
           PY
-      - name: Install Python test dependencies
-        run: |
-          uv venv --python 3.13 .venv
-          uv pip sync \
-            --python .venv/bin/python \
-            --require-hashes --only-binary=:all: --no-binary=http-ece \
-            requirements.lock
-          uv pip install --python .venv/bin/python -r requirements-dev.txt
-      - name: Materialize Web client for release tests
-        run: |
-          npm --prefix web ci
-          npm --prefix web exec -- playwright install --with-deps chromium webkit
-          npm --prefix web run build
-      - name: Python tests and lint
-        run: |
-          .venv/bin/python -m pytest
-          uvx --from ruff==0.15.13 ruff check cc_remote tests deploy
-      - name: Web tests and lint
-        run: |
-          npm --prefix web run test:reliability
-          npm --prefix web run test:history-browser
-          npm --prefix web run lint
-      - name: Release script syntax
-        run: |
-          bash -n \
-            deploy/install.sh \
-            deploy/install-relay.sh \
-            deploy/install-wrapper.sh \
-            deploy/setup-vps.sh
-          shellcheck -x \
-            deploy/install.sh \
-            deploy/install-relay.sh \
-            deploy/install-wrapper.sh \
-            deploy/setup-vps.sh \
-            deploy/setup_transaction.sh
-          git diff --check
 
   build:
     name: Build ${{ matrix.role }} ${{ matrix.os }}/${{ matrix.arch }}

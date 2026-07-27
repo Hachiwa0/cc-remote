@@ -20,6 +20,7 @@ from cc_remote.protocol import (
 )
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
+from cc_remote.wrapper import codex_runtime as codex_runtime_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_handle import (
@@ -1830,16 +1831,17 @@ def test_codex_catalog_normalization_is_structurally_bounded(monkeypatch):
 
 def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
         monkeypatch):
-    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE", None)
-    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE_INVENTORY", None)
+    monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE", None)
+    monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE_INVENTORY", None)
     monkeypatch.delenv("CODEX_BIN", raising=False)
     monkeypatch.setattr(
-        codex_handle_module, "_codex_candidates", lambda: ["old", "new", "broken"])
+        codex_runtime_module, "codex_candidates",
+        lambda: ["old", "new", "broken"])
     versions = {"old": (0, 140, 0), "new": (0, 144, 1), "broken": (-1,)}
     monkeypatch.setattr(
-        codex_handle_module, "_codex_version", lambda path: versions[path])
+        codex_runtime_module, "codex_version", lambda path: versions[path])
 
-    assert codex_handle_module._resolve_codex_bin() == "new"
+    assert codex_runtime_module.resolve_codex_bin() == "new"
 
 
 def test_oversized_resume_prefers_only_a_newer_official_desktop_core(
@@ -1946,11 +1948,11 @@ def test_codex_binary_resolution_reprobes_after_symlink_upgrade(
     current = tmp_path / "codex"
     current.symlink_to(old)
 
-    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE", None)
-    monkeypatch.setattr(codex_handle_module, "_BIN_CACHE_INVENTORY", None)
+    monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE", None)
+    monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE_INVENTORY", None)
     monkeypatch.delenv("CODEX_BIN", raising=False)
     monkeypatch.setattr(
-        codex_handle_module, "_codex_candidates", lambda: [str(current)])
+        codex_runtime_module, "codex_candidates", lambda: [str(current)])
     probed = []
 
     def version(path):
@@ -1958,15 +1960,15 @@ def test_codex_binary_resolution_reprobes_after_symlink_upgrade(
         return ((0, 144, 4) if os.path.realpath(path) == str(new)
                 else (0, 144, 1))
 
-    monkeypatch.setattr(codex_handle_module, "_codex_version", version)
-    assert codex_handle_module._resolve_codex_bin() == str(current)
+    monkeypatch.setattr(codex_runtime_module, "codex_version", version)
+    assert codex_runtime_module.resolve_codex_bin() == str(current)
     assert probed == [str(old)]
-    assert codex_handle_module._resolve_codex_bin() == str(current)
+    assert codex_runtime_module.resolve_codex_bin() == str(current)
     assert probed == [str(old)]
 
     current.unlink()
     current.symlink_to(new)
-    assert codex_handle_module._resolve_codex_bin() == str(current)
+    assert codex_runtime_module.resolve_codex_bin() == str(current)
     assert probed == [str(old), str(new)]
 
 
@@ -2942,6 +2944,105 @@ def test_machine_claude_tool_permission_allows_or_denies_once():
         assert isinstance(denied, PermissionResultDeny)
         assert [o["label"] for o in captured[0][1]] == ["允许一次", "拒绝"]
         assert "Bash" in captured[0][0] and "git status" in captured[0][0]
+
+    asyncio.run(run())
+
+
+def test_machine_claude_ask_user_question_preserves_input_and_collects_answers():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-question", "claude-question")
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Which target?",
+                    "header": "Target",
+                    "options": [
+                        {"label": "Mac", "description": "Local wrapper"},
+                        {"label": "Linux", "description": "Remote wrapper"},
+                    ],
+                    "multiSelect": False,
+                },
+                {
+                    "question": "Which checks?",
+                    "header": "Checks",
+                    "options": [
+                        {"label": "Tests", "description": "Run tests"},
+                        {"label": "Lint", "description": "Run lint"},
+                    ],
+                    "multiSelect": True,
+                },
+            ],
+            "preview": "preserve-this-unknown-sdk-field",
+        }
+        task = asyncio.create_task(machine._on_claude_tool_permission(
+            ctx, "AskUserQuestion", tool_input, SimpleNamespace(suggestions=[])))
+
+        while not ctx.pending_asks:
+            await asyncio.sleep(0)
+        first_id = next(iter(ctx.pending_asks))
+        first_event = next(
+            message for message in transport.sent
+            if message.type == "ask_user" and message.ask_id == first_id)
+        assert first_event.header == "Target"
+        assert first_event.multi_select is False
+        assert [option["label"] for option in first_event.options] == ["Mac", "Linux"]
+        ctx.pending_asks[first_id].set_result("Mac")
+
+        while not ctx.pending_asks or first_id in ctx.pending_asks:
+            await asyncio.sleep(0)
+        second_id = next(iter(ctx.pending_asks))
+        second_event = next(
+            message for message in transport.sent
+            if message.type == "ask_user" and message.ask_id == second_id)
+        assert second_event.header == "Checks"
+        assert second_event.multi_select is True
+        ctx.pending_asks[second_id].set_result(["Tests", "Lint"])
+
+        result = await task
+        assert isinstance(result, PermissionResultAllow)
+        assert result.updated_input == {
+            **tool_input,
+            "answers": {
+                "Which target?": "Mac",
+                "Which checks?": ["Tests", "Lint"],
+            },
+        }
+        assert not any(
+            message.type == "ask_user"
+            and [option["label"] for option in message.options] == ["允许一次", "拒绝"]
+            for message in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_machine_duplicate_answer_returns_correlated_error_to_second_client():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-question", "claude-question")
+        machine.sessions[ctx.key] = ctx
+        task = asyncio.create_task(machine._on_ask(
+            ctx, "Choose", [{"label": "A"}, {"label": "B"}],
+        ))
+        while not ctx.pending_asks:
+            await asyncio.sleep(0)
+        ask_id = next(iter(ctx.pending_asks))
+        first = SimpleNamespace(
+            sid=ctx.key, ask_id=ask_id, answer="A",
+            cmd_id="cmd-first", client_id="client-first",
+        )
+        second = SimpleNamespace(
+            sid=ctx.key, ask_id=ask_id, answer="B",
+            cmd_id="cmd-second", client_id="client-second",
+        )
+        assert await machine._handle_answer_question(first) is None
+        duplicate = await machine._handle_answer_question(second)
+        assert duplicate.type == "error"
+        assert duplicate.request_id == "cmd-second"
+        assert duplicate.to == "client-second"
+        assert await task == "A"
+        assert any(message.type == "ask_user_closed" for message in transport.sent)
 
     asyncio.run(run())
 

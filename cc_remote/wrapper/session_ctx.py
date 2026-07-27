@@ -142,6 +142,12 @@ class SessionContext:
     # record; it never owns or kills that process on an ordinary disconnect.
     claude_broker_generation: Optional[str] = None
     pending_asks: dict = field(default_factory=dict)
+    # Semantic metadata stays separate from the Future map so every answer can
+    # be validated against the exact prompt that created it.
+    pending_ask_specs: dict = field(default_factory=dict)
+    # The browser presents one question card per session. Serialize whole
+    # batches so concurrent tools/subagents cannot overwrite that card.
+    ask_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # A Remote model chip can trigger Claude TUI's cached-history confirmation.
     # Track its question separately so a newer model choice can supersede the
     # old one without leaving an unreachable Future behind.

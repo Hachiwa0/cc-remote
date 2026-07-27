@@ -9,14 +9,24 @@ interface Props {
   options: AskOption[];
   allowText?: boolean;
   secret?: boolean;
-  onAnswer: (answer: string) => void;
+  multiSelect?: boolean;
+  onAnswer: (answer: string | string[]) => void;
 }
 
-export function QuestionSheet({ question, header, options, allowText, secret, onAnswer }: Props) {
+export function QuestionSheet({
+  question, header, options, allowText, secret, multiSelect, onAnswer,
+}: Props) {
   const [text, setText] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
   const imeSubmit = useImeSubmit<HTMLInputElement>((value) => {
-    if (value.trim()) onAnswer(value);
+    if (!value.trim()) return;
+    onAnswer(multiSelect ? [...selected, value] : value);
   });
+  const toggle = (label: string) => {
+    setSelected((current) => current.includes(label)
+      ? current.filter((value) => value !== label)
+      : [...current, label]);
+  };
   return (
     <>
       <div className="scrim show" />
@@ -30,11 +40,18 @@ export function QuestionSheet({ question, header, options, allowText, secret, on
           <div className="qa-question">{question}</div>
           <div className="qa-options">
             {options.map((o, i) => (
-              <button key={i} className="qa-opt" onClick={() => onAnswer(o.label)}>
+              <button key={i}
+                className={`qa-opt${selected.includes(o.label) ? " selected" : ""}`}
+                aria-pressed={multiSelect ? selected.includes(o.label) : undefined}
+                onClick={() => multiSelect ? toggle(o.label) : onAnswer(o.label)}>
                 <span className="qa-opt-label">{o.label}</span>
                 {o.ds && <span className="qa-opt-ds">{o.ds}</span>}
               </button>
             ))}
+            {multiSelect && (
+              <button className="qa-multi-submit" disabled={selected.length === 0}
+                onClick={() => onAnswer(selected)}>确定</button>
+            )}
           </div>
           {allowText && <div className="qa-text-answer">
             <input ref={imeSubmit.inputRef} type={secret ? "password" : "text"} value={text}

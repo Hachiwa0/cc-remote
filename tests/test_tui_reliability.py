@@ -433,9 +433,35 @@ def test_tui_keeps_and_answers_ask_user_per_session():
         assert answers[0]["answer"] == "B2"
         assert "A" in tui.pending_asks and "B" not in tui.pending_asks
 
-        # A terminal event clears only the matching background session's ask.
         tui._handle({
-            "type": "turn_end", "sid": "A", "seq": 2,
+            "type": "ask_user", "sid": "B", "seq": 2,
+            "ask_id": "ask-b-multi", "question": "Question B multi?",
+            "options": [{"label": "B1"}, {"label": "B2"}],
+            "multi_select": True,
+        })
+        await tui._answer_ask([1, 2])
+        multi = [
+            json.loads(raw) for raw in ws.frames
+            if json.loads(raw).get("ask_id") == "ask-b-multi"
+        ]
+        assert multi[-1]["answer"] == ["B1", "B2"]
+
+        # A replayable close clears only its exact ask, not a newer prompt.
+        tui._handle({
+            "type": "ask_user_closed", "sid": "A", "seq": 2,
+            "ask_id": "older-a", "reason": "superseded",
+        })
+        assert "A" in tui.pending_asks
+        tui._handle({
+            "type": "ask_user_closed", "sid": "A", "seq": 3,
+            "ask_id": "ask-a", "reason": "answered",
+        })
+        assert tui.pending_asks == {}
+
+        # A terminal event remains a fail-safe for legacy peers.
+        tui.pending_asks["A"] = {"sid": "A", "ask_id": "legacy"}
+        tui._handle({
+            "type": "turn_end", "sid": "A", "seq": 4,
             "result": {"subtype": "success", "duration_ms": 1,
                        "is_error": False},
         })

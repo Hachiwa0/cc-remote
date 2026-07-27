@@ -1,6 +1,24 @@
 import type { History } from "./protocol";
-import type { SessionRuntime, Turn } from "./reducer";
+import type { Turn } from "./domain/conversation";
 import type { HistoryBrowseProjection } from "./history-browse";
+
+/**
+ * History recovery only needs this projection of a session runtime. Keeping
+ * the feature boundary structural avoids making the history layer depend on
+ * the root reducer that consumes it.
+ */
+export interface HistoryRuntimeState {
+  turns: Turn[];
+  hasMore?: boolean;
+  oldestId?: string | null;
+  historyInvalidated: boolean;
+  historyRevision: string | null;
+  historyGeneration: string | null;
+  historyBuildSeq: number;
+  pendingHistoryRevision: string | null;
+  pendingHistoryGeneration: string | null;
+  pendingHistoryCandidateBuildSeq: number | null;
+}
 
 /**
  * The last painted history while a truncated/rebuild replay or sampled
@@ -34,7 +52,7 @@ export function isHistoryRecoveryPending(
 export function beginHistoryRecovery(
   current: HistoryRecoveryProjection | null,
   sid: string,
-  runtime: SessionRuntime,
+  runtime: HistoryRuntimeState,
   generation?: string | null,
   candidateBuildSeq: number | null = null,
 ): HistoryRecoveryProjection {
@@ -117,7 +135,7 @@ export function advanceHistoryRecovery(
 }
 
 type RuntimeHistoryRecoveryState = Pick<
-  SessionRuntime,
+  HistoryRuntimeState,
   "historyInvalidated" | "historyRevision" | "historyGeneration"
     | "historyBuildSeq" | "pendingHistoryRevision"
     | "pendingHistoryGeneration" | "pendingHistoryCandidateBuildSeq"
@@ -212,7 +230,7 @@ export interface DisplayHistoryProjection {
 export function displayHistoryProjection(
   recovery: HistoryRecoveryProjection | null | undefined,
   sid: string | null,
-  runtime: SessionRuntime,
+  runtime: HistoryRuntimeState,
   browse?: HistoryBrowseProjection | null,
 ): DisplayHistoryProjection {
   if (sid && isHistoryRecoveryPending(recovery, sid)) {

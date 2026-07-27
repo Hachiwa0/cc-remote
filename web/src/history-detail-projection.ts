@@ -1,5 +1,15 @@
 import type { ServerEvent } from "./protocol";
-import type { Block, ProcessBlock, Turn } from "./reducer";
+import type {
+  Block,
+  ProcessBlock,
+  Turn,
+  TurnDetailProjection,
+  TurnDetailSegment,
+} from "./domain/conversation";
+export type {
+  TurnDetailProjection,
+  TurnDetailSegment,
+} from "./domain/conversation";
 
 export const MAX_DETAIL_PROJECTION_ITEMS = 4_000;
 export const MAX_DETAIL_PROJECTION_CHARS = 32 * 1024 * 1024;
@@ -7,35 +17,6 @@ export const DETAIL_PROJECTION_CAP_ITEM_ID =
   "__cc_remote_detail_projection_capped__";
 
 const LATEST_DETAIL_PAGE_KEY = "__cc_remote_detail_latest__";
-
-export interface TurnDetailSegment {
-  /** Request cursor. `LATEST_DETAIL_PAGE_KEY` represents `before=null`. */
-  pageKey: string;
-  before: string | null;
-  events: ServerEvent[];
-  hasMore: boolean;
-  oldestCursor: string | null;
-  hasNewer: boolean;
-  newerCursor: string | null;
-  encodedChars: number;
-}
-
-/** Heavyweight, revision-bound detail lives beside the bounded summary blocks.
- *
- * Segments retain source events so a tool start in one page and its result in
- * the next page can be projected together. `blocks` contains only process,
- * tool, thinking and commentary items; the canonical final answer remains in
- * `Turn.blocks` and is rendered once by ChatView.
- */
-export interface TurnDetailProjection {
-  segments: TurnDetailSegment[];
-  blocks: Block[];
-  capped: boolean;
-  hasMore: boolean;
-  oldestCursor: string | null;
-  hasNewer: boolean;
-  newerCursor: string | null;
-}
 
 export interface TurnDetailProjectionPage {
   before?: string | null;

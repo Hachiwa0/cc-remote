@@ -21,19 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import glob
 import hashlib
 import hmac
 import json
 import os
 import re
 import signal
-import shutil
-import subprocess
-from urllib.parse import urlsplit
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
-from itertools import islice
 from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote import __version__
@@ -58,7 +52,11 @@ from cc_remote.wrapper.codex_provider_repair import (
     canonical_thread_provider_is_restored,
     repair_http_provider_records,
 )
-from cc_remote.wrapper.child_env import sanitized_child_env
+from cc_remote.wrapper.codex_runtime import (
+    codex_env as _runtime_codex_env,
+    codex_version as _runtime_codex_version,
+    resolve_codex_bin as _runtime_resolve_codex_bin,
+)
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
@@ -69,12 +67,6 @@ log = logger("cc_remote.wrapper.codex_handle")
 _REQ_TIMEOUT = 60.0
 _APPROVAL_TIMEOUT = 5 * 60.0
 _MAX_SERVER_REQUEST_TASKS = 32
-_BIN_CACHE: Optional[str] = None
-_MAX_CODEX_CANDIDATES = 16
-_MAX_STANDALONE_CANDIDATES = 6
-_MAX_NVM_CANDIDATES = 3
-_CODEX_VERSION_TIMEOUT = 5
-_BIN_CACHE_INVENTORY: Optional[tuple[tuple[object, ...], ...]] = None
 _THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
@@ -696,47 +688,9 @@ def _is_turn_queue_notification(method: Any) -> bool:
     )
 
 
-def _codex_candidates() -> list[str]:
-    """Every codex install we can find, in tie-break order (earlier wins ties).
-    Managed standalone releases first: `codex upgrade` writes there, so it's the
-    one the user actually updates. An npm-global under nvm is often stale but
-    shadows everything else on PATH."""
-    home = os.path.expanduser("~")
-    out = list(islice(glob.iglob(
-        os.path.join(home, ".codex/packages/standalone/releases/*/bin/codex")),
-        _MAX_STANDALONE_CANDIDATES))
-    out.append(os.path.join(home, ".local/bin/codex"))
-    which = shutil.which("codex")
-    if which:
-        out.append(which)
-    out += list(islice(glob.iglob(
-        os.path.join(home, ".nvm/versions/node/*/bin/codex")),
-        _MAX_NVM_CANDIDATES))
-    out += ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/usr/bin/codex"]
-    seen, uniq = set(), []
-    for c in out:
-        if not os.path.exists(c):
-            continue
-        real = os.path.realpath(c)
-        if real in seen:
-            continue
-        seen.add(real)
-        uniq.append(c)
-        if len(uniq) >= _MAX_CODEX_CANDIDATES:
-            break
-    return uniq
-
-
 def _codex_version(path: str) -> tuple[int, ...]:
-    """`codex --version` -> (0, 144, 1). (-1,) when it can't be run/parsed, so a
-    broken install always loses to a working one."""
-    try:
-        r = subprocess.run([path, "--version"], capture_output=True, text=True,
-                           timeout=_CODEX_VERSION_TIMEOUT, env=_codex_env(path))
-    except Exception:
-        return (-1,)
-    m = re.search(r"(\d+)\.(\d+)\.(\d+)", (r.stdout or "") + (r.stderr or ""))
-    return tuple(int(g) for g in m.groups()) if m else (-1,)
+    """Compatibility seam for private-core selection and existing tests."""
+    return _runtime_codex_version(path)
 
 
 def _newer_private_core_for_oversized_resume(
@@ -862,101 +816,14 @@ def _supports_lightweight_resume(value: Optional[str]) -> bool:
     return _semantic_version(value) >= _LIGHTWEIGHT_RESUME_MIN_VERSION
 
 
-def _codex_inventory(candidates: list[str]) -> tuple[tuple[object, ...], ...]:
-    """Fingerprint candidate identities so CLI upgrades invalidate the cache.
-
-    ``codex upgrade`` can add a standalone release or retarget a stable symlink
-    while the wrapper remains alive.  Existing app-server processes keep their
-    executable; only the next process spawn re-resolves against this inventory.
-    """
-    inventory: list[tuple[object, ...]] = []
-    for path in candidates:
-        real = os.path.realpath(path)
-        try:
-            stat = os.stat(path)
-            identity: tuple[object, ...] = (
-                path, real, stat.st_dev, stat.st_ino,
-                stat.st_size, stat.st_mtime_ns,
-            )
-        except OSError:
-            # A concurrent upgrade may replace a symlink between discovery and
-            # stat.  The missing marker forces a fresh probe on the next call.
-            identity = (path, real, None, None, None, None)
-        inventory.append(identity)
-    return tuple(inventory)
-
-
 def _resolve_codex_bin() -> str:
-    """Locate the codex CLI, preferring the NEWEST install.
-
-    $CODEX_BIN short-circuits. Otherwise we version-probe every candidate and take
-    the highest — plain PATH order is wrong: a stale npm-global (nvm bin sits first
-    on the wrapper's PATH) shadowed a newer standalone release, so the wrapper kept
-    spawning an old app-server whose `model/list` predated the current model family.
-    The app-server IS our model catalog, so serving a stale one silently corrupts
-    every model/effort decision downstream. Blocking (subprocess); cached for the
-    process — call via asyncio.to_thread from async code."""
-    global _BIN_CACHE, _BIN_CACHE_INVENTORY
-    override = os.environ.get("CODEX_BIN")
-    if override:
-        return override
-    cands = _codex_candidates()
-    inventory = _codex_inventory(cands)
-    if _BIN_CACHE and inventory == _BIN_CACHE_INVENTORY:
-        return _BIN_CACHE
-    if not cands:
-        _BIN_CACHE = None
-        _BIN_CACHE_INVENTORY = inventory
-        return "codex"  # last resort — errors clearly if truly absent
-    # A broken candidate must not stall startup serially.  Keep both the list and
-    # the worker pool small; each individual probe also has a hard timeout.
-    with ThreadPoolExecutor(max_workers=min(4, len(cands))) as pool:
-        probed = list(pool.map(_codex_version, cands))
-    versions = list(zip(probed, cands))
-    best_v, best = max(versions, key=lambda p: p[0])
-    if best_v == (-1,):
-        best = cands[0]
-    _BIN_CACHE = best
-    _BIN_CACHE_INVENTORY = inventory
-    log.info("codex bin resolved", path=best, version=".".join(map(str, best_v)),
-             considered=[{"path": c, "version": ".".join(map(str, v))} for v, c in versions])
-    return best
+    """Compatibility seam for resident handle call sites."""
+    return _runtime_resolve_codex_bin()
 
 
-def _codex_env(bin_path: str) -> dict:
-    """Child env for the codex subprocess. codex.js runs via `#!/usr/bin/env
-    node`, so the child needs `node` on PATH. When codex was resolved from a
-    dir that also ships node (nvm / npm-global bin), prepend that dir so the
-    shebang resolves even if the wrapper's own PATH lacks it."""
-    env = sanitized_child_env()
-    proxy = os.environ.get("CC_REMOTE_CODEX_PROXY", "").strip()
-    if proxy:
-        # Keep the proxy scoped to wrapper-owned Codex processes.  In
-        # particular, never export it in the parent or change the user's
-        # ordinary `codex` terminal.  Local daemon/proxy sockets must bypass it.
-        scheme = urlsplit(proxy).scheme.lower()
-        if scheme in {"http", "https"}:
-            env.update({
-                "HTTP_PROXY": proxy,
-                "HTTPS_PROXY": proxy,
-                "http_proxy": proxy,
-                "https_proxy": proxy,
-            })
-        elif scheme in {"socks5", "socks5h"}:
-            env.update({"ALL_PROXY": proxy, "all_proxy": proxy})
-        bypass = [
-            value.strip()
-            for value in (env.get("NO_PROXY") or env.get("no_proxy") or "").split(",")
-            if value.strip()
-        ]
-        for local in ("127.0.0.1", "localhost", "::1"):
-            if local not in bypass:
-                bypass.append(local)
-        env["NO_PROXY"] = env["no_proxy"] = ",".join(bypass)
-    bindir = os.path.dirname(os.path.abspath(bin_path)) if os.sep in bin_path else ""
-    if bindir and os.path.exists(os.path.join(bindir, "node")):
-        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
-    return env
+def _codex_env(bin_path: str) -> dict[str, str]:
+    """Compatibility seam for wrapper-owned Codex child environments."""
+    return _runtime_codex_env(bin_path)
 
 
 def _codex_runtime_tmp() -> str:

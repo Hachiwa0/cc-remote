@@ -57,11 +57,11 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   template. The runtime reads the current user's mode-0600 device JSON instead
   of embedding control credentials in the plist.
 
-Protocol v21 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v22 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v21 relay/web release; then start the v21 wrapper.
+activate the v22 relay/web release; then start the v22 wrapper.
 
 ## Native terminal coordination
 

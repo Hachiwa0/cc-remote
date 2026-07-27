@@ -19,6 +19,10 @@ import {
 } from "../src/runtime-drain.ts";
 import { mergeInitialHistory } from "../src/history-merge.ts";
 import {
+  HISTORY_INITIAL_PAGE,
+  HISTORY_MORE_PAGE,
+} from "../src/history-summary.ts";
+import {
   displayHistoryProjection,
   historyConfirmsRecovery,
   historyConfirmsRuntimeRecovery,
@@ -477,9 +481,9 @@ assert.ok(reconnectBannerSource.includes('busy && <span className="sp"'),
 
 const historyAppSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 const cacheSource = readFileSync(resolve(process.cwd(), "src/cache.ts"), "utf8");
-assert.match(historyAppSource, /HISTORY_INITIAL_PAGE\s*=\s*4/,
+assert.equal(HISTORY_INITIAL_PAGE, 4,
   "the newest history page must stay small enough for an immediate first paint");
-assert.match(historyAppSource, /HISTORY_MORE_PAGE\s*=\s*12/,
+assert.equal(HISTORY_MORE_PAGE, 12,
   "older history must be delivered in bounded follow-up pages");
 const historyBeforeResume = historyAppSource.match(
   /requestHistory\([\s\S]{0,160}?HISTORY_INITIAL_PAGE\);\s*(?:ws\.|wsRef\.current(?:\?\.|\.))sendSwitchSession/g,
@@ -1319,7 +1323,7 @@ try {
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 21, ts: 10, ...body,
+    v: 22, ts: 10, ...body,
   } as ServerEvent);
   assert.equal(createRuntime().sendMode, "steer",
     "Codex running input uses steer mode by default");
@@ -1340,6 +1344,42 @@ try {
   assert.equal(isolatedSendModes.runtimes[sendModeA].sendMode, "queue");
   assert.equal(isolatedSendModes.runtimes[sendModeB].sendMode, "steer",
     "busy-send selection must not leak between sessions");
+  const questionA = "question-session-a";
+  const questionB = "question-session-b";
+  let questionState = {
+    ...initialState,
+    focusedSid: questionA,
+    runtimes: {
+      [questionA]: createRuntime(),
+      [questionB]: createRuntime(),
+    },
+  };
+  questionState = reduce(questionState, { type: "event", event: event({
+    type: "ask_user", sid: questionA, ask_id: "ask-a",
+    question: "A?", options: [{ label: "Yes" }, { label: "No" }],
+  }) });
+  questionState = { ...questionState, focusedSid: questionB };
+  questionState = reduce(questionState, {
+    type: "answer_question", sid: questionA, ask_id: "ask-a",
+  });
+  assert.equal(questionState.runtimes[questionA].pendingQuestion, null,
+    "answering after navigation must clear the originating session");
+  assert.equal(questionState.runtimes[questionB].pendingQuestion, null);
+  questionState = reduce(questionState, { type: "event", event: event({
+    type: "ask_user", sid: questionA, ask_id: "ask-new",
+    question: "New?", options: [{ label: "Yes" }, { label: "No" }],
+  }) });
+  questionState = reduce(questionState, { type: "event", event: event({
+    type: "ask_user_closed", sid: questionA, ask_id: "ask-old",
+    reason: "superseded",
+  }) });
+  assert.equal(questionState.runtimes[questionA].pendingQuestion?.ask_id, "ask-new",
+    "a delayed close for an older prompt must not close the current prompt");
+  questionState = reduce(questionState, { type: "event", event: event({
+    type: "ask_user_closed", sid: questionA, ask_id: "ask-new",
+    reason: "answered",
+  }) });
+  assert.equal(questionState.runtimes[questionA].pendingQuestion, null);
   const problemSid = "safe-problem-presentation";
   let problemState = reduce({
     ...initialState, focusedSid: problemSid,

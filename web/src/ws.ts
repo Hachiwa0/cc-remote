@@ -753,8 +753,13 @@ export class RelayWs {
     return this.send(frame);
   }
 
-  sendAnswerQuestion(askId: string, answer: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "answer_question", ask_id: askId, answer, ts: nowTs(), ...this.sidObj() });
+  sendAnswerQuestion(
+    sid: string, askId: string, answer: string | string[],
+  ): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "answer_question",
+      ask_id: askId, answer, sid, ts: nowTs(),
+    });
   }
 
   sendGetGoal(): void {

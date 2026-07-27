@@ -67,6 +67,9 @@ _CLAUDE_RUNTIME_ENV_KEYS = frozenset({
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
+    # Subscription-backed non-interactive Claude Code sessions may pin their
+    # current OAuth credential in settings.json instead of the OS keychain.
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",

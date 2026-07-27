@@ -12,9 +12,9 @@
 import type { ConnState, EventOwnership } from "./ws";
 import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
-  QueryImg, QueryFile, DirEntry, AssistantChannel, ToolCategory, ProcessKind,
-  ProcessStatus, PlanEntry, CollaborationModeName, Notice, RateLimitUpdate,
-  StatusRateLimit, StatusRateWindow, SessionControl, ConversationImageRef,
+  QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
+  CollaborationModeName, Notice, RateLimitUpdate,
+  StatusRateLimit, StatusRateWindow, SessionControl,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -31,7 +31,6 @@ import {
 } from "./history-merge";
 import {
   installTurnDetailProjectionPage,
-  type TurnDetailProjection,
 } from "./history-detail-projection";
 import {
   advanceHistoryRecovery,
@@ -67,66 +66,22 @@ import {
   queryAcceptanceDescriptor,
   type QueryAcceptanceHistoryHead,
 } from "./outbox";
-
-export interface TextBlock {
-  kind: "text";
-  message_id: string;
-  text: string;
-  done: boolean;
-  channel?: AssistantChannel;
-}
-export interface ToolBlock {
-  kind: "tool";
-  message_id: string;
-  tool_use_id: string;
-  tool: string;
-  input: Record<string, unknown>;
-  category?: ToolCategory;
-  title?: string | null;
-  parent_id?: string | null;
-  server?: string | null;
-  progress?: string;
-  output?: string;
-  diff?: string;
-  result?: {
-    content: string;
-    is_error: boolean;
-    truncated?: boolean | null;
-    status?: ProcessStatus | null;
-    summary?: string | null;
-    diff?: string | null;
-    exit_code?: number | null;
-    duration_ms?: number | null;
-  };
-  done: boolean;
-}
-export interface ProcessBlock {
-  kind: "process";
-  item_id: string;
-  processKind: ProcessKind;
-  phase: "start" | "update" | "end" | "snapshot";
-  status: ProcessStatus;
-  turn_id?: string | null;
-  parent_id?: string | null;
-  title: string;
-  summary?: string | null;
-  detail?: string | null;
-  input?: Record<string, unknown> | null;
-  output?: string | null;
-  diff?: string | null;
-  progress?: string | null;
-  server?: string | null;
-  tool?: string | null;
-  command?: string | null;
-  cwd?: string | null;
-  exit_code?: number | null;
-  duration_ms?: number | null;
-  truncated?: boolean | null;
-  explanation?: string | null;
-  plan?: PlanEntry[];
-  done: boolean;
-}
-export type Block = TextBlock | ToolBlock | ProcessBlock;
+import type {
+  Block,
+  ProcessBlock,
+  TextBlock,
+  ToolBlock,
+  Turn,
+} from "./domain/conversation";
+export type {
+  Block,
+  ProcessBlock,
+  TextBlock,
+  ToolBlock,
+  Turn,
+  TurnDetailProjection,
+  TurnDetailSegment,
+} from "./domain/conversation";
 
 /** A single running goal can emit an effectively unbounded number of distinct
  * app-server/SDK items.  Payload fields have their own byte limits, but without
@@ -139,54 +94,6 @@ export const OMITTED_PROCESS_ITEM_ID = "__cc_remote_earlier_process_omitted__";
 // simultaneous startup/config/security warnings available without allowing a
 // noisy app-server to grow every resident session indefinitely.
 export const MAX_SESSION_NOTICES = 8;
-
-export interface Turn {
-  id: string;
-  /** Codex turn/steer's browser id persisted beside a distinct history cursor. */
-  clientMsgId?: string;
-  // A just-sent browser turn keeps its optimistic id so live deltas do not
-  // remount. Canonical history images are addressed by the transcript's native
-  // user id, which can differ until the next cold history rebuild.
-  historyTurnId?: string;
-  // Engine-specific authoritative branch point: a Codex app-server turn id or
-  // a Claude transcript assistant UUID. The wire keeps the legacy `turn_id`
-  // name so already-deployed protocol-v5 peers remain compatible.
-  forkPointId?: string;
-  // Claude's authoritative top-level user transcript UUID. File rewind and
-  // conversation rewind target this id, never the optimistic browser turn id.
-  checkpointId?: string;
-  /** @deprecated Read only while migrating CACHE_VER=5 entries. */
-  codexTurnId?: string;
-  // Routing-only native task identity for a steered live segment. Unlike
-  // forkPointId, this must not make two user segments in one Codex task merge
-  // into one history turn. TurnEnd promotes it to the final segment's fork id.
-  liveTaskId?: string;
-  prompt: string; // empty when we joined mid-turn (no user bubble rendered)
-  blocks: Block[];
-  done: boolean;
-  interrupted?: boolean;
-  error?: string;
-  progress?: string;
-  images?: QueryImg[];
-  imageRefs?: ConversationImageRef[];
-  files?: QueryFile[];
-  ts?: number;
-  doneTs?: number;
-  durationMs?: number;
-  // Summary history pages omit heavy tool/reasoning bodies. The count keeps
-  // that omission explicit and becomes the affordance for on-demand detail.
-  detailEventCount?: number;
-  detailLoaded?: boolean;
-  detailLoading?: boolean;
-  detailHasMore?: boolean;
-  detailOldestCursor?: string | null;
-  detailHasNewer?: boolean;
-  detailNewerCursor?: string | null;
-  /** Heavy, cursor-paged process history; never subject to Turn.blocks caps. */
-  detailProjection?: TurnDetailProjection;
-  /** Initial disclosure click keeps fetching older pages until EOF or cap. */
-  detailAutoLoad?: boolean;
-}
 
 export interface PendingQuery {
   prompt: string;
@@ -306,7 +213,7 @@ export interface SessionRuntime {
   takeoverPending: boolean;
   takeoverMessage: string | null;
   ccSessionId?: string;
-  pendingQuestion: { ask_id: string; header?: string | null; question: string; options: { label: string; ds?: string }[]; allow_text?: boolean; secret?: boolean } | null;
+  pendingQuestion: { ask_id: string; header?: string | null; question: string; options: { label: string; ds?: string }[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean } | null;
   contextReport: ContextReport | null;
   contextRequestId: string | null;
   contextError: string | null;
@@ -446,7 +353,7 @@ export type Action =
   | { type: "return_to_latest"; sid: string }
   | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null }
   | { type: "prune_runtimes"; protectedSids: string[] }
-  | { type: "answer_question" }
+  | { type: "answer_question"; sid: string; ask_id: string }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
   | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null }
   | { type: "set_new_chat_cwd"; cwd: string; cwdSource?: "default" | "inherited" | "explicit" }
@@ -1463,7 +1370,11 @@ export function reduce(state: AppState, action: Action): AppState {
       return runtimes === state.runtimes ? state : { ...state, runtimes };
     }
     case "answer_question":
-      return patch(state, state.focusedSid, (rt) => { rt.pendingQuestion = null; });
+      return patch(state, action.sid, (rt) => {
+        if (rt.pendingQuestion?.ask_id === action.ask_id) {
+          rt.pendingQuestion = null;
+        }
+      });
     case "dismiss_notice":
       return patch(state, action.sid, (rt) => {
         rt.notices = rt.notices.filter(
@@ -2505,7 +2416,13 @@ function reduceEvent(
         rt.contextError = null;
       });
     case "ask_user":
-      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret }; });
+      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select }; });
+    case "ask_user_closed":
+      return patch(state, e.sid, (rt) => {
+        if (rt.pendingQuestion?.ask_id === e.ask_id) {
+          rt.pendingQuestion = null;
+        }
+      });
     case "goal_state":
       return patch(state, e.sid, (rt) => { rt.goal = e.goal ?? null; });
     case "rollback_result": {

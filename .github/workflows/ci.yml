@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python
+    needs: web
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.13 .venv
+          uv pip sync \
+            --python .venv/bin/python \
+            --require-hashes --only-binary=:all: --no-binary=http-ece \
+            requirements.lock
+          uv pip install --python .venv/bin/python -r requirements-dev.txt
+      - name: Restore built Web client
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-web-dist
+          path: web/dist
+      - name: Test and lint
+        run: |
+          .venv/bin/python -m pytest
+          uvx --from ruff==0.15.13 ruff check cc_remote tests deploy
+
+  web:
+    name: Web
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm --prefix web ci
+          npm --prefix web exec -- playwright install --with-deps chromium webkit
+      - name: Build, test, and lint
+        run: |
+          npm --prefix web run build
+          npm --prefix web run test:reliability
+          npm --prefix web run test:history-browser
+          npm --prefix web run lint
+      - name: Preserve built Web client
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Deploy scripts
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate scripts
+        run: |
+          bash -n \
+            deploy/install.sh \
+            deploy/install-relay.sh \
+            deploy/install-wrapper.sh \
+            deploy/setup-vps.sh
+          shellcheck -x \
+            deploy/install.sh \
+            deploy/install-relay.sh \
+            deploy/install-wrapper.sh \
+            deploy/setup-vps.sh \
+            deploy/setup_transaction.sh
+          git diff --check

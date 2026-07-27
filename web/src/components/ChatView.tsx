@@ -13,7 +13,7 @@ import {
   defaultRangeExtractor,
   useVirtualizer,
 } from "@tanstack/react-virtual";
-import type { Turn } from "../reducer";
+import type { Turn } from "../domain/conversation";
 import type { Space } from "../protocol";
 import { MessageBlock } from "./MessageBlock";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
@@ -35,11 +35,9 @@ import {
   updateTurnKeySnapshot,
   type TurnKeySnapshot,
 } from "../virtual-turn-keys";
-import {
-  historyImageDisplaySource,
-  TurnImagePreviewCache,
-} from "../turn-image-previews";
+import { TurnImagePreviewCache } from "../turn-image-previews";
 import type { TextSelectionGuard } from "../history-selection-guard";
+import { HistoryUserImage } from "./HistoryUserImage";
 import {
   HistoryAnchorController,
   historyPageStatus,
@@ -187,49 +185,6 @@ function detailTurnFingerprint(turn: Turn): string {
     turn.detailProjection?.blocks.length ?? 0,
     turn.blocks.length,
   ].join("\u0000");
-}
-
-function HistoryUserImage({ turnId, imageId, width, height, asset, fallback, onLoad,
-  onPreview }: {
-  turnId: string;
-  imageId: string;
-  width: number;
-  height: number;
-  asset?: HistoryImageAsset;
-  fallback?: NonNullable<Turn["images"]>[number];
-  onLoad?: (turnId: string, imageId: string, variant: HistoryImageVariant) => boolean;
-  onPreview: () => void;
-}) {
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    if (asset || !onLoad) return;
-    const node = triggerRef.current;
-    if (!node || typeof IntersectionObserver === "undefined") {
-      onLoad(turnId, imageId, "thumbnail");
-      return;
-    }
-    const observer = new IntersectionObserver((entries) => {
-      if (!entries.some((entry) => entry.isIntersecting)) return;
-      onLoad(turnId, imageId, "thumbnail");
-      observer.disconnect();
-    }, { rootMargin: "500px 0px" });
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [asset, imageId, onLoad, turnId]);
-
-  const src = historyImageDisplaySource(asset, fallback);
-  return (
-    <button ref={triggerRef} type="button"
-      className="ubub-image-trigger history-image-trigger"
-      style={{ aspectRatio: `${width} / ${height}` }}
-      aria-label="预览用户发送的图片"
-      disabled={!src}
-      onClick={onPreview}>
-      {src
-        ? <img src={src} className="ubub-img" alt="用户发送的图片" />
-        : <span className="history-image-placeholder" aria-hidden="true" />}
-    </button>
-  );
 }
 
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,

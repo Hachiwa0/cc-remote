@@ -595,9 +595,12 @@ class Tui:
             s = line.strip()
             if not s:
                 continue
-            # answering an ask_user prompt: a bare number picks an option
-            if self._pending_ask_for_attached() and s.isdigit():
-                await self._answer_ask(int(s))
+            # Answering an ask_user prompt: one number selects a single choice;
+            # comma-separated numbers select multiple choices when allowed.
+            picks = [part.strip() for part in s.split(",")]
+            if (self._pending_ask_for_attached() and picks
+                    and all(part.isdigit() for part in picks)):
+                await self._answer_ask([int(part) for part in picks])
                 continue
             if s.startswith("/"):
                 await self._command(s)
@@ -690,18 +693,30 @@ class Tui:
                 return
         await self._attach(sid, target_engine)
 
-    async def _answer_ask(self, n: int) -> None:
+    async def _answer_ask(self, picks: int | list[int]) -> None:
         ask = self._pending_ask_for_attached()
         if not ask:
             return
+        if isinstance(picks, int):
+            picks = [picks]
         opts = ask.get("options") or []
-        if not (1 <= n <= len(opts)):
+        if (not picks or any(not 1 <= pick <= len(opts) for pick in picks)
+                or len(set(picks)) != len(picks)):
             self._line(YELLOW(f"[pick 1..{len(opts)}]"))
             return
-        answer = opts[n - 1].get("label", str(n))
+        multi_select = bool(ask.get("multi_select"))
+        if not multi_select and len(picks) != 1:
+            self._line(YELLOW("[this question accepts one choice]"))
+            return
+        labels = [
+            opts[pick - 1].get("label", str(pick))
+            for pick in picks
+        ]
+        answer = labels if multi_select else labels[0]
         if await self._send(AnswerQuestion(
                 ask_id=ask["ask_id"], answer=answer, sid=ask["sid"])):
-            self._line(CYAN(f"[answered: {_safe_remote_text(answer)}]"))
+            display = ", ".join(labels)
+            self._line(CYAN(f"[answered: {_safe_remote_text(display)}]"))
             self.pending_asks.pop(ask["sid"], None)
 
     # ---- inbound event rendering ----
@@ -943,11 +958,17 @@ class Tui:
                     "ask_id": d.get("ask_id"),
                     "question": d.get("question", ""),
                     "options": d.get("options") or [],
+                    "multi_select": bool(d.get("multi_select")),
                 }
                 previous = self.pending_asks.get(sid)
                 self.pending_asks[sid] = ask
                 if self._for_me(d) and previous != ask:
                     self._render_ask(ask)
+        elif t == "ask_user_closed":
+            if isinstance(sid, str):
+                pending = self.pending_asks.get(sid)
+                if pending and pending.get("ask_id") == d.get("ask_id"):
+                    self.pending_asks.pop(sid, None)
         elif t == "context_report":
             self._render_context(d)
         elif t == "wrapper_disconnected":
@@ -1029,7 +1050,11 @@ class Tui:
             self._line(
                 f"  {i}. {label}"
                 + (DIM(f"  — {description}") if description else ""))
-        self._line(DIM("→ type the number to answer"))
+        self._line(DIM(
+            "→ type comma-separated numbers to answer"
+            if ask.get("multi_select")
+            else "→ type the number to answer"
+        ))
 
     def _render_context(self, d: dict) -> None:
         tot, mx = d.get("total_tokens", 0), d.get("max_tokens", 0)
