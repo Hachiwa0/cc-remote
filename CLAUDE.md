@@ -269,10 +269,54 @@ by the explicit `claude-remote` CLI — separate from the Agent SDK path.
   activation, installers, Caddy, systemd/launchd units.
 - `tests/` — zero-token unit tests (`test_*.py`); `e2e_*.py` here and
   `scripts/live/` are explicit, may spend model tokens.
-- `.github/workflows/release.yml` — the only CI: verifies the source release,
-  builds per-role/per-arch bundles, then attests and publishes. It is
-  release-triggered, so it does NOT gate ordinary commits — run the checks
-  below locally.
+- `.github/workflows/ci.yml` — required push/PR regression gate.
+  `.github/workflows/release.yml` reuses it before building, attesting, and
+  publishing per-role/per-arch release bundles.
+
+## Commit and PR gate
+
+- Keep every commit coherent and reviewable. Before staging, inspect
+  `git status --short --branch` and preserve unrelated user changes. Stage only
+  the intended scope, then review `git diff --cached --stat`,
+  `git diff --cached`, and `git diff --cached --check`.
+- Use an English Conventional Commit subject (`type(scope): summary`). Do not
+  add tool prefixes such as `[Codex]` / `[Claude]`, generated-by trailers, or
+  `Co-Authored-By` unless the user explicitly requests one.
+- For a multiline message, use `git commit -F <message-file>` with exactly one
+  blank line after the subject and consecutive direct `- ` bullets. After
+  committing, verify the stored message and scope with
+  `git log -1 --format=raw --stat`, then recheck
+  `git status --short --branch`.
+- Before opening or updating **every** PR, run the complete local gate below;
+  a docs-only or apparently narrow change does not skip it unless the user
+  explicitly accepts that exception. Every command must exit zero. Expected
+  platform-defined test skips are allowed, but failures or missing tools must
+  be reported rather than silently bypassed.
+
+```bash
+.venv/bin/python -m pytest
+uvx --from ruff==0.15.13 ruff check cc_remote tests deploy
+npm --prefix web run build
+npm --prefix web run test:reliability
+npm --prefix web run test:history-browser
+npm --prefix web run lint
+bash -n \
+  deploy/install.sh \
+  deploy/install-relay.sh \
+  deploy/install-wrapper.sh \
+  deploy/setup-vps.sh
+shellcheck -x \
+  deploy/install.sh \
+  deploy/install-relay.sh \
+  deploy/install-wrapper.sh \
+  deploy/setup-vps.sh \
+  deploy/setup_transaction.sh
+git diff --check
+```
+
+- `.github/workflows/ci.yml` repeats this gate for pushes and PRs. A local pass
+  is required before PR publication and does not replace green remote CI before
+  merge. These checks are zero-token; do not substitute a live model probe.
 
 ## Run / test
 ```bash
