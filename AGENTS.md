@@ -110,9 +110,10 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - `cc_remote/wrapper/` — `sdk.py` / `stream.py` and `claude_*` implement Claude;
   `codex_handle.py` / `codex_stream.py` / `codex_daemon.py` / `codex_external.py`
   implement the official Codex app-server paths; `history_store.py` owns the
-  rebuildable SQLite projection; `machine.py`, `session_ctx.py`,
-  `ringbuffer.py`, `transport.py`, and `session.py` provide the shared session
-  pool, routing, live replay, relay transport, and persistence.
+  rebuildable SQLite projection; `machine.py`, `command_router.py`,
+  `session_ctx.py`, `ringbuffer.py`, `transport.py`, and `session.py` provide
+  the shared session pool, command dispatch, live replay, relay transport, and
+  persistence.
 - `cc_remote/relay/` — server.py (FastAPI `/ws` + `/api/login` + static), auth.py
   (wrapper bearer + HMAC cookie session), `devices.py` (pairing and enrolled
   machine ownership), `pairing.py` (machine-scoped wrapper/client routing), and

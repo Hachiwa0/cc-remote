@@ -85,7 +85,7 @@ from cc_remote.protocol import (
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
     ConversationTurn, History, TurnDetail, HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
-    GoalState, Pong, Snapshot, StateEvent, State, TakeoverState, SessionControl,
+    GoalState, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg, TurnSteered,
     ToolUse, ToolResult, TurnBinding, TurnEnd, TurnNotificationContext,
     TurnResult, is_downstream,
@@ -206,6 +206,7 @@ from cc_remote.wrapper.process_scan import (
     process_identity,
     process_owner_uid,
 )
+from cc_remote.wrapper.command_router import CommandRouter, UNHANDLED_COMMAND
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -780,6 +781,7 @@ class WrapperMachine:
     def __init__(self, cfg: WrapperConfig, transport: WrapperTransport):
         self.cfg = cfg
         self.transport = transport
+        self._command_router = CommandRouter(self)
         self.instance_id = uuid4().hex
         # One lifecycle gate coordinates the official process-global Codex
         # daemon. Each resident Code handle still owns only its short-lived
@@ -3049,109 +3051,15 @@ class WrapperMachine:
         rejected = await self._reject_nonowner_btw_command(cmd)
         if rejected is not None:
             return rejected
-        t = cmd.type
-        if t == "hello" and cmd.role == "client":
-            await self._handle_client_hello(cmd)
-        elif t == "query":
-            return await self._handle_query(cmd)
-        elif t == "steer":
-            return await self._handle_steer(cmd)
-        elif t == "interrupt":
-            return await self._handle_interrupt(cmd)
-        elif t == "takeover":
-            return await self._handle_takeover(cmd)
-        elif t == "set_model":
-            return await self._handle_set_model(cmd)
-        elif t == "set_effort":
-            return await self._handle_set_effort(cmd)
-        elif t == "set_service_tier":
-            return await self._handle_set_service_tier(cmd)
-        elif t == "set_collaboration_mode":
-            return await self._handle_set_collaboration_mode(cmd)
-        elif t == "open_btw":
-            return await self._handle_open_btw(cmd)
-        elif t == "close_btw":
-            return await self._handle_close_btw(cmd)
-        elif t == "set_perm":
-            return await self._handle_set_perm(cmd)
-        elif t == "get_context":
-            return await self._handle_get_context(cmd)
-        elif t == "get_status":
-            return await self._handle_get_status(cmd)
-        elif t == "get_diff":
-            return await self._handle_get_diff(cmd)
-        elif t == "get_file_preview":
-            return await self._handle_get_file_preview(cmd)
-        elif t == "save_markdown":
-            return await self._handle_save_markdown(cmd)
-        elif t == "get_preview_asset":
-            return await self._handle_get_preview_asset(cmd)
-        elif t == "get_history":
-            return await self._handle_get_history(cmd)
-        elif t == "get_turn_detail":
-            return await self._handle_get_turn_detail(cmd)
-        elif t == "get_history_image":
-            return await self._handle_get_history_image(cmd)
-        elif t == "get_models":
-            return await self._handle_get_models(cmd)
-        elif t == "get_engine_capabilities":
-            return await self._handle_get_engine_capabilities(cmd)
-        elif t == "manage_engine_plugin":
-            return await self._handle_manage_engine_plugin(cmd)
-        elif t == "manage_engine_skill":
-            return await self._handle_manage_engine_skill(cmd)
-        elif t == "manage_engine_hook":
-            return await self._handle_manage_engine_hook(cmd)
-        elif t == "answer_question":
-            return await self._handle_answer_question(cmd)
-        elif t == "get_goal":
-            return await self._handle_get_goal(cmd)
-        elif t == "set_goal":
-            return await self._handle_set_goal(cmd)
-        elif t == "clear_goal":
-            return await self._handle_clear_goal(cmd)
-        elif t == "list_sessions":
-            return await self._handle_list_sessions(cmd)
-        elif t == "switch_session":
-            return await self._handle_switch_session(cmd)
-        elif t == "new_session":
-            return await self._handle_new_session(cmd)
-        elif t == "list_dir":
-            return await self._handle_list_dir(cmd)
-        elif t == "rename_session":
-            return await self._handle_rename_session(cmd)
-        elif t == "archive_session":
-            return await self._handle_archive_session(cmd)
-        elif t == "pin_session":
-            return await self._handle_pin_session(cmd)
-        elif t == "delete_work_session":
-            return await self._handle_delete_work_session(cmd)
-        elif t == "delete_session":
-            return await self._handle_delete_session(cmd)
-        elif t == "rollback_session":
-            return await self._handle_rollback_session(cmd)
-        elif t == "compact_session":
-            return await self._handle_compact_session(cmd)
-        elif t == "start_review":
-            return await self._handle_start_review(cmd)
-        elif t == "get_work_dashboard":
-            return await self._handle_get_work_dashboard(cmd)
-        elif t == "get_work_artifacts":
-            return await self._handle_get_work_artifacts(cmd)
-        elif t in {
-            "create_work_project", "delete_work_project", "add_work_source",
-            "delete_work_source", "create_work_plugin", "delete_work_plugin",
-            "create_work_schedule", "delete_work_schedule",
-        }:
-            return await self._handle_work_mutation(cmd)
-        elif t == "fork_session":
-            return await self._handle_fork_session(cmd)
-        elif t == "fork_session_worktree":
-            return await self._handle_fork_session_worktree(cmd)
-        elif t == "ping":
-            await self._emit_focused(Pong(n=cmd.n))
-        else:
-            log.warning("unexpected command", type=t, role=getattr(cmd, "role", None))
+        result = await self._command_router.dispatch(cmd)
+        if result is UNHANDLED_COMMAND:
+            log.warning(
+                "unexpected command",
+                type=cmd.type,
+                role=getattr(cmd, "role", None),
+            )
+            return None
+        return result
 
     async def _handle_client_hello(self, cmd) -> None:
         # A fresh client (no cursor for a sid) gets exactly one lightweight

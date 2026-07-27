@@ -141,9 +141,12 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 Shared core:
 - `machine.py` — the brain, and by far the largest module: session pool
   `dict[key, SessionContext]` + `focused_sid`, per-turn consumers, the drain,
-  and every `_handle_*` command (`_handle_query` / `_handle_steer` /
+  and command handlers (`_handle_query` / `_handle_steer` /
   `_handle_interrupt`, session lifecycle, `_handle_get_history` /
   `_handle_get_turn_detail`, previews, rollback, goals, status).
+- `command_router.py` — the behavior-free command-type → existing handler map;
+  scheduling lanes, ownership checks, reliable-command deduplication and ACKs
+  stay in `machine.py`.
 - `session_ctx.py` — one `SessionContext` per resident session: ring buffer, seq
   counter, state machine, turn task, translator, pending ask futures, emit lock.
 - `ringbuffer.py` — monotonic-seq buffer; `replay_from` serves reconnect cursors
