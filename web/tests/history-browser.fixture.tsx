@@ -4,7 +4,10 @@ import { createRoot } from "react-dom/client";
 import "../src/index.css";
 import { OMITTED_PROCESS_ITEM_ID, type Turn } from "../src/reducer";
 import type { QueryImg } from "../src/protocol";
-import { ChatView } from "../src/components/ChatView";
+import {
+  ChatView,
+} from "../src/components/ChatView";
+import type { TextSelectionGuard } from "../src/history-selection-guard";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
 
 const ROBOT_CORE_MERMAID_SOURCE = `flowchart TB
@@ -460,6 +463,13 @@ export function HistoryBrowserFixture() {
         finalTurn(`m${index + 21}`, 3))
       : []);
   const nextLiveTurnRef = useRef(41);
+  const textSelectionGuardRef = useRef<TextSelectionGuard | null>(null);
+  const updateTextSelectionGuard = useCallback(
+    (guard: TextSelectionGuard | null) => {
+      textSelectionGuardRef.current = guard;
+    },
+    [],
+  );
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [pendingImages, setPendingImages] = useState<QueryImg[]>(() =>
     composerAttachment ? [{
@@ -565,9 +575,19 @@ export function HistoryBrowserFixture() {
           ...page.filter((turn) => !ids.has(turn.id)),
         ];
         const bounded = [...merged];
+        const guard = textSelectionGuardRef.current;
+        const protectedIds = new Set([
+          ...(anchorTurnId ? [anchorTurnId] : []),
+          ...(guard
+              && guard.sid === requestSid
+              && guard.revision === historyRevision
+              && guard.viewId === historyViewId
+              && guard.scopeKey === "fixture-history-scope"
+            ? guard.turnIds : []),
+        ]);
         while (bounded.length > 20
-            && bounded[0]?.id !== anchorTurnId
-            && bounded[0]?.historyTurnId !== anchorTurnId) {
+            && !protectedIds.has(bounded[0]?.id ?? "")
+            && !protectedIds.has(bounded[0]?.historyTurnId ?? "")) {
           bounded.shift();
         }
         return {
@@ -583,7 +603,9 @@ export function HistoryBrowserFixture() {
       });
     }, delayMs);
     return true;
-  }, [browseMode, delayMs, sessions, sid]);
+  }, [
+    browseMode, delayMs, historyRevision, historyViewId, sessions, sid,
+  ]);
 
   const loadDetail = useCallback((
     turnId: string,
@@ -800,6 +822,7 @@ export function HistoryBrowserFixture() {
         historyRevision={historyRevision}
         historyViewRevision={historyViewRevision}
         historyViewId={deepBrowse || browseMode ? historyViewId : undefined}
+        historyScopeKey="fixture-history-scope"
         historyWindowEpoch={active.windowEpoch ?? 0}
         historyCursor={active.cursor}
         browseMode={browseMode && sid.endsWith("-a")}
@@ -808,6 +831,7 @@ export function HistoryBrowserFixture() {
         onLoadNewer={loadNewer}
         onReturnLatest={returnLatest}
         onLoadDetail={detailPaging ? loadDetail : undefined}
+        onTextSelectionGuardChange={updateTextSelectionGuard}
         onEdit={() => {}}
         onGetDiff={() => {}}
       />

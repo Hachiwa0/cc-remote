@@ -73,6 +73,10 @@ import {
   type PushBindingSnapshot,
 } from "./push";
 import {
+  protectedHistoryTurnIds,
+  type TextSelectionGuard,
+} from "./history-selection-guard";
+import {
   readNotificationMode,
   writeNotificationMode,
   type NotificationMode,
@@ -291,6 +295,13 @@ export default function App() {
   const historyPageCacheRef = useRef(new HistoryPageCache());
   const historyPageScopesRef =
     useRef(new Map<string, HistoryPageCacheScope>());
+  const textSelectionGuardRef = useRef<TextSelectionGuard | null>(null);
+  const updateTextSelectionGuard = useCallback(
+    (guard: TextSelectionGuard | null) => {
+      textSelectionGuardRef.current = guard;
+    },
+    [],
+  );
   const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
   const createRequestsRef = useRef<Map<string, {
@@ -792,13 +803,22 @@ export default function App() {
         newerPageKey: waiter.sourcePageKey,
         isLatest: false,
       };
+      const protectedTurnIds = protectedHistoryTurnIds(
+        waiter.anchorTurnId,
+        textSelectionGuardRef.current,
+        {
+          sid: history.session_id,
+          revision: history.revision,
+          viewId: waiter.viewId,
+          scopeKey: waiter.scopeKey,
+        },
+      );
       const mutation = prependOlderPage(browse, page, {
         expectedScopeKey: waiter.scopeKey,
         expectedViewId: waiter.viewId,
         expectedWindowEpoch: waiter.windowEpoch,
         expectedOlderCursor: waiter.pendingBefore,
-        protectedTurnIds: waiter.anchorTurnId
-          ? [waiter.anchorTurnId] : undefined,
+        protectedTurnIds,
       });
       if (mutation.projection === browse) continue;
       // Paint the received page immediately. Page-cache writes are best-effort
@@ -819,8 +839,7 @@ export default function App() {
         windowEpoch: waiter.windowEpoch,
         before: waiter.pendingBefore,
         page,
-        protectedTurnIds: waiter.anchorTurnId
-          ? [waiter.anchorTurnId] : undefined,
+        protectedTurnIds,
         prepared: {
           from: browse,
           to: mutation.projection,
@@ -2360,13 +2379,22 @@ export default function App() {
         });
         return;
       }
+      const protectedTurnIds = protectedHistoryTurnIds(
+        frozen.anchorTurnId,
+        textSelectionGuardRef.current,
+        {
+          sid: frozen.sid,
+          revision: frozen.revision,
+          viewId: frozen.viewId,
+          scopeKey: frozen.scopeKey,
+        },
+      );
       const mutation = appendNewerPage(current, page, {
         expectedScopeKey: frozen.scopeKey,
         expectedViewId: frozen.viewId,
         expectedWindowEpoch: frozen.windowEpoch,
         expectedNewerPageKey: frozen.pageKey,
-        protectedTurnIds: frozen.anchorTurnId
-          ? [frozen.anchorTurnId] : undefined,
+        protectedTurnIds,
       });
       if (mutation.projection === current) return;
       for (const evicted of mutation.evictedPages) {
@@ -2381,8 +2409,7 @@ export default function App() {
         viewId: frozen.viewId,
         windowEpoch: frozen.windowEpoch,
         page,
-        protectedTurnIds: frozen.anchorTurnId
-          ? [frozen.anchorTurnId] : undefined,
+        protectedTurnIds,
         prepared: {
           from: current,
           to: mutation.projection,
@@ -2922,6 +2949,12 @@ export default function App() {
               historyRevision={rt.historyRevision}
               historyViewRevision={historyView.viewRevision}
               historyViewId={historyView.viewId}
+              historyScopeKey={
+                historyView.browsing
+                  && state.historyBrowse?.sid === focusedSid
+                  ? state.historyBrowse.scopeKey
+                  : activeScopeKey
+              }
               historyWindowEpoch={historyView.windowEpoch}
               historyCursor={historyView.oldestId}
               browseMode={historyView.browsing}
@@ -2951,6 +2984,7 @@ export default function App() {
               historyImageAssets={historyImageAssets}
               onLoadHistoryImage={historyView.recovering
                 ? undefined : loadHistoryImage}
+              onTextSelectionGuardChange={updateTextSelectionGuard}
               onFork={!historyView.recovering && space === "code"
                 ? forkFromTurn : undefined} />
 

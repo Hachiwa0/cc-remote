@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type PointerEvent,
   type TouchEvent,
   type WheelEvent,
 } from "react";
@@ -38,6 +39,7 @@ import {
   historyImageDisplaySource,
   TurnImagePreviewCache,
 } from "../turn-image-previews";
+import type { TextSelectionGuard } from "../history-selection-guard";
 import {
   HistoryAnchorController,
   historyPageStatus,
@@ -90,6 +92,44 @@ interface RetainedMeasurementBoundary {
   viewId: string;
   turnId: string;
   anchorOffset: number;
+}
+
+interface TextSelectionRetention {
+  scope: string;
+  anchorTurnId: string;
+  focusTurnId: string;
+  pointerId: number;
+  interactionToken: number | null;
+  dragging: boolean;
+  releaseAnchorTurnId: string | null;
+  releaseAnchorOffset: number | null;
+}
+
+interface TextSelectionCandidate {
+  scope: string;
+  pointerId: number;
+}
+
+const TEXT_SELECTION_EXCLUDED_SELECTOR = [
+  "button",
+  "a",
+  "input",
+  "textarea",
+  "select",
+  "option",
+  "summary",
+  "[contenteditable='true']",
+  "[role='button']",
+  ".mermaid-block",
+].join(",");
+
+function selectionTurnId(
+  root: HTMLElement | null,
+  node: Node | null,
+): string | null {
+  if (!root || !node || !root.contains(node)) return null;
+  const element = node instanceof Element ? node : node.parentElement;
+  return element?.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId ?? null;
 }
 
 type DetailPageDirection = "initial" | "older" | "newer";
@@ -194,12 +234,14 @@ function HistoryUserImage({ turnId, imageId, width, height, asset, fallback, onL
 
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   historyRevision = null, historyViewRevision = historyRevision,
-  historyViewId = null, historyWindowEpoch = 0, historyCursor = null,
+  historyViewId = null, historyScopeKey = null,
+  historyWindowEpoch = 0, historyCursor = null,
   browseMode = false, hasNewer = false,
   onLoadMore, onLoadNewer, onReturnLatest,
   onLoadDetail, onEdit, onGetDiff, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
   historyImageAssets, onLoadHistoryImage,
+  onTextSelectionGuardChange,
   surface = "code" }: {
   sid: string | null;
   turns: Turn[];
@@ -213,6 +255,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   // Pagination/detail still use the authoritative historyRevision above.
   historyViewRevision?: string | null;
   historyViewId?: string | null;
+  historyScopeKey?: string | null;
   historyWindowEpoch?: number;
   historyCursor?: string | null;
   browseMode?: boolean;
@@ -235,6 +278,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onLoadHistoryImage?: (
     turnId: string, imageId: string, variant: HistoryImageVariant,
   ) => boolean;
+  onTextSelectionGuardChange?: (guard: TextSelectionGuard | null) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const controllerRef = useRef<ScrollFollowController | null>(null);
@@ -258,6 +302,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     windowEpoch: number;
   } | null>(null);
   const turnNodeRefs = useRef(new Map<string, HTMLDivElement>());
+  const textSelectionCandidateRef = useRef<TextSelectionCandidate | null>(null);
+  const textSelectionRef = useRef<TextSelectionRetention | null>(null);
+  const [textSelection, setTextSelection] =
+    useState<TextSelectionRetention | null>(null);
   const detailAnchorRef = useRef<DetailAnchorTransaction | null>(null);
   const cancelDetailAnchorFnRef = useRef<
     ((releaseInteraction?: boolean) => void) | null
@@ -285,10 +333,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   // non-destructive recovery path. Deep-history browsing supplies an explicit
   // stable view id: revision/view changes reset, window paging does not.
   const resolvedHistoryViewId = historyViewId ?? historyViewRevision ?? "";
-  const scrollScope = historyViewId == null
-    ? `${sid ?? ""}\u0000${resolvedHistoryViewId}`
-    : `${sid ?? ""}\u0000${historyRevision ?? ""}\u0000${resolvedHistoryViewId}`;
   turnImagePreviewCacheRef.current.update(sid, turns);
+  const scrollScope = historyViewId == null
+    ? `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${resolvedHistoryViewId}`
+    : `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${historyRevision ?? ""}\u0000${resolvedHistoryViewId}`;
   const turnKeySnapshot = updateTurnKeySnapshot(
     turnKeySnapshotRef.current,
     turns,
@@ -357,7 +405,21 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       && measurementBoundary.revision === historyRevision
       && measurementBoundary.viewId === resolvedHistoryViewId
     ? measurementBoundary : null;
-  const retainedMeasurementBoundary = scopedMeasurementBoundary
+  const activeTextSelection = textSelection?.scope === scrollScope
+    ? textSelection : null;
+  const retainedSelectionBoundary =
+    activeTextSelection?.releaseAnchorTurnId != null
+    && activeTextSelection.releaseAnchorOffset != null
+      ? {
+        sid,
+        revision: historyRevision,
+        viewId: resolvedHistoryViewId,
+        turnId: activeTextSelection.releaseAnchorTurnId,
+        anchorOffset: activeTextSelection.releaseAnchorOffset,
+      }
+      : null;
+  const retainedMeasurementBoundary = retainedSelectionBoundary
+    ?? scopedMeasurementBoundary
     ?? (keyedPrependActive && activeHistoryAnchor ? {
       sid,
       revision: historyRevision,
@@ -395,6 +457,21 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         : -1;
       if (historyBoundaryIndex >= 0) retainedIndexes.add(historyBoundaryIndex);
       if (detailBoundaryIndex >= 0) retainedIndexes.add(detailBoundaryIndex);
+      if (activeTextSelection) {
+        const anchorIndex = turns.findIndex(
+          (turn) => turn.id === activeTextSelection.anchorTurnId,
+        );
+        const focusIndex = turns.findIndex(
+          (turn) => turn.id === activeTextSelection.focusTurnId,
+        );
+        if (anchorIndex >= 0 && focusIndex >= 0) {
+          const first = Math.min(anchorIndex, focusIndex);
+          const last = Math.max(anchorIndex, focusIndex);
+          for (let index = first; index <= last; index += 1) {
+            retainedIndexes.add(index);
+          }
+        }
+      }
       return [...retainedIndexes].sort((left, right) => left - right);
     },
     gap: HISTORY_TURN_GAP_PX,
@@ -451,33 +528,38 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       - viewportRect.top;
   }, []);
 
-  const captureHistoryBoundary = (): CapturedHistoryBoundary | null => {
-    const el = scrollRef.current;
-    const viewportTop = el?.getBoundingClientRect().top;
-    let anchorTurnId: string | null = null;
-    let anchorOffset = 0;
-    let bestDistance = Number.POSITIVE_INFINITY;
-    if (el && viewportTop != null) {
-      for (const [turnId, node] of turnNodeRefs.current) {
-        const rect = node.getBoundingClientRect();
-        if (rect.bottom <= viewportTop || rect.top >= viewportTop + el.clientHeight) continue;
-        const distance = Math.abs(rect.top - viewportTop);
-        if (distance < bestDistance) {
-          anchorTurnId = turnId;
-          anchorOffset = rect.top - viewportTop;
-          bestDistance = distance;
+  const firstTurnId = turns[0]?.id ?? null;
+  const captureHistoryBoundary = useCallback(
+    (): CapturedHistoryBoundary | null => {
+      const el = scrollRef.current;
+      const viewportTop = el?.getBoundingClientRect().top;
+      let anchorTurnId: string | null = null;
+      let anchorOffset = 0;
+      let bestDistance = Number.POSITIVE_INFINITY;
+      if (el && viewportTop != null) {
+        for (const [turnId, node] of turnNodeRefs.current) {
+          const rect = node.getBoundingClientRect();
+          if (rect.bottom <= viewportTop
+              || rect.top >= viewportTop + el.clientHeight) continue;
+          const distance = Math.abs(rect.top - viewportTop);
+          if (distance < bestDistance) {
+            anchorTurnId = turnId;
+            anchorOffset = rect.top - viewportTop;
+            bestDistance = distance;
+          }
         }
       }
-    }
-    anchorTurnId ??= turns[0]?.id ?? null;
-    if (!anchorTurnId) return null;
-    anchorOffset = measureTurnOffset(anchorTurnId) ?? anchorOffset;
-    return {
-      anchorTurnId,
-      oldestTurnId: turns[0]?.id ?? null,
-      anchorOffset,
-    };
-  };
+      anchorTurnId ??= firstTurnId;
+      if (!anchorTurnId) return null;
+      anchorOffset = measureTurnOffset(anchorTurnId) ?? anchorOffset;
+      return {
+        anchorTurnId,
+        oldestTurnId: firstTurnId,
+        anchorOffset,
+      };
+    },
+    [firstTurnId, measureTurnOffset],
+  );
 
   const clearHistoryRequestTimeout = useCallback((generation?: number) => {
     const pending = historyRequestTimeoutRef.current;
@@ -558,6 +640,185 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     if (!el || !controller) return;
     syncScrollState(controller.pause(readScrollMetrics(el)));
   }, [syncScrollState]);
+
+  const publishTextSelection = useCallback((
+    selection: TextSelectionRetention | null,
+  ) => {
+    if (!onTextSelectionGuardChange) return;
+    if (!selection || selection.scope !== scrollScope || !sid) {
+      onTextSelectionGuardChange(null);
+      return;
+    }
+    onTextSelectionGuardChange({
+      sid,
+      revision: historyRevision,
+      viewId: resolvedHistoryViewId,
+      scopeKey: historyScopeKey,
+      turnIds: [selection.anchorTurnId, selection.focusTurnId],
+    });
+  }, [
+    historyRevision, historyScopeKey, onTextSelectionGuardChange,
+    resolvedHistoryViewId, scrollScope, sid,
+  ]);
+
+  const commitTextSelection = useCallback((
+    selection: TextSelectionRetention | null,
+  ) => {
+    textSelectionRef.current = selection;
+    setTextSelection(selection);
+    publishTextSelection(selection);
+  }, [publishTextSelection]);
+
+  const releaseTextSelectionInteraction = useCallback((
+    pointerId?: number,
+  ) => {
+    const active = textSelectionRef.current;
+    if (!active || !active.dragging
+        || (pointerId != null && active.pointerId !== pointerId)) return;
+    const releaseBoundary = captureHistoryBoundary();
+    if (active.interactionToken !== null) {
+      // Finishing a text drag must never replay a bottom command queued while
+      // the browser owned native selection auto-scroll.
+      scrollCoordinatorRef.current.endInteraction(
+        active.interactionToken, false,
+      );
+      setScrollPolicyEpoch((value) => value + 1);
+    }
+    commitTextSelection({
+      ...active,
+      dragging: false,
+      interactionToken: null,
+      releaseAnchorTurnId: releaseBoundary?.anchorTurnId ?? null,
+      releaseAnchorOffset: releaseBoundary?.anchorOffset ?? null,
+    });
+  }, [captureHistoryBoundary, commitTextSelection]);
+
+  const clearTextSelection = useCallback(() => {
+    textSelectionCandidateRef.current = null;
+    const active = textSelectionRef.current;
+    if (active?.interactionToken != null) {
+      scrollCoordinatorRef.current.endInteraction(
+        active.interactionToken, false,
+      );
+      setScrollPolicyEpoch((value) => value + 1);
+    }
+    if (active) {
+      commitTextSelection(null);
+    } else {
+      publishTextSelection(null);
+    }
+  }, [commitTextSelection, publishTextSelection]);
+
+  const disposeTextSelection = useCallback(() => {
+    const selection = textSelectionRef.current;
+    if (selection?.interactionToken != null) {
+      scrollCoordinatorRef.current.endInteraction(
+        selection.interactionToken, false,
+      );
+    }
+    textSelectionRef.current = null;
+    textSelectionCandidateRef.current = null;
+    onTextSelectionGuardChange?.(null);
+  }, [onTextSelectionGuardChange]);
+
+  const observeNativeTextSelection = useCallback(() => {
+    const nativeSelection = window.getSelection();
+    const candidate = textSelectionCandidateRef.current;
+    const active = textSelectionRef.current;
+    if (!nativeSelection || nativeSelection.isCollapsed
+        || nativeSelection.rangeCount === 0) {
+      if (active) clearTextSelection();
+      return;
+    }
+    if (!candidate && !active) return;
+    const expectedScope = active?.scope ?? candidate?.scope;
+    if (expectedScope !== scrollScope) {
+      clearTextSelection();
+      return;
+    }
+    const root = scrollRef.current;
+    const anchorTurnId = selectionTurnId(root, nativeSelection.anchorNode);
+    const focusTurnId = selectionTurnId(root, nativeSelection.focusNode);
+    if (!anchorTurnId || !focusTurnId) {
+      // While the mouse is held just outside the scrollport Chromium may put
+      // the focus in the surrounding document for one selectionchange. Keep
+      // the last valid in-thread boundary until the next in-thread move.
+      if (!active || !active.dragging) clearTextSelection();
+      return;
+    }
+    if (active) {
+      if (active.anchorTurnId === anchorTurnId
+          && active.focusTurnId === focusTurnId) return;
+      commitTextSelection({
+        ...active,
+        anchorTurnId,
+        focusTurnId,
+      });
+      return;
+    }
+    if (!candidate || !sid) return;
+    cancelDetailAnchorFnRef.current?.();
+    setMeasurementBoundary(null);
+    pauseOutputFollow();
+    const interactionToken =
+      scrollCoordinatorRef.current.beginInteraction(false);
+    const selection: TextSelectionRetention = {
+      scope: scrollScope,
+      anchorTurnId,
+      focusTurnId,
+      pointerId: candidate.pointerId,
+      interactionToken,
+      dragging: true,
+      releaseAnchorTurnId: null,
+      releaseAnchorOffset: null,
+    };
+    commitTextSelection(selection);
+    setScrollPolicyEpoch((value) => value + 1);
+  }, [
+    clearTextSelection, commitTextSelection, pauseOutputFollow, scrollScope,
+    sid,
+  ]);
+
+  useEffect(() => {
+    const handlePointerEnd = (event: globalThis.PointerEvent) => {
+      const candidate = textSelectionCandidateRef.current;
+      if (candidate?.pointerId === event.pointerId) {
+        textSelectionCandidateRef.current = null;
+      }
+      releaseTextSelectionInteraction(event.pointerId);
+    };
+    const handleDocumentPointerDown = (event: globalThis.PointerEvent) => {
+      const active = textSelectionRef.current;
+      if (!active || active.dragging || event.button !== 0) return;
+      const target = event.target;
+      if (target instanceof Node && !scrollRef.current?.contains(target)) {
+        clearTextSelection();
+      }
+    };
+    const handleCopy = () => {
+      if (!textSelectionRef.current) return;
+      window.requestAnimationFrame(() => clearTextSelection());
+    };
+    document.addEventListener("selectionchange", observeNativeTextSelection);
+    document.addEventListener("pointerup", handlePointerEnd);
+    document.addEventListener("pointercancel", handlePointerEnd);
+    document.addEventListener("pointerdown", handleDocumentPointerDown, true);
+    document.addEventListener("copy", handleCopy);
+    return () => {
+      document.removeEventListener(
+        "selectionchange", observeNativeTextSelection,
+      );
+      document.removeEventListener("pointerup", handlePointerEnd);
+      document.removeEventListener("pointercancel", handlePointerEnd);
+      document.removeEventListener(
+        "pointerdown", handleDocumentPointerDown, true,
+      );
+      document.removeEventListener("copy", handleCopy);
+    };
+  }, [
+    clearTextSelection, observeNativeTextSelection,
+    releaseTextSelectionInteraction,
+  ]);
 
   const completeHistoryLoadGates = useCallback(() => {
     historyLoadGateRef.current.complete();
@@ -775,7 +1036,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         || boundary.revision !== historyRevision
         || boundary.viewId !== resolvedHistoryViewId
         || touchYRef.current !== null
-        || (userScrollIntentRef.current && !keyedPrependResponseReady)
+        || (userScrollIntentRef.current && !keyedPrependResponseReady
+          && !retainedSelectionBoundary)
         || scrollCoordinatorRef.current.isInteractionLocked()) return;
     const currentOffset = measureTurnOffset(boundary.turnId);
     if (currentOffset == null) return;
@@ -797,6 +1059,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     // viewport on which the reset command can be consumed.
     if (renderedScrollScopeRef.current !== scrollScope) {
       renderedScrollScopeRef.current = scrollScope;
+      textSelectionCandidateRef.current = null;
+      if (textSelectionRef.current) clearTextSelection();
       const request = historyRequestRef.current;
       const anchor = historyAnchorRef.current.current();
       const enteringBrowse = browseMode
@@ -851,7 +1115,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     }
   }, [
     activeHistoryGeneration, applyScrollCommand, browseMode, cancelHistoryAnchor,
-    clearHistoryRequestTimeout, historyRevision, resolvedHistoryViewId,
+    clearHistoryRequestTimeout, clearTextSelection, historyRevision,
+    resolvedHistoryViewId,
     scrollScope, sid, syncScrollState, turns,
   ]);
 
@@ -865,9 +1130,12 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       if (userScrollIntentTimerRef.current !== null) {
         window.clearTimeout(userScrollIntentTimerRef.current);
       }
+      disposeTextSelection();
       cancelDetailAnchorFnRef.current?.(false);
     };
-  }, [cancelHistoryAnchor, clearHistoryRequestTimeout]);
+  }, [
+    cancelHistoryAnchor, clearHistoryRequestTimeout, disposeTextSelection,
+  ]);
 
   useEffect(() => setZoom(null), [sid]);
 
@@ -905,6 +1173,26 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     }, USER_SCROLL_INTENT_IDLE_MS);
   };
 
+  const onThreadPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    markUserScrollIntent("unknown");
+    if (event.pointerType !== "mouse" || event.button !== 0
+        || !event.isPrimary) {
+      textSelectionCandidateRef.current = null;
+      return;
+    }
+    if (textSelectionRef.current) clearTextSelection();
+    const target = event.target instanceof Element ? event.target : null;
+    const turn = target?.closest<HTMLElement>("[data-turn-id]");
+    if (!target || !turn || target.closest(TEXT_SELECTION_EXCLUDED_SELECTOR)) {
+      textSelectionCandidateRef.current = null;
+      return;
+    }
+    textSelectionCandidateRef.current = {
+      scope: scrollScope,
+      pointerId: event.pointerId,
+    };
+  };
+
   const onScroll = () => {
     const el = scrollRef.current;
     const controller = controllerRef.current;
@@ -915,15 +1203,21 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     const movementDirection: UserScrollDirection | null = movingTowardHistory
       ? "history" : movingTowardLatest ? "latest" : null;
     const intendedDirection = userScrollDirectionRef.current;
+    const textSelectionDragging =
+      textSelectionRef.current?.scope === scrollScope
+      && textSelectionRef.current.dragging;
     const currentHistoryAnchor = historyAnchorRef.current.current();
     const explicitAppliedMovement = keyedPrependResponseReady
       && currentHistoryAnchor?.phase === "applied"
       && intendedDirection !== null
       && intendedDirection !== "unknown";
-    const userDrivenScroll = userScrollIntentRef.current
-      && movementDirection !== null
-      && (intendedDirection === "unknown" || intendedDirection === movementDirection)
-      && (!keyedPrependResponseReady || explicitAppliedMovement);
+    const userDrivenScroll = movementDirection !== null && (
+      textSelectionDragging
+      || (userScrollIntentRef.current
+        && (intendedDirection === "unknown"
+          || intendedDirection === movementDirection)
+        && (!keyedPrependResponseReady || explicitAppliedMovement))
+    );
     if (userDrivenScroll && intendedDirection) {
       markUserScrollIntent(intendedDirection);
     }
@@ -969,23 +1263,27 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     }
     lastScrollTopRef.current = metrics.scrollTop;
     const nextScrollState = userDrivenScroll
-      ? controller.observeScroll(metrics, !browseMode)
+      ? controller.observeScroll(
+        metrics, !browseMode && !textSelectionDragging,
+      )
       : controller.recordProgrammaticScroll(metrics);
     if (nextScrollState.followOutput && !scrollState.followOutput
         && !historyRequestRef.current) {
       setMeasurementBoundary(null);
     }
     syncScrollState(nextScrollState);
-    maybeAutoLoadOlder(
-      movingTowardHistory && userDrivenScroll,
-      touchYRef.current != null ? "touch"
-        : wheelGestureActiveRef.current ? "wheel" : "other",
-    );
-    maybeAutoLoadNewer(
-      movingTowardLatest && userDrivenScroll,
-      touchYRef.current != null ? "touch"
-        : wheelGestureActiveRef.current ? "wheel" : "other",
-    );
+    if (!textSelectionDragging) {
+      maybeAutoLoadOlder(
+        movingTowardHistory && userDrivenScroll,
+        touchYRef.current != null ? "touch"
+          : wheelGestureActiveRef.current ? "wheel" : "other",
+      );
+      maybeAutoLoadNewer(
+        movingTowardLatest && userDrivenScroll,
+        touchYRef.current != null ? "touch"
+          : wheelGestureActiveRef.current ? "wheel" : "other",
+      );
+    }
   };
 
   const onWheel = (event: WheelEvent<HTMLDivElement>) => {
@@ -1478,9 +1776,13 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     <div className={surface === "work" ? "thread-shell work-thread-shell" : "thread-shell"}>
       <div className="thread" ref={scrollRef}
         data-detail-anchor-active={activeDetailAnchor ? "true" : "false"}
+        data-text-selection-dragging={
+          activeTextSelection?.dragging ? "true" : "false"
+        }
+        data-text-selection-retained={activeTextSelection ? "true" : "false"}
         onScroll={onScroll} onWheel={onWheel}
         onKeyDownCapture={onKeyDown}
-        onPointerDown={() => { markUserScrollIntent("unknown"); }}
+        onPointerDown={onThreadPointerDown}
         onTouchStart={onTouchStart} onTouchMove={onTouchMove}
         onTouchEnd={clearTouch} onTouchCancel={clearTouch}>
         <div className="thread-in virtual-thread-in" style={{

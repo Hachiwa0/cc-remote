@@ -224,6 +224,47 @@ async function waitForScrollIdle(
   throw new Error("thread scroll position did not settle");
 }
 
+async function nativeSelectionSnapshot(
+  page: import("@playwright/test").Page,
+): Promise<{
+  anchorTurnId: string | null;
+  focusTurnId: string | null;
+  anchorConnected: boolean;
+  text: string;
+}> {
+  return page.evaluate(() => {
+    const selection = window.getSelection();
+    const turnId = (node: Node | null): string | null => {
+      const element = node instanceof Element ? node : node?.parentElement;
+      return element?.closest<HTMLElement>("[data-turn-id]")
+        ?.dataset.turnId ?? null;
+    };
+    return {
+      anchorTurnId: turnId(selection?.anchorNode ?? null),
+      focusTurnId: turnId(selection?.focusNode ?? null),
+      anchorConnected: selection?.anchorNode?.isConnected ?? false,
+      text: selection?.toString() ?? "",
+    };
+  });
+}
+
+async function textSelectionPoint(
+  locator: import("@playwright/test").Locator,
+): Promise<{ x: number; y: number }> {
+  const point = await locator.evaluate((node) => {
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    const text = walker.nextNode();
+    if (!text || !text.textContent?.length) return null;
+    const range = document.createRange();
+    range.setStart(text, 0);
+    range.setEnd(text, Math.min(2, text.textContent.length));
+    const rect = range.getBoundingClientRect();
+    return { x: rect.left + 1, y: rect.top + rect.height / 2 };
+  });
+  if (!point) throw new Error("selection text has no geometry");
+  return point;
+}
+
 async function wheelUntilTurn(
   page: import("@playwright/test").Page,
   turnId: string,
@@ -1237,7 +1278,7 @@ test("user movement after prepend stays stable through delayed growth", async ({
   const initial = await readingAnchor(page);
   await requestOlderHistory(page, testInfo.project.name);
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(initial.id);
-  await wheelUntilTurn(page, "o2", 1_000, testInfo.project.name);
+  await wheelUntilTurn(page, "o2", 300, testInfo.project.name);
   await waitForScrollIdle(page);
   await page.waitForTimeout(300);
   const before = await readingAnchor(page);
@@ -1332,6 +1373,179 @@ test("virtualization bounds mounted rows and preserves an expanded timeline", as
   await expect(timeline.locator(".turn-process-head")).toHaveAttribute("aria-expanded", "true");
 });
 
+test("desktop text selection keeps its original virtual turn while edge-dragging", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name === "webkit",
+    "the configured WebKit project is a touch phone; this is a desktop mouse path");
+  await page.goto("/tests/history-browser.html?large=120");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => {
+    node.scrollTop = node.scrollHeight * (41 / 120);
+  });
+  const startText = page.locator('[data-turn-id="m42"] p').first();
+  await startText.scrollIntoViewIfNeeded();
+  await expect(startText).toBeInViewport();
+  const viewportBox = await viewport.boundingBox();
+  const startPoint = await textSelectionPoint(startText);
+  if (!viewportBox) {
+    throw new Error("selection fixture has no geometry");
+  }
+  const startScrollTop = await viewport.evaluate((node) => node.scrollTop);
+
+  await page.mouse.move(startPoint.x, startPoint.y);
+  await page.mouse.down();
+  await page.mouse.move(
+    viewportBox.x + viewportBox.width - 48,
+    viewportBox.y + viewportBox.height - 2,
+    { steps: 20 },
+  );
+  for (let step = 0; step < 24; step += 1) {
+    await page.mouse.wheel(0, 220);
+    await page.mouse.move(
+      viewportBox.x + viewportBox.width - 48 + (step % 2),
+      viewportBox.y + viewportBox.height - 2,
+    );
+    await page.waitForTimeout(45);
+  }
+
+  const draggedScrollTop = await viewport.evaluate((node) => node.scrollTop);
+  const draggingSelection = await nativeSelectionSnapshot(page);
+  expect(draggedScrollTop - startScrollTop).toBeGreaterThan(800);
+  expect(draggingSelection.anchorTurnId).toBe("m42");
+  expect(draggingSelection.anchorConnected).toBe(true);
+  expect(draggingSelection.text).toContain("m42");
+  await expect(page.locator('[data-turn-id="m42"]')).toBeAttached();
+  await page.mouse.up();
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-dragging", "false",
+  );
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "true",
+  );
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  }));
+  const immediateReleasedScrollTop =
+    await viewport.evaluate((node) => node.scrollTop);
+  expect(immediateReleasedScrollTop - startScrollTop).toBeGreaterThan(800);
+  expect(Math.abs(immediateReleasedScrollTop - draggedScrollTop)).toBeLessThan(64);
+  await page.waitForTimeout(120);
+  const releasedScrollTop = await viewport.evaluate((node) => node.scrollTop);
+  expect(Math.abs(
+    releasedScrollTop - immediateReleasedScrollTop,
+  )).toBeLessThan(2);
+  const releasedAnchor = await readingAnchor(page);
+  await page.locator('[data-turn-id="m42"]').evaluate((node) => {
+    (node as HTMLElement).style.paddingBottom = "320px";
+  });
+  await page.waitForTimeout(120);
+  const measuredAnchor = await readingAnchor(page);
+  expect(measuredAnchor.id).toBe(releasedAnchor.id);
+  expect(Math.abs(measuredAnchor.offset - releasedAnchor.offset)).toBeLessThan(2);
+  const measuredScrollTop = await viewport.evaluate((node) => node.scrollTop);
+  await page.getByTestId("append-turn").evaluate(
+    (button: HTMLButtonElement) => button.click(),
+  );
+  await page.waitForTimeout(100);
+  expect(Math.abs(
+    await viewport.evaluate((node) => node.scrollTop) - measuredScrollTop,
+  )).toBeLessThan(2);
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "true",
+  );
+
+  await page.evaluate(() => {
+    document.dispatchEvent(new ClipboardEvent("copy", {
+      bubbles: true,
+      cancelable: true,
+    }));
+  });
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "false",
+  );
+  expect(await page.locator(".turn").count()).toBeLessThan(40);
+});
+
+test("a late cached-newer page cannot evict an active text selection", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name === "webkit",
+    "the configured WebKit project is a touch phone; this is a desktop mouse path");
+  await page.goto(
+    "/tests/history-browser.html?deep-browse=1&delay=3000",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await page.getByRole("button", { name: "加载更新的历史" })
+    .dispatchEvent("click");
+  await expect(page.getByTestId("newer-load-count")).toHaveText("1");
+
+  await wheelUntilTurn(page, "m5", -400, testInfo.project.name);
+  const startText = page.locator('[data-turn-id="m5"] p').first();
+  await expect(startText).toBeInViewport();
+  const start = await textSelectionPoint(startText);
+  const textBox = await startText.boundingBox();
+  if (!textBox) throw new Error("selection page fixture has no geometry");
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(
+    Math.min(textBox.x + textBox.width - 2, start.x + 140),
+    start.y,
+    { steps: 8 },
+  );
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-dragging", "true",
+  );
+
+  await expect(page.getByTestId("newest-turn-id")).toHaveText("m28");
+  await expect(page.locator('[data-turn-id="m5"]')).toBeAttached();
+  expect((await nativeSelectionSnapshot(page)).anchorTurnId).toBe("m5");
+  await page.mouse.up();
+  await page.evaluate(() => {
+    document.dispatchEvent(new ClipboardEvent("copy", { bubbles: true }));
+  });
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "false",
+  );
+});
+
+test("switching sessions clears retained desktop text selection", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name === "webkit",
+    "the configured WebKit project is a touch phone; this is a desktop mouse path");
+  await page.goto("/tests/history-browser.html?large=80");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => {
+    node.scrollTop = node.scrollHeight * 0.25;
+  });
+  const startText = page.locator('[data-turn-id="m20"] p').first();
+  await startText.scrollIntoViewIfNeeded();
+  const start = await textSelectionPoint(startText);
+  const textBox = await startText.boundingBox();
+  if (!textBox) throw new Error("selection switch fixture has no geometry");
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(
+    Math.min(textBox.x + textBox.width - 2, start.x + 120),
+    start.y,
+    { steps: 8 },
+  );
+  await page.mouse.up();
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "true",
+  );
+
+  await page.getByTestId("switch-session").click();
+  await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "false",
+  );
+  expect((await nativeSelectionSnapshot(page)).text).toBe("");
+  expect(await page.locator(".turn").count()).toBeLessThan(40);
+});
+
 test("nested process disclosures survive virtual row unmounts", async ({
   page,
 }) => {
@@ -1387,6 +1601,9 @@ test("one stationary press opens a process timeline while a newer turn grows", a
   await page.mouse.up();
 
   await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "false",
+  );
 });
 
 test("one stationary press opens nested thinking while a newer turn grows", async ({

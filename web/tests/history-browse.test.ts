@@ -17,6 +17,7 @@ import {
   installAuthoritativeTurnDetailPage,
   mergeInitialHistory,
 } from "../src/history-merge.ts";
+import { protectedHistoryTurnIds } from "../src/history-selection-guard.ts";
 import {
   DETAIL_PROJECTION_CAP_ITEM_ID,
   installTurnDetailProjectionPage,
@@ -49,6 +50,40 @@ function limits(maxTurns: number, lowWaterTurns = maxTurns): HistoryBrowseLimits
 }
 
 const scopeKey = "machine-a\u0000code\u0000codex";
+const selectionGuard = {
+  sid: "session-a",
+  revision: "revision-a",
+  viewId: "view-a",
+  scopeKey,
+  turnIds: ["turn-2", "turn-8"] as [string, string],
+};
+assert.deepEqual(protectedHistoryTurnIds(
+  "turn-5",
+  selectionGuard,
+  {
+    sid: "session-a",
+    revision: "revision-a",
+    viewId: "view-a",
+    scopeKey,
+  },
+), ["turn-5", "turn-2", "turn-8"]);
+for (const mismatched of [
+  { ...selectionGuard, sid: "session-b" },
+  { ...selectionGuard, revision: "revision-b" },
+  { ...selectionGuard, viewId: "view-b" },
+  { ...selectionGuard, scopeKey: "another-machine" },
+]) {
+  assert.deepEqual(protectedHistoryTurnIds(
+    "turn-5",
+    mismatched,
+    {
+      sid: "session-a",
+      revision: "revision-a",
+      viewId: "view-a",
+      scopeKey,
+    },
+  ), ["turn-5"], "a stale text selection cannot protect another history view");
+}
 
 assert.equal(canonicalTurnId(turn("optimistic", {
   historyTurnId: "native-user-message",

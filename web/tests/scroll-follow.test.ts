@@ -533,8 +533,11 @@ assert.match(appSource, /historyCursor=\{historyView\.oldestId\}/);
 assert.match(chatViewSource,
   /const enteringBrowse = browseMode[\s\S]*request\.revision === historyRevision[\s\S]*anchor\.revision === historyRevision/,
   "runtime-to-browse must preserve an active first-page anchor within one revision");
-assert.match(chatViewSource, /controller\.observeScroll\(metrics, !browseMode\)/,
-  "the bottom of a browse window must never re-enable live following");
+assert.match(
+  chatViewSource,
+  /controller\.observeScroll\(\s*metrics,\s*!browseMode && !textSelectionDragging,\s*\)/,
+  "browse windows and active text drags must never re-enable live following",
+);
 assert.match(chatViewSource, /onClick=\{returnToLatest\}/);
 assert.match(chatViewSource, /onLoadNewer/);
 assert.match(chatViewSource, /turnNodeRefs/,
