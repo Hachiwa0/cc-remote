@@ -273,11 +273,21 @@ async function wheelUntilTurn(
 ): Promise<void> {
   const viewport = page.locator(".thread");
   if (projectName === "webkit") {
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      if (await turnIntersectsViewport(page, turnId)) return;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (await turnIntersectsViewport(page, turnId)) {
+        await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+        return;
+      }
       await dispatchTouchGesture(page, deltaY < 0 ? 60 : -60);
       await viewport.evaluate((node, delta) => {
-        node.scrollBy({ top: delta, behavior: "smooth" });
+        const step = Math.max(
+          160,
+          Math.min(Math.abs(delta), node.clientHeight * 0.8),
+        );
+        node.scrollBy({
+          top: Math.sign(delta) * step,
+          behavior: "auto",
+        });
       }, deltaY);
       await waitForScrollIdle(page);
     }
@@ -293,6 +303,44 @@ async function wheelUntilTurn(
     await page.waitForTimeout(40);
   }
   expect(await turnIntersectsViewport(page, turnId)).toBe(true);
+}
+
+async function scrollThreadToEdge(
+  page: import("@playwright/test").Page,
+  edge: "start" | "end",
+  projectName: string,
+): Promise<void> {
+  const viewport = page.locator(".thread");
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    if (projectName === "webkit") {
+      await dispatchTouchGesture(page, edge === "start" ? 60 : -60);
+    } else {
+      await viewport.dispatchEvent("wheel", {
+        deltaY: edge === "start" ? -80 : 80,
+      });
+    }
+    await viewport.evaluate((node, selectedEdge) => {
+      node.scrollTo({
+        top: selectedEdge === "start" ? 0 : node.scrollHeight,
+        behavior: "auto",
+      });
+    }, edge);
+    await waitForScrollIdle(page);
+    const reached = await viewport.evaluate((node, selectedEdge) => {
+      if (selectedEdge === "start") return node.scrollTop <= 1;
+      return node.scrollHeight - node.scrollTop - node.clientHeight <= 1;
+    }, edge);
+    if (reached) {
+      if (edge === "start") {
+        await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+      }
+      return;
+    }
+  }
+  expect(await viewport.evaluate((node, selectedEdge) => {
+    if (selectedEdge === "start") return node.scrollTop <= 1;
+    return node.scrollHeight - node.scrollTop - node.clientHeight <= 1;
+  }, edge)).toBe(true);
 }
 
 async function dispatchTouchGesture(
@@ -725,6 +773,8 @@ test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
 test("the real wide Robot Core diagram opens once and fits the viewport", async ({
   page,
 }) => {
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
   await page.setViewportSize({ width: 1568, height: 870 });
   await page.goto("/tests/history-browser.html?actual-mermaid=1");
   const diagram = page.locator(".mermaid-block");
@@ -745,7 +795,10 @@ test("the real wide Robot Core diagram opens once and fits the viewport", async 
 
   await trigger.click();
   const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
-  await expect(preview).toBeVisible();
+  await expect.poll(async () => {
+    if (pageErrors.length > 0) return `pageerror: ${pageErrors.join(" | ")}`;
+    return await preview.isVisible() ? "visible" : "missing";
+  }).toBe("visible");
   const bounds = await preview.evaluate((node) => {
     const visual = node.querySelector<HTMLElement>(".image-lightbox-visual");
     if (!visual) throw new Error("lightbox visual is missing");
@@ -784,6 +837,7 @@ test("the real wide Robot Core diagram opens once and fits the viewport", async 
     }));
   });
   await expect(preview).toBeVisible();
+  expect(pageErrors).toEqual([]);
 });
 
 test("desktop trackpad wheel zooms around the pointer and pans the preview", async ({
@@ -1355,20 +1409,19 @@ test("reversing direction while a page is pending preserves the reading row", as
 
 test("virtualization bounds mounted rows and preserves an expanded timeline", async ({
   page,
-}) => {
+}, testInfo) => {
   await page.goto("/tests/history-browser.html?timeline=1");
-  const viewport = page.locator(".thread");
-  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   const timeline = page.locator('[data-turn-id="timeline"]');
   await expect(timeline).toBeVisible();
   await timeline.locator(".turn-process-head").click();
   await expect(timeline.locator(".turn-process-head")).toHaveAttribute("aria-expanded", "true");
 
-  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await scrollThreadToEdge(page, "end", testInfo.project.name);
   await expect(timeline).toHaveCount(0);
   expect(await page.locator(".turn").count()).toBeLessThan(40);
 
-  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   await expect(timeline).toBeVisible();
   await expect(timeline.locator(".turn-process-head")).toHaveAttribute("aria-expanded", "true");
 });
@@ -1548,11 +1601,11 @@ test("switching sessions clears retained desktop text selection", async ({
 
 test("nested process disclosures survive virtual row unmounts", async ({
   page,
-}) => {
+}, testInfo) => {
   await page.goto("/tests/history-browser.html?timeline=1&engine=claude");
-  const viewport = page.locator(".thread");
-  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   const timeline = page.locator('[data-turn-id="timeline"]');
+  await expect(timeline).toBeVisible();
   await timeline.locator(".turn-process-head").click();
   const activity = timeline.locator("details.process-activity");
   const reasoning = timeline.locator("details.process-reasoning");
@@ -1561,9 +1614,9 @@ test("nested process disclosures survive virtual row unmounts", async ({
   await expect(activity).toHaveAttribute("open", "");
   await expect(reasoning).toHaveAttribute("open", "");
 
-  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await scrollThreadToEdge(page, "end", testInfo.project.name);
   await expect(timeline).toHaveCount(0);
-  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   await expect(timeline).toBeVisible();
   await expect(timeline.locator("details.process-activity"))
     .toHaveAttribute("open", "");

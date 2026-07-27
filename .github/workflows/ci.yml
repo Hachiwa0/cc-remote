@@ -67,6 +67,14 @@ jobs:
           npm --prefix web run test:reliability
           npm --prefix web run test:history-browser
           npm --prefix web run lint
+      - name: Preserve Playwright failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failure-${{ github.run_attempt }}
+          path: web/test-results
+          if-no-files-found: warn
+          retention-days: 3
       - name: Preserve built Web client
         uses: actions/upload-artifact@v4
         with:
