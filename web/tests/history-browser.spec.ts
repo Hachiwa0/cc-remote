@@ -1477,6 +1477,7 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   expect(draggingSelection.anchorConnected).toBe(true);
   expect(draggingSelection.text).toContain("m42");
   await expect(page.locator('[data-turn-id="m42"]')).toBeAttached();
+  const draggedAnchor = await readingAnchor(page);
   await page.mouse.up();
   await expect(viewport).toHaveAttribute(
     "data-text-selection-dragging", "false",
@@ -1490,13 +1491,17 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   const immediateReleasedScrollTop =
     await viewport.evaluate((node) => node.scrollTop);
   expect(immediateReleasedScrollTop - startScrollTop).toBeGreaterThan(800);
-  expect(Math.abs(immediateReleasedScrollTop - draggedScrollTop)).toBeLessThan(64);
+  const immediateReleasedAnchor = await readingAnchor(page);
+  // Chromium may finish one native selection auto-scroll step on mouseup.
+  // Retain that released visual position; the app must not replay an older
+  // scroll command after the browser has handed control back.
+  expect(immediateReleasedAnchor.id).toBe(draggedAnchor.id);
   await page.waitForTimeout(120);
-  const releasedScrollTop = await viewport.evaluate((node) => node.scrollTop);
-  expect(Math.abs(
-    releasedScrollTop - immediateReleasedScrollTop,
-  )).toBeLessThan(2);
   const releasedAnchor = await readingAnchor(page);
+  expect(releasedAnchor.id).toBe(immediateReleasedAnchor.id);
+  expect(Math.abs(
+    releasedAnchor.offset - immediateReleasedAnchor.offset,
+  )).toBeLessThan(2);
   await page.locator('[data-turn-id="m42"]').evaluate((node) => {
     (node as HTMLElement).style.paddingBottom = "320px";
   });

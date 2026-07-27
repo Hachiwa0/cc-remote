@@ -68,6 +68,7 @@ const HISTORY_VIRTUAL_OVERSCAN = 6;
 const HISTORY_TURN_GAP_PX = 22;
 const HISTORY_LOAD_HEADER_PX = 52;
 const USER_SCROLL_INTENT_IDLE_MS = 260;
+const HISTORY_ANCHOR_SETTLE_MAX_MS = 2_000;
 // HistoryRequestCoordinator allows replacement after 15 seconds. Release the
 // local anchor just after that boundary so an unanswered command cannot lock
 // pagination forever.
@@ -266,6 +267,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     ((releaseInteraction?: boolean) => void) | null
   >(null);
   const historyReleaseFrameRef = useRef<number | null>(null);
+  const historyReleaseStartedAtRef = useRef<{
+    generation: number;
+    startedAt: number;
+  } | null>(null);
   const historyRequestTimeoutRef = useRef<{
     generation: number | null;
     timer: number;
@@ -533,11 +538,16 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
 
   const cancelHistoryAnchor = useCallback((generation?: number): boolean => {
     clearHistoryRequestTimeout(generation);
+    const activeGeneration =
+      historyAnchorRef.current.current()?.generation ?? null;
     const cancelled = historyAnchorRef.current.cancel(generation);
     if (!cancelled) return false;
     if (historyReleaseFrameRef.current !== null) {
       window.cancelAnimationFrame(historyReleaseFrameRef.current);
       historyReleaseFrameRef.current = null;
+    }
+    if (historyReleaseStartedAtRef.current?.generation === activeGeneration) {
+      historyReleaseStartedAtRef.current = null;
     }
     setActiveHistoryGeneration(null);
     return cancelled;
@@ -793,12 +803,54 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     if (historyReleaseFrameRef.current !== null) {
       window.cancelAnimationFrame(historyReleaseFrameRef.current);
     }
-    historyReleaseFrameRef.current = window.requestAnimationFrame(() => {
+    const previousRelease = historyReleaseStartedAtRef.current;
+    const startedAt = previousRelease?.generation === generation
+      ? previousRelease.startedAt : window.performance.now();
+    historyReleaseStartedAtRef.current = { generation, startedAt };
+    const releaseWhenAligned = () => {
       historyReleaseFrameRef.current = null;
+      const anchor = historyAnchorRef.current.current();
+      if (!anchor || anchor.generation !== generation) {
+        if (historyReleaseStartedAtRef.current?.generation === generation) {
+          historyReleaseStartedAtRef.current = null;
+        }
+        return;
+      }
+      if (touchYRef.current !== null
+          || scrollCoordinatorRef.current.isInteractionLocked()) {
+        // Waiting for a real pointer gesture is not failed settlement time.
+        // Its release path will schedule a fresh bounded correction.
+        if (historyReleaseStartedAtRef.current?.generation === generation) {
+          historyReleaseStartedAtRef.current = null;
+        }
+        return;
+      }
+      const currentOffset = measureTurnOffset(anchor.anchorTurnId);
+      if (currentOffset == null
+          || Math.abs(currentOffset - anchor.anchorOffset) > 0.5) {
+        if (window.performance.now() - startedAt
+            >= HISTORY_ANCHOR_SETTLE_MAX_MS) {
+          cancelHistoryAnchor(generation);
+          completeHistoryLoadGates();
+          return;
+        }
+        // The page can commit before WebKit accepts the post-touch scroll
+        // correction. Keep the keyed row mounted and run the layout
+        // correction again; releasing here would replace it with the newly
+        // prepended first row and make the viewport jump.
+        setScrollPolicyEpoch((value) => value + 1);
+        historyReleaseFrameRef.current =
+          window.requestAnimationFrame(releaseWhenAligned);
+        return;
+      }
       cancelHistoryAnchor(generation);
       completeHistoryLoadGates();
-    });
-  }, [cancelHistoryAnchor, completeHistoryLoadGates]);
+    };
+    historyReleaseFrameRef.current =
+      window.requestAnimationFrame(releaseWhenAligned);
+  }, [
+    cancelHistoryAnchor, completeHistoryLoadGates, measureTurnOffset,
+  ]);
 
   // Freeze one retained row before either asynchronous window mutation.
   // Cached-newer paging may append at the tail and evict rows at the head, so
@@ -1373,6 +1425,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     // native touch ends so the retained history transaction can correct and
     // release its exact reading boundary without fighting the gesture.
     setScrollPolicyEpoch((value) => value + 1);
+    const anchor = historyAnchorRef.current.current();
+    if (anchor?.phase === "applied") {
+      scheduleHistoryAnchorRelease(anchor.generation);
+    }
   };
 
   const scrollToBottom = () => {
