@@ -275,14 +275,16 @@ async function wheelUntilTurn(
   if (projectName === "webkit") {
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (await turnIntersectsViewport(page, turnId)) {
-        await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+        if (deltaY < 0) {
+          await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+        }
         return;
       }
       await dispatchTouchGesture(page, deltaY < 0 ? 60 : -60);
       await viewport.evaluate((node, delta) => {
         const step = Math.max(
           160,
-          Math.min(Math.abs(delta), node.clientHeight * 0.8),
+          Math.min(Math.abs(delta), node.clientHeight * 5),
         );
         node.scrollBy({
           top: Math.sign(delta) * step,
@@ -1609,7 +1611,8 @@ test("nested process disclosures survive virtual row unmounts", async ({
   page,
 }, testInfo) => {
   await page.goto("/tests/history-browser.html?timeline=1&engine=claude");
-  await scrollThreadToEdge(page, "start", testInfo.project.name);
+  await wheelUntilTurn(page, "timeline", -4_000, testInfo.project.name);
+  await waitForScrollIdle(page);
   const timeline = page.locator('[data-turn-id="timeline"]');
   await expect(timeline).toBeVisible();
   await timeline.locator(".turn-process-head").click();
@@ -1620,9 +1623,11 @@ test("nested process disclosures survive virtual row unmounts", async ({
   await expect(activity).toHaveAttribute("open", "");
   await expect(reasoning).toHaveAttribute("open", "");
 
-  await scrollThreadToEdge(page, "end", testInfo.project.name);
+  await wheelUntilTurn(page, "f80", 4_000, testInfo.project.name);
+  await waitForScrollIdle(page);
   await expect(timeline).toHaveCount(0);
-  await scrollThreadToEdge(page, "start", testInfo.project.name);
+  await wheelUntilTurn(page, "timeline", -4_000, testInfo.project.name);
+  await waitForScrollIdle(page);
   await expect(timeline).toBeVisible();
   await expect(timeline.locator("details.process-activity"))
     .toHaveAttribute("open", "");
