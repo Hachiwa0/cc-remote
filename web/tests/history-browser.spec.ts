@@ -324,6 +324,12 @@ async function scrollThreadToEdge(
         top: selectedEdge === "start" ? 0 : node.scrollHeight,
         behavior: "auto",
       });
+      // Synthetic touch events mark genuine reader intent, but Playwright
+      // WebKit does not perform the browser's native pan for them. Deliver the
+      // matching scroll notification after the fixture's explicit scrollTop
+      // write so React and the virtualizer observe the same offset before the
+      // next dynamic row measurement.
+      node.dispatchEvent(new Event("scroll"));
     }, edge);
     await waitForScrollIdle(page);
     const reached = await viewport.evaluate((node, selectedEdge) => {

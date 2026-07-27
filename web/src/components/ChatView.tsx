@@ -390,6 +390,13 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   const virtualScrollPolicy = scrollCoordinatorRef.current.policy(
     scrollState.followOutput,
   );
+  // A history transaction already owns an exact keyed reading boundary. Let
+  // that single coordinator restore the row instead of also asking TanStack
+  // to capture an end anchor for the same prepend. On iOS the latter is
+  // deferred until momentum settles, by which time the local transaction may
+  // already have released and the two corrections can replay out of order.
+  const virtualAnchorTo = keyedPrependActive
+    ? "start" : virtualScrollPolicy.anchorTo;
   const virtualizer = useVirtualizer({
     count: turns.length,
     getScrollElement: () => scrollRef.current,
@@ -397,7 +404,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     getItemKey: turnKeySnapshot.getItemKey,
     // TanStack owns every viewport write. The coordinator only selects policy
     // and serializes explicit bottom requests with interactive pointer locks.
-    anchorTo: virtualScrollPolicy.anchorTo,
+    anchorTo: virtualAnchorTo,
     followOnAppend: virtualScrollPolicy.followOnAppend,
     scrollEndThreshold: 80,
     overscan: HISTORY_VIRTUAL_OVERSCAN,
