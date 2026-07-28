@@ -1030,6 +1030,8 @@ class CodexHandle:
         self.last_rate_limits: Optional[dict] = None
         self.last_rate_limits_by_id: dict[str, dict] = {}
         self.last_goal: Optional[dict[str, Any]] = None
+        self.goal_revision = 0
+        self.last_goal_turn_id: Optional[str] = None
         # A goal/automatic continuation can start without query(), hence without
         # a response queue owned by Machine._run_turn.  Track that one turn
         # separately so the machine can lock the session, expose interrupt, and
@@ -1258,6 +1260,8 @@ class CodexHandle:
         self.last_rate_limits = None
         self.last_rate_limits_by_id = {}
         self.last_goal = None
+        self.goal_revision = 0
+        self.last_goal_turn_id = None
         self._spontaneous_turn_id = None
         self.last_token_usage = None
         self.context_window = None
@@ -3668,11 +3672,18 @@ class CodexHandle:
                     )
                 else:
                     self.last_goal = goal
+                    self.goal_revision += 1
+                    turn_id = params.get("turnId")
+                    self.last_goal_turn_id = (
+                        turn_id if isinstance(turn_id, str) and turn_id else None
+                    )
                     await self._publish_goal(goal)
         elif method == "thread/goal/cleared":
             params = m.get("params") or {}
             if params.get("threadId") == self.thread_id:
                 self.last_goal = None
+                self.goal_revision += 1
+                self.last_goal_turn_id = None
                 await self._publish_goal(None)
         if method == "turn/completed":
             self.turn_active = False
