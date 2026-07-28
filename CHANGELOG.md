@@ -30,6 +30,8 @@
 - Upgrade the coordinated wire contract to protocol v23 and correlate Codex
   status responses with their originating `request_id` so a delayed old-account
   snapshot cannot overwrite newer limits after a switch.
+- Show the current Codex account's five-hour and weekly remaining quota beside
+  context usage, with generation-safe refresh after an account switch.
 
 ## v3.0.0 — 2026-07-24
 

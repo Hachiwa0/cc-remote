@@ -1842,3 +1842,31 @@ test("composer action growth keeps the live tail visible without stealing histor
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 });
+
+test("Codex quota controls fit a 320 px composer", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 720 });
+  await page.goto("/tests/history-browser.html?quota-composer=1");
+
+  const composer = page.getByTestId("quota-composer");
+  await expect(composer.locator(".usage-meter")).toBeVisible();
+  await expect(composer.locator(".hint-ring")).toBeVisible();
+
+  const layout = await composer.evaluate((node) => {
+    const footer = node.getBoundingClientRect();
+    const right = node.querySelector<HTMLElement>(".hint-right")
+      ?.getBoundingClientRect();
+    return {
+      clientWidth: node.clientWidth,
+      scrollWidth: node.scrollWidth,
+      rightLeft: right?.left ?? -1,
+      rightRight: right?.right ?? -1,
+      rightWidth: right?.width ?? 0,
+      footerLeft: footer.left,
+      footerRight: footer.right,
+    };
+  });
+  expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth);
+  expect(layout.rightLeft).toBeGreaterThanOrEqual(layout.footerLeft);
+  expect(layout.rightRight).toBeLessThanOrEqual(layout.footerRight);
+  expect(layout.rightWidth).toBeGreaterThan(280);
+});

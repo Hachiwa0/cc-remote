@@ -3256,6 +3256,7 @@ export default function App() {
           onPreview={previewMarkdown}
           onGoal={runGoal}
           onStatus={openStatus}
+          onRefreshUsage={refreshStatus}
           onReview={(target, value) => {
             if (focusedSid) wsRef.current?.sendStartReview(focusedSid, target, value);
           }}
@@ -3291,6 +3292,9 @@ export default function App() {
           }}
           contextReport={rt.contextReport}
           contextError={rt.contextError}
+          statusReport={rt.statusReport}
+          statusError={rt.statusError}
+          statusLoading={rt.statusRequestId !== null}
         />
           </>
         )}

@@ -811,14 +811,42 @@ function mergeNotices(...groups: Notice[][]): Notice[] {
   return merged.slice(-MAX_SESSION_NOTICES);
 }
 
+const RATE_RESET_JITTER_SECONDS = 60;
+
 function mergeRateWindow(
   current: StatusRateWindow | null | undefined,
   update: StatusRateWindow | null | undefined,
 ): StatusRateWindow | null | undefined {
   if (!update) return current;
+  const currentDuration = current?.window_duration_mins;
+  const updateDuration = update.window_duration_mins;
+  if (currentDuration != null && updateDuration != null
+      && currentDuration !== updateDuration) {
+    return { ...update };
+  }
+  const currentReset = current?.resets_at;
+  const updateReset = update.resets_at;
+  // Provider reset timestamps can jitter by a second across responses. A
+  // genuinely new quota period advances by hours or days, so tolerate one
+  // minute and reject late snapshots from the previous period.
+  if (currentReset != null && updateReset != null
+      && updateReset < currentReset - RATE_RESET_JITTER_SECONDS) {
+    return current;
+  }
+  const newPeriod = currentReset != null && updateReset != null
+    && updateReset > currentReset + RATE_RESET_JITTER_SECONDS;
   const next = { ...(current ?? {}) };
-  if (update.used_percent != null) next.used_percent = update.used_percent;
-  if (update.resets_at != null) next.resets_at = update.resets_at;
+  if (newPeriod && update.used_percent == null) {
+    delete next.used_percent;
+  } else if (update.used_percent != null
+      && (newPeriod || current?.used_percent == null
+        || update.used_percent >= current.used_percent)) {
+    next.used_percent = update.used_percent;
+  }
+  if (updateReset != null) {
+    next.resets_at = currentReset == null || newPeriod
+      ? updateReset : Math.max(currentReset, updateReset);
+  }
   if (update.window_duration_mins != null) {
     next.window_duration_mins = update.window_duration_mins;
   }
