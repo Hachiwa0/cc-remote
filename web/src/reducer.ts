@@ -2461,6 +2461,9 @@ function reduceEvent(
     }
     case "status_report":
       return patch(state, e.sid, (rt) => {
+        // A status read can finish after a newer request.  Never let that old
+        // snapshot overwrite the newer request's loading state or result.
+        if (rt.statusRequestId && e.request_id !== rt.statusRequestId) return;
         rt.statusReport = e;
         rt.statusRequestId = null;
         rt.statusError = null;

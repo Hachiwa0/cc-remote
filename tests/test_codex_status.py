@@ -54,6 +54,7 @@ def test_status_protocol_is_strict_and_round_trips():
     report = StatusReport(
         sid="thread-1",
         to="client-1",
+        request_id="status-1",
         thread=StatusThread(thread_id="thread-1", status="active",
                             active_flags=["waitingOnApproval"]),
         runtime=StatusRuntime(model="gpt-test", sandbox_mode="workspace-write"),

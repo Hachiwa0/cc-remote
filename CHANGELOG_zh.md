@@ -21,6 +21,8 @@
   queued 消息；Goal 走原生目标循环，普通回合使用隐藏的上下文续跑。若 daemon
   重启时正在运行的正是 Goal 自动回合，也会按同一规则迁移；app-server 只恢复 Goal
   状态却没有启动下一回合时，cc-remote 会自动补发隐藏续跑请求。
+- 协同 wire contract 升级到 protocol v23；Codex 状态响应携带源 `request_id`，
+  避免切号后延迟返回的旧账号快照覆盖新额度。
 
 ## v3.0.0 — 2026-07-24
 

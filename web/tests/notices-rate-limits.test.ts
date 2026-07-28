@@ -120,6 +120,36 @@ try {
   assert.equal(Object.hasOwn(merged ?? {}, "credits"), false);
   assert.equal(Object.hasOwn(merged ?? {}, "individualLimit"), false);
 
+  // A delayed status response must not replace the newest in-flight read.
+  state = reduce(state, {
+    type: "begin_status_request", sid, requestId: "status-new",
+  });
+  const staleStatus = {
+    ...report, request_id: "status-old",
+    rate_limits: [{
+      limit_id: "codex", primary: { used_percent: 100 },
+    }],
+  } as StatusReport;
+  state = reduce(state, { type: "event", event: staleStatus });
+  assert.equal(state.runtimes[sid].statusRequestId, "status-new");
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 100,
+    "stale status response must not replace the installed report");
+  const uncorrelatedStatus = { ...staleStatus, request_id: undefined } as StatusReport;
+  state = reduce(state, { type: "event", event: uncorrelatedStatus });
+  assert.equal(state.runtimes[sid].statusRequestId, "status-new");
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 100,
+    "uncorrelated status response must not replace an in-flight request");
+  const currentStatus = {
+    ...report, request_id: "status-new",
+    rate_limits: [{
+      limit_id: "codex", primary: { used_percent: 0 },
+    }],
+  } as StatusReport;
+  state = reduce(state, { type: "event", event: currentStatus });
+  assert.equal(state.runtimes[sid].statusRequestId, null);
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 0,
+    "the matching status response installs and completes the request");
+
   const officialDiagnostic = event({
     type: "notice", notice_id: "codex-notice-private-diagnostic",
     severity: "warning", category: "runtime",

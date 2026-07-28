@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 22
+PROTOCOL_VERSION = 23
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -1489,6 +1489,9 @@ class StatusReport(_Base):
     the successful sections.
     """
     type: Literal["status_report"] = "status_report"
+    # Correlates this snapshot with the reliable GetStatus command that
+    # requested it.  Optional for unsolicited/legacy reports.
+    request_id: Optional[WireId] = None
     thread: StatusThread
     runtime: StatusRuntime
     context: StatusContext

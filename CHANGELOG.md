@@ -27,6 +27,9 @@
   A Goal turn already running when the daemon restarts follows the same contract
   and falls back to a hidden continuation if app-server restores the Goal state
   without launching its next turn.
+- Upgrade the coordinated wire contract to protocol v23 and correlate Codex
+  status responses with their originating `request_id` so a delayed old-account
+  snapshot cannot overwrite newer limits after a switch.
 
 ## v3.0.0 — 2026-07-24
 
