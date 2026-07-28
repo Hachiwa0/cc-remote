@@ -163,6 +163,92 @@ export function historyContainsTurn(history: Turn[], live: Turn): boolean {
   return history.some((turn) => sameTurn(turn, live));
 }
 
+function cloneDetailBlock(block: Block): Block {
+  if (block.kind === "process") {
+    return {
+      ...block,
+      input: block.input ? { ...block.input } : block.input,
+      plan: block.plan?.map((entry) => ({ ...entry })),
+    };
+  }
+  if (block.kind === "tool") {
+    return {
+      ...block,
+      input: { ...block.input },
+      result: block.result ? { ...block.result } : block.result,
+    };
+  }
+  return { ...block };
+}
+
+/** Paint only heavyweight blocks from a same-revision/generation browser
+ * cache over an authoritative summary row.
+ *
+ * The summary remains authoritative for prompt/final/lifecycle. Cached process
+ * is deliberately marked provisional and owns no source segments; the next
+ * accepted TurnDetail page replaces it rather than merging stale events into
+ * the transcript projection.
+ */
+function installCachedDetailRestore(
+  summary: Turn,
+  cached: Turn,
+  reveal: boolean,
+): Turn {
+  if (!summary.done || !cached.done || summary.detailLoaded
+      || summary.detailProjection
+      || (summary.detailEventCount ?? 0) <= 0) return summary;
+  const source = cached.detailProjection?.blocks ?? cached.blocks;
+  const blocks = source.filter((block) => !isFinalTextBlock(block))
+    .map(cloneDetailBlock);
+  if (blocks.length === 0) return summary;
+  return {
+    ...summary,
+    detailLoaded: false,
+    detailLoading: false,
+    detailProjection: {
+      // Empty segments distinguish instant-paint cache from authoritative
+      // cursor pages. installTurnDetailProjectionPage then replaces this
+      // visible block list with the first accepted server page.
+      segments: [],
+      blocks,
+      capped: cached.detailProjection?.capped ?? false,
+      hasMore: false,
+      oldestCursor: null,
+      hasNewer: false,
+      newerCursor: null,
+    },
+    detailHasMore: false,
+    detailOldestCursor: null,
+    detailHasNewer: false,
+    detailNewerCursor: null,
+    detailAutoLoad: false,
+    detailRestorePending: reveal,
+    detailRestoreIncomplete: false,
+    // Automatically recreating thousands of DOM rows would defeat the instant
+    // cache paint. Small latest-turn process is reopened to preserve the live
+    // 1..N reading experience; large projections remain one tap away.
+    detailRestoreOpen: reveal && blocks.length <= 256,
+  };
+}
+
+/** Reconcile cached process with canonical summary identities without
+ * resurrecting a completed row which authoritative History removed. */
+export function restoreCachedTurnDetails(
+  summaries: Turn[],
+  cachedTurns: readonly Turn[],
+): Turn[] {
+  let revealNewest = true;
+  const restored = [...summaries].reverse().map((summary) => {
+    const cached = cachedTurns.find((candidate) => sameTurn(summary, candidate));
+    if (!cached) return summary;
+    const installed = installCachedDetailRestore(
+      summary, cached, revealNewest);
+    if (installed !== summary) revealNewest = false;
+    return installed;
+  });
+  return restored.reverse();
+}
+
 function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
   const historyImageRefs = history.imageRefs?.length
     ? history.imageRefs : undefined;
@@ -246,7 +332,7 @@ export function mergeAuthoritativeTurnDetail(
     error: summary.error,
     progress: summary.progress,
     detailEventCount: summary.detailEventCount,
-    detailLoaded: true,
+    detailLoaded: detail.detailLoaded ?? true,
     detailLoading: false,
     detailProjection: detail.detailProjection ?? summary.detailProjection,
     detailHasMore: detail.detailProjection
@@ -262,6 +348,11 @@ export function mergeAuthoritativeTurnDetail(
       ? detail.detailProjection.newerCursor
       : detail.detailNewerCursor ?? summary.detailNewerCursor,
     detailAutoLoad: detail.detailAutoLoad ?? summary.detailAutoLoad,
+    detailRestorePending: false,
+    detailRestoreOpen:
+      detail.detailRestoreOpen ?? summary.detailRestoreOpen,
+    detailRestoreIncomplete:
+      detail.detailRestoreIncomplete ?? summary.detailRestoreIncomplete,
   };
 }
 
@@ -341,6 +432,8 @@ export function installAuthoritativeTurnDetailPage(
     ? detailProjection.hasNewer : page.hasNewer;
   const newerCursor = detailProjection
     ? detailProjection.newerCursor : page.newerCursor ?? null;
+  const restoreIncomplete =
+    summary.detailRestoreIncomplete === true && hasMore;
   return {
     ...summary,
     prompt: detail.prompt || summary.prompt,
@@ -360,7 +453,7 @@ export function installAuthoritativeTurnDetailPage(
     error: summary.error,
     progress: summary.progress,
     detailEventCount: summary.detailEventCount,
-    detailLoaded: true,
+    detailLoaded: !restoreIncomplete,
     detailLoading: false,
     detailProjection,
     detailHasMore: hasMore,
@@ -368,6 +461,8 @@ export function installAuthoritativeTurnDetailPage(
     detailHasNewer: hasNewer,
     detailNewerCursor: newerCursor,
     detailAutoLoad: !!summary.detailAutoLoad && hasMore,
+    detailRestorePending: false,
+    detailRestoreIncomplete: restoreIncomplete,
   };
 }
 

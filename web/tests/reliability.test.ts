@@ -17,7 +17,10 @@ import {
   queuedQueryWireBytes,
   reduceTargetedRuntime,
 } from "../src/runtime-drain.ts";
-import { mergeInitialHistory } from "../src/history-merge.ts";
+import {
+  mergeInitialHistory,
+  restoreCachedTurnDetails,
+} from "../src/history-merge.ts";
 import {
   HISTORY_INITIAL_PAGE,
   HISTORY_MORE_PAGE,
@@ -693,7 +696,7 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 9/,
+assert.match(cacheSource, /const CACHE_VER = 10/,
   "open-turn merge repair must invalidate duplicate IndexedDB projections");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
@@ -2196,6 +2199,238 @@ try {
   assert.ok(refreshedSummary.runtimes[summarySid].turns[0]
     .detailProjection?.blocks.some((block: Block) => block.kind === "tool"),
   "a same-revision head refresh must not collapse detail the user opened");
+
+  const refreshSid = "completed-process-refresh";
+  const cachedSixStepTurn: Turn = {
+    id: "refresh-turn",
+    prompt: "1",
+    done: true,
+    blocks: [
+      {
+        kind: "text", message_id: "refresh-commentary", text: "2",
+        done: true, channel: "commentary",
+      },
+      {
+        kind: "tool", message_id: "refresh-tool-message-3",
+        tool_use_id: "refresh-tool-3", tool: "Read",
+        input: { file_path: "/tmp/3" }, done: true,
+      },
+      {
+        kind: "tool", message_id: "refresh-tool-message-4",
+        tool_use_id: "refresh-tool-4", tool: "Bash",
+        input: { command: "echo 4" }, done: true,
+      },
+      {
+        kind: "process", item_id: "refresh-process-5",
+        processKind: "command", phase: "snapshot", status: "succeeded",
+        title: "5", done: true,
+      },
+      {
+        kind: "text", message_id: "refresh-final", text: "6",
+        done: true, channel: "final",
+      },
+    ],
+    detailEventCount: 4,
+  };
+  const refreshSummary = () => event({
+    type: "history", session_id: refreshSid, revision: "refresh-r1",
+    generation: "refresh-g1", build_seq: 1, live_seq: 0,
+    detail: "summary", has_more: false, oldest_id: "refresh-turn",
+    events: [], turns: [{
+      id: "refresh-turn", prompt: "1", done: true,
+      blocks: [{
+        kind: "text", message_id: "refresh-final", text: "6",
+        done: true, channel: "final",
+      }],
+      detailEventCount: 4, detailLoaded: false,
+    }],
+  });
+  const processFingerprint = (turn: Turn): string[] =>
+    (turn.detailProjection?.blocks ?? []).map((block) => {
+      if (block.kind === "text") return block.text;
+      if (block.kind === "tool") return block.tool_use_id;
+      return block.title;
+    });
+  const twoCachedRestores = restoreCachedTurnDetails(
+    [
+      {
+        ...cachedSixStepTurn,
+        id: "refresh-turn-older",
+        prompt: "older",
+        blocks: [cachedSixStepTurn.blocks.at(-1)!],
+      },
+      {
+        ...cachedSixStepTurn,
+        blocks: [cachedSixStepTurn.blocks.at(-1)!],
+      },
+    ],
+    [
+      {
+        ...cachedSixStepTurn,
+        id: "refresh-turn-older",
+        prompt: "older",
+      },
+      cachedSixStepTurn,
+    ],
+  );
+  assert.deepEqual(
+    twoCachedRestores.map((turn) => !!turn.detailRestorePending),
+    [false, true],
+    "refresh automatically validates only the newest affected turn instead of downloading every cached process",
+  );
+
+  let cacheFirstRefresh = reduce({
+    ...initialState, focusedSid: refreshSid,
+    runtimes: { [refreshSid]: createRuntime() },
+  }, {
+    type: "hydrate_cache", sid: refreshSid, turns: [cachedSixStepTurn],
+    revision: "refresh-r1", generation: "refresh-g1",
+  });
+  cacheFirstRefresh = reduce(cacheFirstRefresh, {
+    type: "event", event: refreshSummary(),
+  });
+  assert.deepEqual(
+    processFingerprint(cacheFirstRefresh.runtimes[refreshSid].turns[0]),
+    ["2", "refresh-tool-3", "refresh-tool-4", "5"],
+    "cache-first refresh must keep the completed process visible while authoritative detail reloads",
+  );
+  assert.equal(
+    (cacheFirstRefresh.runtimes[refreshSid].turns[0] as Turn & {
+      detailRestorePending?: boolean;
+    }).detailRestorePending,
+    true,
+    "a same-revision cached process should schedule one authoritative detail restore",
+  );
+  assert.equal(
+    (cacheFirstRefresh.runtimes[refreshSid].turns[0] as Turn & {
+      detailRestoreOpen?: boolean;
+    }).detailRestoreOpen,
+    true,
+    "the newest compact process should stay open across a page refresh",
+  );
+
+  let historyFirstRefresh = reduce({
+    ...initialState, focusedSid: refreshSid,
+    runtimes: { [refreshSid]: createRuntime() },
+  }, {
+    type: "event", event: refreshSummary(),
+  });
+  historyFirstRefresh = reduce(historyFirstRefresh, {
+    type: "hydrate_cache", sid: refreshSid, turns: [cachedSixStepTurn],
+    revision: "refresh-r1", generation: "refresh-g1",
+  });
+  assert.deepEqual(
+    processFingerprint(historyFirstRefresh.runtimes[refreshSid].turns[0]),
+    ["2", "refresh-tool-3", "refresh-tool-4", "5"],
+    "History-first refresh must accept the same validated provisional process instead of racing it away",
+  );
+
+  let mismatchedRefresh = reduce({
+    ...initialState, focusedSid: refreshSid,
+    runtimes: { [refreshSid]: createRuntime() },
+  }, {
+    type: "event", event: refreshSummary(),
+  });
+  mismatchedRefresh = reduce(mismatchedRefresh, {
+    type: "hydrate_cache", sid: refreshSid, turns: [cachedSixStepTurn],
+    revision: "refresh-r1", generation: "stale-generation",
+  });
+  assert.deepEqual(
+    processFingerprint(mismatchedRefresh.runtimes[refreshSid].turns[0]),
+    [],
+    "a process cache from another wrapper generation must never be restored",
+  );
+  const mismatchedRevision = reduce(reduce({
+    ...initialState, focusedSid: refreshSid,
+    runtimes: { [refreshSid]: createRuntime() },
+  }, {
+    type: "event", event: refreshSummary(),
+  }), {
+    type: "hydrate_cache", sid: refreshSid, turns: [cachedSixStepTurn],
+    revision: "stale-revision", generation: "refresh-g1",
+  });
+  assert.deepEqual(
+    processFingerprint(mismatchedRevision.runtimes[refreshSid].turns[0]),
+    [],
+    "a process cache from another history revision must never be restored",
+  );
+
+  const restoreRequested = reduce(cacheFirstRefresh, {
+    type: "turn_detail_requested", sid: refreshSid, turnId: "refresh-turn",
+    autoLoad: false,
+  } as Parameters<typeof reduce>[1]);
+  assert.equal(
+    restoreRequested.runtimes[refreshSid].turns[0].detailAutoLoad,
+    false,
+    "automatic refresh repair fetches one newest detail page instead of paging a giant turn to EOF",
+  );
+  assert.equal(
+    (restoreRequested.runtimes[refreshSid].turns[0] as Turn & {
+      detailRestorePending?: boolean;
+    }).detailRestorePending,
+    false,
+    "an accepted restore request is one-shot",
+  );
+  const restoredDetail = reduce(restoreRequested, {
+    type: "event", event: event({
+      type: "turn_detail", session_id: refreshSid,
+      turn_id: "refresh-turn", revision: "refresh-r1",
+      has_more: true, oldest_cursor: "restore-older",
+      events: [
+        event({ type: "user_msg", sid: refreshSid,
+          msg_id: "refresh-turn", prompt: "1" }),
+        event({ type: "assistant_msg_start", sid: refreshSid,
+          message_id: "restore-commentary", channel: "commentary" }),
+        event({ type: "delta", sid: refreshSid,
+          message_id: "restore-commentary", channel: "commentary",
+          text: "2-server" }),
+        event({ type: "assistant_msg_end", sid: refreshSid,
+          message_id: "restore-commentary", channel: "commentary" }),
+        event({ type: "tool_use", sid: refreshSid,
+          message_id: "restore-tool-message", tool_use_id: "restore-tool-5",
+          tool: "Read", input: { file_path: "/tmp/5" } }),
+        event({ type: "tool_result", sid: refreshSid,
+          tool_use_id: "restore-tool-5", content: "ok", is_error: false }),
+        event({ type: "assistant_msg_start", sid: refreshSid,
+          message_id: "refresh-final", channel: "final" }),
+        event({ type: "delta", sid: refreshSid,
+          message_id: "refresh-final", channel: "final", text: "6" }),
+        event({ type: "assistant_msg_end", sid: refreshSid,
+          message_id: "refresh-final", channel: "final" }),
+        event({ type: "turn_end", sid: refreshSid, turn_id: "refresh-turn",
+          result: { subtype: "success", duration_ms: 1, is_error: false } }),
+      ],
+    }),
+  });
+  assert.deepEqual(
+    processFingerprint(restoredDetail.runtimes[refreshSid].turns[0]),
+    ["2-server", "restore-tool-5"],
+    "the authoritative newest detail page replaces rather than merges provisional cache blocks",
+  );
+  assert.equal(
+    restoredDetail.runtimes[refreshSid].turns[0].detailAutoLoad,
+    false,
+    "refresh repair must not follow has_more into an automatic full-turn download",
+  );
+  assert.equal(
+    restoredDetail.runtimes[refreshSid].turns[0].detailLoaded,
+    false,
+    "a one-page repair with older detail remaining must keep the explicit full-process affordance",
+  );
+  const userExpandedRestore = reduce(restoredDetail, {
+    type: "turn_detail_requested", sid: refreshSid, turnId: "refresh-turn",
+    autoLoad: true,
+  });
+  assert.equal(
+    userExpandedRestore.runtimes[refreshSid].turns[0].detailAutoLoad,
+    true,
+    "the user's later disclosure still upgrades the repair into full pagination",
+  );
+  assert.equal(
+    userExpandedRestore.runtimes[refreshSid].turns[0]
+      .detailRestoreIncomplete,
+    false,
+  );
 
   const managedClaudeSid = "managed-claude-session";
   const managedClaudeIdle = reduce({
@@ -6149,6 +6384,115 @@ const skipsOneOversizedCacheTurn = boundCachedTurns([
   { id: "huge", image: "x".repeat(2 * 1024 * 1024 + 1) },
 ]);
 assert.deepEqual(skipsOneOversizedCacheTurn, [{ id: "small", prompt: "keep" }]);
+const oversizedProcessCache = boundCachedTurns([{
+  id: "oversized-process",
+  prompt: "1",
+  done: true,
+  images: [{
+    media_type: "image/png",
+    data: "i".repeat(2 * 1024 * 1024 + 1),
+  }],
+  blocks: [
+    {
+      kind: "text", message_id: "oversized-commentary", text: "2",
+      done: true, channel: "commentary",
+    },
+    {
+      kind: "tool", message_id: "oversized-tool-message-3",
+      tool_use_id: "oversized-tool-3", tool: "Read",
+      input: { file_path: "/tmp/3" },
+      result: {
+        content: "x".repeat(2 * 1024 * 1024 + 1),
+        is_error: false,
+      },
+      done: true,
+    },
+    {
+      kind: "tool", message_id: "oversized-tool-message-4",
+      tool_use_id: "oversized-tool-4", tool: "Bash",
+      input: { command: "echo 4" }, done: true,
+    },
+    {
+      kind: "process", item_id: "oversized-process-5",
+      processKind: "command", phase: "snapshot", status: "succeeded",
+      title: "5", done: true,
+    },
+    {
+      kind: "text", message_id: "oversized-final", text: "6",
+      done: true, channel: "final",
+    },
+  ],
+  detailProjection: {
+    segments: [{
+      pageKey: "huge-segment",
+      before: null,
+      events: [{
+        type: "delta", sid: "oversized-process",
+        message_id: "huge-event", text: "y".repeat(2 * 1024 * 1024 + 1),
+        channel: "commentary", v: 22, ts: 1,
+      }],
+      hasMore: false,
+      oldestCursor: null,
+      hasNewer: false,
+      newerCursor: null,
+      encodedChars: 2 * 1024 * 1024 + 1,
+    }],
+    blocks: [],
+    capped: false,
+    hasMore: false,
+    oldestCursor: null,
+    hasNewer: false,
+    newerCursor: null,
+  },
+  detailEventCount: 4,
+  detailLoaded: true,
+}] as Turn[]) as Turn[];
+assert.equal(oversizedProcessCache.length, 1,
+  "one heavy attachment/output must not evict the whole visible turn");
+assert.equal(oversizedProcessCache[0].images, undefined,
+  "base64 attachments stay in the lazy history-image path");
+assert.equal(oversizedProcessCache[0].detailProjection, undefined,
+  "raw cursor pages are never copied into the instant-paint cache");
+assert.deepEqual(oversizedProcessCache[0].blocks.map((block) => {
+  if (block.kind === "text") return block.text;
+  if (block.kind === "tool") return block.tool_use_id;
+  return block.title;
+}), ["2", "oversized-tool-3", "oversized-tool-4", "5", "6"],
+"the compact cache keeps every visible 1..6 timeline identity across refresh");
+assert.ok(new TextEncoder().encode(
+  JSON.stringify(oversizedProcessCache[0])).byteLength < 2 * 1024 * 1024,
+"the instant projection must remain bounded independently of heavy detail");
+const smallImageCache = boundCachedTurns([{
+  id: "small-image-turn",
+  prompt: "preview",
+  done: true,
+  images: [{ media_type: "image/png", data: "small-preview" }],
+  blocks: [],
+}] as Turn[]) as Turn[];
+assert.equal(smallImageCache[0].images?.[0]?.data, "small-preview",
+  "small optimistic images remain available during the first paint");
+const extremeTimelineCache = boundCachedTurns([{
+  id: "extreme-timeline-turn",
+  prompt: "keep every visible row",
+  done: true,
+  blocks: Array.from({ length: 256 }, (_, index) => ({
+    kind: "tool" as const,
+    message_id: `message-${"m".repeat(12 * 1024)}-${index}`,
+    tool_use_id: `tool-${"t".repeat(12 * 1024)}-${index}`,
+    tool: "Bash",
+    input: { command: `echo ${index}` },
+    done: true,
+  })),
+}] as Turn[]) as Turn[];
+assert.equal(extremeTimelineCache.length, 1);
+assert.equal(extremeTimelineCache[0].blocks.length, 256,
+  "the hard cache fallback preserves the full bounded timeline skeleton");
+assert.equal(new Set(extremeTimelineCache[0].blocks.map((block) =>
+  block.kind === "tool" ? block.tool_use_id : "")).size, 256,
+"hard clipping must retain the unique suffix of every process identity");
+assert.ok(new TextEncoder().encode(
+  JSON.stringify(extremeTimelineCache[0])).byteLength < 2 * 1024 * 1024,
+"even pathological process identifiers cannot evict the current timeline");
 const stripsFileBodiesFromCache = boundCachedTurns([{
   id: "file-turn",
   prompt: "upload",

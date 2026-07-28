@@ -131,4 +131,13 @@ export interface Turn {
   detailProjection?: TurnDetailProjection;
   /** Initial disclosure click keeps fetching older pages until EOF or cap. */
   detailAutoLoad?: boolean;
+  /** Same-revision IndexedDB process is painted provisionally while one
+   * authoritative newest-page detail read replaces it after refresh. */
+  detailRestorePending?: boolean;
+  /** Reopen only the newest compact cached process after a full page refresh;
+   * a user's subsequent disclosure choice overrides this hint. */
+  detailRestoreOpen?: boolean;
+  /** The automatic refresh repair installed only the newest server page; an
+   * explicit disclosure may still request the remaining older pages. */
+  detailRestoreIncomplete?: boolean;
 }

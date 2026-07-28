@@ -404,6 +404,9 @@ body{
 .message-link-disabled{ color:var(--dim); border-bottom:1px dotted var(--faint); cursor:not-allowed; }
 .prose blockquote{ border-left:3px solid var(--accent-line); margin:8px 0; padding:2px 12px; color:var(--dim); }
 .prose img{ max-width:100%; height:auto; }
+.prose .katex-display{ max-width:100%; margin:10px 0; padding:2px 0;
+  overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; }
+.prose .katex-display>.katex{ white-space:nowrap; }
 .message-image-trigger{ display:inline-block; max-width:100%; margin:5px 0; padding:0; border:0;
   border-radius:10px; background:none; cursor:zoom-in; vertical-align:top; touch-action:manipulation; }
 .message-inline-image{ display:block; max-width:min(100%,680px); max-height:min(62vh,680px);

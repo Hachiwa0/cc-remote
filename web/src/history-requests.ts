@@ -173,6 +173,8 @@ export type HistoryDetailRequestContext =
       revision: string;
       turnId: string;
       before?: string | null;
+      /** Initial user expansion pages to EOF; refresh repair reads one page. */
+      autoLoad?: boolean;
     }
   | {
       target: "browse";

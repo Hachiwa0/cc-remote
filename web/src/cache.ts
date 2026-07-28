@@ -9,6 +9,9 @@
 import {
   isSessionControl, sessionControlTargetsSid, type SessionControl,
 } from "./protocol.ts";
+import type {
+  Block, ProcessBlock, TextBlock, ToolBlock, Turn,
+} from "./domain/conversation.ts";
 
 const DB_NAME = "cc_remote_cache";
 const STORE = "sessions";
@@ -24,10 +27,17 @@ const SCHEMA = 1;
 // cannot fall back to an unrevisioned terminal lock. v9 discards projections
 // written by the old open-turn History merge, which could persist duplicate
 // assistant blocks after switching away from and back to a running session.
-const CACHE_VER = 9;
+// v10 separates the instant timeline skeleton from heavyweight detail so one
+// image or tool output can no longer evict an otherwise valid completed turn.
+const CACHE_VER = 10;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
+const CACHE_PROMPT_CHARS = 128 * 1024;
+const CACHE_FINAL_TEXT_CHARS = 512 * 1024;
+const CACHE_PROCESS_TEXT_CHARS = 256 * 1024;
+const CACHE_PROCESS_DETAIL_CHARS = 512 * 1024;
+const CACHE_IMAGE_CHARS = 384 * 1024;
 
 interface ReplayRecord {
   sid: string;
@@ -43,38 +53,308 @@ function retainNewest(records: ReplayRecord[], record: ReplayRecord): void {
   if (records.length > MAX_CACHE_SESSIONS) records.length = MAX_CACHE_SESSIONS;
 }
 
-/** Bound the structured clone written for one session. Large image turns are
- * intentionally omitted from the instant-paint cache; authoritative history is
- * fetched on focus, while the replay cursor remains stored separately. */
-export function boundCachedTurns(turns: unknown[]): unknown[] {
-  const candidates = turns.slice(-MAX_CACHE_TURNS).map((turn) => {
-    if (!turn || typeof turn !== "object" || Array.isArray(turn)) return turn;
-    const record = turn as Record<string, unknown>;
-    if (!Array.isArray(record.files)) return turn;
-    // QueryFile.data is needed only until the command is put on the wire.  The
-    // transcript protocol intentionally echoes metadata only, so make the
-    // best-effort local cache obey the same rule even if an optimistic turn from
-    // an older caller still contains the original body.
+function clipCacheString(value: string | null | undefined, limit: number):
+    string | null | undefined {
+  if (value == null || value.length <= limit) return value;
+  if (limit <= 1) return "…".slice(0, limit);
+  const marker = "…";
+  const content = limit - marker.length;
+  const head = Math.ceil(content / 2);
+  return value.slice(0, head) + marker + value.slice(-(content - head));
+}
+
+function compactCacheValue(
+  value: unknown,
+  limit: number,
+  depth = 0,
+): unknown {
+  if (value == null || typeof value === "boolean"
+      || typeof value === "number") return value;
+  if (typeof value === "string") return clipCacheString(value, limit);
+  if (depth >= 2) return "…";
+  if (Array.isArray(value)) {
+    return value.slice(0, 16).map((item) =>
+      compactCacheValue(item, Math.max(64, Math.floor(limit / 16)), depth + 1));
+  }
+  if (typeof value !== "object") return String(value);
+  const result: Record<string, unknown> = {};
+  const entries = Object.entries(value as Record<string, unknown>).slice(0, 32);
+  const itemLimit = Math.max(64, Math.floor(limit / Math.max(1, entries.length)));
+  for (const [key, item] of entries) {
+    result[clipCacheString(key, 256) ?? key] =
+      compactCacheValue(item, itemLimit, depth + 1);
+  }
+  if (Object.keys(value as object).length > entries.length) {
+    result._truncated = true;
+  }
+  return result;
+}
+
+function compactToolBlock(
+  block: ToolBlock,
+  detailBudget: { remaining: number },
+): ToolBlock {
+  const take = (value: string | null | undefined, limit: number) => {
+    const available = Math.max(0, Math.min(limit, detailBudget.remaining));
+    const clipped = clipCacheString(value, available);
+    detailBudget.remaining -= clipped?.length ?? 0;
+    return clipped;
+  };
+  const inputLimit = Math.min(8 * 1024, detailBudget.remaining);
+  const input = compactCacheValue(block.input, inputLimit);
+  detailBudget.remaining -= JSON.stringify(input)?.length ?? 0;
+  return {
+    ...block,
+    input: input && typeof input === "object" && !Array.isArray(input)
+      ? input as Record<string, unknown> : {},
+    title: clipCacheString(block.title, 1024),
+    server: clipCacheString(block.server, 1024) ?? undefined,
+    progress: take(block.progress, 8 * 1024) ?? undefined,
+    output: take(block.output, 16 * 1024) ?? undefined,
+    diff: take(block.diff, 32 * 1024) ?? undefined,
+    result: block.result ? {
+      ...block.result,
+      content: take(block.result.content, 16 * 1024) ?? "",
+      summary: take(block.result.summary, 8 * 1024),
+      diff: take(block.result.diff, 32 * 1024),
+    } : undefined,
+  };
+}
+
+function compactProcessBlock(
+  block: ProcessBlock,
+  detailBudget: { remaining: number },
+): ProcessBlock {
+  const take = (value: string | null | undefined, limit: number) => {
+    const available = Math.max(0, Math.min(limit, detailBudget.remaining));
+    const clipped = clipCacheString(value, available);
+    detailBudget.remaining -= clipped?.length ?? 0;
+    return clipped;
+  };
+  const inputLimit = Math.min(8 * 1024, detailBudget.remaining);
+  const input = compactCacheValue(block.input, inputLimit);
+  detailBudget.remaining -= JSON.stringify(input)?.length ?? 0;
+  return {
+    ...block,
+    title: clipCacheString(block.title, 1024) || "处理事件",
+    summary: take(block.summary, 8 * 1024),
+    detail: take(block.detail, 16 * 1024),
+    input: input && typeof input === "object" && !Array.isArray(input)
+      ? input as Record<string, unknown> : null,
+    output: take(block.output, 16 * 1024),
+    diff: take(block.diff, 32 * 1024),
+    progress: take(block.progress, 8 * 1024),
+    server: clipCacheString(block.server, 1024),
+    tool: clipCacheString(block.tool, 1024),
+    command: take(block.command, 16 * 1024),
+    cwd: take(block.cwd, 4 * 1024),
+    explanation: take(block.explanation, 8 * 1024),
+    plan: block.plan?.slice(0, 64).map((entry) => ({
+      ...entry,
+      step: take(entry.step, 2 * 1024) || "（空步骤）",
+    })),
+  };
+}
+
+/** Store the same lightweight local projection a native conversation client
+ * paints on launch: every visible timeline identity survives, while attachment
+ * bytes, raw cursor pages and heavyweight outputs remain in their independently
+ * paged authoritative stores. A single large field can therefore never evict
+ * the whole turn and make the middle of a completed process disappear. */
+function projectTurnForCache(turn: Turn): Turn {
+  const finalBudget = { remaining: CACHE_FINAL_TEXT_CHARS };
+  const processTextBudget = { remaining: CACHE_PROCESS_TEXT_CHARS };
+  const detailBudget = { remaining: CACHE_PROCESS_DETAIL_CHARS };
+  const projectionBlocks = turn.detailProjection?.blocks?.length
+    ? turn.detailProjection.blocks : turn.blocks;
+  const finalBlocks = turn.blocks.filter((block): block is TextBlock =>
+    block.kind === "text" && block.channel === "final");
+  const sourceBlocks = [...projectionBlocks];
+  for (const finalBlock of finalBlocks) {
+    if (!sourceBlocks.some((block) =>
+      block.kind === "text" && block.message_id === finalBlock.message_id)) {
+      sourceBlocks.push(finalBlock);
+    }
+  }
+  const blocks = sourceBlocks.map((block): Block => {
+    if (block.kind === "tool") return compactToolBlock(block, detailBudget);
+    if (block.kind === "process") {
+      return compactProcessBlock(block, detailBudget);
+    }
+    const budget = block.channel === "final" ? finalBudget : processTextBudget;
+    const perBlock = block.channel === "final" ? 256 * 1024 : 16 * 1024;
+    const available = Math.max(0, Math.min(perBlock, budget.remaining));
+    const text = clipCacheString(block.text, available) ?? "";
+    budget.remaining -= text.length;
+    return { ...block, text };
+  });
+  const deferredBlocks = blocks.filter((block) =>
+    block.kind !== "text" || block.channel !== "final").length;
+  const imageChars = turn.images?.reduce(
+    (total, image) => total + image.media_type.length + image.data.length, 0);
+  const images = imageChars != null && imageChars <= CACHE_IMAGE_CHARS
+    ? turn.images?.map((image) => ({ ...image }))
+    : undefined;
+  return {
+    ...turn,
+    prompt: clipCacheString(turn.prompt, CACHE_PROMPT_CHARS) ?? "",
+    error: clipCacheString(turn.error, 32 * 1024) ?? undefined,
+    progress: clipCacheString(turn.progress, 8 * 1024) ?? undefined,
+    blocks,
+    // Keep a small optimistic attachment set for a flicker-free first paint.
+    // Larger bodies stay in the transcript image store and are refilled through
+    // History image references instead of evicting the whole turn.
+    images,
+    imageRefs: turn.imageRefs?.slice(0, 64).map((image) => ({ ...image })),
+    files: turn.files?.slice(0, 64).map((file) => ({
+      filename: clipCacheString(file.filename, 16 * 1024) ?? "",
+      data: "",
+    })),
+    detailEventCount: Math.max(turn.detailEventCount ?? 0, deferredBlocks),
+    detailLoaded: false,
+    detailLoading: false,
+    detailProjection: undefined,
+    detailHasMore: false,
+    detailOldestCursor: null,
+    detailHasNewer: false,
+    detailNewerCursor: null,
+    detailAutoLoad: false,
+    detailRestorePending: false,
+    detailRestoreOpen: false,
+    detailRestoreIncomplete: false,
+  };
+}
+
+function projectTurnSkeletonForCache(turn: Turn): Turn {
+  let finalRemaining = 128 * 1024;
+  let processRemaining = 128 * 1024;
+  const blocks = turn.blocks.map((block): Block => {
+    if (block.kind === "text") {
+      const final = block.channel === "final";
+      const remaining = final ? finalRemaining : processRemaining;
+      const text = clipCacheString(
+        block.text, Math.min(final ? 32 * 1024 : 2 * 1024, remaining)) ?? "";
+      if (final) finalRemaining -= text.length;
+      else processRemaining -= text.length;
+      return {
+        ...block,
+        message_id: clipCacheString(block.message_id, 1024) ?? "",
+        text,
+      };
+    }
+    if (block.kind === "tool") {
+      return {
+        kind: "tool",
+        message_id: clipCacheString(block.message_id, 1024) ?? "",
+        tool_use_id: clipCacheString(block.tool_use_id, 1024) ?? "",
+        tool: clipCacheString(block.tool, 512) ?? "",
+        input: compactCacheValue(block.input, 1024) as Record<string, unknown>,
+        category: block.category,
+        title: clipCacheString(block.title, 512),
+        parent_id: clipCacheString(block.parent_id, 1024),
+        server: clipCacheString(block.server, 512),
+        progress: clipCacheString(block.progress, 1024) ?? undefined,
+        result: block.result ? {
+          content: "",
+          is_error: block.result.is_error,
+          truncated: true,
+          status: block.result.status,
+          summary: clipCacheString(block.result.summary, 1024),
+          exit_code: block.result.exit_code,
+          duration_ms: block.result.duration_ms,
+        } : undefined,
+        done: block.done,
+      };
+    }
     return {
-      ...record,
-      files: record.files.map((file) => {
-        const filename = file && typeof file === "object"
-          && typeof (file as Record<string, unknown>).filename === "string"
-          ? (file as Record<string, unknown>).filename as string
-          : "";
-        return { filename, data: "" };
-      }),
+      kind: "process",
+      item_id: clipCacheString(block.item_id, 1024) ?? "",
+      processKind: block.processKind,
+      phase: block.phase,
+      status: block.status,
+      turn_id: clipCacheString(block.turn_id, 1024),
+      parent_id: clipCacheString(block.parent_id, 1024),
+      title: clipCacheString(block.title, 512) || "处理事件",
+      summary: clipCacheString(block.summary, 1024),
+      progress: clipCacheString(block.progress, 1024),
+      server: clipCacheString(block.server, 512),
+      tool: clipCacheString(block.tool, 512),
+      command: clipCacheString(block.command, 1024),
+      cwd: clipCacheString(block.cwd, 1024),
+      exit_code: block.exit_code,
+      duration_ms: block.duration_ms,
+      truncated: true,
+      plan: block.plan?.slice(0, 32).map((entry) => ({
+        ...entry,
+        step: clipCacheString(entry.step, 512) || "（空步骤）",
+      })),
+      done: block.done,
     };
   });
+  return {
+    ...turn,
+    prompt: clipCacheString(turn.prompt, 16 * 1024) ?? "",
+    error: clipCacheString(turn.error, 8 * 1024) ?? undefined,
+    progress: clipCacheString(turn.progress, 2 * 1024) ?? undefined,
+    blocks,
+    images: undefined,
+    imageRefs: turn.imageRefs?.slice(0, 32).map((image) => ({ ...image })),
+    files: turn.files?.slice(0, 32).map((file) => ({
+      filename: clipCacheString(file.filename, 1024) ?? "",
+      data: "",
+    })),
+  };
+}
+
+function cacheTurn(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (typeof record.id === "string"
+      && typeof record.prompt === "string"
+      && typeof record.done === "boolean"
+      && Array.isArray(record.blocks)) {
+    return projectTurnForCache(value as Turn);
+  }
+  if (!Array.isArray(record.files)) return value;
+  return {
+    ...record,
+    files: record.files.map((file) => {
+      const filename = file && typeof file === "object"
+        && typeof (file as Record<string, unknown>).filename === "string"
+        ? (file as Record<string, unknown>).filename as string
+        : "";
+      return { filename, data: "" };
+    }),
+  };
+}
+
+/** Bound the structured clone written for one session. */
+export function boundCachedTurns(turns: unknown[]): unknown[] {
+  const candidates = turns.slice(-MAX_CACHE_TURNS);
   const kept: unknown[] = [];
   let bytes = 2; // []
   for (let i = candidates.length - 1; i >= 0; i--) {
+    // Project lazily newest-first. A large current turn usually fills most of
+    // the instant-paint budget, so walking and cloning every older page on each
+    // 400 ms streaming flush would create avoidable main-thread work.
+    let candidate = cacheTurn(candidates[i]);
     let encoded: string | undefined;
-    try { encoded = JSON.stringify(candidates[i]); } catch { continue; }
+    try { encoded = JSON.stringify(candidate); } catch { continue; }
     if (encoded === undefined) continue;
-    const size = new TextEncoder().encode(encoded).byteLength + 1;
+    let size = new TextEncoder().encode(encoded).byteLength + 1;
+    if (size > MAX_CACHE_BYTES && candidate
+        && typeof candidate === "object" && !Array.isArray(candidate)
+        && typeof (candidate as Partial<Turn>).id === "string"
+        && typeof (candidate as Partial<Turn>).prompt === "string"
+        && typeof (candidate as Partial<Turn>).done === "boolean"
+        && Array.isArray((candidate as Partial<Turn>).blocks)) {
+      candidate = projectTurnSkeletonForCache(candidate as Turn);
+      try { encoded = JSON.stringify(candidate); } catch { continue; }
+      if (encoded === undefined) continue;
+      size = new TextEncoder().encode(encoded).byteLength + 1;
+    }
     if (size > MAX_CACHE_BYTES || bytes + size > MAX_CACHE_BYTES) continue;
-    kept.unshift(candidates[i]);
+    kept.unshift(candidate);
     bytes += size;
   }
   return kept;

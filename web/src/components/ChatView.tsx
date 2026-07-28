@@ -2008,7 +2008,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                 onLoadImage={onLoadImage}
                 onInteractionStart={beginProcessInteraction}
                 onInteractionEnd={endProcessInteraction}
-                openOverride={processDisclosureOpen[`${processOpenKey}\u0000outer`]}
+                openOverride={
+                  processDisclosureOpen[`${processOpenKey}\u0000outer`]
+                  ?? (t.detailRestoreOpen ? true : undefined)
+                }
                 onOpenChange={(open) => rememberProcessDisclosure(
                   `${processOpenKey}\u0000outer`, open,
                 )}

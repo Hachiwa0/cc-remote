@@ -1577,6 +1577,7 @@ export default function App() {
                     type: "turn_detail_requested", sid: detailTarget.sid,
                     turnId: detailTarget.turnId,
                     before: detailTarget.before,
+                    autoLoad: detailTarget.autoLoad,
                   });
                 }
               });
@@ -2373,6 +2374,7 @@ export default function App() {
 
   const loadHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
+    autoLoad = true,
   ): boolean => {
     const current = stateRef.current;
     const sid = current.focusedSid;
@@ -2405,6 +2407,7 @@ export default function App() {
           revision: runtime.historyRevision,
           turnId,
           before,
+          autoLoad,
         };
     if (!historyDetailRequestsRef.current.begin(context)) return false;
     const sent = wsRef.current?.sendGetTurnDetail(
@@ -2425,10 +2428,26 @@ export default function App() {
         before,
       });
     } else {
-      dispatch({ type: "turn_detail_requested", sid, turnId, before });
+      dispatch({
+        type: "turn_detail_requested", sid, turnId, before, autoLoad,
+      });
     }
     return true;
   }, [focusedEngine, historyPageScopeFor, space]);
+  useEffect(() => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime || current.historyBrowse?.sid === sid) return;
+    // Restore only the newest affected row and only its newest detail page.
+    // Older rows retain their instant cached projection until the user opens
+    // them, avoiding a refresh-triggered multi-megabyte pagination cascade.
+    const target = [...runtime.turns].reverse().find((turn) =>
+      turn.detailRestorePending === true && turn.detailLoading !== true);
+    if (!target) return;
+    loadHistoryTurnDetail(target.id, undefined, false);
+  }, [loadHistoryTurnDetail, state.historyBrowse, state.runtimes,
+    state.focusedSid]);
   useEffect(() => {
     const current = stateRef.current;
     const sid = current.focusedSid;

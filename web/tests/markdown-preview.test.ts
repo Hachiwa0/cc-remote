@@ -175,6 +175,9 @@ const harness = await createServer({
 });
 try {
   const { initialState, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
+  const { preloadMarkdownMathPlugins } = await harness.ssrLoadModule(
+    "/src/markdown-math.ts");
+  await preloadMarkdownMathPlugins();
   const { ArtifactPanel } = await harness.ssrLoadModule(
     "/src/components/ArtifactPanel.tsx");
   const { buildSandboxDocument } = await harness.ssrLoadModule(
@@ -204,6 +207,63 @@ try {
   assert.match(completedMermaidMarkup, /class="mermaid-source"/);
   assert.match(completedMermaidMarkup, /flowchart LR/);
   assert.match(completedMermaidMarkup, /aria-label="复制 Mermaid 源码"/);
+  const completedDisplayBracketMath = renderToStaticMarkup(
+    createElement(MessageBlock, {
+      text: String.raw`\[ r = \frac{h}{\sin |\alpha|} \]`,
+      done: true,
+    }),
+  );
+  assert.match(completedDisplayBracketMath, /class="katex-display"/,
+    "completed assistant bracket-delimited display math must render with KaTeX");
+  assert.doesNotMatch(completedDisplayBracketMath, /aria-label="复制代码"/,
+    "math output must not be wrapped in the fenced-code copy UI");
+  const completedInlineBracketMath = renderToStaticMarkup(
+    createElement(MessageBlock, {
+      text: String.raw`半径为 \(r = h / \sin \alpha\)。`,
+      done: true,
+    }),
+  );
+  assert.match(completedInlineBracketMath, /class="katex"/,
+    "completed assistant bracket-delimited inline math must render with KaTeX");
+  const completedDollarMath = renderToStaticMarkup(createElement(MessageBlock, {
+    text: String.raw`inline $r=h$
+
+$$
+h=r\sin\alpha
+$$`,
+    done: true,
+  }));
+  assert.match(completedDollarMath, /class="katex"/);
+  assert.match(completedDollarMath, /class="katex-display"/,
+    "both dollar-delimited inline and display math remain supported");
+  const streamingMathMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: String.raw`\[ r = \frac{h}{\sin |\alpha|} \]`,
+    done: false,
+  }));
+  assert.doesNotMatch(streamingMathMarkup, /class="katex/,
+    "streaming formula source stays stable until the message is terminal");
+  assert.match(streamingMathMarkup, /\\frac/,
+    "streaming formula source remains readable instead of repeatedly re-laying out");
+  const literalMathMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "Inline code: `\\(\\alpha\\)`\n\n"
+      + "```text\n\\[not math\\]\n```",
+    done: true,
+  }));
+  assert.doesNotMatch(literalMathMarkup, /class="katex/,
+    "math delimiters inside inline and fenced code remain literal");
+  assert.match(literalMathMarkup, /aria-label="复制代码"/);
+  const plainBracketMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "普通数组 [1, 2, 3] 不是数学定界符。",
+    done: true,
+  }));
+  assert.doesNotMatch(plainBracketMarkup, /class="katex/,
+    "ordinary square brackets must never be guessed as display math");
+  const untrustedMathMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: String.raw`$\href{javascript:alert(1)}{unsafe}$`,
+    done: true,
+  }));
+  assert.doesNotMatch(untrustedMathMarkup, /href="javascript:/,
+    "KaTeX trust stays disabled for model-provided commands");
   const codexDirectiveMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "提交完成。\n\n::git-commit{cwd=\"/tmp/private-project\"}",
     done: true,
@@ -463,6 +523,26 @@ try {
   assert.match(mermaidPreviewMarkup, /sequenceDiagram/);
   assert.doesNotMatch(mermaidPreviewMarkup, /<pre><div/,
     "the Mermaid component must not be nested inside an invalid pre element");
+  const mathPreviewMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: {
+      file: "docs/formula.md",
+      sid: "session-1",
+      requestId: "preview-math",
+      kind: "md",
+      content: String.raw`\[ r = \frac{h}{\sin |\alpha|} \]`,
+      size: 42,
+      mtimeNs: "4",
+      revision: "c".repeat(64),
+      assets: {},
+    },
+    active: "diff",
+    hasBtw: false,
+    onTab: () => {},
+    onClose: () => {},
+  }));
+  assert.match(mathPreviewMarkup, /class="katex-display"/,
+    "artifact Markdown preview and chat messages must share math rendering");
+  assert.doesNotMatch(mathPreviewMarkup, /aria-label="复制代码"/);
 
   const messageMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "[codex_stream.py](/home/nancy/project/codex_stream.py:731)",

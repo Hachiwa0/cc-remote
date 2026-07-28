@@ -1,7 +1,6 @@
 import { createContext, isValidElement, useContext, useEffect, useMemo, useRef,
   useState, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { parseLocalFileTarget } from "../file-link";
 import { Icon } from "../icons";
 import {
@@ -9,6 +8,12 @@ import {
   type InlineImageAsset,
 } from "../inline-image-assets";
 import { isMermaidFenceClass } from "../mermaid";
+import {
+  isMathFenceClass,
+  normalizeMathDelimiters,
+  STREAMING_REMARK_PLUGINS,
+  useMarkdownMathPlugins,
+} from "../markdown-math";
 import { MermaidBlock } from "./MermaidBlock";
 
 const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
@@ -227,7 +232,9 @@ function fenceClassName(children: ReactNode): string | undefined {
 
 function MarkdownPre({ children }: ComponentPropsWithoutRef<"pre">) {
   const { done } = useContext(MessageMarkdownContext);
-  if (done && isMermaidFenceClass(fenceClassName(children))) return <>{children}</>;
+  const className = fenceClassName(children);
+  if (done && (isMermaidFenceClass(className)
+      || isMathFenceClass(className))) return <>{children}</>;
   return <CopyableCodeBlock>{children}</CopyableCodeBlock>;
 }
 
@@ -235,6 +242,9 @@ function MarkdownCode({
   className, children,
 }: ComponentPropsWithoutRef<"code">) {
   const { done } = useContext(MessageMarkdownContext);
+  if (done && isMathFenceClass(className)) {
+    return <code className={className}>{children}</code>;
+  }
   if (done && isMermaidFenceClass(className)) {
     return <MermaidBlock source={nodeText(children).replace(/\n$/, "")} />;
   }
@@ -249,8 +259,6 @@ const MESSAGE_MARKDOWN_COMPONENTS: Components = Object.freeze({
   img: MarkdownImage,
   a: MarkdownLink,
 });
-const MESSAGE_REMARK_PLUGINS = [remarkGfm];
-
 // Streams markdown with a ~50ms throttle: re-parsing react-markdown on every
 // token delta is wasteful, so we hold a "shown" buffer that catches up on a
 // timer while streaming, and snaps to the full text when the block is done.
@@ -288,7 +296,10 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
   const markdownContext = useMemo<MessageMarkdownContextValue>(() => ({
     done, imageAssets, onLoadImage, onOpenFile, onPreviewImage,
   }), [done, imageAssets, onLoadImage, onOpenFile, onPreviewImage]);
-  const parts = useMemo(() => splitCodexDirectives(shown), [shown]);
+  const mathPlugins = useMarkdownMathPlugins(shown, done);
+  const parts = useMemo(() => splitCodexDirectives(
+    mathPlugins ? normalizeMathDelimiters(shown) : shown,
+  ), [mathPlugins, shown]);
 
   if (!shown) return null;
   return (
@@ -296,7 +307,9 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
       <div className="prose">
         {parts.map((part, index) => part.kind === "markdown"
           ? <ReactMarkdown key={`markdown-${index}`}
-              remarkPlugins={MESSAGE_REMARK_PLUGINS}
+              remarkPlugins={
+                mathPlugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
+              rehypePlugins={mathPlugins?.rehypePlugins}
               components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</ReactMarkdown>
           : <div key={`directive-${index}`} className="codex-directive-status"
               data-directive={part.name}>

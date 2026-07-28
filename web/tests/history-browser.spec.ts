@@ -655,6 +655,79 @@ test("history page cache upgrades v1 and preserves pages in real IndexedDB", asy
   expect(result.afterInvalidation).toBeNull();
 });
 
+test("instant session cache preserves a heavy turn's complete process skeleton", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html");
+  const result = await page.evaluate(async () => {
+    const cache = await import("/src/cache.ts");
+    await cache.clearCache();
+    cache.saveSession("heavy-refresh-session", [{
+      id: "heavy-refresh-turn",
+      prompt: "1",
+      done: true,
+      images: [{
+        media_type: "image/png",
+        data: "i".repeat(2 * 1024 * 1024 + 1),
+      }],
+      blocks: [
+        {
+          kind: "text", message_id: "heavy-commentary", text: "2",
+          done: true, channel: "commentary",
+        },
+        {
+          kind: "tool", message_id: "heavy-tool-message-3",
+          tool_use_id: "heavy-tool-3", tool: "Read",
+          input: { file_path: "/tmp/3" },
+          result: {
+            content: "x".repeat(2 * 1024 * 1024 + 1),
+            is_error: false,
+          },
+          done: true,
+        },
+        {
+          kind: "tool", message_id: "heavy-tool-message-4",
+          tool_use_id: "heavy-tool-4", tool: "Bash",
+          input: { command: "echo 4" }, done: true,
+        },
+        {
+          kind: "process", item_id: "heavy-process-5",
+          processKind: "command", phase: "snapshot", status: "succeeded",
+          title: "5", done: true,
+        },
+        {
+          kind: "text", message_id: "heavy-final", text: "6",
+          done: true, channel: "final",
+        },
+      ],
+      detailEventCount: 4,
+    }], 42, "heavy-refresh-r1", "heavy-refresh-g1");
+    await new Promise((resolve) => window.setTimeout(resolve, 700));
+    const loaded = await cache.loadSession("heavy-refresh-session");
+    const turn = loaded?.turns[0] as {
+      images?: unknown[];
+      blocks?: Array<Record<string, unknown>>;
+      detailProjection?: unknown;
+    } | undefined;
+    return {
+      size: new TextEncoder().encode(JSON.stringify(turn)).byteLength,
+      hasImages: Array.isArray(turn?.images),
+      hasDetailProjection: turn?.detailProjection != null,
+      process: turn?.blocks?.map((block) => (
+        block.kind === "text" ? block.text
+          : block.kind === "tool" ? block.tool_use_id
+            : block.title
+      )),
+    };
+  });
+  expect(result.size).toBeLessThan(2 * 1024 * 1024);
+  expect(result.hasImages).toBe(false);
+  expect(result.hasDetailProjection).toBe(false);
+  expect(result.process).toEqual([
+    "2", "heavy-tool-3", "heavy-tool-4", "5", "6",
+  ]);
+});
+
 test("a canonical image reference does not reserve a second hidden image row", async ({
   page,
 }) => {
@@ -782,6 +855,20 @@ test("completed Mermaid fences render isolated sanitized SVGs", async ({
     page.locator(".mermaid-svg > svg").first().getAttribute("id"),
   ).not.toBe(lightId);
   await expect(diagrams.nth(0)).toHaveAttribute("data-mermaid-state", "ready");
+});
+
+test("completed chat formulas lazy-load accessible KaTeX markup", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?math=1");
+  await expect(page.locator(".katex-display")).toHaveCount(1);
+  await expect(page.locator(".katex")).toHaveCount(2);
+  await expect(page.locator(".katex-mathml math")).toHaveCount(2);
+  await expect(page.locator('[data-turn-id="math"]')).toContainText(
+    "Inline:",
+  );
+  await expect(page.locator('[data-turn-id="math"] .message-code-copy'))
+    .toHaveCount(0);
 });
 
 test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
