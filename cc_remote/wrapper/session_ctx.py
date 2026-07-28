@@ -98,6 +98,12 @@ class SessionContext:
     # with the same clientId confirms it, or the enclosing turn terminates.
     # ``Any`` avoids coupling this shared context module to a v21 wire class.
     codex_uncertain_steer: Any = None
+    # A shared-daemon turn started by Remote is leased on disk so a replacement
+    # wrapper can safely reattach without classifying it as Codex App ownership.
+    codex_owned_turn_id: Optional[str] = None
+    codex_recovered_turn_id: Optional[str] = None
+    codex_recovered_msg_id: Optional[str] = None
+    codex_recovered_automatic: Optional[bool] = None
     # Generation from cc_remote.codex_daemon_restart that this resident shared
     # proxy joined. An intentional account-switch restart changes the generation;
     # an active managed turn is handed to the replacement without unlocking the
