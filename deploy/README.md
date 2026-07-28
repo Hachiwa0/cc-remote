@@ -16,7 +16,10 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   protocol, full Git SHA, OS, architecture, and Python runtime contract.
 - `install-relay.sh` — first-install/upgrade entry for a published Relay
   bundle. It creates secrets only when `/opt/cc-remote/.env` does not exist,
-  then delegates to the existing transactional VPS installer.
+  then delegates to the existing transactional VPS installer. The explicit
+  `--allow-private-origins` first-install option binds IPv4 `0.0.0.0:8765`
+  for simultaneous LAN/Tailscale access and requires firewall restriction;
+  the default remains loopback-only behind Caddy.
 - `install-wrapper.sh` — first-install/upgrade entry for published macOS and
   Linux Wrapper bundles. It builds the immutable release before pairing and
   activation, stores device authority outside the release, atomically switches

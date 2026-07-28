@@ -312,6 +312,17 @@ Linux 上脚本会自行请求 `sudo`。首次安装会交互要求一个至少 
 不可变 staging、原子 `current` 切换和失败回滚。已有
 `/opt/cc-remote/.env` 会原样保留。
 
+如果还要通过 LAN/Tailscale IPv4 地址直连同一台 Relay，首次安装时显式开启：
+
+```bash
+./install.sh relay --domain remote.example.com --allow-private-origins
+```
+
+这会让 Relay 监听 `0.0.0.0:8765`，公网域名仍由 Caddy 提供 HTTPS。端口 8765
+会出现在所有 IPv4 网卡上，必须用主机防火墙只允许可信 LAN/Tailscale 对端。
+已有安装仍保留 `.env`；要开启该模式，先手动把其中的
+`RELAY_HOST=0.0.0.0` 和 `ALLOW_PRIVATE_ORIGINS=1` 一起设置，再用相同参数升级。
+
 打开 `https://remote.example.com/` 登录，在顶部设备中心选择“允许添加设备”，复制
 一次性配对码。
 
@@ -532,7 +543,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `RELAY_HOST` / `RELAY_PORT` | `127.0.0.1` / `8765` | 监听地址（公网部署交给 Caddy，保持 127.0.0.1）。 |
+| `RELAY_HOST` / `RELAY_PORT` | `127.0.0.1` / `8765` | 监听地址（仅 Caddy 公网入口时保持 `127.0.0.1`；同时开放 LAN/Tailscale IPv4 直连时必须配合 `ALLOW_PRIVATE_ORIGINS=1` 改为 `0.0.0.0` 并限制防火墙）。 |
 | `LOGIN_PASSWORD` | 空 | 单用户网页登录口令。未设置 `LOGIN_USERS_JSON` 时**必须设**。 |
 | `LOGIN_USERS_JSON` | 空 | 可选多用户策略：`{"alice":{"password":"…","machines":["mac","nono"]}}`；设置后替代 `LOGIN_PASSWORD`。 |
 | `SESSION_SECRET` | 空 | 给会话 token 签名的 HMAC 密钥。**必须设**（`openssl rand -hex 32`）。 |
@@ -544,6 +555,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `DEVICE_DB_PATH` | `~/.cc-remote/relay-devices.sqlite3` | 持久设备注册、显示名、最近在线时间和凭据哈希；不保存会话或 Artifact。 |
 | `DEVICE_PAIRING_TTL_SECONDS` | `600` | 一次性配对码有效秒数，允许 60–3600。 |
 | `PUBLIC_ORIGIN` | 空 | 浏览器允许连接 WS 的精确来源，如 `https://remote.example.com`；**必须设**，非 loopback 必须 HTTPS（除非开了 `ALLOW_INSECURE_HTTP`）。 |
+| `ALLOW_PRIVATE_ORIGINS` | `0` | 设为 `1` 后，在保留 `PUBLIC_ORIGIN` 的同时，允许浏览器通过 `RELAY_PORT` 上的私网/loopback 字面 IP 直连：`127/8`、`10/8`、`172.16/12`、`192.168/16`、Tailscale `100.64/10`、IPv6 loopback/ULA。Origin 的协议/主机/端口还必须与实际请求目标完全一致；主机名、公网 IP 和其他端口仍拒绝。内网 HTTP 不加密，且通常不能安装 PWA。 |
 | `ALLOW_INSECURE_HTTP` | `0` | 逃生开关：设为 `1` 允许 `PUBLIC_ORIGIN` / `RELAY_URL` 在非 loopback 时仍用明文 `http://`/`ws://`（例如直接暴露一个没有 TLS 终端的公网 IP）。默认关闭；开启后登录口令、会话 cookie 和全部流量都走明文，链路上任何人都能窃取或劫持会话，务必优先使用 TLS。 |
 | `WRAPPER_TOKEN` | 占位值 | 单机器/兼容模式下的 wrapper Bearer token；未设置 `WRAPPER_TOKENS_JSON` 时必须配置。 |
 | `WRAPPER_TOKENS_JSON` | 空 | 可选机器绑定 token：`{"mac":"…","nono":"…"}`；设置后替代 relay 的通配 `WRAPPER_TOKEN`。 |
@@ -599,7 +611,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 
 - Code 会话仍是远程开发控制面：Claude 默认使用 `permissionMode: bypassPermissions`；Codex 默认审批策略是 `never` 并继承本机 Codex sandbox 配置，也可切到 `on-request` / `untrusted`。**能登录且能进入 Code 的人，仍应等同于拿到了这台机器的远程 agent/shell 权限。** Work 会话使用独立私有根目录且不开放外部目录，但这只是缩小默认能力面，不替代操作系统级的独立用户、容器或虚拟机隔离。
 - `LOGIN_PASSWORD` / `LOGIN_USERS_JSON`、`WRAPPER_TOKEN` / `WRAPPER_TOKENS_JSON` 和 `SESSION_SECRET` 是认证边界：用强随机值、别提交 git、别贴到聊天里、定期轮换。仓库 `.env` 只适合本机开发；生产 wrapper 必须使用上述 root-only `/etc/cc-remote/wrapper.env`。systemd 模板会禁止服务及模型子进程读取这个源文件和遗留仓库 `.env`；Linux wrapper 还会关闭 dumpability，避免子进程从 `/proc/<pid>/environ` 或进程内存取回已经捕获的 token。
-- 公网必须上 TLS（`wss://`，本仓库用 Caddy 自动签证书）。只有明确需要临时使用公网 IPv4 + 明文 HTTP/WS 时才设 `ALLOW_INSECURE_HTTP=1`；开启后登录口令、cookie、wrapper token 和全部会话流量都不加密，应尽快切回 TLS。
+- 公网必须上 TLS（`wss://`，本仓库用 Caddy 自动签证书）。只有明确需要临时使用公网 IPv4 + 明文 HTTP/WS 时才设 `ALLOW_INSECURE_HTTP=1`；开启后登录口令、cookie、wrapper token 和全部会话流量都不加密，应尽快切回 TLS。`ALLOW_PRIVATE_ORIGINS=1` 只为同端口私网字面 IP 增加与实际请求目标一致的直连入口，不会放宽公网域名校验；Cookie 的 `Secure` 属性按受信请求传输判断，不读取调用者提供的 Origin。但使用内网 HTTP 时，登录口令、cookie 和会话内容在该网络中仍是明文。
 - 建议：给中继加 IP 白名单 / 只在需要时开、给登录加失败限速（已内置每 IP 每分钟 5 次）。
 
 ## 模型后端（可选）

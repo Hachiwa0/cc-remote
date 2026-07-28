@@ -17,7 +17,7 @@ die() {
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh relay --domain remote.example.com
+  install.sh relay --domain remote.example.com [--allow-private-origins]
   install.sh wrapper --relay https://remote.example.com --pair PAIR-CODE
 
 The role is explicit. The script detects only the operating system and CPU.

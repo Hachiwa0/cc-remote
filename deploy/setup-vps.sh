@@ -39,6 +39,7 @@ UNIT_HAD_FILE=0
 RELAY_SERVICE_TOUCHED=0
 ROLLBACK_DONE=0
 INSECURE_HTTP=0
+PRIVATE_DIRECT=0
 PUBLIC_SCHEME=https
 CADDY_TEMPLATE=""
 
@@ -146,6 +147,16 @@ PY
     die "ALLOW_INSECURE_HTTP must be one of 1/true/yes/on or 0/false/no/off"
     ;;
 esac
+ALLOW_PRIVATE_VALUE="$(
+  read_env_value ALLOW_PRIVATE_ORIGINS 2>/dev/null || printf '0'
+)"
+case "${ALLOW_PRIVATE_VALUE,,}" in
+  1|true|yes|on) PRIVATE_DIRECT=1 ;;
+  0|false|no|off|"") ;;
+  *)
+    die "ALLOW_PRIVATE_ORIGINS must be one of 1/true/yes/on or 0/false/no/off"
+    ;;
+esac
 [ -d "$SOURCE_DIR/web/dist" ] || die "$SOURCE_DIR/web/dist missing (run 'npm --prefix web run build' before uploading)"
 [ -s "$SOURCE_DIR/web/dist/index.html" ] || die "$SOURCE_DIR/web/dist/index.html missing or empty"
 [ -s "$SOURCE_DIR/web/dist/cc-remote-build.json" ] || die "$SOURCE_DIR/web/dist/cc-remote-build.json missing"
@@ -192,8 +203,15 @@ CONFIGURED_RELAY_PORT="$(read_env_value RELAY_PORT)" || \
   die "RELAY_PORT is missing from $ENV_FILE"
 CONFIGURED_STATIC_DIR="$(read_env_value WEB_STATIC_DIR)" || \
   die "WEB_STATIC_DIR is missing from $ENV_FILE"
-[[ "$CONFIGURED_RELAY_HOST" == "127.0.0.1" ]] || \
-  die "RELAY_HOST must be 127.0.0.1 for the bundled Caddy/systemd setup"
+if [[ "$PRIVATE_DIRECT" -eq 1 ]]; then
+  [[ "$CONFIGURED_RELAY_HOST" == "0.0.0.0" ]] || \
+    die "RELAY_HOST must be 0.0.0.0 when ALLOW_PRIVATE_ORIGINS is enabled"
+  echo "WARNING: relay port 8765 is exposed on every IPv4 interface."
+  echo "Restrict direct access to trusted LAN/Tailscale peers with a firewall."
+else
+  [[ "$CONFIGURED_RELAY_HOST" == "127.0.0.1" ]] || \
+    die "RELAY_HOST must be 127.0.0.1 unless ALLOW_PRIVATE_ORIGINS is enabled"
+fi
 [[ "$CONFIGURED_RELAY_PORT" == "8765" ]] || \
   die "RELAY_PORT must be 8765 for the bundled Caddy/readiness setup"
 [[ "$CONFIGURED_STATIC_DIR" == "$CURRENT_LINK/web/dist" ]] || \

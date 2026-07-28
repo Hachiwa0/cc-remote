@@ -389,6 +389,10 @@ def test_role_installers_keep_credentials_out_of_service_definitions():
     assert 'ubuntu) minimum_major=22' in relay_source
     assert 'debian) minimum_major=12' in relay_source
     assert "setup-vps.sh" in relay_source
+    assert "--allow-private-origins" in relay_source
+    assert '"RELAY_HOST=${relay_host}"' in relay_source
+    assert '"ALLOW_PRIVATE_ORIGINS=${allow_private_origins}"' in relay_source
+    assert "relay_host=0.0.0.0" in relay_source
     assert "--login-password" not in relay_source
     assert "LOGIN_PASSWORD=" in relay_source
 

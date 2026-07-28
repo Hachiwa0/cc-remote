@@ -136,7 +136,9 @@ def test_setup_script_is_valid_shell_and_keeps_safe_install_order():
     assert "address.version == 4 and address.is_global" in source
     assert "not address.is_multicast" in source
     assert '"$CONFIGURED_ORIGIN" == "$PUBLIC_SCHEME://$TARGET"' in source
+    assert '[[ "$CONFIGURED_RELAY_HOST" == "0.0.0.0" ]]' in source
     assert '[[ "$CONFIGURED_RELAY_HOST" == "127.0.0.1" ]]' in source
+    assert 'if [[ "$PRIVATE_DIRECT" -eq 1 ]]' in source
     assert '[[ "$CONFIGURED_RELAY_PORT" == "8765" ]]' in source
     assert '[[ "$CONFIGURED_STATIC_DIR" == "$CURRENT_LINK/web/dist" ]]' in source
     assert 'chmod 0600 "$ENV_FILE"' in source
@@ -207,6 +209,7 @@ def test_deploy_examples_configure_insecure_flag_on_both_sides():
     wrapper = (ROOT / "deploy" / "env.wrapper.example").read_text()
     assert "ALLOW_INSECURE_HTTP=0" in relay
     assert "ALLOW_INSECURE_HTTP=0" in wrapper
+    assert "ALLOW_PRIVATE_ORIGINS=0" in relay
 
 
 def test_setup_does_not_make_network_service_owner_of_root_executed_code():

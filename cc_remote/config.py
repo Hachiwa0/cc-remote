@@ -140,6 +140,12 @@ class RelayConfig:
     # Exact browser Origin accepted for cookie-authenticated WebSockets, for
     # example https://remote.example.com (no path or trailing slash).
     public_origin: str = field(default_factory=lambda: _env("PUBLIC_ORIGIN", ""))
+    # Optional same-port browser access through literal private/loopback IPs.
+    # PUBLIC_ORIGIN remains the canonical external origin; this narrowly adds
+    # direct LAN/Tailscale entry points without trusting arbitrary hostnames.
+    allow_private_origins: bool = field(
+        default_factory=lambda: _bool("ALLOW_PRIVATE_ORIGINS")
+    )
     # Opt-in escape hatch: allow a non-loopback PUBLIC_ORIGIN/RELAY_URL to stay
     # on plain http(s)/ws(s) instead of requiring TLS. Off by default; turning
     # it on trades transport confidentiality (password, cookie, tokens, and all
