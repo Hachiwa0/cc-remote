@@ -5,6 +5,7 @@ export default defineConfig({
   testMatch: "history-browser.spec.ts",
   fullyParallel: false,
   workers: 1,
+  retries: process.env.CI ? 2 : 0,
   reporter: "line",
   use: {
     baseURL: "http://127.0.0.1:4174",
