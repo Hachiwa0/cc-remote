@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 
@@ -47,6 +48,48 @@ def test_history_index_roundtrip_is_bound_to_exact_source_snapshot(tmp_path):
     assert changed.token != source.token
     assert store.get_page(
         "session-1", "codex", changed, before=None, limit=4) is None
+
+
+def test_history_index_invalidates_obsolete_cached_turn_schema_and_rebuilds(
+    tmp_path,
+):
+    source_path = tmp_path / "rollout.jsonl"
+    source_path.write_text('{"type":"first"}\n')
+    source = HistorySourceFingerprint.capture(source_path)
+    store = HistoryIndexStore(tmp_path / "state")
+    page = MaterializedHistoryPage(
+        events=({"type": "user_msg", "msg_id": "message-1", "prompt": "hi"},),
+        has_more=False,
+        oldest_id="message-1",
+        newest_id="message-1",
+        turns=({"id": "message-1", "prompt": "hi"},),
+    )
+    assert store.put_page(
+        "session-1", "codex", source, before=None, limit=4, page=page)
+
+    # Simulate a retained pre-schema cache row.  ``origin`` is deliberately
+    # forbidden by ConversationTurn and must invalidate, rather than leak to
+    # the browser or make the current process crash while constructing History.
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM history_pages WHERE session_id=?",
+            ("session-1",),
+        ).fetchone()
+        payload = json.loads(bytes(row[0]).decode("utf-8"))
+        payload["turns"][0]["origin"] = "legacy-cache"
+        connection.execute(
+            "UPDATE history_pages SET payload_json=? WHERE session_id=?",
+            (json.dumps(payload).encode("utf-8"), "session-1"),
+        )
+
+    assert store.get_page(
+        "session-1", "codex", source, before=None, limit=4) is None
+
+    # The engine-backed caller can now replace the discarded projection.
+    assert store.put_page(
+        "session-1", "codex", source, before=None, limit=4, page=page)
+    assert store.get_page(
+        "session-1", "codex", source, before=None, limit=4) == page
 
 
 def test_turn_detail_survives_append_but_not_destructive_invalidation(tmp_path):
