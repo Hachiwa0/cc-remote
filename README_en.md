@@ -149,6 +149,19 @@ commands:
   Codex clients and Remote share the thread and control state. If the installed
   version cannot provide it, cc-remote explicitly falls back to a private
   app-server. Set `CC_REMOTE_CODEX_DAEMON=off` for troubleshooting.
+- **Switching Codex accounts:** configure
+  `scripts/codex-auth-daemon-restart` as the `codex-auth` post-switch hook.
+  It publishes a local generation barrier around the official daemon restart.
+  Remote immediately interrupts its in-flight turn on the old daemon, keeps the
+  session running, resumes the same thread on the replacement, and continues
+  the same task before any queued browser message can drain. Goals use Codex's
+  native automatic continuation; ordinary conversations use contextual-only
+  continuation input that is hidden from user history and rollback user-turn
+  boundaries. The official graceful restart may still wait for other native
+  clients, so the hook hands it to a detached worker and returns immediately.
+  Worker output is written to
+  `~/.cc-remote/codex-daemon-restart.log`. It never replays a prompt or
+  reads/stores Codex credentials.
 - **Work:** Claude and Codex Work keep private processes and directories and do
   not join the Code control plane, preventing work material from leaking into code
   sessions.
@@ -632,6 +645,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `CLAUDE_BIN` | `~/.local/bin/claude` | Daily Claude Code executable launched by the wrapper. Empty still selects this default; use another absolute path only when the CLI is installed elsewhere. |
 | `CC_REMOTE_CODEX_PROXY` | empty | Optional HTTP(S)/SOCKS5 proxy injected only into Codex subprocesses launched by the wrapper. It does not change the wrapper-to-relay connection or the user's terminal `codex`. |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server. Work is always private and ignores this setting. |
+| `CC_REMOTE_STATE_DIR` | `~/.cc-remote` | Local wrapper state directory. The account-switch hook and wrapper must use the same value; the daemon generation barrier stored here contains no Codex credentials. |
 | `CC_CWD` | cwd | Default working directory for new sessions. Claude `--resume` needs it to locate `~/.claude/projects/` — **it must be correct**; Codex resume first recovers the original cwd from its rollout. |
 | `CC_RESUME_SESSION_ID` | empty | Resume a specific session UUID; empty starts fresh. The id is persisted to `~/.cc-remote/` after first start. |
 | `CLAUDE_WORK_ROOT` | `~/.claude/cc-remote/work` | Private Claude Work root for the registry, knowledge sources, sessions, and generated policy files. |

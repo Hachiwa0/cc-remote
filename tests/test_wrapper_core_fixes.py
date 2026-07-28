@@ -18,7 +18,10 @@ from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import codex_stream as codex_stream_module
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_sessions import codex_session_settings
-from cc_remote.wrapper.codex_stream import codex_translate_history
+from cc_remote.wrapper.codex_stream import (
+    codex_native_rollback_turns,
+    codex_translate_history,
+)
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
 from cc_remote.wrapper.session import _session_file, load_session_id, save_session_id
 from tests.test_multisession import _mk_ctx, _mk_machine
@@ -1129,3 +1132,81 @@ def test_codex_history_skips_one_oversized_record_and_continues(
     assert [event.prompt for event in events if event.type == "user_msg"] == [
         "survived"
     ]
+
+
+def test_account_switch_continuation_is_one_history_and_rollback_turn(
+    tmp_path,
+):
+    rollout = tmp_path / "rollout-account-switch.jsonl"
+    internal = machine_module.CODEX_ACCOUNT_SWITCH_CONTINUATION
+    rows = [
+        {"type": "session_meta", "payload": {"id": "session-1"}},
+        {"type": "turn_context", "payload": {"turn_id": "turn-old"}},
+        {"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-old",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "user_message", "turn_id": "turn-old",
+            "message": "finish task A",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "agent_message", "turn_id": "turn-old",
+            "message": "partial work",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "turn_aborted", "turn_id": "turn-old",
+        }},
+        {"type": "turn_context", "payload": {"turn_id": "turn-new"}},
+        {"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-new",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "user_message", "turn_id": "turn-new",
+            "message": internal,
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "agent_message", "turn_id": "turn-new",
+            "message": "task A complete",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "task_complete", "turn_id": "turn-new",
+            "last_agent_message": "task A complete",
+        }},
+        {"type": "turn_context", "payload": {"turn_id": "turn-b"}},
+        {"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-b",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "user_message", "turn_id": "turn-b",
+            "message": "task B",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "agent_message", "turn_id": "turn-b",
+            "message": "task B complete",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "task_complete", "turn_id": "turn-b",
+            "last_agent_message": "task B complete",
+        }},
+    ]
+    rollout.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+    assert [
+        event.prompt for event in events if isinstance(event, UserMsg)
+    ] == ["finish task A", "task B"]
+    terminals = [
+        event for event in events if isinstance(event, TurnEnd)
+    ]
+    assert [event.turn_id for event in terminals] == ["turn-new", "turn-b"]
+    assert all(not event.result.is_error for event in terminals)
+    assert [
+        cursor
+        for _offset, cursor in codex_stream_module._history_boundaries(
+            str(rollout), use_turns=True)
+    ] == ["turn-b", "turn-old"]
+    assert codex_native_rollback_turns(str(rollout), 1) == 1
+    assert codex_native_rollback_turns(str(rollout), 2) == 3

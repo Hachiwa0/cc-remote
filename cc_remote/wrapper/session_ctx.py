@@ -98,6 +98,15 @@ class SessionContext:
     # with the same clientId confirms it, or the enclosing turn terminates.
     # ``Any`` avoids coupling this shared context module to a v21 wire class.
     codex_uncertain_steer: Any = None
+    # Generation from cc_remote.codex_daemon_restart that this resident shared
+    # proxy joined. An intentional account-switch restart changes the generation;
+    # an active managed turn is handed to the replacement without unlocking the
+    # session, while an idle thread reconnects before its next model input.
+    codex_daemon_epoch: Optional[str] = None
+    # True only while an accepted managed turn is crossing an intentional daemon
+    # restart. A resumed active goal may start a spontaneous native turn during
+    # force_reconnect; that turn is the continuation, not a competing writer.
+    codex_account_handoff: bool = False
     # Remote-owned Git checkpoint journal for Codex Code turns. It is created
     # lazily only in Git workspaces; Work and Claude use their own restore paths.
     codex_checkpoint: Any = None

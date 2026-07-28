@@ -132,6 +132,16 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
 - **Codex Code：**默认通过 Codex 官方共享 app-server daemon 接入，让原生 Codex
   客户端与 Remote 共享 thread 和控制状态；如果本机版本不支持，会明确降级到私有
   app-server。`CC_REMOTE_CODEX_DAEMON=off` 可用于故障排查。
+- **切换 Codex 账号：**把
+  `scripts/codex-auth-daemon-restart` 配置为 `codex-auth` 的切换后 hook。
+  脚本在官方 daemon restart 前后写入本地代际屏障。Remote 检测到切号后会立即
+  中断旧 daemon 上正在运行的 Turn，保持会话为 running，在新 daemon 上恢复同一
+  thread，并把同一个任务继续执行完；浏览器中 queued 的后续消息在此期间不会提前
+  发送。Goal 使用 Codex 原生自动续跑，普通对话使用不会显示成用户消息、也不增加
+  rollback 用户轮次的内部续跑输入。官方 graceful restart 仍可能等待其他原生客户端，
+  因此 hook 将它交给独立后台 worker 后立即返回。执行日志位于
+  `~/.cc-remote/codex-daemon-restart.log`。它不会重放 Prompt，也不读取或保存
+  Codex 凭据。
 - **Work：**Claude 与 Codex Work 都保持各自的私有进程和目录，不加入 Code 的共享
   控制面，避免工作资料与代码会话互相泄漏。
 
@@ -564,6 +574,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `CLAUDE_BIN` | `~/.local/bin/claude` | wrapper 实际启动的日常 Claude Code；空值仍使用该默认路径。只有 CLI 安装在别处时才设为另一个绝对路径。 |
 | `CC_REMOTE_CODEX_PROXY` | 空 | 仅注入 wrapper 启动的 Codex 子进程的 HTTP(S)/SOCKS5 代理；不改 wrapper 到 relay 的连接，也不影响用户终端里的 `codex`。例如 nono 可填 `http://127.0.0.1:7897`。 |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server。Work 始终私有，不受此项影响。 |
+| `CC_REMOTE_STATE_DIR` | `~/.cc-remote` | 本机 wrapper 状态目录。账号切换 hook 与 wrapper 必须使用同一个值，daemon 代际屏障保存在其中；不包含 Codex 凭据。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |
 | `CC_RESUME_SESSION_ID` | 空 | 恢复指定会话 UUID；留空开新会话。首次启动后 id 会持久化到 `~/.cc-remote/`。 |
 | `CLAUDE_WORK_ROOT` | `~/.claude/cc-remote/work` | Claude Work 的私有注册表、资料库、会话目录和策略文件根目录。 |

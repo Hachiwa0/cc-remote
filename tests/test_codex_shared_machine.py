@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 
+from cc_remote.codex_daemon_restart import write_restart_state
 from cc_remote.protocol import (
-    Effort, Error, Model, Query, SessionActivity, SessionControl, Takeover,
+    Delta, Effort, Error, Model, Query, SessionActivity, SessionControl,
+    Takeover, TurnEnd, UserMsg,
 )
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
 from tests.test_codex_external import _CodexSdk, _record_async, _watch
@@ -69,6 +71,120 @@ class _InterruptedSharedSdk(_SharedSdk):
     async def force_reconnect(self, *_args, **_kwargs) -> None:
         self.reconnects += 1
         self.live = True
+
+
+class _AccountSwitchSharedSdk(_SharedSdk):
+    shared_daemon_affinity = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reader_started = asyncio.Event()
+        self.old_turn_interrupted = asyncio.Event()
+        self.continuation_started = asyncio.Event()
+        self.finish_continuation = asyncio.Event()
+        self.interrupts = 0
+        self.readers = 0
+        self.restart_path = None
+
+    async def query(self, prompt: str, images=None) -> str:
+        self.queries.append((prompt, images))
+        return "turn-old" if len(self.queries) == 1 else "turn-new"
+
+    async def receive_response(self):
+        self.readers += 1
+        if self.readers == 1:
+            assert self.restart_path is not None
+            write_restart_state(
+                self.restart_path,
+                epoch="9" * 32,
+                phase="restarting",
+            )
+            self.reader_started.set()
+            await self.old_turn_interrupted.wait()
+            write_restart_state(
+                self.restart_path,
+                epoch="9" * 32,
+                phase="ready",
+            )
+            yield {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "sid",
+                    "turn": {"id": "turn-old", "status": "interrupted"},
+                },
+            }
+            return
+        self.continuation_started.set()
+        await self.finish_continuation.wait()
+        yield {
+            "method": "item/completed",
+            "params": {
+                "threadId": "sid",
+                "turnId": "turn-new",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "answer-new",
+                    "text": "continued on new account",
+                    "phase": "final_answer",
+                },
+            },
+        }
+        yield {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "sid",
+                "turn": {"id": "turn-new", "status": "completed"},
+            },
+        }
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+        self.old_turn_interrupted.set()
+
+    async def get_goal(self):
+        return None
+
+
+class _GoalAccountSwitchSharedSdk(_AccountSwitchSharedSdk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.goal_resumed = asyncio.Event()
+        self.finish_goal = asyncio.Event()
+        self.on_goal_resumed = None
+
+    async def get_goal(self):
+        return {"status": "usageLimited"}
+
+    async def set_goal(self, **kwargs):
+        assert kwargs == {"status": "active"}
+        self.goal_resumed.set()
+        assert self.on_goal_resumed is not None
+        await self.on_goal_resumed()
+        return {"status": "active"}
+
+    async def receive_spontaneous_response(self, turn_id: str):
+        assert turn_id == "goal-turn"
+        await self.finish_goal.wait()
+        yield {
+            "method": "item/completed",
+            "params": {
+                "threadId": "sid",
+                "turnId": turn_id,
+                "item": {
+                    "type": "agentMessage",
+                    "id": "goal-answer",
+                    "text": "goal continued",
+                    "phase": "final_answer",
+                },
+            },
+        }
+        yield {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "sid",
+                "turn": {"id": turn_id, "status": "completed"},
+            },
+        }
 
 
 def test_shared_code_watcher_mirrors_growth_without_legacy_lock(tmp_path):
@@ -732,6 +848,319 @@ def test_interrupted_shared_query_reconnects_and_refreshes_activity(
         assert ctx.control_can_takeover is False
 
     asyncio.run(go())
+
+
+def test_intentional_restart_reconnects_live_proxy_before_query(monkeypatch):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        ctx.codex_daemon_epoch = "1" * 32
+        machine.sessions[ctx.key] = ctx
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="2" * 32,
+            phase="ready",
+        )
+        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+
+        async def no_external(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_prime_codex_ownership", no_external)
+        ran = []
+
+        async def fake_turn(session_ctx, prompt, _images=None, _files=None):
+            ran.append((session_ctx.session_id, prompt))
+            await machine._set_state(session_ctx, "idle")
+
+        monkeypatch.setattr(machine, "_run_turn", fake_turn)
+
+        result = await machine._handle_query(Query(
+            sid="sid", prompt="hello", msg_id="restart-query"))
+        assert result is None
+        await ctx.turn_task
+        assert ctx.sdk.reconnects == 1
+        assert ctx.codex_daemon_epoch == "2" * 32
+        assert ran == [("sid", "hello")]
+
+    asyncio.run(go())
+
+
+def test_same_restart_epoch_does_not_reconnect_live_proxy(monkeypatch):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        ctx.codex_daemon_epoch = "3" * 32
+        machine.sessions[ctx.key] = ctx
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="3" * 32,
+            phase="ready",
+        )
+        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+
+        async def no_external(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_prime_codex_ownership", no_external)
+
+        async def fake_turn(session_ctx, *_args):
+            await machine._set_state(session_ctx, "idle")
+
+        monkeypatch.setattr(machine, "_run_turn", fake_turn)
+        await machine._handle_query(Query(
+            sid="sid", prompt="hello", msg_id="same-epoch-query"))
+        await ctx.turn_task
+        assert ctx.sdk.reconnects == 0
+
+    asyncio.run(go())
+
+
+def test_query_waits_for_restart_ready_before_reconnecting(monkeypatch):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        ctx.codex_daemon_epoch = "6" * 32
+        machine.sessions[ctx.key] = ctx
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="7" * 32,
+            phase="restarting",
+        )
+        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+
+        async def no_external(_sid):
+            return False
+
+        async def finish_restart():
+            await asyncio.sleep(0.02)
+            write_restart_state(
+                machine._codex_daemon_restart_path,
+                epoch="7" * 32,
+                phase="ready",
+            )
+
+        async def fake_turn(session_ctx, *_args):
+            await machine._set_state(session_ctx, "idle")
+
+        monkeypatch.setattr(machine, "_prime_codex_ownership", no_external)
+        monkeypatch.setattr(machine, "_run_turn", fake_turn)
+        finisher = asyncio.create_task(finish_restart())
+
+        result = await machine._handle_query(Query(
+            sid="sid", prompt="after-ready", msg_id="wait-ready-query"))
+        await finisher
+        assert result is None
+        await ctx.turn_task
+        assert ctx.sdk.reconnects == 1
+        assert ctx.codex_daemon_epoch == "7" * 32
+
+    asyncio.run(go())
+
+
+def test_failed_restart_barrier_rejects_query_without_model_send(monkeypatch):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        ctx.codex_daemon_epoch = "4" * 32
+        machine.sessions[ctx.key] = ctx
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="5" * 32,
+            phase="failed",
+        )
+
+        result = await machine._handle_query(Query(
+            sid="sid", prompt="must-not-send", msg_id="failed-restart"))
+
+        assert isinstance(result, Error)
+        assert result.code == "not_running"
+        assert ctx.sdk.reconnects == 0
+        assert ctx.sdk.queries == []
+        assert ctx.state == "idle"
+        assert transport.sent[-1].msg_id == "failed-restart"
+
+    asyncio.run(go())
+
+
+def test_stale_restart_barriers_restore_shared_daemon_operations():
+    async def go(phase: str) -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        ctx.codex_daemon_epoch = "4" * 32
+        machine.sessions[ctx.key] = ctx
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="5" * 32,
+            phase=phase,
+            # write_restart_state clamps this to its current wall clock, so
+            # the marker is already expired when it is read below.
+            deadline_at=0.0,
+        )
+
+        assert await machine._ensure_codex_daemon_generation(
+            ctx, reason=f"recover stale {phase} barrier",
+        )
+        assert ctx.sdk.reconnects == 0
+        assert ctx.codex_daemon_epoch == "4" * 32
+
+    for phase in ("restarting", "failed"):
+        asyncio.run(go(phase))
+
+
+def test_restart_outcome_wait_is_interruptible():
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        interrupt = asyncio.Event()
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="6" * 32,
+            phase="restarting",
+            # Keep this barrier live without adding a wall-clock dependency.
+            deadline_at=10**12,
+        )
+
+        async def stop_waiting() -> None:
+            await asyncio.sleep(0.01)
+            interrupt.set()
+
+        stopper = asyncio.create_task(stop_waiting())
+        started = asyncio.get_running_loop().time()
+        state = await machine._codex_restart_state(
+            wait=True,
+            interrupt_event=interrupt,
+        )
+        await stopper
+
+        assert state is not None and state.phase == "restarting"
+        assert asyncio.get_running_loop().time() - started < 0.5
+
+    asyncio.run(go())
+
+
+def test_account_switch_continues_running_turn_before_queue_can_drain():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _AccountSwitchSharedSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "logical-turn-a"
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+        ctx.sdk.restart_path = machine._codex_daemon_restart_path
+        assert not machine._codex_daemon_restart_path.exists()
+        await machine._stamp_codex_daemon_epoch(ctx)
+        assert ctx.codex_daemon_epoch == "unmarked"
+
+        ctx.turn_task = asyncio.create_task(
+            machine._run_turn(ctx, "task A"))
+        await asyncio.wait_for(
+            ctx.sdk.continuation_started.wait(), timeout=5.0)
+
+        # The old native turn ended, but logical task A still owns the runtime.
+        # runtime-drain.ts therefore cannot release any queued B message yet.
+        assert ctx.state == "running"
+        assert ctx.turn_task is not None and not ctx.turn_task.done()
+        assert ctx.sdk.interrupts == 1
+        assert ctx.sdk.reconnects == 1
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        assert not [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len([event for event in transport.sent
+                    if isinstance(event, UserMsg)]) == 1
+        assert ctx.sdk.queries[0] == ("task A", [])
+        assert "<codex_internal_context" in ctx.sdk.queries[1][0]
+
+        ctx.sdk.finish_continuation.set()
+        await asyncio.wait_for(ctx.turn_task, timeout=1.0)
+
+        assert ctx.state == "idle"
+        terminal = next(
+            event for event in transport.sent if isinstance(event, TurnEnd))
+        assert terminal.result.subtype == "success"
+        assert terminal.turn_id == "turn-new"
+        assert any(
+            isinstance(event, Delta)
+            and event.channel == "final"
+            and event.text == "continued on new account"
+            for event in transport.sent
+        )
+
+    asyncio.run(asyncio.wait_for(go(), timeout=15.0))
+
+
+def test_account_switch_resumes_usage_limited_goal_without_competing_query():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _GoalAccountSwitchSharedSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "goal-logical-turn"
+        ctx.codex_checkpoint = False
+        ctx.codex_daemon_epoch = "8" * 32
+        machine.sessions[ctx.key] = ctx
+        ctx.sdk.restart_path = machine._codex_daemon_restart_path
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="8" * 32,
+            phase="ready",
+        )
+
+        async def start_goal_turn() -> None:
+            await machine._on_codex_turn_lifecycle(
+                ctx, "started", "goal-turn")
+
+        ctx.sdk.on_goal_resumed = start_goal_turn
+        checkpoints_finished: list[str] = []
+
+        async def finish_checkpoint(session_ctx) -> None:
+            checkpoints_finished.append(session_ctx.active_msg_id)
+
+        machine._finish_codex_checkpoint = finish_checkpoint
+        managed = asyncio.create_task(machine._run_turn(ctx, "goal task A"))
+        ctx.turn_task = managed
+        await asyncio.wait_for(ctx.sdk.goal_resumed.wait(), timeout=5.0)
+        await asyncio.wait_for(managed, timeout=2.0)
+
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "goal-turn"
+        assert len(ctx.sdk.queries) == 1
+        assert checkpoints_finished == ["goal-logical-turn"]
+        assert not [event for event in transport.sent
+                    if isinstance(event, (Error, TurnEnd))]
+
+        spontaneous = ctx.codex_spontaneous_task
+        assert spontaneous is not None
+        ctx.sdk.finish_goal.set()
+        await asyncio.wait_for(spontaneous, timeout=2.0)
+
+        assert ctx.state == "idle"
+        terminal = next(
+            event for event in transport.sent if isinstance(event, TurnEnd))
+        assert terminal.turn_id == "goal-turn"
+        assert terminal.result.subtype == "success"
+
+    asyncio.run(asyncio.wait_for(go(), timeout=15.0))
 
 
 def test_shared_code_final_launch_never_calls_legacy_ownership_probe(

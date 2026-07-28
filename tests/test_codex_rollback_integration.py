@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from cc_remote.protocol import (
     ArtifactInvalidated,
@@ -13,6 +14,7 @@ from cc_remote.protocol import (
     StateEvent,
 )
 from cc_remote.wrapper.codex_checkpoints import CheckpointError
+from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.machine import WrapperMachine
 from tests.test_multisession import _StubTransport, _mk_ctx, _mk_machine
 
@@ -43,7 +45,9 @@ class _FakeJournal:
         self.cleaned = True
 
 
-def test_combined_rollback_retires_checkpoint_before_native_history_mutation():
+def test_combined_rollback_retires_checkpoint_before_native_history_mutation(
+    monkeypatch, tmp_path,
+):
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("codex-session", "codex-session")
@@ -71,6 +75,29 @@ def test_combined_rollback_retires_checkpoint_before_native_history_mutation():
         machine._codex_code_context = code_context
         machine._build_history = history
         machine._handle_list_sessions = no_list
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(
+            "\n".join(json.dumps(row) for row in [
+                {"type": "event_msg", "payload": {
+                    "type": "user_message", "message": "task A",
+                }},
+                {"type": "event_msg", "payload": {
+                    "type": "user_message",
+                    "message": (
+                        machine_module.CODEX_ACCOUNT_SWITCH_CONTINUATION
+                    ),
+                }},
+                {"type": "event_msg", "payload": {
+                    "type": "user_message", "message": "task B",
+                }},
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
         # Prove a destructive reset does not replace the ring or restart seq.
         await machine._emit(ctx, StateEvent(state="idle"))
         command = RollbackSession(
@@ -88,7 +115,9 @@ def test_combined_rollback_retires_checkpoint_before_native_history_mutation():
         assert journal.restores == [(2, False)]
         assert journal.cleaned is True
         assert ctx.codex_checkpoint is None
-        assert ctx.sdk.rollbacks == [2]
+        # The file journal has one checkpoint per browser turn, while native
+        # Codex also counts the hidden account-handoff input.
+        assert ctx.sdk.rollbacks == [3]
         assert journal.discards == []
         barriers = [
             item for item in transport.sent if isinstance(item, HistoryInvalidated)
