@@ -60,11 +60,11 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   template. The runtime reads the current user's mode-0600 device JSON instead
   of embedding control credentials in the plist.
 
-Protocol v23 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v24 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v23 relay/web release; then start the v23 wrapper.
+activate the v24 relay/web release; then start the v24 wrapper.
 
 ## Native terminal coordination
 

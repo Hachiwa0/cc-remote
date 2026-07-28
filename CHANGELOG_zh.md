@@ -4,6 +4,13 @@
 
 ## 未发布
 
+- 新增 Codex 官方 named permission profile 控制，并与审批策略分开管理。紧凑的
+  权限面板可选择 Read Only、Workspace、Full Access 及按 cwd 生效的自定义
+  profile，不增加输入框底栏控件；protocol v24 在 Wrapper、Relay 与 Web
+  之间传递这些新控制项。
+- 新增 Codex 会话级网页搜索模式（`cached` / `live`）；切换后会无损重连，
+  wrapper 重启后仍保留，同时不修改用户的全局 `config.toml`。
+
 - Claude Agent SDK 升级到 `0.2.128`，同时让 wrapper 显式运行用户日常使用的
   `~/.local/bin/claude`，不再静默选择 SDK 内置副本，使 Remote 与终端的凭据和
   CLI 更新保持一致。
