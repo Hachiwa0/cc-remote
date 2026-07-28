@@ -21,7 +21,10 @@ from cc_remote.protocol import (
     ProcessEvent, TurnPlan, TurnDiff, TurnEnd, TurnResult, UserMsg, Error,
     StateEvent, ERR_CC_CRASH,
 )
-from cc_remote.wrapper.codex_external import visible_codex_user_message
+from cc_remote.wrapper.codex_external import (
+    is_codex_account_switch_message,
+    visible_codex_user_message,
+)
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
 
 _TOOL_TYPES = {
@@ -287,6 +290,25 @@ def _history_terminal_marker(line: bytes) -> bool:
     )
 
 
+def _history_account_switch_marker(line: bytes) -> bool:
+    if (
+        len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+        or b"cc_remote_account_switch" not in line
+    ):
+        return False
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    payload = row.get("payload") if isinstance(row, dict) else None
+    return bool(
+        row.get("type") == "event_msg"
+        and isinstance(payload, dict)
+        and payload.get("type") == "user_message"
+        and is_codex_account_switch_message(payload.get("message"))
+    )
+
+
 def _history_boundaries(path: str, *, use_turns: bool):
     if not use_turns:
         for offset, line in _reverse_jsonl_records(path):
@@ -306,8 +328,12 @@ def _history_boundaries(path: str, *, use_turns: bool):
     # Delaying emission until task_started preserves reverse chronological order
     # while retaining the long-standing task cursor for ordinary one-user turns.
     segment_users: list[tuple[int, str, str]] = []
+    segment_account_switch = False
     pending_assistant_only: tuple[int, str] | None = None
     for offset, line in _reverse_jsonl_records(path):
+        if _history_account_switch_marker(line):
+            segment_account_switch = True
+            continue
         user_cursor = _history_user_cursor(path, offset, line)
         if user_cursor is not None:
             fallback_cursor = _history_user_cursor(
@@ -333,9 +359,10 @@ def _history_boundaries(path: str, *, use_turns: bool):
                 for boundary, _cursor, extra_cursor in segment_users[:-1]:
                     yield boundary, extra_cursor
                 yield offset, turn_cursor
-            else:
+            elif not segment_account_switch:
                 pending_assistant_only = (offset, turn_cursor)
             segment_users = []
+            segment_account_switch = False
             continue
 
         if (pending_assistant_only is not None
@@ -482,6 +509,55 @@ def codex_history_boundary_user(
                     pass
             return event
     return None
+
+
+def codex_native_rollback_turns(path: str, logical_turns: int) -> int:
+    """Translate visible rollback turns to Codex's native user-boundary count.
+
+    The private account-switch continuation is persisted by ``turn/start`` as a
+    native user message but merged into the preceding logical browser turn.
+    Count those exact envelopes with their preceding visible prompt so
+    ``thread/rollback`` removes the whole logical turn. Other internal context
+    rows are not real rollback boundaries and remain ignored.
+    """
+    if (
+        not isinstance(logical_turns, int)
+        or isinstance(logical_turns, bool)
+        or logical_turns < 1
+    ):
+        raise ValueError("logical_turns must be a positive integer")
+    groups: list[int] = []
+    try:
+        size = os.path.getsize(path)
+        source = open(path, "rb")
+    except (OSError, TypeError, ValueError):
+        return logical_turns
+    with source:
+        for _offset, line in _bounded_jsonl_records(
+            source, end_offset=size,
+        ):
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            if (
+                row.get("type") != "event_msg"
+                or not isinstance(payload, dict)
+                or payload.get("type") != "user_message"
+            ):
+                continue
+            message = payload.get("message")
+            if is_codex_account_switch_message(message):
+                if groups:
+                    groups[-1] += 1
+                continue
+            if visible_codex_user_message(message):
+                groups.append(1)
+                if len(groups) > logical_turns:
+                    del groups[0]
+    native_turns = sum(groups)
+    return native_turns if native_turns > 0 else logical_turns
 
 
 class CodexStreamTranslator:
@@ -2326,7 +2402,21 @@ def codex_translate_history(
                     and _SAFE_WIRE_ID.fullmatch(raw_client_id)
                     else None
                 )
-                msg = visible_codex_user_message(p.get("message"))
+                raw_message = p.get("message")
+                account_switch_continuation = (
+                    is_codex_account_switch_message(raw_message)
+                )
+                msg = visible_codex_user_message(raw_message)
+                if (
+                    account_switch_continuation
+                    and events
+                    and isinstance(events[-1], TurnEnd)
+                    and events[-1].result.is_error
+                ):
+                    # The old daemon's interrupted terminal and this private
+                    # continuation are one logical browser turn. The final
+                    # replacement terminal below becomes its sole boundary.
+                    events.pop()
                 if msg:
                     next_turn_id = p.get("turn_id") or pending_turn_id
                     if turn_open:

@@ -53,6 +53,9 @@ _WRAPPER_DEPLOY = (
     "release_manifest.py",
     "validate_protocol_bundle.py",
 )
+_WRAPPER_SCRIPTS = (
+    "codex-auth-daemon-restart",
+)
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
@@ -239,6 +242,11 @@ def build_bundle(
                 (staging / "deploy" / filename).chmod(0o755)
         if role == "relay":
             _copy_tree(root / "web" / "dist", staging / "web" / "dist")
+        else:
+            for filename in _WRAPPER_SCRIPTS:
+                target = staging / "scripts" / filename
+                _copy_file(root / "scripts" / filename, target)
+                target.chmod(0o755)
 
         manifest = {
             "schema": 1,

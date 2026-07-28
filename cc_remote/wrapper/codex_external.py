@@ -702,14 +702,26 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
 
 
 _CODEX_REQUEST_MARKER = "## My request for Codex:"
+_CODEX_ACCOUNT_SWITCH_PREFIX = (
+    '<codex_internal_context source="cc_remote_account_switch">'
+)
 _INTERNAL_CODEX_USER_PREFIXES = (
     "<app-context",
     "<collaboration_mode",
+    _CODEX_ACCOUNT_SWITCH_PREFIX,
     "<environment_context",
     "<in-app-browser-context",
     "<permissions",
     "<turn_aborted",
 )
+
+
+def is_codex_account_switch_message(message: object) -> bool:
+    """Recognize only cc-remote's private account-handoff user envelope."""
+    return (
+        isinstance(message, str)
+        and message.strip().lower().startswith(_CODEX_ACCOUNT_SWITCH_PREFIX)
+    )
 
 
 def visible_codex_user_message(message: object) -> str | None:

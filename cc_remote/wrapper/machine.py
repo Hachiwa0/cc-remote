@@ -75,6 +75,12 @@ from cc_remote.attachments import (
 )
 from cc_remote.claude_paths import claude_config_dir
 from cc_remote.config import WrapperConfig
+from cc_remote.codex_daemon_restart import (
+    CodexDaemonRestartState,
+    read_restart_state,
+    restart_state_is_stale,
+    restart_state_path,
+)
 from cc_remote.log import logger
 from cc_remote.workspaces import WorkStores
 from cc_remote.protocol import (
@@ -154,6 +160,7 @@ from cc_remote.wrapper.codex_handle import (
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_window,
+    codex_native_rollback_turns,
     codex_translate_history,
 )
 from cc_remote.wrapper.codex_sessions import (
@@ -232,6 +239,16 @@ def _normalize_claude_new_session_model(model: Optional[str]) -> Optional[str]:
     if model.strip().lower() in _CLAUDE_OPUS_5_1M_ALIASES:
         return CLAUDE_DEFAULT_MODEL
     return model
+
+
+CODEX_ACCOUNT_SWITCH_CONTINUATION = """\
+<codex_internal_context source="cc_remote_account_switch">
+The previous turn was interrupted only because the authenticated Codex account
+changed. Continue the same user task from the durable conversation and workspace
+state. Do not repeat work that is already complete. Do not discuss the account
+switch unless it prevents completion.
+</codex_internal_context>"""
+_CODEX_DAEMON_UNMARKED_EPOCH = "unmarked"
 
 
 def _codex_fast_on(value: Optional[str]) -> bool:
@@ -788,6 +805,7 @@ class WrapperMachine:
         # proxy connection; Work remains per-session stdio and isolated.
         self._codex_daemon = CodexDaemonManager(
             getattr(cfg, "codex_daemon_mode", "auto"))
+        self._codex_daemon_restart_path = restart_state_path(cfg.state_dir)
         self._claude_broker = BrokerClient(
             getattr(cfg, "claude_broker_socket", None))
         # Claude's official SDK/CLI does not expose a supported multi-writer
@@ -1129,11 +1147,12 @@ class WrapperMachine:
         ctx: SessionContext,
         *,
         reason: str,
+        force: bool = False,
     ) -> bool:
         """Restore one interrupted shared proxy without changing ownership."""
         if not self._codex_shared_affinity(ctx):
             return False
-        if self._codex_shared_live(ctx):
+        if self._codex_shared_live(ctx) and not force:
             return True
         watch = self._watch.get(ctx.session_id or "")
         await self._set_session_control(
@@ -1178,6 +1197,173 @@ class WrapperMachine:
             return False
         await self._sync_external_control(ctx, watch)
         return True
+
+    async def _codex_restart_state(
+        self,
+        *,
+        wait: bool,
+        interrupt_event: Optional[asyncio.Event] = None,
+    ) -> Optional[CodexDaemonRestartState]:
+        """Read the hook barrier, optionally waiting for restart completion."""
+        while True:
+            # The marker is a bounded (4 KiB), atomically replaced local file.
+            # Reading it inline avoids default-executor starvation delaying an
+            # active-turn interrupt beyond the daemon's restart window.
+            state = read_restart_state(self._codex_daemon_restart_path)
+            if state is not None and restart_state_is_stale(state):
+                # A failed worker or an abandoned restarting marker is useful
+                # only until its published deadline. Afterwards the currently
+                # reachable daemon becomes the baseline again; a later hook
+                # writes a fresh epoch and remains observable.
+                state = None
+            if (
+                state is None
+                or state.phase != "restarting"
+                or not wait
+                or (interrupt_event is not None and interrupt_event.is_set())
+            ):
+                return state
+            remaining = max(0.0, state.deadline_at - time.time())
+            if remaining <= 0:
+                return None
+            delay = min(0.1, remaining)
+            if interrupt_event is None:
+                await asyncio.sleep(delay)
+                continue
+            try:
+                await asyncio.wait_for(
+                    interrupt_event.wait(),
+                    timeout=delay,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _stamp_codex_daemon_epoch(self, ctx: SessionContext) -> None:
+        if not self._codex_shared_affinity(ctx):
+            return
+        state = await self._codex_restart_state(wait=False)
+        ctx.codex_daemon_epoch = (
+            state.epoch
+            if state is not None and state.phase == "ready"
+            else _CODEX_DAEMON_UNMARKED_EPOCH
+        )
+
+    async def _ensure_codex_daemon_generation(
+        self,
+        ctx: SessionContext,
+        *,
+        reason: str,
+    ) -> bool:
+        """Cross an intentional restart only between native Codex turns."""
+        if not self._codex_shared_affinity(ctx):
+            return False
+        state = await self._codex_restart_state(
+            wait=True,
+            interrupt_event=ctx.interrupt_event,
+        )
+        if state is None:
+            return (
+                self._codex_shared_live(ctx)
+                or await self._reconnect_codex_shared(ctx, reason=reason)
+            )
+        if state.phase != "ready":
+            log.warning(
+                "Codex daemon restart barrier is not ready",
+                phase=state.phase,
+                epoch=state.epoch,
+                session_id=ctx.session_id,
+            )
+            return False
+        generation_changed = ctx.codex_daemon_epoch != state.epoch
+        if generation_changed:
+            # The manager caches readiness by binary/socket path, which remains
+            # stable across an official restart. Invalidate only its liveness
+            # cache; sticky per-thread shared affinity remains on the handle.
+            self._codex_daemon.invalidate()
+        if not generation_changed and self._codex_shared_live(ctx):
+            return True
+        connected = await self._reconnect_codex_shared(
+            ctx,
+            reason=reason,
+            force=generation_changed,
+        )
+        if connected:
+            ctx.codex_daemon_epoch = state.epoch
+        return connected
+
+    async def _wait_for_codex_account_switch(
+        self, *, starting_epoch: str,
+    ) -> CodexDaemonRestartState:
+        """Return as soon as the hook publishes a different generation.
+
+        The marker is written before ``codex app-server daemon restart`` starts.
+        Detecting ``restarting`` (rather than waiting for ``ready``) lets an
+        accepted turn be interrupted on the old daemon so its graceful shutdown
+        does not wait for exhausted-account work to finish.
+        """
+        while True:
+            state = await self._codex_restart_state(wait=False)
+            if state is not None and state.epoch != starting_epoch:
+                return state
+            await asyncio.sleep(0.05)
+
+    async def _resume_codex_goal_after_account_switch(
+        self,
+        ctx: SessionContext,
+        goal: dict,
+    ) -> bool:
+        """Use the official Goal idle transition until its turn is observed.
+
+        ``thread/goal/set(status=active)`` is serialized by Codex's goal-state
+        permit and calls ``try_start_turn_if_idle``. Reissuing that transition
+        cannot create a competing turn, while a fixed "no notification yet"
+        timeout followed by ``turn/start`` can. Keep the logical task waiting
+        for the correlated spontaneous lifecycle or a user interrupt instead.
+        """
+        current = goal
+        first_activation = True
+        next_activation = 0.0
+        loop = asyncio.get_running_loop()
+        while True:
+            if ctx.codex_spontaneous_turn_id is not None:
+                return True
+            if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
+                return False
+            now = loop.time()
+            if now >= next_activation:
+                if not first_activation:
+                    try:
+                        current = await ctx.sdk.get_goal()
+                    except Exception as exc:
+                        log.warning(
+                            "Codex goal state refresh failed while awaiting "
+                            "account-switch continuation",
+                            session_id=ctx.session_id,
+                            error_type=type(exc).__name__,
+                        )
+                if (
+                    not isinstance(current, dict)
+                    or current.get("status") not in {"active", "usageLimited"}
+                ):
+                    return False
+                prior_status = current.get("status")
+                current = await ctx.sdk.set_goal(status="active")
+                if (
+                    first_activation
+                    and prior_status != "active"
+                    and ctx.goal_visible
+                ):
+                    await self._emit(ctx, GoalState(goal=current))
+                first_activation = False
+                next_activation = loop.time() + 5.0
+                continue
+            try:
+                await asyncio.wait_for(
+                    ctx.interrupt_event.wait(),
+                    timeout=min(0.05, max(0.0, next_activation - now)),
+                )
+            except asyncio.TimeoutError:
+                pass
 
     async def _sync_external_control(
         self,
@@ -5615,9 +5801,11 @@ class WrapperMachine:
                 return error
         is_claude_broker = bool(getattr(ctx.sdk, "is_claude_broker", False))
         is_codex_shared = self._codex_shared_affinity(ctx)
-        if (is_codex_shared and not self._codex_shared_live(ctx)
-                and not await self._reconnect_codex_shared(
-                    ctx, reason="query preflight")):
+        if (
+            is_codex_shared
+            and not await self._ensure_codex_daemon_generation(
+                ctx, reason="query preflight")
+        ):
             error = Error(
                 code=ERR_NOT_RUNNING,
                 message="Codex 共享通道重连失败，本次未发送；请重试",
@@ -6588,9 +6776,9 @@ class WrapperMachine:
         if ctx.engine == "claude" and ctx.space != "code":
             return None
         if self._codex_shared_affinity(ctx):
-            if (self._codex_shared_live(ctx)
-                    or await self._reconnect_codex_shared(
-                        ctx, reason=f"runtime control preflight: {action}")):
+            if await self._ensure_codex_daemon_generation(
+                ctx, reason=f"runtime control preflight: {action}"
+            ):
                 return None
             error = Error(
                 code=ERR_NOT_RUNNING,
@@ -7355,7 +7543,7 @@ class WrapperMachine:
                 )
                 return
             ctx.codex_spontaneous_turn_id = turn_id
-            if ctx.turn_task is not None:
+            if ctx.turn_task is not None and not ctx.codex_account_handoff:
                 # A user send claimed the session but has not reached turn/start
                 # yet (otherwise CodexHandle.turn_active would already be true).
                 # Abort that launch rather than write concurrently with the
@@ -7414,10 +7602,246 @@ class WrapperMachine:
     ) -> None:
         """Translate one goal/automatic turn from the handle's bounded bridge."""
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
+        current_turn_id = turn_id
+        logical_msg_id = turn_id
+        stream = ctx.sdk.receive_spontaneous_response(turn_id).__aiter__()
+        restart_watch_task: Optional[asyncio.Task] = None
         overflowed = False
         terminal_seen = False
         stream_closed = False
         repair_history = False
+
+        def start_restart_watch() -> None:
+            nonlocal restart_watch_task
+            if (
+                self._codex_shared_affinity(ctx)
+                and ctx.codex_daemon_epoch
+            ):
+                restart_watch_task = asyncio.create_task(
+                    self._wait_for_codex_account_switch(
+                        starting_epoch=ctx.codex_daemon_epoch,
+                    )
+                )
+
+        async def cancel_restart_watch() -> None:
+            nonlocal restart_watch_task
+            if restart_watch_task is not None and not restart_watch_task.done():
+                restart_watch_task.cancel()
+                await asyncio.gather(
+                    restart_watch_task, return_exceptions=True)
+            restart_watch_task = None
+
+        async def next_stream_item():
+            """Race the live stream against an intentional daemon generation."""
+            next_task = asyncio.create_task(anext(stream))
+            try:
+                if restart_watch_task is None:
+                    return ("message", await next_task)
+                done, _pending = await asyncio.wait(
+                    {next_task, restart_watch_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # The hook marker is authoritative even when the old daemon
+                # closes or emits a terminal in the same scheduler tick.
+                if restart_watch_task in done:
+                    return ("codex_account_switch",
+                            restart_watch_task.result())
+                return ("message", next_task.result())
+            finally:
+                if not next_task.done():
+                    next_task.cancel()
+                    await asyncio.gather(next_task, return_exceptions=True)
+
+        async def handoff_account_switch(
+            switch_state: CodexDaemonRestartState,
+        ) -> str:
+            """Move an automatic/goal turn to the replacement daemon."""
+            nonlocal translator, current_turn_id, stream
+            nonlocal overflowed, terminal_seen, stream_closed
+
+            ctx.codex_account_handoff = True
+            await self._emit(ctx, StateEvent(
+                state="running",
+                phase="waiting",
+                detail="Codex 账号已切换，正在把当前任务转移到新账号…",
+                msg_id=logical_msg_id,
+            ))
+
+            try:
+                await ctx.sdk.interrupt()
+            except Exception as exc:
+                log.warning(
+                    "old Codex automatic turn could not be interrupted "
+                    "during account handoff",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+
+            # Close any partial assistant/tool blocks from the old native turn,
+            # but keep the logical browser turn busy: its failure boundary is an
+            # implementation detail of the account switch.
+            synthetic_old_terminal = {
+                "method": "turn/completed",
+                "params": {"turn": {
+                    "id": current_turn_id,
+                    "status": "interrupted",
+                }},
+            }
+            for event in translator.feed(synthetic_old_terminal):
+                if isinstance(event, (Error, TurnEnd)):
+                    continue
+                if isinstance(event, StateEvent) and event.detail:
+                    event.state = "running"
+                    event.msg_id = logical_msg_id
+                await self._emit(ctx, event)
+
+            await cancel_restart_watch()
+
+            # Release the old native id before reconnect. thread/resume or
+            # goal/set may synchronously announce a replacement automatic turn;
+            # keeping the old id here would make the lifecycle callback reject it
+            # as an overlapping writer.
+            current_task = asyncio.current_task()
+            if ctx.codex_spontaneous_turn_id == current_turn_id:
+                ctx.codex_spontaneous_turn_id = None
+            if ctx.codex_spontaneous_task is current_task:
+                ctx.codex_spontaneous_task = None
+
+            async def interrupted_handoff_result() -> Optional[str]:
+                if (
+                    not ctx.interrupt_event.is_set()
+                    and ctx.state != "interrupting"
+                ):
+                    return None
+                # A replacement automatic turn may already own the native
+                # interrupt and its terminal drain. Let that consumer finish it
+                # instead of emitting a duplicate terminal for the old id.
+                if ctx.codex_spontaneous_turn_id is not None:
+                    ctx.codex_account_handoff = False
+                    return "spontaneous"
+                await self._emit(ctx, TurnEnd(result=TurnResult(
+                    subtype="error_during_execution",
+                    duration_ms=0,
+                    is_error=True,
+                ), turn_id=current_turn_id))
+                # Reclaim only for cleanup: finally -> _finish clears the
+                # interrupt latch, active message, and running state together.
+                ctx.codex_spontaneous_turn_id = current_turn_id
+                ctx.codex_spontaneous_task = current_task
+                ctx.codex_account_handoff = False
+                return "interrupted"
+
+            ready_state = await self._codex_restart_state(
+                wait=True,
+                interrupt_event=ctx.interrupt_event,
+            )
+            interrupted = await interrupted_handoff_result()
+            if interrupted is not None:
+                return interrupted
+            if ready_state is None or ready_state.phase != "ready":
+                phase = ready_state.phase if ready_state is not None else "missing"
+                raise RuntimeError(
+                    "Codex account-switch daemon restart did not become "
+                    f"ready: {phase}"
+                )
+            if not await self._ensure_codex_daemon_generation(
+                ctx, reason="continue automatic turn after account switch"
+            ):
+                raise RuntimeError(
+                    "Codex account-switch daemon generation reconnect failed")
+
+            interrupted = await interrupted_handoff_result()
+            if interrupted is not None:
+                return interrupted
+
+            try:
+                goal = await ctx.sdk.get_goal()
+            except Exception as exc:
+                goal = None
+                log.warning(
+                    "Codex goal state unavailable during automatic account "
+                    "handoff",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+            resumable_goal = bool(
+                isinstance(goal, dict)
+                and goal.get("status") in {"active", "usageLimited"}
+            )
+            if resumable_goal:
+                resumed = await self._resume_codex_goal_after_account_switch(
+                    ctx, goal)
+                if resumed:
+                    ctx.codex_account_handoff = False
+                    await self._emit(ctx, StateEvent(
+                        state="running",
+                        phase=None,
+                        detail=None,
+                        msg_id=logical_msg_id,
+                    ))
+                    log.info(
+                        "Codex automatic turn transferred after account switch",
+                        session_id=ctx.session_id,
+                        requested_epoch=switch_state.epoch,
+                        new_epoch=ctx.codex_daemon_epoch,
+                        turn_id=ctx.codex_spontaneous_turn_id,
+                    )
+                    return "spontaneous"
+
+            interrupted = await interrupted_handoff_result()
+            if interrupted is not None:
+                return interrupted
+            if resumable_goal:
+                raise RuntimeError(
+                    "Codex Goal stopped before its account-switch "
+                    "continuation started"
+                )
+
+            # An ordinary conversation has no Goal runtime. Submit one internal
+            # continuation turn; history parsing recognizes the exact private
+            # marker and never projects it as a user/rollback boundary.
+            translator = CodexStreamTranslator(self.cfg.tool_result_max)
+            try:
+                new_turn_id = await ctx.sdk.query(
+                    CODEX_ACCOUNT_SWITCH_CONTINUATION, images=[])
+            except Exception:
+                if ctx.codex_spontaneous_turn_id is not None:
+                    ctx.codex_account_handoff = False
+                    return "spontaneous"
+                raise
+            if not new_turn_id:
+                raise RuntimeError(
+                    "Codex continuation did not return a native turn id")
+            current_turn_id = new_turn_id
+            ctx.codex_spontaneous_turn_id = current_turn_id
+            ctx.codex_spontaneous_task = current_task
+            ctx.active_msg_id = logical_msg_id
+            stream = ctx.sdk.receive_response().__aiter__()
+            overflowed = False
+            terminal_seen = False
+            stream_closed = False
+            if logical_msg_id:
+                await self._emit(ctx, TurnBinding(
+                    msg_id=logical_msg_id,
+                    turn_id=current_turn_id,
+                ))
+            start_restart_watch()
+            ctx.codex_account_handoff = False
+            await self._emit(ctx, StateEvent(
+                state="running",
+                phase=None,
+                detail=None,
+                msg_id=logical_msg_id,
+            ))
+            log.info(
+                "continued Codex automatic turn after account switch",
+                session_id=ctx.session_id,
+                requested_epoch=switch_state.epoch,
+                new_epoch=ctx.codex_daemon_epoch,
+                turn_id=current_turn_id,
+            )
+            return "continued"
+
         try:
             if announce_running:
                 await self._emit(ctx, StateEvent(state="running"))
@@ -7448,7 +7872,31 @@ class WrapperMachine:
             # rendering a fabricated user bubble.
             await self._emit(ctx, UserMsg(msg_id=turn_id, prompt=""))
 
-            async for raw in ctx.sdk.receive_spontaneous_response(turn_id):
+            start_restart_watch()
+            while True:
+                try:
+                    kind, value = await next_stream_item()
+                except StopAsyncIteration:
+                    # A graceful daemon close may win the same poll interval as
+                    # the marker. Re-read once before treating EOF as failure.
+                    switch_state = read_restart_state(
+                        self._codex_daemon_restart_path)
+                    if (
+                        switch_state is not None
+                        and ctx.codex_daemon_epoch
+                        and switch_state.epoch != ctx.codex_daemon_epoch
+                    ):
+                        kind, value = "codex_account_switch", switch_state
+                    else:
+                        stream_closed = True
+                        break
+                if kind == "codex_account_switch":
+                    handoff = await handoff_account_switch(value)
+                    if handoff in {"spontaneous", "interrupted"}:
+                        return
+                    continue
+
+                raw = value
                 if isinstance(raw, CodexSteerFence):
                     raw.reached.set()
                     await raw.release.wait()
@@ -7457,10 +7905,23 @@ class WrapperMachine:
                     raw.reached.set()
                     await raw.release.wait()
                     continue
-                if isinstance(raw, CodexSpontaneousOverflow):
+                if isinstance(raw, (
+                    CodexSpontaneousOverflow, CodexManagedOverflow,
+                )):
                     overflowed = True
                     continue
                 if isinstance(raw, CodexSpontaneousClosed):
+                    switch_state = read_restart_state(
+                        self._codex_daemon_restart_path)
+                    if (
+                        switch_state is not None
+                        and ctx.codex_daemon_epoch
+                        and switch_state.epoch != ctx.codex_daemon_epoch
+                    ):
+                        handoff = await handoff_account_switch(switch_state)
+                        if handoff in {"spontaneous", "interrupted"}:
+                            return
+                        continue
                     stream_closed = True
                     break
                 if not isinstance(raw, dict):
@@ -7483,18 +7944,19 @@ class WrapperMachine:
                               if not isinstance(event, (Error, TurnEnd))]
                 for event in events:
                     if isinstance(event, Error) and event.msg_id is None:
-                        event.msg_id = turn_id
+                        event.msg_id = logical_msg_id
                     if isinstance(event, StateEvent) and event.detail:
                         if ctx.state != "running":
                             continue
                         event.state = ctx.state
                         if event.msg_id is None:
-                            event.msg_id = turn_id
+                            event.msg_id = logical_msg_id
                     await self._emit(ctx, event)
                 if terminal:
                     if completed_after_overflow:
                         await self._emit(
-                            ctx, _codex_success_terminal(raw, turn_id))
+                            ctx, _codex_success_terminal(
+                                raw, current_turn_id))
                         repair_history = True
                     terminal_seen = True
                     break
@@ -7503,51 +7965,68 @@ class WrapperMachine:
                 synthetic = {
                     "method": "turn/completed",
                     "params": {"turn": {
-                        "id": turn_id,
+                        "id": current_turn_id,
                         "status": "failed",
                         "error": {"message": "Codex app-server connection closed"},
                     }},
                 }
                 for event in translator.feed(synthetic):
                     if isinstance(event, Error) and event.msg_id is None:
-                        event.msg_id = turn_id
+                        event.msg_id = logical_msg_id
                     await self._emit(ctx, event)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.warning(
                 "codex spontaneous turn consumer failed",
-                turn_id=turn_id,
+                turn_id=current_turn_id,
                 error_type=type(exc).__name__,
             )
+            current_task = asyncio.current_task()
+            replacement_owns = (
+                ctx.codex_spontaneous_task is not None
+                and ctx.codex_spontaneous_task is not current_task
+            )
+            if replacement_owns:
+                return
+            # Handoff releases the old id before reconnect so a replacement can
+            # claim it. Reclaim only on failure, allowing normal cleanup to
+            # unlock the session instead of leaving a permanent running state.
+            ctx.codex_spontaneous_turn_id = current_turn_id
+            ctx.codex_spontaneous_task = current_task
             try:
                 await self._emit(ctx, Error(
                     code=ERR_CC_CRASH,
                     message="Codex 自动回合实时同步失败；请刷新会话。",
-                    msg_id=turn_id,
+                    msg_id=logical_msg_id,
                 ))
                 await self._emit(ctx, TurnEnd(
                     result=TurnResult(
                         subtype="error", duration_ms=0, is_error=True),
-                    turn_id=turn_id,
+                    turn_id=current_turn_id,
                 ))
             except Exception:
                 log.warning(
                     "codex spontaneous failure event could not be emitted",
-                    turn_id=turn_id,
+                    turn_id=current_turn_id,
                 )
         finally:
+            await cancel_restart_watch()
+            ctx.codex_account_handoff = False
             try:
-                await self._finish_codex_spontaneous_turn(ctx, turn_id)
+                # A replacement lifecycle task owns a different id. Its cleanup
+                # is authoritative; the old task must not unlock it.
+                await self._finish_codex_spontaneous_turn(
+                    ctx, current_turn_id)
             except Exception as exc:
                 log.warning(
                     "codex spontaneous turn cleanup failed",
-                    turn_id=turn_id,
+                    turn_id=current_turn_id,
                     error_type=type(exc).__name__,
                 )
             if repair_history:
                 await self._repair_codex_projection_after_overflow(
-                    ctx, turn_id)
+                    ctx, current_turn_id)
 
     async def _run_codex_review_turn(
         self, ctx: SessionContext, turn_id: str,
@@ -10583,10 +11062,11 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
-        if (self._codex_shared_affinity(ctx)
-                and not self._codex_shared_live(ctx)
-                and not await self._reconnect_codex_shared(
-                    ctx, reason=f"before {action}")):
+        if (
+            self._codex_shared_affinity(ctx)
+            and not await self._ensure_codex_daemon_generation(
+                ctx, reason=f"before {action}")
+        ):
             error = Error(
                 code=ERR_NOT_RUNNING,
                 message=f"Codex 共享通道重连失败，无法{action}；请重试",
@@ -11187,7 +11667,28 @@ class WrapperMachine:
                     )
                     codex_journal = None
                     conversation_may_have_changed = True
-                    await ctx.sdk.rollback_thread(cmd.num_turns)
+                    native_turns = cmd.num_turns
+                    rollout = codex_rollout_path(sid)
+                    if rollout:
+                        native_turns = await asyncio.to_thread(
+                            codex_native_rollback_turns,
+                            rollout,
+                            cmd.num_turns,
+                        )
+                    if native_turns > 1000:
+                        raise ValueError(
+                            "logical rollback expands beyond Codex's native "
+                            "1000-turn limit"
+                        )
+                    if native_turns != cmd.num_turns:
+                        log.info(
+                            "expanded Codex rollback across internal account "
+                            "handoff turns",
+                            session_id=sid,
+                            logical_turns=cmd.num_turns,
+                            native_turns=native_turns,
+                        )
+                    await ctx.sdk.rollback_thread(native_turns)
                 else:
                     conversation_may_have_changed = True
                     try:
@@ -13051,6 +13552,7 @@ class WrapperMachine:
                 log.exception("connect failed", error=str(e))
                 await reject(ERR_CC_CRASH, "会话连接未完成，请稍后重试。")
                 return None
+        await self._stamp_codex_daemon_epoch(ctx)
 
         if (ctx.space == "work" and ctx.work_context_baseline_pending
                 and ctx.work_context_baseline_tokens is None):
@@ -13282,6 +13784,7 @@ class WrapperMachine:
             raise _BtwSpawnFailure(
                 ERR_CC_CRASH, "临时侧边会话暂时无法打开，请稍后重试。"
             ) from e
+        await self._stamp_codex_daemon_epoch(ctx)
         key = f"btw-{uuid4().hex}"
         self.sessions[key] = ctx
         ctx.key = key
@@ -13725,20 +14228,25 @@ class WrapperMachine:
         claude_turn_completed = False
         codex_overflowed = False
         codex_overflow_repair_turn_id: Optional[str] = None
+        codex_restart_watch_task: Optional[asyncio.Task] = None
+        codex_handoff_to_spontaneous = False
+        native_turn_id: Optional[str] = None
 
-        async def reader() -> None:
+        async def reader(
+            target_queue: asyncio.Queue, target_reader_exc: list,
+        ) -> None:
             cancelled = False
             try:
                 async for msg in ctx.sdk.receive_response():
-                    await queue.put(msg)
+                    await target_queue.put(msg)
             except asyncio.CancelledError:
                 cancelled = True
                 raise
             except BaseException as e:
-                reader_exc.append(e)
+                target_reader_exc.append(e)
             finally:
                 if not cancelled:
-                    await queue.put(None)
+                    await target_queue.put(None)
 
         async def next_turn_message():
             nonlocal notice_active
@@ -13755,16 +14263,19 @@ class WrapperMachine:
                 self.cfg.codex_turn_idle_warn_seconds
                 if is_codex and not codex_overflowed else 0
             )
-            if warn <= 0 or ctx.state == "interrupting":
-                return await self._next_from_queue(ctx, queue)
             wait_task = asyncio.create_task(self._next_from_queue(ctx, queue))
             try:
-                done, _ = await asyncio.wait((wait_task,), timeout=warn)
-                if wait_task in done:
-                    # Preserve a real drain-timeout exception from
-                    # _next_from_queue.
-                    return wait_task.result()
-                if ctx.state == "running":
+                candidates = {wait_task}
+                if codex_restart_watch_task is not None:
+                    candidates.add(codex_restart_watch_task)
+                timeout = (
+                    warn if warn > 0 and ctx.state != "interrupting" else None)
+                done, _ = await asyncio.wait(
+                    candidates,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done and ctx.state == "running":
                     await self._emit(ctx, StateEvent(
                         state="running",
                         phase="waiting",
@@ -13773,9 +14284,36 @@ class WrapperMachine:
                         msg_id=ctx.active_msg_id,
                     ))
                     notice_active = True
-                # An interrupt racing the warning now enters the normal absolute
-                # DRAIN_TIMEOUT path. Keep awaiting the SAME task: it may have
-                # consumed a boundary event just as asyncio.wait timed out.
+                    done, _ = await asyncio.wait(
+                        candidates,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                # The hook writes its marker before asking the daemon to stop.
+                # If a stale stream frame and the marker become ready together,
+                # account handoff wins so an old terminal cannot falsely unlock
+                # the browser queue.
+                if (codex_restart_watch_task is not None
+                        and codex_restart_watch_task in done):
+                    return (
+                        "codex_account_switch",
+                        codex_restart_watch_task.result(),
+                    )
+                if wait_task in done:
+                    # A graceful daemon stop may close the proxy in the same
+                    # scheduler tick that the 50 ms watcher is polling. Re-read
+                    # the bounded marker synchronously before accepting EOF or
+                    # an old-generation terminal as authoritative.
+                    if is_codex_shared and ctx.codex_daemon_epoch:
+                        switch_state = read_restart_state(
+                            self._codex_daemon_restart_path)
+                        if (
+                            switch_state is not None
+                            and switch_state.epoch != ctx.codex_daemon_epoch
+                        ):
+                            return ("codex_account_switch", switch_state)
+                    # Preserve a real drain-timeout exception from
+                    # _next_from_queue.
+                    return wait_task.result()
                 return await wait_task
             finally:
                 if not wait_task.done():
@@ -13803,6 +14341,224 @@ class WrapperMachine:
                 notice_active = True
             elif isinstance(event, Error):
                 notice_active = False
+
+        async def handoff_codex_account_switch(
+            switch_state: CodexDaemonRestartState,
+        ) -> str:
+            """Move the current logical turn to the replacement daemon.
+
+            Returns ``continued`` for an internal managed continuation,
+            ``spontaneous`` when an active goal owns the continuation, or
+            ``interrupted`` when the user stopped the task during handoff.
+            """
+            nonlocal queue, reader_exc, reader_task
+            nonlocal codex_overflowed, codex_restart_watch_task
+            nonlocal native_turn_id, notice_active
+
+            ctx.codex_account_handoff = True
+            await self._emit(ctx, StateEvent(
+                state="running",
+                phase="waiting",
+                detail="Codex 账号已切换，正在把当前任务转移到新账号…",
+                msg_id=ctx.active_msg_id,
+            ))
+            notice_active = True
+
+            # The hook marker precedes daemon restart, so the old proxy should
+            # still accept turn/interrupt. A disconnect race is harmless: the
+            # generation barrier below remains authoritative.
+            try:
+                await ctx.sdk.interrupt()
+            except Exception as exc:
+                log.warning(
+                    "old Codex turn could not be interrupted during account handoff",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+
+            # Drain the old interrupted terminal briefly so open assistant/tool
+            # blocks close in wire order, but suppress its failure boundary: this
+            # is still logical turn A and the browser must remain busy.
+            old_queue = queue
+            old_reader_task = reader_task
+            old_terminal_seen = False
+            drain_deadline = (
+                asyncio.get_running_loop().time()
+                + min(2.0, self.cfg.drain_timeout)
+            )
+            while old_reader_task is not None:
+                remaining = drain_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    old_message = await asyncio.wait_for(
+                        old_queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                if old_message is None:
+                    break
+                if isinstance(old_message, dict):
+                    old_terminal = is_turn_terminal(old_message)
+                    for event in ctx.translator.feed(old_message):
+                        if isinstance(event, (Error, TurnEnd)):
+                            continue
+                        await emit_codex_event(event)
+                    if old_terminal:
+                        old_terminal_seen = True
+                        break
+            if not old_terminal_seen:
+                synthetic_old_terminal = {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": native_turn_id,
+                        "status": "interrupted",
+                    }},
+                }
+                for event in ctx.translator.feed(synthetic_old_terminal):
+                    if isinstance(event, (Error, TurnEnd)):
+                        continue
+                    await emit_codex_event(event)
+
+            if old_reader_task is not None and not old_reader_task.done():
+                old_reader_task.cancel()
+            if old_reader_task is not None:
+                await asyncio.gather(old_reader_task, return_exceptions=True)
+            reader_task = None
+            if (codex_restart_watch_task is not None
+                    and not codex_restart_watch_task.done()):
+                codex_restart_watch_task.cancel()
+                await asyncio.gather(
+                    codex_restart_watch_task, return_exceptions=True)
+            codex_restart_watch_task = None
+
+            # The restart worker may still be waiting for the old interrupted
+            # turn to release. Do not connect until the exact/newest marker says
+            # the official daemon restart completed successfully.
+            ready_state = await self._codex_restart_state(
+                wait=True,
+                interrupt_event=ctx.interrupt_event,
+            )
+            if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
+                await self._emit(ctx, TurnEnd(result=TurnResult(
+                    subtype="error_during_execution",
+                    duration_ms=0,
+                    is_error=True,
+                ), turn_id=native_turn_id))
+                ctx.codex_account_handoff = False
+                return "interrupted"
+            if ready_state is None or ready_state.phase != "ready":
+                phase = ready_state.phase if ready_state is not None else "missing"
+                raise RuntimeError(
+                    f"Codex account-switch daemon restart did not become ready: {phase}"
+                )
+            if not await self._ensure_codex_daemon_generation(
+                ctx, reason="continue active turn after account switch"
+            ):
+                raise RuntimeError(
+                    "Codex account-switch daemon generation reconnect failed")
+
+            if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
+                await self._emit(ctx, TurnEnd(result=TurnResult(
+                    subtype="error_during_execution",
+                    duration_ms=0,
+                    is_error=True,
+                ), turn_id=native_turn_id))
+                ctx.codex_account_handoff = False
+                return "interrupted"
+
+            # Resuming an active goal can start its official automatic turn as
+            # part of thread/resume. A usage-limited goal needs the same
+            # transition as `/goal resume`; do not add a competing managed turn.
+            try:
+                goal = await ctx.sdk.get_goal()
+            except Exception as exc:
+                goal = None
+                log.warning(
+                    "Codex goal state unavailable during account handoff",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+            resumable_goal = bool(
+                isinstance(goal, dict)
+                and goal.get("status") in {"active", "usageLimited"}
+            )
+            if resumable_goal:
+                if ctx.codex_spontaneous_turn_id is not None:
+                    if ctx.codex_checkpoint not in (None, False):
+                        # thread/resume launched before a safe post-image could
+                        # be captured. Do not snapshot a partially running turn.
+                        await self._retire_codex_checkpoint(
+                            ctx,
+                            reason=(
+                                "active goal resumed during Codex account handoff"
+                            ),
+                        )
+                    return "spontaneous"
+                # The old native turn has stopped and no replacement has started,
+                # so this is the last safe post-image boundary. The automatic
+                # Goal turn receives its normal unavailable checkpoint slot.
+                await self._finish_codex_checkpoint(ctx)
+                resumed = await self._resume_codex_goal_after_account_switch(
+                    ctx, goal)
+                if resumed:
+                    return "spontaneous"
+                if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
+                    await self._emit(ctx, TurnEnd(result=TurnResult(
+                        subtype="error_during_execution",
+                        duration_ms=0,
+                        is_error=True,
+                    ), turn_id=native_turn_id))
+                    ctx.codex_account_handoff = False
+                    return "interrupted"
+                raise RuntimeError(
+                    "Codex Goal stopped before its account-switch "
+                    "continuation started"
+                )
+
+            # Ordinary conversations have no resumable-computation RPC. Start a
+            # native turn with a private marker that history and rollback
+            # projection treat as part of the interrupted logical turn.
+            ctx.translator = CodexStreamTranslator(self.cfg.tool_result_max)
+            queue = asyncio.Queue(
+                maxsize=max(1, self.cfg.turn_reader_queue_cap))
+            reader_exc = []
+            codex_overflowed = False
+            try:
+                native_turn_id = await ctx.sdk.query(
+                    CODEX_ACCOUNT_SWITCH_CONTINUATION, images=[])
+            except Exception:
+                # An active goal may win the tiny gap after the bounded wait.
+                if ctx.codex_spontaneous_turn_id is not None:
+                    return "spontaneous"
+                raise
+            if native_turn_id and ctx.active_msg_id:
+                await self._emit(ctx, TurnBinding(
+                    msg_id=ctx.active_msg_id,
+                    turn_id=native_turn_id,
+                ))
+            ctx.codex_account_handoff = False
+            if native_turn_id and ctx.codex_daemon_epoch:
+                codex_restart_watch_task = asyncio.create_task(
+                    self._wait_for_codex_account_switch(
+                        starting_epoch=ctx.codex_daemon_epoch,
+                    )
+                )
+            reader_task = asyncio.create_task(reader(queue, reader_exc))
+            await self._emit(ctx, StateEvent(
+                state="running",
+                phase=None,
+                detail=None,
+                msg_id=ctx.active_msg_id,
+            ))
+            notice_active = False
+            log.info(
+                "continued Codex turn after account switch",
+                session_id=ctx.session_id,
+                requested_epoch=switch_state.epoch,
+                new_epoch=ctx.codex_daemon_epoch,
+                turn_id=native_turn_id,
+            )
+            return "continued"
 
         async def reconnect_claude(reason: str) -> None:
             """Reconnect without hiding transcript changes during the await."""
@@ -13990,10 +14746,11 @@ class WrapperMachine:
                     # short native turn can finish between the earlier reload and
                     # this probe: no holder remains, but consuming its markers sets
                     # needs_reload. Reconnect once, then probe again before sending.
-                    if (is_codex_shared
-                            and not self._codex_shared_live(ctx)
-                            and not await self._reconnect_codex_shared(
-                                ctx, reason="final query preflight")):
+                    if (
+                        is_codex_shared
+                        and not await self._ensure_codex_daemon_generation(
+                            ctx, reason="final query preflight")
+                    ):
                         await self._emit(ctx, Error(
                             code=ERR_NOT_RUNNING,
                             message="Codex 共享通道重连失败，本次未发送；请重试",
@@ -14089,6 +14846,16 @@ class WrapperMachine:
                             msg_id=ctx.active_msg_id,
                             turn_id=native_turn_id,
                         ))
+                    if (
+                        is_codex_shared
+                        and native_turn_id
+                        and ctx.codex_daemon_epoch
+                    ):
+                        codex_restart_watch_task = asyncio.create_task(
+                            self._wait_for_codex_account_switch(
+                                starting_epoch=ctx.codex_daemon_epoch,
+                            )
+                        )
                     await self._accept_codex_checkpoint(ctx)
                 elif images:
                     content: list = []
@@ -14130,7 +14897,7 @@ class WrapperMachine:
                         mode=collaboration_mode))
                 await self._emit(ctx, Fast(
                     on=_codex_fast_on(ctx.sdk.service_tier)))
-            reader_task = asyncio.create_task(reader())
+            reader_task = asyncio.create_task(reader(queue, reader_exc))
             while True:
                 msg = await next_turn_message()
                 if isinstance(msg, CodexSteerFence):
@@ -14155,6 +14922,18 @@ class WrapperMachine:
                     raise RuntimeError("cc stream ended without a ResultMessage")
 
                 if is_codex:
+                    if (
+                        isinstance(msg, tuple)
+                        and len(msg) == 2
+                        and msg[0] == "codex_account_switch"
+                        and isinstance(msg[1], CodexDaemonRestartState)
+                    ):
+                        outcome = await handoff_codex_account_switch(msg[1])
+                        if outcome == "continued":
+                            continue
+                        if outcome == "spontaneous":
+                            codex_handoff_to_spontaneous = True
+                        break
                     if isinstance(msg, CodexManagedOverflow):
                         codex_overflowed = True
                         await emit_codex_event(StateEvent(
@@ -14251,6 +15030,8 @@ class WrapperMachine:
                 if release_background is not None:
                     release_background()
 
+            if codex_handoff_to_spontaneous:
+                return
             await self._set_idle_after_managed_turn(ctx)
             if codex_overflow_repair_turn_id is not None:
                 await self._repair_codex_projection_after_overflow(
@@ -14289,6 +15070,7 @@ class WrapperMachine:
                     ctx.sdk, "release_background_messages", None)
                 if release_background is not None:
                     release_background()
+            ctx.codex_account_handoff = False
             ctx.translator = None
             ctx.turn_task = None
             if ctx.codex_spontaneous_turn_id is None:
@@ -14314,3 +15096,10 @@ class WrapperMachine:
                     await reader_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if (
+                codex_restart_watch_task is not None
+                and not codex_restart_watch_task.done()
+            ):
+                codex_restart_watch_task.cancel()
+                await asyncio.gather(
+                    codex_restart_watch_task, return_exceptions=True)
