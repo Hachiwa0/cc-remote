@@ -405,6 +405,49 @@ async function dispatchTouchPhase(
   }, { type, clientY });
 }
 
+async function stageDelayedTouchMove(
+  page: import("@playwright/test").Page,
+  startY: number,
+  clientY: number,
+): Promise<void> {
+  await page.locator(".thread").evaluate((node, input) => {
+    const target = node as HTMLElement & { __delayedTouchMove?: Event };
+    const startTouch = {
+      identifier: 1,
+      target,
+      clientX: 120,
+      clientY: input.startY,
+    };
+    const start = new Event("touchstart", { bubbles: true, cancelable: true });
+    Object.defineProperties(start, {
+      touches: { value: [startTouch] },
+      targetTouches: { value: [startTouch] },
+      changedTouches: { value: [startTouch] },
+    });
+    target.dispatchEvent(start);
+    const touch = { ...startTouch, clientY: input.clientY };
+    const event = new Event("touchmove", { bubbles: true, cancelable: true });
+    Object.defineProperties(event, {
+      touches: { value: [touch] },
+      targetTouches: { value: [touch] },
+      changedTouches: { value: [touch] },
+    });
+    target.__delayedTouchMove = event;
+  }, { startY, clientY });
+}
+
+async function dispatchDelayedTouchMove(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  await page.locator(".thread").evaluate((node) => {
+    const target = node as HTMLElement & { __delayedTouchMove?: Event };
+    const event = target.__delayedTouchMove;
+    delete target.__delayedTouchMove;
+    if (!event) throw new Error("delayed touchmove was not staged");
+    target.dispatchEvent(event);
+  });
+}
+
 async function requestOlderHistory(
   page: import("@playwright/test").Page,
   projectName: string,
@@ -956,7 +999,7 @@ test("invalid Mermaid falls back to copyable source", async ({ page }) => {
 
 test("offscreen historical Mermaid does not load until its row is mounted", async ({
   page,
-}) => {
+}, testInfo) => {
   await page.goto("/tests/history-browser.html?mermaid-history=1");
   await expect(page.locator('[data-turn-id="after-mermaid-40"]')).toBeVisible();
   await expect(page.locator(".mermaid-block")).toHaveCount(0);
@@ -966,7 +1009,7 @@ test("offscreen historical Mermaid does not load until its row is mounted", asyn
     /\/node_modules\/\.vite\/deps\/mermaid(?:\.js|-)/i.test(url),
   )).toBe(false);
 
-  await page.locator(".thread").evaluate((node) => { node.scrollTop = 0; });
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   const diagramTurn = page.locator('[data-turn-id="mermaid"]');
   await expect(diagramTurn).toBeVisible();
   await expect(diagramTurn.locator(".mermaid-block")).toHaveCount(2);
@@ -1072,6 +1115,15 @@ test("a page that finishes under an active touch restores its retained boundary"
   await dispatchTouchPhase(page, "touchmove", 220);
   await expect(page.getByTestId("load-count")).toHaveText("1");
   await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  // WebKit may deliver the scroll that reached the paging edge only after the
+  // prepended rows have committed. Reproduce that stale metrics sequence
+  // deterministically: without a post-commit touchmove it must not replace o1.
+  await viewport.evaluate((node) => {
+    node.scrollTop = 400;
+    node.dispatchEvent(new Event("scroll"));
+    node.scrollTop = 0;
+    node.dispatchEvent(new Event("scroll"));
+  });
   await dispatchTouchPhase(page, "touchend", 220);
 
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
@@ -1082,6 +1134,36 @@ test("a page that finishes under an active touch restores its retained boundary"
   const settled = await readingAnchor(page);
   expect(settled.id).toBe(before.id);
   expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
+});
+
+test("a delayed pre-commit touchmove never rebases a retained page", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  const before = await readingAnchor(page);
+
+  // Create the reverse move before the page request. WebKit may queue that
+  // native event and deliver it only after React commits the prepend.
+  await stageDelayedTouchMove(page, 160, 80);
+  await dispatchTouchPhase(page, "touchmove", 220);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await dispatchDelayedTouchMove(page);
+  await viewport.evaluate((node) => {
+    node.scrollTop = 400;
+    node.dispatchEvent(new Event("scroll"));
+    node.scrollTop = 0;
+    node.dispatchEvent(new Event("scroll"));
+  });
+  await dispatchTouchPhase(page, "touchend", 80);
+
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
 });
 
 test("a cached-newer page that finishes under touch keeps its retained row", async ({

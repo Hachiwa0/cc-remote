@@ -85,6 +85,13 @@ interface CapturedHistoryBoundary extends HistoryAnchorPoint {
   anchorOffset: number;
 }
 
+interface TouchAppliedBoundary {
+  generation: number;
+  appliedEventTimestamp: number;
+  baselineY: number;
+  movedAfterApply: boolean;
+}
+
 interface RetainedMeasurementBoundary {
   sid: string | null;
   revision: string | null;
@@ -283,7 +290,9 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   const lastScrollTopRef = useRef(0);
   const renderedScrollScopeRef = useRef<string | null>(null);
   const touchYRef = useRef<number | null>(null);
-  const touchRebaseAppliedRef = useRef(false);
+  const touchEventClockOffsetRef = useRef<number | null>(null);
+  const touchAppliedBoundaryRef = useRef<TouchAppliedBoundary | null>(null);
+  const touchHistoryGenerationRef = useRef<number | null>(null);
   const userScrollIntentRef = useRef(false);
   const userScrollDirectionRef = useRef<UserScrollDirection | null>(null);
   const userScrollIntentTimerRef = useRef<number | null>(null);
@@ -542,6 +551,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       historyAnchorRef.current.current()?.generation ?? null;
     const cancelled = historyAnchorRef.current.cancel(generation);
     if (!cancelled) return false;
+    if (touchHistoryGenerationRef.current === activeGeneration) {
+      touchHistoryGenerationRef.current = null;
+      touchAppliedBoundaryRef.current = null;
+    }
     if (historyReleaseFrameRef.current !== null) {
       window.cancelAnimationFrame(historyReleaseFrameRef.current);
       historyReleaseFrameRef.current = null;
@@ -901,6 +914,9 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         oldestTurnId: point.oldestTurnId,
         anchorOffset: point.anchorOffset,
       });
+      touchHistoryGenerationRef.current =
+        touchYRef.current !== null ? generation : null;
+      touchAppliedBoundaryRef.current = null;
       setActiveHistoryGeneration(generation);
     }
     clearHistoryRequestTimeout();
@@ -1027,7 +1043,19 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       return;
     }
     if (historyAnchorRef.current.markRendering(anchor.generation)) {
-      historyAnchorRef.current.markApplied(anchor.generation);
+      if (historyAnchorRef.current.markApplied(anchor.generation)
+          && touchHistoryGenerationRef.current === anchor.generation
+          && touchYRef.current !== null) {
+        const clockOffset = touchEventClockOffsetRef.current;
+        touchAppliedBoundaryRef.current = {
+          generation: anchor.generation,
+          appliedEventTimestamp: clockOffset == null
+            ? Number.POSITIVE_INFINITY
+            : window.performance.now() - clockOffset,
+          baselineY: touchYRef.current,
+          movedAfterApply: false,
+        };
+      }
       scheduleHistoryAnchorRelease(anchor.generation);
     }
   }, [
@@ -1093,7 +1121,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       cancelHistoryAnchor();
       clearHistoryRequestTimeout();
       touchYRef.current = null;
-      touchRebaseAppliedRef.current = false;
+      touchAppliedBoundaryRef.current = null;
+      touchEventClockOffsetRef.current = null;
       userScrollIntentRef.current = false;
       userScrollDirectionRef.current = null;
       if (userScrollIntentTimerRef.current !== null) {
@@ -1221,10 +1250,21 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       textSelectionRef.current?.scope === scrollScope
       && textSelectionRef.current.dragging;
     const currentHistoryAnchor = historyAnchorRef.current.current();
+    const touchOwnsHistoryAnchor = currentHistoryAnchor != null
+      && touchHistoryGenerationRef.current === currentHistoryAnchor.generation;
     const explicitAppliedMovement = keyedPrependResponseReady
       && currentHistoryAnchor?.phase === "applied"
       && intendedDirection !== null
-      && intendedDirection !== "unknown";
+      && intendedDirection !== "unknown"
+      // Mobile WebKit can deliver the scroll that reached the paging edge
+      // only after the response has already rendered. For a touch-owned page,
+      // only a touchmove observed after that render may replace the original
+      // retained row. clearTouch synchronously captures that explicit move
+      // before clearing this marker.
+      && (!touchOwnsHistoryAnchor
+        || (touchAppliedBoundaryRef.current?.generation
+            === currentHistoryAnchor.generation
+          && touchAppliedBoundaryRef.current.movedAfterApply));
     const userDrivenScroll = movementDirection !== null && (
       textSelectionDragging
       || (userScrollIntentRef.current
@@ -1350,7 +1390,9 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   const onTouchStart = (event: TouchEvent<HTMLDivElement>) => {
     markUserScrollIntent("unknown");
     historyLoadGateRef.current.beginGesture();
-    touchRebaseAppliedRef.current = false;
+    touchAppliedBoundaryRef.current = null;
+    touchEventClockOffsetRef.current =
+      window.performance.now() - event.timeStamp;
     touchYRef.current = event.touches[0]?.clientY ?? null;
   };
 
@@ -1358,6 +1400,9 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     const currentY = event.touches[0]?.clientY;
     const previousY = touchYRef.current;
     if (currentY == null || previousY == null) return;
+    // Publish the newest finger position before a paging state update can
+    // synchronously commit and capture the applied boundary.
+    touchYRef.current = currentY;
     // A finger moving down scrolls the viewport toward earlier messages.
     if (currentY > previousY) {
       markUserScrollIntent("history");
@@ -1377,8 +1422,12 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     } else if (currentY < previousY) {
       markUserScrollIntent("latest");
       const anchor = historyAnchorRef.current.current();
-      if (anchor?.phase === "applied") {
-        touchRebaseAppliedRef.current = true;
+      const appliedBoundary = touchAppliedBoundaryRef.current;
+      if (anchor?.phase === "applied"
+          && appliedBoundary?.generation === anchor.generation
+          && event.timeStamp > appliedBoundary.appliedEventTimestamp
+          && currentY < appliedBoundary.baselineY - 0.5) {
+        appliedBoundary.movedAfterApply = true;
       }
       if (anchor?.direction !== "newer"
           && (anchor?.phase === "pending" || anchor?.phase === "rendering")) {
@@ -1392,7 +1441,6 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         maybeAutoLoadNewer(true, "touch");
       }
     }
-    touchYRef.current = currentY;
   };
 
   const rebaseAppliedHistoryAnchor = () => {
@@ -1415,10 +1463,11 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     // Mobile WebKit may defer React's scroll event until touchend. Capture the
     // DOM's already-moved reading row before clearing the touch lock, otherwise
     // the residual prepend correction can restore the pre-gesture row first.
-    if (touchRebaseAppliedRef.current) {
+    if (touchAppliedBoundaryRef.current?.movedAfterApply) {
       rebaseAppliedHistoryAnchor();
     }
-    touchRebaseAppliedRef.current = false;
+    touchAppliedBoundaryRef.current = null;
+    touchEventClockOffsetRef.current = null;
     touchYRef.current = null;
     historyLoadGateRef.current.endGesture();
     // A page can finish while the finger is still down. Re-render after the
