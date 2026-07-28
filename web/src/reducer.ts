@@ -865,6 +865,9 @@ export function reduce(state: AppState, action: Action): AppState {
       if (action.connState === "connected") banner = undefined;
       else if (action.connState === "reconnecting") banner = action.detail || "正在重新连接…";
       else if (action.connState === "connecting") banner = "正在连接…";
+      else if (action.connState === "disconnected" && action.detail) {
+        banner = action.detail;
+      }
       const runtimes = action.connState === "connected"
         ? state.runtimes
         : Object.fromEntries(Object.entries(state.runtimes).map(

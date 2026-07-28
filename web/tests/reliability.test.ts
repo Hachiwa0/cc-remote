@@ -5978,12 +5978,79 @@ class FakeWebSocket {
   }
 }
 
+const sessionValues = new Map<string, string>();
+const browserSessionStorage = {
+  getItem: (key: string) => sessionValues.get(key) ?? null,
+  setItem: (key: string, value: string) => { sessionValues.set(key, value); },
+  removeItem: (key: string) => { sessionValues.delete(key); },
+};
+let protocolReloads = 0;
 Object.assign(globalThis, {
   window: {
-    location: { protocol: "http:", host: "relay.test", reload: () => {} },
+    location: {
+      protocol: "http:", host: "relay.test",
+      reload: () => { protocolReloads += 1; },
+    },
   },
   WebSocket: FakeWebSocket,
+  sessionStorage: browserSessionStorage,
 });
+
+const firstMismatch = new RelayWs({
+  onEvent: () => {},
+  onConnState: () => {},
+});
+firstMismatch.start();
+FakeWebSocket.instances.at(-1)?.onclose?.({ code: 4406 });
+assert.equal(protocolReloads, 1,
+  "the first protocol mismatch should refresh the bundle once");
+
+const mismatchStates: Array<{ state: string; detail?: string }> = [];
+const repeatedMismatch = new RelayWs({
+  onEvent: () => {},
+  onConnState: (state, detail) => {
+    mismatchStates.push({ state, detail });
+  },
+});
+repeatedMismatch.start();
+FakeWebSocket.instances.at(-1)?.onclose?.({ code: 4406 });
+assert.equal(protocolReloads, 1,
+  "a rolling deploy must not trap the browser in a reload loop");
+assert.deepEqual(mismatchStates.at(-1), {
+  state: "disconnected",
+  detail: "页面与服务端版本不一致；请等待部署完成后手动刷新。",
+});
+
+Object.assign(globalThis, {
+  sessionStorage: {
+    getItem: () => { throw new DOMException("blocked", "SecurityError"); },
+    setItem: () => { throw new DOMException("blocked", "SecurityError"); },
+    removeItem: () => { throw new DOMException("blocked", "SecurityError"); },
+  },
+});
+const storageBlockedEvents: ServerEvent[] = [];
+const storageBlockedStates: Array<{ state: string; detail?: string }> = [];
+const storageBlocked = new RelayWs({
+  onEvent: (event) => { storageBlockedEvents.push(event); },
+  onConnState: (state, detail) => {
+    storageBlockedStates.push({ state, detail });
+  },
+});
+storageBlocked.start();
+const storageBlockedSocket = FakeWebSocket.instances.at(-1);
+storageBlockedSocket?.receive({
+  type: "state", sid: "storage-blocked", state: "idle",
+});
+assert.equal(storageBlockedEvents.length, 1,
+  "blocked sessionStorage must not make a valid frame look malformed");
+storageBlockedSocket?.onclose?.({ code: 4406 });
+assert.equal(protocolReloads, 1,
+  "a mismatch cannot auto-reload safely when the reload guard is unavailable");
+assert.deepEqual(storageBlockedStates.at(-1), {
+  state: "disconnected",
+  detail: "页面与服务端版本不一致；请等待部署完成后手动刷新。",
+});
+Object.assign(globalThis, { sessionStorage: browserSessionStorage });
 
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;
