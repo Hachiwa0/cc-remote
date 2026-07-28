@@ -1947,6 +1947,14 @@ class CodexHandle:
         if q.put_end_nowait(closed):
             return
 
+    def _discard_spontaneous_stream(self, turn_id: str) -> None:
+        """Drop a recovery bridge that was never exposed to a consumer."""
+        if self._spontaneous_queue_turn_id != turn_id:
+            return
+        self._spontaneous_q = None
+        self._spontaneous_queue_turn_id = None
+        self._spontaneous_overflow = False
+
     async def receive_spontaneous_response(self, turn_id: str):
         """Yield exactly one spontaneous turn's raw frames and internal signals."""
         q = self._spontaneous_q
@@ -2569,6 +2577,96 @@ class CodexHandle:
         # server value (captured in _dispatch) wins; else the config-declared window.
         win = self.context_window or u.get("modelContextWindow") or codex_context_window()
         return {"used_tokens": used, "context_window": win, "raw": u}
+
+    async def recover_owned_turn(self, turn_id: str) -> bool:
+        """Reattach one durably attributed turn after a wrapper restart.
+
+        Arm the bounded stream before the status reads so a terminal notification
+        racing either RPC is captured rather than leaving a false running state.
+        Machine has already matched this id against its private lease and rollout
+        tail; the bounded latest-turn page supplies the missing native-id proof.
+        """
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ValueError("invalid Codex turn id")
+        if self.turn_active or self._spontaneous_turn_id is not None:
+            return (
+                self.turn_id == turn_id
+                and self._spontaneous_turn_id == turn_id
+            )
+
+        self.turn_id = turn_id
+        self.turn_active = True
+        self.remember_owned_turn_id(turn_id)
+        self._spontaneous_turn_id = turn_id
+        self._open_spontaneous_stream(turn_id)
+        try:
+            response = await self._request("thread/read", {
+                "threadId": self.thread_id,
+                "includeTurns": False,
+            })
+            thread = (
+                response.get("thread")
+                if isinstance(response, dict) else None
+            )
+            raw_status = (
+                thread.get("status")
+                if isinstance(thread, dict) else None
+            )
+            if (
+                not isinstance(raw_status, dict)
+                or raw_status.get("type") not in _THREAD_STATUSES
+            ):
+                raise RuntimeError(
+                    "codex thread/read returned an invalid thread status")
+            self.last_thread_status = _copy_thread_status(raw_status)
+            active = raw_status.get("type") == "active"
+            latest_turn = None
+            if (
+                active
+                and self.turn_id == turn_id
+                and self._spontaneous_turn_id == turn_id
+            ):
+                page = await self._request("thread/turns/list", {
+                    "threadId": self.thread_id,
+                    "cursor": None,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "notLoaded",
+                })
+                turns = page.get("data") if isinstance(page, dict) else None
+                if not isinstance(turns, list) or len(turns) != 1:
+                    raise RuntimeError(
+                        "codex latest-turn read returned an invalid page")
+                latest_turn = turns[0]
+        except BaseException:
+            if self._spontaneous_turn_id == turn_id:
+                self._spontaneous_turn_id = None
+            self._discard_spontaneous_stream(turn_id)
+            if self.turn_id == turn_id:
+                self.turn_id = None
+            self.turn_active = False
+            raise
+
+        # turn/completed may have been dispatched while the read response was
+        # waking this coroutine.  Its cleared id overrides a stale active result.
+        if (
+            active
+            and isinstance(latest_turn, dict)
+            and latest_turn.get("id") == turn_id
+            and latest_turn.get("status") == "inProgress"
+            and self.turn_id == turn_id
+            and self._spontaneous_turn_id == turn_id
+        ):
+            await self._publish_turn_lifecycle("started", turn_id)
+            return True
+
+        if self._spontaneous_turn_id == turn_id:
+            self._spontaneous_turn_id = None
+        self._discard_spontaneous_stream(turn_id)
+        if self.turn_id == turn_id:
+            self.turn_id = None
+        self.turn_active = False
+        return False
 
     async def get_status(self) -> dict:
         """Return a sanitized status composed from official app-server RPCs.

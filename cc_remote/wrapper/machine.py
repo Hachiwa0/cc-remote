@@ -157,6 +157,7 @@ from cc_remote.wrapper.codex_handle import (
     CodexSteerOutcomeUnknown,
     CodexSpontaneousClosed, CodexSpontaneousOverflow, CodexSteerFence,
 )
+from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_window,
@@ -806,6 +807,7 @@ class WrapperMachine:
         self._codex_daemon = CodexDaemonManager(
             getattr(cfg, "codex_daemon_mode", "auto"))
         self._codex_daemon_restart_path = restart_state_path(cfg.state_dir)
+        self._codex_turn_leases = CodexTurnLeaseStore(cfg.state_dir)
         self._claude_broker = BrokerClient(
             getattr(cfg, "claude_broker_socket", None))
         # Claude's official SDK/CLI does not expose a supported multi-writer
@@ -1247,6 +1249,241 @@ class WrapperMachine:
             if state is not None and state.phase == "ready"
             else _CODEX_DAEMON_UNMARKED_EPOCH
         )
+
+    def _claim_codex_turn(
+        self,
+        ctx: SessionContext,
+        turn_id: str,
+        msg_id: Optional[str],
+        *,
+        automatic: bool = False,
+    ) -> None:
+        session_id = ctx.session_id
+        if (
+            not self._codex_shared_affinity(ctx)
+            or not session_id
+            or not turn_id
+        ):
+            return
+        logical_msg_id = msg_id or turn_id
+        try:
+            self._codex_turn_leases.claim(
+                session_id,
+                turn_id,
+                logical_msg_id,
+                daemon_epoch=ctx.codex_daemon_epoch,
+                automatic=automatic,
+            )
+        except Exception as exc:
+            # A lease failure must not abort an accepted model turn. It narrows
+            # only crash recovery; live ownership remains in SessionContext.
+            log.warning(
+                "Codex turn lease could not be persisted",
+                session_id=session_id,
+                turn_id=turn_id,
+                error_type=type(exc).__name__,
+            )
+            return
+        ctx.codex_owned_turn_id = turn_id
+
+    def _release_codex_turn(
+        self, ctx: SessionContext, turn_id: Optional[str] = None,
+    ) -> None:
+        session_id = ctx.session_id
+        owned = ctx.codex_owned_turn_id
+        target = turn_id or owned
+        if not session_id or not target:
+            return
+        try:
+            released = self._codex_turn_leases.release(
+                session_id, turn_id=target)
+        except Exception as exc:
+            log.warning(
+                "Codex turn lease could not be released",
+                session_id=session_id,
+                turn_id=target,
+                error_type=type(exc).__name__,
+            )
+            return
+        if released and owned == target:
+            ctx.codex_owned_turn_id = None
+
+    async def _recover_codex_owned_turn(
+        self, ctx: SessionContext, session_id: str,
+    ) -> bool:
+        """Reattach only a three-way confirmed Remote-owned daemon turn."""
+        if not self._codex_shared_affinity(ctx):
+            return False
+        try:
+            lease = self._codex_turn_leases.get(session_id)
+        except Exception as exc:
+            log.warning(
+                "Codex turn lease could not be read",
+                session_id=session_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+        if lease is None:
+            return False
+
+        path = await asyncio.to_thread(codex_rollout_path, session_id)
+        try:
+            size = (
+                await asyncio.to_thread(os.path.getsize, path)
+                if path else 0
+            )
+        except OSError:
+            size = 0
+        active, _partial, last_marker = (
+            await asyncio.to_thread(self._codex_tail_snapshot, path, size)
+            if path else (set(), b"", None)
+        )
+        restart_state = await self._codex_restart_state(wait=False)
+        resumable_goal = False
+        if lease.automatic:
+            try:
+                goal = await ctx.sdk.get_goal()
+            except Exception as exc:
+                log.warning(
+                    "Codex goal state unavailable during owned turn recovery",
+                    session_id=session_id,
+                    error_type=type(exc).__name__,
+                )
+            else:
+                resumable_goal = bool(
+                    isinstance(goal, dict)
+                    and goal.get("status") in {"active", "usageLimited"}
+                )
+        generation_changed = bool(
+            lease.daemon_epoch
+            and restart_state is not None
+            and restart_state.epoch != lease.daemon_epoch
+        )
+        if generation_changed:
+            # connect() observes the current marker, but this leased native turn
+            # still belongs to the older daemon. Preserve that generation until
+            # its consumer crosses the handoff; otherwise its restart watcher
+            # would compare new==new and accept the old terminal as ordinary.
+            ctx.codex_daemon_epoch = lease.daemon_epoch
+        handoff_after_restart = bool(
+            generation_changed
+            and (
+                active == {lease.turn_id}
+                or (
+                    lease.automatic
+                    and resumable_goal
+                    and len(active) == 1
+                )
+                or last_marker in {
+                    ("turn_aborted", lease.turn_id),
+                    ("task_failed", lease.turn_id),
+                }
+                or (
+                    lease.automatic
+                    and resumable_goal
+                    and last_marker is not None
+                    and last_marker[0] in {"turn_aborted", "task_failed"}
+                )
+            )
+        )
+        if handoff_after_restart:
+            # A replacement wrapper may connect while the old generation is
+            # still draining, or after it has already written its terminal
+            # marker.  In both cases daemon ownership proves the logical Remote
+            # turn must cross the account handoff instead of becoming idle.
+            ctx.codex_owned_turn_id = lease.turn_id
+            ctx.codex_recovered_turn_id = lease.turn_id
+            ctx.codex_recovered_msg_id = lease.msg_id
+            ctx.codex_recovered_automatic = lease.automatic
+            ctx.codex_spontaneous_turn_id = lease.turn_id
+            announce_running = ctx.state == "idle"
+            if announce_running:
+                ctx.interrupt_event.clear()
+                ctx.interrupt_deadline = None
+                ctx.state = "running"
+            task = asyncio.create_task(
+                self._run_codex_spontaneous_turn(
+                    ctx,
+                    lease.turn_id,
+                    announce_running=announce_running,
+                    recovered_msg_id=lease.msg_id,
+                    pending_switch=restart_state,
+                )
+            )
+            ctx.codex_spontaneous_task = task
+            ctx.codex_recovered_turn_id = None
+            ctx.codex_recovered_msg_id = None
+            ctx.codex_recovered_automatic = None
+            log.info(
+                "recovering Remote-owned Codex turn across account switch",
+                session_id=session_id,
+                turn_id=lease.turn_id,
+                old_epoch=lease.daemon_epoch,
+                new_epoch=restart_state.epoch,
+                old_turn_active=active == {lease.turn_id},
+            )
+            return True
+        rollout_matches = bool(
+            active == {lease.turn_id}
+            or (
+                lease.automatic
+                and resumable_goal
+                and len(active) == 1
+            )
+        )
+        if not rollout_matches:
+            try:
+                self._codex_turn_leases.release(
+                    session_id, turn_id=lease.turn_id)
+            except Exception as exc:
+                log.warning(
+                    "stale Codex turn lease could not be released",
+                    session_id=session_id,
+                    turn_id=lease.turn_id,
+                    error_type=type(exc).__name__,
+                )
+            return False
+
+        recover = getattr(ctx.sdk, "recover_owned_turn", None)
+        if not callable(recover):
+            return False
+        ctx.codex_owned_turn_id = lease.turn_id
+        ctx.codex_recovered_turn_id = lease.turn_id
+        ctx.codex_recovered_msg_id = lease.msg_id
+        ctx.codex_recovered_automatic = lease.automatic
+        try:
+            recovered = bool(await recover(lease.turn_id))
+        except Exception as exc:
+            log.warning(
+                "Codex owned turn recovery failed",
+                session_id=session_id,
+                turn_id=lease.turn_id,
+                error_type=type(exc).__name__,
+            )
+            recovered = False
+        recovered = bool(
+            recovered
+            and ctx.codex_spontaneous_turn_id == lease.turn_id
+            and ctx.codex_spontaneous_task is not None
+        )
+        if recovered:
+            log.info(
+                "recovered Remote-owned Codex turn",
+                session_id=session_id,
+                turn_id=lease.turn_id,
+            )
+            return True
+
+        ctx.codex_owned_turn_id = None
+        ctx.codex_recovered_turn_id = None
+        ctx.codex_recovered_msg_id = None
+        ctx.codex_recovered_automatic = None
+        try:
+            self._codex_turn_leases.release(
+                session_id, turn_id=lease.turn_id)
+        except Exception:
+            pass
+        return False
 
     async def _ensure_codex_daemon_generation(
         self,
@@ -2409,8 +2646,31 @@ class WrapperMachine:
                 self.cfg.resume_session_id
                 or load_session_id(self.cfg.state_dir, self.cfg.cc_cwd)
             )
-            ctx = await self._spawn(
-                resume_id=bootstrap_sid, cwd=self.cfg.cc_cwd, bootstrap=True)
+            # Shared-daemon turns already accepted on behalf of Remote outrank
+            # creating an idle bootstrap resident. Recover every durable lease
+            # first; recovery may temporarily exceed the normal resident cap
+            # because those native turns are already consuming daemon capacity.
+            await self._restore_codex_owned_turns()
+            ctx = (
+                self._ctx_by_sid(bootstrap_sid)
+                if bootstrap_sid else None
+            )
+            if (
+                ctx is None
+                and len(self.sessions) < self.cfg.max_concurrent_sessions
+            ):
+                ctx = await self._spawn(
+                    resume_id=bootstrap_sid,
+                    cwd=self.cfg.cc_cwd,
+                    bootstrap=True,
+                )
+            elif ctx is None and self.sessions:
+                ctx = next(iter(self.sessions.values()))
+                log.info(
+                    "idle bootstrap deferred behind recovered Codex turns",
+                    resident=len(self.sessions),
+                    cap=self.cfg.max_concurrent_sessions,
+                )
             if ctx is not None:
                 self.focused_sid = ctx.key
                 log.info("wrapper running", session_id=ctx.session_id,
@@ -2421,6 +2681,7 @@ class WrapperMachine:
                 await self._on_transport_connected()
             else:
                 log.warning("Claude bootstrap unavailable; continuing with empty pool")
+                await self._on_transport_connected()
 
             self._watch_task = asyncio.create_task(self._watch_loop())
             self._work_schedule_task = asyncio.create_task(
@@ -2752,6 +3013,45 @@ class WrapperMachine:
             buffer_head_seq=(ctx.buffer.head_seq if ctx else 0),
             buffer_tail_seq=(ctx.buffer.tail_seq if ctx else 0),
         ))
+
+    async def _restore_codex_owned_turns(self) -> None:
+        """Rehydrate background daemon turns before accepting client commands."""
+        try:
+            leases = self._codex_turn_leases.list()
+        except Exception as exc:
+            log.warning(
+                "Codex turn leases could not be listed",
+                error_type=type(exc).__name__,
+            )
+            return
+        for lease in leases:
+            if self._ctx_by_sid(lease.session_id) is not None:
+                continue
+            ctx = await self._spawn(
+                resume_id=lease.session_id,
+                engine="codex",
+                space="code",
+                bootstrap=True,
+            )
+            if ctx is None:
+                continue
+            if (
+                ctx.codex_owned_turn_id == lease.turn_id
+                and ctx.state == "running"
+            ):
+                continue
+            # The lease was stale or the official turn completed while the
+            # replacement wrapper connected. It was spawned only for recovery;
+            # leave the resident slot available until the user focuses it.
+            self.sessions.pop(ctx.key, None)
+            try:
+                await ctx.sdk.disconnect()
+            except Exception as exc:
+                log.warning(
+                    "stale Codex recovery proxy could not be disconnected",
+                    session_id=lease.session_id,
+                    error_type=type(exc).__name__,
+                )
 
     # ---- emit (per-ctx seq + buffer + best-effort send), serialized per ctx ----
 
@@ -3844,19 +4144,21 @@ class WrapperMachine:
             return bool(w.get("external"))
 
     @classmethod
-    def _codex_tail_state(cls, path: str, size: int) -> tuple[set[str], bytes]:
-        """Best-effort seed when a watch begins during an external Codex turn."""
+    def _codex_tail_snapshot(
+        cls, path: str, size: int,
+    ) -> tuple[set[str], bytes, Optional[tuple[str, str]]]:
+        """Return the latest bounded lifecycle state and exact last marker."""
         try:
             start = max(0, size - cls.CODEX_TAIL_READ_MAX)
             with open(path, "rb") as stream:
                 stream.seek(start)
                 data = stream.read(cls.CODEX_TAIL_READ_MAX)
         except OSError:
-            return set(), b""
+            return set(), b"", None
         if start:
             _, separator, data = data.partition(b"\n")
             if not separator:
-                return set(), b""
+                return set(), b"", None
         markers = parse_turn_markers(data)
         # A Codex thread has one current turn. Historical crash/orphan starts can
         # lack a matching terminal record, so set subtraction would resurrect an
@@ -3864,7 +4166,14 @@ class WrapperMachine:
         active: set[str] = set()
         for kind, turn_id in markers.ordered:
             active = {turn_id} if kind == "task_started" else set()
-        return active, markers.partial
+        last_marker = markers.ordered[-1] if markers.ordered else None
+        return active, markers.partial, last_marker
+
+    @classmethod
+    def _codex_tail_state(cls, path: str, size: int) -> tuple[set[str], bytes]:
+        """Best-effort seed when a watch begins during an external Codex turn."""
+        active, partial, _last_marker = cls._codex_tail_snapshot(path, size)
+        return active, partial
 
     @classmethod
     def _read_watch_growth(cls, path: str, offset: int, available: int) -> bytes:
@@ -7535,7 +7844,27 @@ class WrapperMachine:
                     incoming_turn_id=turn_id,
                 )
                 return
+            recovered_msg_id = (
+                ctx.codex_recovered_msg_id
+                if ctx.codex_recovered_turn_id == turn_id
+                else None
+            )
+            recovered_automatic = (
+                ctx.codex_recovered_automatic
+                if ctx.codex_recovered_turn_id == turn_id
+                else None
+            )
             ctx.codex_spontaneous_turn_id = turn_id
+            self._claim_codex_turn(
+                ctx,
+                turn_id,
+                recovered_msg_id or turn_id,
+                automatic=(
+                    recovered_automatic
+                    if recovered_automatic is not None
+                    else True
+                ),
+            )
             if ctx.turn_task is not None and not ctx.codex_account_handoff:
                 # A user send claimed the session but has not reached turn/start
                 # yet (otherwise CodexHandle.turn_active would already be true).
@@ -7550,8 +7879,15 @@ class WrapperMachine:
                 # turn/started and the bridge consumer's first scheduled step.
                 ctx.state = "running"
             task = asyncio.create_task(self._run_codex_spontaneous_turn(
-                ctx, turn_id, announce_running=announce_running))
+                ctx,
+                turn_id,
+                announce_running=announce_running,
+                recovered_msg_id=recovered_msg_id,
+            ))
             ctx.codex_spontaneous_task = task
+            ctx.codex_recovered_turn_id = None
+            ctx.codex_recovered_msg_id = None
+            ctx.codex_recovered_automatic = None
             return
         if phase != "completed" or ctx.codex_spontaneous_turn_id != turn_id:
             return
@@ -7574,6 +7910,7 @@ class WrapperMachine:
             reason="automatic turn began before Remote could capture a pre-image",
         )
         ctx.codex_spontaneous_turn_id = None
+        self._release_codex_turn(ctx, turn_id)
         current = asyncio.current_task()
         if (ctx.codex_spontaneous_task is current
                 or (ctx.codex_spontaneous_task is not None
@@ -7591,12 +7928,18 @@ class WrapperMachine:
             await self._set_state(ctx, "idle")
 
     async def _run_codex_spontaneous_turn(
-        self, ctx: SessionContext, turn_id: str, *, announce_running: bool,
+        self,
+        ctx: SessionContext,
+        turn_id: str,
+        *,
+        announce_running: bool,
+        recovered_msg_id: Optional[str] = None,
+        pending_switch: Optional[CodexDaemonRestartState] = None,
     ) -> None:
         """Translate one goal/automatic turn from the handle's bounded bridge."""
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
         current_turn_id = turn_id
-        logical_msg_id = turn_id
+        logical_msg_id = recovered_msg_id or turn_id
         stream = ctx.sdk.receive_spontaneous_response(turn_id).__aiter__()
         restart_watch_task: Optional[asyncio.Task] = None
         overflowed = False
@@ -7806,6 +8149,8 @@ class WrapperMachine:
                 raise RuntimeError(
                     "Codex continuation did not return a native turn id")
             current_turn_id = new_turn_id
+            self._claim_codex_turn(
+                ctx, current_turn_id, logical_msg_id)
             ctx.codex_spontaneous_turn_id = current_turn_id
             ctx.codex_spontaneous_task = current_task
             ctx.active_msg_id = logical_msg_id
@@ -7849,23 +8194,32 @@ class WrapperMachine:
             if ctx.codex_spontaneous_turn_id != turn_id:
                 return
 
-            ctx.active_msg_id = turn_id
+            ctx.active_msg_id = logical_msg_id
             # turn/started is delivered only after app-server has already begun
             # executing the automatic continuation. A filesystem pre-image taken
             # here could be a half-turn snapshot, so preserve count alignment with
             # an explicit unavailable slot instead of claiming code rollback.
-            await self._record_codex_unavailable_turn(
-                ctx,
-                turn_id,
-                reason="automatic turn has no safe pre-tool checkpoint boundary",
-            )
+            if recovered_msg_id is None:
+                await self._record_codex_unavailable_turn(
+                    ctx,
+                    turn_id,
+                    reason=(
+                        "automatic turn has no safe pre-tool checkpoint boundary"
+                    ),
+                )
 
             # Automatic continuations have no user prompt. A real empty anchor
             # gives their assistant/process events a stable turn owner without
             # rendering a fabricated user bubble.
-            await self._emit(ctx, UserMsg(msg_id=turn_id, prompt=""))
+            if recovered_msg_id is None:
+                await self._emit(ctx, UserMsg(msg_id=turn_id, prompt=""))
 
-            start_restart_watch()
+            if pending_switch is not None:
+                handoff = await handoff_account_switch(pending_switch)
+                if handoff in {"spontaneous", "interrupted"}:
+                    return
+            else:
+                start_restart_watch()
             while True:
                 try:
                     kind, value = await next_stream_item()
@@ -8175,6 +8529,8 @@ class WrapperMachine:
         await self._cleanup_codex_steer_attachments(ctx)
         if ctx.engine == "codex" and ctx.codex_spontaneous_turn_id is not None:
             return
+        if ctx.engine == "codex":
+            self._release_codex_turn(ctx)
         await self._set_state(ctx, "idle")
 
     async def _cleanup_codex_steer_attachments(
@@ -13668,6 +14024,7 @@ class WrapperMachine:
         if resume_id:
             self._watch_session(resume_id)
             if engine == "codex":
+                await self._recover_codex_owned_turn(ctx, resume_id)
                 await self._prime_codex_ownership(resume_id)
             elif engine == "claude" and broker_handle is None:
                 await self._prime_claude_ownership(resume_id)
@@ -14529,6 +14886,9 @@ class WrapperMachine:
                     msg_id=ctx.active_msg_id,
                     turn_id=native_turn_id,
                 ))
+            if native_turn_id:
+                self._claim_codex_turn(
+                    ctx, native_turn_id, ctx.active_msg_id)
             ctx.codex_account_handoff = False
             if native_turn_id and ctx.codex_daemon_epoch:
                 codex_restart_watch_task = asyncio.create_task(
@@ -14839,6 +15199,9 @@ class WrapperMachine:
                             msg_id=ctx.active_msg_id,
                             turn_id=native_turn_id,
                         ))
+                    if native_turn_id:
+                        self._claim_codex_turn(
+                            ctx, native_turn_id, ctx.active_msg_id)
                     if (
                         is_codex_shared
                         and native_turn_id

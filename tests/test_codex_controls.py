@@ -1133,6 +1133,168 @@ def test_codex_buffered_stdout_yields_to_managed_consumer_without_false_overflow
     asyncio.run(run())
 
 
+def test_codex_recover_owned_turn_arms_stream_before_status_read():
+    async def run():
+        lifecycle = []
+
+        async def on_lifecycle(phase, turn_id):
+            lifecycle.append((phase, turn_id))
+
+        handle = CodexHandle(
+            _Cfg(), turn_lifecycle_callback=on_lifecycle)
+        handle.thread_id = "recovered-thread"
+
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            return {
+                "data": [{
+                    "id": "recovered-turn",
+                    "status": "inProgress",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                }],
+                "nextCursor": None,
+            }
+
+        handle._request = request
+        assert await handle.recover_owned_turn("recovered-turn") is True
+        assert requests == [
+            (
+                "thread/read",
+                {
+                    "threadId": "recovered-thread",
+                    "includeTurns": False,
+                },
+            ),
+            (
+                "thread/turns/list",
+                {
+                    "threadId": "recovered-thread",
+                    "cursor": None,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "notLoaded",
+                },
+            ),
+        ]
+        assert lifecycle == [("started", "recovered-turn")]
+        assert handle.turn_active is True
+        assert handle.turn_id == "recovered-turn"
+
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "recovered-thread",
+                "turn": {
+                    "id": "recovered-turn",
+                    "status": "completed",
+                },
+            },
+        })
+        frames = [
+            frame async for frame in
+            handle.receive_spontaneous_response("recovered-turn")
+        ]
+        assert [frame["method"] for frame in frames] == ["turn/completed"]
+        assert lifecycle == [
+            ("started", "recovered-turn"),
+            ("completed", "recovered-turn"),
+        ]
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+
+    asyncio.run(run())
+
+
+def test_codex_recover_owned_turn_rejects_a_different_active_turn():
+    async def run():
+        lifecycle = []
+
+        async def on_lifecycle(phase, turn_id):
+            lifecycle.append((phase, turn_id))
+
+        handle = CodexHandle(
+            _Cfg(), turn_lifecycle_callback=on_lifecycle)
+        handle.thread_id = "recovered-thread"
+
+        async def request(method, _params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            return {
+                "data": [{
+                    "id": "newer-turn",
+                    "status": "inProgress",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                }],
+                "nextCursor": None,
+            }
+
+        handle._request = request
+        assert await handle.recover_owned_turn("leased-turn") is False
+        assert lifecycle == []
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+        assert handle._spontaneous_q is None
+
+    asyncio.run(run())
+
+
+def test_codex_recover_owned_turn_rejects_terminal_status_race():
+    async def run():
+        lifecycle = []
+
+        async def on_lifecycle(phase, turn_id):
+            lifecycle.append((phase, turn_id))
+
+        handle = CodexHandle(
+            _Cfg(), turn_lifecycle_callback=on_lifecycle)
+        handle.thread_id = "recovered-thread"
+
+        async def request(method, _params=None):
+            assert method == "thread/read"
+            # The bridge is already armed, so this terminal is attributed even
+            # though it wins the race against the active status response.
+            await handle._dispatch({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "recovered-thread",
+                    "turn": {
+                        "id": "recovered-turn",
+                        "status": "completed",
+                    },
+                },
+            })
+            return {
+                "thread": {
+                    "status": {"type": "active", "activeFlags": []},
+                },
+            }
+
+        handle._request = request
+        assert await handle.recover_owned_turn("recovered-turn") is False
+        assert lifecycle == [("completed", "recovered-turn")]
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+        assert handle._spontaneous_q is None
+
+    asyncio.run(run())
+
+
 def test_codex_review_response_turn_is_interruptible_and_streamed():
     async def run():
         machine, transport = _mk_machine()

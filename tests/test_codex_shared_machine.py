@@ -265,6 +265,409 @@ class _SpontaneousAccountSwitchSharedSdk(_SharedSdk):
         return {"status": "active"}
 
 
+class _RecoveredOwnedTurnSdk(_SharedSdk):
+    shared_daemon_affinity = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.machine = None
+        self.ctx = None
+        self.interrupted = asyncio.Event()
+        self.interrupts = 0
+
+    async def recover_owned_turn(self, turn_id: str) -> bool:
+        assert self.machine is not None and self.ctx is not None
+        self.remember_owned_turn_id(turn_id)
+        await self.machine._on_codex_turn_lifecycle(
+            self.ctx, "started", turn_id)
+        return True
+
+    async def receive_spontaneous_response(self, turn_id: str):
+        await self.interrupted.wait()
+        yield {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "sid",
+                "turn": {"id": turn_id, "status": "interrupted"},
+            },
+        }
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+        self.interrupted.set()
+
+
+class _RecoveredAccountSwitchSdk(_SpontaneousAccountSwitchSharedSdk):
+    """Replacement wrapper sees the old leased turn already aborted."""
+
+    async def query(self, prompt: str, images=None) -> str:
+        self.queries.append((prompt, images))
+        return "goal-new"
+
+    async def receive_response(self):
+        async for message in (
+            _SpontaneousAccountSwitchSharedSdk
+            .receive_spontaneous_response(self, "goal-new")
+        ):
+            yield message
+
+    async def receive_spontaneous_response(self, turn_id: str):
+        # The old stream is never consumed: recovery enters the persisted
+        # account handoff before polling it.
+        await asyncio.Future()
+        yield  # pragma: no cover
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+
+    async def get_goal(self):
+        return None
+
+
+class _RecoveredActiveAccountSwitchSdk(_RecoveredAccountSwitchSdk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.machine = None
+        self.ctx = None
+
+    async def recover_owned_turn(self, turn_id: str) -> bool:
+        assert self.machine is not None and self.ctx is not None
+        await self.machine._on_codex_turn_lifecycle(
+            self.ctx, "started", turn_id)
+        return True
+
+
+class _RecoveredOwnedGoalSdk(_RecoveredOwnedTurnSdk):
+    async def get_goal(self):
+        return {"status": "active"}
+
+
+class _RecoveredGoalAccountSwitchSdk(_SpontaneousAccountSwitchSharedSdk):
+    async def receive_spontaneous_response(self, turn_id: str):
+        if turn_id == "goal-new":
+            async for message in (
+                _SpontaneousAccountSwitchSharedSdk
+                .receive_spontaneous_response(self, turn_id)
+            ):
+                yield message
+            return
+        await asyncio.Future()
+        yield  # pragma: no cover
+
+
+def test_restarted_wrapper_reclaims_only_leased_active_daemon_turn(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_bytes(_event("task_started", "owned-turn"))
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        machine._codex_turn_leases.claim(
+            "sid", "owned-turn", "logical-message")
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _RecoveredOwnedTurnSdk()
+        ctx.sdk.machine = machine
+        ctx.sdk.ctx = ctx
+        machine.sessions[ctx.key] = ctx
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is True
+        await asyncio.sleep(0)
+
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "owned-turn"
+        assert ctx.active_msg_id == "logical-message"
+        assert ctx.codex_owned_turn_id == "owned-turn"
+        assert ctx.codex_spontaneous_task is not None
+        lease = machine._codex_turn_leases.get("sid")
+        assert lease is not None
+        assert lease.automatic is False
+        assert not [
+            event for event in transport.sent if isinstance(event, UserMsg)
+        ]
+
+        await machine._handle_interrupt(SimpleNamespace(sid="sid"))
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert ctx.sdk.interrupts == 1
+        assert ctx.state == "idle"
+        assert ctx.codex_owned_turn_id is None
+        assert machine._codex_turn_leases.get("sid") is None
+
+    asyncio.run(go())
+
+
+def test_restarted_wrapper_continues_leased_turn_aborted_by_account_switch(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_bytes(
+            _event("task_started", "owned-turn")
+            + _event("turn_aborted", "owned-turn")
+        )
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        machine._codex_turn_leases.claim(
+            "sid",
+            "owned-turn",
+            "logical-message",
+            daemon_epoch="8" * 32,
+        )
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="9" * 32,
+            phase="ready",
+        )
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _RecoveredAccountSwitchSdk()
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is True
+        await asyncio.wait_for(
+            ctx.sdk.continuation_started.wait(), timeout=5.0)
+
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "goal-new"
+        assert ctx.active_msg_id == "logical-message"
+        assert ctx.sdk.interrupts == 1
+        assert ctx.sdk.reconnects == 1
+        assert len(ctx.sdk.queries) == 1
+        assert "<codex_internal_context" in ctx.sdk.queries[0][0]
+        lease = machine._codex_turn_leases.get("sid")
+        assert lease is not None
+        assert lease.turn_id == "goal-new"
+        assert lease.msg_id == "logical-message"
+        assert lease.daemon_epoch == "9" * 32
+        assert not [
+            event for event in transport.sent
+            if isinstance(event, (Error, TurnEnd))
+        ]
+
+        active = ctx.codex_spontaneous_task
+        assert active is not None
+        ctx.sdk.finish_continuation.set()
+        await asyncio.wait_for(active, timeout=2.0)
+
+        assert ctx.state == "idle"
+        assert machine._codex_turn_leases.get("sid") is None
+
+    asyncio.run(asyncio.wait_for(go(), timeout=10.0))
+
+
+def test_restarted_wrapper_recovers_goal_with_distinct_rollout_turn_id(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_bytes(_event("task_started", "goal-task-id"))
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        machine._codex_turn_leases.claim(
+            "sid",
+            "native-turn-id",
+            "logical-message",
+            daemon_epoch="8" * 32,
+            automatic=True,
+        )
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="8" * 32,
+            phase="ready",
+        )
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _RecoveredOwnedGoalSdk()
+        ctx.sdk.machine = machine
+        ctx.sdk.ctx = ctx
+        machine.sessions[ctx.key] = ctx
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is True
+        await asyncio.sleep(0)
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "native-turn-id"
+        assert ctx.active_msg_id == "logical-message"
+        lease = machine._codex_turn_leases.get("sid")
+        assert lease is not None
+        assert lease.automatic is True
+
+        await machine._handle_interrupt(SimpleNamespace(sid="sid"))
+        active = ctx.codex_spontaneous_task
+        assert active is not None
+        await asyncio.wait_for(active, timeout=2.0)
+        assert ctx.state == "idle"
+
+    asyncio.run(asyncio.wait_for(go(), timeout=5.0))
+
+
+def test_restarted_wrapper_continues_aborted_goal_with_distinct_rollout_id(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_bytes(
+            _event("task_started", "goal-task-id")
+            + _event("turn_aborted", "goal-task-id")
+        )
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        machine._codex_turn_leases.claim(
+            "sid",
+            "native-turn-id",
+            "logical-message",
+            daemon_epoch="8" * 32,
+            automatic=True,
+        )
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="9" * 32,
+            phase="ready",
+        )
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _RecoveredGoalAccountSwitchSdk()
+        ctx.sdk.restart_path = machine._codex_daemon_restart_path
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+
+        async def start_goal_continuation() -> None:
+            await machine._on_codex_turn_lifecycle(
+                ctx, "started", "goal-new")
+
+        ctx.sdk.on_goal_resumed = start_goal_continuation
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is True
+        await asyncio.wait_for(
+            ctx.sdk.continuation_started.wait(), timeout=5.0)
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "goal-new"
+        assert ctx.sdk.interrupts == 1
+        assert ctx.sdk.reconnects == 1
+
+        active = ctx.codex_spontaneous_task
+        assert active is not None
+        ctx.sdk.finish_continuation.set()
+        await asyncio.wait_for(active, timeout=2.0)
+        assert ctx.state == "idle"
+
+    asyncio.run(asyncio.wait_for(go(), timeout=10.0))
+
+
+def test_restarted_wrapper_hands_active_old_generation_to_new_daemon(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_bytes(_event("task_started", "owned-turn"))
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        machine._codex_turn_leases.claim(
+            "sid",
+            "owned-turn",
+            "logical-message",
+            daemon_epoch="8" * 32,
+        )
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="9" * 32,
+            phase="ready",
+        )
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _RecoveredActiveAccountSwitchSdk()
+        ctx.sdk.machine = machine
+        ctx.sdk.ctx = ctx
+        ctx.codex_checkpoint = False
+        # _spawn stamps the newest ready generation before consulting the old
+        # lease. Recovery must restore the old generation for the watcher.
+        ctx.codex_daemon_epoch = "9" * 32
+        machine.sessions[ctx.key] = ctx
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is True
+        await asyncio.wait_for(
+            ctx.sdk.continuation_started.wait(), timeout=5.0)
+
+        assert ctx.state == "running"
+        assert ctx.codex_daemon_epoch == "9" * 32
+        assert ctx.codex_spontaneous_turn_id == "goal-new"
+        assert ctx.sdk.interrupts == 1
+        assert ctx.sdk.reconnects == 1
+
+        active = ctx.codex_spontaneous_task
+        assert active is not None
+        ctx.sdk.finish_continuation.set()
+        await asyncio.wait_for(active, timeout=2.0)
+        assert ctx.state == "idle"
+
+    asyncio.run(asyncio.wait_for(go(), timeout=10.0))
+
+
+def test_wrapper_startup_restores_background_owned_turns():
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        machine.cfg.max_concurrent_sessions = 1
+        idle = _mk_ctx("idle-bootstrap", "idle-bootstrap")
+        idle.state = "idle"
+        machine.sessions[idle.key] = idle
+        machine._codex_turn_leases.claim("sid", "turn", "message")
+        spawned = []
+
+        async def spawn(**kwargs):
+            spawned.append(kwargs)
+            ctx = _mk_ctx("sid", "sid")
+            ctx.engine = "codex"
+            ctx.state = "running"
+            ctx.codex_owned_turn_id = "turn"
+            machine.sessions[ctx.key] = ctx
+            return ctx
+
+        machine._spawn = spawn
+        await machine._restore_codex_owned_turns()
+
+        assert spawned == [{
+            "resume_id": "sid",
+            "engine": "codex",
+            "space": "code",
+            "bootstrap": True,
+        }]
+        assert machine.sessions["sid"].state == "running"
+        # Recovery is never permanently skipped behind an idle bootstrap
+        # resident; startup now invokes it before creating that resident.
+        assert len(machine.sessions) == 2
+
+    asyncio.run(go())
+
+
 def test_shared_code_watcher_mirrors_growth_without_legacy_lock(tmp_path):
     async def go() -> None:
         machine, _transport = _mk_machine()
