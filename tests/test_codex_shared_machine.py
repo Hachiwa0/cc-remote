@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 from cc_remote.codex_daemon_restart import write_restart_state
 from cc_remote.protocol import (
@@ -185,6 +186,83 @@ class _GoalAccountSwitchSharedSdk(_AccountSwitchSharedSdk):
                 "turn": {"id": turn_id, "status": "completed"},
             },
         }
+
+
+class _SpontaneousAccountSwitchSharedSdk(_SharedSdk):
+    """Goal turn whose replacement daemon launches after a controlled delay."""
+
+    shared_daemon_affinity = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.restart_path = None
+        self.spontaneous_started = asyncio.Event()
+        self.old_turn_interrupted = asyncio.Event()
+        self.continuation_started = asyncio.Event()
+        self.finish_continuation = asyncio.Event()
+        self.goal_activated = asyncio.Event()
+        self.interrupts = 0
+        self.goal_activations = 0
+        self.on_goal_resumed = None
+
+    async def receive_spontaneous_response(self, turn_id: str):
+        if turn_id == "goal-old":
+            self.spontaneous_started.set()
+            await self.old_turn_interrupted.wait()
+            # The watcher should cancel this old-generation stream. Keep a
+            # terminal fallback if cancellation loses the race.
+            yield {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "sid",
+                    "turn": {"id": turn_id, "status": "interrupted"},
+                },
+            }
+            return
+        assert turn_id == "goal-new"
+        self.continuation_started.set()
+        await self.finish_continuation.wait()
+        yield {
+            "method": "item/completed",
+            "params": {
+                "threadId": "sid",
+                "turnId": turn_id,
+                "item": {
+                    "type": "agentMessage",
+                    "id": "goal-answer-new",
+                    "text": "goal resumed on new account",
+                    "phase": "final_answer",
+                },
+            },
+        }
+        yield {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "sid",
+                "turn": {"id": turn_id, "status": "completed"},
+            },
+        }
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+        assert self.restart_path is not None
+        write_restart_state(
+            self.restart_path,
+            epoch="9" * 32,
+            phase="ready",
+        )
+        self.old_turn_interrupted.set()
+
+    async def get_goal(self):
+        return {"status": "usageLimited"}
+
+    async def set_goal(self, **kwargs):
+        assert kwargs == {"status": "active"}
+        self.goal_activations += 1
+        self.goal_activated.set()
+        if self.on_goal_resumed is not None:
+            asyncio.create_task(self.on_goal_resumed())
+        return {"status": "active"}
 
 
 def test_shared_code_watcher_mirrors_growth_without_legacy_lock(tmp_path):
@@ -1159,6 +1237,137 @@ def test_account_switch_resumes_usage_limited_goal_without_competing_query():
             event for event in transport.sent if isinstance(event, TurnEnd))
         assert terminal.turn_id == "goal-turn"
         assert terminal.result.subtype == "success"
+
+    asyncio.run(asyncio.wait_for(go(), timeout=15.0))
+
+
+def test_account_switch_resumes_already_spontaneous_goal_on_new_daemon():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SpontaneousAccountSwitchSharedSdk()
+        ctx.codex_checkpoint = False
+        ctx.codex_daemon_epoch = "8" * 32
+        machine.sessions[ctx.key] = ctx
+        ctx.sdk.restart_path = machine._codex_daemon_restart_path
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="8" * 32,
+            phase="ready",
+        )
+        allow_goal_start = asyncio.Event()
+
+        async def start_delayed_goal_turn() -> None:
+            await allow_goal_start.wait()
+            await machine._on_codex_turn_lifecycle(
+                ctx, "started", "goal-new")
+
+        ctx.sdk.on_goal_resumed = start_delayed_goal_turn
+
+        await machine._on_codex_turn_lifecycle(
+            ctx, "started", "goal-old")
+        await asyncio.wait_for(
+            ctx.sdk.spontaneous_started.wait(), timeout=2.0)
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="9" * 32,
+            phase="restarting",
+        )
+        await asyncio.wait_for(ctx.sdk.goal_activated.wait(), timeout=5.0)
+        # The official Goal lifecycle may arrive later than the old two-second
+        # heuristic. No ordinary user turn may be submitted in that gap.
+        await asyncio.sleep(2.05)
+        assert ctx.sdk.queries == []
+        assert ctx.state == "running"
+        assert not ctx.sdk.continuation_started.is_set()
+
+        allow_goal_start.set()
+        await asyncio.wait_for(
+            ctx.sdk.continuation_started.wait(), timeout=5.0)
+
+        # Goal A remains the sole owner while the old daemon is replaced. A
+        # queued browser message therefore cannot drain into the new daemon.
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_task is not None
+        assert not ctx.codex_spontaneous_task.done()
+        assert ctx.codex_spontaneous_turn_id == "goal-new"
+        assert ctx.sdk.interrupts == 1
+        assert ctx.sdk.reconnects == 1
+        assert ctx.sdk.goal_activations == 1
+        assert ctx.sdk.queries == []
+        assert not [
+            event for event in transport.sent
+            if isinstance(event, (Error, TurnEnd))
+        ]
+
+        active = ctx.codex_spontaneous_task
+        ctx.sdk.finish_continuation.set()
+        await asyncio.wait_for(active, timeout=2.0)
+
+        assert ctx.state == "idle"
+        terminal = next(
+            event for event in transport.sent if isinstance(event, TurnEnd))
+        assert terminal.turn_id == "goal-new"
+        assert terminal.result.subtype == "success"
+        assert any(
+            isinstance(event, Delta)
+            and event.channel == "final"
+            and event.text == "goal resumed on new account"
+            for event in transport.sent
+        )
+
+    asyncio.run(asyncio.wait_for(go(), timeout=15.0))
+
+
+def test_interrupt_during_spontaneous_account_handoff_never_starts_fallback():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SpontaneousAccountSwitchSharedSdk()
+        ctx.codex_checkpoint = False
+        ctx.codex_daemon_epoch = "8" * 32
+        machine.sessions[ctx.key] = ctx
+        ctx.sdk.restart_path = machine._codex_daemon_restart_path
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="8" * 32,
+            phase="ready",
+        )
+
+        await machine._on_codex_turn_lifecycle(
+            ctx, "started", "goal-old")
+        active = ctx.codex_spontaneous_task
+        await asyncio.wait_for(
+            ctx.sdk.spontaneous_started.wait(), timeout=2.0)
+        write_restart_state(
+            machine._codex_daemon_restart_path,
+            epoch="9" * 32,
+            phase="restarting",
+        )
+        await asyncio.wait_for(
+            ctx.sdk.goal_activated.wait(), timeout=3.0)
+        # Handoff deliberately releases the old id while waiting for app-server
+        # to auto-launch. Interrupt must still stop the logical task rather than
+        # allowing the hidden fallback query to start afterward.
+        await machine._handle_interrupt(SimpleNamespace(sid="sid"))
+        assert active is not None
+        await asyncio.wait_for(active, timeout=2.0)
+
+        assert ctx.state == "idle"
+        assert ctx.codex_spontaneous_turn_id is None
+        assert ctx.active_msg_id is None
+        assert not ctx.interrupt_event.is_set()
+        assert ctx.sdk.queries == []
+        terminal = [
+            event for event in transport.sent if isinstance(event, TurnEnd)
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].turn_id == "goal-old"
+        assert terminal[0].result.subtype == "error_during_execution"
 
     asyncio.run(asyncio.wait_for(go(), timeout=15.0))
 

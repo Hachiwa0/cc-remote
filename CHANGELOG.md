@@ -24,6 +24,9 @@
 - Continue an in-flight Codex task on the replacement daemon after an account
   switch, without unlocking queued messages. Active goals resume through
   Codex's native goal loop; ordinary turns use hidden contextual continuation.
+  A Goal turn already running when the daemon restarts follows the same contract
+  and falls back to a hidden continuation if app-server restores the Goal state
+  without launching its next turn.
 
 ## v3.0.0 — 2026-07-24
 

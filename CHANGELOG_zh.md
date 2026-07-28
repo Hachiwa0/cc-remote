@@ -18,7 +18,9 @@
 - Wrapper、Relay 与 Web 的协同 wire gate 升级到 protocol v22，增加可安全重放的
   用户问题关闭事件与多选回答。
 - Codex 切号后会在新 daemon 上继续同一个正在运行的任务，续跑完成前不会提前发送
-  queued 消息；Goal 走原生目标循环，普通回合使用隐藏的上下文续跑。
+  queued 消息；Goal 走原生目标循环，普通回合使用隐藏的上下文续跑。若 daemon
+  重启时正在运行的正是 Goal 自动回合，也会按同一规则迁移；app-server 只恢复 Goal
+  状态却没有启动下一回合时，cc-remote 会自动补发隐藏续跑请求。
 
 ## v3.0.0 — 2026-07-24
 
