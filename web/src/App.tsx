@@ -148,11 +148,24 @@ import {
   type CompletionBadgeKind,
   type CompletionReceipts,
 } from "./completion-badges";
+import {
+  cacheSkillCatalog,
+  skillCatalogFresh,
+  skillCatalogKey,
+  type SkillCatalogCacheEntry,
+} from "./skill-catalog-cache";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
+
+interface SkillCatalogRequest {
+  key: string;
+  engine: Engine;
+  space: Space;
+  cwd: string;
+}
 
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
@@ -193,6 +206,8 @@ export default function App() {
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
   const [deviceSheetOpen, setDeviceSheetOpen] = useState(false);
   const [capabilitiesBySurface, setCapabilitiesBySurface] = useState<Record<string, EngineCapabilities>>({});
+  const [skillCatalogs, setSkillCatalogs] =
+    useState<Record<string, SkillCatalogCacheEntry>>({});
   const [notificationMode, setNotificationMode] = useState<NotificationMode>(
     () => readNotificationMode(localStorage));
   const [pushBinding, setPushBinding] = useState<PushBindingSnapshot>({
@@ -255,6 +270,18 @@ export default function App() {
   const rightViewRef = useRef(rightView);
   rightViewRef.current = rightView;
   const wsRef = useRef<RelayWs | null>(null);
+  const skillCatalogsRef =
+    useRef<Record<string, SkillCatalogCacheEntry>>({});
+  const skillCatalogReadsRef = useRef<{
+    active: SkillCatalogRequest | null;
+    queued: Map<string, SkillCatalogRequest>;
+  }>({ active: null, queued: new Map() });
+  const focusedSkillScopeRef = useRef<{
+    key: string;
+    engine: Engine;
+    space: Space;
+    cwd: string;
+  } | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
   const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
     (context) => {
@@ -400,6 +427,9 @@ export default function App() {
     authoritativeSurfaceListsRef.current.clear();
     notificationListRequestRef.current = null;
     sessionActivityPendingRef.current.clear();
+    skillCatalogsRef.current = {};
+    skillCatalogReadsRef.current = { active: null, queued: new Map() };
+    setSkillCatalogs({});
     historyRequestsRef.current.clear();
     clearHistoryDetailRequests();
     historyPageScopesRef.current.clear();
@@ -451,11 +481,21 @@ export default function App() {
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const historyView = displayHistoryProjection(
     state.historyRecovery, focusedSid, rt, state.historyBrowse);
-  const focusedEngine = (state.sessions.find(
-    (session) => session.session_id === focusedSid)?.engine ?? engine) as "claude" | "codex";
+  const focusedSession = state.sessions.find(
+    (session) => session.session_id === focusedSid);
+  const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  const capabilityCwd = focusedSession?.cwd || currentCwd;
   const focusedComposerDraftKey = composerDraftKey(
     machineId, space, focusedEngine, focusedSid ?? "",
   );
+  const focusedSkillCatalogKey = skillCatalogKey(
+    machineId, focusedEngine, space, capabilityCwd);
+  focusedSkillScopeRef.current = {
+    key: focusedSkillCatalogKey,
+    engine: focusedEngine,
+    space,
+    cwd: capabilityCwd,
+  };
   const activeBtwDraftKey = composerDraftKey(
     machineId, space,
     (activeBtw?.engine === "codex" ? "codex" : "claude"),
@@ -498,6 +538,64 @@ export default function App() {
   }, [visibleParentSid, activeBtwSid, rightView, state.artifact]);
 
   const goalUi = focusedSid ? goalUiBySid[focusedSid] : undefined;
+  const storeSkillCatalog = useCallback((
+    key: string,
+    items: EngineCapabilityItem[],
+  ) => {
+    const next = cacheSkillCatalog(
+      skillCatalogsRef.current, key, items);
+    skillCatalogsRef.current = next;
+    setSkillCatalogs(next);
+  }, []);
+  const requestSkillCatalog = useCallback((
+    request: SkillCatalogRequest,
+    force = false,
+  ) => {
+    const cached = skillCatalogsRef.current[request.key];
+    if (!force && skillCatalogFresh(cached)) return false;
+    const reads = skillCatalogReadsRef.current;
+    if (reads.active) {
+      if (reads.active.key !== request.key) {
+        reads.queued.set(request.key, request);
+      }
+      return false;
+    }
+    const ws = wsRef.current;
+    if (!ws) return false;
+    reads.active = request;
+    ws.sendGetEngineCapabilities(
+      request.engine, request.space, request.cwd);
+    return true;
+  }, []);
+  const acceptSkillCatalog = useCallback((msg: EngineCapabilities) => {
+    const reads = skillCatalogReadsRef.current;
+    const active = reads.active;
+    if (active && active.engine === msg.engine && active.space === msg.space) {
+      storeSkillCatalog(
+        active.key, msg.items.filter((item) => item.kind === "skill"));
+      reads.active = null;
+      const next = reads.queued.values().next().value as
+        SkillCatalogRequest | undefined;
+      if (next) {
+        reads.queued.delete(next.key);
+        const ws = wsRef.current;
+        if (ws) {
+          reads.active = next;
+          ws.sendGetEngineCapabilities(next.engine, next.space, next.cwd);
+        }
+      }
+      return;
+    }
+    // Capability mutations also return a fresh full catalog. Adopt it for the
+    // currently focused cwd when no explicit read owns the response.
+    const focused = focusedSkillScopeRef.current;
+    if (!active && focused
+        && msg.engine === focused.engine && msg.space === focused.space) {
+      storeSkillCatalog(
+        focused.key,
+        msg.items.filter((item) => item.kind === "skill"));
+    }
+  }, [storeSkillCatalog]);
   const loadMessageImage = useCallback((sid: string, path: string): boolean => {
     const ws = wsRef.current;
     if (!ws || stateRef.current.focusedSid !== sid) return false;
@@ -1685,6 +1783,7 @@ export default function App() {
             }));
           }
           if (msg.type === "engine_capabilities") {
+            acceptSkillCatalog(msg);
             setCapabilitiesBySurface((current) => ({
               ...current, [`${msg.space}:${msg.engine}`]: msg,
             }));
@@ -1743,6 +1842,16 @@ export default function App() {
           }
           dispatch({ type: "event", event: msg, ownership });
           if (msg.type === "wrapper_reconnected") {
+            skillCatalogsRef.current = {};
+            setSkillCatalogs({});
+            skillCatalogReadsRef.current = {
+              active: null,
+              queued: new Map(),
+            };
+            const focusedSkills = focusedSkillScopeRef.current;
+            if (focusedSkills?.engine === "codex" && focusedSkills.cwd) {
+              requestSkillCatalog(focusedSkills, true);
+            }
             ws.sendListSessions(engineRef.current, spaceRef.current);
             if (spaceRef.current === "work") {
               ws.sendGetWorkDashboard(engineRef.current);
@@ -1774,6 +1883,12 @@ export default function App() {
         },
         onConnState: (s, detail) => {
           dispatch({ type: "conn", connState: s, detail });
+          if (s !== "connected") {
+            skillCatalogReadsRef.current = {
+              active: null,
+              queued: new Map(),
+            };
+          }
           if (s === "connected") {
             recoverableReads.clear();
             historyRequestsRef.current.beginConnection();
@@ -1888,12 +2003,14 @@ export default function App() {
       draining.clear();
     };
   }, [
+    acceptSkillCatalog,
     authed,
     clearHistoryDetailRequests,
     installBrowseHistoryPage,
     invalidateHistoryPageScopes,
     machineId,
     requestHistory,
+    requestSkillCatalog,
     setBtwOpeningFor,
   ]);
 
@@ -1950,6 +2067,32 @@ export default function App() {
     const selectedSpace: Space = selected.space === "work" ? "work" : "code";
     lastFocusBySurfaceRef.current[`${selectedSpace}:${selectedEngine}`] = focusedSid;
   }, [focusedSid, state.newChat, state.sessions, engine]);
+
+  // Warm the cwd-scoped Codex Skill catalog when a session becomes usable.
+  // Composer completion then reads memory synchronously; an expired entry stays
+  // visible while this refresh runs in the background.
+  useEffect(() => {
+    if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
+        || !capabilityCwd || state.connState !== "connected"
+        || !state.wrapperOnline) return;
+    requestSkillCatalog({
+      key: focusedSkillCatalogKey,
+      engine: focusedEngine,
+      space,
+      cwd: capabilityCwd,
+    });
+  }, [
+    authed,
+    capabilityCwd,
+    focusedEngine,
+    focusedSid,
+    focusedSkillCatalogKey,
+    requestSkillCatalog,
+    space,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+  ]);
 
   // Drain every resident session, not just the one currently visible. A queued
   // background turn must resume when that runtime becomes idle even if the user
@@ -3034,8 +3177,21 @@ export default function App() {
             setCapabilitiesKind(kind);
             setCapabilitiesOpen(true);
             setCapabilitiesLoading(true);
-            wsRef.current?.sendGetEngineCapabilities(
-              focusedEngine, space, state.newChat?.cwd ?? currentCwd);
+            requestSkillCatalog({
+              key: focusedSkillCatalogKey,
+              engine: focusedEngine,
+              space,
+              cwd: capabilityCwd,
+            }, true);
+          }}
+          skills={skillCatalogs[focusedSkillCatalogKey]?.items}
+          onRequestSkills={() => {
+            requestSkillCatalog({
+              key: focusedSkillCatalogKey,
+              engine: focusedEngine,
+              space,
+              cwd: capabilityCwd,
+            });
           }}
           workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
           onOpenArtifacts={() => {
@@ -3167,8 +3323,12 @@ export default function App() {
         onKindChange={setCapabilitiesKind}
         onRefresh={() => {
           setCapabilitiesLoading(true);
-          wsRef.current?.sendGetEngineCapabilities(
-            focusedEngine, space, state.newChat?.cwd ?? currentCwd);
+          requestSkillCatalog({
+            key: focusedSkillCatalogKey,
+            engine: focusedEngine,
+            space,
+            cwd: capabilityCwd,
+          }, true);
         }}
         onManagePlugin={(item, action) => {
           const verb = action === "install" ? "安装" : "卸载";

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -327,7 +328,8 @@ def test_codex_skill_toggle_uses_native_config_write(monkeypatch, tmp_path):
 
 def test_codex_capabilities_include_native_hooks_as_read_only(monkeypatch, tmp_path):
     async def run():
-        async def component(method, _params, _cwd):
+        async def components(requests, cwd):
+            assert cwd == str(tmp_path)
             responses = {
                 "skills/list": {"data": []},
                 "hooks/list": {"data": [{"hooks": [{
@@ -340,9 +342,11 @@ def test_codex_capabilities_include_native_hooks_as_read_only(monkeypatch, tmp_p
                 "app/list": {"data": []},
                 "mcpServerStatus/list": {"data": []},
             }
-            return responses[method]
+            return [responses[method] for method, _params in requests]
 
-        monkeypatch.setattr(capabilities_module, "_codex_component", component)
+        monkeypatch.setattr(
+            capabilities_module, "_codex_components", components
+        )
         items, errors, _notes = await capabilities_module.codex_capabilities(
             str(tmp_path), "code"
         )
@@ -472,6 +476,11 @@ def test_machine_forwards_configured_cli_to_capability_listing(
     async def run():
         machine, _ = _mk_machine()
         machine.cfg.claude_bin = "/configured/claude"
+        machine._focused_ctx = lambda: SimpleNamespace(
+            engine="claude",
+            space="code",
+            cwd="/different/focused/project",
+        )
         seen = []
 
         async def discover(engine, cwd, space, claude_bin):
@@ -496,6 +505,11 @@ def test_machine_forwards_work_space_to_plugin_backend(monkeypatch, tmp_path):
     async def run():
         machine, transport = _mk_machine()
         machine.cfg.claude_bin = "/configured/claude"
+        machine._focused_ctx = lambda: SimpleNamespace(
+            engine="claude",
+            space="work",
+            cwd="/different/focused/project",
+        )
         seen = []
 
         async def reject(engine, plugin_id, action, cwd, *, space, claude_bin):

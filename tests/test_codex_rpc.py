@@ -102,6 +102,62 @@ def test_codex_rpc_initializes_sends_exact_shape_and_reaps(monkeypatch, tmp_path
     asyncio.run(run())
 
 
+def test_codex_rpc_batch_uses_one_process_and_preserves_partial_results(
+    monkeypatch, tmp_path,
+):
+    async def run():
+        process = _FakeProcess([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "account/updated", "params": {}},
+            {"jsonrpc": "2.0", "id": 4, "result": {"third": True}},
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {"code": -32602, "message": "unsupported"},
+            },
+            {"jsonrpc": "2.0", "id": 3, "result": {"second": True}},
+        ])
+        spawn_count = 0
+
+        async def create_subprocess_exec(*_args, **_kwargs):
+            nonlocal spawn_count
+            spawn_count += 1
+            return process
+
+        monkeypatch.setattr(
+            codex_rpc_module, "_resolve_codex_bin", lambda: "/bin/codex"
+        )
+        monkeypatch.setattr(codex_rpc_module, "_codex_env", lambda _path: {})
+        monkeypatch.setattr(
+            codex_rpc_module.asyncio,
+            "create_subprocess_exec",
+            create_subprocess_exec,
+        )
+
+        results = await codex_rpc_module.codex_rpc_batch([
+            ("skills/list", {"cwds": [str(tmp_path)]}),
+            ("hooks/list", {"cwds": [str(tmp_path)]}),
+            ("mcpServerStatus/list", None),
+        ], cwd=str(tmp_path))
+
+        assert spawn_count == 1
+        assert isinstance(results[0], codex_rpc_module.CodexRpcRejected)
+        assert results[1:] == [{"second": True}, {"third": True}]
+        messages = [json.loads(line) for line in process.stdin.writes]
+        assert [message.get("method") for message in messages] == [
+            "initialize",
+            "initialized",
+            "skills/list",
+            "hooks/list",
+            "mcpServerStatus/list",
+        ]
+        assert [message.get("id") for message in messages[2:]] == [2, 3, 4]
+        assert process.stdin.closed is True
+        assert process.terminated is True and process.killed is False
+
+    asyncio.run(run())
+
+
 def test_codex_rpc_distinguishes_rejection_from_unknown_post_submit_outcome(
     monkeypatch, tmp_path,
 ):

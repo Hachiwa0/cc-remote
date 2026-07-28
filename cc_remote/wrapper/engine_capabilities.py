@@ -24,7 +24,11 @@ from urllib.parse import urlsplit
 from cc_remote.claude_paths import claude_config_dir
 from cc_remote.wrapper.child_env import sanitized_child_env
 from cc_remote.wrapper.claude_runtime import resolve_claude_cli
-from cc_remote.wrapper.codex_rpc import CodexRpcOutcomeUnknown, codex_rpc
+from cc_remote.wrapper.codex_rpc import (
+    CodexRpcOutcomeUnknown,
+    codex_rpc,
+    codex_rpc_batch,
+)
 
 _COMPONENT_TIMEOUT = 8.0
 _MAX_ITEMS = 500
@@ -114,6 +118,19 @@ async def _codex_component(method: str, params: dict[str, Any], cwd: str):
         codex_rpc(method, params, cwd=cwd), timeout=_COMPONENT_TIMEOUT)
 
 
+async def _codex_components(
+    requests: list[tuple[str, dict[str, Any]]],
+    cwd: str,
+) -> list[Any | Exception]:
+    try:
+        return await asyncio.wait_for(
+            codex_rpc_batch(requests, cwd=cwd),
+            timeout=_COMPONENT_TIMEOUT,
+        )
+    except Exception as exc:
+        return [exc for _request in requests]
+
+
 async def codex_capabilities(cwd: str, space: str) -> tuple[list[dict], list[str], list[str]]:
     requests = {
         "skills": ("skills/list", {"cwds": [cwd], "forceReload": False}),
@@ -122,10 +139,7 @@ async def codex_capabilities(cwd: str, space: str) -> tuple[list[dict], list[str
         "apps": ("app/list", {"limit": _MAX_ITEMS}),
         "mcp": ("mcpServerStatus/list", {}),
     }
-    results = await asyncio.gather(*(
-        _codex_component(method, params, cwd)
-        for method, params in requests.values()
-    ), return_exceptions=True)
+    results = await _codex_components(list(requests.values()), cwd)
     values = dict(zip(requests, results))
     items: list[dict] = []
     errors: list[str] = []

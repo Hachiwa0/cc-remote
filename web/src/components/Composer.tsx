@@ -7,11 +7,20 @@ import {
   type ClipboardEvent,
   type SetStateAction,
 } from "react";
-import type { State, QueryImg, QueryFile, ContextReport, CollaborationModeName, SessionControl, EngineCapabilityKind } from "../protocol";
+import type {
+  State, QueryImg, QueryFile, ContextReport,
+  CollaborationModeName, SessionControl, EngineCapabilityKind,
+  EngineCapabilityItem,
+} from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
-import { clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken, matchCommands, parseSlash, modelsFor, effortsFor, permsFor, type Catalog } from "../data";
+import {
+  clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken,
+  matchCommands, matchSkills, parseSlash, skillToken,
+  modelsFor, effortsFor, permsFor,
+  type Catalog,
+} from "../data";
 import { CommandSheet } from "./CommandSheet";
 import { attachmentBytes, pickFiles } from "../img";
 import type { PendingQuery } from "../reducer";
@@ -79,6 +88,8 @@ interface Props {
   ) => void;
   onCompact?: () => void;
   onOpenExtensions?: (kind: EngineCapabilityKind | "all") => void;
+  skills?: EngineCapabilityItem[];
+  onRequestSkills?: () => void;
   workArtifactCount?: number;
   onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
@@ -135,6 +146,7 @@ export function Composer(p: Props) {
   const buttonSendTimerRef = useRef<number | null>(null);
   const photoRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const requestedSkillScopeRef = useRef<string | null>(null);
   const pickFilesRef = useRef<(files: FileList | File[] | null) => Promise<void>>(
     async () => {});
 
@@ -259,14 +271,40 @@ export function Composer(p: Props) {
     growTa();
   };
 
-  // Command palette = live suggestions derived from the input. Visible while the
-  // user is typing a command name (after "/", before a space) that prefix-matches
-  // at least one command. Typing past a match (/pet) hides it; deleting back
-  // (/pe) shows it again — no separate input, no modal scrim over the composer.
+  // Command/Skill palette = live suggestions derived from the input. A slash
+  // matches cc-remote/native commands; "$" matches the Codex app-server's real
+  // enabled Skill catalog. Both stop suggesting once arguments begin.
   const cmdToken = slashToken(input);
   const cmdMatches = cmdToken !== null
     ? matchCommands(cmdToken, p.engine, p.surface ?? "code") : [];
-  const cmdOpen = cmdMatches.length > 0;
+  const currentSkillToken = p.engine === "codex" ? skillToken(input) : null;
+  const skillMatches = currentSkillToken !== null && p.skills
+    ? matchSkills(currentSkillToken, p.skills) : [];
+  const skillLoading = currentSkillToken !== null && p.skills === undefined;
+  const skillOpen = currentSkillToken !== null
+    && (skillLoading || currentSkillToken === "" || skillMatches.length > 0);
+  const suggestionOpen = cmdMatches.length > 0 || skillOpen;
+  const requestSkills = p.onRequestSkills;
+  const skillRequestScope =
+    `${p.draftKey}:${p.surface ?? "code"}:${p.engine ?? "claude"}`;
+
+  // Skills are cwd-sensitive. Refresh once per focused draft when "$" is first
+  // used; App clears the surface cache before asking the wrapper, so stale
+  // suggestions from a previously focused repository disappear immediately.
+  useEffect(() => {
+    if (currentSkillToken === null) {
+      requestedSkillScopeRef.current = null;
+      return;
+    }
+    if (!requestSkills) return;
+    if (requestedSkillScopeRef.current === skillRequestScope) return;
+    requestedSkillScopeRef.current = skillRequestScope;
+    requestSkills();
+  }, [
+    currentSkillToken,
+    requestSkills,
+    skillRequestScope,
+  ]);
 
   const onPickFiles = async (fl: FileList | File[] | null) => {
     if (importing) { flash("附件正在导入，请稍候"); return; }
@@ -479,6 +517,11 @@ export function Composer(p: Props) {
     focusTa(); growTa();
   };
 
+  const pickSkill = (name: string) => {
+    setInput("$" + name + " ");
+    focusTa(); growTa();
+  };
+
   const send = (value = taRef.current?.value ?? input) => {
     if (locked || importing) return;
     const raw = value.trim();
@@ -577,7 +620,9 @@ export function Composer(p: Props) {
       }}
       onPaste={onPaste}
       onKeyDown={(e) => {
-        if (e.key === "Escape" && cmdOpen) { setInput(""); resetTaHeight(); return; }
+        if (e.key === "Escape" && suggestionOpen) {
+          setInput(""); resetTaHeight(); return;
+        }
         if (!imeSubmitRef.current.shouldSubmitKey({
           key: e.key,
           shiftKey: e.shiftKey,
@@ -585,8 +630,14 @@ export function Composer(p: Props) {
           keyCode: e.nativeEvent.keyCode,
         })) return;
         e.preventDefault();
-        if (cmdOpen && cmdToken) { pickCommand(cmdMatches[0].slash); return; }
+        if (cmdMatches.length > 0 && cmdToken) {
+          pickCommand(cmdMatches[0].slash); return;
+        }
+        if (skillMatches.length > 0 && currentSkillToken !== null) {
+          pickSkill(skillMatches[0].name); return;
+        }
         if (cmdToken === "") return;
+        if (currentSkillToken === "") return;
         send(e.currentTarget.value);
       }}
     />
@@ -607,10 +658,12 @@ export function Composer(p: Props) {
   return (
     <div className={workSurface ? "composer work-composer" : "composer"}>
       <div className={workSurface ? "composer-in work-composer-in" : "composer-in"}>
-        {cmdOpen && (
-          <div className="cmd-pop" role="listbox" aria-label="命令"
+        {suggestionOpen && (
+          <div className="cmd-pop" role="listbox" aria-label={
+            currentSkillToken !== null ? "Skills" : "命令"
+          }
             data-lock-horizontal-swipe="true">
-            {cmdMatches.map((c) => (
+            {currentSkillToken === null ? cmdMatches.map((c) => (
               <button key={c.slash} type="button" className="cmd" onClick={() => pickCommand(c.slash)}>
                 <span className="cmd-ic"><Icon name={c.ic} size={17} /></span>
                 <span className="cmd-tx">
@@ -619,7 +672,21 @@ export function Composer(p: Props) {
                 </span>
                 <span className="cmd-kbd">↵</span>
               </button>
-            ))}
+            )) : skillLoading ? (
+              <div className="cmd-empty">正在读取当前目录的 Skills…</div>
+            ) : skillMatches.length > 0 ? skillMatches.map((skill) => (
+              <button key={skill.name.toLocaleLowerCase()} type="button"
+                className="cmd" onClick={() => pickSkill(skill.name)}>
+                <span className="cmd-ic"><Icon name="spark" size={17} /></span>
+                <span className="cmd-tx">
+                  <span className="cmd-nm"><span className="slash">${skill.name}</span></span>
+                  <span className="cmd-ds">{skill.description || "调用此 Skill"}</span>
+                </span>
+                <span className="cmd-kbd">↵</span>
+              </button>
+            )) : (
+              <div className="cmd-empty">当前目录没有已启用的 Skills</div>
+            )}
           </div>
         )}
         {notice && <div className="composer-notice">{notice}</div>}
@@ -750,7 +817,9 @@ export function Composer(p: Props) {
             <button className="cmdbtn" onClick={() => photoRef.current?.click()}
               aria-label="添加照片" title="添加照片"
               disabled={locked || importing}><Icon name="plus" size={19} /></button>
-            {inputControl("发消息…  输入 / 唤起命令")}
+            {inputControl(p.engine === "codex"
+              ? "发消息…  输入 / 唤起命令，$ 调用 Skill"
+              : "发消息…  输入 / 唤起命令")}
             {sendControl}
           </div>
           <div className="hint">
@@ -768,7 +837,9 @@ export function Composer(p: Props) {
               : (perm ? perm.short : "Mode loading")} · {stateZh[p.state]}
             {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
           </button>
-          <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令</span>
+          <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
+            p.engine === "codex" && <> · <kbd>$</kbd> Skills</>
+          }</span>
           <div className="hint-right" ref={ctxWrapRef}>
             {deferredClaudeControls && (
               <span className="hint-control-scope"
