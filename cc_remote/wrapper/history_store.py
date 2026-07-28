@@ -25,6 +25,7 @@ from cc_remote.attachments import (
     decode_attachment,
     image_dimensions,
 )
+from cc_remote.protocol import ConversationTurn
 
 
 _SCHEMA_VERSION = 10
@@ -153,6 +154,18 @@ class MaterializedHistoryPage:
         if not isinstance(turns, (list, tuple)) or not all(
                 isinstance(turn, dict) for turn in turns):
             raise ValueError("invalid materialized history turns")
+        # The SQLite projection is rebuildable, but can outlive a wire-schema
+        # change.  Validate its cached summary at this single boundary so an
+        # obsolete field is never served to the client; callers invalidate the
+        # whole session and rebuild from the engine source on validation error.
+        normalized_turns: list[dict[str, Any]] = []
+        for turn in turns:
+            # Preserve omitted defaults in old cache rows: they remain omitted
+            # on the wire today, while values that *are* present get Pydantic's
+            # canonical JSON form.  Unknown keys are rejected by the model.
+            normalized = ConversationTurn.model_validate(turn).model_dump(
+                mode="json")
+            normalized_turns.append({key: normalized[key] for key in turn})
         return cls(
             events=tuple(events),
             has_more=bool(payload.get("has_more")),
@@ -160,7 +173,7 @@ class MaterializedHistoryPage:
                        if isinstance(payload.get("oldest_id"), str) else None),
             newest_id=(payload.get("newest_id")
                        if isinstance(payload.get("newest_id"), str) else None),
-            turns=tuple(turns),
+            turns=tuple(normalized_turns),
         )
 
 

@@ -854,6 +854,35 @@ def test_relay_config_rejects_non_tls_public_origin():
         validate_relay_config(_cfg(public_origin="http://remote.example"))
 
 
+def test_static_shell_revalidates_across_protocol_upgrades(tmp_path):
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "index.html").write_text("<p>shell</p>", encoding="utf-8")
+    (tmp_path / "sw.js").write_text("// worker", encoding="utf-8")
+    (tmp_path / "cc-remote-build.json").write_text(
+        '{"version":"3.0.0","protocol":20}', encoding="utf-8",
+    )
+    (tmp_path / "assets" / "index-hash.js").write_text(
+        "// hashed", encoding="utf-8",
+    )
+    cfg = _cfg(static_dir=str(tmp_path))
+
+    with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
+        for path in ("/", "/index.html", "/sw.js", "/cc-remote-build.json"):
+            response = client.get(path)
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == (
+                "no-cache, must-revalidate"
+            )
+        asset = client.get("/assets/index-hash.js")
+        assert asset.status_code == 200
+        assert asset.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
+        missing = client.get("/assets/not-yet-deployed.js")
+        assert missing.status_code == 404
+        assert "immutable" not in missing.headers.get("cache-control", "")
+
+
 def test_allow_insecure_http_permits_a_plain_http_public_ip_origin():
     # Explicit opt-in escape hatch: a bare public IP without a TLS terminator.
     cfg = _cfg(public_origin="http://198.51.100.10:8765", allow_insecure_http=True)

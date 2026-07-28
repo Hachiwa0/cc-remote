@@ -567,6 +567,24 @@ def create_app(
     app.state.push_dispatcher = push_dispatcher
     app.state.device_store = devices
 
+    @app.middleware("http")
+    async def static_shell_cache_policy(req: Request, call_next):
+        """Never let a protocol upgrade reload into a stale application shell."""
+        response = await call_next(req)
+        path = req.url.path
+        if path in {"/", "/index.html", "/sw.js", "/cc-remote-build.json"}:
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        elif (
+            path.startswith("/assets/")
+            and response.status_code in {200, 206}
+        ):
+            # Vite asset names are content-addressed; old pages can keep using
+            # their exact files while a new navigation picks up the new index.
+            response.headers["Cache-Control"] = (
+                "public, max-age=31536000, immutable"
+            )
+        return response
+
     @app.get("/api/auth-config")
     async def auth_config() -> JSONResponse:
         return JSONResponse(
