@@ -6364,6 +6364,9 @@ assert.match(appSource, /legacyExternal=\{!rt\.control && !!rt\.external\}/,
   "rolling-deploy compatibility keeps legacy external ownership actionable");
 assert.match(appSource, /sessionControlLocksInput\(rt\.control\)/,
   "Shift+Tab must not mutate controls while the authoritative session is read-only");
+assert.match(appSource,
+  /state\.connState !== "connected" \|\| !state\.wrapperOnline\) return;[\s\S]{0,300}sendGetContext\(\)[\s\S]{0,200}begin_context_request/,
+  "a focused session must prime its context ring after initial sync and reconnect");
 assert.doesNotMatch(appSource, /className="work-artifacts-btn"/);
 assert.doesNotMatch(appSource, /className="work-head-manage"/);
 assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
@@ -6435,6 +6438,15 @@ assert.doesNotMatch(appSource,
   "opening $ completion must never clear a usable Skill cache");
 assert.doesNotMatch(composerSource, /control-bar/,
   "terminal state no longer consumes a permanent row above the composer");
+assert.doesNotMatch(composerSource, /hint-mode[^]*stateZh\[p\.state\]/,
+  "the composer permission chip must not repeat the header runtime state");
+const permissionControlIndex = composerSource.indexOf('className={"hint-mode"');
+const runtimeControlsIndex = composerSource.indexOf('className="hint-right"');
+const shortcutHintIndex = composerSource.indexOf('className="hint-kbds"');
+assert.ok(permissionControlIndex >= 0
+    && permissionControlIndex < shortcutHintIndex
+    && shortcutHintIndex < runtimeControlsIndex,
+  "desktop composer must keep its original split control layout");
 const workDashboardSource = readFileSync(
   resolve(process.cwd(), "src/components/WorkDashboardSheet.tsx"), "utf8");
 assert.match(workDashboardSource, /<DateTimePicker value=\{scheduleAt\}/,
@@ -6446,6 +6458,13 @@ const dateTimePickerSource = readFileSync(
 assert.match(dateTimePickerSource, /createPortal\(<>.*document\.body\)/s,
   "the date-time popover must escape the scrollable Work manager container");
 const appCssSource = readFileSync(resolve(process.cwd(), "src/index.css"), "utf8");
+assert.doesNotMatch(appCssSource, /\.hint-mode\.busy/,
+  "the composer permission chip must not duplicate runtime state by color");
+assert.match(appCssSource, /\.hint-right\{[^}]*margin-left:auto/,
+  "desktop composer controls must retain the original right alignment");
+assert.match(appCssSource,
+  /@media \(max-width:640px\)\{[\s\S]*?\.hint-kbds\{ display:none; \}[\s\S]*?\.hint-right\{[^}]*margin-left:0;[^}]*flex:1;[^}]*justify-content:space-between;/,
+  "mobile composer controls must distribute across the available row width");
 assert.match(appCssSource, /\.capabilities-sheet>header\{[^}]*flex:none/s,
   "the Extensions header must not collapse under a long capability list");
 assert.match(appCssSource, /\.capabilities-tabs\{[^}]*flex:none/s,

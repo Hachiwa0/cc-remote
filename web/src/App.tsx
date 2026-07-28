@@ -2323,6 +2323,26 @@ export default function App() {
   }, [loadHistoryTurnDetail, state.historyBrowse, state.runtimes,
     state.focusedSid]);
 
+  // Prime the ring as soon as the focused session is usable. Previously the
+  // first read only happened when the user opened the popover or a turn ended,
+  // so a freshly loaded/restored session misleadingly painted an empty ring.
+  // wrapperOnline deliberately gates reconnects until snapshot/replay proves
+  // that the replacement wrapper has finished restoring resident sessions.
+  useEffect(() => {
+    if (!authed || !focusedSid || state.newChat
+        || state.connState !== "connected" || !state.wrapperOnline) return;
+    if (stateRef.current.runtimes[focusedSid]?.contextRequestId) return;
+    const requestId = wsRef.current?.sendGetContext();
+    if (requestId) {
+      dispatch({ type: "begin_context_request", sid: focusedSid, requestId });
+    }
+  }, [
+    authed,
+    focusedSid,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+  ]);
   if (!authReady) {
     return <div className="login" aria-busy="true">正在连接中继…</div>;
   }
