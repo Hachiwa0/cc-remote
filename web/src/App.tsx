@@ -2645,15 +2645,23 @@ export default function App() {
   };
   const runGoal = (args: string) => {
     if (!focusedSid) return;
-    const command = parseGoalCommand(args);
+    const command = parseGoalCommand(args, focusedEngine);
     if (command.kind === "clear") {
       wsRef.current?.sendClearGoal();
       setGoalUi({ revealed: false, open: false });
       return;
     }
     setGoalUi({ revealed: true, open: true });
-    if (command.kind === "show") wsRef.current?.sendGetGoal();
-    else wsRef.current?.sendSetGoal(command.objective, "active", null);
+    if (command.kind === "show") {
+      wsRef.current?.sendGetGoal();
+    } else if (command.kind === "resume") {
+      // Codex resumes the existing condition by changing only its status.
+      if (focusedEngine === "codex") {
+        wsRef.current?.sendSetGoal(null, "active", null);
+      }
+    } else {
+      wsRef.current?.sendSetGoal(command.objective, "active", null);
+    }
   };
   const openStatus = () => {
     if (!focusedSid) return;
