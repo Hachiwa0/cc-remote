@@ -55,6 +55,33 @@ const OUTBOX_MAX_BYTES = 64 * 1024 * 1024;
 // that can enter the 64 MiB aggregate outbox but can never cross the relay.
 const OUTBOX_MAX_FRAME_BYTES = 14 * 1024 * 1024;
 const MAX_REPLAY_SESSIONS = 128;
+const PROTOCOL_RELOAD_KEY = "cc-remote:protocol-reload";
+
+function readProtocolReloadMarker(): string | null | undefined {
+  try {
+    return globalThis.sessionStorage.getItem(PROTOCOL_RELOAD_KEY);
+  } catch {
+    return undefined;
+  }
+}
+
+function writeProtocolReloadMarker(): boolean {
+  try {
+    globalThis.sessionStorage.setItem(
+      PROTOCOL_RELOAD_KEY, String(PROTOCOL_VERSION));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearProtocolReloadMarker(): void {
+  try {
+    globalThis.sessionStorage.removeItem(PROTOCOL_RELOAD_KEY);
+  } catch {
+    // Storage can be unavailable in privacy-restricted or sandboxed contexts.
+  }
+}
 
 function nowTs(): number {
   return Date.now() / 1000;
@@ -1093,6 +1120,9 @@ export class RelayWs {
       try {
         const decoded = JSON.parse(e.data) as ServerEvent;
         this.lastRecvAt = Date.now();  // any valid JSON frame proves the link is alive
+        // A real frame proves that this bundle and the relay agree. Clear the
+        // one-shot mismatch guard so a future deployment may refresh once too.
+        clearProtocolReloadMarker();
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
@@ -1320,7 +1350,21 @@ export class RelayWs {
       if (this.ws === ws) this.ws = null;
       this.stopHeartbeat();
       if (ev.code === 4406) {
-        window.location.reload();
+        // Static assets and the relay cannot be swapped atomically on every
+        // deployment target. Refresh once to pick up the matching bundle, but
+        // never trap mobile browsers in an unbounded reload loop while the
+        // other tier is still rolling forward.
+        const reloadMarker = readProtocolReloadMarker();
+        if (reloadMarker !== undefined
+            && reloadMarker !== String(PROTOCOL_VERSION)
+            && writeProtocolReloadMarker()) {
+          window.location.reload();
+        } else {
+          this.cb.onConnState(
+            "disconnected",
+            "页面与服务端版本不一致；请等待部署完成后手动刷新。",
+          );
+        }
         return;
       }
       if (ev.code === 1008) {
