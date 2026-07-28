@@ -8,9 +8,11 @@ import {
   effortsFor, modelsFor, type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
-import type { CodexPermissionMode, CodexServiceTier, CollaborationModeName, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
+import type { CodexPermissionMode, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { PendingImageAttachments } from "./PendingImageAttachments";
+import { CommandSheet } from "./CommandSheet";
+import { permissionProfileLabel } from "../data";
 
 type Engine = "claude" | "codex";
 
@@ -110,6 +112,8 @@ export function newChatEfforts(
 
 interface Props {
   cwd: string;
+  /** Authorization boundary for local execution-control choices. */
+  controlScopeKey: string;
   space?: Space;
   engine?: Engine;  // which backend this new chat will use
   catalog?: Catalog;
@@ -126,9 +130,13 @@ interface Props {
   onPickCwd: () => void;  // open the directory picker
   onPickModel?: (model: string | null) => void;
   onPickEffort?: (effort: string | null) => void;
+  permissionProfiles?: PermissionProfileInfo[] | null;
+  onGetPermissionProfiles?: (cwd: string) => void;
   onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[],
            collaborationMode?: CollaborationModeName,
            permissionMode?: CodexPermissionMode,
+           permissionProfile?: string,
+           webSearch?: CodexWebSearchMode,
            serviceTier?: CodexServiceTier) => boolean;
 }
 
@@ -138,6 +146,22 @@ interface SelectorOption {
   description: string;
   icon: string;
 }
+
+interface NewChatExecutionControls {
+  scopeKey: string;
+  permissionMode: CodexPermissionMode;
+  permissionProfile: string | null;
+  webSearch: CodexWebSearchMode | null;
+}
+
+const defaultExecutionControls = (
+  scopeKey: string,
+): NewChatExecutionControls => ({
+  scopeKey,
+  permissionMode: "never",
+  permissionProfile: null,
+  webSearch: null,
+});
 
 function NewChatSelectorSheet({
   open, kind, options, current, onClose, onPick,
@@ -192,11 +216,13 @@ function displayEffort(
   return efforts.find((candidate) => candidate.id === id)?.name ?? id;
 }
 
-export function NewChatView({ cwd, space = "code", engine = "claude",
+export function NewChatView({ cwd, controlScopeKey,
+  space = "code", engine = "claude",
   catalog = {}, model = null, effort = null,
   defaultModel = null, defaultEffort = null, autoFocus = true, createError,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
-  onPickModel, onPickEffort, onSend }: Props) {
+  onPickModel, onPickEffort, permissionProfiles, onGetPermissionProfiles,
+  onSend }: Props) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
@@ -204,6 +230,10 @@ export function NewChatView({ cwd, space = "code", engine = "claude",
   const [creating, setCreating] = useState(false);
   const [sheetKind, setSheetKind] =
     useState<"models" | "efforts" | null>(null);
+  const [executionControls, setExecutionControls] =
+    useState<NewChatExecutionControls>(
+      () => defaultExecutionControls(controlScopeKey));
+  const [permissionsOpen, setPermissionsOpen] = useState(false);
   const photoRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -214,6 +244,26 @@ export function NewChatView({ cwd, space = "code", engine = "claude",
     if (createError) setCreating(false);
   }, [createError]);
 
+  useEffect(() => {
+    setExecutionControls((current) => (
+      current.scopeKey === controlScopeKey
+        ? current
+        : defaultExecutionControls(controlScopeKey)
+    ));
+    setPermissionsOpen(false);
+  }, [controlScopeKey]);
+
+  useEffect(() => {
+    setExecutionControls((current) => {
+      const scoped = current.scopeKey === controlScopeKey
+        ? current
+        : defaultExecutionControls(controlScopeKey);
+      return scoped.permissionProfile === null
+        ? scoped
+        : { ...scoped, permissionProfile: null };
+    });
+  }, [controlScopeKey, cwd]);
+
   useEffect(() => () => {
     if (buttonSendTimerRef.current !== null) {
       window.clearTimeout(buttonSendTimerRef.current);
@@ -221,6 +271,28 @@ export function NewChatView({ cwd, space = "code", engine = "claude",
   }, []);
 
   const hasAttachments = images.length > 0 || files.length > 0;
+  // Effects run after paint. Derive the fail-closed defaults synchronously too,
+  // so a send in the first frame after a device/surface switch cannot reuse
+  // another authorization scope's choices.
+  const scopedExecutionControls =
+    executionControls.scopeKey === controlScopeKey
+      ? executionControls
+      : defaultExecutionControls(controlScopeKey);
+  const {
+    permissionMode,
+    permissionProfile,
+    webSearch,
+  } = scopedExecutionControls;
+  const updateExecutionControls = (
+    patch: Partial<Omit<NewChatExecutionControls, "scopeKey">>,
+  ) => {
+    setExecutionControls((current) => ({
+      ...(current.scopeKey === controlScopeKey
+        ? current
+        : defaultExecutionControls(controlScopeKey)),
+      ...patch,
+    }));
+  };
   const canSend = (text.trim().length > 0 || hasAttachments) && !creating && !importing;
   const modelList = modelsFor(engine, catalog);
   const effectiveModel = model ?? defaultModel;
@@ -293,7 +365,15 @@ export function NewChatView({ cwd, space = "code", engine = "claude",
     const queued = onSend(
       prompt, images.length ? images : undefined, files.length ? files : undefined,
       engine === "codex" ? "default" : undefined,
-      engine === "codex" ? (space === "work" ? "on-request" : "never") : undefined,
+      engine === "codex"
+        ? (space === "work" ? "never" : permissionMode)
+        : undefined,
+      engine === "codex" && space === "code"
+        ? (permissionProfile ?? undefined)
+        : undefined,
+      engine === "codex" && space === "code"
+        ? (webSearch ?? undefined)
+        : undefined,
       engine === "codex" ? "default" : undefined);
     if (!queued) setCreating(false);
   };
@@ -418,6 +498,19 @@ export function NewChatView({ cwd, space = "code", engine = "claude",
               disabled={creating || importing || !onPickEffort}>
               {effortLabel}
             </button>
+            {engine === "codex" && space === "code" && (
+              <button type="button" className="newchat-access"
+                onClick={() => {
+                  setPermissionsOpen(true);
+                  onGetPermissionProfiles?.(cwd);
+                }}
+                disabled={creating || importing}
+                title={`执行环境：${permissionProfileLabel(permissionProfile) ?? "默认"}；审批：${permissionMode}；网页搜索：${webSearch ?? "默认"}`}>
+                <Icon name="shield" size={15} />
+                <span>{permissionProfileLabel(permissionProfile) ?? "默认环境"}</span>
+                <span aria-hidden="true">▾</span>
+              </button>
+            )}
           </div>
           <div className="newchat-foot-right">
             <span className="newchat-hint">{createError
@@ -446,6 +539,25 @@ export function NewChatView({ cwd, space = "code", engine = "claude",
           else onPickModel?.(value);
           setSheetKind(null);
         }}
+      />
+      <CommandSheet
+        open={permissionsOpen}
+        kind="perms"
+        engine={engine}
+        onClose={() => setPermissionsOpen(false)}
+        currentPerm={permissionMode}
+        onPickPerm={(mode) => updateExecutionControls({
+          permissionMode: mode as CodexPermissionMode,
+        })}
+        currentPermissionProfile={permissionProfile}
+        permissionProfiles={permissionProfiles}
+        onPickPermissionProfile={(profile) => updateExecutionControls({
+          permissionProfile: profile,
+        })}
+        currentWebSearch={webSearch}
+        onPickWebSearch={(mode) => updateExecutionControls({
+          webSearch: mode,
+        })}
       />
     </div>
   );

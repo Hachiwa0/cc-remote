@@ -109,6 +109,7 @@ export function StatusSheet({ open, report, notices = [], error, onClose,
             <Row label="思考强度" mono>{show(runtime?.reasoning_effort)}</Row>
             <Row label="Service tier">{show(runtime?.service_tier, "标准")}</Row>
             <Row label="审批策略">{show(runtime?.approval_policy)}</Row>
+            <Row label="执行环境" mono>{show(runtime?.permission_profile)}</Row>
             <Row label="Sandbox">{show(runtime?.sandbox_mode)}</Row>
             <Row label="Web search">{show(runtime?.web_search)}</Row>
           </div>

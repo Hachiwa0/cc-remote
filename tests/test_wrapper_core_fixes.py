@@ -1056,6 +1056,7 @@ def test_codex_session_settings_restores_applied_update_before_next_turn(
                 "model": "gpt-after",
                 "reasoning_effort": "xhigh",
                 "approval_policy": "never",
+                "active_permission_profile": {"id": ":danger-full-access"},
                 "service_tier": "default",
                 "collaboration_mode": {"mode": "plan", "settings": {
                     "model": "gpt-after",
@@ -1071,6 +1072,7 @@ def test_codex_session_settings_restores_applied_update_before_next_turn(
         "model": "gpt-after",
         "effort": "xhigh",
         "approval_policy": "never",
+        "permission_profile": ":danger-full-access",
         "service_tier": None,
         "collaboration_mode": "plan",
     }
