@@ -138,7 +138,7 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
   return out;
 }
 
-function sameTurn(history: Turn, live: Turn): boolean {
+function sameTurnIdentity(history: Turn, live: Turn): boolean {
   if (history.id === live.id) return true;
   if (history.clientMsgId && (
     history.clientMsgId === live.id
@@ -150,7 +150,11 @@ function sameTurn(history: Turn, live: Turn): boolean {
   // assistant item id; TurnEnd still supplies the same authoritative branch id.
   if (history.forkPointId && live.forkPointId
       && history.forkPointId === live.forkPointId) return true;
-  if (history.forkPointId === live.id || live.forkPointId === history.id) return true;
+  return history.forkPointId === live.id || live.forkPointId === history.id;
+}
+
+function sameTurn(history: Turn, live: Turn): boolean {
+  if (sameTurnIdentity(history, live)) return true;
   if (!history.prompt || !live.prompt || history.prompt !== live.prompt) return false;
   // Different ids are an optimistic-client id vs transcript id only when their
   // authoritative UserMsg times are nearly identical. Prompt text alone is not
@@ -237,16 +241,57 @@ export function restoreCachedTurnDetails(
   summaries: Turn[],
   cachedTurns: readonly Turn[],
 ): Turn[] {
+  const matches = new Array<number>(summaries.length).fill(-1);
+  const usedCached = new Set<number>();
+
+  // Reserve every authoritative identity before considering the timestamp
+  // compatibility fallback. Otherwise a nearby repeated prompt can consume a
+  // cache row which belongs exactly to another summary.
+  for (let summaryIndex = 0; summaryIndex < summaries.length; summaryIndex += 1) {
+    const cachedIndex = cachedTurns.findIndex((candidate, index) =>
+      !usedCached.has(index)
+      && sameTurnIdentity(summaries[summaryIndex], candidate));
+    if (cachedIndex < 0) continue;
+    matches[summaryIndex] = cachedIndex;
+    usedCached.add(cachedIndex);
+  }
+
+  // Older optimistic caches may legitimately have a different id. Keep that
+  // compatibility one-to-one and choose the closest timestamp so repeated
+  // prompts cannot all reuse the first eligible cache row.
+  for (let summaryIndex = 0; summaryIndex < summaries.length; summaryIndex += 1) {
+    if (matches[summaryIndex] >= 0) continue;
+    const summary = summaries[summaryIndex];
+    let bestIndex = -1;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (let cachedIndex = 0; cachedIndex < cachedTurns.length;
+      cachedIndex += 1) {
+      if (usedCached.has(cachedIndex)) continue;
+      const candidate = cachedTurns[cachedIndex];
+      if (!sameTurn(summary, candidate)) continue;
+      const distance = Math.abs((summary.ts ?? 0) - (candidate.ts ?? 0));
+      if (distance >= bestDistance) continue;
+      bestIndex = cachedIndex;
+      bestDistance = distance;
+    }
+    if (bestIndex < 0) continue;
+    matches[summaryIndex] = bestIndex;
+    usedCached.add(bestIndex);
+  }
+
   let revealNewest = true;
-  const restored = [...summaries].reverse().map((summary) => {
-    const cached = cachedTurns.find((candidate) => sameTurn(summary, candidate));
-    if (!cached) return summary;
+  const restored = [...summaries];
+  for (let summaryIndex = restored.length - 1; summaryIndex >= 0;
+    summaryIndex -= 1) {
+    const cachedIndex = matches[summaryIndex];
+    if (cachedIndex < 0) continue;
+    const summary = restored[summaryIndex];
     const installed = installCachedDetailRestore(
-      summary, cached, revealNewest);
+      summary, cachedTurns[cachedIndex], revealNewest);
     if (installed !== summary) revealNewest = false;
-    return installed;
-  });
-  return restored.reverse();
+    restored[summaryIndex] = installed;
+  }
+  return restored;
 }
 
 function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {

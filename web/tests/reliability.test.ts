@@ -2447,6 +2447,39 @@ try {
     [false, true],
     "refresh automatically validates only the newest affected turn instead of downloading every cached process",
   );
+  const repeatedPromptSummaries: Turn[] = ["a", "b"].map((suffix, index) => ({
+    id: `repeated-${suffix}`,
+    prompt: "继续",
+    ts: 1_000 + index * 1_000,
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: `repeated-${suffix}-final`,
+      text: `final-${suffix}`,
+      done: true,
+      channel: "final",
+    }],
+    detailEventCount: 1,
+  }));
+  const repeatedPromptCaches = repeatedPromptSummaries.map((turn, index) => ({
+    ...turn,
+    blocks: [{
+      kind: "process" as const,
+      item_id: `repeated-${index}-process`,
+      processKind: "command" as const,
+      phase: "snapshot" as const,
+      status: "succeeded" as const,
+      title: `process-${index}`,
+      done: true,
+    }, ...turn.blocks],
+  }));
+  const repeatedPromptRestores = restoreCachedTurnDetails(
+    repeatedPromptSummaries, repeatedPromptCaches);
+  assert.deepEqual(
+    repeatedPromptRestores.map(processFingerprint),
+    [["process-0"], ["process-1"]],
+    "nearby repeated prompts must restore each turn's own cached process exactly once",
+  );
 
   let cacheFirstRefresh = reduce({
     ...initialState, focusedSid: refreshSid,
