@@ -106,7 +106,9 @@ export class SkillCatalogRequestCoordinator {
   private readonly begin: (
     request: SkillCatalogRequest,
   ) => string | null;
-  private active: ActiveSkillCatalogRead | null = null;
+  // Keep each response shape bounded to one request while allowing the
+  // latency-sensitive Skills lane to bypass slow plugin/app/MCP inventory.
+  private readonly active = new Map<boolean, ActiveSkillCatalogRead>();
   private readonly queued = new Map<string, SkillCatalogRequest>();
   private readonly mutations = new Map<string, SkillCatalogMutation>();
   private readonly latestMutationByScope = new Map<string, number>();
@@ -118,10 +120,11 @@ export class SkillCatalogRequestCoordinator {
 
   request(request: SkillCatalogRequest): boolean {
     const readKey = skillCatalogReadKey(request.key, request.skillsOnly);
-    if (this.active) {
+    const active = this.active.get(request.skillsOnly);
+    if (active) {
       const activeKey = skillCatalogReadKey(
-        this.active.key, this.active.skillsOnly);
-      if (activeKey !== readKey || this.active.superseded) {
+        active.key, active.skillsOnly);
+      if (activeKey !== readKey || active.superseded) {
         this.queued.set(readKey, request);
       }
       return false;
@@ -146,18 +149,17 @@ export class SkillCatalogRequestCoordinator {
       generation,
     });
     this.latestMutationByScope.set(request.key, generation);
-    if (this.active?.key === request.key) {
-      this.active.superseded = true;
+    for (const active of this.active.values()) {
+      if (active.key === request.key) active.superseded = true;
     }
     return true;
   }
 
   accept(response: EngineCapabilities): SkillCatalogAcceptance | null {
     let accepted: SkillCatalogAcceptance | null = null;
-    if (this.active
-        && skillCatalogResponseMatches(this.active, response)) {
-      const active = this.active;
-      this.active = null;
+    const active = this.active.get(response.skills_only);
+    if (active && skillCatalogResponseMatches(active, response)) {
+      this.active.delete(response.skills_only);
       accepted = {
         request: active,
         source: "read",
@@ -187,9 +189,10 @@ export class SkillCatalogRequestCoordinator {
 
   hasPendingRead(key: string, skillsOnly: boolean): boolean {
     const readKey = skillCatalogReadKey(key, skillsOnly);
+    const active = this.active.get(skillsOnly);
     return (
-      !!this.active
-        && skillCatalogReadKey(this.active.key, this.active.skillsOnly)
+      !!active
+        && skillCatalogReadKey(active.key, active.skillsOnly)
           === readKey
     ) || this.queued.has(readKey);
   }
@@ -202,7 +205,7 @@ export class SkillCatalogRequestCoordinator {
   }
 
   resetReads(): void {
-    this.active = null;
+    this.active.clear();
     this.queued.clear();
   }
 
@@ -213,22 +216,23 @@ export class SkillCatalogRequestCoordinator {
   }
 
   private beginRead(request: SkillCatalogRequest): boolean {
+    if (this.active.has(request.skillsOnly)) return false;
     const requestId = this.begin(request);
     if (!requestId) return false;
-    this.active = {
+    this.active.set(request.skillsOnly, {
       ...request,
       requestId,
       superseded: false,
-    };
+    });
     return true;
   }
 
   private drain(): void {
-    if (this.active) return;
     for (const [readKey, request] of this.queued) {
+      if (this.active.has(request.skillsOnly)) continue;
       if (this.hasPendingMutation(request.key)) continue;
       this.queued.delete(readKey);
-      if (this.beginRead(request)) return;
+      if (this.beginRead(request)) continue;
       // A failed send has already surfaced a command error. Continue so one
       // bad queued request cannot discard or starve unrelated scopes.
     }

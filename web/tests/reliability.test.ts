@@ -457,6 +457,61 @@ const capabilityResponse = (
   skills_only: skillsOnly,
 });
 
+const parallelLaneStarts: Array<{
+  requestId: string;
+  key: string;
+  skillsOnly: boolean;
+}> = [];
+const parallelLanes = new SkillCatalogRequestCoordinator((request) => {
+  const requestId = `parallel-read-${parallelLaneStarts.length + 1}`;
+  parallelLaneStarts.push({
+    requestId, key: request.key, skillsOnly: request.skillsOnly,
+  });
+  return requestId;
+});
+const parallelFullRequest = capabilityRequest(
+  repoSkillKey, "/repo/a", false);
+const parallelSkillsRequest = capabilityRequest(
+  repoSkillKey, "/repo/a", true);
+assert.equal(parallelLanes.request(parallelFullRequest), true);
+assert.equal(parallelLanes.request(parallelSkillsRequest), true,
+  "a Skills-only read must not wait for a slow full inventory read");
+assert.deepEqual(
+  parallelLaneStarts.map(({ skillsOnly }) => skillsOnly),
+  [false, true],
+  "full and Skills-only reads use independent bounded lanes");
+assert.equal(parallelLanes.accept(
+  capabilityResponse("parallel-read-2", "/repo/a", true))?.request.skillsOnly,
+  true);
+assert.equal(parallelLanes.hasPendingRead(repoSkillKey, false), true,
+  "accepting the fast Skills response must leave full inventory active");
+assert.equal(parallelLanes.hasPendingRead(repoSkillKey, true), false);
+assert.equal(parallelLanes.accept(
+  capabilityResponse("parallel-read-1", "/repo/a", false))?.request.skillsOnly,
+  false);
+
+const parallelMutationStarts: string[] = [];
+const parallelMutation = new SkillCatalogRequestCoordinator((_request) => {
+  const requestId = `parallel-mutation-read-${parallelMutationStarts.length + 1}`;
+  parallelMutationStarts.push(requestId);
+  return requestId;
+});
+assert.equal(parallelMutation.request(parallelFullRequest), true);
+assert.equal(parallelMutation.request(parallelSkillsRequest), true);
+assert.equal(parallelMutation.trackMutation(
+  "parallel-mutation", parallelFullRequest), true);
+assert.equal(parallelMutation.accept(
+  capabilityResponse("parallel-mutation", "/repo/a", false))?.superseded,
+  false);
+assert.equal(parallelMutation.accept(
+  capabilityResponse(
+    "parallel-mutation-read-2", "/repo/a", true))?.superseded,
+  true, "a same-scope mutation must supersede the active Skills lane");
+assert.equal(parallelMutation.accept(
+  capabilityResponse(
+    "parallel-mutation-read-1", "/repo/a", false))?.superseded,
+  true, "a same-scope mutation must supersede the active full lane");
+
 const mutationRaceStarts: Array<{ requestId: string; key: string; skillsOnly: boolean }> = [];
 const mutationRace = new SkillCatalogRequestCoordinator((request) => {
   const requestId = `race-read-${mutationRaceStarts.length + 1}`;
@@ -471,20 +526,22 @@ assert.equal(mutationRace.request(raceSkillsRequest), true);
 assert.equal(mutationRace.trackMutation("race-mutation", raceFullRequest), true);
 assert.equal(mutationRace.request(raceFullRequest), false,
   "a read requested during a same-scope mutation must wait");
+assert.equal(mutationRaceStarts.length, 1,
+  "the queued refresh must not overtake the pending mutation");
 const raceMutationAcceptance = mutationRace.accept(
   capabilityResponse("race-mutation", "/repo/a", false));
 assert.equal(raceMutationAcceptance?.superseded, false);
-assert.equal(mutationRaceStarts.length, 1,
-  "the queued refresh must not overtake the still-active old read");
-const staleReadAcceptance = mutationRace.accept(
-  capabilityResponse("race-read-1", "/repo/a", true));
-assert.equal(staleReadAcceptance?.superseded, true,
-  "a read started before mutation must not roll the catalog back");
 assert.deepEqual(mutationRaceStarts.at(-1), {
   requestId: "race-read-2",
   key: repoSkillKey,
   skillsOnly: false,
-}, "the queued full refresh must continue after mutation and stale-read drain");
+}, "the full lane may refresh after mutation while stale Skills drain");
+const staleReadAcceptance = mutationRace.accept(
+  capabilityResponse("race-read-1", "/repo/a", true));
+assert.equal(staleReadAcceptance?.superseded, true,
+  "a read started before mutation must not roll the catalog back");
+assert.equal(mutationRaceStarts.length, 2,
+  "draining the stale Skills lane must not duplicate the active full refresh");
 
 const blockedMutationStarts: string[] = [];
 const blockedMutation = new SkillCatalogRequestCoordinator((request) => {
