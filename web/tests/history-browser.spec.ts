@@ -1615,6 +1615,47 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   expect(await page.locator(".turn").count()).toBeLessThan(40);
 });
 
+test("desktop wheel scrolling remains available after text selection", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name === "webkit",
+    "the configured WebKit project is a touch phone; this is a desktop mouse path");
+  await page.goto("/tests/history-browser.html?large=120");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => {
+    node.scrollTop = node.scrollHeight * (41 / 120);
+  });
+  const text = page.locator('[data-turn-id="m42"] p').first();
+  await text.scrollIntoViewIfNeeded();
+  const box = await text.boundingBox();
+  if (!box) throw new Error("selection fixture has no geometry");
+
+  await page.mouse.move(box.x + 4, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(
+    Math.min(box.x + box.width - 4, box.x + 180),
+    box.y + box.height / 2,
+    { steps: 12 },
+  );
+  await page.mouse.up();
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "true",
+  );
+  expect((await nativeSelectionSnapshot(page)).text.length).toBeGreaterThan(0);
+  const beforeScrollTop = await viewport.evaluate((node) => node.scrollTop);
+
+  await page.mouse.wheel(0, 640);
+  await expect.poll(
+    () => viewport.evaluate((node) => node.scrollTop),
+  ).toBeGreaterThan(beforeScrollTop + 200);
+  const afterScroll = await nativeSelectionSnapshot(page);
+  expect(afterScroll.anchorConnected).toBe(true);
+  expect(afterScroll.text.length).toBeGreaterThan(0);
+  await expect(viewport).toHaveAttribute(
+    "data-text-selection-retained", "true",
+  );
+});
+
 test("a late cached-newer page cannot evict an active text selection", async ({
   page,
 }, testInfo) => {
