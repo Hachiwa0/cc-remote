@@ -1019,18 +1019,24 @@ export function HistoryBrowserFixture() {
       {quotaComposer && (
         <div className="composer" data-testid="quota-composer">
           <div className="composer-in">
+            <div className="inrow">
+              <button className="cmdbtn" type="button" aria-label="add">+</button>
+              <textarea rows={1} aria-label="message"
+                placeholder="输入 / 命令，$ Skill" />
+              <button className="sendbtn" type="button" aria-label="send">↑</button>
+            </div>
             <div className="hint">
               <button className="hint-mode" type="button">
-                Full access · idle <span className="hint-mode-ch">▾</span>
+                Full Access <span className="hint-mode-ch">▾</span>
               </button>
               <span className="hint-kbds">keyboard shortcuts</span>
               <div className="hint-right">
                 <button className="hint-ctl" type="button">
-                  gpt-5.6-codex
+                  GPT-5.6 Sol
                 </button>
                 <button className="hint-ctl" type="button">xhigh</button>
-                <button className="hint-ctl fast-chip" type="button">
-                  standard
+                <button className="hint-ctl fast-chip on" type="button">
+                  快速
                 </button>
                 <UsageMeter
                   open={false}

@@ -7257,6 +7257,14 @@ assert.ok(permissionControlIndex >= 0
     && permissionControlIndex < shortcutHintIndex
     && shortcutHintIndex < runtimeControlsIndex,
   "desktop composer must keep its original split control layout");
+assert.doesNotMatch(composerSource, /发消息…/,
+  "the compact composer placeholder must not wrap a redundant send label");
+assert.match(composerSource, /输入 \/ 命令，\$ Skill/,
+  "the Codex placeholder must retain command and Skill discovery");
+assert.match(composerSource, /p\.fast \? "快速" : "标准"/,
+  "the Fast control must use stable text labels");
+assert.doesNotMatch(composerSource, /⚡/,
+  "the Fast control must not add a lightning marker");
 const workDashboardSource = readFileSync(
   resolve(process.cwd(), "src/components/WorkDashboardSheet.tsx"), "utf8");
 assert.match(workDashboardSource, /<DateTimePicker value=\{scheduleAt\}/,
@@ -7273,8 +7281,17 @@ assert.doesNotMatch(appCssSource, /\.hint-mode\.busy/,
 assert.match(appCssSource, /\.hint-right\{[^}]*margin-left:auto/,
   "desktop composer controls must retain the original right alignment");
 assert.match(appCssSource,
-  /@media \(max-width:640px\)\{[\s\S]*?\.hint-kbds\{ display:none; \}[\s\S]*?\.hint-right\{[^}]*margin-left:0;[^}]*flex:1;[^}]*justify-content:space-between;/,
-  "mobile composer controls must distribute across the available row width");
+  /@media \(max-width:640px\)\{[\s\S]*?\.hint-kbds\{ display:none; \}[\s\S]*?\.hint-right\{[^}]*margin-left:0;[^}]*flex:1;[^}]*justify-content:flex-end;/,
+  "mobile composer controls must stay compact at the end of the row");
+assert.match(appCssSource,
+  /@media \(max-width:420px\)\{[\s\S]*?\.hint\{[^}]*flex-wrap:nowrap;[\s\S]*?\.hint-right\{[^}]*width:auto;[^}]*flex:1 1 auto;/,
+  "phone composer controls must remain on one row");
+assert.match(appCssSource,
+  /@media \(max-width:420px\)\{[\s\S]*?\.hint\{[^}]*gap:11px;[\s\S]*?\.hint-right\{[^}]*gap:11px;/,
+  "phone composer controls must retain readable separation");
+assert.match(appCssSource,
+  /\.usage-meter-line \.good\{ background:color-mix\(in srgb,var\(--ok\) 68%,white\); \}/,
+  "healthy compact quota bars must use a softer green");
 assert.match(appCssSource, /\.capabilities-sheet>header\{[^}]*flex:none/s,
   "the Extensions header must not collapse under a long capability list");
 assert.match(appCssSource, /\.capabilities-tabs\{[^}]*flex:none/s,

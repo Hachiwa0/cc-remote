@@ -863,8 +863,8 @@ export function Composer(p: Props) {
               aria-label="添加照片" title="添加照片"
               disabled={locked || importing}><Icon name="plus" size={19} /></button>
             {inputControl(p.engine === "codex"
-              ? "发消息…  输入 / 唤起命令，$ 调用 Skill"
-              : "发消息…  输入 / 唤起命令")}
+              ? "输入 / 命令，$ Skill"
+              : "输入 / 命令")}
             {sendControl}
           </div>
           <div className="hint">
@@ -919,7 +919,7 @@ export function Composer(p: Props) {
                 onClick={() => p.onSetServiceTier?.("toggle")}
                 disabled={locked}
                 title="Fast 服务档位:快 / 标准(下条消息生效)"
-              >{p.fast == null ? "档位读取中" : p.fast ? "⚡ 快" : "标准"}</button>
+              >{p.fast == null ? "档位读取中" : p.fast ? "快速" : "标准"}</button>
             )}
             {p.engine === "codex" && (
               <UsageMeter

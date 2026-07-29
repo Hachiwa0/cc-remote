@@ -1971,33 +1971,71 @@ test("composer action growth keeps the live tail visible without stealing histor
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 });
 
-test("Codex quota controls fit a 320 px composer", async ({ page }) => {
-  await page.setViewportSize({ width: 320, height: 720 });
-  await page.goto("/tests/history-browser.html?quota-composer=1");
+for (const width of [320, 390]) {
+  test(`Codex controls stay on one row in a ${width} px composer`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 720 });
+    await page.goto("/tests/history-browser.html?quota-composer=1");
 
-  const composer = page.getByTestId("quota-composer");
-  await expect(composer.locator(".usage-meter")).toBeVisible();
-  await expect(composer.locator(".hint-ring")).toBeVisible();
+    const composer = page.getByTestId("quota-composer");
+    const input = composer.getByRole("textbox", { name: "message" });
+    await expect(input).toHaveAttribute(
+      "placeholder", "输入 / 命令，$ Skill");
+    await expect(composer.locator(".fast-chip")).toHaveText("快速");
+    await expect(composer.locator(".fast-chip")).not.toContainText("⚡");
+    await expect(composer.locator(".usage-meter")).toBeVisible();
+    await expect(composer.locator(".hint-ring")).toBeVisible();
+    const inputHeight = await input.evaluate((node) => ({
+      client: node.clientHeight,
+      scroll: node.scrollHeight,
+    }));
+    expect(inputHeight.scroll).toBeLessThanOrEqual(inputHeight.client + 1);
 
-  const layout = await composer.evaluate((node) => {
-    const footer = node.getBoundingClientRect();
-    const right = node.querySelector<HTMLElement>(".hint-right")
-      ?.getBoundingClientRect();
-    return {
-      clientWidth: node.clientWidth,
-      scrollWidth: node.scrollWidth,
-      rightLeft: right?.left ?? -1,
-      rightRight: right?.right ?? -1,
-      rightWidth: right?.width ?? 0,
-      footerLeft: footer.left,
-      footerRight: footer.right,
-    };
+    const layout = await composer.evaluate((node) => {
+      const footer = node.getBoundingClientRect();
+      const controls = [
+        node.querySelector<HTMLElement>(".hint-mode"),
+        ...node.querySelectorAll<HTMLElement>(".hint-right > .hint-ctl"),
+        node.querySelector<HTMLElement>(".usage-meter"),
+        node.querySelector<HTMLElement>(".hint-ring"),
+      ].filter((control): control is HTMLElement => control !== null)
+        .map((control) => {
+          const rect = control.getBoundingClientRect();
+          return {
+            left: rect.left,
+            right: rect.right,
+            width: rect.width,
+            centerY: rect.top + rect.height / 2,
+          };
+        });
+      return {
+        clientWidth: node.clientWidth,
+        scrollWidth: node.scrollWidth,
+        footerLeft: footer.left,
+        footerRight: footer.right,
+        controls,
+      };
+    });
+    expect(layout.controls).toHaveLength(6);
+    expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth);
+    expect(Math.max(...layout.controls.map((control) => control.centerY))
+      - Math.min(...layout.controls.map((control) => control.centerY)))
+      .toBeLessThanOrEqual(2);
+    const minimumWidths = [48, 48, 28, 20, 44, 28];
+    for (const [index, control] of layout.controls.entries()) {
+      expect(control.width).toBeGreaterThanOrEqual(minimumWidths[index]);
+    }
+    for (const [index, control] of layout.controls.entries()) {
+      expect(control.left).toBeGreaterThanOrEqual(layout.footerLeft);
+      expect(control.right).toBeLessThanOrEqual(layout.footerRight);
+      if (index > 0) {
+        expect(control.left - layout.controls[index - 1].right)
+          .toBeGreaterThanOrEqual(10);
+      }
+    }
   });
-  expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth);
-  expect(layout.rightLeft).toBeGreaterThanOrEqual(layout.footerLeft);
-  expect(layout.rightRight).toBeLessThanOrEqual(layout.footerRight);
-  expect(layout.rightWidth).toBeGreaterThan(280);
-});
+}
 
 test("queued messages expand to full editable prompts", async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 720 });

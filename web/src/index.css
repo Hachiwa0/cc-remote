@@ -1030,10 +1030,9 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .hint-ctl:disabled{ opacity:.45; cursor:default; color:inherit; }
 .collaboration-chip.plan{ flex:none; color:var(--accent-ink); background:var(--accent-weak);
   border:1px solid var(--accent-line); border-radius:999px; padding:1px 8px; }
-/* codex Fast-mode chip: dim when standard, accent pill when fast is on */
+/* Codex Fast mode keeps a stable text-only footprint in both states. */
 .fast-chip{ flex:none; color:var(--dim); }
-.fast-chip.on{ color:var(--accent); background:var(--accent-weak); border:1px solid var(--accent-line);
-  border-radius:999px; padding:1px 8px; }
+.fast-chip.on{ color:var(--accent); }
 /* context-usage ring */
 .hint-ring{ border:0; background:none; padding:0; display:inline-flex; cursor:pointer; line-height:0; flex:none; }
 .hint-ring svg{ display:block; transition:transform .14s; }
@@ -1053,7 +1052,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   overflow:hidden; background:var(--border); }
 .usage-meter-line i em{ display:block; height:100%; border-radius:inherit;
   background:var(--accent); transition:width .24s var(--ease),background .18s; }
-.usage-meter-line .good{ background:var(--ok); }
+.usage-meter-line .good{ background:color-mix(in srgb,var(--ok) 68%,white); }
 .usage-meter-line .warn{ background:var(--warn); }
 .usage-meter-line .critical{ background:var(--danger); }
 .usage-meter-line .unknown{ background:var(--border-strong); }
@@ -1075,7 +1074,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   border-radius:999px; background:var(--raised); }
 .usage-pop-window>i span{ display:block; height:100%; border-radius:inherit;
   background:var(--accent); transition:width .24s var(--ease),background .18s; }
-.usage-pop-window>i .good{ background:var(--ok); }
+.usage-pop-window>i .good{ background:color-mix(in srgb,var(--ok) 68%,white); }
 .usage-pop-window>i .warn{ background:var(--warn); }
 .usage-pop-window>i .critical{ background:var(--danger); }
 .usage-pop-window>i .unknown{ background:var(--border-strong); }
@@ -1160,21 +1159,29 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 @media (max-width:640px){
   .hint{ gap:clamp(6px,2vw,12px); }
   .hint-kbds{ display:none; }
-  .hint-right{ min-width:0; margin-left:0; flex:1; justify-content:space-between;
-    gap:clamp(4px,1.4vw,10px); }
+  .hint-right{ min-width:0; margin-left:0; flex:1; justify-content:flex-end;
+    gap:clamp(6px,1.8vw,10px); }
 }
-/* A 320 px phone cannot keep the mode label and every Codex control on one
-   line. Give controls their own row, then let only the two textual selectors
-   shrink; quota bars and the context ring retain usable touch targets. */
+/* Keep the complete control strip on one line even at 320 px. Text selectors
+   shrink with ellipsis while quota and context retain stable touch targets. */
 @media (max-width:420px){
-  .hint{ align-items:flex-start; flex-wrap:wrap; row-gap:4px; column-gap:8px; }
-  .hint-mode{ min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; }
-  .hint-right{ width:100%; min-width:0; margin-left:0; flex:1 0 100%;
-    justify-content:flex-end; gap:6px; }
+  .hint{ align-items:center; flex-wrap:nowrap; gap:11px; }
+  .hint-mode{ min-width:0; max-width:72px; min-height:34px; flex:0 1 auto;
+    overflow:hidden; text-overflow:ellipsis; }
+  .hint-right{ width:auto; min-width:0; margin-left:0; flex:1 1 auto;
+    justify-content:flex-end; gap:11px; }
   .hint-control-scope{ display:none; }
-  .hint-right>.hint-ctl:not(.collaboration-chip):not(.fast-chip){
-    flex:1 1 0; min-width:0; max-width:70px; overflow:hidden; text-overflow:ellipsis;
+  .hint-right>.hint-ctl{
+    min-width:0; min-height:34px; display:inline-flex; align-items:center;
+    justify-content:center; overflow:hidden; text-overflow:ellipsis;
   }
+  .hint-right>.hint-ctl:not(.collaboration-chip):not(.fast-chip){
+    flex:0 1 auto; max-width:none;
+  }
+  .hint-right>.hint-ctl:nth-of-type(2){ min-width:28px; }
+  .hint-right>.collaboration-chip,.hint-right>.fast-chip{ flex:0 1 auto; }
+  .hint-right>.fast-chip{ min-width:20px; }
+  .hint-ring{ width:28px; height:34px; align-items:center; justify-content:center; }
 }
 
 /* COMMAND SHEET */
