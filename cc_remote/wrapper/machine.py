@@ -87,7 +87,8 @@ from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, ARTIFACT_PREVIEW_MAX_BYTES, FILE_PREVIEW_MAX_BYTES,
     PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort, Fast,
-    CollaborationMode, Perm, BtwOpened, ContextReport, StatusReport, Notice,
+    CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
+    BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
     ConversationTurn, History, TurnDetail, HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
@@ -110,6 +111,12 @@ from cc_remote.wrapper.claude_controls import (
     ClaudeControls,
     last_completed_assistant_controls,
     valid_claude_model,
+)
+from cc_remote.wrapper.codex_controls import (
+    CODEX_WEB_SEARCH_MODES,
+    CodexControls,
+    CodexControlStore,
+    CodexControlStoreError,
 )
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
@@ -158,6 +165,7 @@ from cc_remote.wrapper.codex_handle import (
     CodexSpontaneousClosed, CodexSpontaneousOverflow, CodexSteerFence,
 )
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
+from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_window,
@@ -667,6 +675,23 @@ def _session_permission_mode(ctx: SessionContext) -> str:
     return getattr(ctx.sdk, "permission_mode", "bypassPermissions")
 
 
+def _session_permission_profile(ctx: SessionContext) -> Optional[str]:
+    """Return the official active Codex named profile, when available."""
+    if ctx.engine != "codex":
+        return None
+    value = getattr(ctx.sdk, "permission_profile", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _session_web_search(ctx: SessionContext) -> Optional[str]:
+    if ctx.engine != "codex":
+        return None
+    value = getattr(ctx.sdk, "web_search", None)
+    return value if value in CODEX_WEB_SEARCH_MODES else None
+
+
 def _session_model(ctx: SessionContext) -> Optional[str]:
     """Return the live engine's authoritative per-session model, if known."""
     value = getattr(ctx.sdk, "model", None) or ctx.announced_model
@@ -774,7 +799,7 @@ class WrapperMachine:
     }
     SAFE_RETRY_COMMANDS = frozenset({
         "list_sessions", "get_history", "get_turn_detail", "get_history_image",
-        "get_models", "get_engine_capabilities",
+        "get_models", "get_permission_profiles", "get_engine_capabilities",
         "get_context", "get_status", "get_diff", "get_file_preview",
         "get_preview_asset", "get_goal", "list_dir", "get_work_dashboard",
     })
@@ -783,7 +808,9 @@ class WrapperMachine:
     # the owner check before its handler is allowed to read or mutate state.
     BTW_SID_COMMANDS = frozenset({
         "query", "steer", "interrupt", "takeover", "set_model", "set_effort",
-        "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw", "set_perm",
+        "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw",
+        "set_perm", "get_permission_profiles", "set_permission_profile",
+        "set_web_search",
         "get_context", "get_status", "get_diff", "get_file_preview", "save_markdown",
         "get_preview_asset", "answer_question", "get_goal", "set_goal", "clear_goal",
     })
@@ -943,6 +970,13 @@ class WrapperMachine:
             # starting. Keep Remote usable, but do not silently trust it.
             self._claude_controls = None
             log.exception("Claude Remote control store unavailable")
+        try:
+            self._codex_controls: CodexControlStore | None = (
+                CodexControlStore(self.cfg.state_dir)
+            )
+        except CodexControlStoreError:
+            self._codex_controls = None
+            log.exception("Codex Remote control store unavailable")
         try:
             self._rollback_commands: RollbackCommandJournal | None = (
                 RollbackCommandJournal(self.cfg.state_dir)
@@ -1866,6 +1900,50 @@ class WrapperMachine:
             )
             return ClaudeControls()
 
+    async def _persist_codex_session_controls(
+        self, ctx: SessionContext,
+    ) -> None:
+        if (ctx.engine != "codex" or ctx.space != "code"
+                or not ctx.session_id or self._codex_controls is None):
+            return
+        try:
+            await asyncio.to_thread(
+                self._codex_controls.update,
+                ctx.session_id,
+                approval_policy=(
+                    getattr(ctx.sdk, "approval_policy", None)
+                    if isinstance(
+                        getattr(ctx.sdk, "approval_policy", None), str)
+                    else None
+                ),
+                permission_profile=getattr(
+                    ctx.sdk, "permission_profile", None),
+                web_search=getattr(
+                    ctx.sdk, "web_search_override", None),
+            )
+        except Exception as exc:
+            log.warning(
+                "Codex Remote controls could not be persisted",
+                session_id=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+
+    async def _load_codex_session_controls(
+        self, session_id: str,
+    ) -> CodexControls:
+        if self._codex_controls is None:
+            return CodexControls()
+        try:
+            return await asyncio.to_thread(
+                self._codex_controls.get, session_id)
+        except Exception as exc:
+            log.warning(
+                "Codex Remote controls could not be loaded",
+                session_id=session_id,
+                error_type=type(exc).__name__,
+            )
+            return CodexControls()
+
     async def _read_claude_handoff_controls(
         self, ctx: SessionContext,
     ) -> ClaudeControls:
@@ -2743,6 +2821,9 @@ class WrapperMachine:
                     # monopolize the serial command lane and delay an explicit
                     # Stop arriving from another client.
                     self._start_interactive_control_command(cmd)
+                    continue
+                if cmd.type == "get_permission_profiles":
+                    self._start_models_command(cmd)
                     continue
                 if cmd.type == "get_status":
                     self._start_status_command(cmd)
@@ -3714,6 +3795,24 @@ class WrapperMachine:
                     to=cmd.client_id,
                     route_id=getattr(cmd, "route_id", None),
                 ))
+                if ctx.engine == "codex":
+                    permission_profile = _session_permission_profile(ctx)
+                    ctx.announced_permission_profile = permission_profile
+                    await self.transport.send(PermissionProfile(
+                        profile=permission_profile,
+                        sid=sid,
+                        to=cmd.client_id,
+                        route_id=getattr(cmd, "route_id", None),
+                    ))
+                    web_search = _session_web_search(ctx)
+                    if web_search:
+                        ctx.announced_web_search = web_search
+                        await self.transport.send(WebSearch(
+                            mode=web_search,
+                            sid=sid,
+                            to=cmd.client_id,
+                            route_id=getattr(cmd, "route_id", None),
+                        ))
                 model = _session_model(ctx)
                 if model:
                     ctx.announced_model = model
@@ -7457,6 +7556,16 @@ class WrapperMachine:
                     and ctx.announced_perm != approval):
                 ctx.announced_perm = approval
                 await self._emit(ctx, Perm(mode=approval))
+            permission_profile = _session_permission_profile(ctx)
+            if ctx.announced_permission_profile != permission_profile:
+                ctx.announced_permission_profile = permission_profile
+                await self._emit(ctx, PermissionProfile(
+                    profile=permission_profile))
+            web_search = _session_web_search(ctx)
+            if (web_search
+                    and ctx.announced_web_search != web_search):
+                ctx.announced_web_search = web_search
+                await self._emit(ctx, WebSearch(mode=web_search))
             mode = getattr(ctx.sdk, "collaboration_mode", None)
             if (mode in CODEX_COLLABORATION_MODES
                     and ctx.announced_collaboration_mode != mode):
@@ -7483,6 +7592,16 @@ class WrapperMachine:
             ctx.sdk.approval = approval
             ctx.announced_perm = approval
             await self._emit(ctx, Perm(mode=approval))
+        if ctx.space != "work" and "permission_profile" in settings:
+            permission_profile = settings.get("permission_profile")
+            if permission_profile is None or (
+                    isinstance(permission_profile, str)
+                    and permission_profile):
+                if ctx.sdk.permission_profile != permission_profile:
+                    ctx.sdk.permission_profile = permission_profile
+                    ctx.announced_permission_profile = permission_profile
+                    await self._emit(ctx, PermissionProfile(
+                        profile=permission_profile))
         if "service_tier" in settings:
             tier = settings.get("service_tier")
             if tier is None or isinstance(tier, str):
@@ -7570,14 +7689,28 @@ class WrapperMachine:
         btw.announced_perm = permission_mode
         permission = Perm(mode=permission_mode, sid=btw.key, to=cid)
         await self.transport.send(permission)
+        responses = [ev, snap, permission]
         if btw.engine == "codex":
+            permission_profile = _session_permission_profile(btw)
+            btw.announced_permission_profile = permission_profile
+            profile_event = PermissionProfile(
+                profile=permission_profile, sid=btw.key, to=cid)
+            await self.transport.send(profile_event)
+            responses.append(profile_event)
+            web_search = _session_web_search(btw)
+            if web_search:
+                btw.announced_web_search = web_search
+                search_event = WebSearch(
+                    mode=web_search, sid=btw.key, to=cid)
+                await self.transport.send(search_event)
+                responses.append(search_event)
             # BtwOpened + Snapshot create the owner-only browser runtime before
             # pending app-server notices are released into that route.
             await btw.sdk.activate_runtime_events()
         log.info("btw opened", btw_sid=btw.key, parent=parent.session_id, client_id=cid)
         # All three one-shot frames are required to reconstruct the fork after a
         # lost response. Reliable-command retries replay them without re-forking.
-        return ev, snap, permission
+        return tuple(responses)
 
     async def _handle_close_btw(self, cmd) -> None:
         sid = getattr(cmd, "sid", None)
@@ -7642,6 +7775,7 @@ class WrapperMachine:
                        or getattr(ctx.sdk, "permission_mode", None)
                        or cmd.mode)
             await self._persist_claude_session_controls(ctx)
+            await self._persist_codex_session_controls(ctx)
             ctx.announced_perm = applied
             event = Perm(mode=applied)
             await self._emit(ctx, event)
@@ -7652,6 +7786,193 @@ class WrapperMachine:
                 self._claude_broker_control_error("切换权限模式", e)
                 if getattr(ctx.sdk, "is_claude_broker", False)
                 else Error(code=ERR_INTERNAL, message="权限模式切换未完成，请重试。")
+            )
+            await self._emit(ctx, error)
+            return error
+
+    async def _handle_get_permission_profiles(self, cmd):
+        client_id = getattr(cmd, "client_id", None)
+        requested_cwd = getattr(cmd, "cwd", None)
+        ctx = (
+            None if requested_cwd is not None
+            else self._ctx_for(getattr(cmd, "sid", None))
+        )
+        if requested_cwd is None and ctx is None:
+            return await self._missing_session_error(cmd, "读取执行环境")
+        if ctx is not None and ctx.engine != "codex":
+            error = Error(
+                code=ERR_INTERNAL,
+                message="只有 Codex 会话支持执行环境配置。",
+                request_id=getattr(cmd, "cmd_id", None),
+                sid=ctx.key,
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+        try:
+            if requested_cwd is not None:
+                target_cwd = os.path.realpath(
+                    os.path.expanduser(requested_cwd))
+                if not os.path.isdir(target_cwd):
+                    raise ValueError("permission profile cwd does not exist")
+                profiles = await codex_permission_profiles(target_cwd)
+            else:
+                assert ctx is not None
+                profiles = await ctx.sdk.list_permission_profiles()
+            event = PermissionProfiles(
+                profiles=profiles,
+                request_id=getattr(cmd, "cmd_id", None),
+                cwd=requested_cwd,
+                sid=ctx.key if ctx is not None else None,
+                to=client_id,
+            )
+            await self.transport.send(event)
+            return event
+        except Exception as exc:
+            log.exception(
+                "permission profile catalog failed",
+                sid=ctx.session_id if ctx is not None else None,
+                error_type=type(exc).__name__,
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="执行环境列表读取失败，请稍后重试。",
+                request_id=getattr(cmd, "cmd_id", None),
+                sid=ctx.key if ctx is not None else None,
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+
+    async def _handle_set_permission_profile(self, cmd):
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return await self._missing_session_error(
+                cmd, "切换执行环境")
+        if ctx.state != "idle":
+            error = Error(
+                code=ERR_BUSY,
+                message="Codex 正在处理回合，完成或中断后再切换执行环境。",
+            )
+            await self._emit(ctx, error)
+            return error
+        control_error = await self._runtime_control_preflight(
+            ctx, action="切换执行环境")
+        if control_error is not None:
+            return control_error
+        if ctx.engine != "codex":
+            error = Error(
+                code=ERR_INTERNAL,
+                message="只有 Codex 会话支持执行环境配置。",
+            )
+            await self._emit(ctx, error)
+            return error
+        if ctx.space == "work":
+            error = Error(
+                code=ERR_AUTH,
+                message="Codex Work 的执行环境由隔离工作区固定管理，不能切换。",
+            )
+            await self._emit(ctx, error)
+            return error
+        try:
+            await ctx.sdk.set_permission_profile(cmd.profile)
+            applied = _session_permission_profile(ctx)
+            if not applied:
+                raise RuntimeError(
+                    "Codex did not report an active permission profile")
+            ctx.announced_permission_profile = applied
+            await self._persist_codex_session_controls(ctx)
+            event = PermissionProfile(profile=applied)
+            await self._emit(ctx, event)
+            return event
+        except Exception as exc:
+            log.exception(
+                "set_permission_profile failed",
+                sid=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="执行环境切换未完成，请重试。",
+            )
+            await self._emit(ctx, error)
+            return error
+
+    async def _republish_codex_execution_controls(
+        self, ctx: SessionContext,
+    ) -> None:
+        """Reassert the controls proven by a recovered Codex connection."""
+        permission_mode = _session_permission_mode(ctx)
+        if permission_mode in CODEX_PERMISSION_MODES:
+            ctx.announced_perm = permission_mode
+            await self._emit(ctx, Perm(mode=permission_mode))
+        permission_profile = _session_permission_profile(ctx)
+        ctx.announced_permission_profile = permission_profile
+        await self._emit(ctx, PermissionProfile(
+            profile=permission_profile))
+        web_search = _session_web_search(ctx)
+        if web_search in CODEX_WEB_SEARCH_MODES:
+            ctx.announced_web_search = web_search
+            await self._emit(ctx, WebSearch(mode=web_search))
+
+    async def _handle_set_web_search(self, cmd):
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return await self._missing_session_error(
+                cmd, "切换网页搜索")
+        if ctx.state != "idle":
+            error = Error(
+                code=ERR_BUSY,
+                message="Codex 正在处理回合，完成或中断后再切换网页搜索。",
+            )
+            await self._emit(ctx, error)
+            return error
+        control_error = await self._runtime_control_preflight(
+            ctx, action="切换网页搜索")
+        if control_error is not None:
+            return control_error
+        if ctx.engine != "codex" or ctx.space != "code":
+            error = Error(
+                code=ERR_AUTH,
+                message="只有 Codex Code 会话支持切换网页搜索。",
+            )
+            await self._emit(ctx, error)
+            return error
+        try:
+            await ctx.sdk.set_web_search(cmd.mode)
+            await self._stamp_codex_daemon_epoch(ctx)
+            await self._persist_codex_session_controls(ctx)
+            applied = _session_web_search(ctx)
+            if applied not in CODEX_WEB_SEARCH_MODES:
+                raise RuntimeError(
+                    "Codex did not report an active web search mode")
+            ctx.announced_web_search = applied
+            event = WebSearch(mode=applied)
+            await self._emit(ctx, event)
+            return event
+        except Exception as exc:
+            log.exception(
+                "set_web_search failed",
+                sid=ctx.session_id,
+                error_type=type(exc).__name__,
+            )
+            if getattr(ctx.sdk, "proc", None) is not None:
+                try:
+                    # A failed replacement can briefly publish its defaults.
+                    # The rollback connection is authoritative; repeat all
+                    # coupled controls so every browser converges immediately.
+                    await self._persist_codex_session_controls(ctx)
+                    await self._republish_codex_execution_controls(ctx)
+                except Exception as publish_exc:
+                    log.warning(
+                        "restored Codex execution controls could not be "
+                        "republished",
+                        sid=ctx.session_id,
+                        error_type=type(publish_exc).__name__,
+                    )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="网页搜索模式切换未完成，请重试。",
             )
             await self._emit(ctx, error)
             return error
@@ -10795,6 +11116,18 @@ class WrapperMachine:
         # thread-local settings restored in _spawn. Without the Model frame the composer falls back
         # to the engine's first model, so a luna session came up labelled "Sol".
         if ctx.engine == "codex":
+            permission_profile = _session_permission_profile(ctx)
+            ctx.announced_permission_profile = permission_profile
+            profile_event = PermissionProfile(
+                profile=permission_profile)
+            await self._emit(ctx, profile_event)
+            cached_responses.append(profile_event)
+            web_search = _session_web_search(ctx)
+            if web_search:
+                ctx.announced_web_search = web_search
+                search_event = WebSearch(mode=web_search)
+                await self._emit(ctx, search_event)
+                cached_responses.append(search_event)
             fast_event = Fast(on=_codex_fast_on(ctx.sdk.service_tier))
             await self._emit(ctx, fast_event)
             cached_responses.append(fast_event)
@@ -10972,6 +11305,8 @@ class WrapperMachine:
                 effort=getattr(cmd, "effort", None),
                 collaboration_mode=getattr(cmd, "collaboration_mode", None),
                 permission_mode=getattr(cmd, "permission_mode", None),
+                permission_profile=getattr(cmd, "permission_profile", None),
+                web_search=getattr(cmd, "web_search", None),
                 service_tier=getattr(cmd, "service_tier", None),
                 space=space,
                 work_id=(work_record.work_id if work_record else None),
@@ -11046,6 +11381,18 @@ class WrapperMachine:
         cached_responses.append(permission_event)
         # Collaboration mode is a separate Codex-only control.
         if ctx.engine == "codex":
+            permission_profile = _session_permission_profile(ctx)
+            ctx.announced_permission_profile = permission_profile
+            profile_event = PermissionProfile(
+                profile=permission_profile)
+            await self._emit(ctx, profile_event)
+            cached_responses.append(profile_event)
+            web_search = _session_web_search(ctx)
+            if web_search:
+                ctx.announced_web_search = web_search
+                search_event = WebSearch(mode=web_search)
+                await self._emit(ctx, search_event)
+                cached_responses.append(search_event)
             collaboration_mode = getattr(
                 ctx.sdk, "collaboration_mode", "default")
             ctx.announced_collaboration_mode = collaboration_mode
@@ -13658,6 +14005,8 @@ class WrapperMachine:
                      model: Optional[str] = None, effort: Optional[str] = None,
                      collaboration_mode: Optional[str] = None,
                      permission_mode: Optional[str] = None,
+                     permission_profile: Optional[str] = None,
+                     web_search: Optional[str] = None,
                      service_tier: Optional[str] = None,
                      space: str = "code",
                      work_id: Optional[str] = None,
@@ -13834,6 +14183,55 @@ class WrapperMachine:
                 return None
             work_id = work_record.work_id
 
+        codex_profile_catalog: list[dict] = []
+        codex_profile_catalog_loaded = False
+        codex_profile_catalog_error: Optional[Exception] = None
+
+        async def codex_profile_allowed(profile_id: str) -> bool:
+            nonlocal codex_profile_catalog
+            nonlocal codex_profile_catalog_loaded
+            nonlocal codex_profile_catalog_error
+            if not codex_profile_catalog_loaded:
+                codex_profile_catalog_loaded = True
+                try:
+                    codex_profile_catalog = (
+                        await codex_permission_profiles(target_cwd))
+                except Exception as exc:
+                    codex_profile_catalog_error = exc
+            if codex_profile_catalog_error is not None:
+                raise codex_profile_catalog_error
+            return any(
+                profile["id"] == profile_id and profile["allowed"]
+                for profile in codex_profile_catalog
+            )
+
+        if (engine == "codex" and space == "code"
+                and isinstance(permission_profile, str)
+                and permission_profile):
+            try:
+                selected_profile_allowed = await codex_profile_allowed(
+                    permission_profile)
+            except Exception:
+                log.exception(
+                    "new-session permission profile validation failed",
+                    cwd=target_cwd,
+                )
+                await reject(
+                    ERR_INTERNAL,
+                    "执行环境状态无法确认，未创建会话。",
+                    route="sid",
+                    sid=resume_id,
+                )
+                return None
+            if not selected_profile_allowed:
+                await reject(
+                    ERR_AUTH,
+                    "当前目录不允许使用所选执行环境，未创建会话。",
+                    route="sid",
+                    sid=resume_id,
+                )
+                return None
+
         if (resume_id and engine == "claude" and space == "code"
                 and broker_handle is None):
             # Explicit command controls win. Otherwise restore only the private
@@ -13890,10 +14288,21 @@ class WrapperMachine:
         # sees the first turn as already-applied (cc's connect re-syncs it anyway;
         # this is what keeps codex from a spurious first-turn reconnect).
         if engine == "codex":
+            preserve_codex_controls = False
+            preserve_codex_permission_profile = False
             if collaboration_mode in CODEX_COLLABORATION_MODES:
                 sdk.collaboration_mode = collaboration_mode
             if (space != "work" and permission_mode in CODEX_PERMISSION_MODES):
                 sdk.approval = permission_mode
+                preserve_codex_controls = True
+            if (space != "work" and isinstance(permission_profile, str)
+                    and permission_profile):
+                sdk.permission_profile = permission_profile
+                preserve_codex_controls = True
+                preserve_codex_permission_profile = True
+            if space != "work" and web_search in CODEX_WEB_SEARCH_MODES:
+                sdk.web_search_override = web_search
+                sdk.web_search = web_search
             if service_tier in {"default", "fast"}:
                 sdk.service_tier = (
                     "fast" if service_tier == "fast" else None)
@@ -13902,6 +14311,42 @@ class WrapperMachine:
             # the rollout remains required for collaboration mode, which 0.144.1's
             # resume response does not expose.
             if resume_id:
+                controls = await self._load_codex_session_controls(
+                    resume_id)
+                restored_control_profile = False
+                if (space != "work" and permission_mode is None
+                        and controls.approval_policy
+                        in CODEX_PERMISSION_MODES):
+                    sdk.approval = controls.approval_policy
+                    preserve_codex_controls = True
+                if (space != "work" and permission_profile is None
+                        and controls.permission_profile):
+                    try:
+                        restored_control_profile = (
+                            await codex_profile_allowed(
+                                controls.permission_profile))
+                    except Exception as exc:
+                        log.warning(
+                            "persisted Codex permission profile could not be "
+                            "revalidated; using native default",
+                            session_id=resume_id,
+                            error_type=type(exc).__name__,
+                        )
+                    if restored_control_profile:
+                        sdk.permission_profile = controls.permission_profile
+                        preserve_codex_controls = True
+                        preserve_codex_permission_profile = True
+                    else:
+                        log.warning(
+                            "stale or disallowed persisted Codex permission "
+                            "profile discarded",
+                            session_id=resume_id,
+                            permission_profile=controls.permission_profile,
+                        )
+                if space != "work" and web_search is None:
+                    if controls.web_search in CODEX_WEB_SEARCH_MODES:
+                        sdk.web_search_override = controls.web_search
+                        sdk.web_search = controls.web_search
                 prev = await asyncio.to_thread(
                     codex_session_settings, resume_id,
                     self.cfg.history_source_max_bytes)
@@ -13909,8 +14354,37 @@ class WrapperMachine:
                 effort = effort or prev.get("effort")
                 approval = prev.get("approval_policy")
                 if (space != "work" and permission_mode is None
+                        and controls.approval_policy is None
                         and approval in CODEX_PERMISSION_MODES):
                     sdk.approval = approval
+                    preserve_codex_controls = True
+                if (space != "work" and permission_profile is None
+                        and not restored_control_profile
+                        and "permission_profile" in prev):
+                    previous_profile = prev.get("permission_profile")
+                    previous_profile_allowed = previous_profile is None
+                    if isinstance(previous_profile, str) and previous_profile:
+                        try:
+                            previous_profile_allowed = (
+                                await codex_profile_allowed(previous_profile))
+                        except Exception as exc:
+                            log.warning(
+                                "rollout Codex permission profile could not be "
+                                "revalidated; using native default",
+                                session_id=resume_id,
+                                error_type=type(exc).__name__,
+                            )
+                    if previous_profile_allowed:
+                        sdk.permission_profile = previous_profile
+                        preserve_codex_controls = True
+                        preserve_codex_permission_profile = True
+                    elif previous_profile is not None:
+                        log.warning(
+                            "stale or disallowed rollout Codex permission "
+                            "profile discarded",
+                            session_id=resume_id,
+                            permission_profile=previous_profile,
+                        )
                 if service_tier is None and "service_tier" in prev:
                     tier = prev.get("service_tier")
                     if tier is None or isinstance(tier, str):
@@ -13984,7 +14458,22 @@ class WrapperMachine:
                 lambda event: self._on_codex_runtime_event(ctx, event))
 
         try:
-            await ctx.sdk.connect(resume_id=resume_id, cwd=target_cwd)
+            if engine == "codex":
+                codex_connect_options = {
+                    "resume_id": resume_id,
+                    "cwd": target_cwd,
+                    "preserve_controls": preserve_codex_controls,
+                }
+                if (resume_id and preserve_codex_controls
+                        and not preserve_codex_permission_profile):
+                    codex_connect_options[
+                        "preserve_permission_profile"] = False
+                await ctx.sdk.connect(
+                    **codex_connect_options,
+                )
+            else:
+                await ctx.sdk.connect(
+                    resume_id=resume_id, cwd=target_cwd)
         except Exception as e:
             if bootstrap and resume_id:
                 log.warning("resume failed, starting a fresh session", error=str(e))
@@ -14061,6 +14550,10 @@ class WrapperMachine:
             # thread/resume may restore the Code-time policy recorded in the
             # native rollout. Work always reasserts its non-escalating profile.
             ctx.sdk.approval = "never"
+            ctx.sdk.permission_profile = "cc_remote_work"
+
+        if engine == "codex" and space == "code":
+            await self._persist_codex_session_controls(ctx)
 
         if engine == "codex" and space == "code":
             await self._set_session_control(
@@ -14136,6 +14629,14 @@ class WrapperMachine:
             ctx.announced_perm = _session_permission_mode(ctx)
             await self._emit(ctx, Perm(mode=ctx.announced_perm))
             if engine == "codex":
+                ctx.announced_permission_profile = (
+                    _session_permission_profile(ctx))
+                await self._emit(ctx, PermissionProfile(
+                    profile=ctx.announced_permission_profile))
+                web_search = _session_web_search(ctx)
+                if web_search:
+                    ctx.announced_web_search = web_search
+                    await self._emit(ctx, WebSearch(mode=web_search))
                 collaboration_mode = getattr(
                     ctx.sdk, "collaboration_mode", "default")
                 ctx.announced_collaboration_mode = collaboration_mode
@@ -14212,6 +14713,10 @@ class WrapperMachine:
         else:
             ctx.sdk.approval = parent.sdk.approval
             ctx.sdk.approval_policy = parent.sdk.approval_policy
+            ctx.sdk.permission_profile = parent.sdk.permission_profile
+            ctx.sdk.web_search_override = (
+                parent.sdk.web_search_override)
+            ctx.sdk.web_search = parent.sdk.web_search
             ctx.sdk.approval_callback = (
                 lambda method, params: self._on_codex_approval(
                     ctx, method, params))

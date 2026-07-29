@@ -57,7 +57,11 @@ def test_status_protocol_is_strict_and_round_trips():
         request_id="status-1",
         thread=StatusThread(thread_id="thread-1", status="active",
                             active_flags=["waitingOnApproval"]),
-        runtime=StatusRuntime(model="gpt-test", sandbox_mode="workspace-write"),
+        runtime=StatusRuntime(
+            model="gpt-test",
+            permission_profile=":workspace",
+            sandbox_mode="workspace-write",
+        ),
         context=StatusContext(used_tokens=25, max_tokens=100, percentage=25.0),
         component_errors=["usage: unsupported by this Codex app-server"],
     )
@@ -90,6 +94,8 @@ def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
         handle.effort = "high"
         handle.service_tier = "fast"
         handle.approval = "on-request"
+        handle.permission_profile = ":workspace"
+        handle.web_search = "live"
         handle.last_token_usage = {
             "last": {"totalTokens": 250}, "modelContextWindow": 1000,
         }
@@ -154,7 +160,9 @@ def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
             "app_server_version": "0.144.1",
             "model": "session-model", "model_provider": "openai",
             "reasoning_effort": "high", "service_tier": "fast",
-            "approval_policy": "on-request", "sandbox_mode": "workspace-write",
+            "approval_policy": "on-request",
+            "permission_profile": ":workspace",
+            "sandbox_mode": "workspace-write",
             "web_search": "live",
         }
         assert status["context"] == {

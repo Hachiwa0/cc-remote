@@ -53,6 +53,7 @@ import { isTerminalWorktreeForkError, matchesSessionForkRequest,
 import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
+  type CodexWebSearchMode, type PermissionProfileInfo,
   type CodexServiceTier, type CollaborationModeName,
   type DiffTheme, type Engine, type Space,
   type SessionControl, type History, sessionControlLocksInput } from "./protocol";
@@ -247,6 +248,11 @@ export default function App() {
   const [btwSendModeBySid, setBtwSendModeBySid] = useState<
     Record<string, SendMode>
   >({});
+  const [newChatPermissionCatalog, setNewChatPermissionCatalog] = useState<{
+    machineId: string;
+    cwd: string;
+    profiles: PermissionProfileInfo[];
+  } | null>(null);
   const [state, dispatch] = useReducer(reduce, initialState);
   const inlineImageAssetsRef = useRef(new InlineImageAssetCache());
   const [, bumpInlineImageRevision] = useReducer((value: number) => value + 1, 0);
@@ -1656,6 +1662,14 @@ export default function App() {
             handleSnapshot(msg, ownership);
             return;
           }
+          if (msg.type === "permission_profiles" && !msg.sid && msg.cwd) {
+            setNewChatPermissionCatalog({
+              machineId,
+              cwd: msg.cwd,
+              profiles: msg.profiles,
+            });
+            return;
+          }
           if (msg.type === "session_rekey") {
             setCompletionReceipts((current) => rekeyCompletionReceipts(
               current, msg.old_key, msg.session_id));
@@ -2637,6 +2651,8 @@ export default function App() {
   const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[],
                             collaborationMode?: CollaborationModeName,
                             permissionMode?: CodexPermissionMode,
+                            permissionProfile?: string,
+                            webSearch?: CodexWebSearchMode,
                             serviceTier?: CodexServiceTier): boolean => {
     if (!wsRef.current || !state.newChat) return false;
     const { cwd, cwdSource, model, effort } = state.newChat;
@@ -2649,7 +2665,13 @@ export default function App() {
       { prompt, msg_id, images, files },
       engine === "codex" ? collaborationMode : undefined,
       engine === "codex"
-        ? (space === "work" ? "on-request" : permissionMode)
+        ? (space === "work" ? "never" : permissionMode)
+        : undefined,
+      engine === "codex" && space === "code"
+        ? permissionProfile
+        : undefined,
+      engine === "codex" && space === "code"
+        ? webSearch
         : undefined,
       engine === "codex" ? serviceTier : undefined,
       space, space === "work" ? workProjectId : undefined);
@@ -2704,6 +2726,15 @@ export default function App() {
   };
   const setPerm = (perm: string) => {
     wsRef.current?.sendSetPerm(perm);
+  };
+  const getPermissionProfiles = () => {
+    wsRef.current?.sendGetPermissionProfiles();
+  };
+  const setPermissionProfile = (profile: string) => {
+    wsRef.current?.sendSetPermissionProfile(profile);
+  };
+  const setWebSearch = (mode: CodexWebSearchMode) => {
+    wsRef.current?.sendSetWebSearch(mode);
   };
   const setCollaborationMode = (mode: CollaborationModeName) => {
     wsRef.current?.sendSetCollaborationMode(mode);
@@ -3128,7 +3159,9 @@ export default function App() {
           }} />
 
         {state.newChat ? (
-          <NewChatView cwd={state.newChat.cwd} space={space}
+          <NewChatView cwd={state.newChat.cwd}
+            controlScopeKey={sessionScopeKey(machineId, engine, space)}
+            space={space}
             createError={createError}
             autoFocus={newChatAutoFocus}
             engine={engine}
@@ -3144,6 +3177,15 @@ export default function App() {
             onPickCwd={() => setDirPickerOpen(true)}
             onPickModel={pickNewChatModel}
             onPickEffort={pickNewChatEffort}
+            permissionProfiles={
+              newChatPermissionCatalog?.machineId === machineId
+                && newChatPermissionCatalog.cwd === state.newChat.cwd
+                ? newChatPermissionCatalog.profiles
+                : null
+            }
+            onGetPermissionProfiles={(cwd) => {
+              wsRef.current?.sendGetPermissionProfiles(cwd);
+            }}
             onSend={sendFirstMessage} />
         ) : (
           <>
@@ -3226,6 +3268,9 @@ export default function App() {
           model={rt.model}
           effort={rt.effort}
           perm={rt.perm}
+          permissionProfile={rt.permissionProfile}
+          permissionProfiles={rt.permissionProfiles}
+          webSearch={rt.webSearch}
           collaborationMode={rt.collaborationMode}
           fast={rt.fast}
           control={rt.control}
@@ -3245,6 +3290,9 @@ export default function App() {
           onSetEffort={setEffort}
           onSetServiceTier={setServiceTier}
           onSetPerm={setPerm}
+          onGetPermissionProfiles={getPermissionProfiles}
+          onSetPermissionProfile={setPermissionProfile}
+          onSetWebSearch={setWebSearch}
           onSetCollaborationMode={setCollaborationMode}
           onClear={() => dispatch({
             type: "enter_new_chat",

@@ -1106,7 +1106,9 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .hint-control-scope{ color:var(--faint); font-size:10px; font-weight:600; white-space:nowrap; }
 .hint kbd{ font-family:var(--mono); font-size:10px; background:var(--raised);
   border:1px solid var(--border); border-radius:4px; padding:0 4px; }
-.hint-mode{ white-space:nowrap; cursor:pointer; font:inherit; color:inherit; background:none; border:0; padding:0; display:inline-flex; align-items:center; gap:3px; }
+.hint-mode{ min-width:0; max-width:min(280px,45vw); overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; cursor:pointer; font:inherit; color:inherit; background:none; border:0;
+  padding:0; display:inline-flex; align-items:center; gap:3px; }
 .hint-mode:hover{ color:var(--accent-ink); }
 .hint-mode:disabled{ opacity:.45; cursor:default; color:inherit; }
 .hint-mode .hint-mode-ch{ font-size:9px; opacity:.6; }
@@ -1178,17 +1180,28 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .qa-multi-submit:disabled{ opacity:.45; cursor:default; }
 .cmd-group{ font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
   color:var(--faint); padding:12px 12px 5px; }
+.cmd-empty{ color:var(--dim); font-size:13px; padding:14px 12px 18px; }
+.cmd-search{ display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:5px 12px; }
+.cmd-search button{ min-height:38px; border:1px solid var(--border); border-radius:10px;
+  color:var(--dim); background:var(--surface); font-size:13px; font-weight:600; }
+.cmd-search button.sel{ color:var(--accent-ink); border-color:var(--accent-line);
+  background:var(--accent-weak); }
+.cmd-search-note{ color:var(--faint); font-size:11.5px; line-height:1.45;
+  padding:2px 12px 14px; }
 .cmd{ display:flex; align-items:center; gap:12px; width:100%; min-width:0; overflow:hidden; text-align:left;
   padding:10px 12px; border-radius:12px; transition:.12s; }
 .cmd.sel{ background:var(--accent-weak); }
+.cmd:disabled{ opacity:.46; cursor:not-allowed; }
 @media (hover:hover){ .cmd:hover{ background:var(--accent-weak); } }
+@media (hover:hover){ .cmd:disabled:hover{ background:transparent; } }
 .cmd-ic{ width:34px; height:34px; border-radius:10px; background:var(--bg); border:1px solid var(--border);
   display:grid; place-items:center; flex:none; color:var(--accent); }
 .cmd.sel .cmd-ic{ border-color:var(--accent-line); }
 @media (hover:hover){ .cmd:hover .cmd-ic{ border-color:var(--accent-line); } }
 .cmd-ic svg{ width:17px; height:17px; }
 .cmd-tx{ flex:1; min-width:0; }
-.cmd-nm{ font-weight:600; font-size:14.5px; display:flex; align-items:center; gap:8px; }
+.cmd-nm{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font-weight:600; font-size:14.5px; display:flex; align-items:center; gap:8px; }
 .cmd-nm .slash{ font-family:var(--mono); color:var(--accent-ink); font-weight:600; }
 .cmd-ds{ font-size:12.5px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .cmd-kbd{ font-family:var(--mono); font-size:11px; color:var(--faint); flex:none; width:18px; text-align:center; }
@@ -1400,6 +1413,14 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   background:var(--raised); color:var(--dim); max-width:min(260px,calc(100vw - 72px)); overflow:hidden; text-overflow:ellipsis; }
 .newchat-ctls .hint-ctl:hover{ border-color:var(--border-strong); color:var(--text); background:var(--surface); }
 .newchat-ctls .hint-ctl:disabled{ opacity:.55; cursor:default; }
+.newchat-access{ display:flex; flex:0 1 auto; align-items:center; gap:6px; min-width:0;
+  max-width:min(220px,55vw); overflow:hidden;
+  padding:6px 10px; border:1px solid var(--border); border-radius:999px;
+  background:var(--raised); color:var(--dim); font-size:12px; }
+.newchat-access span:first-of-type{ min-width:0; max-width:100%; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+.newchat-access:hover{ border-color:var(--border-strong); color:var(--text); background:var(--surface); }
+.newchat-access:disabled{ opacity:.55; cursor:default; }
 .newchat-send{ display:flex; align-items:center; gap:7px; background:var(--accent); color:#fff; font-weight:600; font-size:14px; padding:10px 18px; border-radius:12px; transition:filter .14s, opacity .14s; }
 .newchat-send:hover{ filter:brightness(1.05); }
 .newchat-send:disabled{ opacity:.45; cursor:not-allowed; }

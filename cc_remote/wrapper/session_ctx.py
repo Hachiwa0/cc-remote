@@ -79,6 +79,8 @@ class SessionContext:
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
     announced_perm: Optional[str] = None
+    announced_permission_profile: Optional[str] = None
+    announced_web_search: Optional[str] = None
     announced_collaboration_mode: Optional[str] = None
     # Goal state is restored silently.  The remote UI only reveals it after the
     # user explicitly invokes /goal (get/set); this avoids a permanent empty

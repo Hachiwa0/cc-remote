@@ -249,6 +249,7 @@ try {
     "/src/components/NewChatView.tsx");
   const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
     cwd: "/tmp/project",
+    controlScopeKey: "machine-a:code:claude",
     onPickCwd: () => {},
     onSend: () => true,
   }));

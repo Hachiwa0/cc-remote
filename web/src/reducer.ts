@@ -14,7 +14,7 @@ import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
-  StatusRateLimit, StatusRateWindow, SessionControl,
+  StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -142,6 +142,9 @@ export interface SessionRuntime {
   model: string;
   effort: string;
   perm: string;
+  permissionProfile: string | null;
+  permissionProfiles: PermissionProfileInfo[] | null;
+  webSearch: "cached" | "live" | null;
   collaborationMode: CollaborationModeName;
   fast: boolean | null;   // null until the wrapper reports the real service tier
   replaying: boolean;
@@ -285,6 +288,7 @@ export function createRuntime(): SessionRuntime {
     // model, effort, or permission policy that may not match the native CLI.
     turns: [], state: "idle", mirroredRunning: false,
     model: "", effort: "", perm: "",
+    permissionProfile: null, permissionProfiles: null, webSearch: null,
     collaborationMode: "default",
     fast: null,
     control: null, controlGeneration: null, hasRevisionedControl: false,
@@ -2440,6 +2444,18 @@ function reduceEvent(
     }
     case "perm":
       return patch(state, e.sid, (rt) => { rt.perm = e.mode; });
+    case "permission_profile":
+      return patch(state, e.sid, (rt) => {
+        rt.permissionProfile = e.profile ?? null;
+      });
+    case "permission_profiles":
+      return patch(state, e.sid, (rt) => {
+        rt.permissionProfiles = e.profiles;
+      });
+    case "web_search":
+      return patch(state, e.sid, (rt) => {
+        rt.webSearch = e.mode;
+      });
     case "context_report":
       return patch(state, e.sid, (rt) => {
         rt.contextReport = e;

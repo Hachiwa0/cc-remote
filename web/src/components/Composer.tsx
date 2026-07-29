@@ -10,7 +10,7 @@ import {
 import type {
   State, QueryImg, QueryFile, ContextReport, StatusReport,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
-  EngineCapabilityItem,
+  EngineCapabilityItem, PermissionProfileInfo,
 } from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
@@ -19,7 +19,7 @@ import {
   clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken,
   matchCommands, matchSkills, parseSlash, skillToken,
   modelsFor, effortsFor, permsFor,
-  type Catalog,
+  permissionProfileLabel, type Catalog,
 } from "../data";
 import { CommandSheet } from "./CommandSheet";
 import { attachmentBytes, pickFiles } from "../img";
@@ -53,6 +53,9 @@ interface Props {
   model: string;
   effort: string;
   perm: string;
+  permissionProfile: string | null;
+  permissionProfiles: PermissionProfileInfo[] | null;
+  webSearch: "cached" | "live" | null;
   collaborationMode: CollaborationModeName;
   fast?: boolean | null;   // null until the wrapper reports the real service tier
   control?: SessionControl | null;
@@ -76,6 +79,9 @@ interface Props {
   onSetEffort: (effort: string) => void;
   onSetServiceTier?: (tier: string) => void;
   onSetPerm: (perm: string) => void;
+  onSetPermissionProfile: (profile: string) => void;
+  onGetPermissionProfiles: () => void;
+  onSetWebSearch: (mode: "cached" | "live") => void;
   onSetCollaborationMode: (mode: CollaborationModeName) => void;
   onClear: () => void;
   onContext: () => void;
@@ -138,6 +144,10 @@ export function Composer(p: Props) {
   // Only the modal pickers live in state now; the "/" command palette is a live
   // popover DERIVED from the composer text (no second input box).
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
+  const openPermissions = () => {
+    setSheetKind("perms");
+    if (p.engine === "codex") p.onGetPermissionProfiles();
+  };
   const [ctxOpen, setCtxOpen] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
   const ctxWrapRef = useRef<HTMLDivElement>(null);
@@ -440,7 +450,7 @@ export function Composer(p: Props) {
         if (args) { p.onSetModel(args); flash(`正在切换模型：${args}`); }
         else setSheetKind("models");
         break;
-      case "permissions": setSheetKind("perms"); break;
+      case "permissions": openPermissions(); break;
       case "clear": p.onClear(); break;
       // open the popup too (not just fetch) — same as clicking the context ring.
       case "context":
@@ -612,8 +622,15 @@ export function Composer(p: Props) {
     ? (PERMS_E.find((x) => x.id === p.perm)
       || { id: p.perm, name: p.perm, short: p.perm, ds: "", ic: "shield" })
     : null;
+  const permissionProfileName = permissionProfileLabel(
+    p.permissionProfile, p.permissionProfiles);
+  const modeLabel = p.engine === "codex"
+    ? (permissionProfileName ?? perm?.short ?? "环境读取中")
+    : (perm?.short ?? "Mode loading");
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
-  const modeCls = perm?.id === "plan" ? " plan" : perm?.danger ? " danger" : "";
+  const modeCls = perm?.id === "plan" ? " plan"
+    : (perm?.danger || p.permissionProfile === ":danger-full-access")
+      ? " danger" : "";
 
   const inputControl = (placeholder: string) => (
     <textarea
@@ -841,15 +858,17 @@ export function Composer(p: Props) {
           <button
             type="button"
             className={"hint-mode" + modeCls}
-            onClick={() => setSheetKind("perms")}
+            onClick={openPermissions}
             disabled={locked}
             title={deferredClaudeControls
               ? `${externalClaudeOwner} 当前权限模式未公开`
-              : "点击切换权限模式"}
+              : (p.engine === "codex"
+                ? `执行环境：${permissionProfileName ?? "默认"}；审批：${perm?.name ?? "读取中"}`
+                : "点击切换权限模式")}
           >
             {deferredClaudeControls
               ? externalClaudeOwner
-              : (perm ? perm.short : "Mode loading")}
+              : modeLabel}
             {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
           </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
@@ -980,7 +999,15 @@ export function Composer(p: Props) {
         currentEffort={p.effort}
         onPickEffort={(ef) => { p.onSetEffort(ef); setSheetKind(null); }}
         currentPerm={p.perm}
-        onPickPerm={(perm) => { p.onSetPerm(perm); setSheetKind(null); }}
+        onPickPerm={(perm) => {
+          p.onSetPerm(perm);
+          if (p.engine !== "codex") setSheetKind(null);
+        }}
+        currentPermissionProfile={p.permissionProfile}
+        permissionProfiles={p.permissionProfiles}
+        onPickPermissionProfile={p.onSetPermissionProfile}
+        currentWebSearch={p.webSearch}
+        onPickWebSearch={p.onSetWebSearch}
       />
 
       {dragOver && (

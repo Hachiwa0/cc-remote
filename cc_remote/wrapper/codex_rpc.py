@@ -116,6 +116,7 @@ async def codex_rpc(
             "method": "initialize",
             "params": {
                 "clientInfo": {"name": "cc-remote", "version": __version__},
+                "capabilities": {"experimentalApi": True},
             },
         })
         await asyncio.wait_for(result(1), timeout=_RPC_TIMEOUT)

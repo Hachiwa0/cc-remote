@@ -71,6 +71,7 @@ import {
   matchModelId,
   MODELS,
   modelsFor,
+  permissionProfileLabel,
   permsFor,
   skillToken,
 } from "../src/data.ts";
@@ -145,6 +146,11 @@ import {
 import { updateScopedSessionLifecycle } from "../src/session-list.ts";
 
 const composerDrafts = new ComposerDraftStore();
+const longPermissionProfileLabel = permissionProfileLabel(
+  `custom-${"authorization-boundary-".repeat(20)}`);
+assert.ok(longPermissionProfileLabel?.endsWith("…"));
+assert.ok(Array.from(longPermissionProfileLabel ?? "").length <= 24,
+  "unknown permission-profile labels must remain bounded");
 const draftA = composerDraftKey("machine-a", "code", "codex", "session-a");
 const draftB = composerDraftKey("machine-a", "code", "codex", "session-b");
 const draftOtherSurface = composerDraftKey(
@@ -4482,6 +4488,7 @@ try {
 
   const newChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
     cwd: "~", engine: "claude",
+    controlScopeKey: "machine-a:code:claude",
     model: null, effort: null,
     defaultModel: "claude-mythos-5", defaultEffort: "max",
     onPickModel: () => {}, onPickEffort: () => {},
@@ -4490,6 +4497,7 @@ try {
   }));
   const codexNewChatMarkup = renderToStaticMarkup(createElement(NewChatView, {
     cwd: "~", engine: "codex", catalog: liveNewChatCatalog,
+    controlScopeKey: "machine-a:code:codex",
     model: null, effort: null,
     defaultModel: "gpt-future", defaultEffort: "low",
     onPickModel: () => {}, onPickEffort: () => {},
@@ -4516,7 +4524,15 @@ try {
   assert.match(codexNewChatMarkup, /本机默认 · GPT Future/);
   assert.match(codexNewChatMarkup, /dynamic catalog model/,
     "new-session selectors render the live Codex catalog when available");
-  assert.doesNotMatch(codexNewChatMarkup, /不询问|Plan|标准/);
+  const codexNewChatControls = codexNewChatMarkup.match(
+    /<div class="newchat-ctls">([\s\S]*?)<\/div>/,
+  )?.[1] ?? "";
+  assert.doesNotMatch(codexNewChatControls, /不询问|Plan|标准/,
+    "the compact footer must not duplicate controls that live in its sheet");
+  assert.match(codexNewChatMarkup, /class="newchat-access"/);
+  assert.match(codexNewChatMarkup, /权限与执行环境/);
+  assert.match(codexNewChatMarkup, /Full Access/);
+  assert.doesNotMatch(newChatMarkup, /class="newchat-access"/);
   const artifactsMarkup = renderToStaticMarkup(createElement(WorkArtifactsSheet, {
     open: true,
     artifacts: [
@@ -6258,16 +6274,42 @@ assert.equal(collaborationFrame.mode, "plan");
 assert.equal(typeof collaborationFrame.cmd_id, "string");
 assert.equal(typeof collaborationFrame.client_id, "string");
 
+relay.sendSetPermissionProfile(":danger-full-access");
+const permissionProfileFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(permissionProfileFrame.type, "set_permission_profile");
+assert.equal(permissionProfileFrame.sid, "codex-plan-session");
+assert.equal(permissionProfileFrame.profile, ":danger-full-access");
+
+relay.sendSetWebSearch("live");
+const webSearchFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(webSearchFrame.type, "set_web_search");
+assert.equal(webSearchFrame.sid, "codex-plan-session");
+assert.equal(webSearchFrame.mode, "live");
+
+relay.sendGetPermissionProfiles();
+const permissionProfilesFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(permissionProfilesFrame.type, "get_permission_profiles");
+assert.equal(permissionProfilesFrame.sid, "codex-plan-session");
+
+relay.sendGetPermissionProfiles("/tmp/prospective-project");
+const newChatProfilesFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(newChatProfilesFrame.type, "get_permission_profiles");
+assert.equal(newChatProfilesFrame.cwd, "/tmp/prospective-project");
+assert.equal("sid" in newChatProfilesFrame, false,
+  "prospective cwd discovery must not inherit the previously focused session");
+
 relay.sendNewSession(
   "/tmp/project", "codex", "gpt-5.6-sol", "xhigh",
   { prompt: "先制定计划", msg_id: "first-plan-message" }, "plan",
-  "on-request", "fast",
+  "on-request", ":danger-full-access", "live", "fast",
 );
 const newPlanFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(newPlanFrame.type, "new_session");
 assert.equal(newPlanFrame.engine, "codex");
 assert.equal(newPlanFrame.collaboration_mode, "plan");
 assert.equal(newPlanFrame.permission_mode, "on-request");
+assert.equal(newPlanFrame.permission_profile, ":danger-full-access");
+assert.equal(newPlanFrame.web_search, "live");
 assert.equal(newPlanFrame.service_tier, "fast");
 assert.equal(newPlanFrame.prompt, "先制定计划");
 
@@ -6379,6 +6421,12 @@ assert.match(newChatSource, /autoFocus=\{autoFocus\}/,
   "new-chat focus must follow the navigation intent instead of being unconditional");
 assert.match(newChatSource, /<PendingImageAttachments/,
   "new-chat attachments must share the interactive image preview");
+assert.match(newChatSource, /executionControls\.scopeKey === controlScopeKey/,
+  "new-chat execution controls must be scoped before the first switched render");
+assert.match(newChatSource, /space === "work" \? "never" : permissionMode/,
+  "Codex Work must request its authoritative non-escalating approval policy");
+assert.match(appSource, /space === "work" \? "never" : permissionMode/,
+  "the atomic new-session wire must retain the authoritative Work policy");
 const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
 assert.match(composerSource, /<PendingImageAttachments/,
