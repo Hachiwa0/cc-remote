@@ -397,6 +397,8 @@ export interface StatusRateLimit { limit_id?: string | null; limit_name?: string
 export interface StatusUsage { lifetime_tokens?: number | null; current_streak_days?: number | null; longest_streak_days?: number | null; peak_daily_tokens?: number | null; longest_running_turn_sec?: number | null }
 export interface StatusReport extends Base {
   type: "status_report";
+  /** Echoes the GetStatus command id; absent for unsolicited reports. */
+  request_id?: string | null;
   thread: StatusThread;
   runtime: StatusRuntime;
   context: StatusContext;
@@ -452,7 +454,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 22;
+export const PROTOCOL_VERSION = 23;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

@@ -800,6 +800,13 @@ export class RelayWs {
     });
   }
 
+  sendGetStatusTo(sid: string): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_status", sid,
+      client_id: this.clientId, ts: nowTs(),
+    });
+  }
+
   sendSetGoal(objective: string | null, status: GoalStatus | null, tokenBudget: number | null): void {
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "set_goal", ts: nowTs(), ...this.sidObj() };
     if (objective !== null) obj.objective = objective;

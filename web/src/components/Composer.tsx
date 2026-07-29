@@ -8,7 +8,7 @@ import {
   type SetStateAction,
 } from "react";
 import type {
-  State, QueryImg, QueryFile, ContextReport,
+  State, QueryImg, QueryFile, ContextReport, StatusReport,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
   EngineCapabilityItem,
 } from "../protocol";
@@ -36,6 +36,7 @@ import {
 import { workContextMetrics } from "../work-context";
 import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
 import { PendingImageAttachments } from "./PendingImageAttachments";
+import { UsageMeter } from "./UsageMeter";
 
 interface Props {
   draftKey: string;
@@ -82,6 +83,7 @@ interface Props {
   onPreview?: (path: string) => void;
   onGoal?: (args: string) => void;
   onStatus?: () => void;
+  onRefreshUsage?: () => void;
   onReview?: (
     target: "uncommittedChanges" | "baseBranch" | "commit" | "custom",
     value?: string,
@@ -94,6 +96,9 @@ interface Props {
   onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
   contextError?: string | null;
+  statusReport?: StatusReport | null;
+  statusError?: string | null;
+  statusLoading?: boolean;
 }
 
 export function Composer(p: Props) {
@@ -134,6 +139,7 @@ export function Composer(p: Props) {
   // popover DERIVED from the composer text (no second input box).
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
   const [ctxOpen, setCtxOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
   const ctxWrapRef = useRef<HTMLDivElement>(null);
   const workSettingsRef = useRef<HTMLDetailsElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -156,6 +162,7 @@ export function Composer(p: Props) {
     setDraft(p.draftStore.get(p.draftKey));
     setSheetKind(null);
     setCtxOpen(false);
+    setUsageOpen(false);
     setNotice(null);
     if (noticeTimer.current !== null) {
       window.clearTimeout(noticeTimer.current);
@@ -164,15 +171,18 @@ export function Composer(p: Props) {
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [p.draftKey, p.draftStore]);
 
-  // context popover: close on outside click
+  // Context and account-usage popovers share one anchor and close together.
   useEffect(() => {
-    if (!ctxOpen) return;
+    if (!ctxOpen && !usageOpen) return;
     const onDoc = (e: MouseEvent) => {
-      if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) setCtxOpen(false);
+      if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) {
+        setCtxOpen(false);
+        setUsageOpen(false);
+      }
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [ctxOpen]);
+  }, [ctxOpen, usageOpen]);
 
   // <details> has no controlled open state here, so keep one document-level
   // listener active for mouse and touch and close it when focus moves outside.
@@ -181,6 +191,7 @@ export function Composer(p: Props) {
       if (!workSettingsRef.current?.open) return;
       workSettingsRef.current.open = false;
       setCtxOpen(false);
+      setUsageOpen(false);
     };
     const onPointerDown = (event: PointerEvent) => {
       const details = workSettingsRef.current;
@@ -233,6 +244,7 @@ export function Composer(p: Props) {
     if (!locked) return;
     setSheetKind(null);
     setCtxOpen(false);
+    setUsageOpen(false);
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [locked]);
 
@@ -431,7 +443,11 @@ export function Composer(p: Props) {
       case "permissions": setSheetKind("perms"); break;
       case "clear": p.onClear(); break;
       // open the popup too (not just fetch) — same as clicking the context ring.
-      case "context": p.onContext(); setCtxOpen(true); break;
+      case "context":
+        p.onContext();
+        setUsageOpen(false);
+        setCtxOpen(true);
+        break;
       case "status": p.onStatus?.(); break;
       case "goal": p.onGoal?.(args); break;
       case "rewind": flash("Claude Rewind 暂未开放"); break;
@@ -873,11 +889,34 @@ export function Composer(p: Props) {
                 title="Fast 服务档位:快 / 标准(下条消息生效)"
               >{p.fast == null ? "档位读取中" : p.fast ? "⚡ 快" : "标准"}</button>
             )}
+            {p.engine === "codex" && (
+              <UsageMeter
+                open={usageOpen}
+                report={p.statusReport ?? null}
+                error={p.statusError}
+                loading={p.statusLoading}
+                onToggle={() => {
+                  const opening = !usageOpen;
+                  setCtxOpen(false);
+                  setUsageOpen(opening);
+                  if (opening) p.onRefreshUsage?.();
+                }}
+                onRefresh={() => p.onRefreshUsage?.()}
+                onOpenStatus={p.onStatus ? () => {
+                  setUsageOpen(false);
+                  p.onStatus?.();
+                } : undefined}
+              />
+            )}
             <button
               className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
               aria-label="上下文占用"
               title="上下文占用"
-              onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}
+              onClick={() => {
+                p.onContext();
+                setUsageOpen(false);
+                setCtxOpen((o) => !o);
+              }}
             >
               <svg viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
                 <circle className="hr-track" cx="18" cy="18" r="15" />

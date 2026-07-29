@@ -318,6 +318,7 @@ export default function App() {
   // its remembered/latest focus only after a fresh wrapper list is accepted.
   const authoritativeSurfaceListsRef = useRef<Set<string>>(new Set());
   const sessionActivityPendingRef = useRef<Set<string>>(new Set());
+  const deferredStatusRefreshRef = useRef<Set<string>>(new Set());
   const prefetchedSurfacesRef = useRef<Set<string>>(new Set());
   const lastFocusBySurfaceRef = useRef<Record<string, string>>({});
   const preferredSurfaceFocusRef = useRef<{ key: string; sid: string } | null>(null);
@@ -430,6 +431,7 @@ export default function App() {
     skillCatalogsRef.current = {};
     skillCatalogReadsRef.current = { active: null, queued: new Map() };
     setSkillCatalogs({});
+    deferredStatusRefreshRef.current.clear();
     historyRequestsRef.current.clear();
     clearHistoryDetailRequests();
     historyPageScopesRef.current.clear();
@@ -1840,7 +1842,51 @@ export default function App() {
               && msg.sid) {
             draining.delete(msg.sid);
           }
+          const statusRuntimeBeforeEvent = msg.sid
+            ? stateRef.current.runtimes[msg.sid] : undefined;
+          const completesStatusRequest = !!statusRuntimeBeforeEvent?.statusRequestId
+            && (
+              (msg.type === "status_report"
+                && msg.request_id === statusRuntimeBeforeEvent.statusRequestId)
+              || (msg.type === "error"
+                && msg.request_id === statusRuntimeBeforeEvent.statusRequestId)
+            );
           dispatch({ type: "event", event: msg, ownership });
+          if (msg.sid && completesStatusRequest
+              && deferredStatusRefreshRef.current.delete(msg.sid)) {
+            const requestId = ws.sendGetStatusTo(msg.sid);
+            if (requestId) {
+              dispatch({
+                type: "begin_status_request",
+                sid: msg.sid,
+                requestId,
+              });
+            }
+          }
+          // Account quota belongs to the Codex daemon generation, not the
+          // transcript. Refresh after the authoritative idle boundary so an
+          // account-switch restart has finished before we read the new limits.
+          if (msg.type === "state" && msg.state === "idle" && msg.sid) {
+            const session = stateRef.current.sessions.find(
+              (candidate) => candidate.session_id === msg.sid);
+            const eventEngine = session?.engine
+              ?? (stateRef.current.focusedSid === msg.sid
+                ? engineRef.current : undefined);
+            if (eventEngine === "codex") {
+              if (stateRef.current.runtimes[msg.sid]?.statusRequestId) {
+                deferredStatusRefreshRef.current.add(msg.sid);
+              } else {
+                const requestId = ws.sendGetStatusTo(msg.sid);
+                if (requestId) {
+                  dispatch({
+                    type: "begin_status_request",
+                    sid: msg.sid,
+                    requestId,
+                  });
+                }
+              }
+            }
+          }
           if (msg.type === "wrapper_reconnected") {
             skillCatalogsRef.current = {};
             setSkillCatalogs({});
@@ -2343,6 +2389,32 @@ export default function App() {
     state.newChat,
     state.wrapperOnline,
   ]);
+
+  const refreshStatus = useCallback(() => {
+    if (!focusedSid || focusedEngine !== "codex") return;
+    if (stateRef.current.runtimes[focusedSid]?.statusRequestId) return;
+    const requestId = wsRef.current?.sendGetStatus();
+    if (requestId) {
+      dispatch({ type: "begin_status_request", sid: focusedSid, requestId });
+    }
+  }, [focusedEngine, focusedSid]);
+  useEffect(() => {
+    if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
+        || rt.state !== "idle"
+        || state.connState !== "connected" || !state.wrapperOnline) return;
+    if (stateRef.current.runtimes[focusedSid]?.statusRequestId) return;
+    refreshStatus();
+  }, [
+    authed,
+    focusedEngine,
+    focusedSid,
+    refreshStatus,
+    rt.state,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+  ]);
+
   if (!authReady) {
     return <div className="login" aria-busy="true">正在连接中继…</div>;
   }
@@ -2658,10 +2730,7 @@ export default function App() {
   const openStatus = () => {
     if (!focusedSid) return;
     setStatusOpenSid(focusedSid);
-    const requestId = wsRef.current?.sendGetStatus();
-    if (requestId) {
-      dispatch({ type: "begin_status_request", sid: focusedSid, requestId });
-    }
+    refreshStatus();
   };
   const requestContext = () => {
     if (!focusedSid) return;
@@ -3187,6 +3256,7 @@ export default function App() {
           onPreview={previewMarkdown}
           onGoal={runGoal}
           onStatus={openStatus}
+          onRefreshUsage={refreshStatus}
           onReview={(target, value) => {
             if (focusedSid) wsRef.current?.sendStartReview(focusedSid, target, value);
           }}
@@ -3222,6 +3292,9 @@ export default function App() {
           }}
           contextReport={rt.contextReport}
           contextError={rt.contextError}
+          statusReport={rt.statusReport}
+          statusError={rt.statusError}
+          statusLoading={rt.statusRequestId !== null}
         />
           </>
         )}

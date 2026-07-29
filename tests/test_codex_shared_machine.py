@@ -5,10 +5,13 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from cc_remote.codex_daemon_restart import write_restart_state
+from cc_remote.codex_daemon_restart import (
+    CodexDaemonRestartState,
+    write_restart_state,
+)
 from cc_remote.protocol import (
-    Delta, Effort, Error, Model, Query, SessionActivity, SessionControl,
-    Takeover, TurnEnd, UserMsg,
+    Delta, Effort, Error, GetStatus, Model, Query, SessionActivity,
+    SessionControl, StatusReport, Takeover, TurnEnd, UserMsg,
 )
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
 from tests.test_codex_external import _CodexSdk, _record_async, _watch
@@ -57,6 +60,21 @@ class _SharedSdk(_CodexSdk):
     async def force_reconnect(self, *_args, **_kwargs) -> None:
         self.reconnects += 1
 
+    async def get_status(self) -> dict:
+        return {
+            "thread": {
+                "thread_id": "sid",
+                "status": "idle",
+                "active_flags": [],
+            },
+            "runtime": {},
+            "context": {},
+            "account": None,
+            "rate_limits": [],
+            "usage": None,
+            "component_errors": [],
+        }
+
 
 class _InterruptedSharedSdk(_SharedSdk):
     shared_daemon_affinity = True
@@ -72,6 +90,24 @@ class _InterruptedSharedSdk(_SharedSdk):
     async def force_reconnect(self, *_args, **_kwargs) -> None:
         self.reconnects += 1
         self.live = True
+
+
+class _EvictedDuringReconnectSdk(_InterruptedSharedSdk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reconnect_started = asyncio.Event()
+        self.release_reconnect = asyncio.Event()
+        self.disconnects = 0
+
+    async def force_reconnect(self, *_args, **_kwargs) -> None:
+        self.reconnects += 1
+        self.reconnect_started.set()
+        await self.release_reconnect.wait()
+        self.live = True
+
+    async def disconnect(self) -> None:
+        self.disconnects += 1
+        self.live = False
 
 
 class _AccountSwitchSharedSdk(_SharedSdk):
@@ -1399,6 +1435,226 @@ def test_same_restart_epoch_does_not_reconnect_live_proxy(monkeypatch):
             sid="sid", prompt="hello", msg_id="same-epoch-query"))
         await ctx.turn_task
         assert ctx.sdk.reconnects == 0
+
+    asyncio.run(go())
+
+
+def test_idle_status_reconnects_changed_daemon_generation(monkeypatch):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        ctx.state = "idle"
+        ctx.codex_daemon_epoch = "a" * 32
+        machine.sessions[ctx.key] = ctx
+        ready = CodexDaemonRestartState(
+            epoch="b" * 32,
+            phase="ready",
+            updated_at=1.0,
+            deadline_at=2.0,
+        )
+        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+
+        async def restart_state(*, wait, interrupt_event):
+            assert wait is True
+            assert interrupt_event is ctx.interrupt_event
+            return ready
+
+        async def no_external(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_codex_restart_state", restart_state)
+        monkeypatch.setattr(machine, "_prime_codex_ownership", no_external)
+
+        result = await asyncio.wait_for(
+            machine._handle_get_status(GetStatus(
+                sid="sid",
+                cmd_id="usage-refresh",
+                client_id="browser",
+            )),
+            timeout=1.0,
+        )
+
+        assert isinstance(result, StatusReport)
+        assert ctx.sdk.reconnects == 1
+        assert ctx.codex_daemon_epoch == "b" * 32
+        assert transport.sent[-1].to == "browser"
+        assert transport.sent[-1].request_id == "usage-refresh"
+
+    asyncio.run(go())
+
+
+def test_generation_reconnect_does_not_revive_evicted_context(monkeypatch):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _EvictedDuringReconnectSdk()
+        ctx.sdk = sdk
+        ctx.codex_daemon_epoch = "a" * 32
+        machine.sessions[ctx.key] = ctx
+        ready = CodexDaemonRestartState(
+            epoch="b" * 32,
+            phase="ready",
+            updated_at=1.0,
+            deadline_at=2.0,
+        )
+
+        async def restart_state(*, wait, interrupt_event):
+            assert wait is True
+            assert interrupt_event is ctx.interrupt_event
+            return ready
+
+        monkeypatch.setattr(machine, "_codex_restart_state", restart_state)
+        reconnect = asyncio.create_task(machine._ensure_codex_daemon_generation(
+            ctx, reason="background status refresh"))
+        await asyncio.wait_for(sdk.reconnect_started.wait(), timeout=1.0)
+
+        # Model the eviction path: it removes the route and closes the old
+        # proxy while a reconnect is still awaiting app-server startup.
+        assert machine.sessions.pop(ctx.key) is ctx
+        await sdk.disconnect()
+        sdk.release_reconnect.set()
+
+        assert await asyncio.wait_for(reconnect, timeout=1.0) is False
+        assert sdk.reconnects == 1
+        assert sdk.disconnects == 2
+        assert sdk.live is False
+
+    asyncio.run(go())
+
+
+def test_status_read_does_not_block_serial_commands():
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        status_started = asyncio.Event()
+        release_status = asyncio.Event()
+        command_seen = asyncio.Event()
+        status_calls = 0
+
+        async def process(command):
+            nonlocal status_calls
+            if command.type == "get_status":
+                status_calls += 1
+                status_started.set()
+                await release_status.wait()
+            else:
+                command_seen.set()
+
+        machine._process_command = process
+        status = SimpleNamespace(
+            type="get_status",
+            client_id="browser",
+            cmd_id="usage-refresh",
+        )
+        machine._start_status_command(status)
+        await asyncio.wait_for(status_started.wait(), timeout=1.0)
+
+        # A reconnect retry coalesces, while a user command remains immediately
+        # serviceable by the serial lane.
+        machine._start_status_command(status)
+        await machine._process_command_safely(SimpleNamespace(type="query"))
+        assert command_seen.is_set()
+        assert status_calls == 1
+
+        tasks = list(machine._status_command_tasks.values())
+        release_status.set()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(go())
+
+
+def test_status_failure_keeps_request_correlation(monkeypatch):
+    class FailedStatusSdk(_SharedSdk):
+        async def get_status(self) -> dict:
+            raise RuntimeError("status failed")
+
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = FailedStatusSdk()
+        ctx.state = "idle"
+        machine.sessions[ctx.key] = ctx
+
+        async def generation_ready(_ctx, *, reason):
+            return True
+
+        monkeypatch.setattr(
+            machine, "_ensure_codex_daemon_generation", generation_ready)
+        result = await machine._handle_get_status(GetStatus(
+            sid="sid",
+            cmd_id="usage-refresh",
+            client_id="browser",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.request_id == "usage-refresh"
+        assert result.to == "browser"
+        assert transport.sent[-1] is result
+
+    asyncio.run(go())
+
+
+def test_idle_status_is_emitted_after_running_generation_read(monkeypatch):
+    class OrderedStatusSdk(_SharedSdk):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.status_calls = 0
+
+        async def get_status(self) -> dict:
+            self.status_calls += 1
+            call = self.status_calls
+            if call == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            report = await super().get_status()
+            report["runtime"] = {"app_server_version": f"read-{call}"}
+            return report
+
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = OrderedStatusSdk()
+        ctx.sdk = sdk
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+
+        async def generation_ready(_ctx, *, reason):
+            return True
+
+        monkeypatch.setattr(
+            machine, "_ensure_codex_daemon_generation", generation_ready)
+        old_read = asyncio.create_task(machine._handle_get_status(GetStatus(
+            sid="sid", cmd_id="old-read", client_id="browser",
+        )))
+        await asyncio.wait_for(sdk.first_started.wait(), timeout=1.0)
+
+        ctx.state = "idle"
+        new_read = asyncio.create_task(machine._handle_get_status(GetStatus(
+            sid="sid", cmd_id="new-read", client_id="browser",
+        )))
+        await asyncio.sleep(0)
+        assert sdk.status_calls == 1
+
+        sdk.release_first.set()
+        await asyncio.gather(old_read, new_read)
+        reports = [
+            event for event in transport.sent
+            if isinstance(event, StatusReport)
+        ]
+        assert [
+            report.runtime.app_server_version for report in reports
+        ] == ["read-1", "read-2"]
+        assert [report.request_id for report in reports] == ["old-read", "new-read"]
 
     asyncio.run(go())
 

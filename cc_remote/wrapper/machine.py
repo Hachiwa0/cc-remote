@@ -963,6 +963,12 @@ class WrapperMachine:
         self._models_command_tasks: dict[
             tuple[str, str], asyncio.Task
         ] = {}
+        # Account/status reads may wait behind the intentional Codex daemon
+        # restart barrier. Keep that wait off the serial Query/Interrupt lane;
+        # reliable reconnect retries coalesce by their stable command id.
+        self._status_command_tasks: dict[
+            tuple[str, str], asyncio.Task
+        ] = {}
         self._capabilities_command_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # A broker-owned Claude model change can pause for a Remote answer.
         # Keep it off the serial receive lane so AnswerQuestion can be handled.
@@ -1143,6 +1149,10 @@ class WrapperMachine:
             ctx.engine == "codex"
             and getattr(ctx.sdk, "using_daemon_proxy", False)
         )
+
+    def _is_resident_context(self, ctx: SessionContext) -> bool:
+        """Whether ``ctx`` still belongs to this machine's resident pool."""
+        return ctx.key is not None and self.sessions.get(ctx.key) is ctx
 
     async def _reconnect_codex_shared(
         self,
@@ -1494,39 +1504,71 @@ class WrapperMachine:
         """Cross an intentional restart only between native Codex turns."""
         if not self._codex_shared_affinity(ctx):
             return False
+        # Waiting is deliberately outside the lock. Automatic status reads run
+        # in background tasks and must not make a Query wait behind the hook's
+        # published outcome barrier; once ready, only the actual generation
+        # handoff is shared.
         state = await self._codex_restart_state(
             wait=True,
             interrupt_event=ctx.interrupt_event,
         )
-        if state is None:
-            return (
-                self._codex_shared_live(ctx)
-                or await self._reconnect_codex_shared(ctx, reason=reason)
-            )
-        if state.phase != "ready":
-            log.warning(
-                "Codex daemon restart barrier is not ready",
-                phase=state.phase,
-                epoch=state.epoch,
-                session_id=ctx.session_id,
-            )
+        # A background status read can outlive a delete/eviction while waiting
+        # for the hook. Never reconnect a context that is no longer resident.
+        if not self._is_resident_context(ctx):
             return False
-        generation_changed = ctx.codex_daemon_epoch != state.epoch
-        if generation_changed:
-            # The manager caches readiness by binary/socket path, which remains
-            # stable across an official restart. Invalidate only its liveness
-            # cache; sticky per-thread shared affinity remains on the handle.
-            self._codex_daemon.invalidate()
-        if not generation_changed and self._codex_shared_live(ctx):
-            return True
-        connected = await self._reconnect_codex_shared(
-            ctx,
-            reason=reason,
-            force=generation_changed,
-        )
-        if connected:
-            ctx.codex_daemon_epoch = state.epoch
-        return connected
+        async with ctx.codex_daemon_generation_lock:
+            # Eviction may race a previous generation reconnect while this task
+            # waits on the per-context lock.  Do not resurrect a detached SDK.
+            if not self._is_resident_context(ctx):
+                return False
+            if state is None:
+                if self._codex_shared_live(ctx):
+                    return True
+                connected = await self._reconnect_codex_shared(ctx, reason=reason)
+            else:
+                if state.phase != "ready":
+                    log.warning(
+                        "Codex daemon restart barrier is not ready",
+                        phase=state.phase,
+                        epoch=state.epoch,
+                        session_id=ctx.session_id,
+                    )
+                    return False
+                generation_changed = ctx.codex_daemon_epoch != state.epoch
+                if generation_changed:
+                    # The manager caches readiness by binary/socket path, which
+                    # remains stable across an official restart. Invalidate only
+                    # its liveness cache; sticky per-thread shared affinity remains
+                    # on the handle.
+                    self._codex_daemon.invalidate()
+                if not generation_changed and self._codex_shared_live(ctx):
+                    return True
+                connected = await self._reconnect_codex_shared(
+                    ctx,
+                    reason=reason,
+                    force=generation_changed,
+                )
+
+            # ``force_reconnect`` awaits process setup.  The normal eviction
+            # path may remove and disconnect this context in that interval;
+            # close the newly-created proxy rather than leave an unrouteable
+            # app-server connection alive.
+            if not self._is_resident_context(ctx):
+                if connected:
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception as exc:
+                        log.warning(
+                            "failed to disconnect evicted Codex shared proxy",
+                            session_id=ctx.session_id,
+                            error_type=type(exc).__name__,
+                        )
+                return False
+            if state is None:
+                return connected
+            if connected:
+                ctx.codex_daemon_epoch = state.epoch
+            return connected
 
     async def _wait_for_codex_account_switch(
         self, *, starting_epoch: str,
@@ -2702,6 +2744,9 @@ class WrapperMachine:
                     # Stop arriving from another client.
                     self._start_interactive_control_command(cmd)
                     continue
+                if cmd.type == "get_status":
+                    self._start_status_command(cmd)
+                    continue
                 if cmd.type in {
                     "get_engine_capabilities", "manage_engine_plugin",
                     "manage_engine_skill", "manage_engine_hook",
@@ -2722,6 +2767,12 @@ class WrapperMachine:
             if models_tasks:
                 await asyncio.gather(*models_tasks, return_exceptions=True)
             self._models_command_tasks.clear()
+            status_tasks = list(self._status_command_tasks.values())
+            for task in status_tasks:
+                task.cancel()
+            if status_tasks:
+                await asyncio.gather(*status_tasks, return_exceptions=True)
+            self._status_command_tasks.clear()
             capabilities_tasks = list(self._capabilities_command_tasks.values())
             for task in capabilities_tasks:
                 task.cancel()
@@ -3385,6 +3436,23 @@ class WrapperMachine:
         def forget(done: asyncio.Task) -> None:
             if self._models_command_tasks.get(key) is done:
                 self._models_command_tasks.pop(key, None)
+
+        task.add_done_callback(forget)
+
+    def _start_status_command(self, cmd) -> None:
+        """Read Codex status without blocking Query/Interrupt intake."""
+        client_id = getattr(cmd, "client_id", None) or ""
+        cmd_id = getattr(cmd, "cmd_id", None) or f"untracked-{id(cmd)}"
+        key = (client_id, cmd_id)
+        current = self._status_command_tasks.get(key)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(self._process_command_safely(cmd))
+        self._status_command_tasks[key] = task
+
+        def forget(done: asyncio.Task) -> None:
+            if self._status_command_tasks.get(key) is done:
+                self._status_command_tasks.pop(key, None)
 
         task.add_done_callback(forget)
 
@@ -7747,25 +7815,48 @@ class WrapperMachine:
             )
             await self._emit(ctx, error)
             return error
-        try:
-            event = StatusReport(
-                **await ctx.sdk.get_status(),
-                to=getattr(cmd, "client_id", None),
-            )
-            await self._emit(ctx, event)
-            return event
-        except Exception:
-            # get_status already degrades individual RPC failures. Reaching this
-            # path means the composed report itself could not be produced; do not
-            # copy a raw provider/app-server exception onto the wire.
-            log.exception("get_status failed")
-            error = Error(
-                code=ERR_INTERNAL,
-                message="Codex status unavailable",
-                to=getattr(cmd, "client_id", None),
-            )
-            await self._emit(ctx, error)
-            return error
+        async with ctx.codex_status_lock:
+            # Status belongs to the account backing the current daemon
+            # generation. During a turn the old generation is authoritative;
+            # once idle, cross an intentional account-switch restart before
+            # reading limits. Serializing status reads ensures the new account's
+            # report is always emitted after any already-started old read.
+            if (
+                ctx.state == "idle"
+                and self._codex_shared_affinity(ctx)
+                and not await self._ensure_codex_daemon_generation(
+                    ctx, reason="status preflight")
+            ):
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message="Codex 共享通道重连失败，账户额度暂不可用；请重试",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
+            try:
+                event = StatusReport(
+                    **await ctx.sdk.get_status(),
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit(ctx, event)
+                return event
+            except Exception:
+                # get_status already degrades individual RPC failures. Reaching
+                # this path means the composed report itself could not be
+                # produced; do not copy a raw provider/app-server exception
+                # onto the wire.
+                log.exception("get_status failed")
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="Codex status unavailable",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
 
     async def _goal_ctx(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))

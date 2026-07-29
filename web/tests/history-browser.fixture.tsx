@@ -9,6 +9,7 @@ import {
 } from "../src/components/ChatView";
 import type { TextSelectionGuard } from "../src/history-selection-guard";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
+import { UsageMeter } from "../src/components/UsageMeter";
 
 const ROBOT_CORE_MERMAID_SOURCE = `flowchart TB
     USER["任务入口<br/>语音 · 文本 · App · API"]
@@ -364,6 +365,7 @@ export function HistoryBrowserFixture() {
   const mermaidHistory = params.has("mermaid-history");
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
+  const quotaComposer = params.has("quota-composer");
   const recoveryReplacement = params.has("recovery-replace");
   const deepBrowse = params.has("deep-browse");
   const runtimeBrowse = params.has("runtime-browse");
@@ -845,6 +847,41 @@ export function HistoryBrowserFixture() {
             onClick={() => setComposerExpanded((current) => !current)}>
             toggle composer actions
           </button>
+        </div>
+      )}
+      {quotaComposer && (
+        <div className="composer" data-testid="quota-composer">
+          <div className="composer-in">
+            <div className="hint">
+              <button className="hint-mode" type="button">
+                Full access · idle <span className="hint-mode-ch">▾</span>
+              </button>
+              <span className="hint-kbds">keyboard shortcuts</span>
+              <div className="hint-right">
+                <button className="hint-ctl" type="button">
+                  gpt-5.6-codex
+                </button>
+                <button className="hint-ctl" type="button">xhigh</button>
+                <button className="hint-ctl fast-chip" type="button">
+                  standard
+                </button>
+                <UsageMeter
+                  open={false}
+                  report={null}
+                  onToggle={() => {}}
+                  onRefresh={() => {}}
+                />
+                <button className="hint-ring" type="button"
+                  aria-label="context usage">
+                  <svg viewBox="0 0 36 36" width="20" height="20"
+                    aria-hidden="true">
+                    <circle className="hr-track" cx="18" cy="18" r="15" />
+                    <circle className="hr-fill" cx="18" cy="18" r="15" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </main>

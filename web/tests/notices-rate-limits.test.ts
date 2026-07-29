@@ -22,6 +22,11 @@ try {
     "/src/components/NoticeStack.tsx");
   const { StatusSheet } = await harness.ssrLoadModule(
     "/src/components/StatusSheet.tsx");
+  const { UsageMeter } = await harness.ssrLoadModule(
+    "/src/components/UsageMeter.tsx");
+  const {
+    accountQuotaWindows, remainingPercent,
+  } = await harness.ssrLoadModule("/src/rate-limit-usage.ts");
   const { statusNotices } = await harness.ssrLoadModule(
     "/src/notice-presentation.ts");
   const {
@@ -107,11 +112,54 @@ try {
     limit_id: "codex",
     name: null,
     plan_type: null,
+    reached_type: null,
+    primary: { used_percent: 0, resets_at: 901, window_duration_mins: null },
+    secondary: null,
+  }) });
+  let merged = state.runtimes[sid].statusReport?.rate_limits[0];
+  assert.equal(merged?.primary?.used_percent, 40,
+    "same-period live updates must not regress an authoritative percentage");
+  assert.equal(merged?.primary?.resets_at, 901,
+    "one-second provider reset jitter still belongs to the current period");
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_update",
+    limit_id: "codex",
+    name: null,
+    plan_type: null,
+    reached_type: null,
+    primary: {
+      used_percent: 0, resets_at: 18_900, window_duration_mins: 300,
+    },
+    secondary: null,
+  }) });
+  merged = state.runtimes[sid].statusReport?.rate_limits[0];
+  assert.equal(merged?.primary?.used_percent, 0,
+    "a confirmed new quota period may lower the used percentage");
+  assert.equal(merged?.primary?.resets_at, 18_900);
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_update",
+    limit_id: "codex",
+    name: null,
+    plan_type: null,
+    reached_type: null,
+    primary: { used_percent: 100, resets_at: 900, window_duration_mins: 300 },
+    secondary: null,
+  }) });
+  merged = state.runtimes[sid].statusReport?.rate_limits[0];
+  assert.equal(merged?.primary?.used_percent, 0,
+    "a late snapshot from the previous period must be ignored");
+  assert.equal(merged?.primary?.resets_at, 18_900);
+  state = reduce(state, { type: "event", event: report });
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_update",
+    limit_id: "codex",
+    name: null,
+    plan_type: null,
     reached_type: "rate_limit_reached",
     primary: { used_percent: 100, resets_at: null, window_duration_mins: null },
     secondary: null,
   }) });
-  const merged = state.runtimes[sid].statusReport?.rate_limits[0];
+  merged = state.runtimes[sid].statusReport?.rate_limits[0];
   assert.equal(merged?.limit_name, "Codex");
   assert.equal(merged?.plan_type, "pro");
   assert.equal(merged?.primary?.used_percent, 100);
@@ -119,6 +167,36 @@ try {
   assert.equal(merged?.rate_limit_reached_type, "rate_limit_reached");
   assert.equal(Object.hasOwn(merged ?? {}, "credits"), false);
   assert.equal(Object.hasOwn(merged ?? {}, "individualLimit"), false);
+
+  // A delayed status response must not replace the newest in-flight read.
+  state = reduce(state, {
+    type: "begin_status_request", sid, requestId: "status-new",
+  });
+  const staleStatus = {
+    ...report, request_id: "status-old",
+    rate_limits: [{
+      limit_id: "codex", primary: { used_percent: 100 },
+    }],
+  } as StatusReport;
+  state = reduce(state, { type: "event", event: staleStatus });
+  assert.equal(state.runtimes[sid].statusRequestId, "status-new");
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 100,
+    "stale status response must not replace the installed report");
+  const uncorrelatedStatus = { ...staleStatus, request_id: undefined } as StatusReport;
+  state = reduce(state, { type: "event", event: uncorrelatedStatus });
+  assert.equal(state.runtimes[sid].statusRequestId, "status-new");
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 100,
+    "uncorrelated status response must not replace an in-flight request");
+  const currentStatus = {
+    ...report, request_id: "status-new",
+    rate_limits: [{
+      limit_id: "codex", primary: { used_percent: 0 },
+    }],
+  } as StatusReport;
+  state = reduce(state, { type: "event", event: currentStatus });
+  assert.equal(state.runtimes[sid].statusRequestId, null);
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 0,
+    "the matching status response installs and completes the request");
 
   const officialDiagnostic = event({
     type: "notice", notice_id: "codex-notice-private-diagnostic",
@@ -167,6 +245,152 @@ try {
     /crash|warning|wrapper|private|traceback|secret|rate_limit_reached/i,
     "the status sheet must not expose provider diagnostics or raw enums");
 
+  const quotaReport = {
+    ...report,
+    account: {
+      auth_type: "chatgpt", plan_type: "plus", requires_openai_auth: true,
+    },
+    rate_limits: [{
+      limit_id: "codex", limit_name: "Codex", plan_type: "plus",
+      primary: {
+        used_percent: 40, resets_at: 1_800_000_000,
+        window_duration_mins: 300,
+      },
+      secondary: {
+        used_percent: 75, resets_at: 1_800_500_000,
+        window_duration_mins: 10_080,
+      },
+    }],
+  } satisfies StatusReport;
+  const quotas = accountQuotaWindows(quotaReport);
+  assert.equal(remainingPercent(quotas.fiveHour), 60);
+  assert.equal(remainingPercent(quotas.weekly), 25);
+  const separateQuotaLimits = accountQuotaWindows({
+    ...quotaReport,
+    rate_limits: [{
+      limit_id: null, primary: {
+        used_percent: 10, resets_at: 1_800_000_000,
+        window_duration_mins: 300,
+      }, secondary: null,
+    }, {
+      limit_id: null, primary: null, secondary: {
+        used_percent: 90, resets_at: 1_800_500_000,
+        window_duration_mins: 10_080,
+      },
+    }],
+  });
+  assert.equal(separateQuotaLimits.limit?.limit_id, null);
+  assert.equal(remainingPercent(separateQuotaLimits.fiveHour), 90);
+  assert.equal(separateQuotaLimits.weekly, null,
+    "weekly quota from a different limit must not be combined");
+  const pairedQuotaLimit = accountQuotaWindows({
+    ...quotaReport,
+    rate_limits: [{
+      limit_id: null, primary: {
+        used_percent: 10, resets_at: 1_800_000_000,
+        window_duration_mins: 300,
+      }, secondary: null,
+    }, {
+      limit_id: null, primary: {
+        used_percent: 40, resets_at: 1_800_000_000,
+        window_duration_mins: 300,
+      }, secondary: {
+        used_percent: 75, resets_at: 1_800_500_000,
+        window_duration_mins: 10_080,
+      },
+    }],
+  });
+  assert.equal(pairedQuotaLimit.limit?.limit_id, null,
+    "a complete quota pair takes precedence over an earlier partial limit");
+  assert.equal(remainingPercent(pairedQuotaLimit.fiveHour), 60);
+  assert.equal(remainingPercent(pairedQuotaLimit.weekly), 25);
+  const competingQuotaBuckets = [{
+    limit_id: "codex_bengalfox", limit_name: "GPT-5.3-Codex-Spark",
+    plan_type: "pro", primary: {
+      used_percent: 0, resets_at: 1_800_500_000,
+      window_duration_mins: 10_080,
+    }, secondary: null,
+  }, {
+    limit_id: "codex", limit_name: null, plan_type: "pro",
+    primary: {
+      used_percent: 2, resets_at: 1_800_500_000,
+      window_duration_mins: 10_080,
+    }, secondary: null,
+  }];
+  for (const rateLimits of [
+    competingQuotaBuckets,
+    [...competingQuotaBuckets].reverse(),
+  ]) {
+    const accountQuota = accountQuotaWindows({
+      ...quotaReport, rate_limits: rateLimits,
+    });
+    assert.equal(accountQuota.limit?.limit_id, "codex",
+      "model-specific bucket ordering must not replace the account quota");
+    assert.equal(remainingPercent(accountQuota.weekly), 98,
+      "cached updates and explicit reads must show the same account quota");
+  }
+  const specializedQuotaOnly = accountQuotaWindows({
+    ...quotaReport, rate_limits: [competingQuotaBuckets[0]],
+  });
+  assert.equal(specializedQuotaOnly.limit, null,
+    "a model-specific quota must not masquerade as the account quota");
+  assert.equal(specializedQuotaOnly.weekly, null);
+  const unknownWindows = accountQuotaWindows({
+    ...quotaReport,
+    rate_limits: [{
+      limit_id: "other", limit_name: "Other", plan_type: "plus",
+      primary: {
+        used_percent: 10, resets_at: null, window_duration_mins: null,
+      },
+      secondary: {
+        used_percent: 20, resets_at: null, window_duration_mins: 1_440,
+      },
+    }],
+  });
+  assert.equal(unknownWindows.fiveHour, null,
+    "unknown windows must not be relabeled as five-hour quota");
+  assert.equal(unknownWindows.weekly, null,
+    "unknown windows must not be relabeled as weekly quota");
+  const usageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
+    open: true,
+    report: quotaReport,
+    error: null,
+    loading: false,
+    onToggle: () => {},
+    onRefresh: () => {},
+    onOpenStatus: () => {},
+  }));
+  assert.match(usageMarkup, /5 小时额度/);
+  assert.match(usageMarkup, /每周额度/);
+  assert.match(usageMarkup, /剩余 60%/);
+  assert.match(usageMarkup, /剩余 25%/);
+  assert.match(usageMarkup, /width:60%/);
+  assert.match(usageMarkup, /width:25%/);
+  assert.doesNotMatch(usageMarkup, /used_percent|rate_limit_reached/i);
+  assert.match(usageMarkup, /aria-haspopup="true"/);
+  assert.doesNotMatch(usageMarkup, /role="dialog"/);
+  const compactUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
+    open: false,
+    report: quotaReport,
+    error: null,
+    loading: false,
+    onToggle: () => {},
+    onRefresh: () => {},
+  }));
+  assert.doesNotMatch(compactUsageMarkup, /<small>60%<\/small>|<small>25%<\/small>/,
+    "the compact meter must keep percentages accessible but visually hidden");
+  const failedUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
+    open: true,
+    report: quotaReport,
+    error: "账户额度暂不可用",
+    loading: false,
+    onToggle: () => {},
+    onRefresh: () => {},
+  }));
+  assert.match(failedUsageMarkup, /账户额度暂不可用/);
+  assert.doesNotMatch(failedUsageMarkup, /剩余 60%|剩余 25%|width:60%|width:25%/,
+    "a failed account-switch refresh must quarantine the previous report");
+
   assert.equal(TRANSIENT_BANNER_TTL_MS, 6_000);
   const transientBanner = renderToStaticMarkup(createElement(ReconnectBanner, {
     banner: "详细过程已过期，请刷新会话后重试",
@@ -197,6 +421,19 @@ try {
   const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
   assert.ok(appSource.indexOf("<ReconnectBanner") < appSource.indexOf("<NoticeStack"),
     "NoticeStack must remain below, not replace, ReconnectBanner");
+  assert.match(appSource,
+    /msg\.type === "state" && msg\.state === "idle"[\s\S]*sendGetStatusTo\(msg\.sid\)/,
+    "Codex quota must refresh after the authoritative idle boundary");
+  assert.match(appSource,
+    /deferredStatusRefreshRef\.current\.add\(msg\.sid\)/,
+    "an in-flight old-generation read must schedule an idle follow-up");
+  assert.match(appSource,
+    /focusedEngine !== "codex"[\s\S]*refreshStatus\(\)/,
+    "focused Codex sessions must load quota without opening /status");
+  assert.match(appSource, /statusReport=\{rt\.statusReport\}/);
+  const composerSource = readFileSync(resolve(
+    process.cwd(), "src/components/Composer.tsx"), "utf8");
+  assert.match(composerSource, /<UsageMeter/);
 
   const boundary = new ErrorBoundary({ children: createElement("div") });
   boundary.state = { error: new Error(hiddenDiagnostic) };
