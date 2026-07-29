@@ -31,6 +31,7 @@ from cc_remote.wrapper.codex_handle import (
     _provider_error_diagnostic,
 )
 from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.session_ctx import CodexGoalMutation
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
@@ -3589,6 +3590,8 @@ def test_codex_goal_notifications_are_sanitized_filtered_and_cleared():
             "params": {"threadId": "other-thread", "goal": raw_goal},
         })
         assert seen == []
+        assert handle.goal_revision == 0
+        assert handle.last_goal_turn_id is None
 
         await handle._dispatch({
             "method": "thread/goal/updated",
@@ -3599,6 +3602,8 @@ def test_codex_goal_notifications_are_sanitized_filtered_and_cleared():
         assert seen[0]["tokensUsed"] == 7
         assert "futureSecret" not in seen[0]
         assert handle.last_goal == seen[0]
+        assert handle.goal_revision == 1
+        assert handle.last_goal_turn_id == "turn-1"
 
         await handle._dispatch({
             "method": "thread/goal/cleared",
@@ -3606,6 +3611,8 @@ def test_codex_goal_notifications_are_sanitized_filtered_and_cleared():
         })
         assert seen[-1] is None
         assert handle.last_goal is None
+        assert handle.goal_revision == 2
+        assert handle.last_goal_turn_id is None
 
     asyncio.run(run())
 
@@ -3686,11 +3693,19 @@ def test_codex_goal_auto_turn_claims_session_interrupts_and_completes():
 
         handle._request = request
         set_task = asyncio.create_task(machine._handle_set_goal(SimpleNamespace(
-            sid=ctx.key, client_id="client-1", objective="finish tests",
-            status="active", token_budget=None,
+            sid=ctx.key, client_id="client-1", cmd_id="goal-auto-command",
+            objective="finish tests", status="active", token_budget=None,
         )))
         await entered.wait()
         assert ctx.state == "running"
+        assert ctx.codex_goal_mutation == CodexGoalMutation(
+            command_id="goal-auto-command",
+            client_id="client-1",
+            objective="finish tests",
+            status="active",
+            token_budget=None,
+            goal_revision_before=0,
+        )
 
         # The goal RPC has not returned and turn/started has not arrived yet, but
         # the session is already claimed: no second remote writer can slip in.
@@ -3709,6 +3724,9 @@ def test_codex_goal_auto_turn_claims_session_interrupts_and_completes():
         assert isinstance(result, GoalState)
         assert ctx.state == "running"
         assert ctx.codex_spontaneous_turn_id == "auto-1"
+        assert ctx.codex_goal_mutation is not None
+        assert ctx.codex_goal_mutation.turn_id == "auto-1"
+        assert ctx.codex_goal_mutation.applied is True
 
         await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
         assert ctx.state == "interrupting"
@@ -3725,6 +3743,7 @@ def test_codex_goal_auto_turn_claims_session_interrupts_and_completes():
         await spontaneous_task
         assert ctx.state == "idle"
         assert ctx.codex_spontaneous_turn_id is None
+        assert ctx.codex_goal_mutation is None
         assert [event.state for event in transport.sent
                 if isinstance(event, StateEvent)][-3:] == [
                     "running", "interrupting", "idle",
@@ -4202,6 +4221,141 @@ def test_codex_no_active_turn_rejects_wrong_thread_or_active_status(
         ]
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_repeated_codex_goal_during_auto_turn_is_idempotent():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("goal-repeat", "goal-repeat")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.codex_spontaneous_turn_id = "goal-auto-turn"
+        goal = {
+            "threadId": ctx.session_id,
+            "objective": "finish tests",
+            "status": "active",
+            "engine": "codex",
+            "tokenBudget": 12000,
+            "tokensUsed": 10,
+            "timeUsedSeconds": 2,
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+
+        class Sdk:
+            last_goal = goal
+            goal_revision = 0
+            last_goal_turn_id = None
+
+            async def set_goal(self, **_kwargs):
+                raise AssertionError("an applied Goal must not be submitted again")
+
+        ctx.sdk = Sdk()
+        ctx.codex_goal_mutation = CodexGoalMutation(
+            command_id="goal-command-original",
+            client_id="client-1",
+            objective="finish tests",
+            status="active",
+            token_budget=12000,
+            goal_revision_before=0,
+            turn_id="goal-auto-turn",
+            applied=True,
+        )
+        machine.sessions[ctx.key] = ctx
+
+        repeated = await machine._handle_set_goal(SimpleNamespace(
+            sid=ctx.key,
+            client_id="client-1",
+            cmd_id="goal-command-repeat",
+            objective="finish tests",
+            status="active",
+            token_budget=12000,
+        ))
+        assert isinstance(repeated, GoalState)
+        assert repeated.goal == ThreadGoal(**goal)
+        assert not any(isinstance(event, Error) for event in transport.sent)
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "goal-auto-turn"
+
+        # A cached Goal by itself cannot make an unrelated future mutation look
+        # successful, even when the payload and browser client happen to match.
+        ctx.codex_goal_mutation = None
+        stale = await machine._handle_set_goal(SimpleNamespace(
+            sid=ctx.key,
+            client_id="client-1",
+            cmd_id="goal-command-stale",
+            objective="finish tests",
+            status="active",
+            token_budget=12000,
+        ))
+        assert isinstance(stale, Error)
+        assert stale.code == "busy"
+
+        changed = await machine._handle_set_goal(SimpleNamespace(
+            sid=ctx.key,
+            client_id="client-1",
+            cmd_id="goal-command-change",
+            objective="ship release",
+            status="active",
+            token_budget=12000,
+        ))
+        assert isinstance(changed, Error)
+        assert changed.code == "busy"
+
+    asyncio.run(run())
+
+
+def test_codex_goal_lost_response_reconciles_live_notification():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("goal-lost-response", "goal-lost-response")
+        ctx.engine = "codex"
+        goal = {
+            "threadId": ctx.session_id,
+            "objective": "finish tests",
+            "status": "active",
+            "engine": "codex",
+            "tokenBudget": 12000,
+            "tokensUsed": 10,
+            "timeUsedSeconds": 2,
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+
+        class Sdk:
+            goal_revision = 0
+            last_goal_turn_id = None
+            last_goal = None
+            turn_active = True
+
+            async def set_goal(self, **_kwargs):
+                self.last_goal = goal
+                self.goal_revision = 1
+                self.last_goal_turn_id = "goal-auto-turn"
+                ctx.codex_spontaneous_turn_id = "goal-auto-turn"
+                assert ctx.codex_goal_mutation is not None
+                ctx.codex_goal_mutation.turn_id = "goal-auto-turn"
+                raise TimeoutError("response lost after app-server applied Goal")
+
+        ctx.sdk = Sdk()
+        machine.sessions[ctx.key] = ctx
+        result = await machine._handle_set_goal(SimpleNamespace(
+            sid=ctx.key,
+            client_id="client-1",
+            cmd_id="goal-command",
+            objective="finish tests",
+            status="active",
+            token_budget=12000,
+        ))
+
+        assert isinstance(result, GoalState)
+        assert result.goal == ThreadGoal(**goal)
+        assert ctx.state == "running"
+        assert ctx.codex_goal_mutation is not None
+        assert ctx.codex_goal_mutation.applied is True
+        assert not any(isinstance(event, Error) for event in transport.sent)
 
     asyncio.run(run())
 

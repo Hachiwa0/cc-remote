@@ -624,6 +624,13 @@ assert.equal(isKnownCodeOnlySlash("my-personal-skill", "claude"), false,
 assert.deepEqual(matchCommands("", "claude", "work").map((command) => command.slash),
   claudeWorkSlashes);
 assert.deepEqual(matchCommands("pla", "codex", "work"), []);
+assert.match(historyAppSource,
+  /command\.kind === "resume"[\s\S]{0,300}focusedEngine === "codex"[\s\S]{0,160}sendSetGoal\(null, "active", null\)/,
+  "Codex /goal resume must reactivate the existing Goal without replacing its objective");
+const codexGoalDescription = commandsFor("codex").flatMap((command) =>
+  "slash" in command && command.slash === "goal" ? [command.ds] : [])[0] ?? "";
+assert.match(codexGoalDescription, /\/goal resume/,
+  "the Codex command palette must advertise /goal resume");
 assert.doesNotMatch(historyAppSource, /openClaudeRewind|openLatestClaudeRewind/,
   "Claude rewind must not have an App entry point while unsupported");
 assert.doesNotMatch(rewindChatViewSource, /onRewind|回到这里/,

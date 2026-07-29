@@ -23,6 +23,20 @@ from cc_remote.wrapper.stream import StreamTranslator
 
 
 @dataclass
+class CodexGoalMutation:
+    """Identity and proof boundary for one in-flight Goal mutation."""
+
+    command_id: Optional[str]
+    client_id: Optional[str]
+    objective: Optional[str]
+    status: Optional[str]
+    token_budget: Optional[int]
+    goal_revision_before: int
+    turn_id: Optional[str] = None
+    applied: bool = False
+
+
+@dataclass
 class SessionContext:
     # None until the first ResultMessage/init SystemMessage captures the real id
     # (a brand-new session). A resumed session knows its id at spawn time.
@@ -91,6 +105,10 @@ class SessionContext:
     # managed turn stream so the session remains single-writer and interruptible.
     codex_spontaneous_turn_id: Optional[str] = None
     codex_spontaneous_task: Optional[asyncio.Task] = None
+    # A matching cached Goal is not proof that the current command applied it.
+    # Keep the exact command scope and the automatic turn claimed while its RPC
+    # was in flight; retries are idempotent only while that turn remains live.
+    codex_goal_mutation: Optional[CodexGoalMutation] = None
     # ``turn/steer`` can accept localImage paths and consume them after the RPC
     # response. Keep Code's private attachment directories alive until the
     # enclosing native turn reaches its authoritative terminal boundary.

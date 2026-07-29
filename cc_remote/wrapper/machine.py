@@ -144,7 +144,7 @@ from cc_remote.wrapper.rollback_commands import (
     RollbackJournalError,
 )
 from cc_remote.wrapper.session import load_session_id, save_session_id
-from cc_remote.wrapper.session_ctx import SessionContext
+from cc_remote.wrapper.session_ctx import CodexGoalMutation, SessionContext
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
@@ -8191,6 +8191,8 @@ class WrapperMachine:
         broadcasts normal-session updates to every signed-in client and
         automatically routes private /btw updates to their owning client.
         """
+        if goal is None:
+            ctx.codex_goal_mutation = None
         await self._emit(ctx, GoalState(goal=goal))
 
     async def _on_codex_runtime_event(
@@ -8284,6 +8286,13 @@ class WrapperMachine:
                     else True
                 ),
             )
+            mutation = ctx.codex_goal_mutation
+            if (
+                mutation is not None
+                and mutation.turn_id is None
+                and ctx.state == "running"
+            ):
+                mutation.turn_id = turn_id
             if ctx.turn_task is not None and not ctx.codex_account_handoff:
                 # A user send claimed the session but has not reached turn/start
                 # yet (otherwise CodexHandle.turn_active would already be true).
@@ -8328,6 +8337,9 @@ class WrapperMachine:
             turn_id,
             reason="automatic turn began before Remote could capture a pre-image",
         )
+        mutation = ctx.codex_goal_mutation
+        if mutation is not None and mutation.turn_id == turn_id:
+            ctx.codex_goal_mutation = None
         ctx.codex_spontaneous_turn_id = None
         self._release_codex_turn(ctx, turn_id)
         current = asyncio.current_task()
@@ -9342,6 +9354,64 @@ class WrapperMachine:
         await self._emit(ctx, error)
         return error
 
+    @staticmethod
+    def _codex_goal_update_already_applied(
+        ctx: SessionContext, cmd,
+    ) -> Optional[dict]:
+        """Prove a retried Goal mutation owns the currently live auto-turn."""
+        mutation = ctx.codex_goal_mutation
+        if ctx.state != "running" or mutation is None:
+            return None
+        requested_command_id = getattr(cmd, "cmd_id", None)
+        requested_client_id = getattr(cmd, "client_id", None)
+        same_command = bool(
+            requested_command_id
+            and requested_command_id == mutation.command_id
+        )
+        same_client_retry = requested_client_id == mutation.client_id
+        if not same_command and not same_client_retry:
+            return None
+        if (
+            getattr(cmd, "objective", None) != mutation.objective
+            or getattr(cmd, "status", None) != mutation.status
+            or getattr(cmd, "token_budget", None) != mutation.token_budget
+        ):
+            return None
+        if (
+            not mutation.turn_id
+            or ctx.codex_spontaneous_turn_id != mutation.turn_id
+        ):
+            return None
+        current_goal_revision = int(
+            getattr(ctx.sdk, "goal_revision", 0) or 0
+        )
+        notification_proves_apply = (
+            current_goal_revision > mutation.goal_revision_before
+        )
+        if not mutation.applied and not notification_proves_apply:
+            return None
+        notified_turn_id = getattr(ctx.sdk, "last_goal_turn_id", None)
+        if (
+            notification_proves_apply
+            and notified_turn_id is not None
+            and notified_turn_id != mutation.turn_id
+        ):
+            return None
+        goal = getattr(ctx.sdk, "last_goal", None)
+        if not isinstance(goal, dict):
+            return None
+        if goal.get("threadId") != (ctx.session_id or ctx.key):
+            return None
+        requested = (
+            ("objective", mutation.objective),
+            ("status", mutation.status),
+            ("tokenBudget", mutation.token_budget),
+        )
+        supplied = [(key, value) for key, value in requested if value is not None]
+        if not supplied or any(goal.get(key) != value for key, value in supplied):
+            return None
+        return goal
+
     async def _handle_get_goal(self, cmd) -> None:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
@@ -9429,12 +9499,32 @@ class WrapperMachine:
             # interrupt wait until the authoritative automatic turn id is known.
             async with ctx.launch_lock:
                 if ctx.state != "idle":
+                    # The browser may retry after receiving GoalState but before
+                    # its CommandAck, or two taps may enqueue equivalent command
+                    # ids. The first set has already started the automatic turn,
+                    # so rejecting the identical mutation as busy produces a
+                    # false failure banner even though the Goal is active.
+                    applied = self._codex_goal_update_already_applied(ctx, cmd)
+                    if applied is not None:
+                        event = GoalState(goal=applied)
+                        await self._emit(ctx, event)
+                        return event
                     error = Error(
                         code=ERR_BUSY, message="该会话正忙,先 interrupt",
                         request_id=getattr(cmd, "cmd_id", None),
                         to=getattr(cmd, "client_id", None))
                     await self._emit(ctx, error)
                     return error
+                ctx.codex_goal_mutation = CodexGoalMutation(
+                    command_id=getattr(cmd, "cmd_id", None),
+                    client_id=getattr(cmd, "client_id", None),
+                    objective=getattr(cmd, "objective", None),
+                    status=getattr(cmd, "status", None),
+                    token_budget=getattr(cmd, "token_budget", None),
+                    goal_revision_before=int(
+                        getattr(ctx.sdk, "goal_revision", 0) or 0
+                    ),
+                )
                 ctx.interrupt_event.clear()
                 ctx.interrupt_deadline = None
                 ctx.state = "running"
@@ -9442,20 +9532,42 @@ class WrapperMachine:
                 goal = await ctx.sdk.set_goal(
                     objective=cmd.objective, status=cmd.status,
                     token_budget=cmd.token_budget)
+                mutation = ctx.codex_goal_mutation
+                if mutation is not None:
+                    mutation.applied = True
                 automatic_turn_live = bool(
                     ctx.codex_spontaneous_turn_id
                     or getattr(ctx.sdk, "turn_active", False))
-                if not automatic_turn_live and ctx.state != "idle":
-                    await self._set_idle_after_managed_turn(ctx)
+                if automatic_turn_live:
+                    if (
+                        mutation is not None
+                        and mutation.turn_id is None
+                        and ctx.codex_spontaneous_turn_id is not None
+                    ):
+                        mutation.turn_id = ctx.codex_spontaneous_turn_id
+                else:
+                    ctx.codex_goal_mutation = None
+                    if ctx.state != "idle":
+                        await self._set_idle_after_managed_turn(ctx)
             event = GoalState(goal=goal)
             await self._emit(ctx, event)
             return event
         except Exception as exc:
+            applied = self._codex_goal_update_already_applied(ctx, cmd)
+            if applied is not None:
+                mutation = ctx.codex_goal_mutation
+                if mutation is not None:
+                    mutation.applied = True
+                event = GoalState(goal=applied)
+                await self._emit(ctx, event)
+                return event
             automatic_turn_live = bool(
                 ctx.codex_spontaneous_turn_id
                 or getattr(ctx.sdk, "turn_active", False))
-            if not automatic_turn_live and ctx.state != "idle":
-                await self._set_state(ctx, "idle")
+            if not automatic_turn_live:
+                ctx.codex_goal_mutation = None
+                if ctx.state != "idle":
+                    await self._set_state(ctx, "idle")
             log.warning("set_goal failed", error_type=type(exc).__name__)
             return await self._emit_goal_error(ctx, cmd, "设置 Goal 失败")
 
@@ -9502,6 +9614,7 @@ class WrapperMachine:
         try:
             async with ctx.launch_lock:
                 await ctx.sdk.clear_goal()
+            ctx.codex_goal_mutation = None
             # Clearing the condition does not necessarily stop the already-live
             # automatic turn. Route it through the normal interrupt state machine
             # so the thread cannot keep writing invisibly after the UI says clear.
