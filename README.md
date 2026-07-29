@@ -4,7 +4,7 @@
 
 自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web
 
-**当前版本：v3.0.0** · Wire protocol v22
+**当前版本：v3.0.0** · Wire protocol v24
 
 [English](README_en.md) ·
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
@@ -58,7 +58,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
 | **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
 | **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
-| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v22。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
+| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v24。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
 
 > **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在
 > wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
@@ -80,7 +80,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。 |
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
 | **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Codex 支持主动 compact、原生 Review，以及在 Git 仓库中派生到独立 worktree。 |
-| **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 通过 `/permissions` 控制审批并继承本机 Sandbox 配置；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
+| **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 的 `/permissions` 在同一紧凑面板中分别控制审批策略、官方执行环境 profile 和 Cached/Live 网页搜索；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
 | **真实扩展目录** | 通过 `/extensions`、`/skills`、`/plugins`、`/apps`、`/mcp`、`/hooks` 按需读取当前引擎目录。Code 中可按引擎能力管理 Skills、插件和 Claude Hooks；Codex Hooks 受官方接口限制为只读。Work 为避免改变私有工作环境，只读展示全部扩展。 |
 | **连续性** | 后台会话继续运行，多端实时同步；浏览器本地投影先绘制，wrapper 从 Claude transcript / Codex rollout 的物化摘要索引分页校验，断线后只按游标补实时尾巴。 |
 | **多机器与 PWA** | 一个 relay 可连接多个具名 wrapper；可选账号策略把用户限制到指定机器。网页可安装为 PWA；通知默认使用不含会话信息的通用模式，也可由用户主动开启安全截断的会话名称与精确跳转。 |
@@ -184,9 +184,9 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ![可折叠的计划、Hook 和工具调用处理过程](assets/readme-process-timeline.jpg)
 
-### Codex 会话级控制：模型、思考、权限与状态
+### Codex 会话级控制：模型、思考、权限、搜索与状态
 
-模型、思考强度、服务档位和权限都绑定当前会话；可以在不改本机全局配置的情况下调整下一回合。Codex 运行中按 Enter 默认引导当前任务，仍可切换为排队，空输入时的停止按钮不会隐式发送；输入区同时提供附件、上下文占用以及 `/goal`、`/status` 等命令入口。
+模型、思考强度、服务档位和权限都绑定当前会话；可以在不改本机全局配置的情况下调整下一回合。Codex 的“审批策略”和“执行环境”是两件事：`never` / `on-request` / `untrusted` 决定何时询问，Read Only / Workspace / Full Access 或自定义 named profile 决定文件系统和网络边界。`/permissions` 把两者与 Cached/Live 网页搜索放在同一个弹层中，不占用手机端输入栏宽度。Codex 运行中按 Enter 默认引导当前任务，仍可切换为排队，空输入时的停止按钮不会隐式发送；输入区同时提供附件、上下文占用以及 `/goal`、`/status` 等命令入口。
 
 ![Codex 模型选择和会话控制](assets/readme-model-controls.jpg)
 
@@ -401,12 +401,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v22**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v24**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v22 relay 和
-> v22 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v24 relay 和
+> v24 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
 
 ### 3）上传 staging，由原子 release 安装器发布
 
@@ -460,7 +460,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v22 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v24 wrapper。
 
 验证：
 
@@ -620,7 +620,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 
 > **cc-remote 会让远端的人在你机器上跑任意命令。请当成「给别人一个你机器的 shell」来对待。**
 
-- Code 会话仍是远程开发控制面：Claude 默认使用 `permissionMode: bypassPermissions`；Codex 默认审批策略是 `never` 并继承本机 Codex sandbox 配置，也可切到 `on-request` / `untrusted`。**能登录且能进入 Code 的人，仍应等同于拿到了这台机器的远程 agent/shell 权限。** Work 会话使用独立私有根目录且不开放外部目录，但这只是缩小默认能力面，不替代操作系统级的独立用户、容器或虚拟机隔离。
+- Code 会话仍是远程开发控制面：Claude 默认使用 `permissionMode: bypassPermissions`；Codex 默认审批策略是 `never`，并可在 app-server 对当前 cwd 允许的 named permission profile 中选择执行环境。审批策略不会扩大 profile 的边界，Full Access 则会显著扩大能力。**能登录且能进入 Code 的人，仍应等同于拿到了这台机器的远程 agent/shell 权限。** Work 会话使用固定的 `cc_remote_work` profile、独立私有根目录且不开放外部目录，但这只是缩小默认能力面，不替代操作系统级的独立用户、容器或虚拟机隔离。
 - `LOGIN_PASSWORD` / `LOGIN_USERS_JSON`、`WRAPPER_TOKEN` / `WRAPPER_TOKENS_JSON` 和 `SESSION_SECRET` 是认证边界：用强随机值、别提交 git、别贴到聊天里、定期轮换。仓库 `.env` 只适合本机开发；生产 wrapper 必须使用上述 root-only `/etc/cc-remote/wrapper.env`。systemd 模板会禁止服务及模型子进程读取这个源文件和遗留仓库 `.env`；Linux wrapper 还会关闭 dumpability，避免子进程从 `/proc/<pid>/environ` 或进程内存取回已经捕获的 token。
 - 公网必须上 TLS（`wss://`，本仓库用 Caddy 自动签证书）。只有明确需要临时使用公网 IPv4 + 明文 HTTP/WS 时才设 `ALLOW_INSECURE_HTTP=1`；开启后登录口令、cookie、wrapper token 和全部会话流量都不加密，应尽快切回 TLS。`ALLOW_PRIVATE_ORIGINS=1` 只为同端口私网字面 IP 增加与实际请求目标一致的直连入口，不会放宽公网域名校验；Cookie 的 `Secure` 属性按受信请求传输判断，不读取调用者提供的 Origin。但使用内网 HTTP 时，登录口令、cookie 和会话内容在该网络中仍是明文。
 - 建议：给中继加 IP 白名单 / 只在需要时开、给登录加失败限速（已内置每 IP 每分钟 5 次）。

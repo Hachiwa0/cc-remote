@@ -3,12 +3,22 @@ import { createRoot } from "react-dom/client";
 
 import "../src/index.css";
 import { OMITTED_PROCESS_ITEM_ID, type Turn } from "../src/reducer";
-import type { QueryImg } from "../src/protocol";
+import type {
+  PermissionProfileInfo,
+  QueryFile,
+  QueryImg,
+  Space,
+} from "../src/protocol";
 import {
   ChatView,
 } from "../src/components/ChatView";
 import type { TextSelectionGuard } from "../src/history-selection-guard";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
+import { UsageMeter } from "../src/components/UsageMeter";
+import { NewChatView } from "../src/components/NewChatView";
+
+const LONG_PERMISSION_PROFILE_ID =
+  `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
 
 const ROBOT_CORE_MERMAID_SOURCE = `flowchart TB
     USER["任务入口<br/>语音 · 文本 · App · API"]
@@ -364,6 +374,9 @@ export function HistoryBrowserFixture() {
   const mermaidHistory = params.has("mermaid-history");
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
+  const quotaComposer = params.has("quota-composer");
+  const newChatControls = params.has("newchat-controls");
+  const longProfile = params.has("long-profile");
   const recoveryReplacement = params.has("recovery-replace");
   const deepBrowse = params.has("deep-browse");
   const runtimeBrowse = params.has("runtime-browse");
@@ -471,6 +484,29 @@ export function HistoryBrowserFixture() {
     [],
   );
   const [composerExpanded, setComposerExpanded] = useState(false);
+  const [newChatSurface, setNewChatSurface] = useState<{
+    machine: string;
+    engine: "claude" | "codex";
+    space: Space;
+  }>({
+    machine: "machine-a",
+    engine: "codex",
+    space: "code",
+  });
+  const [newChatSubmission, setNewChatSubmission] =
+    useState<Record<string, unknown> | null>(null);
+  const newChatProfiles = useMemo<PermissionProfileInfo[]>(() => [
+    { id: ":read-only", allowed: true },
+    { id: ":workspace", allowed: true },
+    { id: ":danger-full-access", allowed: true },
+    ...(longProfile
+      ? [{
+          id: LONG_PERMISSION_PROFILE_ID,
+          description: "A deliberately long custom execution profile",
+          allowed: true,
+        }]
+      : []),
+  ], [longProfile]);
   const [pendingImages, setPendingImages] = useState<QueryImg[]>(() =>
     composerAttachment ? [{
       media_type: "image/png",
@@ -792,6 +828,39 @@ export function HistoryBrowserFixture() {
           onClick={replaceHistoryRevision}>
           replace revision
         </button>
+        {newChatControls && (
+          <>
+            <button data-testid="switch-newchat-device" type="button"
+              onClick={() => setNewChatSurface((current) => ({
+                ...current,
+                machine: current.machine === "machine-a"
+                  ? "machine-b" : "machine-a",
+              }))}>
+              switch new-chat device
+            </button>
+            <button data-testid="switch-newchat-engine" type="button"
+              onClick={() => setNewChatSurface((current) => ({
+                ...current,
+                engine: current.engine === "codex" ? "claude" : "codex",
+              }))}>
+              switch new-chat engine
+            </button>
+            <button data-testid="switch-newchat-space" type="button"
+              onClick={() => setNewChatSurface((current) => ({
+                ...current,
+                space: current.space === "code" ? "work" : "code",
+              }))}>
+              switch new-chat space
+            </button>
+            <output data-testid="newchat-scope">{
+              `${newChatSurface.machine}:${newChatSurface.space}:`
+              + newChatSurface.engine
+            }</output>
+            <output data-testid="newchat-submission">{
+              JSON.stringify(newChatSubmission)
+            }</output>
+          </>
+        )}
         {composerAttachment && (
           <div className="attach show" data-testid="fixture-attachments">
             <PendingImageAttachments images={pendingImages}
@@ -814,27 +883,65 @@ export function HistoryBrowserFixture() {
           </button>
         )}
       </div>
-      <ChatView
-        sid={sid}
-        turns={active.turns}
-        engine={timelineEngine}
-        hasMore={active.hasMore}
-        historyRevision={historyRevision}
-        historyViewRevision={historyViewRevision}
-        historyViewId={deepBrowse || browseMode ? historyViewId : undefined}
-        historyScopeKey="fixture-history-scope"
-        historyWindowEpoch={active.windowEpoch ?? 0}
-        historyCursor={active.cursor}
-        browseMode={browseMode && sid.endsWith("-a")}
-        hasNewer={!!active.hasNewer}
-        onLoadMore={loadMore}
-        onLoadNewer={loadNewer}
-        onReturnLatest={returnLatest}
-        onLoadDetail={detailPaging ? loadDetail : undefined}
-        onTextSelectionGuardChange={updateTextSelectionGuard}
-        onEdit={() => {}}
-        onGetDiff={() => {}}
-      />
+      {newChatControls ? (
+        <div data-testid="newchat-controls-fixture"
+          style={{ flex: 1, minHeight: 0, display: "flex" }}>
+          <NewChatView
+            cwd="/tmp/project"
+            controlScopeKey={
+              `${newChatSurface.machine}:${newChatSurface.space}:`
+              + newChatSurface.engine
+            }
+            engine={newChatSurface.engine}
+            space={newChatSurface.space}
+            autoFocus={false}
+            permissionProfiles={newChatProfiles}
+            onPickCwd={() => {}}
+            onSend={(
+              prompt: string,
+              _images?: QueryImg[],
+              _files?: QueryFile[],
+              collaborationMode?: string,
+              permissionMode?: string,
+              permissionProfile?: string,
+              webSearch?: string,
+              serviceTier?: string,
+            ) => {
+              setNewChatSubmission({
+                prompt,
+                collaborationMode,
+                permissionMode,
+                permissionProfile,
+                webSearch,
+                serviceTier,
+              });
+              return false;
+            }}
+          />
+        </div>
+      ) : (
+        <ChatView
+          sid={sid}
+          turns={active.turns}
+          engine={timelineEngine}
+          hasMore={active.hasMore}
+          historyRevision={historyRevision}
+          historyViewRevision={historyViewRevision}
+          historyViewId={deepBrowse || browseMode ? historyViewId : undefined}
+          historyScopeKey="fixture-history-scope"
+          historyWindowEpoch={active.windowEpoch ?? 0}
+          historyCursor={active.cursor}
+          browseMode={browseMode && sid.endsWith("-a")}
+          hasNewer={!!active.hasNewer}
+          onLoadMore={loadMore}
+          onLoadNewer={loadNewer}
+          onReturnLatest={returnLatest}
+          onLoadDetail={detailPaging ? loadDetail : undefined}
+          onTextSelectionGuardChange={updateTextSelectionGuard}
+          onEdit={() => {}}
+          onGetDiff={() => {}}
+        />
+      )}
       {composerResize && (
         <div data-testid="fixture-composer" style={{
           flex: "none",
@@ -845,6 +952,41 @@ export function HistoryBrowserFixture() {
             onClick={() => setComposerExpanded((current) => !current)}>
             toggle composer actions
           </button>
+        </div>
+      )}
+      {quotaComposer && (
+        <div className="composer" data-testid="quota-composer">
+          <div className="composer-in">
+            <div className="hint">
+              <button className="hint-mode" type="button">
+                Full access · idle <span className="hint-mode-ch">▾</span>
+              </button>
+              <span className="hint-kbds">keyboard shortcuts</span>
+              <div className="hint-right">
+                <button className="hint-ctl" type="button">
+                  gpt-5.6-codex
+                </button>
+                <button className="hint-ctl" type="button">xhigh</button>
+                <button className="hint-ctl fast-chip" type="button">
+                  standard
+                </button>
+                <UsageMeter
+                  open={false}
+                  report={null}
+                  onToggle={() => {}}
+                  onRefresh={() => {}}
+                />
+                <button className="hint-ring" type="button"
+                  aria-label="context usage">
+                  <svg viewBox="0 0 36 36" width="20" height="20"
+                    aria-hidden="true">
+                    <circle className="hr-track" cx="18" cy="18" r="15" />
+                    <circle className="hr-fill" cx="18" cy="18" r="15" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </main>

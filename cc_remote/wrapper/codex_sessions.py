@@ -206,6 +206,12 @@ def codex_approval(default: str = "never") -> str:
     return value if value in {"untrusted", "on-request", "never"} else default
 
 
+def codex_web_search(default: str = "cached") -> str:
+    """The top-level search mode inherited by a new no-override thread."""
+    value = _config_value("web_search", default)
+    return value if value in {"cached", "live"} else default
+
+
 def codex_session_settings(
     session_id: str, max_bytes: int = 64 * 1024 * 1024,
 ) -> dict:
@@ -307,6 +313,18 @@ def codex_session_settings(
                     mode = collaboration.get("mode")
                     if mode in ("default", "plan"):
                         out["collaboration_mode"] = mode
+                # Only thread_settings_applied contains the selected profile id.
+                # turn_context.permission_profile is the expanded policy object
+                # and intentionally has no stable profile provenance.
+                if effort_key == "reasoning_effort":
+                    active_profile = payload.get("active_permission_profile")
+                    if isinstance(active_profile, dict):
+                        profile_id = active_profile.get("id")
+                        if (isinstance(profile_id, str) and profile_id
+                                and len(profile_id) <= 256):
+                            out["permission_profile"] = profile_id
+                    elif "active_permission_profile" in payload:
+                        out["permission_profile"] = None
     except Exception as e:
         log.warning("read codex session settings failed", session_id=session_id, error=str(e))
     return out

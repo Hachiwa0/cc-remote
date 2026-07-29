@@ -20,7 +20,9 @@ export type WriteState = "writable" | "read_only" | "takeover_pending" | "input_
 export type ServiceTier = "" | "default" | "fast" | "toggle";
 export type DiffTheme = "light" | "dark";
 export type CodexPermissionMode = "never" | "on-request" | "untrusted";
+export type CodexPermissionProfileId = string;
 export type CodexServiceTier = "default" | "fast";
+export type CodexWebSearchMode = "cached" | "live";
 export type NoticeSeverity = "info" | "warning";
 export type NoticeCategory = "runtime" | "guardian" | "config" | "deprecation" | "security" | "rate_limit";
 
@@ -221,6 +223,8 @@ export interface NewSession extends Base {
   effort?: string | null;
   collaboration_mode?: CollaborationModeName | null;
   permission_mode?: CodexPermissionMode | null;
+  permission_profile?: CodexPermissionProfileId | null;
+  web_search?: CodexWebSearchMode | null;
   service_tier?: CodexServiceTier | null;
   prompt?: string | null;
   msg_id?: string | null;
@@ -284,6 +288,38 @@ export interface ListDir extends Base { type: "list_dir"; path?: string | null }
 export interface DirList extends Base { type: "dir_list"; path: string; parent?: string | null; dirs: DirEntry[] }
 export interface SetPerm extends Base { type: "set_perm"; mode: PermissionMode }
 export interface Perm extends Base { type: "perm"; mode: string }
+export interface PermissionProfileInfo {
+  id: CodexPermissionProfileId;
+  description?: string | null;
+  allowed: boolean;
+}
+export interface GetPermissionProfiles extends Base {
+  type: "get_permission_profiles";
+  client_id?: string | null;
+  cwd?: string | null;
+}
+export interface PermissionProfiles extends Base {
+  type: "permission_profiles";
+  profiles: PermissionProfileInfo[];
+  request_id?: string | null;
+  cwd?: string | null;
+}
+export interface SetPermissionProfile extends Base {
+  type: "set_permission_profile";
+  profile: CodexPermissionProfileId;
+}
+export interface PermissionProfile extends Base {
+  type: "permission_profile";
+  profile?: CodexPermissionProfileId | null;
+}
+export interface SetWebSearch extends Base {
+  type: "set_web_search";
+  mode: CodexWebSearchMode;
+}
+export interface WebSearch extends Base {
+  type: "web_search";
+  mode: CodexWebSearchMode;
+}
 export interface GetContext extends Base { type: "get_context" }
 export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: DiffTheme }
 export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string; request_id?: string }
@@ -387,6 +423,7 @@ export interface StatusRuntime {
   reasoning_effort?: string | null;
   service_tier?: string | null;
   approval_policy?: string | null;
+  permission_profile?: string | null;
   sandbox_mode?: string | null;
   web_search?: string | null;
 }
@@ -397,6 +434,8 @@ export interface StatusRateLimit { limit_id?: string | null; limit_name?: string
 export interface StatusUsage { lifetime_tokens?: number | null; current_streak_days?: number | null; longest_streak_days?: number | null; peak_daily_tokens?: number | null; longest_running_turn_sec?: number | null }
 export interface StatusReport extends Base {
   type: "status_report";
+  /** Echoes the GetStatus command id; absent for unsolicited reports. */
+  request_id?: string | null;
   thread: StatusThread;
   runtime: StatusRuntime;
   context: StatusContext;
@@ -444,7 +483,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | AskUserClosed | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionActivity | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
@@ -452,7 +491,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 22;
+export const PROTOCOL_VERSION = 24;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

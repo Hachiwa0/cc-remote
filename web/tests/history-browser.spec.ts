@@ -1842,3 +1842,196 @@ test("composer action growth keeps the live tail visible without stealing histor
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 });
+
+test("Codex quota controls fit a 320 px composer", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 720 });
+  await page.goto("/tests/history-browser.html?quota-composer=1");
+
+  const composer = page.getByTestId("quota-composer");
+  await expect(composer.locator(".usage-meter")).toBeVisible();
+  await expect(composer.locator(".hint-ring")).toBeVisible();
+
+  const layout = await composer.evaluate((node) => {
+    const footer = node.getBoundingClientRect();
+    const right = node.querySelector<HTMLElement>(".hint-right")
+      ?.getBoundingClientRect();
+    return {
+      clientWidth: node.clientWidth,
+      scrollWidth: node.scrollWidth,
+      rightLeft: right?.left ?? -1,
+      rightRight: right?.right ?? -1,
+      rightWidth: right?.width ?? 0,
+      footerLeft: footer.left,
+      footerRight: footer.right,
+    };
+  });
+  expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth);
+  expect(layout.rightLeft).toBeGreaterThanOrEqual(layout.footerLeft);
+  expect(layout.rightRight).toBeLessThanOrEqual(layout.footerRight);
+  expect(layout.rightWidth).toBeGreaterThan(280);
+});
+
+async function chooseDangerousNewChatControls(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  await page.locator(".newchat-access").click();
+  const dialog = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: /On Request/ }).click();
+  await dialog.getByRole("button", { name: /Full Access/ }).click();
+  await dialog.getByRole("button", { name: "Live", exact: true }).click();
+  await page.locator(".scrim.show").click({ position: { x: 8, y: 8 } });
+  await expect(dialog).not.toHaveClass(/(?:^|\s)show(?:\s|$)/);
+  await expect(page.locator(".newchat-access")).toContainText("Full Access");
+}
+
+let newChatSubmissionSequence = 0;
+
+async function submitNewChatFixture(
+  page: import("@playwright/test").Page,
+): Promise<Record<string, unknown>> {
+  const prompt = `verify scoped controls ${++newChatSubmissionSequence}`;
+  await page.locator(".newchat-input").fill(prompt);
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  await expect(page.getByTestId("newchat-submission")).toContainText(prompt);
+  return JSON.parse(
+    await page.getByTestId("newchat-submission").innerText(),
+  ) as Record<string, unknown>;
+}
+
+test("new-chat controls reset across device authorization scopes", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await chooseDangerousNewChatControls(page);
+
+  await page.getByTestId("switch-newchat-device").click();
+  await expect(page.getByTestId("newchat-scope"))
+    .toHaveText("machine-b:code:codex");
+  await expect(page.locator(".newchat-access")).toContainText("默认环境");
+
+  const submitted = await submitNewChatFixture(page);
+  expect(submitted.permissionMode).toBe("never");
+  expect(submitted).not.toHaveProperty("permissionProfile");
+  expect(submitted).not.toHaveProperty("webSearch");
+});
+
+test("new-chat controls reset across engine authorization scopes", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await chooseDangerousNewChatControls(page);
+
+  await page.getByTestId("switch-newchat-engine").click();
+  await expect(page.getByTestId("newchat-scope"))
+    .toHaveText("machine-a:code:claude");
+  await expect(page.locator(".newchat-access")).toHaveCount(0);
+  const claudeSubmission = await submitNewChatFixture(page);
+  expect(claudeSubmission).not.toHaveProperty("permissionMode");
+
+  await page.getByTestId("switch-newchat-engine").click();
+  await expect(page.locator(".newchat-access")).toContainText("默认环境");
+  const codexSubmission = await submitNewChatFixture(page);
+  expect(codexSubmission.permissionMode).toBe("never");
+  expect(codexSubmission).not.toHaveProperty("permissionProfile");
+  expect(codexSubmission).not.toHaveProperty("webSearch");
+});
+
+test("new-chat controls reset and normalize across Code and Work", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await chooseDangerousNewChatControls(page);
+
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(page.getByTestId("newchat-scope"))
+    .toHaveText("machine-a:work:codex");
+  await expect(page.locator(".newchat-access")).toHaveCount(0);
+  const workSubmission = await submitNewChatFixture(page);
+  expect(workSubmission.permissionMode).toBe("never");
+  expect(workSubmission).not.toHaveProperty("permissionProfile");
+  expect(workSubmission).not.toHaveProperty("webSearch");
+
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(page.locator(".newchat-access")).toContainText("默认环境");
+});
+
+test("a 256-character profile id fits a 296 px new-chat row", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 296, height: 720 });
+  await page.goto(
+    "/tests/history-browser.html?newchat-controls=1&long-profile=1",
+  );
+  await page.locator(".newchat-access").click();
+  const customProfile = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  }).locator('button[title^="custom-profile-"]');
+  const profileRow = await customProfile.evaluate((button) => {
+    const sheet = button.closest<HTMLElement>(".sheet");
+    const name = button.querySelector<HTMLElement>(".cmd-nm");
+    if (!sheet || !name) {
+      throw new Error("permission-profile sheet row is incomplete");
+    }
+    const rowRect = button.getBoundingClientRect();
+    const sheetRect = sheet.getBoundingClientRect();
+    const nameStyle = getComputedStyle(name);
+    return {
+      viewportWidth: window.innerWidth,
+      pageScrollWidth: document.documentElement.scrollWidth,
+      sheetClientWidth: sheet.clientWidth,
+      sheetScrollWidth: sheet.scrollWidth,
+      rowLeft: rowRect.left,
+      rowRight: rowRect.right,
+      sheetLeft: sheetRect.left,
+      sheetRight: sheetRect.right,
+      nameClientWidth: name.clientWidth,
+      nameScrollWidth: name.scrollWidth,
+      nameOverflow: nameStyle.overflow,
+      nameTextOverflow: nameStyle.textOverflow,
+      titleLength: Array.from(button.getAttribute("title") ?? "").length,
+    };
+  });
+  expect(profileRow.pageScrollWidth).toBeLessThanOrEqual(
+    profileRow.viewportWidth);
+  expect(profileRow.sheetScrollWidth).toBeLessThanOrEqual(
+    profileRow.sheetClientWidth);
+  expect(profileRow.rowLeft).toBeGreaterThanOrEqual(profileRow.sheetLeft);
+  expect(profileRow.rowRight).toBeLessThanOrEqual(profileRow.sheetRight);
+  expect(profileRow.nameScrollWidth).toBeGreaterThan(
+    profileRow.nameClientWidth);
+  expect(profileRow.nameOverflow).toBe("hidden");
+  expect(profileRow.nameTextOverflow).toBe("ellipsis");
+  expect(profileRow.titleLength).toBe(256);
+  await customProfile.click();
+  await page.locator(".scrim.show").click({ position: { x: 8, y: 8 } });
+
+  const layout = await page.getByTestId("newchat-controls-fixture")
+    .evaluate((node) => {
+      const card = node.querySelector<HTMLElement>(".newchat-card");
+      const access = node.querySelector<HTMLElement>(".newchat-access");
+      if (!card || !access) throw new Error("new-chat controls are missing");
+      const cardRect = card.getBoundingClientRect();
+      const accessRect = access.getBoundingClientRect();
+      return {
+        fixtureClientWidth: node.clientWidth,
+        fixtureScrollWidth: node.scrollWidth,
+        cardClientWidth: card.clientWidth,
+        cardScrollWidth: card.scrollWidth,
+        accessLeft: accessRect.left,
+        accessRight: accessRect.right,
+        cardLeft: cardRect.left,
+        cardRight: cardRect.right,
+        label: access.textContent ?? "",
+      };
+    });
+  expect(layout.fixtureScrollWidth).toBeLessThanOrEqual(
+    layout.fixtureClientWidth);
+  expect(layout.cardScrollWidth).toBeLessThanOrEqual(layout.cardClientWidth);
+  expect(layout.accessLeft).toBeGreaterThanOrEqual(layout.cardLeft);
+  expect(layout.accessRight).toBeLessThanOrEqual(layout.cardRight);
+  expect(layout.label).toContain("…");
+  expect(Array.from(layout.label).length).toBeLessThan(32);
+});

@@ -93,6 +93,8 @@ class SessionContext:
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
     announced_perm: Optional[str] = None
+    announced_permission_profile: Optional[str] = None
+    announced_web_search: Optional[str] = None
     announced_collaboration_mode: Optional[str] = None
     # Goal state is restored silently.  The remote UI only reveals it after the
     # user explicitly invokes /goal (get/set); this avoids a permanent empty
@@ -193,6 +195,16 @@ class SessionContext:
     preview_write_candidates: dict[str, tuple[str, ...]] = field(default_factory=dict)
     preview_external_paths: dict[str, None] = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Status reads run outside the serial command lane so a daemon restart
+    # barrier cannot delay Query/Interrupt. They can therefore reach the same
+    # generation handoff as a user command; serialize only that reconnect
+    # boundary, not the potentially long wait for the hook to become ready.
+    codex_daemon_generation_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock)
+    # Multiple browsers (and focus/idle refreshes from one browser) may ask for
+    # status around the same turn boundary. Preserve their arrival order so an
+    # old-generation read cannot finish after and overwrite the new account.
+    codex_status_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Serialize the tiny "final preflight check -> query accepted by engine"
     # window against interrupt().  Reconnects happen before this lock; once held,
     # interrupt either marks the event before query (so the turn aborts) or waits

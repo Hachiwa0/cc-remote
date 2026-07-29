@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+- Add official Codex named permission profiles as a control separate from the
+  approval policy. The compact permissions sheet can select Read Only,
+  Workspace, Full Access, or cwd-aware custom profiles without adding another
+  composer-bar control. Protocol v24 carries the new controls across Wrapper,
+  Relay, and Web.
+- Add per-session Codex Web Search selection (`cached` / `live`). The override
+  survives controlled reconnects and wrapper restarts without modifying the
+  user's global `config.toml`.
+
 - Upgrade Claude Agent SDK to `0.2.128` and make wrappers explicitly run the
   user's daily `~/.local/bin/claude` instead of silently selecting the SDK
   bundle, keeping Remote and terminal credentials and CLI updates aligned.
@@ -27,6 +36,11 @@
   A Goal turn already running when the daemon restarts follows the same contract
   and falls back to a hidden continuation if app-server restores the Goal state
   without launching its next turn.
+- Upgrade the coordinated wire contract to protocol v23 and correlate Codex
+  status responses with their originating `request_id` so a delayed old-account
+  snapshot cannot overwrite newer limits after a switch.
+- Show the current Codex account's five-hour and weekly remaining quota beside
+  context usage, with generation-safe refresh after an account switch.
 
 ## v3.0.0 — 2026-07-24
 

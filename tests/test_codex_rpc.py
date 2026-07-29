@@ -88,6 +88,7 @@ def test_codex_rpc_initializes_sends_exact_shape_and_reaps(monkeypatch, tmp_path
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {
                     "clientInfo": {"name": "cc-remote", "version": __version__},
+                    "capabilities": {"experimentalApi": True},
                 },
             },
             {"jsonrpc": "2.0", "method": "initialized"},

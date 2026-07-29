@@ -6,7 +6,7 @@
 // chips drive set_model / set_permission_mode on the wrapper.
 
 import type {
-  CatalogModel, EngineCapabilityItem,
+  CatalogModel, EngineCapabilityItem, PermissionProfileInfo,
 } from "./protocol";
 
 export interface CmdGroup { g: string }
@@ -125,6 +125,80 @@ export const CODEX_PERMS: Perm[] = [
   { id: "on-request", name: "On Request", short: "On Request", ds: "需要时才询问", ic: "shield" },
   { id: "untrusted", name: "Untrusted", short: "Untrusted", ds: "每步都先询问", ic: "shield" },
 ];
+
+export interface PermissionProfileChoice extends PermissionProfileInfo {
+  name: string;
+  short: string;
+  ds: string;
+  ic: string;
+  danger?: boolean;
+}
+
+const CODEX_PROFILE_LOOKS: Record<string, {
+  name: string; short: string; ds: string; ic: string; danger?: boolean;
+}> = {
+  ":read-only": {
+    name: "Read Only", short: "Read Only",
+    ds: "只读文件；适合审查和分析", ic: "lock",
+  },
+  ":workspace": {
+    name: "Workspace", short: "Workspace",
+    ds: "可修改当前工作区；工作区外仍受保护", ic: "folder",
+  },
+  ":danger-full-access": {
+    name: "Full Access", short: "Full Access",
+    ds: "危险 · 不使用文件系统或网络沙箱", ic: "bolt", danger: true,
+  },
+};
+
+const boundedPermissionProfileLabel = (
+  value: string,
+  limit: number,
+): string => {
+  const characters = Array.from(value);
+  return characters.length <= limit
+    ? value
+    : `${characters.slice(0, Math.max(1, limit - 1)).join("")}…`;
+};
+
+export const CODEX_PERMISSION_PROFILES: PermissionProfileInfo[] = [
+  { id: ":read-only", allowed: false },
+  { id: ":workspace", allowed: false },
+  { id: ":danger-full-access", allowed: false },
+];
+
+export const permissionProfilesFor = (
+  live?: PermissionProfileInfo[] | null,
+): PermissionProfileChoice[] => {
+  // `undefined`/null means discovery has not completed. Render the familiar
+  // built-ins read-only while loading; an authoritative [] must stay empty.
+  const profiles = live == null ? CODEX_PERMISSION_PROFILES : live;
+  return profiles.map((profile) => {
+    const look = CODEX_PROFILE_LOOKS[profile.id];
+    const fallbackName = profile.id.startsWith(":")
+      ? profile.id.slice(1).replaceAll("-", " ")
+      : profile.id;
+    return {
+      ...profile,
+      name: look?.name ?? boundedPermissionProfileLabel(fallbackName, 48),
+      short: look?.short ?? boundedPermissionProfileLabel(fallbackName, 24),
+      ds: profile.description || look?.ds || "自定义 Codex 执行环境",
+      ic: look?.ic ?? "shield",
+      danger: look?.danger,
+    };
+  });
+};
+
+export const permissionProfileLabel = (
+  profile: string | null | undefined,
+  live?: PermissionProfileInfo[] | null,
+): string | null => {
+  if (!profile) return null;
+  return permissionProfilesFor(live).find((item) => item.id === profile)?.short
+    ?? boundedPermissionProfileLabel(profile.startsWith(":")
+      ? profile.slice(1).replaceAll("-", " ")
+      : profile, 24);
+};
 
 /** Live catalogs by engine, as reported by the wrapper (`models` frame). */
 export type Catalog = Record<string, CatalogModel[]>;

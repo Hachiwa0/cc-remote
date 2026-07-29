@@ -22,8 +22,8 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
-def test_protocol_v22_new_session_query_and_turn_binding_roundtrip():
-    assert PROTOCOL_VERSION == 22
+def test_protocol_v24_new_session_query_and_turn_binding_roundtrip():
+    assert PROTOCOL_VERSION == 24
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",
@@ -123,6 +123,8 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             "effort": "high",
             "collaboration_mode": None,
             "permission_mode": None,
+            "permission_profile": None,
+            "web_search": None,
             "service_tier": None,
             "space": "code",
             "work_id": None,

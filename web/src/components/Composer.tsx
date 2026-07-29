@@ -8,9 +8,9 @@ import {
   type SetStateAction,
 } from "react";
 import type {
-  State, QueryImg, QueryFile, ContextReport,
+  State, QueryImg, QueryFile, ContextReport, StatusReport,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
-  EngineCapabilityItem,
+  EngineCapabilityItem, PermissionProfileInfo,
 } from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
@@ -19,7 +19,7 @@ import {
   clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken,
   matchCommands, matchSkills, parseSlash, skillToken,
   modelsFor, effortsFor, permsFor,
-  type Catalog,
+  permissionProfileLabel, type Catalog,
 } from "../data";
 import { CommandSheet } from "./CommandSheet";
 import { attachmentBytes, pickFiles } from "../img";
@@ -36,6 +36,7 @@ import {
 import { workContextMetrics } from "../work-context";
 import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
 import { PendingImageAttachments } from "./PendingImageAttachments";
+import { UsageMeter } from "./UsageMeter";
 
 interface Props {
   draftKey: string;
@@ -52,6 +53,9 @@ interface Props {
   model: string;
   effort: string;
   perm: string;
+  permissionProfile: string | null;
+  permissionProfiles: PermissionProfileInfo[] | null;
+  webSearch: "cached" | "live" | null;
   collaborationMode: CollaborationModeName;
   fast?: boolean | null;   // null until the wrapper reports the real service tier
   control?: SessionControl | null;
@@ -75,6 +79,9 @@ interface Props {
   onSetEffort: (effort: string) => void;
   onSetServiceTier?: (tier: string) => void;
   onSetPerm: (perm: string) => void;
+  onSetPermissionProfile: (profile: string) => void;
+  onGetPermissionProfiles: () => void;
+  onSetWebSearch: (mode: "cached" | "live") => void;
   onSetCollaborationMode: (mode: CollaborationModeName) => void;
   onClear: () => void;
   onContext: () => void;
@@ -82,6 +89,7 @@ interface Props {
   onPreview?: (path: string) => void;
   onGoal?: (args: string) => void;
   onStatus?: () => void;
+  onRefreshUsage?: () => void;
   onReview?: (
     target: "uncommittedChanges" | "baseBranch" | "commit" | "custom",
     value?: string,
@@ -94,6 +102,9 @@ interface Props {
   onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
   contextError?: string | null;
+  statusReport?: StatusReport | null;
+  statusError?: string | null;
+  statusLoading?: boolean;
 }
 
 export function Composer(p: Props) {
@@ -133,7 +144,12 @@ export function Composer(p: Props) {
   // Only the modal pickers live in state now; the "/" command palette is a live
   // popover DERIVED from the composer text (no second input box).
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
+  const openPermissions = () => {
+    setSheetKind("perms");
+    if (p.engine === "codex") p.onGetPermissionProfiles();
+  };
   const [ctxOpen, setCtxOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
   const ctxWrapRef = useRef<HTMLDivElement>(null);
   const workSettingsRef = useRef<HTMLDetailsElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -156,6 +172,7 @@ export function Composer(p: Props) {
     setDraft(p.draftStore.get(p.draftKey));
     setSheetKind(null);
     setCtxOpen(false);
+    setUsageOpen(false);
     setNotice(null);
     if (noticeTimer.current !== null) {
       window.clearTimeout(noticeTimer.current);
@@ -164,15 +181,18 @@ export function Composer(p: Props) {
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [p.draftKey, p.draftStore]);
 
-  // context popover: close on outside click
+  // Context and account-usage popovers share one anchor and close together.
   useEffect(() => {
-    if (!ctxOpen) return;
+    if (!ctxOpen && !usageOpen) return;
     const onDoc = (e: MouseEvent) => {
-      if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) setCtxOpen(false);
+      if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) {
+        setCtxOpen(false);
+        setUsageOpen(false);
+      }
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [ctxOpen]);
+  }, [ctxOpen, usageOpen]);
 
   // <details> has no controlled open state here, so keep one document-level
   // listener active for mouse and touch and close it when focus moves outside.
@@ -181,6 +201,7 @@ export function Composer(p: Props) {
       if (!workSettingsRef.current?.open) return;
       workSettingsRef.current.open = false;
       setCtxOpen(false);
+      setUsageOpen(false);
     };
     const onPointerDown = (event: PointerEvent) => {
       const details = workSettingsRef.current;
@@ -233,6 +254,7 @@ export function Composer(p: Props) {
     if (!locked) return;
     setSheetKind(null);
     setCtxOpen(false);
+    setUsageOpen(false);
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [locked]);
 
@@ -428,10 +450,14 @@ export function Composer(p: Props) {
         if (args) { p.onSetModel(args); flash(`正在切换模型：${args}`); }
         else setSheetKind("models");
         break;
-      case "permissions": setSheetKind("perms"); break;
+      case "permissions": openPermissions(); break;
       case "clear": p.onClear(); break;
       // open the popup too (not just fetch) — same as clicking the context ring.
-      case "context": p.onContext(); setCtxOpen(true); break;
+      case "context":
+        p.onContext();
+        setUsageOpen(false);
+        setCtxOpen(true);
+        break;
       case "status": p.onStatus?.(); break;
       case "goal": p.onGoal?.(args); break;
       case "rewind": flash("Claude Rewind 暂未开放"); break;
@@ -596,8 +622,15 @@ export function Composer(p: Props) {
     ? (PERMS_E.find((x) => x.id === p.perm)
       || { id: p.perm, name: p.perm, short: p.perm, ds: "", ic: "shield" })
     : null;
+  const permissionProfileName = permissionProfileLabel(
+    p.permissionProfile, p.permissionProfiles);
+  const modeLabel = p.engine === "codex"
+    ? (permissionProfileName ?? perm?.short ?? "环境读取中")
+    : (perm?.short ?? "Mode loading");
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
-  const modeCls = perm?.id === "plan" ? " plan" : perm?.danger ? " danger" : "";
+  const modeCls = perm?.id === "plan" ? " plan"
+    : (perm?.danger || p.permissionProfile === ":danger-full-access")
+      ? " danger" : "";
 
   const inputControl = (placeholder: string) => (
     <textarea
@@ -825,15 +858,17 @@ export function Composer(p: Props) {
           <button
             type="button"
             className={"hint-mode" + modeCls}
-            onClick={() => setSheetKind("perms")}
+            onClick={openPermissions}
             disabled={locked}
             title={deferredClaudeControls
               ? `${externalClaudeOwner} 当前权限模式未公开`
-              : "点击切换权限模式"}
+              : (p.engine === "codex"
+                ? `执行环境：${permissionProfileName ?? "默认"}；审批：${perm?.name ?? "读取中"}`
+                : "点击切换权限模式")}
           >
             {deferredClaudeControls
               ? externalClaudeOwner
-              : (perm ? perm.short : "Mode loading")}
+              : modeLabel}
             {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
           </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
@@ -873,11 +908,34 @@ export function Composer(p: Props) {
                 title="Fast 服务档位:快 / 标准(下条消息生效)"
               >{p.fast == null ? "档位读取中" : p.fast ? "⚡ 快" : "标准"}</button>
             )}
+            {p.engine === "codex" && (
+              <UsageMeter
+                open={usageOpen}
+                report={p.statusReport ?? null}
+                error={p.statusError}
+                loading={p.statusLoading}
+                onToggle={() => {
+                  const opening = !usageOpen;
+                  setCtxOpen(false);
+                  setUsageOpen(opening);
+                  if (opening) p.onRefreshUsage?.();
+                }}
+                onRefresh={() => p.onRefreshUsage?.()}
+                onOpenStatus={p.onStatus ? () => {
+                  setUsageOpen(false);
+                  p.onStatus?.();
+                } : undefined}
+              />
+            )}
             <button
               className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
               aria-label="上下文占用"
               title="上下文占用"
-              onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}
+              onClick={() => {
+                p.onContext();
+                setUsageOpen(false);
+                setCtxOpen((o) => !o);
+              }}
             >
               <svg viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
                 <circle className="hr-track" cx="18" cy="18" r="15" />
@@ -941,7 +999,15 @@ export function Composer(p: Props) {
         currentEffort={p.effort}
         onPickEffort={(ef) => { p.onSetEffort(ef); setSheetKind(null); }}
         currentPerm={p.perm}
-        onPickPerm={(perm) => { p.onSetPerm(perm); setSheetKind(null); }}
+        onPickPerm={(perm) => {
+          p.onSetPerm(perm);
+          if (p.engine !== "codex") setSheetKind(null);
+        }}
+        currentPermissionProfile={p.permissionProfile}
+        permissionProfiles={p.permissionProfiles}
+        onPickPermissionProfile={p.onSetPermissionProfile}
+        currentWebSearch={p.webSearch}
+        onPickWebSearch={p.onSetWebSearch}
       />
 
       {dragOver && (

@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 22
+PROTOCOL_VERSION = 24
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -59,6 +59,7 @@ PermissionMode = Literal[
     "never", "on-request", "untrusted",
 ]
 CollaborationModeName = Literal["default", "plan"]
+WebSearchMode = Literal["cached", "live"]
 ControlMode = Literal[
     "remote", "codex_shared", "claude_broker", "external_cli",
     "agent_view", "desktop",
@@ -67,6 +68,9 @@ WriteState = Literal[
     "writable", "read_only", "takeover_pending", "input_busy",
 ]
 ModelName = Annotated[str, StringConstraints(min_length=1, max_length=256)]
+PermissionProfileId = Annotated[
+    str, StringConstraints(min_length=1, max_length=256),
+]
 WireId = Annotated[
     str,
     StringConstraints(
@@ -849,6 +853,8 @@ class NewSession(_Command):
     permission_mode: Optional[
         Literal["never", "on-request", "untrusted"]
     ] = None  # Codex only; persisted before the first turn
+    permission_profile: Optional[PermissionProfileId] = None  # Codex only
+    web_search: Optional[WebSearchMode] = None  # Codex Code only
     service_tier: Optional[Literal["default", "fast"]] = None  # Codex only
     prompt: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
     msg_id: Optional[WireId] = None
@@ -865,6 +871,8 @@ class NewSession(_Command):
         codex_only = {
             "collaboration_mode": self.collaboration_mode,
             "permission_mode": self.permission_mode,
+            "permission_profile": self.permission_profile,
+            "web_search": self.web_search,
             "service_tier": self.service_tier,
         }
         invalid = [name for name, value in codex_only.items()
@@ -874,6 +882,8 @@ class NewSession(_Command):
                 f"{', '.join(invalid)} only supported for Codex sessions")
         if self.space == "work" and self.cwd is not None:
             raise ValueError("Work session cwd is assigned by the wrapper")
+        if self.space == "work" and self.web_search is not None:
+            raise ValueError("Work web_search is fixed by the wrapper")
         if self.space == "code" and self.project_id is not None:
             raise ValueError("project_id is only supported for Work sessions")
         return self
@@ -1372,6 +1382,54 @@ class Perm(_Base):
     mode: str
 
 
+class PermissionProfileInfo(BaseModel):
+    """One cwd-aware named Codex permission profile from app-server."""
+    model_config = ConfigDict(extra="forbid")
+
+    id: PermissionProfileId
+    description: Optional[str] = Field(default=None, max_length=2048)
+    allowed: bool
+
+
+class GetPermissionProfiles(_Command):
+    """List profiles for a session, or for a prospective new-session cwd."""
+    type: Literal["get_permission_profiles"] = "get_permission_profiles"
+    client_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class PermissionProfiles(_Base):
+    """wrapper -> requesting client: bounded cwd-aware profile catalog."""
+    type: Literal["permission_profiles"] = "permission_profiles"
+    profiles: list[PermissionProfileInfo] = Field(max_length=128)
+    request_id: Optional[WireId] = None
+    cwd: Optional[str] = Field(default=None, max_length=4096)
+
+
+class SetPermissionProfile(_Command):
+    """client -> wrapper: select a named Codex permission profile."""
+    type: Literal["set_permission_profile"] = "set_permission_profile"
+    profile: PermissionProfileId
+
+
+class PermissionProfile(_Base):
+    """The Codex session's active named permission profile."""
+    type: Literal["permission_profile"] = "permission_profile"
+    profile: Optional[PermissionProfileId] = None
+
+
+class SetWebSearch(_Command):
+    """Select cached or live Codex search for the next turn."""
+    type: Literal["set_web_search"] = "set_web_search"
+    mode: WebSearchMode
+
+
+class WebSearch(_Base):
+    """The effective per-session Codex search mode."""
+    type: Literal["web_search"] = "web_search"
+    mode: WebSearchMode
+
+
 class GetContext(_Command):
     """client -> wrapper: request current context window usage."""
     type: Literal["get_context"] = "get_context"
@@ -1440,6 +1498,7 @@ class StatusRuntime(_StatusPart):
     reasoning_effort: Optional[str] = Field(default=None, max_length=64)
     service_tier: Optional[str] = Field(default=None, max_length=64)
     approval_policy: Optional[str] = Field(default=None, max_length=64)
+    permission_profile: Optional[str] = Field(default=None, max_length=256)
     sandbox_mode: Optional[str] = Field(default=None, max_length=64)
     web_search: Optional[str] = Field(default=None, max_length=64)
 
@@ -1489,6 +1548,9 @@ class StatusReport(_Base):
     the successful sections.
     """
     type: Literal["status_report"] = "status_report"
+    # Correlates this snapshot with the reliable GetStatus command that
+    # requested it.  Optional for unsolicited/legacy reports.
+    request_id: Optional[WireId] = None
     thread: StatusThread
     runtime: StatusRuntime
     context: StatusContext
@@ -1919,8 +1981,8 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
+    Hello, Query, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
@@ -1933,7 +1995,8 @@ AnyMessage = Union[
 # control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "turn_steered", "state", "model", "effort", "perm", "fast",
+    "user_msg", "turn_steered", "state", "model", "effort", "perm",
+    "permission_profile", "web_search", "fast",
     "collaboration_mode", "session_control", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_binding",
@@ -1957,6 +2020,12 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "close_btw": CloseBtw,
     "btw_opened": BtwOpened,
     "set_perm": SetPerm,
+    "get_permission_profiles": GetPermissionProfiles,
+    "permission_profiles": PermissionProfiles,
+    "set_permission_profile": SetPermissionProfile,
+    "permission_profile": PermissionProfile,
+    "set_web_search": SetWebSearch,
+    "web_search": WebSearch,
     "get_context": GetContext,
     "get_status": GetStatus,
     "get_diff": GetDiff,

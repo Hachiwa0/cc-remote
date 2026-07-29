@@ -4,6 +4,13 @@
 
 ## 未发布
 
+- 新增 Codex 官方 named permission profile 控制，并与审批策略分开管理。紧凑的
+  权限面板可选择 Read Only、Workspace、Full Access 及按 cwd 生效的自定义
+  profile，不增加输入框底栏控件；protocol v24 在 Wrapper、Relay 与 Web
+  之间传递这些新控制项。
+- 新增 Codex 会话级网页搜索模式（`cached` / `live`）；切换后会无损重连，
+  wrapper 重启后仍保留，同时不修改用户的全局 `config.toml`。
+
 - Claude Agent SDK 升级到 `0.2.128`，同时让 wrapper 显式运行用户日常使用的
   `~/.local/bin/claude`，不再静默选择 SDK 内置副本，使 Remote 与终端的凭据和
   CLI 更新保持一致。
@@ -21,6 +28,10 @@
   queued 消息；Goal 走原生目标循环，普通回合使用隐藏的上下文续跑。若 daemon
   重启时正在运行的正是 Goal 自动回合，也会按同一规则迁移；app-server 只恢复 Goal
   状态却没有启动下一回合时，cc-remote 会自动补发隐藏续跑请求。
+- 协同 wire contract 升级到 protocol v23；Codex 状态响应携带源 `request_id`，
+  避免切号后延迟返回的旧账号快照覆盖新额度。
+- 在上下文用量旁显示当前 Codex 账号的 5 小时和每周剩余额度，并在切号后按 daemon
+  代际安全刷新。
 
 ## v3.0.0 — 2026-07-24
 

@@ -46,6 +46,7 @@ from cc_remote.wrapper.codex_sessions import (
     codex_fast_enabled,
     codex_model,
     codex_rollout_path,
+    codex_web_search,
 )
 from cc_remote.wrapper.codex_provider_repair import (
     HTTP_COMPAT_PROVIDER_ID,
@@ -57,6 +58,7 @@ from cc_remote.wrapper.codex_runtime import (
     codex_version as _runtime_codex_version,
     resolve_codex_bin as _runtime_resolve_codex_bin,
 )
+from cc_remote.wrapper.codex_permissions import normalize_permission_profiles
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
@@ -1053,6 +1055,20 @@ class CodexHandle:
         # when a resumed native thread persisted a Code-time approval policy.
         self.approval: str = (
             "never" if self.work_mode else codex_approval())  # UI/callback projection
+        # Official named profile id (for example ``:workspace`` or
+        # ``:danger-full-access``).  It is independent from approvalPolicy:
+        # the profile says what the sandbox may access; approvalPolicy says
+        # whether Codex may ask to exceed that access.
+        self.permission_profile: Optional[str] = (
+            "cc_remote_work" if self.work_mode else None
+        )
+        # app-server has no thread/settings field for search. A Code override is
+        # applied through config.web_search on start/resume/fork and retained
+        # locally so controlled reconnects preserve it.
+        self.web_search_override: Optional[str] = None
+        self.web_search: str = (
+            "cached" if self.work_mode else codex_web_search()
+        )
         self.collaboration_mode: str = "default"            # default | plan; independent of approval
         self.service_tier: Optional[str] = (
             "fast" if codex_fast_enabled() else None
@@ -1278,8 +1294,14 @@ class CodexHandle:
             raise
         self._reader = asyncio.create_task(self._read_loop(proc, generation))
 
-    async def connect(self, resume_id: Optional[str] = None, cwd: Optional[str] = None,
-                      fork: bool = False) -> None:
+    async def connect(
+        self,
+        resume_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+        fork: bool = False,
+        preserve_controls: bool = False,
+        preserve_permission_profile: bool = True,
+    ) -> None:
         if self.proc is not None:
             await self.disconnect()
         self._shared_resume_binding_thread_id = None
@@ -1434,6 +1456,12 @@ class CodexHandle:
                     "cwd": self._cwd,
                     "approvalPolicy": self.approval_policy,
                 }
+                if self.permission_profile:
+                    fork_params["permissions"] = self.permission_profile
+                if not self.work_mode and self.web_search_override:
+                    fork_params["config"] = {
+                        "web_search": self.web_search_override,
+                    }
                 if http_only_resume:
                     fork_params["modelProvider"] = (
                         _OPENAI_HTTP_RESUME_PROVIDER_ID)
@@ -1453,12 +1481,24 @@ class CodexHandle:
                 res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
             elif resume_id:
-                # Do not send local/config defaults here: omitted fields tell
-                # app-server to resume the thread's persisted settings. The
-                # authoritative response is adopted below.
+                # A replacement daemon reconstructs approval/profile from
+                # config defaults rather than the last live thread settings.
+                # Controlled reconnects repeat the exact settings that the old
+                # generation had already accepted.
                 resume_params: dict[str, Any] = {
                     "threadId": resume_id, "cwd": self._cwd,
                 }
+                preserved_approval = (
+                    self.approval_policy if preserve_controls else None)
+                preserved_profile = (
+                    self.permission_profile
+                    if preserve_controls and preserve_permission_profile
+                    else None
+                )
+                if preserve_controls:
+                    resume_params["approvalPolicy"] = preserved_approval
+                    if preserve_permission_profile and preserved_profile:
+                        resume_params["permissions"] = preserved_profile
                 if http_only_resume:
                     resume_params["modelProvider"] = (
                         _OPENAI_HTTP_RESUME_PROVIDER_ID)
@@ -1468,7 +1508,12 @@ class CodexHandle:
                         "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
                         "personality": "none",
                         "config": self._work_config,
+                        "permissions": "cc_remote_work",
                     })
+                elif self.web_search_override:
+                    resume_params["config"] = {
+                        "web_search": self.web_search_override,
+                    }
                 if _supports_lightweight_resume(self.app_server_version):
                     # Since Codex 0.144.6, excludeTurns is the official way for
                     # clients with a paged history UI to resume a live thread.
@@ -1509,6 +1554,12 @@ class CodexHandle:
                 }
                 if self.model:
                     params["model"] = self.model
+                if self.permission_profile:
+                    params["permissions"] = self.permission_profile
+                if not self.work_mode and self.web_search_override:
+                    params["config"] = {
+                        "web_search": self.web_search_override,
+                    }
                 if self.work_mode:
                     params.update({
                         "baseInstructions": WORK_BASE_INSTRUCTIONS,
@@ -1531,6 +1582,24 @@ class CodexHandle:
                     authoritative = dict(res)
                     authoritative.pop("reasoningEffort", None)
                 self._apply_thread_settings(authoritative)
+                if resume_id and not fork and preserve_controls:
+                    # Some generations echo config-derived defaults even when
+                    # resume overrides were accepted. Keep the next turn pinned
+                    # to the controls carried across the generation boundary.
+                    if self.work_mode:
+                        self.approval = "never"
+                        self.permission_profile = "cc_remote_work"
+                    else:
+                        if isinstance(preserved_approval, str):
+                            self.approval = preserved_approval
+                        else:
+                            granular = _copy_granular_approval(
+                                preserved_approval)
+                            if granular is not None:
+                                self.approval_policy = granular
+                                self._approval = "on-request"
+                        if preserve_permission_profile:
+                            self.permission_profile = preserved_profile
             if not resume_id:
                 # thread/start cannot carry effort or collaborationMode in 0.144.1.
                 # Persist both before the new-session command can return, so even a
@@ -1542,6 +1611,8 @@ class CodexHandle:
                 }
                 if self.effort:
                     sticky["effort"] = self.effort
+                if self.permission_profile:
+                    sticky["permissions"] = self.permission_profile
                 await self._update_thread_settings(
                     wait_for_notification=True, **sticky)
         except BaseException:
@@ -1563,6 +1634,8 @@ class CodexHandle:
             "input": _to_input(prompt, images),
             "approvalPolicy": self.approval_policy,
         }
+        if self.permission_profile:
+            params["permissions"] = self.permission_profile
         if self.work_mode:
             params["cwd"] = self._cwd
             # Do not add the legacy sandboxPolicy here. Codex gives legacy
@@ -2237,7 +2310,11 @@ class CodexHandle:
         log.warning("codex force-reconnect", reason=reason)
         target = resume_id or self.thread_id
         await self.disconnect()
-        await self.connect(resume_id=target, cwd=cwd or self._cwd)
+        await self.connect(
+            resume_id=target,
+            cwd=cwd or self._cwd,
+            preserve_controls=True,
+        )
 
     # --- live controls (persisted for this thread by app-server 0.144.1) ---
     @property
@@ -2348,6 +2425,21 @@ class CodexHandle:
             if mode in {"default", "plan"}:
                 self.collaboration_mode = mode
 
+        active_key = (
+            "activePermissionProfile"
+            if "activePermissionProfile" in settings
+            else "active_permission_profile"
+        )
+        active_profile = settings.get(active_key)
+        if self.work_mode:
+            self.permission_profile = "cc_remote_work"
+        elif isinstance(active_profile, dict):
+            profile_id = active_profile.get("id")
+            if isinstance(profile_id, str) and 0 < len(profile_id) <= 256:
+                self.permission_profile = profile_id
+        elif active_key in settings:
+            self.permission_profile = None
+
     async def set_model(self, model: str) -> None:
         if not isinstance(model, str) or not model:
             raise ValueError("Codex model must be non-empty")
@@ -2393,6 +2485,90 @@ class CodexHandle:
             self.approval = mode
         log.info("codex thread approval set", requested=mode,
                  applied=self.approval)
+
+    async def list_permission_profiles(self) -> list[dict[str, Any]]:
+        """Return the bounded, cwd-aware profile catalog from app-server."""
+        return normalize_permission_profiles(await self._request(
+            "permissionProfile/list",
+            {"cwd": self._cwd, "limit": 128},
+        ))
+
+    async def set_permission_profile(self, profile: str) -> None:
+        if (not isinstance(profile, str) or not profile
+                or len(profile) > 256):
+            raise ValueError("Codex permission profile must be non-empty")
+        if self.work_mode:
+            raise ValueError(
+                "Codex Work permission profile is fixed to cc_remote_work")
+        catalog = await self.list_permission_profiles()
+        selected = next(
+            (item for item in catalog if item["id"] == profile), None)
+        if selected is None or not selected["allowed"]:
+            raise ValueError(
+                "Codex permission profile is unavailable for this cwd")
+        authoritative = await self._update_thread_settings(
+            permissions=profile, wait_for_notification=True)
+        if not authoritative:
+            self.permission_profile = profile
+        log.info(
+            "codex permission profile set",
+            requested=profile,
+            applied=self.permission_profile,
+        )
+
+    async def set_web_search(self, mode: str) -> None:
+        """Apply Code search mode by resuming the same thread with config."""
+        if mode not in {"cached", "live"}:
+            raise ValueError(f"unsupported Codex web search mode: {mode}")
+        if self.work_mode:
+            raise ValueError("Codex Work web search is fixed to cached")
+        if not self.thread_id:
+            raise RuntimeError("connect() first")
+        if self.turn_active or self.turn_start_pending:
+            raise RuntimeError("Codex turn is active")
+        if (self.web_search_override == mode and self.web_search == mode):
+            return
+        thread_id = self.thread_id
+        previous_approval = self._approval
+        previous_approval_policy = self.approval_policy
+        granular_approval = _copy_granular_approval(
+            previous_approval_policy)
+        if granular_approval is not None:
+            previous_approval_policy = granular_approval
+        previous_profile = self.permission_profile
+        previous_override = self.web_search_override
+        previous_mode = self.web_search
+        self.web_search_override = mode
+        self.web_search = mode
+        try:
+            await self.force_reconnect(
+                thread_id,
+                self._cwd,
+                reason="web search changed",
+            )
+        except BaseException:
+            # The failed replacement process may have reported its config
+            # defaults before failing later in resume. Roll back the complete
+            # execution boundary, not just search, before reconnecting.
+            self._approval = previous_approval
+            self.approval_policy = previous_approval_policy
+            self.permission_profile = previous_profile
+            self.web_search_override = previous_override
+            self.web_search = previous_mode
+            if self.proc is None:
+                try:
+                    await self.connect(
+                        resume_id=thread_id,
+                        cwd=self._cwd,
+                        preserve_controls=True,
+                    )
+                except Exception:
+                    log.exception(
+                        "codex web search rollback reconnect failed",
+                        thread_id=thread_id,
+                    )
+            raise
+        log.info("codex web search set", mode=mode, thread_id=thread_id)
 
     async def set_collaboration_mode(self, mode: str) -> None:
         if mode not in ("default", "plan"):
@@ -2784,8 +2960,10 @@ class CodexHandle:
             "approval_policy": _approval_policy_name(
                 self.approval_policy if self.approval_policy
                 else raw_config.get("approval_policy")),
+            "permission_profile": _bounded_string(
+                self.permission_profile, 256),
             "sandbox_mode": _bounded_string(raw_config.get("sandbox_mode"), 64),
-            "web_search": _bounded_string(raw_config.get("web_search"), 64),
+            "web_search": _bounded_string(self.web_search, 64),
         }
 
         account = None

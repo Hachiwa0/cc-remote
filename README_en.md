@@ -4,7 +4,7 @@
 
 Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web
 
-**Current release: v3.0.0** · Wire protocol v22
+**Current release: v3.0.0** · Wire protocol v24
 
 [中文](README.md) ·
 [5-minute quick start](#quick-start-local-one-machine-5-min) ·
@@ -62,7 +62,7 @@ with the previous public release, the major changes are:
 | **Native App / CLI coordination** | Claude CLI/Desktop/Agent View and Codex shared daemon/App/CLI retain engine-specific ownership models. v3 reconciles running, read-only, interrupt, steer, compact, turn binding, and terminal state so sibling sessions do not lock each other, old turns do not move to the tail, and interrupted work does not leave ghost activity. |
 | **Multi-device isolation** | Device Center adds single-use pairing, independently revocable machine credentials, and presence. The relay routes only an account's allowed `machine_id` values. Device, Code / Work, engine, connection generation, and session ownership are isolated so delayed frames cannot mutate the active view. |
 | **Mobile and artifact UX** | Loading older history preserves the scroll anchor. Images load on demand and support a lightbox, tap-to-close, and pinch zoom. Markdown, source, HTML, PDF, and Office previews remain within the local security boundary. PWA icons, narrow-screen sheets, error presentation, and process timelines are also aligned. |
-| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v22. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
+| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v24. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
 
 > **The trust boundary has not changed:** model accounts, API keys, session
 > sources, and tool execution stay on the wrapper machine. The VPS relay stores
@@ -86,7 +86,7 @@ requirements.
 | **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. |
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
 | **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Codex supports explicit compact, native Review, and isolated Git worktree forks. |
-| **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses `/permissions` for approval control while inheriting the local Sandbox configuration. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
+| **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses one compact `/permissions` sheet for approval policy, official execution-environment profiles, and Cached/Live Web Search. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
 | **Real extension catalog** | Open `/extensions`, `/skills`, `/plugins`, `/apps`, `/mcp`, or `/hooks` against the current engine. Code can manage Skills, plugins, and Claude Hooks where the engine allows it; Codex Hooks remain read-only because the official API has no write path. Work presents every extension category read-only to preserve its private environment. |
 | **Continuity** | Let background sessions keep running and synchronize them across clients. Paint the browser projection first, validate paged materialized summaries from Claude transcripts or Codex rollouts, and resume only the live tail after reconnecting. |
 | **Multi-machine and PWA** | Connect multiple named wrappers to one relay and optionally restrict accounts to selected machines. Install the web client as a PWA; notifications default to a generic privacy mode, with an explicit opt-in for a safely truncated session name and exact navigation. |
@@ -224,14 +224,18 @@ separate.
 
 ![Collapsible Codex plan, Hook, and tool-call timeline](assets/readme-process-timeline.jpg)
 
-### Per-session Codex controls: model, reasoning, permissions, and status
+### Per-session Codex controls: model, reasoning, permissions, search, and status
 
 The model, reasoning effort, service tier, and permissions belong to the current
 session, so you can change the next turn without editing the machine's global
-configuration. While Codex is running, Enter steers the active task by default;
-queue remains selectable, and an empty composer exposes Stop as a separate
-action. The composer also provides attachments, context usage, and command
-entry points such as `/goal` and `/status`.
+configuration. In Codex, approval policy and execution environment are separate:
+`never` / `on-request` / `untrusted` decide when Codex asks, while Read Only,
+Workspace, Full Access, or a custom named profile defines filesystem and network
+boundaries. `/permissions` keeps those controls and Cached/Live Web Search in one
+sheet so the mobile composer stays compact. While Codex is running, Enter steers
+the active task by default; queue remains selectable, and an empty composer
+exposes Stop as a separate action. The composer also provides attachments,
+context usage, and command entry points such as `/goal` and `/status`.
 
 ![Codex model selection and per-session controls](assets/readme-model-controls.jpg)
 
@@ -465,14 +469,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v22:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v24:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v22 relay and v22 wrapper so the old wrapper cannot occupy the
+> then start the v24 relay and v24 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`.
 
 ### 3) Upload staging, then publish it as an atomic release
@@ -530,7 +534,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v22 wrapper after success.
+release's `/healthz` is verified. Start the v24 wrapper after success.
 
 Verify:
 
@@ -693,7 +697,7 @@ Each message accepts at most 8 attachments, at most 6 MiB each and 8 MiB decoded
 
 > **cc-remote lets a remote person run arbitrary commands on your machine. Treat it like handing someone a shell.**
 
-- Code sessions remain a remote development control plane: Claude defaults to `permissionMode: bypassPermissions`, and Codex defaults to approval policy `never` while inheriting the machine's Codex sandbox configuration; both can expose approval controls in the web client. **Treat anyone who can log in and enter Code as holding remote agent/shell authority on the wrapper machine.** Work uses a separate private root and does not expose external directories, but this only narrows the default capability surface; it is not a substitute for OS-user, container, or VM isolation.
+- Code sessions remain a remote development control plane: Claude defaults to `permissionMode: bypassPermissions`; Codex defaults to approval policy `never` and may select any named permission profile app-server allows for the current cwd. Approval policy cannot widen a profile boundary, while Full Access materially expands capability. **Treat anyone who can log in and enter Code as holding remote agent/shell authority on the wrapper machine.** Work uses the fixed `cc_remote_work` profile and a separate private root without external directories, but this only narrows the default capability surface; it is not a substitute for OS-user, container, or VM isolation.
 - `LOGIN_PASSWORD` / `LOGIN_USERS_JSON`, `WRAPPER_TOKEN` / `WRAPPER_TOKENS_JSON`, and `SESSION_SECRET` form the authentication boundary: use strong random values, never commit or paste them into chats, and rotate them. A repository `.env` is for local development only; production wrappers must use the root-only `/etc/cc-remote/wrapper.env` above. The systemd template prevents the service and model descendants from reading that source file or a legacy repository `.env`; on Linux the wrapper also disables dumpability so children cannot recover captured credentials through `/proc/<pid>/environ` or process memory.
 - Always use TLS (`wss://`) in production. Only set `ALLOW_INSECURE_HTTP=1` for a temporary bare-public-IPv4 deployment; login credentials, cookies, wrapper tokens, and all session traffic are unencrypted while it is enabled, so switch back to TLS as soon as possible. `ALLOW_PRIVATE_ORIGINS=1` adds only same-port literal private-IP entry points that match the effective request target and does not relax the public-domain check. Cookie `Secure` follows the trusted request transport, not the caller-provided Origin, but login credentials, cookies, and session traffic are still plaintext when a private HTTP entry point is used.
 - Recommended: restrict the relay by IP / only run it when needed; login is rate-limited (5/min per IP) out of the box.

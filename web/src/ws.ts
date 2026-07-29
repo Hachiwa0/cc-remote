@@ -595,6 +595,35 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }
 
+  sendGetPermissionProfiles(cwd?: string): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "get_permission_profiles",
+      ts: nowTs(),
+      ...(cwd ? { cwd } : this.sidObj()),
+    });
+  }
+
+  sendSetPermissionProfile(profile: string): void {
+    this.send({
+      v: PROTOCOL_VERSION,
+      type: "set_permission_profile",
+      profile,
+      ts: nowTs(),
+      ...this.sidObj(),
+    });
+  }
+
+  sendSetWebSearch(mode: "cached" | "live"): void {
+    this.send({
+      v: PROTOCOL_VERSION,
+      type: "set_web_search",
+      mode,
+      ts: nowTs(),
+      ...this.sidObj(),
+    });
+  }
+
   sendGetContext(): string | null {
     return this.sendTracked({
       v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj(),
@@ -800,6 +829,13 @@ export class RelayWs {
     });
   }
 
+  sendGetStatusTo(sid: string): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_status", sid,
+      client_id: this.clientId, ts: nowTs(),
+    });
+  }
+
   sendSetGoal(objective: string | null, status: GoalStatus | null, tokenBudget: number | null): void {
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "set_goal", ts: nowTs(), ...this.sidObj() };
     if (objective !== null) obj.objective = objective;
@@ -844,6 +880,8 @@ export class RelayWs {
                  initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] },
                  collaborationMode?: "default" | "plan",
                  permissionMode?: "never" | "on-request" | "untrusted",
+                 permissionProfile?: string,
+                 webSearch?: "cached" | "live",
                  serviceTier?: "default" | "fast",
                  space: Space = "code", projectId?: string | null): boolean {
     const requestId = initial?.msg_id ?? uuid();
@@ -867,6 +905,12 @@ export class RelayWs {
     }
     if (engine === "codex" && permissionMode) {
       obj.permission_mode = permissionMode;
+    }
+    if (engine === "codex" && permissionProfile) {
+      obj.permission_profile = permissionProfile;
+    }
+    if (engine === "codex" && webSearch) {
+      obj.web_search = webSearch;
     }
     if (engine === "codex" && serviceTier) {
       obj.service_tier = serviceTier;

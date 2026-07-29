@@ -1,5 +1,10 @@
-import { isCmd, commandsFor, modelsFor, effortsFor, permsFor, type Cmd, type CmdGroup, type Catalog } from "../data";
+import {
+  isCmd, commandsFor, modelsFor, effortsFor, permsFor,
+  permissionProfilesFor,
+  type Cmd, type CmdGroup, type Catalog,
+} from "../data";
 import { Icon } from "../icons";
+import type { PermissionProfileInfo } from "../protocol";
 
 interface Props {
   open: boolean;
@@ -18,9 +23,19 @@ interface Props {
   onPickEffort?: (effort: string) => void;
   currentPerm?: string;
   onPickPerm?: (perm: string) => void;
+  currentPermissionProfile?: string | null;
+  permissionProfiles?: PermissionProfileInfo[] | null;
+  onPickPermissionProfile?: (profile: string) => void;
+  currentWebSearch?: "cached" | "live" | null;
+  onPickWebSearch?: (mode: "cached" | "live") => void;
 }
 
-export function CommandSheet({ open, kind, engine, catalog, filter = "", onClose, onPickCommand, currentModel, onPickModel, currentEffort, onPickEffort, currentPerm, onPickPerm }: Props) {
+export function CommandSheet({
+  open, kind, engine, catalog, filter = "", onClose, onPickCommand,
+  currentModel, onPickModel, currentEffort, onPickEffort, currentPerm,
+  onPickPerm, currentPermissionProfile, permissionProfiles,
+  onPickPermissionProfile, currentWebSearch, onPickWebSearch,
+}: Props) {
   const isCmdMode = kind === "commands";
   const isPermMode = kind === "perms";
   const isEffortMode = kind === "efforts";
@@ -28,6 +43,7 @@ export function CommandSheet({ open, kind, engine, catalog, filter = "", onClose
   // Effort levels are per-model, so the effort sheet must be built from the model
   // currently selected, not just the engine.
   const MODELS = modelsFor(engine, catalog), EFFORTS = effortsFor(engine, currentModel, catalog), PERMS = permsFor(engine);
+  const PROFILES = permissionProfilesFor(permissionProfiles);
 
   // Prefix-match on the slash (same rule the composer uses to decide visibility),
   // preserving group headers that still have matches.
@@ -46,7 +62,9 @@ export function CommandSheet({ open, kind, engine, catalog, filter = "", onClose
   }
   const visible = groups.filter((g) => g.cmds.length > 0);
 
-  const title = isCmdMode ? "命令面板" : isPermMode ? "选择权限模式" : isEffortMode ? "选择思考强度" : "选择模型";
+  const title = isCmdMode ? "命令面板"
+    : isPermMode ? (engine === "codex" ? "权限与执行环境" : "选择权限模式")
+    : isEffortMode ? "选择思考强度" : "选择模型";
 
   return (
     <>
@@ -72,22 +90,71 @@ export function CommandSheet({ open, kind, engine, catalog, filter = "", onClose
               </div>
             ))
           ) : isPermMode ? (
-            PERMS.map((p) => (
-              <button
-                key={p.id}
-                className={"cmd" + (p.id === currentPerm ? " sel" : "") + (p.danger ? " danger" : "")}
-                onClick={() => onPickPerm?.(p.id)}
-              >
-                <span className="cmd-ic"><Icon name={p.ic} size={17} /></span>
-                <span className="cmd-tx">
-                  <span className="cmd-nm">{p.name}</span>
-                  <span className="cmd-ds">{p.ds}</span>
-                </span>
-                {p.id === currentPerm
-                  ? <span className="cmd-check"><Icon name="check" size={19} /></span>
-                  : <span className="cmd-kbd" />}
-              </button>
-            ))
+            <>
+              {engine === "codex" && <div className="cmd-group">审批方式</div>}
+              {PERMS.map((p) => (
+                <button
+                  key={p.id}
+                  className={"cmd" + (p.id === currentPerm ? " sel" : "") + (p.danger ? " danger" : "")}
+                  onClick={() => onPickPerm?.(p.id)}
+                >
+                  <span className="cmd-ic"><Icon name={p.ic} size={17} /></span>
+                  <span className="cmd-tx">
+                    <span className="cmd-nm">{p.name}</span>
+                    <span className="cmd-ds">{p.ds}</span>
+                  </span>
+                  {p.id === currentPerm
+                    ? <span className="cmd-check"><Icon name="check" size={19} /></span>
+                    : <span className="cmd-kbd" />}
+                </button>
+              ))}
+              {engine === "codex" && (
+                <>
+                  <div className="cmd-group">执行环境</div>
+                  {PROFILES.map((profile) => (
+                    <button
+                      key={profile.id}
+                      className={"cmd" + (profile.id === currentPermissionProfile ? " sel" : "") + (profile.danger ? " danger" : "")}
+                      onClick={() => onPickPermissionProfile?.(profile.id)}
+                      disabled={!profile.allowed}
+                      title={profile.allowed
+                        ? profile.id
+                        : `${profile.id} · 当前机器策略不允许选择`}
+                    >
+                      <span className="cmd-ic"><Icon name={profile.ic} size={17} /></span>
+                      <span className="cmd-tx">
+                        <span className="cmd-nm">{profile.name}</span>
+                        <span className="cmd-ds">{profile.ds}{
+                          profile.allowed ? "" : " · 当前策略不可用"
+                        }</span>
+                      </span>
+                      {profile.id === currentPermissionProfile
+                        ? <span className="cmd-check"><Icon name="check" size={19} /></span>
+                        : <span className="cmd-kbd" />}
+                    </button>
+                  ))}
+                  {PROFILES.length === 0 && (
+                    <div className="cmd-empty">当前目录没有可选执行环境</div>
+                  )}
+                  <div className="cmd-group">网页搜索</div>
+                  <div className="cmd-search">
+                    <button type="button"
+                      className={currentWebSearch === "cached" ? "sel" : ""}
+                      onClick={() => onPickWebSearch?.("cached")}>
+                      Cached
+                    </button>
+                    <button type="button"
+                      className={currentWebSearch === "live" ? "sel" : ""}
+                      onClick={() => onPickWebSearch?.("live")}>
+                      Live
+                    </button>
+                  </div>
+                  <div className="cmd-search-note">
+                    Live 使用实时网页结果；切换会无损重连当前空闲会话。
+                  </div>
+                </>
+              )}
+            </>
           ) : isEffortMode ? (
             EFFORTS.map((ef) => (
               <button

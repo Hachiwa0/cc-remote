@@ -16,11 +16,13 @@ from cc_remote.protocol import (
     ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
     CollaborationMode, CommandAck, Delta, Error, GoalState, Interrupt, Model,
     NewSession, PinSession, StateEvent, Steer, ThreadGoal, TurnBinding, TurnEnd,
-    TurnSteered, UserMsg,
+    TurnSteered, UserMsg, PermissionProfile, PermissionProfiles,
+    SetPermissionProfile, SetWebSearch, WebSearch,
 )
 from cc_remote.wrapper import codex_handle as codex_handle_module
 from cc_remote.wrapper import codex_models as codex_models_module
 from cc_remote.wrapper import codex_runtime as codex_runtime_module
+from cc_remote.wrapper import codex_permissions as codex_permissions_module
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_handle import (
@@ -2139,14 +2141,17 @@ def test_codex_config_defaults_use_only_top_level_toml_keys(
         monkeypatch, tmp_path):
     config = tmp_path / "config.toml"
     config.write_text(
-        'model = "gpt-top"\nmodel_reasoning_effort = "high"\n\n'
+        'model = "gpt-top"\nmodel_reasoning_effort = "high"\n'
+        'web_search = "live"\n\n'
         '[profiles.work]\nmodel = "gpt-nested"\n'
-        'model_reasoning_effort = "low"\nservice_tier = "fast"\n')
+        'model_reasoning_effort = "low"\nservice_tier = "fast"\n'
+        'web_search = "cached"\n')
     monkeypatch.setattr(codex_sessions_module, "_CONFIG", str(config))
 
     assert codex_sessions_module.codex_model() == "gpt-top"
     assert codex_sessions_module.codex_effort() == "high"
     assert codex_sessions_module.codex_fast_enabled() is False
+    assert codex_sessions_module.codex_web_search() == "live"
 
 
 def test_codex_thread_settings_update_uses_official_01441_shapes():
@@ -2159,10 +2164,17 @@ def test_codex_thread_settings_update_uses_official_01441_shapes():
 
         async def request(method, params=None):
             requests.append((method, params))
+            if method == "permissionProfile/list":
+                return {"data": [{
+                    "id": ":danger-full-access",
+                    "description": "Full access",
+                    "allowed": True,
+                }]}
             return {}
 
         handle._request = request
         await handle.set_permission_mode("on-request")
+        await handle.set_permission_profile(":danger-full-access")
         await handle.set_model("gpt-after")
         await handle.set_effort("ultra")
         await handle.set_collaboration_mode("plan")
@@ -2172,6 +2184,13 @@ def test_codex_thread_settings_update_uses_official_01441_shapes():
         assert requests == [
             ("thread/settings/update", {
                 "threadId": "thread-settings", "approvalPolicy": "on-request",
+            }),
+            ("permissionProfile/list", {
+                "cwd": None, "limit": 128,
+            }),
+            ("thread/settings/update", {
+                "threadId": "thread-settings",
+                "permissions": ":danger-full-access",
             }),
             ("thread/settings/update", {
                 "threadId": "thread-settings", "model": "gpt-after",
@@ -2198,6 +2217,7 @@ def test_codex_thread_settings_update_uses_official_01441_shapes():
             }),
         ]
         assert handle.approval == "on-request"
+        assert handle.permission_profile == ":danger-full-access"
         assert handle.model == "gpt-after"
         assert handle.effort == "ultra"
         assert handle.collaboration_mode == "plan"
@@ -2218,11 +2238,12 @@ def test_codex_authoritative_thread_settings_restore_after_resume_or_notificatio
             "model": "persisted-model",
             "reasoningEffort": "xhigh",
             "approvalPolicy": "on-request",
+            "activePermissionProfile": {"id": ":workspace"},
             "serviceTier": "fast",
         })
         assert (handle.model, handle.effort, handle.approval,
-                handle.service_tier) == (
-            "persisted-model", "xhigh", "on-request", "fast")
+                handle.permission_profile, handle.service_tier) == (
+            "persisted-model", "xhigh", "on-request", ":workspace", "fast")
 
         handle.thread_id = "thread-settings"
         await handle._dispatch({
@@ -2233,6 +2254,9 @@ def test_codex_authoritative_thread_settings_restore_after_resume_or_notificatio
                     "model": "notification-model",
                     "effort": "ultra",
                     "approvalPolicy": "untrusted",
+                    "activePermissionProfile": {
+                        "id": ":danger-full-access",
+                    },
                     "serviceTier": None,
                     "collaborationMode": {
                         "mode": "plan",
@@ -2242,8 +2266,10 @@ def test_codex_authoritative_thread_settings_restore_after_resume_or_notificatio
             },
         })
         assert (handle.model, handle.effort, handle.approval,
-                handle.service_tier, handle.collaboration_mode) == (
-            "notification-model", "ultra", "untrusted", None, "plan")
+                handle.permission_profile, handle.service_tier,
+                handle.collaboration_mode) == (
+            "notification-model", "ultra", "untrusted",
+            ":danger-full-access", None, "plan")
 
     asyncio.run(run())
 
@@ -2253,6 +2279,7 @@ def test_codex_granular_approval_survives_resume_and_turn_start():
         handle = CodexHandle(_Cfg())
         handle.proc = SimpleNamespace(returncode=None)
         handle.thread_id = "granular-thread"
+        handle.permission_profile = ":workspace"
         granular = {"granular": {
             "mcp_elicitations": True,
             "rules": False,
@@ -2272,6 +2299,205 @@ def test_codex_granular_approval_survives_resume_and_turn_start():
         handle._request = request
         await handle.query("keep granular")
         assert requests[-1][1]["approvalPolicy"] == granular
+        assert requests[-1][1]["permissions"] == ":workspace"
+
+    asyncio.run(run())
+
+
+def test_codex_permission_profile_catalog_is_bounded_and_sanitized():
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp")
+        handle.thread_id = "profiles-thread"
+        calls = []
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            return {"data": [
+                {
+                    "id": ":workspace",
+                    "description": "Workspace writes",
+                    "allowed": True,
+                },
+                {"id": "", "description": "invalid", "allowed": True},
+                {"id": ":blocked", "description": None, "allowed": False},
+            ]}
+
+        handle._request = request
+        assert await handle.list_permission_profiles() == [
+            {
+                "id": ":workspace",
+                "description": "Workspace writes",
+                "allowed": True,
+            },
+            {"id": ":blocked", "description": None, "allowed": False},
+        ]
+        assert calls == [(
+            "permissionProfile/list", {"cwd": "/tmp", "limit": 128},
+        )]
+
+    asyncio.run(run())
+
+
+def test_codex_permission_profile_rejects_unknown_or_disallowed_selection():
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp")
+        handle.thread_id = "profiles-thread"
+        updates = []
+
+        async def request(method, params=None):
+            if method == "permissionProfile/list":
+                return {"data": [
+                    {"id": ":workspace", "allowed": True},
+                    {"id": ":blocked", "allowed": False},
+                ]}
+            updates.append((method, params))
+            return {}
+
+        handle._request = request
+        for profile in (":blocked", ":unknown"):
+            with pytest.raises(ValueError, match="unavailable"):
+                await handle.set_permission_profile(profile)
+        assert updates == []
+
+    asyncio.run(run())
+
+
+def test_codex_permission_profile_one_shot_catalog_uses_requested_cwd(
+        monkeypatch):
+    async def run():
+        calls = []
+
+        async def rpc(method, params, cwd=None):
+            calls.append((method, params, cwd))
+            return {"data": [{
+                "id": ":workspace",
+                "description": "Workspace",
+                "allowed": True,
+            }]}
+
+        monkeypatch.setattr(codex_permissions_module, "codex_rpc", rpc)
+        assert await codex_permissions_module.codex_permission_profiles(
+            "/tmp/project") == [{
+                "id": ":workspace",
+                "description": "Workspace",
+                "allowed": True,
+            }]
+        assert calls == [(
+            "permissionProfile/list",
+            {"cwd": "/tmp/project", "limit": 128},
+            "/tmp/project",
+        )]
+
+    asyncio.run(run())
+
+
+def test_codex_web_search_reconnects_same_thread_with_validated_override():
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp/project")
+        handle.thread_id = "search-thread"
+        reconnects = []
+
+        async def reconnect(resume_id, cwd=None, reason="reconnect"):
+            reconnects.append((resume_id, cwd, reason))
+
+        handle.force_reconnect = reconnect
+        await handle.set_web_search("live")
+        assert handle.web_search_override == "live"
+        assert handle.web_search == "live"
+        assert reconnects == [(
+            "search-thread", "/tmp/project", "web search changed",
+        )]
+        with pytest.raises(ValueError):
+            await handle.set_web_search("future-mode")
+
+        handle.turn_active = True
+        with pytest.raises(RuntimeError, match="active"):
+            await handle.set_web_search("cached")
+        assert handle.web_search == "live"
+
+        work = CodexHandle(_Cfg(), cwd="/tmp/work", work_mode=True)
+        work.thread_id = "work-thread"
+        with pytest.raises(ValueError, match="fixed"):
+            await work.set_web_search("live")
+
+    asyncio.run(run())
+
+
+def test_codex_web_search_failure_restores_approval_and_profile():
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp/project")
+        handle.thread_id = "search-thread"
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.approval = "on-request"
+        handle.permission_profile = ":read-only"
+        handle.web_search_override = "cached"
+        handle.web_search = "cached"
+        reconnects = []
+
+        async def fail_reconnect(
+            resume_id, cwd=None, reason="reconnect",
+        ):
+            assert (resume_id, cwd, reason) == (
+                "search-thread", "/tmp/project", "web search changed")
+            handle.approval = "never"
+            handle.permission_profile = ":danger-full-access"
+            handle.proc = None
+            raise RuntimeError("replacement resume failed")
+
+        async def restore_connect(**kwargs):
+            reconnects.append((
+                kwargs,
+                handle.approval,
+                handle.permission_profile,
+                handle.web_search_override,
+            ))
+            handle.proc = SimpleNamespace(returncode=None)
+
+        handle.force_reconnect = fail_reconnect
+        handle.connect = restore_connect
+        with pytest.raises(RuntimeError, match="replacement resume failed"):
+            await handle.set_web_search("live")
+
+        assert reconnects == [({
+            "resume_id": "search-thread",
+            "cwd": "/tmp/project",
+            "preserve_controls": True,
+        }, "on-request", ":read-only", "cached")]
+        assert (
+            handle.approval,
+            handle.permission_profile,
+            handle.web_search_override,
+            handle.web_search,
+        ) == ("on-request", ":read-only", "cached", "cached")
+
+    asyncio.run(run())
+
+
+def test_codex_force_reconnect_preserves_live_thread_controls():
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp/project")
+        handle.thread_id = "resume-thread"
+        calls = []
+
+        async def disconnect():
+            calls.append(("disconnect",))
+
+        async def connect(**kwargs):
+            calls.append(("connect", kwargs))
+
+        handle.disconnect = disconnect
+        handle.connect = connect
+        await handle.force_reconnect(
+            "resume-thread", "/tmp/project", reason="account switch")
+
+        assert calls == [
+            ("disconnect",),
+            ("connect", {
+                "resume_id": "resume-thread",
+                "cwd": "/tmp/project",
+                "preserve_controls": True,
+            }),
+        ]
 
     asyncio.run(run())
 
@@ -2335,18 +2561,24 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
         assert method == "turn/start"
         assert params["cwd"] == cwd
         assert params["approvalPolicy"] == "never"
+        assert params["permissions"] == "cc_remote_work"
         assert "sandboxPolicy" not in params
 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("work_mode,http_only", [
-    (False, False),
-    (False, True),
-    (True, False),
+@pytest.mark.parametrize(
+    "work_mode,http_only,web_override,preserve_controls,preserve_profile", [
+    (False, False, None, False, True),
+    (False, True, None, False, True),
+    (False, False, "live", False, True),
+    (False, False, "live", True, True),
+    (False, False, None, True, False),
+    (True, False, None, False, True),
 ])
-def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
-        monkeypatch, work_mode, http_only):
+def test_codex_resume_adopts_native_settings_unless_controls_are_preserved(
+        monkeypatch, work_mode, http_only, web_override, preserve_controls,
+        preserve_profile):
     class FakeProcess:
         pid = 424243
         returncode = None
@@ -2396,6 +2628,12 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         )
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
+        if preserve_controls:
+            handle.approval = "never"
+            handle.permission_profile = ":danger-full-access"
+        if web_override:
+            handle.web_search_override = web_override
+            handle.web_search = web_override
         calls = []
 
         async def idle(*_args):
@@ -2415,6 +2653,11 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
                     "model": "persisted-model",
                     "reasoningEffort": "ultra",
                     "approvalPolicy": "on-request",
+                    "activePermissionProfile": {
+                        "id": (
+                            "cc_remote_work" if work_mode else ":workspace"
+                        ),
+                    },
                     "serviceTier": "fast",
                 }
             raise AssertionError(method)
@@ -2423,7 +2666,12 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         handle._drain_stderr = idle
         handle._request = request
         handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
-        await handle.connect(resume_id="resume-thread", cwd="/tmp")
+        await handle.connect(
+            resume_id="resume-thread",
+            cwd="/tmp",
+            preserve_controls=preserve_controls,
+            preserve_permission_profile=preserve_profile,
+        )
 
         expected_resume = {
             "threadId": "resume-thread", "cwd": "/tmp",
@@ -2432,24 +2680,39 @@ def test_codex_resume_omits_local_defaults_and_adopts_app_server_settings(
         if http_only:
             expected_resume["modelProvider"] = (
                 codex_handle_module._OPENAI_HTTP_RESUME_PROVIDER_ID)
+        if preserve_controls:
+            expected_resume["approvalPolicy"] = "never"
+            if preserve_profile:
+                expected_resume["permissions"] = ":danger-full-access"
         if work_mode:
             expected_resume.update({
                 "baseInstructions": WORK_BASE_INSTRUCTIONS,
                 "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
                 "personality": "none",
                 "config": _expected_work_config(),
+                "permissions": "cc_remote_work",
             })
+        elif web_override:
+            expected_resume["config"] = {"web_search": web_override}
         resume_call = next(call for call in calls if call[0] == "thread/resume")
         assert resume_call == ("thread/resume", expected_resume)
         assert not ({
             "sandbox", "sandboxPolicy", "approvalsReviewer",
         } & resume_call[1].keys())
-        if not work_mode:
+        if not work_mode and not web_override:
             assert not ({"config", "personality"} & resume_call[1].keys())
         assert (handle.model, handle.effort, handle.approval,
-                handle.service_tier) == (
+                handle.permission_profile, handle.service_tier) == (
             "persisted-model", "ultra",
-            "never" if work_mode else "on-request", "fast")
+            "never" if work_mode or preserve_controls else "on-request",
+            (
+                "cc_remote_work" if work_mode
+                else ":danger-full-access"
+                if preserve_controls and preserve_profile
+                else ":workspace"
+            ),
+            "fast",
+        )
         await handle.disconnect()
         assert bool(repair_calls) is http_only
 
@@ -2591,9 +2854,13 @@ def test_codex_legacy_resume_rejects_oversized_rollout_before_request(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("work_mode", [False, True])
+@pytest.mark.parametrize("work_mode,web_override", [
+    (False, None),
+    (False, "live"),
+    (True, None),
+])
 def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
-        monkeypatch, work_mode):
+        monkeypatch, work_mode, web_override):
     class FakeProcess:
         pid = 424244
         returncode = None
@@ -2623,8 +2890,13 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         handle.effort = "ultra"
         handle.applied_effort = "ultra"
         handle.approval = "on-request"
+        handle.permission_profile = (
+            "cc_remote_work" if work_mode else ":danger-full-access")
         handle.collaboration_mode = "plan"
         handle.service_tier = "fast"
+        if web_override:
+            handle.web_search_override = web_override
+            handle.web_search = web_override
         calls = []
 
         async def idle(*_args):
@@ -2644,6 +2916,9 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
                     "model": "first-model",
                     "reasoningEffort": "low",
                     "approvalPolicy": "on-request",
+                    "activePermissionProfile": {
+                        "id": handle.permission_profile,
+                    },
                     "serviceTier": "priority",
                 }
             if method == "thread/settings/update":
@@ -2655,6 +2930,9 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
                             "model": "first-model",
                             "effort": "ultra",
                             "approvalPolicy": "on-request",
+                            "activePermissionProfile": {
+                                "id": handle.permission_profile,
+                            },
                             "serviceTier": "priority",
                             "collaborationMode": {
                                 "mode": "plan",
@@ -2677,6 +2955,8 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
             "approvalPolicy": "never" if work_mode else "on-request",
             "serviceTier": "fast",
             "model": "first-model",
+            "permissions": (
+                "cc_remote_work" if work_mode else ":danger-full-access"),
         }
         if work_mode:
             expected_start.update({
@@ -2684,7 +2964,10 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
                 "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
                 "personality": "none",
                 "config": _expected_work_config(),
+                "permissions": "cc_remote_work",
             })
+        elif web_override:
+            expected_start["config"] = {"web_search": web_override}
         start_call = next(call for call in calls if call[0] == "thread/start")
         assert start_call == ("thread/start", expected_start)
         discovery_methods = [
@@ -2703,7 +2986,7 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         assert not ({
             "sandbox", "sandboxPolicy", "approvalsReviewer",
         } & start_call[1].keys())
-        if not work_mode:
+        if not work_mode and not web_override:
             assert not ({"config", "personality"} & start_call[1].keys())
         settings_call = next(
             call for call in calls if call[0] == "thread/settings/update")
@@ -2719,19 +3002,27 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
                 },
             },
             "effort": "ultra",
+            "permissions": (
+                "cc_remote_work" if work_mode else ":danger-full-access"),
         })
         assert (handle.model, handle.effort, handle.approval,
-                handle.collaboration_mode, handle.service_tier) == (
+                handle.permission_profile, handle.collaboration_mode,
+                handle.service_tier) == (
             "first-model", "ultra",
-            "never" if work_mode else "on-request", "plan", "priority")
+            "never" if work_mode else "on-request",
+            "cc_remote_work" if work_mode else ":danger-full-access",
+            "plan", "priority")
         await handle.disconnect()
 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("work_mode", [False, True])
+@pytest.mark.parametrize("work_mode,web_override", [
+    (False, "live"),
+    (True, None),
+])
 def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
-        monkeypatch, work_mode):
+        monkeypatch, work_mode, web_override):
     class FakeProcess:
         pid = 424245
         returncode = None
@@ -2757,6 +3048,9 @@ def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
 
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
+        if web_override:
+            handle.web_search_override = web_override
+            handle.web_search = web_override
         calls = []
 
         async def idle(*_args):
@@ -2794,7 +3088,10 @@ def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
                 "developerInstructions": WORK_DEVELOPER_INSTRUCTIONS,
                 "personality": "none",
                 "config": _expected_work_config(),
+                "permissions": "cc_remote_work",
             })
+        elif web_override:
+            expected_fork["config"] = {"web_search": web_override}
         fork_call = next(call for call in calls if call[0] == "thread/fork")
         assert fork_call == ("thread/fork", expected_fork)
         await handle.disconnect()
@@ -4304,13 +4601,20 @@ def test_machine_codex_mcp_elicitation_form_returns_typed_content():
 
 class _ControlSdk:
     def __init__(self, approval="never", fail_perm=False,
-                 fail_collaboration=False):
+                 fail_collaboration=False, fail_profile=False):
         self.approval = approval
+        self.approval_policy = approval
+        self.permission_profile = ":workspace"
+        self.web_search = "cached"
+        self.web_search_override = None
         self.fail_perm = fail_perm
+        self.fail_profile = fail_profile
         self.fail_collaboration = fail_collaboration
         self.collaboration_mode = "default"
         self.service_tier = None
         self.permission_calls: list[str] = []
+        self.permission_profile_calls: list[str] = []
+        self.web_search_calls: list[str] = []
         self.collaboration_calls: list[str] = []
         self.service_tier_calls: list[str | None] = []
         self.tier_dirty = False
@@ -4321,6 +4625,32 @@ class _ControlSdk:
         if self.fail_perm:
             raise RuntimeError("apply failed")
         self.approval = mode
+        self.approval_policy = mode
+
+    async def list_permission_profiles(self):
+        return [
+            {
+                "id": ":workspace",
+                "description": "Workspace",
+                "allowed": True,
+            },
+            {
+                "id": ":danger-full-access",
+                "description": "Full access",
+                "allowed": True,
+            },
+        ]
+
+    async def set_permission_profile(self, profile):
+        self.permission_profile_calls.append(profile)
+        if self.fail_profile:
+            raise RuntimeError("profile apply failed")
+        self.permission_profile = profile
+
+    async def set_web_search(self, mode):
+        self.web_search_calls.append(mode)
+        self.web_search = mode
+        self.web_search_override = mode
 
     async def set_service_tier(self, tier):
         self.service_tier_calls.append(tier)
@@ -4360,6 +4690,8 @@ def test_permission_modes_are_engine_strict_and_broadcast_after_apply():
         assert codex.sdk.permission_calls == ["on-request"]
         assert transport.sent[-1].type == "perm"
         assert transport.sent[-1].mode == "on-request"
+        assert machine._codex_controls.get(
+            "codex").approval_policy == "on-request"
 
         await machine._handle_set_perm(
             SimpleNamespace(sid="claude", mode="untrusted"))
@@ -4400,6 +4732,173 @@ def test_codex_work_permission_cannot_escalate_outside_its_profile():
         assert work.sdk.permission_calls == ["never"]
         assert transport.sent[-1].type == "perm"
         assert transport.sent[-1].mode == "never"
+
+    asyncio.run(run())
+
+
+def test_permission_profiles_are_codex_only_and_broadcast_after_apply():
+    async def run():
+        machine, transport = _mk_machine()
+        codex = _control_ctx("codex", "codex")
+        claude = _control_ctx("claude", "claude")
+        machine.sessions = {"codex": codex, "claude": claude}
+
+        catalog = await machine._handle_get_permission_profiles(
+            SimpleNamespace(
+                sid="codex", client_id="client-1", cmd_id="profiles-1"))
+        assert isinstance(catalog, PermissionProfiles)
+        assert catalog.to == "client-1"
+        assert [profile.id for profile in catalog.profiles] == [
+            ":workspace", ":danger-full-access",
+        ]
+
+        event = await machine._handle_set_permission_profile(
+            SetPermissionProfile(
+                sid="codex", profile=":danger-full-access"))
+        assert isinstance(event, PermissionProfile)
+        assert event.profile == ":danger-full-access"
+        assert codex.sdk.permission_profile_calls == [
+            ":danger-full-access",
+        ]
+        assert codex.announced_permission_profile == ":danger-full-access"
+        assert machine._codex_controls.get(
+            "codex").permission_profile == ":danger-full-access"
+
+        codex.state = "running"
+        rejected = await machine._handle_set_permission_profile(
+            SetPermissionProfile(
+                sid="codex", profile=":workspace"))
+        assert isinstance(rejected, Error)
+        assert rejected.code == "busy"
+        assert codex.sdk.permission_profile_calls == [
+            ":danger-full-access",
+        ]
+        codex.state = "idle"
+
+        rejected = await machine._handle_set_permission_profile(
+            SetPermissionProfile(
+                sid="claude", profile=":danger-full-access"))
+        assert isinstance(rejected, Error)
+        assert claude.sdk.permission_profile_calls == []
+
+        work = _control_ctx("codex-work", "codex")
+        work.space = "work"
+        machine.sessions["codex-work"] = work
+        rejected = await machine._handle_set_permission_profile(
+            SetPermissionProfile(
+                sid="codex-work", profile=":danger-full-access"))
+        assert isinstance(rejected, Error)
+        assert rejected.code == "auth"
+        assert work.sdk.permission_profile_calls == []
+
+    asyncio.run(run())
+
+
+def test_new_session_permission_profile_catalog_is_cwd_scoped(
+        monkeypatch, tmp_path):
+    async def run():
+        machine, transport = _mk_machine()
+        calls = []
+
+        async def catalog(cwd):
+            calls.append(cwd)
+            return [{
+                "id": ":custom",
+                "description": "Project profile",
+                "allowed": True,
+            }]
+
+        monkeypatch.setattr(machine_module, "codex_permission_profiles", catalog)
+        event = await machine._handle_get_permission_profiles(
+            SimpleNamespace(
+                sid=None,
+                cwd=str(tmp_path),
+                client_id="client-new",
+                cmd_id="profiles-new",
+            ))
+        assert isinstance(event, PermissionProfiles)
+        assert event.sid is None
+        assert event.to == "client-new"
+        assert event.request_id == "profiles-new"
+        assert event.cwd == str(tmp_path)
+        assert [profile.id for profile in event.profiles] == [":custom"]
+        assert calls == [str(tmp_path.resolve())]
+        assert transport.sent[-1] is event
+
+    asyncio.run(run())
+
+
+def test_web_search_is_codex_code_only_idle_and_broadcast_after_reconnect():
+    async def run():
+        machine, transport = _mk_machine()
+        codex = _control_ctx("codex", "codex")
+        machine.sessions = {"codex": codex}
+        machine._stamp_codex_daemon_epoch = lambda _ctx: asyncio.sleep(0)
+        machine._persist_codex_session_controls = lambda _ctx: asyncio.sleep(0)
+
+        event = await machine._handle_set_web_search(
+            SetWebSearch(sid="codex", mode="live"))
+        assert isinstance(event, WebSearch)
+        assert event.mode == "live"
+        assert codex.sdk.web_search_calls == ["live"]
+        assert codex.announced_web_search == "live"
+
+        codex.state = "running"
+        rejected = await machine._handle_set_web_search(
+            SetWebSearch(sid="codex", mode="cached"))
+        assert isinstance(rejected, Error)
+        assert rejected.code == "busy"
+        assert codex.sdk.web_search_calls == ["live"]
+
+        codex.state = "idle"
+        codex.space = "work"
+        rejected = await machine._handle_set_web_search(
+            SetWebSearch(sid="codex", mode="cached"))
+        assert isinstance(rejected, Error)
+        assert rejected.code == "auth"
+        assert transport.sent[-1] is rejected
+
+    asyncio.run(run())
+
+
+def test_failed_web_search_republishes_restored_execution_controls():
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = _ControlSdk(approval="on-request")
+        sdk.permission_profile = ":read-only"
+        sdk.web_search = "cached"
+        sdk.web_search_override = "cached"
+        sdk.proc = SimpleNamespace(returncode=None)
+
+        async def fail(_mode):
+            raise RuntimeError("search reconnect failed after rollback")
+
+        sdk.set_web_search = fail
+        ctx = _control_ctx("codex", "codex", sdk)
+        ctx.announced_perm = "never"
+        ctx.announced_permission_profile = ":danger-full-access"
+        ctx.announced_web_search = "live"
+        machine.sessions = {"codex": ctx}
+
+        result = await machine._handle_set_web_search(
+            SetWebSearch(sid="codex", mode="live"))
+
+        assert isinstance(result, Error)
+        assert [event.type for event in transport.sent[-4:]] == [
+            "perm", "permission_profile", "web_search", "error",
+        ]
+        assert transport.sent[-4].mode == "on-request"
+        assert transport.sent[-3].profile == ":read-only"
+        assert transport.sent[-2].mode == "cached"
+        assert (
+            ctx.announced_perm,
+            ctx.announced_permission_profile,
+            ctx.announced_web_search,
+        ) == ("on-request", ":read-only", "cached")
+        persisted = machine._codex_controls.get("codex")
+        assert persisted.approval_policy == "on-request"
+        assert persisted.permission_profile == ":read-only"
+        assert persisted.web_search == "cached"
 
     asyncio.run(run())
 
@@ -4789,6 +5288,11 @@ def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
             self.effort = "high"
             self.applied_effort = "high"
             self.approval = "never"
+            self.permission_profile = None
+            self.web_search = "cached"
+            self.web_search_override = None
+            self.collaboration_mode = "default"
+            self.service_tier = None
             self.approval_callback = None
             self.disconnected = False
 
@@ -4808,7 +5312,9 @@ def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
         monkeypatch.setattr(SdkHandle, "preflight", staticmethod(fail))
         monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
         machine, _ = _mk_machine()
-        transport = _FiniteTransport([NewSession(engine="codex")])
+        transport = _FiniteTransport([
+            NewSession(engine="codex", web_search="live"),
+        ])
         machine.transport = transport
         transport.on_connected = machine._on_transport_connected
         machine.cfg.state_dir = tmp_path / "state"
@@ -4819,11 +5325,127 @@ def test_empty_pool_accepts_codex_session_after_claude_bootstrap_failure(
         assert len(machine.sessions) == 1
         ctx = next(iter(machine.sessions.values()))
         assert ctx.engine == "codex"
+        assert ctx.sdk.web_search == "live"
+        assert ctx.sdk.web_search_override == "live"
+        assert machine._codex_controls.get(
+            "fresh-codex-thread").web_search == "live"
         assert machine.focused_sid == ctx.key
         assert any(message.type == "session_focus" for message in transport.sent)
         assert any(message.type == "perm" and message.mode == "never"
                    for message in transport.sent)
         assert ctx.sdk.disconnected is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stale_catalog_entry", [
+    None,
+    {"id": ":removed-profile", "allowed": False},
+])
+def test_codex_resume_discards_unavailable_persisted_profile(
+        monkeypatch, tmp_path, stale_catalog_entry):
+    class FakeCodexHandle:
+        def __init__(self, _cfg, cwd=None, daemon_mode=None,
+                     daemon_manager=None):
+            self.cwd = cwd
+            self.daemon_mode = daemon_mode
+            self.daemon_manager = daemon_manager
+            self.thread_id = None
+            self.proc = SimpleNamespace(returncode=None)
+            self.model = "gpt-test"
+            self.effort = "high"
+            self.applied_effort = "high"
+            self._approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search = "cached"
+            self.web_search_override = None
+            self.collaboration_mode = "default"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.connect_calls = []
+
+        @property
+        def approval(self):
+            return self._approval
+
+        @approval.setter
+        def approval(self, value):
+            self._approval = value
+            self.approval_policy = value
+
+        async def connect(self, **kwargs):
+            self.connect_calls.append(kwargs)
+            self.thread_id = kwargs["resume_id"]
+            # Simulate the allowed cwd-aware native default returned by resume.
+            self.permission_profile = ":workspace"
+
+        async def disconnect(self):
+            self.proc = None
+
+    async def run():
+        thread_id = "persisted-profile-thread"
+        machine, _ = _mk_machine()
+        machine.cfg.cc_cwd = str(tmp_path)
+        machine._codex_controls.update(
+            thread_id,
+            approval_policy="on-request",
+            permission_profile=":removed-profile",
+            web_search="live",
+        )
+        catalog_calls = []
+
+        async def catalog(cwd):
+            catalog_calls.append(cwd)
+            entries = [{
+                "id": ":workspace",
+                "description": "Workspace",
+                "allowed": True,
+            }]
+            if stale_catalog_entry is not None:
+                entries.insert(0, stale_catalog_entry)
+            return entries
+
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        monkeypatch.setattr(machine_module, "codex_permission_profiles", catalog)
+        monkeypatch.setattr(
+            machine_module, "codex_session_cwd",
+            lambda _thread_id: str(tmp_path),
+        )
+        monkeypatch.setattr(
+            machine_module, "codex_session_settings",
+            lambda *_args: {
+                "approval_policy": "on-request",
+                "permission_profile": ":removed-profile",
+            },
+        )
+        machine._watch_session = lambda _sid: None
+        machine._prime_codex_ownership = (
+            lambda _sid: asyncio.sleep(0, result=False))
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            resume_id=thread_id,
+            engine="codex",
+            space="code",
+        )
+
+        assert ctx is not None
+        assert ctx.sdk.connect_calls == [{
+            "resume_id": thread_id,
+            "cwd": str(tmp_path),
+            "preserve_controls": True,
+            "preserve_permission_profile": False,
+        }]
+        assert ctx.sdk.approval == "on-request"
+        assert ctx.sdk.permission_profile == ":workspace"
+        assert ctx.sdk.web_search == "live"
+        assert catalog_calls == [str(tmp_path)]
+        persisted = machine._codex_controls.get(thread_id)
+        assert persisted.approval_policy == "on-request"
+        assert persisted.permission_profile == ":workspace"
+        assert persisted.web_search == "live"
 
     asyncio.run(run())
 
