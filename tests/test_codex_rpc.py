@@ -34,6 +34,20 @@ class _FakeStdout:
         return self.lines.pop(0) if self.lines else b""
 
 
+class _BlockingFakeStdout(_FakeStdout):
+    async def readline(self) -> bytes:
+        if self.lines:
+            return self.lines.pop(0)
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class _BackpressuredFakeStdin(_FakeStdin):
+    async def drain(self) -> None:
+        if len(self.writes) >= 3:
+            await asyncio.Event().wait()
+
+
 class _FakeProcess:
     def __init__(self, messages):
         self.stdin = _FakeStdin()
@@ -153,6 +167,78 @@ def test_codex_rpc_batch_uses_one_process_and_preserves_partial_results(
             "mcpServerStatus/list",
         ]
         assert [message.get("id") for message in messages[2:]] == [2, 3, 4]
+        assert process.stdin.closed is True
+        assert process.terminated is True and process.killed is False
+
+    asyncio.run(run())
+
+
+def test_codex_rpc_batch_timeout_preserves_completed_results(
+    monkeypatch, tmp_path,
+):
+    async def run():
+        process = _FakeProcess([])
+        process.stdout = _BlockingFakeStdout([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "id": 2, "result": {"skills": True}},
+        ])
+
+        async def create_subprocess_exec(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(
+            codex_rpc_module, "_resolve_codex_bin", lambda: "/bin/codex"
+        )
+        monkeypatch.setattr(codex_rpc_module, "_codex_env", lambda _path: {})
+        monkeypatch.setattr(
+            codex_rpc_module.asyncio,
+            "create_subprocess_exec",
+            create_subprocess_exec,
+        )
+
+        results = await codex_rpc_module.codex_rpc_batch([
+            ("skills/list", {"cwds": [str(tmp_path)]}),
+            ("mcpServerStatus/list", None),
+        ], cwd=str(tmp_path), timeout=0.1)
+
+        assert results[0] == {"skills": True}
+        assert isinstance(results[1], codex_rpc_module.CodexRpcOutcomeUnknown)
+        assert process.stdin.closed is True
+        assert process.terminated is True and process.killed is False
+
+    asyncio.run(run())
+
+
+def test_codex_rpc_batch_deadline_covers_request_backpressure(
+    monkeypatch, tmp_path,
+):
+    async def run():
+        process = _FakeProcess([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+        ])
+        process.stdin = _BackpressuredFakeStdin()
+
+        async def create_subprocess_exec(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(
+            codex_rpc_module, "_resolve_codex_bin", lambda: "/bin/codex"
+        )
+        monkeypatch.setattr(codex_rpc_module, "_codex_env", lambda _path: {})
+        monkeypatch.setattr(
+            codex_rpc_module.asyncio,
+            "create_subprocess_exec",
+            create_subprocess_exec,
+        )
+
+        results = await asyncio.wait_for(
+            codex_rpc_module.codex_rpc_batch([
+                ("skills/list", {"cwds": [str(tmp_path)]}),
+            ], cwd=str(tmp_path), timeout=0.1),
+            timeout=0.5,
+        )
+
+        assert isinstance(results[0], codex_rpc_module.CodexRpcOutcomeUnknown)
         assert process.stdin.closed is True
         assert process.terminated is True and process.killed is False
 

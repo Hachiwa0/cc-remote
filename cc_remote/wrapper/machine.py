@@ -7765,7 +7765,11 @@ class WrapperMachine:
         client_id = getattr(cmd, "client_id", None)
         try:
             items, errors, notes = await engine_capabilities(
-                engine, target_cwd, space, self.cfg.claude_bin
+                engine,
+                target_cwd,
+                space,
+                self.cfg.claude_bin,
+                skills_only=getattr(cmd, "skills_only", False),
             )
         except Exception:
             log.exception(
@@ -7775,9 +7779,12 @@ class WrapperMachine:
         result = EngineCapabilities(
             engine=engine,
             space=space,
+            request_id=getattr(cmd, "cmd_id", None),
+            cwd=target_cwd,
             items=items,
             errors=errors,
             notes=notes,
+            skills_only=getattr(cmd, "skills_only", False),
             to=client_id,
         )
         await self.transport.send(result)

@@ -138,7 +138,7 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
   return out;
 }
 
-function sameTurn(history: Turn, live: Turn): boolean {
+function sameTurnIdentity(history: Turn, live: Turn): boolean {
   if (history.id === live.id) return true;
   if (history.clientMsgId && (
     history.clientMsgId === live.id
@@ -150,7 +150,11 @@ function sameTurn(history: Turn, live: Turn): boolean {
   // assistant item id; TurnEnd still supplies the same authoritative branch id.
   if (history.forkPointId && live.forkPointId
       && history.forkPointId === live.forkPointId) return true;
-  if (history.forkPointId === live.id || live.forkPointId === history.id) return true;
+  return history.forkPointId === live.id || live.forkPointId === history.id;
+}
+
+function sameTurn(history: Turn, live: Turn): boolean {
+  if (sameTurnIdentity(history, live)) return true;
   if (!history.prompt || !live.prompt || history.prompt !== live.prompt) return false;
   // Different ids are an optimistic-client id vs transcript id only when their
   // authoritative UserMsg times are nearly identical. Prompt text alone is not
@@ -161,6 +165,133 @@ function sameTurn(history: Turn, live: Turn): boolean {
 
 export function historyContainsTurn(history: Turn[], live: Turn): boolean {
   return history.some((turn) => sameTurn(turn, live));
+}
+
+function cloneDetailBlock(block: Block): Block {
+  if (block.kind === "process") {
+    return {
+      ...block,
+      input: block.input ? { ...block.input } : block.input,
+      plan: block.plan?.map((entry) => ({ ...entry })),
+    };
+  }
+  if (block.kind === "tool") {
+    return {
+      ...block,
+      input: { ...block.input },
+      result: block.result ? { ...block.result } : block.result,
+    };
+  }
+  return { ...block };
+}
+
+/** Paint only heavyweight blocks from a same-revision/generation browser
+ * cache over an authoritative summary row.
+ *
+ * The summary remains authoritative for prompt/final/lifecycle. Cached process
+ * is deliberately marked provisional and owns no source segments; the next
+ * accepted TurnDetail page replaces it rather than merging stale events into
+ * the transcript projection.
+ */
+function installCachedDetailRestore(
+  summary: Turn,
+  cached: Turn,
+  reveal: boolean,
+): Turn {
+  if (!summary.done || !cached.done || summary.detailLoaded
+      || summary.detailProjection
+      || (summary.detailEventCount ?? 0) <= 0) return summary;
+  const source = cached.detailProjection?.blocks ?? cached.blocks;
+  const blocks = source.filter((block) => !isFinalTextBlock(block))
+    .map(cloneDetailBlock);
+  if (blocks.length === 0) return summary;
+  return {
+    ...summary,
+    detailLoaded: false,
+    detailLoading: false,
+    detailProjection: {
+      // Empty segments distinguish instant-paint cache from authoritative
+      // cursor pages. installTurnDetailProjectionPage then replaces this
+      // visible block list with the first accepted server page.
+      segments: [],
+      blocks,
+      capped: cached.detailProjection?.capped ?? false,
+      hasMore: false,
+      oldestCursor: null,
+      hasNewer: false,
+      newerCursor: null,
+    },
+    detailHasMore: false,
+    detailOldestCursor: null,
+    detailHasNewer: false,
+    detailNewerCursor: null,
+    detailAutoLoad: false,
+    detailRestorePending: reveal,
+    detailRestoreIncomplete: false,
+    // Automatically recreating thousands of DOM rows would defeat the instant
+    // cache paint. Small latest-turn process is reopened to preserve the live
+    // 1..N reading experience; large projections remain one tap away.
+    detailRestoreOpen: reveal && blocks.length <= 256,
+  };
+}
+
+/** Reconcile cached process with canonical summary identities without
+ * resurrecting a completed row which authoritative History removed. */
+export function restoreCachedTurnDetails(
+  summaries: Turn[],
+  cachedTurns: readonly Turn[],
+): Turn[] {
+  const matches = new Array<number>(summaries.length).fill(-1);
+  const usedCached = new Set<number>();
+
+  // Reserve every authoritative identity before considering the timestamp
+  // compatibility fallback. Otherwise a nearby repeated prompt can consume a
+  // cache row which belongs exactly to another summary.
+  for (let summaryIndex = 0; summaryIndex < summaries.length; summaryIndex += 1) {
+    const cachedIndex = cachedTurns.findIndex((candidate, index) =>
+      !usedCached.has(index)
+      && sameTurnIdentity(summaries[summaryIndex], candidate));
+    if (cachedIndex < 0) continue;
+    matches[summaryIndex] = cachedIndex;
+    usedCached.add(cachedIndex);
+  }
+
+  // Older optimistic caches may legitimately have a different id. Keep that
+  // compatibility one-to-one and choose the closest timestamp so repeated
+  // prompts cannot all reuse the first eligible cache row.
+  for (let summaryIndex = 0; summaryIndex < summaries.length; summaryIndex += 1) {
+    if (matches[summaryIndex] >= 0) continue;
+    const summary = summaries[summaryIndex];
+    let bestIndex = -1;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (let cachedIndex = 0; cachedIndex < cachedTurns.length;
+      cachedIndex += 1) {
+      if (usedCached.has(cachedIndex)) continue;
+      const candidate = cachedTurns[cachedIndex];
+      if (!sameTurn(summary, candidate)) continue;
+      const distance = Math.abs((summary.ts ?? 0) - (candidate.ts ?? 0));
+      if (distance >= bestDistance) continue;
+      bestIndex = cachedIndex;
+      bestDistance = distance;
+    }
+    if (bestIndex < 0) continue;
+    matches[summaryIndex] = bestIndex;
+    usedCached.add(bestIndex);
+  }
+
+  let revealNewest = true;
+  const restored = [...summaries];
+  for (let summaryIndex = restored.length - 1; summaryIndex >= 0;
+    summaryIndex -= 1) {
+    const cachedIndex = matches[summaryIndex];
+    if (cachedIndex < 0) continue;
+    const summary = restored[summaryIndex];
+    const installed = installCachedDetailRestore(
+      summary, cachedTurns[cachedIndex], revealNewest);
+    if (installed !== summary) revealNewest = false;
+    restored[summaryIndex] = installed;
+  }
+  return restored;
 }
 
 function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
@@ -246,7 +377,7 @@ export function mergeAuthoritativeTurnDetail(
     error: summary.error,
     progress: summary.progress,
     detailEventCount: summary.detailEventCount,
-    detailLoaded: true,
+    detailLoaded: detail.detailLoaded ?? true,
     detailLoading: false,
     detailProjection: detail.detailProjection ?? summary.detailProjection,
     detailHasMore: detail.detailProjection
@@ -262,6 +393,11 @@ export function mergeAuthoritativeTurnDetail(
       ? detail.detailProjection.newerCursor
       : detail.detailNewerCursor ?? summary.detailNewerCursor,
     detailAutoLoad: detail.detailAutoLoad ?? summary.detailAutoLoad,
+    detailRestorePending: false,
+    detailRestoreOpen:
+      detail.detailRestoreOpen ?? summary.detailRestoreOpen,
+    detailRestoreIncomplete:
+      detail.detailRestoreIncomplete ?? summary.detailRestoreIncomplete,
   };
 }
 
@@ -341,6 +477,8 @@ export function installAuthoritativeTurnDetailPage(
     ? detailProjection.hasNewer : page.hasNewer;
   const newerCursor = detailProjection
     ? detailProjection.newerCursor : page.newerCursor ?? null;
+  const restoreIncomplete =
+    summary.detailRestoreIncomplete === true && hasMore;
   return {
     ...summary,
     prompt: detail.prompt || summary.prompt,
@@ -360,7 +498,7 @@ export function installAuthoritativeTurnDetailPage(
     error: summary.error,
     progress: summary.progress,
     detailEventCount: summary.detailEventCount,
-    detailLoaded: true,
+    detailLoaded: !restoreIncomplete,
     detailLoading: false,
     detailProjection,
     detailHasMore: hasMore,
@@ -368,6 +506,8 @@ export function installAuthoritativeTurnDetailPage(
     detailHasNewer: hasNewer,
     detailNewerCursor: newerCursor,
     detailAutoLoad: !!summary.detailAutoLoad && hasMore,
+    detailRestorePending: false,
+    detailRestoreIncomplete: restoreIncomplete,
   };
 }
 

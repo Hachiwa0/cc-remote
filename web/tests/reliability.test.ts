@@ -17,7 +17,10 @@ import {
   queuedQueryWireBytes,
   reduceTargetedRuntime,
 } from "../src/runtime-drain.ts";
-import { mergeInitialHistory } from "../src/history-merge.ts";
+import {
+  mergeInitialHistory,
+  restoreCachedTurnDetails,
+} from "../src/history-merge.ts";
 import {
   HISTORY_INITIAL_PAGE,
   HISTORY_MORE_PAGE,
@@ -81,7 +84,12 @@ import {
   type MobileViewportEvent,
   type ViewportReading,
 } from "../src/use-mobile-viewport.ts";
-import type { History, ServerEvent, SessionControl } from "../src/protocol.ts";
+import type {
+  EngineCapabilities,
+  History,
+  ServerEvent,
+  SessionControl,
+} from "../src/protocol.ts";
 import type { Block, Turn } from "../src/reducer.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
 import {
@@ -119,8 +127,12 @@ import { PointerTapGuard } from "../src/pointer-tap.ts";
 import {
   cacheSkillCatalog,
   MAX_SKILL_CATALOGS,
+  SkillCatalogRequestCoordinator,
   skillCatalogFresh,
   skillCatalogKey,
+  skillCatalogRefreshSucceeded,
+  skillCatalogReadKey,
+  skillCatalogResponseMatches,
   SKILL_CATALOG_TTL_MS,
 } from "../src/skill-catalog-cache.ts";
 import {
@@ -372,6 +384,223 @@ assert.notEqual(repoSkillKey, skillCatalogKey(
 assert.notEqual(repoSkillKey, skillCatalogKey(
   "machine-b", "codex", "code", "/repo/a"),
   "Skill catalogs must remain inside the machine authorization boundary");
+assert.notEqual(
+  skillCatalogReadKey(repoSkillKey, true),
+  skillCatalogReadKey(repoSkillKey, false),
+  "a lightweight Skill read must not swallow a queued full extension read",
+);
+const skillRead = {
+  key: repoSkillKey,
+  requestId: "skills-request-a",
+  engine: "codex",
+  space: "code",
+  cwd: "/repo/a",
+  skillsOnly: true,
+} as const;
+const skillResponse = {
+  v: 26,
+  ts: 0,
+  type: "engine_capabilities",
+  engine: "codex",
+  space: "code",
+  request_id: "skills-request-a",
+  cwd: "/repo/a",
+  items: skillCatalog,
+  errors: [],
+  notes: [],
+  skills_only: true,
+} satisfies EngineCapabilities;
+assert.equal(skillCatalogResponseMatches(skillRead, skillResponse), true);
+assert.equal(skillCatalogResponseMatches(
+  skillRead, { ...skillResponse, request_id: "replayed-old-request" }), false,
+  "a replayed capability response must not complete a newer read",
+);
+assert.equal(skillCatalogResponseMatches(
+  skillRead, { ...skillResponse, cwd: "/repo/b" }), false,
+  "a capability response from another cwd must not complete the active read",
+);
+assert.equal(skillCatalogResponseMatches(
+  { ...skillRead, cwd: "" }, skillResponse), true,
+  "an omitted cwd must accept the wrapper's resolved default directory",
+);
+assert.equal(skillCatalogRefreshSucceeded(skillResponse), true);
+assert.equal(skillCatalogRefreshSucceeded({
+  ...skillResponse,
+  items: [],
+  errors: ["skills: app-server request failed"],
+}), false, "a failed Skill refresh must preserve stale cached items");
+assert.equal(skillCatalogRefreshSucceeded({
+  ...skillResponse,
+  skills_only: false,
+  errors: ["plugins: app-server request failed"],
+}), true, "an unrelated full-inventory failure must not hide valid Skills");
+
+const capabilityRequest = (
+  key: string,
+  cwd: string,
+  skillsOnly: boolean,
+) => ({
+  key,
+  engine: "codex" as const,
+  space: "code" as const,
+  cwd,
+  skillsOnly,
+});
+const capabilityResponse = (
+  requestId: string,
+  cwd: string,
+  skillsOnly: boolean,
+): EngineCapabilities => ({
+  ...skillResponse,
+  request_id: requestId,
+  cwd,
+  skills_only: skillsOnly,
+});
+
+const parallelLaneStarts: Array<{
+  requestId: string;
+  key: string;
+  skillsOnly: boolean;
+}> = [];
+const parallelLanes = new SkillCatalogRequestCoordinator((request) => {
+  const requestId = `parallel-read-${parallelLaneStarts.length + 1}`;
+  parallelLaneStarts.push({
+    requestId, key: request.key, skillsOnly: request.skillsOnly,
+  });
+  return requestId;
+});
+const parallelFullRequest = capabilityRequest(
+  repoSkillKey, "/repo/a", false);
+const parallelSkillsRequest = capabilityRequest(
+  repoSkillKey, "/repo/a", true);
+assert.equal(parallelLanes.request(parallelFullRequest), true);
+assert.equal(parallelLanes.request(parallelSkillsRequest), true,
+  "a Skills-only read must not wait for a slow full inventory read");
+assert.deepEqual(
+  parallelLaneStarts.map(({ skillsOnly }) => skillsOnly),
+  [false, true],
+  "full and Skills-only reads use independent bounded lanes");
+assert.equal(parallelLanes.accept(
+  capabilityResponse("parallel-read-2", "/repo/a", true))?.request.skillsOnly,
+  true);
+assert.equal(parallelLanes.hasPendingRead(repoSkillKey, false), true,
+  "accepting the fast Skills response must leave full inventory active");
+assert.equal(parallelLanes.hasPendingRead(repoSkillKey, true), false);
+assert.equal(parallelLanes.accept(
+  capabilityResponse("parallel-read-1", "/repo/a", false))?.request.skillsOnly,
+  false);
+
+const parallelMutationStarts: string[] = [];
+const parallelMutation = new SkillCatalogRequestCoordinator((_request) => {
+  const requestId = `parallel-mutation-read-${parallelMutationStarts.length + 1}`;
+  parallelMutationStarts.push(requestId);
+  return requestId;
+});
+assert.equal(parallelMutation.request(parallelFullRequest), true);
+assert.equal(parallelMutation.request(parallelSkillsRequest), true);
+assert.equal(parallelMutation.trackMutation(
+  "parallel-mutation", parallelFullRequest), true);
+assert.equal(parallelMutation.accept(
+  capabilityResponse("parallel-mutation", "/repo/a", false))?.superseded,
+  false);
+assert.equal(parallelMutation.accept(
+  capabilityResponse(
+    "parallel-mutation-read-2", "/repo/a", true))?.superseded,
+  true, "a same-scope mutation must supersede the active Skills lane");
+assert.equal(parallelMutation.accept(
+  capabilityResponse(
+    "parallel-mutation-read-1", "/repo/a", false))?.superseded,
+  true, "a same-scope mutation must supersede the active full lane");
+
+const mutationRaceStarts: Array<{ requestId: string; key: string; skillsOnly: boolean }> = [];
+const mutationRace = new SkillCatalogRequestCoordinator((request) => {
+  const requestId = `race-read-${mutationRaceStarts.length + 1}`;
+  mutationRaceStarts.push({
+    requestId, key: request.key, skillsOnly: request.skillsOnly,
+  });
+  return requestId;
+});
+const raceSkillsRequest = capabilityRequest(repoSkillKey, "/repo/a", true);
+const raceFullRequest = capabilityRequest(repoSkillKey, "/repo/a", false);
+assert.equal(mutationRace.request(raceSkillsRequest), true);
+assert.equal(mutationRace.trackMutation("race-mutation", raceFullRequest), true);
+assert.equal(mutationRace.request(raceFullRequest), false,
+  "a read requested during a same-scope mutation must wait");
+assert.equal(mutationRaceStarts.length, 1,
+  "the queued refresh must not overtake the pending mutation");
+const raceMutationAcceptance = mutationRace.accept(
+  capabilityResponse("race-mutation", "/repo/a", false));
+assert.equal(raceMutationAcceptance?.superseded, false);
+assert.deepEqual(mutationRaceStarts.at(-1), {
+  requestId: "race-read-2",
+  key: repoSkillKey,
+  skillsOnly: false,
+}, "the full lane may refresh after mutation while stale Skills drain");
+const staleReadAcceptance = mutationRace.accept(
+  capabilityResponse("race-read-1", "/repo/a", true));
+assert.equal(staleReadAcceptance?.superseded, true,
+  "a read started before mutation must not roll the catalog back");
+assert.equal(mutationRaceStarts.length, 2,
+  "draining the stale Skills lane must not duplicate the active full refresh");
+
+const blockedMutationStarts: string[] = [];
+const blockedMutation = new SkillCatalogRequestCoordinator((request) => {
+  blockedMutationStarts.push(request.key);
+  return `blocked-read-${blockedMutationStarts.length}`;
+});
+assert.equal(blockedMutation.trackMutation(
+  "blocked-mutation", raceFullRequest), true);
+assert.equal(blockedMutation.request(raceSkillsRequest), false);
+assert.deepEqual(blockedMutationStarts, [],
+  "same-scope reads must stay queued while a mutation is pending");
+assert.equal(blockedMutation.accept(
+  capabilityResponse("blocked-mutation", "/repo/b", false)), null,
+  "a mutation response from another cwd must not release the scoped queue");
+assert.deepEqual(blockedMutationStarts, []);
+assert.ok(blockedMutation.accept(
+  capabilityResponse("blocked-mutation", "/repo/a", false)));
+assert.deepEqual(blockedMutationStarts, [repoSkillKey],
+  "a queued read must start after the mutation response");
+
+const isolatedStarts: string[] = [];
+const isolatedRequests = new SkillCatalogRequestCoordinator((request) => {
+  const requestId = `isolated-${isolatedStarts.length + 1}`;
+  isolatedStarts.push(request.key);
+  return requestId;
+});
+const machineARequest = capabilityRequest(repoSkillKey, "/repo/a", true);
+const machineBKey = skillCatalogKey(
+  "machine-b", "codex", "code", "/repo/b");
+const machineBRequest = capabilityRequest(machineBKey, "/repo/b", true);
+assert.equal(isolatedRequests.request(machineARequest), true);
+isolatedRequests.reset();
+assert.equal(isolatedRequests.request(machineBRequest), true);
+assert.equal(isolatedRequests.accept(
+  capabilityResponse("isolated-1", "/repo/a", true)), null,
+  "a delayed response from a reset machine scope must be ignored");
+assert.equal(isolatedRequests.accept(
+  capabilityResponse("isolated-2", "/repo/a", true)), null,
+  "even a current request id must not authorize another cwd");
+assert.equal(isolatedRequests.accept(
+  capabilityResponse("isolated-2", "/repo/b", true))?.request.key,
+  machineBKey);
+
+const failedDrainStarts: string[] = [];
+const failedDrain = new SkillCatalogRequestCoordinator((request) => {
+  failedDrainStarts.push(request.key);
+  if (request.key === "send-fails") return null;
+  return `drain-${failedDrainStarts.length}`;
+});
+const drainActive = capabilityRequest("active", "/active", true);
+assert.equal(failedDrain.request(drainActive), true);
+assert.equal(failedDrain.request(
+  capabilityRequest("send-fails", "/bad", true)), false);
+assert.equal(failedDrain.request(
+  capabilityRequest("send-works", "/good", true)), false);
+assert.ok(failedDrain.accept(
+  capabilityResponse("drain-1", "/active", true)));
+assert.deepEqual(failedDrainStarts, ["active", "send-fails", "send-works"],
+  "one failed queued send must not discard later runnable scopes");
 const freshSkillEntry = { items: skillCatalog, fetchedAt: 1_000 };
 assert.equal(skillCatalogFresh(freshSkillEntry, 1_000 + SKILL_CATALOG_TTL_MS - 1),
   true);
@@ -693,7 +922,7 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 9/,
+assert.match(cacheSource, /const CACHE_VER = 10/,
   "open-turn merge repair must invalidate duplicate IndexedDB projections");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
@@ -2196,6 +2425,271 @@ try {
   assert.ok(refreshedSummary.runtimes[summarySid].turns[0]
     .detailProjection?.blocks.some((block: Block) => block.kind === "tool"),
   "a same-revision head refresh must not collapse detail the user opened");
+
+  const refreshSid = "completed-process-refresh";
+  const cachedSixStepTurn: Turn = {
+    id: "refresh-turn",
+    prompt: "1",
+    done: true,
+    blocks: [
+      {
+        kind: "text", message_id: "refresh-commentary", text: "2",
+        done: true, channel: "commentary",
+      },
+      {
+        kind: "tool", message_id: "refresh-tool-message-3",
+        tool_use_id: "refresh-tool-3", tool: "Read",
+        input: { file_path: "/tmp/3" }, done: true,
+      },
+      {
+        kind: "tool", message_id: "refresh-tool-message-4",
+        tool_use_id: "refresh-tool-4", tool: "Bash",
+        input: { command: "echo 4" }, done: true,
+      },
+      {
+        kind: "process", item_id: "refresh-process-5",
+        processKind: "command", phase: "snapshot", status: "succeeded",
+        title: "5", done: true,
+      },
+      {
+        kind: "text", message_id: "refresh-final", text: "6",
+        done: true, channel: "final",
+      },
+    ],
+    detailEventCount: 4,
+  };
+  const refreshSummary = () => event({
+    type: "history", session_id: refreshSid, revision: "refresh-r1",
+    generation: "refresh-g1", build_seq: 1, live_seq: 0,
+    detail: "summary", has_more: false, oldest_id: "refresh-turn",
+    events: [], turns: [{
+      id: "refresh-turn", prompt: "1", done: true,
+      blocks: [{
+        kind: "text", message_id: "refresh-final", text: "6",
+        done: true, channel: "final",
+      }],
+      detailEventCount: 4, detailLoaded: false,
+    }],
+  });
+  const processFingerprint = (turn: Turn): string[] =>
+    (turn.detailProjection?.blocks ?? []).map((block) => {
+      if (block.kind === "text") return block.text;
+      if (block.kind === "tool") return block.tool_use_id;
+      return block.title;
+    });
+  const twoCachedRestores = restoreCachedTurnDetails(
+    [
+      {
+        ...cachedSixStepTurn,
+        id: "refresh-turn-older",
+        prompt: "older",
+        blocks: [cachedSixStepTurn.blocks.at(-1)!],
+      },
+      {
+        ...cachedSixStepTurn,
+        blocks: [cachedSixStepTurn.blocks.at(-1)!],
+      },
+    ],
+    [
+      {
+        ...cachedSixStepTurn,
+        id: "refresh-turn-older",
+        prompt: "older",
+      },
+      cachedSixStepTurn,
+    ],
+  );
+  assert.deepEqual(
+    twoCachedRestores.map((turn) => !!turn.detailRestorePending),
+    [false, true],
+    "refresh automatically validates only the newest affected turn instead of downloading every cached process",
+  );
+  const repeatedPromptSummaries: Turn[] = ["a", "b"].map((suffix, index) => ({
+    id: `repeated-${suffix}`,
+    prompt: "继续",
+    ts: 1_000 + index * 1_000,
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: `repeated-${suffix}-final`,
+      text: `final-${suffix}`,
+      done: true,
+      channel: "final",
+    }],
+    detailEventCount: 1,
+  }));
+  const repeatedPromptCaches = repeatedPromptSummaries.map((turn, index) => ({
+    ...turn,
+    blocks: [{
+      kind: "process" as const,
+      item_id: `repeated-${index}-process`,
+      processKind: "command" as const,
+      phase: "snapshot" as const,
+      status: "succeeded" as const,
+      title: `process-${index}`,
+      done: true,
+    }, ...turn.blocks],
+  }));
+  const repeatedPromptRestores = restoreCachedTurnDetails(
+    repeatedPromptSummaries, repeatedPromptCaches);
+  assert.deepEqual(
+    repeatedPromptRestores.map(processFingerprint),
+    [["process-0"], ["process-1"]],
+    "nearby repeated prompts must restore each turn's own cached process exactly once",
+  );
+
+  let cacheFirstRefresh = reduce({
+    ...initialState, focusedSid: refreshSid,
+    runtimes: { [refreshSid]: createRuntime() },
+  }, {
+    type: "hydrate_cache", sid: refreshSid, turns: [cachedSixStepTurn],
+    revision: "refresh-r1", generation: "refresh-g1",
+  });
+  cacheFirstRefresh = reduce(cacheFirstRefresh, {
+    type: "event", event: refreshSummary(),
+  });
+  assert.deepEqual(
+    processFingerprint(cacheFirstRefresh.runtimes[refreshSid].turns[0]),
+    ["2", "refresh-tool-3", "refresh-tool-4", "5"],
+    "cache-first refresh must keep the completed process visible while authoritative detail reloads",
+  );
+  assert.equal(
+    (cacheFirstRefresh.runtimes[refreshSid].turns[0] as Turn & {
+      detailRestorePending?: boolean;
+    }).detailRestorePending,
+    true,
+    "a same-revision cached process should schedule one authoritative detail restore",
+  );
+  assert.equal(
+    (cacheFirstRefresh.runtimes[refreshSid].turns[0] as Turn & {
+      detailRestoreOpen?: boolean;
+    }).detailRestoreOpen,
+    true,
+    "the newest compact process should stay open across a page refresh",
+  );
+
+  let historyFirstRefresh = reduce({
+    ...initialState, focusedSid: refreshSid,
+    runtimes: { [refreshSid]: createRuntime() },
+  }, {
+    type: "event", event: refreshSummary(),
+  });
+  historyFirstRefresh = reduce(historyFirstRefresh, {
+    type: "hydrate_cache", sid: refreshSid, turns: [cachedSixStepTurn],
+    revision: "refresh-r1", generation: "refresh-g1",
+  });
+  assert.deepEqual(
+    processFingerprint(historyFirstRefresh.runtimes[refreshSid].turns[0]),
+    ["2", "refresh-tool-3", "refresh-tool-4", "5"],
+    "History-first refresh must accept the same validated provisional process instead of racing it away",
+  );
+
+  let mismatchedRefresh = reduce({
+    ...initialState, focusedSid: refreshSid,
+    runtimes: { [refreshSid]: createRuntime() },
+  }, {
+    type: "event", event: refreshSummary(),
+  });
+  mismatchedRefresh = reduce(mismatchedRefresh, {
+    type: "hydrate_cache", sid: refreshSid, turns: [cachedSixStepTurn],
+    revision: "refresh-r1", generation: "stale-generation",
+  });
+  assert.deepEqual(
+    processFingerprint(mismatchedRefresh.runtimes[refreshSid].turns[0]),
+    [],
+    "a process cache from another wrapper generation must never be restored",
+  );
+  const mismatchedRevision = reduce(reduce({
+    ...initialState, focusedSid: refreshSid,
+    runtimes: { [refreshSid]: createRuntime() },
+  }, {
+    type: "event", event: refreshSummary(),
+  }), {
+    type: "hydrate_cache", sid: refreshSid, turns: [cachedSixStepTurn],
+    revision: "stale-revision", generation: "refresh-g1",
+  });
+  assert.deepEqual(
+    processFingerprint(mismatchedRevision.runtimes[refreshSid].turns[0]),
+    [],
+    "a process cache from another history revision must never be restored",
+  );
+
+  const restoreRequested = reduce(cacheFirstRefresh, {
+    type: "turn_detail_requested", sid: refreshSid, turnId: "refresh-turn",
+    autoLoad: false,
+  } as Parameters<typeof reduce>[1]);
+  assert.equal(
+    restoreRequested.runtimes[refreshSid].turns[0].detailAutoLoad,
+    false,
+    "automatic refresh repair fetches one newest detail page instead of paging a giant turn to EOF",
+  );
+  assert.equal(
+    (restoreRequested.runtimes[refreshSid].turns[0] as Turn & {
+      detailRestorePending?: boolean;
+    }).detailRestorePending,
+    false,
+    "an accepted restore request is one-shot",
+  );
+  const restoredDetail = reduce(restoreRequested, {
+    type: "event", event: event({
+      type: "turn_detail", session_id: refreshSid,
+      turn_id: "refresh-turn", revision: "refresh-r1",
+      has_more: true, oldest_cursor: "restore-older",
+      events: [
+        event({ type: "user_msg", sid: refreshSid,
+          msg_id: "refresh-turn", prompt: "1" }),
+        event({ type: "assistant_msg_start", sid: refreshSid,
+          message_id: "restore-commentary", channel: "commentary" }),
+        event({ type: "delta", sid: refreshSid,
+          message_id: "restore-commentary", channel: "commentary",
+          text: "2-server" }),
+        event({ type: "assistant_msg_end", sid: refreshSid,
+          message_id: "restore-commentary", channel: "commentary" }),
+        event({ type: "tool_use", sid: refreshSid,
+          message_id: "restore-tool-message", tool_use_id: "restore-tool-5",
+          tool: "Read", input: { file_path: "/tmp/5" } }),
+        event({ type: "tool_result", sid: refreshSid,
+          tool_use_id: "restore-tool-5", content: "ok", is_error: false }),
+        event({ type: "assistant_msg_start", sid: refreshSid,
+          message_id: "refresh-final", channel: "final" }),
+        event({ type: "delta", sid: refreshSid,
+          message_id: "refresh-final", channel: "final", text: "6" }),
+        event({ type: "assistant_msg_end", sid: refreshSid,
+          message_id: "refresh-final", channel: "final" }),
+        event({ type: "turn_end", sid: refreshSid, turn_id: "refresh-turn",
+          result: { subtype: "success", duration_ms: 1, is_error: false } }),
+      ],
+    }),
+  });
+  assert.deepEqual(
+    processFingerprint(restoredDetail.runtimes[refreshSid].turns[0]),
+    ["2-server", "restore-tool-5"],
+    "the authoritative newest detail page replaces rather than merges provisional cache blocks",
+  );
+  assert.equal(
+    restoredDetail.runtimes[refreshSid].turns[0].detailAutoLoad,
+    false,
+    "refresh repair must not follow has_more into an automatic full-turn download",
+  );
+  assert.equal(
+    restoredDetail.runtimes[refreshSid].turns[0].detailLoaded,
+    false,
+    "a one-page repair with older detail remaining must keep the explicit full-process affordance",
+  );
+  const userExpandedRestore = reduce(restoredDetail, {
+    type: "turn_detail_requested", sid: refreshSid, turnId: "refresh-turn",
+    autoLoad: true,
+  });
+  assert.equal(
+    userExpandedRestore.runtimes[refreshSid].turns[0].detailAutoLoad,
+    true,
+    "the user's later disclosure still upgrades the repair into full pagination",
+  );
+  assert.equal(
+    userExpandedRestore.runtimes[refreshSid].turns[0]
+      .detailRestoreIncomplete,
+    false,
+  );
 
   const managedClaudeSid = "managed-claude-session";
   const managedClaudeIdle = reduce({
@@ -6149,6 +6643,115 @@ const skipsOneOversizedCacheTurn = boundCachedTurns([
   { id: "huge", image: "x".repeat(2 * 1024 * 1024 + 1) },
 ]);
 assert.deepEqual(skipsOneOversizedCacheTurn, [{ id: "small", prompt: "keep" }]);
+const oversizedProcessCache = boundCachedTurns([{
+  id: "oversized-process",
+  prompt: "1",
+  done: true,
+  images: [{
+    media_type: "image/png",
+    data: "i".repeat(2 * 1024 * 1024 + 1),
+  }],
+  blocks: [
+    {
+      kind: "text", message_id: "oversized-commentary", text: "2",
+      done: true, channel: "commentary",
+    },
+    {
+      kind: "tool", message_id: "oversized-tool-message-3",
+      tool_use_id: "oversized-tool-3", tool: "Read",
+      input: { file_path: "/tmp/3" },
+      result: {
+        content: "x".repeat(2 * 1024 * 1024 + 1),
+        is_error: false,
+      },
+      done: true,
+    },
+    {
+      kind: "tool", message_id: "oversized-tool-message-4",
+      tool_use_id: "oversized-tool-4", tool: "Bash",
+      input: { command: "echo 4" }, done: true,
+    },
+    {
+      kind: "process", item_id: "oversized-process-5",
+      processKind: "command", phase: "snapshot", status: "succeeded",
+      title: "5", done: true,
+    },
+    {
+      kind: "text", message_id: "oversized-final", text: "6",
+      done: true, channel: "final",
+    },
+  ],
+  detailProjection: {
+    segments: [{
+      pageKey: "huge-segment",
+      before: null,
+      events: [{
+        type: "delta", sid: "oversized-process",
+        message_id: "huge-event", text: "y".repeat(2 * 1024 * 1024 + 1),
+        channel: "commentary", v: 22, ts: 1,
+      }],
+      hasMore: false,
+      oldestCursor: null,
+      hasNewer: false,
+      newerCursor: null,
+      encodedChars: 2 * 1024 * 1024 + 1,
+    }],
+    blocks: [],
+    capped: false,
+    hasMore: false,
+    oldestCursor: null,
+    hasNewer: false,
+    newerCursor: null,
+  },
+  detailEventCount: 4,
+  detailLoaded: true,
+}] as Turn[]) as Turn[];
+assert.equal(oversizedProcessCache.length, 1,
+  "one heavy attachment/output must not evict the whole visible turn");
+assert.equal(oversizedProcessCache[0].images, undefined,
+  "base64 attachments stay in the lazy history-image path");
+assert.equal(oversizedProcessCache[0].detailProjection, undefined,
+  "raw cursor pages are never copied into the instant-paint cache");
+assert.deepEqual(oversizedProcessCache[0].blocks.map((block) => {
+  if (block.kind === "text") return block.text;
+  if (block.kind === "tool") return block.tool_use_id;
+  return block.title;
+}), ["2", "oversized-tool-3", "oversized-tool-4", "5", "6"],
+"the compact cache keeps every visible 1..6 timeline identity across refresh");
+assert.ok(new TextEncoder().encode(
+  JSON.stringify(oversizedProcessCache[0])).byteLength < 2 * 1024 * 1024,
+"the instant projection must remain bounded independently of heavy detail");
+const smallImageCache = boundCachedTurns([{
+  id: "small-image-turn",
+  prompt: "preview",
+  done: true,
+  images: [{ media_type: "image/png", data: "small-preview" }],
+  blocks: [],
+}] as Turn[]) as Turn[];
+assert.equal(smallImageCache[0].images?.[0]?.data, "small-preview",
+  "small optimistic images remain available during the first paint");
+const extremeTimelineCache = boundCachedTurns([{
+  id: "extreme-timeline-turn",
+  prompt: "keep every visible row",
+  done: true,
+  blocks: Array.from({ length: 256 }, (_, index) => ({
+    kind: "tool" as const,
+    message_id: `message-${"m".repeat(12 * 1024)}-${index}`,
+    tool_use_id: `tool-${"t".repeat(12 * 1024)}-${index}`,
+    tool: "Bash",
+    input: { command: `echo ${index}` },
+    done: true,
+  })),
+}] as Turn[]) as Turn[];
+assert.equal(extremeTimelineCache.length, 1);
+assert.equal(extremeTimelineCache[0].blocks.length, 256,
+  "the hard cache fallback preserves the full bounded timeline skeleton");
+assert.equal(new Set(extremeTimelineCache[0].blocks.map((block) =>
+  block.kind === "tool" ? block.tool_use_id : "")).size, 256,
+"hard clipping must retain the unique suffix of every process identity");
+assert.ok(new TextEncoder().encode(
+  JSON.stringify(extremeTimelineCache[0])).byteLength < 2 * 1024 * 1024,
+"even pathological process identifiers cannot evict the current timeline");
 const stripsFileBodiesFromCache = boundCachedTurns([{
   id: "file-turn",
   prompt: "upload",
@@ -6554,6 +7157,19 @@ assert.equal(claudeDefaultsFrame.cwd, "/tmp/project");
 assert.equal(typeof claudeDefaultsFrame.cmd_id, "string");
 assert.equal(typeof claudeDefaultsFrame.client_id, "string");
 
+const skillOnlyCapabilitiesRequestId = relay.sendGetEngineCapabilities(
+  "codex", "code", "/tmp/project", true,
+);
+const skillOnlyCapabilitiesFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(skillOnlyCapabilitiesFrame.type, "get_engine_capabilities");
+assert.equal(skillOnlyCapabilitiesFrame.skills_only, true);
+assert.equal(skillOnlyCapabilitiesFrame.cwd, "/tmp/project");
+assert.equal(typeof skillOnlyCapabilitiesFrame.client_id, "string");
+assert.equal(
+  skillOnlyCapabilitiesFrame.cmd_id, skillOnlyCapabilitiesRequestId,
+  "capability responses need the reliable request id for exact correlation",
+);
+
 const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
   assert.doesNotMatch(appSource, new RegExp(`dispatch\\(\\{ type: ["']${optimisticAction}["']`));
@@ -6700,6 +7316,18 @@ assert.match(composerSource, /正在读取当前目录的 Skills/,
   "the Skill palette must stay visible while native discovery is in flight");
 assert.match(appSource, /skills=\{skillCatalogs\[focusedSkillCatalogKey\]\?\.items\}/,
   "the composer must paint a cwd-scoped Skill cache synchronously");
+assert.match(appSource,
+  /onRequestSkills=\{\(\) => \{[\s\S]{0,500}skillsOnly: true/,
+  "$ completion must request only the lightweight Skill inventory");
+assert.match(appSource,
+  /onOpenExtensions=\{\(kind\) => \{[\s\S]{0,600}skillsOnly: false/,
+  "the extensions sheet must continue requesting the complete inventory");
+assert.match(appSource,
+  /report=\{capabilitiesByScope\[focusedSkillCatalogKey\] \?\? null\}/,
+  "the full Extensions report must share the machine and cwd scope key");
+assert.match(appSource,
+  /skillCatalogRefreshSucceeded\(msg\)[\s\S]{0,200}storeSkillCatalog/,
+  "a failed Skill refresh must not replace a usable cached catalog");
 assert.match(appSource, /Warm the cwd-scoped Codex Skill catalog[\s\S]*requestSkillCatalog/,
   "focused Codex sessions must prefetch Skills before the user types $");
 assert.match(appSource,
@@ -6719,6 +7347,14 @@ assert.ok(permissionControlIndex >= 0
     && permissionControlIndex < shortcutHintIndex
     && shortcutHintIndex < runtimeControlsIndex,
   "desktop composer must keep its original split control layout");
+assert.doesNotMatch(composerSource, /发消息…/,
+  "the compact composer placeholder must not wrap a redundant send label");
+assert.match(composerSource, /输入 \/ 命令，\$ Skill/,
+  "the Codex placeholder must retain command and Skill discovery");
+assert.match(composerSource, /p\.fast \? "快速" : "标准"/,
+  "the Fast control must use stable text labels");
+assert.doesNotMatch(composerSource, /⚡/,
+  "the Fast control must not add a lightning marker");
 const workDashboardSource = readFileSync(
   resolve(process.cwd(), "src/components/WorkDashboardSheet.tsx"), "utf8");
 assert.match(workDashboardSource, /<DateTimePicker value=\{scheduleAt\}/,
@@ -6735,8 +7371,17 @@ assert.doesNotMatch(appCssSource, /\.hint-mode\.busy/,
 assert.match(appCssSource, /\.hint-right\{[^}]*margin-left:auto/,
   "desktop composer controls must retain the original right alignment");
 assert.match(appCssSource,
-  /@media \(max-width:640px\)\{[\s\S]*?\.hint-kbds\{ display:none; \}[\s\S]*?\.hint-right\{[^}]*margin-left:0;[^}]*flex:1;[^}]*justify-content:space-between;/,
-  "mobile composer controls must distribute across the available row width");
+  /@media \(max-width:640px\)\{[\s\S]*?\.hint-kbds\{ display:none; \}[\s\S]*?\.hint-right\{[^}]*margin-left:0;[^}]*flex:1;[^}]*justify-content:flex-end;/,
+  "mobile composer controls must stay compact at the end of the row");
+assert.match(appCssSource,
+  /@media \(max-width:420px\)\{[\s\S]*?\.hint\{[^}]*flex-wrap:nowrap;[\s\S]*?\.hint-right\{[^}]*width:auto;[^}]*flex:1 1 auto;/,
+  "phone composer controls must remain on one row");
+assert.match(appCssSource,
+  /@media \(max-width:420px\)\{[\s\S]*?\.hint\{[^}]*gap:11px;[\s\S]*?\.hint-right\{[^}]*gap:11px;/,
+  "phone composer controls must retain readable separation");
+assert.match(appCssSource,
+  /\.usage-meter-line \.good\{ background:color-mix\(in srgb,var\(--ok\) 68%,white\); \}/,
+  "healthy compact quota bars must use a softer green");
 assert.match(appCssSource, /\.capabilities-sheet>header\{[^}]*flex:none/s,
   "the Extensions header must not collapse under a long capability list");
 assert.match(appCssSource, /\.capabilities-tabs\{[^}]*flex:none/s,

@@ -54,8 +54,9 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: `PROTOCOL_VERSION` in both `protocol.py` and
-  `web/src/protocol.ts`. `deserialize` hard-rejects a version mismatch, and
+- **Protocol version gate**: current wire protocol v26 is declared by
+  `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
+  `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
   three tiers together (wrapper + relay + web) and the relay restarted — the
   relay imports `protocol.py` and drops frames it can't parse.

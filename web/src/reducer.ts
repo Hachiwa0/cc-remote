@@ -36,6 +36,7 @@ import {
 import {
   historyContainsTurn, installAuthoritativeTurnDetailPage,
   mergeAuthoritativeTurnDetail, mergeInitialHistory,
+  restoreCachedTurnDetails,
 } from "./history-merge";
 import {
   installTurnDetailProjectionPage,
@@ -372,7 +373,7 @@ export type Action =
   | { type: "restore_session_list"; sessions: SessionInfo[] }
   | { type: "set_session_pinned"; sid: string; pinned: boolean }
   | { type: "focus_session"; sid: string }
-  | { type: "turn_detail_requested"; sid: string; turnId: string; before?: string | null }
+  | { type: "turn_detail_requested"; sid: string; turnId: string; before?: string | null; autoLoad?: boolean }
   | { type: "begin_history_browse"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; basePageKey: string }
   | { type: "install_history_browse_page"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
   | { type: "install_history_browse_newer"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
@@ -1256,7 +1257,11 @@ export function reduce(state: AppState, action: Action): AppState {
               ...turn,
               detailLoading: true,
               detailAutoLoad: action.before == null
-                ? true : turn.detailAutoLoad,
+                ? (action.autoLoad ?? true) : turn.detailAutoLoad,
+              detailRestorePending: false,
+              detailRestoreIncomplete: action.before == null
+                ? action.autoLoad === false
+                : turn.detailRestoreIncomplete,
             }
           : turn);
       }, true);
@@ -1521,17 +1526,36 @@ export function reduce(state: AppState, action: Action): AppState {
         const control = action.control
           && sessionControlTargetsSid(action.control, action.sid)
           ? action.control : null;
-        switchControlGeneration(
-          rt, action.generation ?? control?.generation);
-        if (control) applySessionControl(rt, control);
-        if (rt.turns.length === 0 && action.turns.length) {
-          replaceWithBoundedTurns(rt, action.turns.map((turn) => (
-            !turn.forkPointId && turn.codexTurnId
-              ? { ...turn, forkPointId: turn.codexTurnId }
-              : turn
-          )));
-          rt.historyRevision = action.revision;
-          rt.hydratedCacheTurnIds = action.turns.map((turn) => turn.id);
+        const cacheGeneration =
+          action.generation ?? control?.generation ?? null;
+        if (rt.turns.length === 0) {
+          switchControlGeneration(
+            rt, cacheGeneration);
+          if (control) applySessionControl(rt, control);
+          if (action.turns.length) {
+            replaceWithBoundedTurns(rt, action.turns.map((turn) => (
+              !turn.forkPointId && turn.codexTurnId
+                ? { ...turn, forkPointId: turn.codexTurnId }
+                : turn
+            )));
+            rt.historyRevision = action.revision;
+            rt.historyGeneration = cacheGeneration;
+            rt.hydratedCacheTurnIds = action.turns.map((turn) => turn.id);
+          }
+        } else if (rt.turns.length > 0
+            && action.revision != null
+            && action.revision === rt.historyRevision
+            && (cacheGeneration != null
+              ? cacheGeneration === rt.historyGeneration
+              : rt.historyGeneration == null)) {
+          // IndexedDB and authoritative History race on focus. If History won,
+          // accept only its exact revision/generation cache as temporary
+          // process paint; prompt/final/lifecycle remain server-owned.
+          if (control) {
+            switchControlGeneration(rt, cacheGeneration);
+            applySessionControl(rt, control);
+          }
+          rt.turns = restoreCachedTurnDetails(rt.turns, action.turns);
         }
         rt.loading = false;
       }, true);
@@ -2168,7 +2192,8 @@ function reduceEvent(
       if (e.detail === "summary" && !base.historyInvalidated
           && base.historyRevision === e.revision) {
         const loadedDetail = new Map(base.turns
-          .filter((turn) => turn.detailLoaded)
+          .filter((turn) => turn.detailLoaded
+            || (turn.detailProjection?.segments.length ?? 0) > 0)
           .map((turn) => [turn.id, turn]));
         turns = turns.map((turn) => {
           const detail = loadedDetail.get(turn.id);
@@ -2181,6 +2206,16 @@ function reduceEvent(
           }
           return merged;
         });
+        const cachedScopeMatches = e.generation != null
+          ? base.historyGeneration === e.generation
+          : base.historyGeneration == null;
+        if (cachedScopeMatches && base.hydratedCacheTurnIds.length > 0) {
+          const cachedIds = new Set(base.hydratedCacheTurnIds);
+          turns = restoreCachedTurnDetails(
+            turns,
+            base.turns.filter((turn) => cachedIds.has(turn.id)),
+          );
+        }
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);

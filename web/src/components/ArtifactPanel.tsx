@@ -2,7 +2,6 @@ import { isValidElement, useCallback, useEffect, useMemo, useRef, useState,
   type ComponentPropsWithoutRef, type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
-import remarkGfm from "remark-gfm";
 import type { Artifact, PreviewAssetState } from "../reducer";
 import { Icon } from "../icons";
 import { PanelTabs } from "./PanelTabs";
@@ -12,6 +11,12 @@ import { parseLocalFileTarget } from "../file-link";
 import { buildSandboxDocument } from "../html-preview";
 import { clampPanelWidth } from "../responsive-layout";
 import { isMermaidFenceClass } from "../mermaid";
+import {
+  isMathFenceClass,
+  normalizeMathDelimiters,
+  STREAMING_REMARK_PLUGINS,
+  useMarkdownMathPlugins,
+} from "../markdown-math";
 import { MermaidBlock } from "./MermaidBlock";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
@@ -39,13 +44,18 @@ function markdownFenceClassName(children: ReactNode): string | undefined {
 }
 
 function MarkdownPreviewPre({ children }: ComponentPropsWithoutRef<"pre">) {
-  if (isMermaidFenceClass(markdownFenceClassName(children))) return <>{children}</>;
+  const className = markdownFenceClassName(children);
+  if (isMermaidFenceClass(className)
+      || isMathFenceClass(className)) return <>{children}</>;
   return <pre>{children}</pre>;
 }
 
 function MarkdownPreviewCode({
   className, children,
 }: ComponentPropsWithoutRef<"code">) {
+  if (isMathFenceClass(className)) {
+    return <code className={className}>{children}</code>;
+  }
   if (isMermaidFenceClass(className)) {
     return <MermaidBlock source={markdownNodeText(children).replace(/\n$/, "")} />;
   }
@@ -279,6 +289,10 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     draft: artifact.content || "",
     baseline: artifact.content || "",
   };
+  const mathPlugins = useMarkdownMathPlugins(
+    editor.draft,
+    artifact.kind === "md" && mode === "preview",
+  );
   const dirty = artifact.kind === "md" && editor.draft !== editor.baseline;
   const sections = artifact.kind === "gitdiff"
     ? (artifact.sections || EMPTY_GIT_DIFF_SECTIONS) : EMPTY_GIT_DIFF_SECTIONS;
@@ -608,7 +622,13 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
                     baseline: editor.baseline,
                   })} />
               : <div className="prose markdown-preview"><ReactMarkdown
-                  remarkPlugins={[remarkGfm]} components={markdownComponents}>{editor.draft}</ReactMarkdown></div>}
+                  remarkPlugins={
+                    mathPlugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
+                  rehypePlugins={mathPlugins?.rehypePlugins}
+                  components={markdownComponents}>
+                  {mathPlugins
+                    ? normalizeMathDelimiters(editor.draft) : editor.draft}
+                </ReactMarkdown></div>}
           </>
         ) : null}
       </div>

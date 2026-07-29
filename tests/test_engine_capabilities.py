@@ -361,6 +361,107 @@ def test_codex_capabilities_include_native_hooks_as_read_only(monkeypatch, tmp_p
     asyncio.run(run())
 
 
+def test_codex_capabilities_keep_skills_when_another_component_times_out(
+    monkeypatch, tmp_path,
+):
+    async def run():
+        skill_path = tmp_path / ".codex" / "skills" / "example" / "SKILL.md"
+
+        async def batch(requests, cwd, *, timeout):
+            assert cwd == str(tmp_path)
+            assert timeout == capabilities_module._COMPONENT_TIMEOUT
+            responses = {
+                "skills/list": {"data": [{"skills": [{
+                    "name": "example",
+                    "path": str(skill_path),
+                    "scope": "repo",
+                    "enabled": True,
+                }]}]},
+                "hooks/list": RuntimeError("timed out"),
+                "plugin/list": RuntimeError("timed out"),
+                "app/list": RuntimeError("timed out"),
+                "mcpServerStatus/list": RuntimeError("timed out"),
+            }
+            return [responses[method] for method, _params in requests]
+
+        monkeypatch.setattr(capabilities_module, "codex_rpc_batch", batch)
+        items, errors, _notes = await capabilities_module.codex_capabilities(
+            str(tmp_path), "code"
+        )
+
+        assert [item["name"] for item in items if item["kind"] == "skill"] == [
+            "example"
+        ]
+        assert errors == [
+            "hooks: app-server request failed",
+            "plugins: app-server request failed",
+            "apps: app-server request failed",
+            "mcp: app-server request failed",
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_skills_only_skips_unrelated_component_requests(
+    monkeypatch, tmp_path,
+):
+    async def run():
+        skill_path = tmp_path / ".codex" / "skills" / "example" / "SKILL.md"
+        seen = []
+
+        async def components(requests, cwd):
+            seen.extend(requests)
+            assert cwd == str(tmp_path)
+            return [{"data": [{"skills": [{
+                "name": "example",
+                "path": str(skill_path),
+                "scope": "repo",
+                "enabled": True,
+            }]}]}]
+
+        monkeypatch.setattr(capabilities_module, "_codex_components", components)
+        items, errors, notes = await capabilities_module.codex_capabilities(
+            str(tmp_path), "code", skills_only=True
+        )
+
+        assert [method for method, _params in seen] == ["skills/list"]
+        assert [item["name"] for item in items] == ["example"]
+        assert errors == []
+        assert notes == []
+
+    asyncio.run(run())
+
+
+def test_claude_skills_only_does_not_spawn_plugin_cli(monkeypatch, tmp_path):
+    async def run():
+        monkeypatch.setattr(capabilities_module, "_claude_skills", lambda _cwd: [{
+            "kind": "skill",
+            "id": "skill:example",
+            "name": "example",
+            "enabled": True,
+            "scope": "user",
+            "actions": ["remove"],
+        }])
+        monkeypatch.setattr(
+            capabilities_module,
+            "resolve_claude_cli",
+            lambda _configured: pytest.fail(
+                "skills-only discovery must not resolve the plugin CLI"
+            ),
+        )
+
+        items, errors, notes = await capabilities_module.engine_capabilities(
+            "claude", str(tmp_path), "code", "/configured/claude",
+            skills_only=True,
+        )
+
+        assert [item["name"] for item in items] == ["example"]
+        assert errors == []
+        assert notes == []
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("kind", ["skill", "hook"])
 def test_work_rejects_extension_mutations(kind, tmp_path):
     async def run():
@@ -474,7 +575,7 @@ def test_machine_forwards_configured_cli_to_capability_listing(
     monkeypatch, tmp_path
 ):
     async def run():
-        machine, _ = _mk_machine()
+        machine, transport = _mk_machine()
         machine.cfg.claude_bin = "/configured/claude"
         machine._focused_ctx = lambda: SimpleNamespace(
             engine="claude",
@@ -483,20 +584,26 @@ def test_machine_forwards_configured_cli_to_capability_listing(
         )
         seen = []
 
-        async def discover(engine, cwd, space, claude_bin):
-            seen.append((engine, cwd, space, claude_bin))
+        async def discover(
+            engine, cwd, space, claude_bin, *, skills_only=False,
+        ):
+            seen.append((engine, cwd, space, claude_bin, skills_only))
             return [], [], []
 
         monkeypatch.setattr(machine_module, "engine_capabilities", discover)
         await machine._handle_get_engine_capabilities(
             GetEngineCapabilities(
-                engine="claude", cwd=str(tmp_path), client_id="client-1"
+                engine="claude", cwd=str(tmp_path), client_id="client-1",
+                cmd_id="capabilities-1", skills_only=True,
             )
         )
 
         assert seen == [
-            ("claude", str(tmp_path), "code", "/configured/claude")
+            ("claude", str(tmp_path), "code", "/configured/claude", True)
         ]
+        assert transport.sent[-1].request_id == "capabilities-1"
+        assert transport.sent[-1].cwd == str(tmp_path)
+        assert transport.sent[-1].skills_only is True
 
     asyncio.run(run())
 

@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 25
+PROTOCOL_VERSION = 26
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -1389,6 +1389,7 @@ class GetEngineCapabilities(_Command):
     space: Space = "code"
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    skills_only: bool = False
 
 
 class ManageEnginePlugin(_Command):
@@ -1459,9 +1460,12 @@ class EngineCapabilities(_Base):
     type: Literal["engine_capabilities"] = "engine_capabilities"
     engine: Engine
     space: Space
+    request_id: Optional[WireId] = None
+    cwd: str = Field(max_length=4096)
     items: list[EngineCapabilityItem] = Field(max_length=2000)
     errors: list[str] = Field(default_factory=list, max_length=32)
     notes: list[str] = Field(default_factory=list, max_length=32)
+    skills_only: bool = False
 
 
 class SetPerm(_Command):

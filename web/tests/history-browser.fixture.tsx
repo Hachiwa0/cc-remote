@@ -356,6 +356,25 @@ function mermaidTurn(invalid = false, source?: string): Turn {
   };
 }
 
+function mathTurn(): Turn {
+  return {
+    id: "math",
+    prompt: "渲染数学公式",
+    blocks: [{
+      kind: "text",
+      message_id: "math-message",
+      channel: "final",
+      text: String.raw`\[ r = \frac{h}{\sin |\alpha|} \]
+
+Inline: \(h = r \sin \alpha\).`,
+      done: true,
+    }],
+    done: true,
+    ts: Date.now(),
+    doneTs: Date.now(),
+  };
+}
+
 interface FixtureSession {
   turns: Turn[];
   cursor: string;
@@ -385,6 +404,7 @@ export function HistoryBrowserFixture() {
   const actualMermaid = params.has("actual-mermaid");
   const invalidMermaid = params.has("invalid-mermaid");
   const mermaidHistory = params.has("mermaid-history");
+  const math = params.has("math");
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
   const quotaComposer = params.has("quota-composer");
@@ -418,6 +438,7 @@ export function HistoryBrowserFixture() {
         actualMermaid ? ROBOT_CORE_MERMAID_SOURCE : undefined,
       )];
     }
+    if (math) return [mathTurn()];
     if (mermaidHistory) {
       return [
         mermaidTurn(),
@@ -450,7 +471,7 @@ export function HistoryBrowserFixture() {
   }, [
     actualMermaid, compactTools, detailPaging, detailRetainedPreview,
     detailScrollCancel, dualImage,
-    interactiveTimeline,
+    interactiveTimeline, math,
     deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
     timeline,
   ]);
@@ -460,7 +481,7 @@ export function HistoryBrowserFixture() {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
       hasMore: !compactTools && !detailPaging && !invalidMermaid && !large && !mermaid
-        && !mermaidHistory && !timeline && !deepBrowse,
+        && !mermaidHistory && !math && !timeline && !deepBrowse,
       pagesLoaded: 0,
       hasNewer: deepBrowse,
       newerPagesLoaded: 0,
@@ -998,18 +1019,24 @@ export function HistoryBrowserFixture() {
       {quotaComposer && (
         <div className="composer" data-testid="quota-composer">
           <div className="composer-in">
+            <div className="inrow">
+              <button className="cmdbtn" type="button" aria-label="add">+</button>
+              <textarea rows={1} aria-label="message"
+                placeholder="输入 / 命令，$ Skill" />
+              <button className="sendbtn" type="button" aria-label="send">↑</button>
+            </div>
             <div className="hint">
               <button className="hint-mode" type="button">
-                Full access · idle <span className="hint-mode-ch">▾</span>
+                Full Access <span className="hint-mode-ch">▾</span>
               </button>
               <span className="hint-kbds">keyboard shortcuts</span>
               <div className="hint-right">
                 <button className="hint-ctl" type="button">
-                  gpt-5.6-codex
+                  GPT-5.6 Sol
                 </button>
                 <button className="hint-ctl" type="button">xhigh</button>
-                <button className="hint-ctl fast-chip" type="button">
-                  standard
+                <button className="hint-ctl fast-chip on" type="button">
+                  快速
                 </button>
                 <UsageMeter
                   open={false}
