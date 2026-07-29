@@ -678,6 +678,21 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     });
   }, [captureHistoryBoundary, commitTextSelection]);
 
+  const releaseTextSelectionViewportAnchor = useCallback(() => {
+    const active = textSelectionRef.current;
+    if (!active || active.dragging
+        || (active.releaseAnchorTurnId == null
+          && active.releaseAnchorOffset == null)) return;
+    // The release boundary only protects the viewport from late measurements
+    // while the reader is stationary. Once a new scroll gesture starts, keep
+    // the selected turns mounted but stop correcting back to the old viewport.
+    commitTextSelection({
+      ...active,
+      releaseAnchorTurnId: null,
+      releaseAnchorOffset: null,
+    });
+  }, [commitTextSelection]);
+
   const clearTextSelection = useCallback(() => {
     textSelectionCandidateRef.current = null;
     const active = textSelectionRef.current;
@@ -1186,6 +1201,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     // A real wheel/touch/key/pointer action transfers ownership back to the
     // reader. Late detail responses and ResizeObserver callbacks must not pull
     // the viewport back to the edge captured before that gesture.
+    releaseTextSelectionViewportAnchor();
     cancelDetailAnchorFnRef.current?.();
     setMeasurementBoundary(null);
     userScrollIntentRef.current = true;
