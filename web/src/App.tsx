@@ -160,22 +160,18 @@ import {
 } from "./completion-badges";
 import {
   cacheSkillCatalog,
+  SkillCatalogRequestCoordinator,
   skillCatalogFresh,
   skillCatalogKey,
+  skillCatalogRefreshSucceeded,
   type SkillCatalogCacheEntry,
+  type SkillCatalogRequest,
 } from "./skill-catalog-cache";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
-
-interface SkillCatalogRequest {
-  key: string;
-  engine: Engine;
-  space: Space;
-  cwd: string;
-}
 
 interface QueuedQueryEditorState extends QueuedQueryEditor {
   detailRequestId: string | null;
@@ -223,7 +219,8 @@ export default function App() {
   const [capabilitiesKind, setCapabilitiesKind] = useState<EngineCapabilityKind | "all">("all");
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
   const [deviceSheetOpen, setDeviceSheetOpen] = useState(false);
-  const [capabilitiesBySurface, setCapabilitiesBySurface] = useState<Record<string, EngineCapabilities>>({});
+  const [capabilitiesByScope, setCapabilitiesByScope] =
+    useState<Record<string, EngineCapabilities>>({});
   const [skillCatalogs, setSkillCatalogs] =
     useState<Record<string, SkillCatalogCacheEntry>>({});
   const [notificationMode, setNotificationMode] = useState<NotificationMode>(
@@ -295,15 +292,24 @@ export default function App() {
   const wsRef = useRef<RelayWs | null>(null);
   const skillCatalogsRef =
     useRef<Record<string, SkillCatalogCacheEntry>>({});
-  const skillCatalogReadsRef = useRef<{
-    active: SkillCatalogRequest | null;
-    queued: Map<string, SkillCatalogRequest>;
-  }>({ active: null, queued: new Map() });
+  const skillCatalogRequestsRef =
+    useRef<SkillCatalogRequestCoordinator | null>(null);
+  if (skillCatalogRequestsRef.current === null) {
+    skillCatalogRequestsRef.current = new SkillCatalogRequestCoordinator(
+      (request) => wsRef.current?.sendGetEngineCapabilities(
+        request.engine,
+        request.space,
+        request.cwd,
+        request.skillsOnly,
+      ) ?? null,
+    );
+  }
   const focusedSkillScopeRef = useRef<{
     key: string;
     engine: Engine;
     space: Space;
     cwd: string;
+    skillsOnly: boolean;
   } | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
   const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
@@ -452,8 +458,9 @@ export default function App() {
     notificationListRequestRef.current = null;
     sessionActivityPendingRef.current.clear();
     skillCatalogsRef.current = {};
-    skillCatalogReadsRef.current = { active: null, queued: new Map() };
+    skillCatalogRequestsRef.current?.reset();
     setSkillCatalogs({});
+    setCapabilitiesByScope({});
     deferredStatusRefreshRef.current.clear();
     historyRequestsRef.current.clear();
     clearHistoryDetailRequests();
@@ -520,6 +527,7 @@ export default function App() {
     engine: focusedEngine,
     space,
     cwd: capabilityCwd,
+    skillsOnly: true,
   };
   const activeBtwDraftKey = composerDraftKey(
     machineId, space,
@@ -592,50 +600,40 @@ export default function App() {
     force = false,
   ) => {
     const cached = skillCatalogsRef.current[request.key];
-    if (!force && skillCatalogFresh(cached)) return false;
-    const reads = skillCatalogReadsRef.current;
-    if (reads.active) {
-      if (reads.active.key !== request.key) {
-        reads.queued.set(request.key, request);
-      }
-      return false;
-    }
-    const ws = wsRef.current;
-    if (!ws) return false;
-    reads.active = request;
-    ws.sendGetEngineCapabilities(
-      request.engine, request.space, request.cwd);
-    return true;
+    if (request.skillsOnly && !force && skillCatalogFresh(cached)) return false;
+    return skillCatalogRequestsRef.current?.request(request) ?? false;
   }, []);
   const acceptSkillCatalog = useCallback((msg: EngineCapabilities) => {
-    const reads = skillCatalogReadsRef.current;
-    const active = reads.active;
-    if (active && active.engine === msg.engine && active.space === msg.space) {
+    const coordinator = skillCatalogRequestsRef.current;
+    if (!coordinator) return;
+    const accepted = coordinator.accept(msg);
+    if (!accepted) return;
+    const matchedScope = accepted.request;
+    if (!accepted.superseded && skillCatalogRefreshSucceeded(msg)) {
       storeSkillCatalog(
-        active.key, msg.items.filter((item) => item.kind === "skill"));
-      reads.active = null;
-      const next = reads.queued.values().next().value as
-        SkillCatalogRequest | undefined;
-      if (next) {
-        reads.queued.delete(next.key);
-        const ws = wsRef.current;
-        if (ws) {
-          reads.active = next;
-          ws.sendGetEngineCapabilities(next.engine, next.space, next.cwd);
-        }
-      }
-      return;
-    }
-    // Capability mutations also return a fresh full catalog. Adopt it for the
-    // currently focused cwd when no explicit read owns the response.
-    const focused = focusedSkillScopeRef.current;
-    if (!active && focused
-        && msg.engine === focused.engine && msg.space === focused.space) {
-      storeSkillCatalog(
-        focused.key,
+        matchedScope.key,
         msg.items.filter((item) => item.kind === "skill"));
     }
+    if (!accepted.superseded && !msg.skills_only) {
+      setCapabilitiesByScope((current) => ({
+        ...current,
+        [matchedScope.key]: msg,
+      }));
+    }
+    if (focusedSkillScopeRef.current?.key === matchedScope.key
+        && !coordinator.hasPendingMutation(matchedScope.key)
+        && !coordinator.hasPendingRead(matchedScope.key, false)) {
+      setCapabilitiesLoading(false);
+    }
   }, [storeSkillCatalog]);
+  const trackCapabilityMutation = useCallback((
+    requestId: string | null | undefined,
+    request: SkillCatalogRequest,
+  ) => {
+    if (!skillCatalogRequestsRef.current?.trackMutation(requestId, request)) {
+      setCapabilitiesLoading(false);
+    }
+  }, []);
   const loadMessageImage = useCallback((sid: string, path: string): boolean => {
     const ws = wsRef.current;
     if (!ws || stateRef.current.focusedSid !== sid) return false;
@@ -1896,12 +1894,6 @@ export default function App() {
           }
           if (msg.type === "engine_capabilities") {
             acceptSkillCatalog(msg);
-            setCapabilitiesBySurface((current) => ({
-              ...current, [`${msg.space}:${msg.engine}`]: msg,
-            }));
-            if (msg.space === spaceRef.current && msg.engine === engineRef.current) {
-              setCapabilitiesLoading(false);
-            }
           }
           if (msg.type === "turn_end" && msg.sid && msg.notification_context
               && document.hidden
@@ -1995,10 +1987,7 @@ export default function App() {
           if (msg.type === "wrapper_reconnected") {
             skillCatalogsRef.current = {};
             setSkillCatalogs({});
-            skillCatalogReadsRef.current = {
-              active: null,
-              queued: new Map(),
-            };
+            skillCatalogRequestsRef.current?.resetReads();
             const focusedSkills = focusedSkillScopeRef.current;
             if (focusedSkills?.engine === "codex" && focusedSkills.cwd) {
               requestSkillCatalog(focusedSkills, true);
@@ -2035,10 +2024,7 @@ export default function App() {
         onConnState: (s, detail) => {
           dispatch({ type: "conn", connState: s, detail });
           if (s !== "connected") {
-            skillCatalogReadsRef.current = {
-              active: null,
-              queued: new Map(),
-            };
+            skillCatalogRequestsRef.current?.resetReads();
           }
           if (s === "connected") {
             recoverableReads.clear();
@@ -2073,6 +2059,10 @@ export default function App() {
           historyInvalidationGenerationsRef.current.clear();
           historyCacheEpochRef.current.clear();
           historySessionListsRef.current = {};
+          skillCatalogsRef.current = {};
+          skillCatalogRequestsRef.current?.reset();
+          setSkillCatalogs({});
+          setCapabilitiesByScope({});
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
           bumpInlineImageRevision();
@@ -2230,6 +2220,7 @@ export default function App() {
       engine: focusedEngine,
       space,
       cwd: capabilityCwd,
+      skillsOnly: true,
     });
   }, [
     authed,
@@ -2241,6 +2232,32 @@ export default function App() {
     space,
     state.connState,
     state.newChat,
+    state.wrapperOnline,
+  ]);
+
+  // An open Extensions sheet follows the focused authorization scope. Switching
+  // device, engine, space, or cwd must fetch that scope instead of retaining a
+  // report from the previously visible session.
+  useEffect(() => {
+    if (!capabilitiesOpen || !authed || state.connState !== "connected"
+        || !state.wrapperOnline) return;
+    setCapabilitiesLoading(true);
+    requestSkillCatalog({
+      key: focusedSkillCatalogKey,
+      engine: focusedEngine,
+      space,
+      cwd: capabilityCwd,
+      skillsOnly: false,
+    }, true);
+  }, [
+    authed,
+    capabilitiesOpen,
+    capabilityCwd,
+    focusedEngine,
+    focusedSkillCatalogKey,
+    requestSkillCatalog,
+    space,
+    state.connState,
     state.wrapperOnline,
   ]);
 
@@ -3611,6 +3628,7 @@ export default function App() {
               engine: focusedEngine,
               space,
               cwd: capabilityCwd,
+              skillsOnly: false,
             }, true);
           }}
           skills={skillCatalogs[focusedSkillCatalogKey]?.items}
@@ -3620,6 +3638,7 @@ export default function App() {
               engine: focusedEngine,
               space,
               cwd: capabilityCwd,
+              skillsOnly: true,
             });
           }}
           workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
@@ -3760,7 +3779,7 @@ export default function App() {
         engine={focusedEngine}
         activeKind={capabilitiesKind}
         readOnly={space === "work"}
-        report={capabilitiesBySurface[`${space}:${focusedEngine}`] ?? null}
+        report={capabilitiesByScope[focusedSkillCatalogKey] ?? null}
         loading={capabilitiesLoading}
         onKindChange={setCapabilitiesKind}
         onRefresh={() => {
@@ -3770,42 +3789,63 @@ export default function App() {
             engine: focusedEngine,
             space,
             cwd: capabilityCwd,
+            skillsOnly: false,
           }, true);
         }}
         onManagePlugin={(item, action) => {
           const verb = action === "install" ? "安装" : "卸载";
           if (!window.confirm(`${verb}插件「${item.name}」将修改本机 ${focusedEngine === "codex" ? "Codex" : "Claude"} 配置，确定继续吗？`)) return;
           setCapabilitiesLoading(true);
-          wsRef.current?.sendManageEnginePlugin(
+          const requestId = wsRef.current?.sendManageEnginePlugin(
             focusedEngine, space, action, item.id,
-            state.newChat?.cwd ?? currentCwd);
+            capabilityCwd);
+          trackCapabilityMutation(requestId, {
+            key: focusedSkillCatalogKey, engine: focusedEngine, space,
+            cwd: capabilityCwd, skillsOnly: false,
+          });
         }}
         onManageSkill={(item: EngineCapabilityItem, action) => {
           const labels = { enable: "启用", disable: "停用", remove: "删除" } as const;
           if (!window.confirm(`${labels[action]} Skill「${item.name}」？${action === "remove" ? "删除会移动到本机可恢复回收目录。" : ""}`)) return;
           setCapabilitiesLoading(true);
-          wsRef.current?.sendManageEngineSkill(
+          const requestId = wsRef.current?.sendManageEngineSkill(
             focusedEngine, space, action, { skillId: item.id },
-            state.newChat?.cwd ?? currentCwd);
+            capabilityCwd);
+          trackCapabilityMutation(requestId, {
+            key: focusedSkillCatalogKey, engine: focusedEngine, space,
+            cwd: capabilityCwd, skillsOnly: false,
+          });
         }}
         onCreateSkill={(draft: SkillDraft) => {
           setCapabilitiesLoading(true);
-          wsRef.current?.sendManageEngineSkill(
+          const requestId = wsRef.current?.sendManageEngineSkill(
             focusedEngine, space, "create", draft,
-            state.newChat?.cwd ?? currentCwd);
+            capabilityCwd);
+          trackCapabilityMutation(requestId, {
+            key: focusedSkillCatalogKey, engine: focusedEngine, space,
+            cwd: capabilityCwd, skillsOnly: false,
+          });
         }}
         onRemoveHook={(item: EngineCapabilityItem) => {
           if (!window.confirm(`删除 Hook「${item.name}」？配置文件中的其他内容会原样保留。`)) return;
           setCapabilitiesLoading(true);
-          wsRef.current?.sendManageEngineHook(
+          const requestId = wsRef.current?.sendManageEngineHook(
             focusedEngine, space, "remove", { hookId: item.id },
-            state.newChat?.cwd ?? currentCwd);
+            capabilityCwd);
+          trackCapabilityMutation(requestId, {
+            key: focusedSkillCatalogKey, engine: focusedEngine, space,
+            cwd: capabilityCwd, skillsOnly: false,
+          });
         }}
         onCreateHook={(draft: HookDraft) => {
           setCapabilitiesLoading(true);
-          wsRef.current?.sendManageEngineHook(
+          const requestId = wsRef.current?.sendManageEngineHook(
             focusedEngine, space, "create", draft,
-            state.newChat?.cwd ?? currentCwd);
+            capabilityCwd);
+          trackCapabilityMutation(requestId, {
+            key: focusedSkillCatalogKey, engine: focusedEngine, space,
+            cwd: capabilityCwd, skillsOnly: false,
+          });
         }}
         onClose={() => setCapabilitiesOpen(false)} />
       <DeviceSheet open={deviceSheetOpen}

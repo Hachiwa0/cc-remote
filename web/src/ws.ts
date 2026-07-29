@@ -802,24 +802,25 @@ export class RelayWs {
   }
 
   sendGetEngineCapabilities(engine: "claude" | "codex", space: Space,
-                            cwd?: string | null): void {
+                            cwd?: string | null,
+                            skillsOnly = false): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_engine_capabilities", engine, space,
-      client_id: this.clientId, ts: nowTs(),
+      client_id: this.clientId, skills_only: skillsOnly, ts: nowTs(),
     };
     if (cwd) frame.cwd = cwd;
-    this.send(frame);
+    return this.sendTracked(frame);
   }
 
   sendManageEnginePlugin(engine: "claude" | "codex", space: Space,
                          action: "install" | "uninstall", pluginId: string,
-                         cwd?: string | null): boolean {
+                         cwd?: string | null): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_plugin", engine, space,
       action, plugin_id: pluginId, client_id: this.clientId, ts: nowTs(),
     };
     if (cwd) frame.cwd = cwd;
-    return this.send(frame);
+    return this.sendTracked(frame);
   }
 
   sendManageEngineSkill(
@@ -830,7 +831,7 @@ export class RelayWs {
       instructions?: string; scope?: "user" | "project";
     },
     cwd?: string | null,
-  ): boolean {
+  ): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_skill", engine, space, action,
       client_id: this.clientId, ts: nowTs(),
@@ -841,7 +842,7 @@ export class RelayWs {
     if (options.instructions !== undefined) frame.instructions = options.instructions;
     if (options.scope) frame.scope = options.scope;
     if (cwd) frame.cwd = cwd;
-    return this.send(frame);
+    return this.sendTracked(frame);
   }
 
   sendManageEngineHook(
@@ -852,7 +853,7 @@ export class RelayWs {
       timeout?: number; scope?: "user" | "project";
     },
     cwd?: string | null,
-  ): boolean {
+  ): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_hook", engine, space, action,
       client_id: this.clientId, ts: nowTs(),
@@ -864,7 +865,7 @@ export class RelayWs {
     if (options.timeout !== undefined) frame.timeout = options.timeout;
     if (options.scope) frame.scope = options.scope;
     if (cwd) frame.cwd = cwd;
-    return this.send(frame);
+    return this.sendTracked(frame);
   }
 
   sendAnswerQuestion(

@@ -9,7 +9,6 @@ from pydantic import ValidationError
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.protocol import (
     ERR_INVALID_CWD,
-    PROTOCOL_VERSION,
     NewSession,
     SessionFocus,
     TurnBinding,
@@ -22,8 +21,7 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
-def test_protocol_v25_new_session_query_and_turn_binding_roundtrip():
-    assert PROTOCOL_VERSION == 25
+def test_new_session_query_and_turn_binding_roundtrip():
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",

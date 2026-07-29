@@ -145,6 +145,8 @@ async def codex_rpc(
 async def codex_rpc_batch(
     requests: list[tuple[str, Optional[dict[str, Any]]]],
     cwd: Optional[str] = None,
+    *,
+    timeout: float = _RPC_TIMEOUT,
 ) -> list[Any | Exception]:
     """Issue a read-only request batch through one initialized app-server.
 
@@ -152,7 +154,8 @@ async def codex_rpc_batch(
     JSON-RPC rejection is returned as ``CodexRpcRejected`` so inventory callers
     can preserve successful components. Process/initialization failures before
     submission still raise; transport failures after submission become
-    per-request ``CodexRpcOutcomeUnknown`` values.
+    per-request ``CodexRpcOutcomeUnknown`` values. The shared deadline preserves
+    responses received before a slower component times out.
     """
     if not isinstance(requests, list):
         raise TypeError("codex RPC batch must be a list")
@@ -161,21 +164,33 @@ async def codex_rpc_batch(
             raise ValueError("codex RPC method must be a non-empty string")
         if params is not None and not isinstance(params, dict):
             raise TypeError("codex RPC params must be a dict or None")
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ValueError("codex RPC timeout must be positive")
     if not requests:
         return []
 
-    bin_path = await asyncio.to_thread(_resolve_codex_bin)
+    deadline = asyncio.get_running_loop().time() + timeout
+
+    def remaining() -> float:
+        return max(0.0, deadline - asyncio.get_running_loop().time())
+
+    bin_path = await asyncio.wait_for(
+        asyncio.to_thread(_resolve_codex_bin), timeout=remaining(),
+    )
     workdir = os.path.realpath(os.path.expanduser(cwd or "~"))
-    proc = await asyncio.create_subprocess_exec(
-        bin_path,
-        "app-server",
-        "--stdio",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-        cwd=workdir,
-        env=_codex_env(bin_path),
-        limit=_STREAM_LIMIT,
+    proc = await asyncio.wait_for(
+        asyncio.create_subprocess_exec(
+            bin_path,
+            "app-server",
+            "--stdio",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=workdir,
+            env=_codex_env(bin_path),
+            limit=_STREAM_LIMIT,
+        ),
+        timeout=remaining(),
     )
 
     async def send(message: dict[str, Any]) -> None:
@@ -184,7 +199,7 @@ async def codex_rpc_batch(
         proc.stdin.write(
             (json.dumps(message, separators=(",", ":")) + "\n").encode()
         )
-        await proc.stdin.drain()
+        await asyncio.wait_for(proc.stdin.drain(), timeout=remaining())
 
     async def response_for(request_id: int) -> Any:
         if proc.stdout is None:
@@ -214,7 +229,7 @@ async def codex_rpc_batch(
                 "clientInfo": {"name": "cc-remote", "version": __version__},
             },
         })
-        await asyncio.wait_for(response_for(1), timeout=_RPC_TIMEOUT)
+        await asyncio.wait_for(response_for(1), timeout=remaining())
         await send({"jsonrpc": "2.0", "method": "initialized"})
 
         pending: dict[int, int] = {}
@@ -259,7 +274,7 @@ async def codex_rpc_batch(
                     )
                     completed.add(index)
 
-            await asyncio.wait_for(collect(), timeout=_RPC_TIMEOUT)
+            await asyncio.wait_for(collect(), timeout=remaining())
         except asyncio.CancelledError:
             raise
         except Exception as exc:

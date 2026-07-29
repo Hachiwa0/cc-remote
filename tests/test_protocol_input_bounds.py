@@ -16,6 +16,7 @@ from cc_remote.protocol import (
     ForkSessionWorktree,
     GetDiff,
     GetFilePreview,
+    GetEngineCapabilities,
     GetModels,
     GetPreviewAsset,
     ManageEngineHook,
@@ -188,6 +189,9 @@ def test_known_dynamic_control_values_remain_supported():
     assert SetCollaborationMode(mode="default").mode == "default"
     assert SetPerm(mode="on-request").mode == "on-request"
     assert GetModels(engine="cc", cwd="/tmp/project").cwd == "/tmp/project"
+    assert GetEngineCapabilities(
+        engine="codex", skills_only=True
+    ).skills_only is True
     assert ForkSessionWorktree(
         session_id="sid-1", request_id="request-1", name="feature",
     ).name == "feature"

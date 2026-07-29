@@ -84,7 +84,12 @@ import {
   type MobileViewportEvent,
   type ViewportReading,
 } from "../src/use-mobile-viewport.ts";
-import type { History, ServerEvent, SessionControl } from "../src/protocol.ts";
+import type {
+  EngineCapabilities,
+  History,
+  ServerEvent,
+  SessionControl,
+} from "../src/protocol.ts";
 import type { Block, Turn } from "../src/reducer.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
 import {
@@ -122,8 +127,12 @@ import { PointerTapGuard } from "../src/pointer-tap.ts";
 import {
   cacheSkillCatalog,
   MAX_SKILL_CATALOGS,
+  SkillCatalogRequestCoordinator,
   skillCatalogFresh,
   skillCatalogKey,
+  skillCatalogRefreshSucceeded,
+  skillCatalogReadKey,
+  skillCatalogResponseMatches,
   SKILL_CATALOG_TTL_MS,
 } from "../src/skill-catalog-cache.ts";
 import {
@@ -375,6 +384,166 @@ assert.notEqual(repoSkillKey, skillCatalogKey(
 assert.notEqual(repoSkillKey, skillCatalogKey(
   "machine-b", "codex", "code", "/repo/a"),
   "Skill catalogs must remain inside the machine authorization boundary");
+assert.notEqual(
+  skillCatalogReadKey(repoSkillKey, true),
+  skillCatalogReadKey(repoSkillKey, false),
+  "a lightweight Skill read must not swallow a queued full extension read",
+);
+const skillRead = {
+  key: repoSkillKey,
+  requestId: "skills-request-a",
+  engine: "codex",
+  space: "code",
+  cwd: "/repo/a",
+  skillsOnly: true,
+} as const;
+const skillResponse = {
+  v: 26,
+  ts: 0,
+  type: "engine_capabilities",
+  engine: "codex",
+  space: "code",
+  request_id: "skills-request-a",
+  cwd: "/repo/a",
+  items: skillCatalog,
+  errors: [],
+  notes: [],
+  skills_only: true,
+} satisfies EngineCapabilities;
+assert.equal(skillCatalogResponseMatches(skillRead, skillResponse), true);
+assert.equal(skillCatalogResponseMatches(
+  skillRead, { ...skillResponse, request_id: "replayed-old-request" }), false,
+  "a replayed capability response must not complete a newer read",
+);
+assert.equal(skillCatalogResponseMatches(
+  skillRead, { ...skillResponse, cwd: "/repo/b" }), false,
+  "a capability response from another cwd must not complete the active read",
+);
+assert.equal(skillCatalogResponseMatches(
+  { ...skillRead, cwd: "" }, skillResponse), true,
+  "an omitted cwd must accept the wrapper's resolved default directory",
+);
+assert.equal(skillCatalogRefreshSucceeded(skillResponse), true);
+assert.equal(skillCatalogRefreshSucceeded({
+  ...skillResponse,
+  items: [],
+  errors: ["skills: app-server request failed"],
+}), false, "a failed Skill refresh must preserve stale cached items");
+assert.equal(skillCatalogRefreshSucceeded({
+  ...skillResponse,
+  skills_only: false,
+  errors: ["plugins: app-server request failed"],
+}), true, "an unrelated full-inventory failure must not hide valid Skills");
+
+const capabilityRequest = (
+  key: string,
+  cwd: string,
+  skillsOnly: boolean,
+) => ({
+  key,
+  engine: "codex" as const,
+  space: "code" as const,
+  cwd,
+  skillsOnly,
+});
+const capabilityResponse = (
+  requestId: string,
+  cwd: string,
+  skillsOnly: boolean,
+): EngineCapabilities => ({
+  ...skillResponse,
+  request_id: requestId,
+  cwd,
+  skills_only: skillsOnly,
+});
+
+const mutationRaceStarts: Array<{ requestId: string; key: string; skillsOnly: boolean }> = [];
+const mutationRace = new SkillCatalogRequestCoordinator((request) => {
+  const requestId = `race-read-${mutationRaceStarts.length + 1}`;
+  mutationRaceStarts.push({
+    requestId, key: request.key, skillsOnly: request.skillsOnly,
+  });
+  return requestId;
+});
+const raceSkillsRequest = capabilityRequest(repoSkillKey, "/repo/a", true);
+const raceFullRequest = capabilityRequest(repoSkillKey, "/repo/a", false);
+assert.equal(mutationRace.request(raceSkillsRequest), true);
+assert.equal(mutationRace.trackMutation("race-mutation", raceFullRequest), true);
+assert.equal(mutationRace.request(raceFullRequest), false,
+  "a read requested during a same-scope mutation must wait");
+const raceMutationAcceptance = mutationRace.accept(
+  capabilityResponse("race-mutation", "/repo/a", false));
+assert.equal(raceMutationAcceptance?.superseded, false);
+assert.equal(mutationRaceStarts.length, 1,
+  "the queued refresh must not overtake the still-active old read");
+const staleReadAcceptance = mutationRace.accept(
+  capabilityResponse("race-read-1", "/repo/a", true));
+assert.equal(staleReadAcceptance?.superseded, true,
+  "a read started before mutation must not roll the catalog back");
+assert.deepEqual(mutationRaceStarts.at(-1), {
+  requestId: "race-read-2",
+  key: repoSkillKey,
+  skillsOnly: false,
+}, "the queued full refresh must continue after mutation and stale-read drain");
+
+const blockedMutationStarts: string[] = [];
+const blockedMutation = new SkillCatalogRequestCoordinator((request) => {
+  blockedMutationStarts.push(request.key);
+  return `blocked-read-${blockedMutationStarts.length}`;
+});
+assert.equal(blockedMutation.trackMutation(
+  "blocked-mutation", raceFullRequest), true);
+assert.equal(blockedMutation.request(raceSkillsRequest), false);
+assert.deepEqual(blockedMutationStarts, [],
+  "same-scope reads must stay queued while a mutation is pending");
+assert.equal(blockedMutation.accept(
+  capabilityResponse("blocked-mutation", "/repo/b", false)), null,
+  "a mutation response from another cwd must not release the scoped queue");
+assert.deepEqual(blockedMutationStarts, []);
+assert.ok(blockedMutation.accept(
+  capabilityResponse("blocked-mutation", "/repo/a", false)));
+assert.deepEqual(blockedMutationStarts, [repoSkillKey],
+  "a queued read must start after the mutation response");
+
+const isolatedStarts: string[] = [];
+const isolatedRequests = new SkillCatalogRequestCoordinator((request) => {
+  const requestId = `isolated-${isolatedStarts.length + 1}`;
+  isolatedStarts.push(request.key);
+  return requestId;
+});
+const machineARequest = capabilityRequest(repoSkillKey, "/repo/a", true);
+const machineBKey = skillCatalogKey(
+  "machine-b", "codex", "code", "/repo/b");
+const machineBRequest = capabilityRequest(machineBKey, "/repo/b", true);
+assert.equal(isolatedRequests.request(machineARequest), true);
+isolatedRequests.reset();
+assert.equal(isolatedRequests.request(machineBRequest), true);
+assert.equal(isolatedRequests.accept(
+  capabilityResponse("isolated-1", "/repo/a", true)), null,
+  "a delayed response from a reset machine scope must be ignored");
+assert.equal(isolatedRequests.accept(
+  capabilityResponse("isolated-2", "/repo/a", true)), null,
+  "even a current request id must not authorize another cwd");
+assert.equal(isolatedRequests.accept(
+  capabilityResponse("isolated-2", "/repo/b", true))?.request.key,
+  machineBKey);
+
+const failedDrainStarts: string[] = [];
+const failedDrain = new SkillCatalogRequestCoordinator((request) => {
+  failedDrainStarts.push(request.key);
+  if (request.key === "send-fails") return null;
+  return `drain-${failedDrainStarts.length}`;
+});
+const drainActive = capabilityRequest("active", "/active", true);
+assert.equal(failedDrain.request(drainActive), true);
+assert.equal(failedDrain.request(
+  capabilityRequest("send-fails", "/bad", true)), false);
+assert.equal(failedDrain.request(
+  capabilityRequest("send-works", "/good", true)), false);
+assert.ok(failedDrain.accept(
+  capabilityResponse("drain-1", "/active", true)));
+assert.deepEqual(failedDrainStarts, ["active", "send-fails", "send-works"],
+  "one failed queued send must not discard later runnable scopes");
 const freshSkillEntry = { items: skillCatalog, fetchedAt: 1_000 };
 assert.equal(skillCatalogFresh(freshSkillEntry, 1_000 + SKILL_CATALOG_TTL_MS - 1),
   true);
@@ -6898,6 +7067,19 @@ assert.equal(claudeDefaultsFrame.cwd, "/tmp/project");
 assert.equal(typeof claudeDefaultsFrame.cmd_id, "string");
 assert.equal(typeof claudeDefaultsFrame.client_id, "string");
 
+const skillOnlyCapabilitiesRequestId = relay.sendGetEngineCapabilities(
+  "codex", "code", "/tmp/project", true,
+);
+const skillOnlyCapabilitiesFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(skillOnlyCapabilitiesFrame.type, "get_engine_capabilities");
+assert.equal(skillOnlyCapabilitiesFrame.skills_only, true);
+assert.equal(skillOnlyCapabilitiesFrame.cwd, "/tmp/project");
+assert.equal(typeof skillOnlyCapabilitiesFrame.client_id, "string");
+assert.equal(
+  skillOnlyCapabilitiesFrame.cmd_id, skillOnlyCapabilitiesRequestId,
+  "capability responses need the reliable request id for exact correlation",
+);
+
 const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
   assert.doesNotMatch(appSource, new RegExp(`dispatch\\(\\{ type: ["']${optimisticAction}["']`));
@@ -7044,6 +7226,18 @@ assert.match(composerSource, /正在读取当前目录的 Skills/,
   "the Skill palette must stay visible while native discovery is in flight");
 assert.match(appSource, /skills=\{skillCatalogs\[focusedSkillCatalogKey\]\?\.items\}/,
   "the composer must paint a cwd-scoped Skill cache synchronously");
+assert.match(appSource,
+  /onRequestSkills=\{\(\) => \{[\s\S]{0,500}skillsOnly: true/,
+  "$ completion must request only the lightweight Skill inventory");
+assert.match(appSource,
+  /onOpenExtensions=\{\(kind\) => \{[\s\S]{0,600}skillsOnly: false/,
+  "the extensions sheet must continue requesting the complete inventory");
+assert.match(appSource,
+  /report=\{capabilitiesByScope\[focusedSkillCatalogKey\] \?\? null\}/,
+  "the full Extensions report must share the machine and cwd scope key");
+assert.match(appSource,
+  /skillCatalogRefreshSucceeded\(msg\)[\s\S]{0,200}storeSkillCatalog/,
+  "a failed Skill refresh must not replace a usable cached catalog");
 assert.match(appSource, /Warm the cwd-scoped Codex Skill catalog[\s\S]*requestSkillCatalog/,
   "focused Codex sessions must prefetch Skills before the user types $");
 assert.match(appSource,

@@ -10,6 +10,10 @@
   disconnected, and restores the authoritative queue when a client reconnects.
   Queue chips retain only bounded previews; opening one fetches its full prompt
   privately and edits it atomically in the wrapper without dropping attachments.
+- Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v26 and give
+  Codex `$` completion a lightweight Skills-only inventory path. Slow Apps or
+  MCP discovery can no longer hide an already returned Skill catalog, while
+  the full Extensions sheet retains the complete native inventory.
 - Add official Codex named permission profiles as a control separate from the
   approval policy. The compact permissions sheet can select Read Only,
   Workspace, Full Access, or cwd-aware custom profiles without adding another

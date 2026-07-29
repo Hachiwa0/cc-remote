@@ -123,15 +123,19 @@ async def _codex_components(
     cwd: str,
 ) -> list[Any | Exception]:
     try:
-        return await asyncio.wait_for(
-            codex_rpc_batch(requests, cwd=cwd),
-            timeout=_COMPONENT_TIMEOUT,
+        return await codex_rpc_batch(
+            requests, cwd=cwd, timeout=_COMPONENT_TIMEOUT,
         )
     except Exception as exc:
         return [exc for _request in requests]
 
 
-async def codex_capabilities(cwd: str, space: str) -> tuple[list[dict], list[str], list[str]]:
+async def codex_capabilities(
+    cwd: str,
+    space: str,
+    *,
+    skills_only: bool = False,
+) -> tuple[list[dict], list[str], list[str]]:
     requests = {
         "skills": ("skills/list", {"cwds": [cwd], "forceReload": False}),
         "hooks": ("hooks/list", {"cwds": [cwd]}),
@@ -139,6 +143,8 @@ async def codex_capabilities(cwd: str, space: str) -> tuple[list[dict], list[str
         "apps": ("app/list", {"limit": _MAX_ITEMS}),
         "mcp": ("mcpServerStatus/list", {}),
     }
+    if skills_only:
+        requests = {"skills": requests["skills"]}
     results = await _codex_components(list(requests.values()), cwd)
     values = dict(zip(requests, results))
     items: list[dict] = []
@@ -180,7 +186,7 @@ async def codex_capabilities(cwd: str, space: str) -> tuple[list[dict], list[str
                     "actions": actions,
                 })
 
-    raw_hooks = values["hooks"]
+    raw_hooks = values.get("hooks")
     if isinstance(raw_hooks, Exception):
         errors.append("hooks: app-server request failed")
     elif isinstance(raw_hooks, dict):
@@ -217,7 +223,7 @@ async def codex_capabilities(cwd: str, space: str) -> tuple[list[dict], list[str
                 if warning and len(notes) < 32:
                     notes.append(f"Hook: {warning}")
 
-    raw_plugins = values["plugins"]
+    raw_plugins = values.get("plugins")
     if isinstance(raw_plugins, Exception):
         errors.append("plugins: app-server request failed")
     elif isinstance(raw_plugins, dict):
@@ -247,7 +253,7 @@ async def codex_capabilities(cwd: str, space: str) -> tuple[list[dict], list[str
                     ]),
                 })
 
-    raw_apps = values["apps"]
+    raw_apps = values.get("apps")
     if isinstance(raw_apps, Exception):
         errors.append("apps: app-server request failed")
     elif isinstance(raw_apps, dict):
@@ -267,7 +273,7 @@ async def codex_capabilities(cwd: str, space: str) -> tuple[list[dict], list[str
                 "install_url": _public_url(app.get("installUrl")),
             })
 
-    raw_mcp = values["mcp"]
+    raw_mcp = values.get("mcp")
     if isinstance(raw_mcp, Exception):
         errors.append("mcp: app-server request failed")
     elif isinstance(raw_mcp, dict):
@@ -888,13 +894,19 @@ async def manage_engine_plugin(
 
 
 async def claude_capabilities(
-    cwd: str, space: str, claude_bin: str = ""
+    cwd: str,
+    space: str,
+    claude_bin: str = "",
+    *,
+    skills_only: bool = False,
 ) -> tuple[list[dict], list[str], list[str]]:
     if space == "work":
         return [], [], [
             "Claude Work 为防止 Code 配置泄漏，明确禁用了用户/项目技能、插件、Hook 与 MCP。"
         ]
     items = await asyncio.to_thread(_claude_skills, cwd)
+    if skills_only:
+        return items[:2000], [], []
     items.extend(await asyncio.to_thread(_claude_hooks, cwd))
     errors: list[str] = []
     try:
@@ -906,11 +918,20 @@ async def claude_capabilities(
 
 
 async def engine_capabilities(
-    engine: str, cwd: str, space: str, claude_bin: str = ""
+    engine: str,
+    cwd: str,
+    space: str,
+    claude_bin: str = "",
+    *,
+    skills_only: bool = False,
 ):
     target = os.path.realpath(os.path.expanduser(cwd))
     if not os.path.isdir(target):
         raise ValueError("capability cwd does not exist")
     if engine == "codex":
-        return await codex_capabilities(target, space)
-    return await claude_capabilities(target, space, claude_bin)
+        return await codex_capabilities(
+            target, space, skills_only=skills_only,
+        )
+    return await claude_capabilities(
+        target, space, claude_bin, skills_only=skills_only,
+    )
