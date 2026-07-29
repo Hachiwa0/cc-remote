@@ -4,7 +4,7 @@
 
 Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web
 
-**Current release: v3.0.0** · Wire protocol v24
+**Current release: v3.0.0** · Wire protocol v25
 
 [中文](README.md) ·
 [5-minute quick start](#quick-start-local-one-machine-5-min) ·
@@ -469,14 +469,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v24:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v25:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v24 relay and v24 wrapper so the old wrapper cannot occupy the
+> then start the v25 relay and v25 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`.
 
 ### 3) Upload staging, then publish it as an atomic release
@@ -534,7 +534,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v24 wrapper after success.
+release's `/healthz` is verified. Start the v25 wrapper after success.
 
 Verify:
 
@@ -689,6 +689,7 @@ Each message accepts at most 8 attachments, at most 6 MiB each and 8 MiB decoded
 ## Reliability boundary
 
 - The Web and TUI attach a stable `cmd_id` to retryable commands and resend them after a socket reconnect or wrapper recovery. The wrapper deduplicates them and ACKs completion within the same wrapper process lifetime. Each live session also pairs its cursor with a wrapper generation so a restart cannot make an old sequence number look current.
+- Once the wrapper accepts a queued or interrupt-replacement message, its bounded in-memory queue owns that work. It starts after the active turn's real terminal boundary even if every Web/PWA client sleeps, disconnects, or hard-refreshes, and reconnecting clients recover a payload-bounded queue summary. Opening a summary privately fetches the full instruction, whose text can be atomically edited before execution without dropping attachments; full payloads never enter the replay ring. This queue is not persisted across a wrapper process crash or restart.
 - Unacknowledged-command queues and the general command-deduplication table are **bounded in-memory state**. A hard browser refresh, TUI exit, or wrapper crash does not promise cross-process exactly-once delivery. cc-remote is an interactive control plane, not a durable job queue; after such a failure, inspect the transcript/rollout and live session state before resending.
 - Persisted Claude transcripts and Codex rollouts are the history source of truth. The wrapper SQLite summary index and browser IndexedDB are rebuildable projections; the live ring only provides bounded reconnect catch-up. Heavy tool/reasoning detail loads per turn instead of blocking first paint.
 - Work schedules are the exception: schedules, run records, leases, heartbeats, retry counts, and next-run timestamps live in SQLite. An expired lease is recovered after a wrapper restart, but an uncertain outcome is never reported as success.

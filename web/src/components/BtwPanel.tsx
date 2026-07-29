@@ -21,8 +21,9 @@ import {
   isSettlingStopDisabled,
   type SendMode,
 } from "../composer-submit";
-import { canEnqueueQuery } from "../runtime-drain";
+import { canEnqueueQuery, type QueueCapacity } from "../runtime-drain";
 import { effortsFor, modelsFor, type Catalog } from "../data";
+import { QueuedQueryChip } from "./QueuedQueryDialog";
 
 interface Props {
   sid?: string;
@@ -36,16 +37,19 @@ interface Props {
   draftKey: string;
   draftStore: ComposerDraftStore;
   sendMode: SendMode;
-  allQueued: PendingQuery[];
-  replaceableQueued: PendingQuery[];
+  unconfirmedQueued: PendingQuery[];
+  unconfirmedReplaceable: PendingQuery[];
+  queueCapacity: QueueCapacity;
+  replaceQueueCapacity: QueueCapacity;
   onTab: (v: "diff" | "btw") => void;
   onSend: (prompt: string) => boolean;
   onSteer: (prompt: string) => boolean;
   onInterrupt: () => void;
   onSetSendMode: (mode: SendMode) => void;
-  onEnqueue: (query: PendingQuery) => void;
-  onSetPending: (query: PendingQuery) => void;
-  onDequeue: (index: number) => void;
+  onEnqueue: (query: PendingQuery) => boolean;
+  onSetPending: (query: PendingQuery) => boolean;
+  onRemoveQueued: (query: PendingQuery) => void;
+  onInspectQueued: (query: PendingQuery) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
   onOpenFile?: (path: string, line?: number) => void;
@@ -167,17 +171,19 @@ export function BtwPanel(p: Props) {
         }
         return;
       }
-      const existing = p.sendMode === "queue"
-        ? p.allQueued : p.replaceableQueued;
-      if (!canEnqueueQuery(existing, query)) {
+      const unconfirmed = p.sendMode === "queue"
+        ? p.unconfirmedQueued : p.unconfirmedReplaceable;
+      const capacity = p.sendMode === "queue"
+        ? p.queueCapacity : p.replaceQueueCapacity;
+      if (!canEnqueueQuery(unconfirmed, query, capacity)) {
         flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
         return;
       }
       if (action === "enqueue") {
-        p.onEnqueue(query);
+        if (!p.onEnqueue(query)) return;
       } else {
         if (action === "interrupt-and-replace") p.onInterrupt();
-        p.onSetPending(query);
+        if (!p.onSetPending(query)) return;
       }
       clearDraft();
       resetTaHeight();
@@ -263,17 +269,20 @@ export function BtwPanel(p: Props) {
       </div>
       <div className="btw-composer">
         {notice && <div className="btw-composer-notice">{notice}</div>}
-        {(p.rt?.queue.length ?? 0) > 0 && (
+        {(
+          (p.rt?.queue.length ?? 0) > 0
+          || !!p.rt?.pendingSend
+          || (p.rt?.failedDeferred.length ?? 0) > 0
+        ) && (
           <div className="btw-queued">
-            {p.rt!.queue.map((query, index) => (
-              <span className="qchip" key={index}>
-                <span className="qbadge">排队</span>
-                <span className="qt">{query.prompt}</span>
-                <button className="qx" onClick={() => p.onDequeue(index)}
-                  aria-label="移出队列">
-                  <Icon name="close" size={12} />
-                </button>
-              </span>
+            {[
+              ...(p.rt?.pendingSend ? [p.rt.pendingSend] : []),
+              ...(p.rt?.queue ?? []),
+              ...(p.rt?.failedDeferred ?? []),
+            ].map((query, index) => (
+              <QueuedQueryChip query={query} key={query.msg_id ?? index}
+                onOpen={p.onInspectQueued}
+                onRemove={() => p.onRemoveQueued(query)} />
             ))}
           </div>
         )}

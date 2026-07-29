@@ -148,11 +148,17 @@ export interface RetainedRuntime {
   }>;
   queue: unknown[];
   pendingSend: unknown | null;
+  failedDeferred: unknown[];
   pendingQuestion: unknown | null;
 }
 
 function hasLiveWork(runtime: RetainedRuntime): boolean {
-  if (runtime.queue.length || runtime.pendingSend || runtime.replaying) return true;
+  if (
+    runtime.queue.length
+    || runtime.pendingSend
+    || runtime.failedDeferred.length
+    || runtime.replaying
+  ) return true;
   if (!runtime.syncReady) return false;
   return runtime.state !== "idle" || runtime.pendingQuestion !== null
     || runtime.turns.some((turn) => !turn.done || turnHasActiveProcess(turn));

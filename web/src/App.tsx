@@ -1,11 +1,21 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
-import { reduce, initialState, createRuntime } from "./reducer";
+import {
+  createRuntime,
+  deferredQueueCapacity,
+  initialState,
+  reduce,
+  type PendingQuery,
+} from "./reducer";
 import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
 import { Icon } from "./icons";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
+import {
+  QueuedQueryDialog,
+  type QueuedQueryEditor,
+} from "./components/QueuedQueryDialog";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { NoticeStack } from "./components/NoticeStack";
 import { presentCommandProblem } from "./problem-presentation";
@@ -42,8 +52,7 @@ import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
 import { nextAutoLoadDetailTurn } from "./history-detail-projection";
 import {
   canEnqueueQuery,
-  collectWaitingQueries,
-  selectDrainCandidates,
+  collectUnconfirmedQueries,
 } from "./runtime-drain";
 import type { SendMode } from "./composer-submit";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
@@ -168,6 +177,12 @@ interface SkillCatalogRequest {
   cwd: string;
 }
 
+interface QueuedQueryEditorState extends QueuedQueryEditor {
+  detailRequestId: string | null;
+  updateRequestId: string | null;
+  pendingPrompt: string | null;
+}
+
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
 // ONLY on mobile; on desktop keep it open.
@@ -187,6 +202,8 @@ export default function App() {
   const [createError, setCreateError] = useState<string | null>(null);
   const [newChatAutoFocus, setNewChatAutoFocus] = useState(true);
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
+  const [queuedQueryEditor, setQueuedQueryEditor] =
+    useState<QueuedQueryEditorState | null>(null);
   // right slot is shared by diff + /btw; rightView picks which shows.
   const [rightView, setRightView] = useState<"diff" | "btw">("diff");
   // true from the moment /btw is clicked until the fork's btw_opened arrives — so
@@ -309,7 +326,6 @@ export default function App() {
     },
     [],
   );
-  const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
   const createRequestsRef = useRef<Map<string, {
     scopeKey: string;
@@ -427,6 +443,7 @@ export default function App() {
     discardedBtwSidsRef.current.clear();
     setBtwOpeningByParentSid({});
     setBtwSendModeBySid({});
+    setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
     setCompletionReceipts({});
     sessionListsBySurfaceRef.current = {};
@@ -514,12 +531,27 @@ export default function App() {
   const historyImageAssets = focusedSid
     ? historyImageAssetsRef.current.forSession(focusedSid) : {};
   const currentWorkArtifacts = focusedSid ? (workArtifactsBySid[focusedSid] ?? []) : [];
-  const allQueued = collectWaitingQueries(state.runtimes);
-  const replaceableQueued = collectWaitingQueries(state.runtimes, focusedSid);
-  const btwReplaceableQueued = collectWaitingQueries(
+  const unconfirmedQueued = collectUnconfirmedQueries(state.runtimes);
+  const unconfirmedReplaceable = collectUnconfirmedQueries(
+    state.runtimes, focusedSid);
+  const btwUnconfirmedReplaceable = collectUnconfirmedQueries(
     state.runtimes, activeBtwSid);
+  const queueCapacity = deferredQueueCapacity(state);
+  const replaceQueueCapacity = deferredQueueCapacity(state, focusedSid);
+  const btwReplaceQueueCapacity = deferredQueueCapacity(
+    state, activeBtwSid);
   const activeBtwSendMode = activeBtwSid
     ? btwSendModeBySid[activeBtwSid] ?? "steer" : "steer";
+
+  useEffect(() => {
+    setQueuedQueryEditor((current) => (
+      current
+      && current.sid !== focusedSid
+      && current.sid !== activeBtwSid
+        ? null
+        : current
+    ));
+  }, [activeBtwSid, focusedSid]);
 
   useEffect(() => {
     const acknowledgeVisible = () => {
@@ -1167,7 +1199,6 @@ export default function App() {
   // WebSocket lifecycle
   useEffect(() => {
     if (!authed) return;
-    const draining = drainingRef.current;
     const historyRequests = historyRequestsRef.current;
     didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
     authoritativeSurfaceListsRef.current.delete(`${spaceRef.current}:${engineRef.current}`);
@@ -1201,6 +1232,70 @@ export default function App() {
           if (msg.type === "history_image"
               && historyImageAssetsRef.current.accept(msg)) {
             bumpHistoryImageRevision();
+          }
+          if (msg.type === "queued_query_detail") {
+            setQueuedQueryEditor((current) => (
+              current
+              && current.sid === msg.sid
+              && current.msgId === msg.msg_id
+              && current.detailRequestId === msg.request_id
+                ? {
+                    ...current,
+                    prompt: msg.prompt ?? null,
+                    kind: msg.kind ?? null,
+                    imageCount: msg.image_count,
+                    fileCount: msg.file_count,
+                    loading: false,
+                    error: msg.error ?? null,
+                    detailRequestId: null,
+                  }
+                : current
+            ));
+            return;
+          }
+          if (msg.type === "queued_query_updated") {
+            setQueuedQueryEditor((current) => {
+              if (!current
+                  || current.sid !== msg.sid
+                  || current.msgId !== msg.msg_id
+                  || current.updateRequestId !== msg.request_id) {
+                return current;
+              }
+              if (!msg.updated) {
+                return {
+                  ...current,
+                  saving: false,
+                  error: msg.error ?? "排队消息修改失败。",
+                  updateRequestId: null,
+                  pendingPrompt: null,
+                };
+              }
+              const prompt = current.pendingPrompt ?? current.prompt ?? "";
+              return {
+                ...current,
+                preview: prompt.slice(0, 512),
+                prompt,
+                saving: false,
+                error: null,
+                updateRequestId: null,
+                pendingPrompt: null,
+              };
+            });
+            return;
+          }
+          if (msg.type === "query_queue" && msg.sid) {
+            setQueuedQueryEditor((current) => {
+              if (!current || current.sid !== msg.sid) return current;
+              return msg.items.some(
+                (item) => item.msg_id === current.msgId) ? current : null;
+            });
+          }
+          if (msg.type === "session_rekey") {
+            setQueuedQueryEditor((current) => (
+              current?.sid === msg.old_key
+                ? { ...current, sid: msg.session_id }
+                : current
+            ));
           }
           if (msg.type === "turn_end" && msg.sid && !msg.result.is_error) {
             const current = stateRef.current;
@@ -1851,11 +1946,6 @@ export default function App() {
               preferredSurfaceFocusRef.current = null;
             }
           }
-          if ((msg.type === "turn_end"
-              || (msg.type === "error" && msg.code !== "wrapper_offline"))
-              && msg.sid) {
-            draining.delete(msg.sid);
-          }
           const statusRuntimeBeforeEvent = msg.sid
             ? stateRef.current.runtimes[msg.sid] : undefined;
           const completesStatusRequest = !!statusRuntimeBeforeEvent?.statusRequestId
@@ -2060,7 +2150,6 @@ export default function App() {
       historyRequests.clear();
       clearHistoryDetailRequests();
       recoverableReads.clear();
-      draining.clear();
     };
   }, [
     acceptSkillCatalog,
@@ -2153,36 +2242,6 @@ export default function App() {
     state.newChat,
     state.wrapperOnline,
   ]);
-
-  // Drain every resident session, not just the one currently visible. A queued
-  // background turn must resume when that runtime becomes idle even if the user
-  // has switched elsewhere. Never remove work merely because the socket or
-  // wrapper is offline; accepted commands are retained by RelayWs's outbox.
-  useEffect(() => {
-    const draining = drainingRef.current;
-    for (const sid of draining) {
-      const runtime = state.runtimes[sid];
-      if (!runtime || runtime.state !== "idle") draining.delete(sid);
-    }
-
-    const ws = wsRef.current;
-    if (!ws) return;
-    const candidates = selectDrainCandidates(
-      state.runtimes,
-      draining,
-      state.connState === "connected",
-      state.wrapperOnline,
-    );
-    for (const { sid, source, query } of candidates) {
-      const msg_id = uuid();
-      if (!ws.sendQueryTo(sid, query.prompt, msg_id, query.images, query.files)) continue;
-      draining.add(sid);
-      dispatch({ type: "query_sent", sid, prompt: query.prompt, msg_id,
-        images: query.images, files: query.files, ts: Date.now() });
-      if (source === "pending") dispatch({ type: "clear_pending", sid });
-      else dispatch({ type: "dequeue_at", sid, i: 0 });
-    }
-  }, [state.runtimes, state.connState, state.wrapperOnline]);
 
   // Keep a long-lived tab bounded without evicting anything that can still be
   // acted on. ACK callbacks run the same prune when an outbox target becomes
@@ -2437,33 +2496,205 @@ export default function App() {
     return <LoginForm onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
   }
 
+  const sendDeferredQuery = (
+    sid: string,
+    query: PendingQuery,
+    delivery: "queue" | "replace",
+  ): boolean => {
+    const ws = wsRef.current;
+    if (!ws) return false;
+    const currentState = stateRef.current;
+    const unconfirmed = collectUnconfirmedQueries(
+      currentState.runtimes,
+      delivery === "replace" ? sid : undefined,
+    );
+    if (!canEnqueueQuery(
+      unconfirmed,
+      query,
+      deferredQueueCapacity(
+        currentState, delivery === "replace" ? sid : undefined),
+    )) {
+      dispatch({
+        type: "command_error",
+        detail: "排队已满（最多 32 条 / 64 MiB），请先等待发送。",
+      });
+      return false;
+    }
+    const msg_id = uuid();
+    if (!ws.sendDeferredQueryTo(
+      sid, query.prompt, msg_id, delivery, query.images, query.files,
+    )) return false;
+    const currentReplacement = currentState.runtimes[sid]?.pendingSend;
+    const optimistic: PendingQuery = {
+      ...query,
+      msg_id,
+      imageCount: query.images?.length,
+      fileCount: query.files?.length,
+      queueKind: delivery,
+      queueState: "submitting",
+      retainedBytes: undefined,
+      queueError: undefined,
+      failedAt: undefined,
+      replacesRetainedBytes: delivery === "replace"
+        ? currentReplacement?.queueState === "queued"
+          ? currentReplacement.retainedBytes
+          : currentReplacement?.replacesRetainedBytes
+        : undefined,
+    };
+    dispatch(delivery === "queue"
+      ? { type: "enqueue", sid, query: optimistic }
+      : { type: "set_pending", sid, query: optimistic });
+    return true;
+  };
+
+  const cancelQueuedQuery = (sid: string, query: PendingQuery): void => {
+    if (!query.msg_id) return;
+    if (query.queueState !== "failed"
+        && !wsRef.current?.sendCancelQueuedQueryTo(sid, query.msg_id)) {
+      return;
+    }
+    dispatch({ type: "remove_deferred", sid, msgId: query.msg_id });
+  };
+
+  const inspectQueuedQuery = (sid: string, query: PendingQuery): void => {
+    if (!query.msg_id) return;
+    const serverOwned = query.queueState === "queued";
+    const requestId = serverOwned
+      ? wsRef.current?.sendGetQueuedQueryTo(sid, query.msg_id) ?? null
+      : null;
+    setQueuedQueryEditor({
+      sid,
+      msgId: query.msg_id,
+      preview: query.prompt,
+      prompt: serverOwned ? null : query.prompt,
+      kind: query.queueKind ?? null,
+      state: query.queueState ?? "submitting",
+      imageCount: query.imageCount ?? query.images?.length ?? 0,
+      fileCount: query.fileCount ?? query.files?.length ?? 0,
+      loading: serverOwned && requestId !== null,
+      saving: false,
+      error: serverOwned && requestId === null
+        ? "完整消息读取请求未发送，请等待连接恢复后重试。"
+        : query.queueError ?? null,
+      detailRequestId: requestId,
+      updateRequestId: null,
+      pendingPrompt: null,
+    });
+  };
+
+  const updateQueuedQuery = (prompt: string): boolean => {
+    const current = queuedQueryEditor;
+    if (!current || current.saving) return false;
+    if (current.state === "failed") {
+      dispatch({
+        type: "update_failed_deferred",
+        sid: current.sid,
+        msgId: current.msgId,
+        prompt,
+      });
+      setQueuedQueryEditor((editor) => (
+        editor
+        && editor.sid === current.sid
+        && editor.msgId === current.msgId
+          ? {
+              ...editor,
+              preview: prompt.slice(0, 512),
+              prompt,
+            }
+          : editor
+      ));
+      return true;
+    }
+    if (current.state !== "queued") return false;
+    const requestId = wsRef.current?.sendUpdateQueuedQueryTo(
+      current.sid, current.msgId, prompt) ?? null;
+    if (requestId === null) {
+      setQueuedQueryEditor((editor) => editor ? {
+        ...editor,
+        error: "修改请求未发送，请等待连接恢复后重试。",
+      } : null);
+      return false;
+    }
+    setQueuedQueryEditor((editor) => (
+      editor
+      && editor.sid === current.sid
+      && editor.msgId === current.msgId
+        ? {
+            ...editor,
+            saving: true,
+            error: null,
+            updateRequestId: requestId,
+            pendingPrompt: prompt,
+          }
+        : editor
+    ));
+    return true;
+  };
+
+  const retryQueuedQuery = (): boolean => {
+    const current = queuedQueryEditor;
+    if (!current || current.saving || current.prompt === null) return false;
+    if (current.state === "queued") {
+      return updateQueuedQuery(current.prompt);
+    }
+    if (current.state !== "failed") return false;
+    const runtime = stateRef.current.runtimes[current.sid];
+    const query = runtime?.failedDeferred.find(
+      (candidate) => candidate.msg_id === current.msgId);
+    if (!query) return false;
+    const sent = sendDeferredQuery(
+      current.sid,
+      { ...query, prompt: current.prompt },
+      query.queueKind === "replace" ? "replace" : "queue",
+    );
+    if (!sent) return false;
+    dispatch({
+      type: "remove_deferred",
+      sid: current.sid,
+      msgId: current.msgId,
+    });
+    setQueuedQueryEditor(null);
+    return true;
+  };
+
   const sendQuery = (prompt: string, images?: QueryImg[], files?: QueryFile[]): boolean => {
     const ws = wsRef.current;
     if (!ws || !focusedSid) return false;
     const query = { prompt, images, files };
     const currentState = stateRef.current;
-    if (ws.pendingQueryFor(focusedSid)
-        || currentState.runtimes[focusedSid]?.acceptancePending) {
-      const sendMode = currentState.runtimes[focusedSid]?.sendMode ?? "steer";
-      const waiting = collectWaitingQueries(
+    const currentRuntime = currentState.runtimes[focusedSid];
+    const awaitingAcceptance = !!(
+      ws.pendingQueryFor(focusedSid) || currentRuntime?.acceptancePending
+    );
+    const hasDeferred = !!(
+      currentRuntime?.queue.length || currentRuntime?.pendingSend
+    );
+    if (awaitingAcceptance || hasDeferred) {
+      const sendMode = currentRuntime?.sendMode ?? "steer";
+      const delivery = awaitingAcceptance && sendMode !== "queue"
+        ? "replace" : "queue";
+      const unconfirmed = collectUnconfirmedQueries(
         currentState.runtimes,
-        sendMode === "steer" ? focusedSid : undefined,
+        delivery === "replace" ? focusedSid : undefined,
       );
-      if (!canEnqueueQuery(waiting, query)) {
+      if (!canEnqueueQuery(
+        unconfirmed,
+        query,
+        deferredQueueCapacity(
+          currentState,
+          delivery === "replace" ? focusedSid : undefined,
+        ),
+      )) {
         dispatch({
           type: "command_error",
           detail: "排队已满（最多 32 条 / 64 MiB），请先等待发送。",
         });
         return false;
       }
-      dispatch(sendMode === "queue"
-        ? { type: "enqueue", sid: focusedSid, query }
-        : { type: "set_pending", sid: focusedSid, query });
-      return true;
+      return sendDeferredQuery(focusedSid, query, delivery);
     }
     const msg_id = uuid();
     if (!ws.sendQueryTo(focusedSid, prompt, msg_id, images, files)) return false;
-    drainingRef.current.add(focusedSid);
     const activityMs = Date.now();
     const surfaceKey = `${space}:${engine}`;
     const cached = sessionListsBySurfaceRef.current[surfaceKey];
@@ -2908,9 +3139,29 @@ export default function App() {
     const sid = activeBtwSid;
     const ws = wsRef.current;
     if (!sid || !ws) return false;
+    const runtime = stateRef.current.runtimes[sid];
+    const awaitingAcceptance = !!(
+      ws.pendingQueryFor(sid) || runtime?.acceptancePending
+    );
+    if (awaitingAcceptance || runtime?.queue.length || runtime?.pendingSend) {
+      const delivery = awaitingAcceptance && activeBtwSendMode !== "queue"
+        ? "replace" : "queue";
+      const query = { prompt };
+      const currentState = stateRef.current;
+      const unconfirmed = collectUnconfirmedQueries(
+        currentState.runtimes,
+        delivery === "replace" ? sid : undefined,
+      );
+      if (!canEnqueueQuery(
+        unconfirmed,
+        query,
+        deferredQueueCapacity(
+          currentState, delivery === "replace" ? sid : undefined),
+      )) return false;
+      return sendDeferredQuery(sid, query, delivery);
+    }
     const msg_id = uuid();
     if (!ws.sendQueryTo(sid, prompt, msg_id)) return false;
-    drainingRef.current.add(sid);
     dispatch({
       type: "query_sent", sid, prompt, msg_id, ts: Date.now(),
     });
@@ -3271,8 +3522,12 @@ export default function App() {
             type: "set_send_mode", sid: focusedSid, mode: m,
           })}
           queue={rt.queue}
-          allQueued={allQueued}
-          replaceableQueued={replaceableQueued}
+          pendingSend={rt.pendingSend}
+          failedDeferred={rt.failedDeferred}
+          unconfirmedQueued={unconfirmedQueued}
+          unconfirmedReplaceable={unconfirmedReplaceable}
+          queueCapacity={queueCapacity}
+          replaceQueueCapacity={replaceQueueCapacity}
           model={rt.model}
           effort={rt.effort}
           perm={rt.perm}
@@ -3291,9 +3546,18 @@ export default function App() {
           onSendQuery={sendQuery}
           onSteerQuery={sendSteer}
           onInterrupt={interrupt}
-          onEnqueue={(query) => dispatch({ type: "enqueue", query })}
-          onSetPending={(query) => dispatch({ type: "set_pending", query })}
-          onDequeue={(i) => { if (focusedSid) dispatch({ type: "dequeue_at", sid: focusedSid, i }); }}
+          onEnqueue={(query) => (
+            focusedSid ? sendDeferredQuery(focusedSid, query, "queue") : false
+          )}
+          onSetPending={(query) => (
+            focusedSid ? sendDeferredQuery(focusedSid, query, "replace") : false
+          )}
+          onRemoveQueued={(query) => {
+            if (focusedSid) cancelQueuedQuery(focusedSid, query);
+          }}
+          onInspectQueued={(query) => {
+            if (focusedSid) inspectQueuedQuery(focusedSid, query);
+          }}
           onSetModel={setModel}
           onSetEffort={setEffort}
           onSetServiceTier={setServiceTier}
@@ -3368,7 +3632,10 @@ export default function App() {
             catalog={state.catalog}
             draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
             sendMode={activeBtwSendMode}
-            allQueued={allQueued} replaceableQueued={btwReplaceableQueued}
+            unconfirmedQueued={unconfirmedQueued}
+            unconfirmedReplaceable={btwUnconfirmedReplaceable}
+            queueCapacity={queueCapacity}
+            replaceQueueCapacity={btwReplaceQueueCapacity}
             onSend={sendBtw}
             onSteer={steerBtw}
             onInterrupt={() => {
@@ -3378,21 +3645,18 @@ export default function App() {
               if (activeBtwSid) setBtwSendMode(activeBtwSid, mode);
             }}
             onEnqueue={(query) => {
-              if (activeBtwSid) {
-                dispatch({ type: "enqueue", sid: activeBtwSid, query });
-              }
+              return activeBtwSid
+                ? sendDeferredQuery(activeBtwSid, query, "queue") : false;
             }}
             onSetPending={(query) => {
-              if (activeBtwSid) {
-                dispatch({ type: "set_pending", sid: activeBtwSid, query });
-              }
+              return activeBtwSid
+                ? sendDeferredQuery(activeBtwSid, query, "replace") : false;
             }}
-            onDequeue={(index) => {
-              if (activeBtwSid) {
-                dispatch({
-                  type: "dequeue_at", sid: activeBtwSid, i: index,
-                });
-              }
+            onRemoveQueued={(query) => {
+              if (activeBtwSid) cancelQueuedQuery(activeBtwSid, query);
+            }}
+            onInspectQueued={(query) => {
+              if (activeBtwSid) inspectQueuedQuery(activeBtwSid, query);
             }}
             onSetModel={(model) => {
               if (activeBtwSid) setBtwModel(activeBtwSid, model);
@@ -3412,6 +3676,16 @@ export default function App() {
             onClose={() => dispatch({ type: "clear_artifact" })} />;
         return null;
       })()}
+      <QueuedQueryDialog
+        key={queuedQueryEditor
+          ? `${queuedQueryEditor.sid}:${queuedQueryEditor.msgId}`
+          : "closed"}
+        editor={queuedQueryEditor}
+        onClose={() => {
+          if (!queuedQueryEditor?.saving) setQueuedQueryEditor(null);
+        }}
+        onSave={updateQueuedQuery}
+        onRetry={retryQueuedQuery} />
       {rt.pendingQuestion && (
         <QuestionSheet
           key={rt.pendingQuestion.ask_id}

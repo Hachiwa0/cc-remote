@@ -22,8 +22,8 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 _PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 
-def test_protocol_v24_new_session_query_and_turn_binding_roundtrip():
-    assert PROTOCOL_VERSION == 24
+def test_protocol_v25_new_session_query_and_turn_binding_roundtrip():
+    assert PROTOCOL_VERSION == 25
     msg = NewSession(
         request_id="req-1",
         cwd="/tmp/project",

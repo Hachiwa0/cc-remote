@@ -1470,7 +1470,7 @@ test("replay recovery replacement preserves the current reading row", async ({
 }, testInfo) => {
   await page.goto("/tests/history-browser.html?large=40&recovery-replace=1");
   await expect(page.locator('[data-turn-id="m40"]')).toBeVisible();
-  await wheelUntilTurn(page, "m10", -2_000, testInfo.project.name);
+  await wheelUntilTurn(page, "m10", -400, testInfo.project.name);
   await waitForScrollIdle(page);
   const before = await readingAnchor(page);
 
@@ -1869,6 +1869,44 @@ test("Codex quota controls fit a 320 px composer", async ({ page }) => {
   expect(layout.rightLeft).toBeGreaterThanOrEqual(layout.footerLeft);
   expect(layout.rightRight).toBeLessThanOrEqual(layout.footerRight);
   expect(layout.rightWidth).toBeGreaterThan(280);
+});
+
+test("queued messages expand to full editable prompts", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 720 });
+  await page.goto("/tests/history-browser.html?queued-query-editor=1");
+
+  const fixture = page.getByTestId("queued-query-fixture");
+  const preview = fixture.locator(".qt");
+  await expect(preview).toBeVisible();
+  await expect(fixture).not.toContainText("QUEUED-INSTRUCTION-END");
+  expect(await preview.evaluate((node) =>
+    node.scrollWidth > node.clientWidth)).toBe(true);
+
+  await fixture.getByRole("button", { name: "查看排队消息" }).click();
+  const dialog = page.getByRole("dialog", { name: "排队消息详情" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByTestId("queued-full-prompt"))
+    .toContainText("QUEUED-INSTRUCTION-END");
+  await expect(dialog).toContainText("编辑文字不会移除附件");
+
+  await dialog.getByRole("button", { name: "编辑", exact: true }).click();
+  const editor = dialog.getByRole("textbox", { name: "编辑排队消息" });
+  await editor.fill("Updated queued instruction\nwith the complete context.");
+  await dialog.getByRole("button", { name: "保存修改" }).click();
+  await expect(dialog.getByTestId("queued-full-prompt"))
+    .toHaveText("Updated queued instruction\nwith the complete context.");
+
+  await dialog.getByRole(
+    "button", { name: "关闭排队消息详情" },
+  ).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(preview).toContainText("Updated queued instruction");
+  await fixture.getByRole("button", { name: "查看排队消息" }).click();
+  await expect(page.getByTestId("queued-full-prompt"))
+    .toContainText("with the complete context.");
+  expect(await page.evaluate(() => (
+    document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  ))).toBe(true);
 });
 
 async function chooseDangerousNewChatControls(

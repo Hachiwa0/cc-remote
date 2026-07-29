@@ -16,9 +16,22 @@ import type { TextSelectionGuard } from "../src/history-selection-guard";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
 import { UsageMeter } from "../src/components/UsageMeter";
 import { NewChatView } from "../src/components/NewChatView";
+import {
+  QueuedQueryChip,
+  QueuedQueryDialog,
+  type QueuedQueryEditor,
+} from "../src/components/QueuedQueryDialog";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
+const QUEUED_FULL_PROMPT = [
+  "Review the complete deployment plan before changing any files.",
+  ...Array.from(
+    { length: 24 },
+    (_, index) => `Requirement ${index + 1}: preserve queued execution order.`,
+  ),
+  "QUEUED-INSTRUCTION-END",
+].join("\n");
 
 const ROBOT_CORE_MERMAID_SOURCE = `flowchart TB
     USER["任务入口<br/>语音 · 文本 · App · API"]
@@ -375,6 +388,7 @@ export function HistoryBrowserFixture() {
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
   const quotaComposer = params.has("quota-composer");
+  const queuedQueryFixture = params.has("queued-query-editor");
   const newChatControls = params.has("newchat-controls");
   const longProfile = params.has("long-profile");
   const recoveryReplacement = params.has("recovery-replace");
@@ -495,6 +509,9 @@ export function HistoryBrowserFixture() {
   });
   const [newChatSubmission, setNewChatSubmission] =
     useState<Record<string, unknown> | null>(null);
+  const [queuedPrompt, setQueuedPrompt] = useState(QUEUED_FULL_PROMPT);
+  const [queuedEditor, setQueuedEditor] =
+    useState<QueuedQueryEditor | null>(null);
   const newChatProfiles = useMemo<PermissionProfileInfo[]>(() => [
     { id: ":read-only", allowed: true },
     { id: ":workspace", allowed: true },
@@ -861,6 +878,30 @@ export function HistoryBrowserFixture() {
             }</output>
           </>
         )}
+        {queuedQueryFixture && (
+          <div className="queued show" data-testid="queued-query-fixture">
+            <QueuedQueryChip query={{
+              msg_id: "queued-fixture-message",
+              prompt: queuedPrompt.slice(0, 512),
+              imageCount: 1,
+              fileCount: 0,
+            }}
+            onOpen={() => setQueuedEditor({
+              sid: "queued-fixture-session",
+              msgId: "queued-fixture-message",
+              preview: queuedPrompt.slice(0, 512),
+              prompt: queuedPrompt,
+              kind: "queue",
+              state: "queued",
+              imageCount: 1,
+              fileCount: 0,
+              loading: false,
+              saving: false,
+              error: null,
+            })}
+            onRemove={() => {}} />
+          </div>
+        )}
         {composerAttachment && (
           <div className="attach show" data-testid="fixture-attachments">
             <PendingImageAttachments images={pendingImages}
@@ -989,6 +1030,27 @@ export function HistoryBrowserFixture() {
           </div>
         </div>
       )}
+      <QueuedQueryDialog editor={queuedEditor}
+        onClose={() => setQueuedEditor(null)}
+        onSave={(prompt) => {
+          setQueuedEditor((current) => current
+            ? { ...current, saving: true, error: null }
+            : current);
+          window.setTimeout(() => {
+            setQueuedPrompt(prompt);
+            setQueuedEditor((current) => current
+              ? {
+                  ...current,
+                  preview: prompt.slice(0, 512),
+                  prompt,
+                  saving: false,
+                  error: null,
+                }
+              : current);
+          }, 10);
+          return true;
+        }}
+        onRetry={() => true} />
     </main>
   );
 }
