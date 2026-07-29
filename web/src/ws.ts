@@ -528,6 +528,41 @@ export class RelayWs {
     );
   }
 
+  /** Transfer follow-up ownership to the wrapper immediately. Unlike an
+   * immediate Query, a deferred query must not open the browser's narrative
+   * acceptance latch: it may remain queued long after this tab is suspended. */
+  sendDeferredQueryTo(
+    sid: string,
+    prompt: string,
+    msg_id: string,
+    delivery: "queue" | "replace",
+    images?: QueryImg[],
+    files?: QueryFile[],
+  ): boolean {
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION,
+      type: "query",
+      prompt,
+      msg_id,
+      sid,
+      delivery,
+      ts: nowTs(),
+    };
+    if (images && images.length) obj.images = images;
+    if (files && files.length) obj.files = files;
+    return this.send(obj);
+  }
+
+  sendCancelQueuedQueryTo(sid: string, msg_id: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: "cancel_queued_query",
+      sid,
+      msg_id,
+      ts: nowTs(),
+    });
+  }
+
   /** Append input to the active Codex turn. The reliable command and the
    *  narrative acceptance latch are separate: an ACK alone must not clear the
    *  draft/runtime protection before the wrapper echoes the steered user row. */

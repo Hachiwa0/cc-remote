@@ -54,7 +54,16 @@ export interface Hello extends Base {
 }
 export interface QueryImg { media_type: "image/png" | "image/jpeg" | "image/jpg" | "image/webp"; data: string }
 export interface QueryFile { filename: string; data: string }
-export interface Query extends Base { type: "query"; prompt: string; msg_id: string; images?: QueryImg[] | null; files?: QueryFile[] | null }
+export interface Query extends Base { type: "query"; prompt: string; msg_id: string; images?: QueryImg[] | null; files?: QueryFile[] | null; delivery?: "immediate" | "queue" | "replace" }
+export interface CancelQueuedQuery extends Base { type: "cancel_queued_query"; sid: string; msg_id: string; cmd_id: string; client_id: string }
+export interface QueuedQueryInfo {
+  msg_id: string;
+  kind: "queue" | "replace";
+  prompt_preview: string;
+  image_count: number;
+  file_count: number;
+}
+export interface QueryQueueState extends Base { type: "query_queue"; items: QueuedQueryInfo[] }
 export interface Steer extends Base { type: "steer"; sid: string; cmd_id: string; client_id: string; prompt: string; msg_id: string; images?: QueryImg[] | null; files?: QueryFile[] | null }
 export interface Interrupt extends Base { type: "interrupt" }
 export interface Takeover extends Base { type: "takeover"; sid: string; cmd_id: string }
@@ -483,7 +492,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | AskUserClosed | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionActivity | SessionFocus | SessionRekey | SessionForked | WorkDashboard | WorkArtifacts
   | DirList
@@ -491,7 +500,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 24;
+export const PROTOCOL_VERSION = 25;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 24
+PROTOCOL_VERSION = 25
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -81,6 +81,9 @@ WireId = Annotated[
 ]
 
 MAX_ENCODED_ATTACHMENT_CHARS = ((MAX_SINGLE_ATTACHMENT_BYTES + 2) // 3) * 4
+MAX_QUERY_QUEUE_ITEMS = 32
+MAX_QUERY_QUEUE_BYTES = 64 * 1024 * 1024
+MAX_QUERY_QUEUE_PREVIEW_CHARS = 512
 ASK_QUESTION_MAX_CHARS = 16 * 1024
 ASK_OPTION_LABEL_MAX_CHARS = 512
 ASK_OPTION_DESCRIPTION_MAX_CHARS = 2 * 1024
@@ -247,6 +250,7 @@ ERR_AUTH = "auth"
 ERR_FORK_RECONCILING = "fork_reconciling"
 ERR_NOT_STEERABLE = "not_steerable"
 ERR_STEER_UNKNOWN = "steer_outcome_unknown"
+ERR_QUEUE_FULL = "queue_full"
 
 
 class _Base(BaseModel):
@@ -316,13 +320,51 @@ class Query(_Command):
     msg_id: WireId
     images: Optional[list[QueryImage]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
     files: Optional[list[QueryFile]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
+    # `queue` and `replace` transfer ownership to the always-on wrapper
+    # immediately. The wrapper starts them after the active turn reaches its
+    # authoritative terminal boundary, even if every browser has disconnected.
+    delivery: Literal["immediate", "queue", "replace"] = "immediate"
 
     @model_validator(mode="after")
     def bounded_attachment_count(self):
         if _attachment_count(self.images, self.files) > MAX_ATTACHMENT_COUNT:
             raise ValueError(
                 f"query attachments exceed {MAX_ATTACHMENT_COUNT} items")
+        if self.delivery != "immediate" and (
+            not self.sid or not self.cmd_id or not self.client_id
+        ):
+            raise ValueError(
+                "deferred query requires sid, cmd_id, and client_id")
         return self
+
+
+class CancelQueuedQuery(_Command):
+    """Cancel one wrapper-owned query before it starts."""
+
+    type: Literal["cancel_queued_query"] = "cancel_queued_query"
+    sid: WireId
+    msg_id: WireId
+    cmd_id: WireId
+    client_id: WireId
+
+
+class QueuedQueryInfo(BaseModel):
+    """Payload-free queue projection safe to replay to browsers."""
+
+    model_config = ConfigDict(extra="forbid")
+    msg_id: WireId
+    kind: Literal["queue", "replace"]
+    prompt_preview: str = Field(max_length=MAX_QUERY_QUEUE_PREVIEW_CHARS)
+    image_count: int = Field(ge=0, le=MAX_ATTACHMENT_COUNT)
+    file_count: int = Field(ge=0, le=MAX_ATTACHMENT_COUNT)
+
+
+class QueryQueueState(_Base):
+    """Authoritative per-session wrapper queue, newest replacement first."""
+
+    type: Literal["query_queue"] = "query_queue"
+    items: list[QueuedQueryInfo] = Field(
+        default_factory=list, max_length=MAX_QUERY_QUEUE_ITEMS)
 
 
 class Steer(_Command):
@@ -1981,7 +2023,7 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, CancelQueuedQuery, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
@@ -1997,7 +2039,7 @@ AnyMessage = Union[
 DOWNSTREAM_TYPES = frozenset({
     "user_msg", "turn_steered", "state", "model", "effort", "perm",
     "permission_profile", "web_search", "fast",
-    "collaboration_mode", "session_control", "btw_opened",
+    "collaboration_mode", "session_control", "query_queue", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_binding",
     "turn_end",
@@ -2007,6 +2049,8 @@ DOWNSTREAM_TYPES = frozenset({
 _TYPE_MAP: dict[str, type[BaseModel]] = {
     "hello": Hello,
     "query": Query,
+    "cancel_queued_query": CancelQueuedQuery,
+    "query_queue": QueryQueueState,
     "steer": Steer,
     "interrupt": Interrupt,
     "takeover": Takeover,

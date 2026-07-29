@@ -14,6 +14,7 @@ from cc_remote.protocol import Pong
 
 COMMAND_HANDLER_NAMES = MappingProxyType({
     "query": "_handle_query",
+    "cancel_queued_query": "_handle_cancel_queued_query",
     "steer": "_handle_steer",
     "interrupt": "_handle_interrupt",
     "takeover": "_handle_takeover",

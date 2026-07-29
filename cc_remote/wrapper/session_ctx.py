@@ -66,6 +66,14 @@ class SessionContext:
     # than silently reclassifying their existing conversation as engine cost.
     work_context_baseline_pending: bool = False
     turn_task: Optional[asyncio.Task] = None
+    # Browser queue mode transfers complete Query commands here immediately.
+    # The wrapper-owned drain keeps running while browsers are disconnected or
+    # suspended and starts entries only after the current native turn settles.
+    queued_queries: list[Any] = field(default_factory=list)
+    queued_query_bytes: int = 0
+    queued_query_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queued_query_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+    queued_query_drain_task: Optional[asyncio.Task] = None
     # Correlates asynchronous turn crashes/drain failures with the optimistic
     # client turn. Control-command errors must never terminate an unrelated turn.
     active_msg_id: Optional[str] = None
@@ -210,6 +218,10 @@ class SessionContext:
     # interrupt either marks the event before query (so the turn aborts) or waits
     # until query() has returned and can interrupt the newly-created live turn.
     launch_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Deferred queries launch from a per-session worker rather than the serial
+    # browser command lane. Serialize their full idle-check/preflight/claim
+    # boundary against a newly-arriving immediate query.
+    query_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Serializes multiple native turn/steer requests without blocking explicit
     # interrupt, which deliberately uses the separate launch_lock.
     steer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)

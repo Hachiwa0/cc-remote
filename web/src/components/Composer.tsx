@@ -72,8 +72,8 @@ interface Props {
   onSendQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
   onSteerQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
   onInterrupt: () => void;
-  onEnqueue: (query: PendingQuery) => void;
-  onSetPending: (query: PendingQuery) => void;
+  onEnqueue: (query: PendingQuery) => boolean;
+  onSetPending: (query: PendingQuery) => boolean;
   onDequeue: (i: number) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
@@ -426,13 +426,15 @@ export function Composer(p: Props) {
         return;
       }
       if (action === "enqueue") {
-        p.onEnqueue(query);
-        clearDraft(); resetTaHeight();
+        if (p.onEnqueue(query)) {
+          clearDraft(); resetTaHeight();
+        }
         return;
       }
       if (action === "interrupt-and-replace") p.onInterrupt();
-      p.onSetPending(query);
-      clearDraft(); resetTaHeight();
+      if (p.onSetPending(query)) {
+        clearDraft(); resetTaHeight();
+      }
       return;
     }
     if (!prompt && !hasAttachments) return;
@@ -725,9 +727,11 @@ export function Composer(p: Props) {
         {p.queue.length > 0 && (
           <div className="queued show">
             {p.queue.map((m, i) => (
-              <span className="qchip" key={i}>
+              <span className="qchip" key={m.msg_id ?? i}>
                 <span className="qbadge">排队</span>
-                <span className="qt">{m.prompt || (m.images?.length ? "图片" : "附件")}</span>
+                <span className="qt">{m.prompt
+                  || ((m.imageCount ?? m.images?.length ?? 0) > 0
+                    ? "图片" : "附件")}</span>
                 <span className="qx" onClick={() => p.onDequeue(i)}><Icon name="close" size={12} /></span>
               </span>
             ))}

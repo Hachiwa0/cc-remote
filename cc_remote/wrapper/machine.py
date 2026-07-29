@@ -85,8 +85,9 @@ from cc_remote.log import logger
 from cc_remote.workspaces import WorkStores
 from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, ARTIFACT_PREVIEW_MAX_BYTES, FILE_PREVIEW_MAX_BYTES,
-    PREVIEW_ASSET_MAX_BYTES,
-    Error, Hello, Query, Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort, Fast,
+    MAX_QUERY_QUEUE_BYTES, MAX_QUERY_QUEUE_ITEMS, PREVIEW_ASSET_MAX_BYTES,
+    Error, Hello, Query, QueryQueueState, QueuedQueryInfo,
+    Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort, Fast,
     CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
     BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
@@ -102,6 +103,7 @@ from cc_remote.protocol import (
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_INVALID_CWD, ERR_AUTH, ERR_PROTOCOL,
     ERR_FORK_RECONCILING, ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
+    ERR_QUEUE_FULL,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
@@ -807,7 +809,8 @@ class WrapperMachine:
     # the client that created it, so every operation against that sid must pass
     # the owner check before its handler is allowed to read or mutate state.
     BTW_SID_COMMANDS = frozenset({
-        "query", "steer", "interrupt", "takeover", "set_model", "set_effort",
+        "query", "cancel_queued_query", "steer", "interrupt", "takeover",
+        "set_model", "set_effort",
         "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw",
         "set_perm", "get_permission_profiles", "set_permission_profile",
         "set_web_search",
@@ -933,6 +936,11 @@ class WrapperMachine:
         ] = OrderedDict()
         self._processed_command_sizes: dict[tuple[str, str], int] = {}
         self._processed_command_bytes = 0
+        # Deferred browser queries are owned by resident SessionContexts, while
+        # these machine-wide counters prevent many clients/sessions from each
+        # allocating the full advertised queue allowance.
+        self._queued_query_count = 0
+        self._queued_query_bytes = 0
         # Durable temp-key -> real-id recovery. SessionRekey is a control frame;
         # if its one live send is lost after NewSession was ACKed, the next Hello
         # uses this map to replay the rekey before cursor catch-up.
@@ -2933,6 +2941,17 @@ class WrapperMachine:
                 task.cancel()
             if spontaneous_tasks:
                 await asyncio.gather(*spontaneous_tasks, return_exceptions=True)
+            queue_tasks = [
+                c.queued_query_drain_task for c in self.sessions.values()
+                if c.queued_query_drain_task is not None
+                and not c.queued_query_drain_task.done()
+            ]
+            for task in queue_tasks:
+                task.cancel()
+            if queue_tasks:
+                await asyncio.gather(*queue_tasks, return_exceptions=True)
+            for c in self.sessions.values():
+                c.queued_query_drain_task = None
             await self.transport.stop()
             for c in list(self.sessions.values()):
                 disconnected = False
@@ -3361,8 +3380,361 @@ class WrapperMachine:
         await self._emit_to_sid(sid, error)
         return error
 
+    @staticmethod
+    def _queued_query_size(cmd: Query) -> int:
+        """Bound retained payloads without serializing another giant JSON copy."""
+        size = 128 + len(cmd.prompt.encode("utf-8", "surrogatepass"))
+        for image in cmd.images or ():
+            size += (
+                64
+                + len(image.get("media_type", "").encode("utf-8"))
+                + len(image.get("data", ""))
+            )
+        for file in cmd.files or ():
+            size += (
+                64
+                + len(file.get("filename", "").encode(
+                    "utf-8", "surrogatepass"))
+                + len(file.get("data", ""))
+            )
+        return size
+
+    @staticmethod
+    def _query_queue_task_active(ctx: SessionContext) -> bool:
+        task = ctx.queued_query_drain_task
+        return task is not None and not task.done()
+
+    @staticmethod
+    def _queued_query_info(cmd: Query) -> QueuedQueryInfo:
+        return QueuedQueryInfo(
+            msg_id=cmd.msg_id,
+            kind="replace" if cmd.delivery == "replace" else "queue",
+            prompt_preview=cmd.prompt[:512],
+            image_count=len(cmd.images or ()),
+            file_count=len(cmd.files or ()),
+        )
+
+    def _query_queue_state(self, ctx: SessionContext) -> QueryQueueState:
+        return QueryQueueState(items=[
+            self._queued_query_info(command)
+            for command in ctx.queued_queries
+        ])
+
+    async def _emit_deferred_query_error(
+        self,
+        ctx: SessionContext,
+        cmd: Query,
+        code: str,
+        message: str,
+    ) -> Error:
+        error = Error(
+            code=code,
+            message=message,
+            msg_id=cmd.msg_id,
+            request_id=getattr(cmd, "cmd_id", None),
+            to=getattr(cmd, "client_id", None),
+            sid=ctx.session_id or ctx.key,
+        )
+        # A rejected enqueue is private command feedback, not shared session
+        # narrative. Reliable-command retry caches it for the origin; buffering
+        # it in the session ring would expose it to other clients on Hello.
+        await self.transport.send(error)
+        return error
+
+    async def _enqueue_deferred_query(
+        self, ctx: SessionContext, cmd: Query,
+    ) -> Error | None:
+        """Transfer one append/replace query to the wrapper-owned bounded FIFO."""
+        if not cmd.prompt and not cmd.images and not cmd.files:
+            return await self._emit_deferred_query_error(
+                ctx, cmd, ERR_BAD_PROMPT,
+                "消息内容为空，请输入内容或添加附件。",
+            )
+        attachment_error = validate_attachments(cmd.images, cmd.files)
+        if attachment_error:
+            return await self._emit_deferred_query_error(
+                ctx, cmd, ERR_BAD_PROMPT,
+                "附件不符合要求，请调整后重试。",
+            )
+        if ctx.write_state != "writable":
+            return await self._emit_deferred_query_error(
+                ctx, cmd, ERR_BUSY,
+                "该会话当前不可写，本次排队未提交。",
+            )
+
+        size = self._queued_query_size(cmd)
+        accepted = False
+        async with ctx.emit_lock:
+            async with ctx.queued_query_lock:
+                duplicate = next((
+                    queued for queued in ctx.queued_queries
+                    if queued.msg_id == cmd.msg_id
+                ), None)
+                if duplicate is not None:
+                    # An ACK-lost replay is idempotent. Re-publish the current
+                    # projection so the origin can recover without another turn.
+                    state = self._query_queue_state(ctx)
+                else:
+                    replace_index = next((
+                        index for index, queued in enumerate(ctx.queued_queries)
+                        if queued.delivery == "replace"
+                    ), None) if cmd.delivery == "replace" else None
+                    replaced = (
+                        ctx.queued_queries[replace_index]
+                        if replace_index is not None else None
+                    )
+                    replaced_size = (
+                        self._queued_query_size(replaced)
+                        if replaced is not None else 0
+                    )
+                    projected_count = (
+                        self._queued_query_count
+                        - (1 if replaced is not None else 0)
+                        + 1
+                    )
+                    projected_bytes = (
+                        self._queued_query_bytes - replaced_size + size
+                    )
+                    if (
+                        projected_count > MAX_QUERY_QUEUE_ITEMS
+                        or projected_bytes > MAX_QUERY_QUEUE_BYTES
+                    ):
+                        error = Error(
+                            code=ERR_QUEUE_FULL,
+                            message=(
+                                "服务端排队已满（最多 32 条 / 64 MiB），"
+                                "请等待已有任务开始后重试。"
+                            ),
+                            msg_id=cmd.msg_id,
+                            request_id=getattr(cmd, "cmd_id", None),
+                            to=getattr(cmd, "client_id", None),
+                            sid=ctx.session_id or ctx.key,
+                        )
+                        try:
+                            await self.transport.send(error)
+                        except Exception as exc:
+                            log.warning(
+                                "deferred query rejection delivery delayed",
+                                session_id=ctx.session_id or ctx.key,
+                                error_type=type(exc).__name__,
+                            )
+                        return error
+
+                    if replace_index is not None:
+                        ctx.queued_queries.pop(replace_index)
+                        ctx.queued_query_bytes -= replaced_size
+                        self._queued_query_count -= 1
+                        self._queued_query_bytes -= replaced_size
+                    if cmd.delivery == "replace":
+                        ctx.queued_queries.insert(0, cmd)
+                    else:
+                        ctx.queued_queries.append(cmd)
+                    ctx.queued_query_bytes += size
+                    self._queued_query_count += 1
+                    self._queued_query_bytes += size
+                    state = self._query_queue_state(ctx)
+                    accepted = True
+                try:
+                    await self._emit_locked(ctx, state)
+                except Exception as exc:
+                    # The replayable state is already in the ring. Queue
+                    # ownership and execution must not depend on a live browser.
+                    log.warning(
+                        "query queue live projection delayed",
+                        session_id=ctx.session_id or ctx.key,
+                        error_type=type(exc).__name__,
+                    )
+
+        if accepted:
+            log.info(
+                "deferred query accepted",
+                session_id=ctx.session_id or ctx.key,
+                msg_id=cmd.msg_id,
+                delivery=cmd.delivery,
+                queued=len(ctx.queued_queries),
+            )
+        self._schedule_query_queue_drain(ctx)
+        return None
+
+    async def _handle_cancel_queued_query(self, cmd) -> None:
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return await self._missing_session_error(cmd, "取消排队消息")
+        removed = None
+        async with ctx.emit_lock:
+            async with ctx.queued_query_lock:
+                index = next((
+                    index for index, queued in enumerate(ctx.queued_queries)
+                    if queued.msg_id == cmd.msg_id
+                ), None)
+                if index is not None:
+                    removed = ctx.queued_queries.pop(index)
+                    size = self._queued_query_size(removed)
+                    ctx.queued_query_bytes -= size
+                    self._queued_query_count -= 1
+                    self._queued_query_bytes -= size
+                try:
+                    await self._emit_locked(
+                        ctx, self._query_queue_state(ctx))
+                except Exception as exc:
+                    log.warning(
+                        "query queue cancellation projection delayed",
+                        session_id=ctx.session_id or ctx.key,
+                        error_type=type(exc).__name__,
+                    )
+        ctx.queued_query_wakeup.set()
+        if removed is not None:
+            log.info(
+                "deferred query cancelled",
+                session_id=ctx.session_id or ctx.key,
+                msg_id=cmd.msg_id,
+            )
+
+    def _schedule_query_queue_drain(self, ctx: SessionContext) -> None:
+        if not ctx.queued_queries or not self._is_resident_context(ctx):
+            return
+        current = ctx.queued_query_drain_task
+        if current is not None and not current.done():
+            ctx.queued_query_wakeup.set()
+            return
+        task = asyncio.create_task(
+            self._drain_query_queue(ctx),
+            name=f"query-queue-{ctx.session_id or ctx.key}",
+        )
+        ctx.queued_query_drain_task = task
+
+    async def _drain_query_queue(self, ctx: SessionContext) -> None:
+        """Start wrapper-owned queries in order without any browser callback."""
+        current_task = asyncio.current_task()
+        try:
+            while ctx.queued_queries and self._is_resident_context(ctx):
+                active = next((
+                    task for task in (
+                        ctx.turn_task, ctx.codex_spontaneous_task)
+                    if task is not None and not task.done()
+                    and task is not current_task
+                ), None)
+                if active is not None or ctx.state != "idle":
+                    ctx.queued_query_wakeup.clear()
+                    if active is not None:
+                        active.add_done_callback(
+                            lambda _done: ctx.queued_query_wakeup.set())
+                    # Close the clear/recheck race with a terminal state or task
+                    # completion that happened immediately before the callback.
+                    if (
+                        ctx.state == "idle"
+                        and not any(
+                            task is not None and not task.done()
+                            for task in (
+                                ctx.turn_task, ctx.codex_spontaneous_task)
+                        )
+                    ):
+                        ctx.queued_query_wakeup.set()
+                    await ctx.queued_query_wakeup.wait()
+                    continue
+
+                command = None
+                result = None
+                try:
+                    # The browser command lane and this worker share query_lock:
+                    # once an item leaves the queue, no later immediate query
+                    # can claim the same idle boundary first and make us drop it.
+                    async with ctx.query_lock:
+                        active_now = any(
+                            task is not None and not task.done()
+                            for task in (
+                                ctx.turn_task, ctx.codex_spontaneous_task)
+                        )
+                        if ctx.state != "idle" or active_now:
+                            continue
+                        async with ctx.emit_lock:
+                            async with ctx.queued_query_lock:
+                                if ctx.queued_queries:
+                                    command = ctx.queued_queries.pop(0)
+                                    size = self._queued_query_size(command)
+                                    ctx.queued_query_bytes -= size
+                                    self._queued_query_count -= 1
+                                    self._queued_query_bytes -= size
+                                    try:
+                                        await self._emit_locked(
+                                            ctx, self._query_queue_state(ctx))
+                                    except Exception as exc:
+                                        log.warning(
+                                            "query queue start projection delayed",
+                                            session_id=ctx.session_id or ctx.key,
+                                            error_type=type(exc).__name__,
+                                        )
+                        if command is not None:
+                            immediate = command.model_copy(
+                                deep=True, update={"delivery": "immediate"})
+                            result = await self._handle_immediate_query(
+                                ctx, immediate)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if command is None:
+                        raise
+                    log.exception(
+                        "deferred query launch failed",
+                        session_id=ctx.session_id or ctx.key,
+                        msg_id=command.msg_id,
+                        error_type=type(exc).__name__,
+                    )
+                    await self._emit(ctx, Error(
+                        code=ERR_INTERNAL,
+                        message="排队消息启动失败，请重新发送。",
+                        msg_id=command.msg_id,
+                    ))
+                    continue
+                if command is None:
+                    continue
+                if isinstance(result, Error):
+                    continue
+                log.info(
+                    "deferred query started",
+                    session_id=ctx.session_id or ctx.key,
+                    msg_id=command.msg_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "query queue drain stopped unexpectedly",
+                session_id=ctx.session_id or ctx.key,
+            )
+        finally:
+            if ctx.queued_query_drain_task is current_task:
+                ctx.queued_query_drain_task = None
+            if ctx.queued_queries and self._is_resident_context(ctx):
+                self._schedule_query_queue_drain(ctx)
+
+    async def _discard_query_queue(
+        self, ctx: SessionContext, *, publish: bool = False,
+    ) -> None:
+        """Release bounded queue accounting before a resident is destroyed."""
+        async with ctx.emit_lock:
+            async with ctx.queued_query_lock:
+                self._queued_query_count -= len(ctx.queued_queries)
+                self._queued_query_bytes -= ctx.queued_query_bytes
+                ctx.queued_queries = []
+                ctx.queued_query_bytes = 0
+                if publish:
+                    await self._emit_locked(
+                        ctx, self._query_queue_state(ctx))
+        ctx.queued_query_wakeup.set()
+        task = ctx.queued_query_drain_task
+        if (
+            task is not None
+            and task is not asyncio.current_task()
+            and not task.done()
+        ):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        ctx.queued_query_drain_task = None
+
     async def _set_state(self, ctx: SessionContext, state: State) -> None:
         ctx.state = state
+        ctx.queued_query_wakeup.set()
         await self._emit(ctx, StateEvent(state=state))
         log.info("state transition", sid=ctx.session_id, state=state)
 
@@ -3784,6 +4156,17 @@ class WrapperMachine:
                             "sid": sid,
                             "route_id": getattr(cmd, "route_id", None),
                         }))
+                # Queue ownership lives in the wrapper, so a browser which slept
+                # past enqueue/start/cancel transitions must receive the current
+                # projection even when its replay cursor is already at the tail.
+                async with ctx.queued_query_lock:
+                    queue_state = self._query_queue_state(ctx)
+                await self.transport.send(queue_state.model_copy(
+                    deep=True, update={
+                        "to": cmd.client_id,
+                        "sid": sid,
+                        "route_id": getattr(cmd, "route_id", None),
+                    }))
                 # Permission/collaboration modes are live control state, not
                 # transcript history. Always seed them on hello even when the
                 # browser's replay cursor is already at the ring tail.
@@ -6259,6 +6642,12 @@ class WrapperMachine:
                 msg_id=getattr(cmd, "msg_id", None))
             await self._emit_to_sid(sid, error)
             return error
+        if getattr(cmd, "delivery", "immediate") != "immediate":
+            return await self._enqueue_deferred_query(ctx, cmd)
+        async with ctx.query_lock:
+            return await self._handle_immediate_query(ctx, cmd)
+
+    async def _handle_immediate_query(self, ctx: SessionContext, cmd):
         if ctx.state != "idle":
             error = Error(
                 code=ERR_BUSY, message="该会话正忙,先 interrupt",
@@ -7717,6 +8106,7 @@ class WrapperMachine:
         ctx = self.sessions.get(sid) if sid else None
         if ctx is None or not ctx.btw:
             return
+        await self._discard_query_queue(ctx)
         self.sessions.pop(ctx.key, None)
         disconnected = False
         try:
@@ -11294,6 +11684,7 @@ class WrapperMachine:
                 self._private_btw_sessions[sid] = {
                     "cwd": ctx.cwd, "created_at": time.time(),
                 }
+                await self._discard_query_queue(ctx)
                 self.sessions.pop(ctx.key, None)
                 log.error("private btw persistence failed; terminating fork",
                           error_type=type(persist_error).__name__)
@@ -11753,10 +12144,14 @@ class WrapperMachine:
             await self.transport.send(error)
             return error
         ctx = self._ctx_for(sid)
-        if ctx is not None and ctx.state != "idle":
+        if ctx is not None and (
+            ctx.state != "idle"
+            or ctx.queued_queries
+            or self._query_queue_task_active(ctx)
+        ):
             error = Error(
                 code=ERR_BUSY,
-                message="Work 会话仍在运行，请先中断后再删除",
+                message="Work 会话仍在运行或有排队消息，请先停止并取消排队后再删除",
                 sid=sid,
                 to=getattr(cmd, "client_id", None),
             )
@@ -11825,10 +12220,14 @@ class WrapperMachine:
             await self.transport.send(error)
             return error
         ctx = self._ctx_for(sid)
-        if ctx is not None and ctx.state != "idle":
+        if ctx is not None and (
+            ctx.state != "idle"
+            or ctx.queued_queries
+            or self._query_queue_task_active(ctx)
+        ):
             error = Error(
                 code=ERR_BUSY,
-                message="会话仍在运行，请先中断后再删除",
+                message="会话仍在运行或有排队消息，请先停止并取消排队后再删除",
                 sid=sid,
                 to=getattr(cmd, "client_id", None),
             )
@@ -14199,7 +14598,9 @@ class WrapperMachine:
         # so merely browsing between sessions never wedges you.
         if not bootstrap and len(self.sessions) >= self.cfg.max_concurrent_sessions:
             victim = next((k for k, c in self.sessions.items()
-                           if k != self.focused_sid and c.state == "idle" and not c.btw), None)
+                           if k != self.focused_sid and c.state == "idle"
+                           and not c.btw and not c.queued_queries
+                           and not self._query_queue_task_active(c)), None)
             if victim is None:
                 await reject(
                     ERR_BUSY, "所有会话都在运行,先中断一个再切换")
@@ -14794,7 +15195,9 @@ class WrapperMachine:
         # btw counts toward the cap; evict an idle, non-focused, non-btw victim.
         if len(self.sessions) >= self.cfg.max_concurrent_sessions:
             victim = next((k for k, c in self.sessions.items()
-                           if k != self.focused_sid and c.state == "idle" and not c.btw), None)
+                           if k != self.focused_sid and c.state == "idle"
+                           and not c.btw and not c.queued_queries
+                           and not self._query_queue_task_active(c)), None)
             if victim is None:
                 raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
             vc = self.sessions.pop(victim)

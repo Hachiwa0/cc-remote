@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- Move busy-session follow-up queues from browser memory to the always-on
+  wrapper. Protocol v25 lets queued and interrupt-replacement messages continue
+  as soon as the active turn ends even when every Web/PWA client is asleep or
+  disconnected, and restores the authoritative queue when a client reconnects.
 - Add official Codex named permission profiles as a control separate from the
   approval policy. The compact permissions sheet can select Read Only,
   Workspace, Full Access, or cwd-aware custom profiles without adding another

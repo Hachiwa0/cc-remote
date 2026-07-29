@@ -1,15 +1,6 @@
 export interface DrainableRuntime<Query> {
-  state: string;
-  syncReady: boolean;
-  external?: boolean;
   pendingSend: Query | null;
   queue: Query[];
-}
-
-export interface DrainCandidate<Query> {
-  sid: string;
-  source: "pending" | "queue";
-  query: Query;
 }
 
 export const MAX_QUEUED_QUERIES = 32;
@@ -76,29 +67,6 @@ export function canEnqueueQuery(
     if (used > maxBytes - nextBytes) return false;
   }
   return true;
-}
-
-/** Pick at most one message per idle session. Pending interrupt-and-send work
- * wins over the ordinary queue, preserving its stronger user intent. */
-export function selectDrainCandidates<Query>(
-  runtimes: Record<string, DrainableRuntime<Query>>,
-  draining: ReadonlySet<string>,
-  connected: boolean,
-  wrapperOnline: boolean,
-): DrainCandidate<Query>[] {
-  if (!connected || !wrapperOnline) return [];
-
-  const candidates: DrainCandidate<Query>[] = [];
-  for (const [sid, runtime] of Object.entries(runtimes)) {
-    if (!runtime.syncReady || runtime.external
-        || runtime.state !== "idle" || draining.has(sid)) continue;
-    if (runtime.pendingSend) {
-      candidates.push({ sid, source: "pending", query: runtime.pendingSend });
-    } else if (runtime.queue.length > 0) {
-      candidates.push({ sid, source: "queue", query: runtime.queue[0] });
-    }
-  }
-  return candidates;
 }
 
 export type TargetedRuntimeAction<Turn> =

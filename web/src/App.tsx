@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
-import { reduce, initialState, createRuntime } from "./reducer";
+import {
+  reduce, initialState, createRuntime, type PendingQuery,
+} from "./reducer";
 import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
 import { Icon } from "./icons";
@@ -43,7 +45,6 @@ import { nextAutoLoadDetailTurn } from "./history-detail-projection";
 import {
   canEnqueueQuery,
   collectWaitingQueries,
-  selectDrainCandidates,
 } from "./runtime-drain";
 import type { SendMode } from "./composer-submit";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
@@ -309,7 +310,6 @@ export default function App() {
     },
     [],
   );
-  const drainingRef = useRef<Set<string>>(new Set());
   const pendingCreateRef = useRef<string | null>(null);
   const createRequestsRef = useRef<Map<string, {
     scopeKey: string;
@@ -1167,7 +1167,6 @@ export default function App() {
   // WebSocket lifecycle
   useEffect(() => {
     if (!authed) return;
-    const draining = drainingRef.current;
     const historyRequests = historyRequestsRef.current;
     didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
     authoritativeSurfaceListsRef.current.delete(`${spaceRef.current}:${engineRef.current}`);
@@ -1851,11 +1850,6 @@ export default function App() {
               preferredSurfaceFocusRef.current = null;
             }
           }
-          if ((msg.type === "turn_end"
-              || (msg.type === "error" && msg.code !== "wrapper_offline"))
-              && msg.sid) {
-            draining.delete(msg.sid);
-          }
           const statusRuntimeBeforeEvent = msg.sid
             ? stateRef.current.runtimes[msg.sid] : undefined;
           const completesStatusRequest = !!statusRuntimeBeforeEvent?.statusRequestId
@@ -2060,7 +2054,6 @@ export default function App() {
       historyRequests.clear();
       clearHistoryDetailRequests();
       recoverableReads.clear();
-      draining.clear();
     };
   }, [
     acceptSkillCatalog,
@@ -2153,36 +2146,6 @@ export default function App() {
     state.newChat,
     state.wrapperOnline,
   ]);
-
-  // Drain every resident session, not just the one currently visible. A queued
-  // background turn must resume when that runtime becomes idle even if the user
-  // has switched elsewhere. Never remove work merely because the socket or
-  // wrapper is offline; accepted commands are retained by RelayWs's outbox.
-  useEffect(() => {
-    const draining = drainingRef.current;
-    for (const sid of draining) {
-      const runtime = state.runtimes[sid];
-      if (!runtime || runtime.state !== "idle") draining.delete(sid);
-    }
-
-    const ws = wsRef.current;
-    if (!ws) return;
-    const candidates = selectDrainCandidates(
-      state.runtimes,
-      draining,
-      state.connState === "connected",
-      state.wrapperOnline,
-    );
-    for (const { sid, source, query } of candidates) {
-      const msg_id = uuid();
-      if (!ws.sendQueryTo(sid, query.prompt, msg_id, query.images, query.files)) continue;
-      draining.add(sid);
-      dispatch({ type: "query_sent", sid, prompt: query.prompt, msg_id,
-        images: query.images, files: query.files, ts: Date.now() });
-      if (source === "pending") dispatch({ type: "clear_pending", sid });
-      else dispatch({ type: "dequeue_at", sid, i: 0 });
-    }
-  }, [state.runtimes, state.connState, state.wrapperOnline]);
 
   // Keep a long-lived tab bounded without evicting anything that can still be
   // acted on. ACK callbacks run the same prune when an outbox target becomes
@@ -2437,17 +2400,58 @@ export default function App() {
     return <LoginForm onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
   }
 
+  const sendDeferredQuery = (
+    sid: string,
+    query: PendingQuery,
+    delivery: "queue" | "replace",
+  ): boolean => {
+    const ws = wsRef.current;
+    if (!ws) return false;
+    const msg_id = uuid();
+    if (!ws.sendDeferredQueryTo(
+      sid, query.prompt, msg_id, delivery, query.images, query.files,
+    )) return false;
+    const optimistic = {
+      ...query,
+      msg_id,
+      imageCount: query.images?.length,
+      fileCount: query.files?.length,
+    };
+    dispatch(delivery === "queue"
+      ? { type: "enqueue", sid, query: optimistic }
+      : { type: "set_pending", sid, query: optimistic });
+    return true;
+  };
+
+  const cancelQueuedQuery = (sid: string, index: number): void => {
+    const query = stateRef.current.runtimes[sid]?.queue[index];
+    if (!query) return;
+    if (query.msg_id
+        && !wsRef.current?.sendCancelQueuedQueryTo(sid, query.msg_id)) {
+      return;
+    }
+    dispatch({ type: "dequeue_at", sid, i: index });
+  };
+
   const sendQuery = (prompt: string, images?: QueryImg[], files?: QueryFile[]): boolean => {
     const ws = wsRef.current;
     if (!ws || !focusedSid) return false;
     const query = { prompt, images, files };
     const currentState = stateRef.current;
-    if (ws.pendingQueryFor(focusedSid)
-        || currentState.runtimes[focusedSid]?.acceptancePending) {
-      const sendMode = currentState.runtimes[focusedSid]?.sendMode ?? "steer";
+    const currentRuntime = currentState.runtimes[focusedSid];
+    const awaitingAcceptance = !!(
+      ws.pendingQueryFor(focusedSid) || currentRuntime?.acceptancePending
+    );
+    const hasDeferred = !!(
+      currentRuntime?.queue.length || currentRuntime?.pendingSend
+    );
+    if (awaitingAcceptance || hasDeferred) {
+      const sendMode = currentRuntime?.sendMode ?? "steer";
+      const delivery = awaitingAcceptance && sendMode !== "queue"
+        ? "replace" : "queue";
       const waiting = collectWaitingQueries(
         currentState.runtimes,
-        sendMode === "steer" ? focusedSid : undefined,
+        delivery === "replace" ? focusedSid : undefined,
       );
       if (!canEnqueueQuery(waiting, query)) {
         dispatch({
@@ -2456,14 +2460,10 @@ export default function App() {
         });
         return false;
       }
-      dispatch(sendMode === "queue"
-        ? { type: "enqueue", sid: focusedSid, query }
-        : { type: "set_pending", sid: focusedSid, query });
-      return true;
+      return sendDeferredQuery(focusedSid, query, delivery);
     }
     const msg_id = uuid();
     if (!ws.sendQueryTo(focusedSid, prompt, msg_id, images, files)) return false;
-    drainingRef.current.add(focusedSid);
     const activityMs = Date.now();
     const surfaceKey = `${space}:${engine}`;
     const cached = sessionListsBySurfaceRef.current[surfaceKey];
@@ -2908,9 +2908,23 @@ export default function App() {
     const sid = activeBtwSid;
     const ws = wsRef.current;
     if (!sid || !ws) return false;
+    const runtime = stateRef.current.runtimes[sid];
+    const awaitingAcceptance = !!(
+      ws.pendingQueryFor(sid) || runtime?.acceptancePending
+    );
+    if (awaitingAcceptance || runtime?.queue.length || runtime?.pendingSend) {
+      const delivery = awaitingAcceptance && activeBtwSendMode !== "queue"
+        ? "replace" : "queue";
+      const query = { prompt };
+      const waiting = collectWaitingQueries(
+        stateRef.current.runtimes,
+        delivery === "replace" ? sid : undefined,
+      );
+      if (!canEnqueueQuery(waiting, query)) return false;
+      return sendDeferredQuery(sid, query, delivery);
+    }
     const msg_id = uuid();
     if (!ws.sendQueryTo(sid, prompt, msg_id)) return false;
-    drainingRef.current.add(sid);
     dispatch({
       type: "query_sent", sid, prompt, msg_id, ts: Date.now(),
     });
@@ -3291,9 +3305,15 @@ export default function App() {
           onSendQuery={sendQuery}
           onSteerQuery={sendSteer}
           onInterrupt={interrupt}
-          onEnqueue={(query) => dispatch({ type: "enqueue", query })}
-          onSetPending={(query) => dispatch({ type: "set_pending", query })}
-          onDequeue={(i) => { if (focusedSid) dispatch({ type: "dequeue_at", sid: focusedSid, i }); }}
+          onEnqueue={(query) => (
+            focusedSid ? sendDeferredQuery(focusedSid, query, "queue") : false
+          )}
+          onSetPending={(query) => (
+            focusedSid ? sendDeferredQuery(focusedSid, query, "replace") : false
+          )}
+          onDequeue={(i) => {
+            if (focusedSid) cancelQueuedQuery(focusedSid, i);
+          }}
           onSetModel={setModel}
           onSetEffort={setEffort}
           onSetServiceTier={setServiceTier}
@@ -3378,21 +3398,15 @@ export default function App() {
               if (activeBtwSid) setBtwSendMode(activeBtwSid, mode);
             }}
             onEnqueue={(query) => {
-              if (activeBtwSid) {
-                dispatch({ type: "enqueue", sid: activeBtwSid, query });
-              }
+              return activeBtwSid
+                ? sendDeferredQuery(activeBtwSid, query, "queue") : false;
             }}
             onSetPending={(query) => {
-              if (activeBtwSid) {
-                dispatch({ type: "set_pending", sid: activeBtwSid, query });
-              }
+              return activeBtwSid
+                ? sendDeferredQuery(activeBtwSid, query, "replace") : false;
             }}
             onDequeue={(index) => {
-              if (activeBtwSid) {
-                dispatch({
-                  type: "dequeue_at", sid: activeBtwSid, i: index,
-                });
-              }
+              if (activeBtwSid) cancelQueuedQuery(activeBtwSid, index);
             }}
             onSetModel={(model) => {
               if (activeBtwSid) setBtwModel(activeBtwSid, model);

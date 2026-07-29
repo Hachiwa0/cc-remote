@@ -96,9 +96,12 @@ export const OMITTED_PROCESS_ITEM_ID = "__cc_remote_earlier_process_omitted__";
 export const MAX_SESSION_NOTICES = 8;
 
 export interface PendingQuery {
+  msg_id?: string;
   prompt: string;
   images?: QueryImg[];
   files?: QueryFile[];
+  imageCount?: number;
+  fileCount?: number;
 }
 
 export interface PreviewAssetState {
@@ -2400,6 +2403,24 @@ function reduceEvent(
       });
       return changed ? { ...next, sessions } : next;
     }
+    case "query_queue":
+      return patch(state, e.sid, (rt) => {
+        // The wrapper owns deferred payloads. Retain only bounded display
+        // metadata after its authoritative projection arrives so a sleeping
+        // browser is no longer responsible for either execution or attachment
+        // memory.
+        const projected = e.items.map((item): PendingQuery => ({
+          msg_id: item.msg_id,
+          prompt: item.prompt_preview,
+          imageCount: item.image_count,
+          fileCount: item.file_count,
+        }));
+        rt.queue = projected.filter((_, index) =>
+          e.items[index].kind === "queue");
+        const replacement = projected.find((_, index) =>
+          e.items[index].kind === "replace");
+        rt.pendingSend = replacement ?? null;
+      }, true);
     case "session_control":
       // Direct control events require an explicit runtime key. Snapshot and
       // History controls are routed by their outer envelope above.
@@ -2629,6 +2650,23 @@ function reduceEvent(
         // would steal subsequent deltas from the active segment.
         return { ...state, banner: presentCommandProblem(e) };
       }
+      if (e.msg_id) {
+        const key = e.sid ?? state.focusedSid;
+        const runtime = key ? state.runtimes[key] : undefined;
+        const queued = runtime?.queue.some(
+          (query) => query.msg_id === e.msg_id) ?? false;
+        const pending = runtime?.pendingSend?.msg_id === e.msg_id;
+        if (queued || pending) {
+          const next = patch(state, key, (rt) => {
+            rt.queue = rt.queue.filter(
+              (query) => query.msg_id !== e.msg_id);
+            if (rt.pendingSend?.msg_id === e.msg_id) {
+              rt.pendingSend = null;
+            }
+          });
+          return { ...next, banner: presentCommandProblem(e) };
+        }
+      }
       if (!e.msg_id) {
         return { ...state, banner: presentCommandProblem(e) };
       }
@@ -2657,6 +2695,11 @@ function reduceEvent(
     }
     case "user_msg": {
       const next = patch(state, e.sid, (rt) => {
+        // query_queue removal normally precedes the user boundary. This fallback
+        // also reconciles a replay gap or an older wrapper which emitted only
+        // the accepted message.
+        rt.queue = rt.queue.filter((query) => query.msg_id !== e.msg_id);
+        if (rt.pendingSend?.msg_id === e.msg_id) rt.pendingSend = null;
         if (rt.acceptancePending === e.msg_id) {
           rt.acceptancePending = null;
           rt.acceptanceHistoryBaseline = null;

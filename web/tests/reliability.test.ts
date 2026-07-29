@@ -15,7 +15,6 @@ import {
   collectWaitingQueries,
   queuedQueryWireBytes,
   reduceTargetedRuntime,
-  selectDrainCandidates,
 } from "../src/runtime-drain.ts";
 import { mergeInitialHistory } from "../src/history-merge.ts";
 import {
@@ -910,32 +909,6 @@ assert.equal(timeout, "unavailable");
 const removed: string[] = [];
 clearLegacyAuthMarkers({ removeItem: (key) => { removed.push(key); } });
 assert.deepEqual(removed, ["cc_remote_session", "cc_remote_authenticated"]);
-
-const pending = {
-  prompt: "pending-a",
-  images: [{ media_type: "image/png", data: "img" }],
-};
-const queued = {
-  prompt: "queued-b",
-  files: [{ name: "note.txt", media_type: "text/plain", data: "file" }],
-};
-const runtimes = {
-  a: { state: "idle", syncReady: true, pendingSend: pending, queue: [{ prompt: "later-a" }] },
-  b: { state: "idle", syncReady: true, pendingSend: null, queue: [queued] },
-  c: { state: "running", syncReady: true, pendingSend: null, queue: [{ prompt: "busy-c" }] },
-  d: { state: "idle", syncReady: true, pendingSend: null, queue: [{ prompt: "draining-d" }] },
-  e: { state: "idle", syncReady: false, pendingSend: null, queue: [{ prompt: "stale-e" }] },
-  f: { state: "idle", syncReady: true, external: true, pendingSend: null, queue: [{ prompt: "external-f" }] },
-};
-assert.deepEqual(
-  selectDrainCandidates(runtimes, new Set(["d"]), true, true),
-  [
-    { sid: "a", source: "pending", query: pending },
-    { sid: "b", source: "queue", query: queued },
-  ],
-);
-assert.deepEqual(selectDrainCandidates(runtimes, new Set(), false, true), []);
-assert.deepEqual(selectDrainCandidates(runtimes, new Set(), true, false), []);
 
 const sizedQuery = {
   prompt: "queued",
@@ -5719,18 +5692,26 @@ try {
   assert.equal(state.runtimes[progressSid].state, "running",
     "TurnEnd closes presentation only; it must not unlock before State(idle)");
   state = reduce(state, {
-    type: "set_pending", query: { prompt: "send after interrupt drain" },
+    type: "set_pending",
+    query: { prompt: "send after interrupt drain", msg_id: "queued-replace" },
   });
-  assert.deepEqual(selectDrainCandidates(
-    state.runtimes, new Set(), true, true), [],
-  "pending work must stay blocked while the wrapper is still settling");
+  state = reduce(state, { type: "event", event: event({
+    type: "query_queue", sid: progressSid, items: [{
+      msg_id: "queued-replace", kind: "replace",
+      prompt_preview: "send after interrupt drain",
+      image_count: 0, file_count: 0,
+    }],
+  }) });
   state = reduce(state, { type: "event", event: event({
     type: "state", sid: progressSid, state: "idle",
   }) });
-  assert.deepEqual(selectDrainCandidates(
-    state.runtimes, new Set(), true, true).map(({ sid, source }) => ({ sid, source })),
-  [{ sid: progressSid, source: "pending" }],
-  "the authoritative idle lifecycle frame releases the pending replacement");
+  assert.equal(state.runtimes[progressSid].pendingSend?.msg_id, "queued-replace",
+    "browser idle state must not consume wrapper-owned queued work");
+  state = reduce(state, { type: "event", event: event({
+    type: "query_queue", sid: progressSid, items: [],
+  }) });
+  assert.equal(state.runtimes[progressSid].pendingSend, null,
+    "only the wrapper's authoritative queue projection removes deferred work");
 
   const pinnedBtwSid = "btw-pinned";
   const pinnedBtwTurn = {
@@ -5805,26 +5786,35 @@ try {
   );
   assert.deepEqual(pinnedBtwState.runtimes["parent-a"]?.queue, [],
     "BTW queue updates must not mutate the parent runtime");
-  const btwDrainState = {
-    ...pinnedBtwState,
-    runtimes: {
-      ...pinnedBtwState.runtimes,
-      [pinnedBtwSid]: {
-        ...pinnedBtwState.runtimes[pinnedBtwSid],
-        state: "idle" as const,
-        syncReady: true,
-      },
-    },
-  };
-  assert.deepEqual(selectDrainCandidates<{ prompt: string }>(
-    btwDrainState.runtimes, new Set(), true, true,
-  ).filter((candidate) => candidate.sid === pinnedBtwSid)
-    .map(({ sid, source, query }) => ({ sid, source, prompt: query.prompt })),
-  [{
-    sid: pinnedBtwSid,
-    source: "pending",
-    prompt: "replace after interrupt",
-  }], "the BTW pending replacement wins only within its own runtime");
+  pinnedBtwState = reduce(pinnedBtwState, {
+    type: "event",
+    event: event({
+      type: "query_queue",
+      sid: pinnedBtwSid,
+      items: [
+        {
+          msg_id: "btw-replace", kind: "replace",
+          prompt_preview: "server replacement",
+          image_count: 0, file_count: 0,
+        },
+        {
+          msg_id: "btw-queue", kind: "queue",
+          prompt_preview: "server queued",
+          image_count: 0, file_count: 0,
+        },
+      ],
+    }),
+  });
+  assert.equal(
+    pinnedBtwState.runtimes[pinnedBtwSid]?.pendingSend?.msg_id,
+    "btw-replace",
+    "the authoritative BTW replacement stays scoped to its side runtime",
+  );
+  assert.deepEqual(
+    pinnedBtwState.runtimes[pinnedBtwSid]?.queue.map(
+      (query: { msg_id?: string }) => query.msg_id),
+    ["btw-queue"],
+  );
   pinnedBtwState = reduce(pinnedBtwState, {
     type: "clear_btw", parentSid: "parent-a",
   });
@@ -7318,6 +7308,40 @@ acceptanceReconnectSocket.receive({
 assert.equal(acceptanceRelay.pendingQueryFor("accept-wire-b"), null,
   "a matching appended native History head recovers an echo missed during reconnect");
 acceptanceRelay.stop();
+
+// Deferred queries enter the reliable outbox and the wire immediately, but do
+// not create a browser-owned acceptance latch. The wrapper, not a later idle
+// React render, is responsible for starting them.
+const deferredRelay = new RelayWs({
+  onEvent: () => {},
+  onConnState: () => {},
+});
+deferredRelay.start();
+const deferredSocket = FakeWebSocket.instances.at(-1);
+assert.ok(deferredSocket);
+deferredSocket.onopen?.();
+assert.equal(deferredRelay.sendDeferredQueryTo(
+  "deferred-session",
+  "run after the active turn",
+  "deferred-message",
+  "queue",
+), true);
+const deferredFrame = JSON.parse(deferredSocket.sent.at(-1) ?? "{}");
+assert.equal(deferredFrame.type, "query");
+assert.equal(deferredFrame.sid, "deferred-session");
+assert.equal(deferredFrame.msg_id, "deferred-message");
+assert.equal(deferredFrame.delivery, "queue");
+assert.equal(typeof deferredFrame.cmd_id, "string");
+assert.equal(typeof deferredFrame.client_id, "string");
+assert.equal(deferredRelay.pendingQueryFor("deferred-session"), null,
+  "wrapper-owned queues must not wait on a browser narrative latch");
+assert.equal(deferredRelay.sendCancelQueuedQueryTo(
+  "deferred-session", "deferred-message"), true);
+const cancelDeferredFrame = JSON.parse(deferredSocket.sent.at(-1) ?? "{}");
+assert.equal(cancelDeferredFrame.type, "cancel_queued_query");
+assert.equal(cancelDeferredFrame.sid, "deferred-session");
+assert.equal(cancelDeferredFrame.msg_id, "deferred-message");
+deferredRelay.stop();
 
 // Steer uses the same reliable outbox and narrative acceptance barrier as a
 // query, but always targets its explicit sid rather than the current focus.

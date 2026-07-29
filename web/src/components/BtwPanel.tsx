@@ -43,8 +43,8 @@ interface Props {
   onSteer: (prompt: string) => boolean;
   onInterrupt: () => void;
   onSetSendMode: (mode: SendMode) => void;
-  onEnqueue: (query: PendingQuery) => void;
-  onSetPending: (query: PendingQuery) => void;
+  onEnqueue: (query: PendingQuery) => boolean;
+  onSetPending: (query: PendingQuery) => boolean;
   onDequeue: (index: number) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
@@ -174,10 +174,10 @@ export function BtwPanel(p: Props) {
         return;
       }
       if (action === "enqueue") {
-        p.onEnqueue(query);
+        if (!p.onEnqueue(query)) return;
       } else {
         if (action === "interrupt-and-replace") p.onInterrupt();
-        p.onSetPending(query);
+        if (!p.onSetPending(query)) return;
       }
       clearDraft();
       resetTaHeight();
@@ -266,7 +266,7 @@ export function BtwPanel(p: Props) {
         {(p.rt?.queue.length ?? 0) > 0 && (
           <div className="btw-queued">
             {p.rt!.queue.map((query, index) => (
-              <span className="qchip" key={index}>
+              <span className="qchip" key={query.msg_id ?? index}>
                 <span className="qbadge">排队</span>
                 <span className="qt">{query.prompt}</span>
                 <button className="qx" onClick={() => p.onDequeue(index)}

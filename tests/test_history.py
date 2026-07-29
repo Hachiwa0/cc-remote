@@ -1677,7 +1677,10 @@ def test_hello_sends_snapshots_and_control_state_without_replay_flood():
             m.sessions[key] = ctx
         await m._handle_client_hello(SimpleNamespace(client_id="c1"))
         types = [msg.type for msg in tr.sent]
-        assert types == ["snapshot", "perm", "snapshot", "perm"]
+        assert types == [
+            "snapshot", "query_queue", "perm",
+            "snapshot", "query_queue", "perm",
+        ]
         assert "replay_start" not in types and "user_msg" not in types
         assert all(msg.to == "c1" for msg in tr.sent)     # routed to the requesting client
     asyncio.run(go())
@@ -1700,7 +1703,8 @@ def test_hello_with_cursor_replays_only_missing_tail():
             generations={"s1": m.instance_id}, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
-            "replay_start", "user_msg", "replay_end", "session_control", "perm"]
+            "replay_start", "user_msg", "replay_end", "session_control",
+            "query_queue", "perm"]
         assert tr.sent[1].msg_id == "m3"
         assert all(msg.to == "c1" for msg in tr.sent)
 
@@ -1726,7 +1730,7 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
 
         assert [msg.type for msg in tr.sent] == [
             "snapshot", "replay_start", "user_msg", "delta", "replay_end",
-            "perm"]
+            "query_queue", "perm"]
         assert tr.sent[2].prompt == "current"
         assert all(msg.to == "c1" for msg in tr.sent)
 
