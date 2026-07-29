@@ -24,7 +24,7 @@ import {
 import { CommandSheet } from "./CommandSheet";
 import { attachmentBytes, pickFiles } from "../img";
 import type { PendingQuery } from "../reducer";
-import { canEnqueueQuery } from "../runtime-drain";
+import { canEnqueueQuery, type QueueCapacity } from "../runtime-drain";
 import { ImeSubmitGuard } from "../ime-submit";
 import {
   classifyBusySubmit,
@@ -36,6 +36,7 @@ import {
 import { workContextMetrics } from "../work-context";
 import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
 import { PendingImageAttachments } from "./PendingImageAttachments";
+import { QueuedQueryChip } from "./QueuedQueryDialog";
 import { UsageMeter } from "./UsageMeter";
 
 interface Props {
@@ -48,8 +49,12 @@ interface Props {
   sendMode: SendMode;
   setSendMode: (m: SendMode) => void;
   queue: PendingQuery[];
-  allQueued: PendingQuery[];
-  replaceableQueued: PendingQuery[];
+  pendingSend: PendingQuery | null;
+  failedDeferred: PendingQuery[];
+  unconfirmedQueued: PendingQuery[];
+  unconfirmedReplaceable: PendingQuery[];
+  queueCapacity: QueueCapacity;
+  replaceQueueCapacity: QueueCapacity;
   model: string;
   effort: string;
   perm: string;
@@ -74,7 +79,8 @@ interface Props {
   onInterrupt: () => void;
   onEnqueue: (query: PendingQuery) => boolean;
   onSetPending: (query: PendingQuery) => boolean;
-  onDequeue: (i: number) => void;
+  onRemoveQueued: (query: PendingQuery) => void;
+  onInspectQueued: (query: PendingQuery) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
   onSetServiceTier?: (tier: string) => void;
@@ -420,8 +426,11 @@ export function Composer(p: Props) {
         }
         return;
       }
-      const existing = p.sendMode === "queue" ? p.allQueued : p.replaceableQueued;
-      if (!canEnqueueQuery(existing, query)) {
+      const unconfirmed = p.sendMode === "queue"
+        ? p.unconfirmedQueued : p.unconfirmedReplaceable;
+      const capacity = p.sendMode === "queue"
+        ? p.queueCapacity : p.replaceQueueCapacity;
+      if (!canEnqueueQuery(unconfirmed, query, capacity)) {
         flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
         return;
       }
@@ -724,16 +733,16 @@ export function Composer(p: Props) {
           </div>
         )}
         {notice && <div className="composer-notice">{notice}</div>}
-        {p.queue.length > 0 && (
+        {(p.queue.length > 0 || p.pendingSend || p.failedDeferred.length > 0) && (
           <div className="queued show">
-            {p.queue.map((m, i) => (
-              <span className="qchip" key={m.msg_id ?? i}>
-                <span className="qbadge">排队</span>
-                <span className="qt">{m.prompt
-                  || ((m.imageCount ?? m.images?.length ?? 0) > 0
-                    ? "图片" : "附件")}</span>
-                <span className="qx" onClick={() => p.onDequeue(i)}><Icon name="close" size={12} /></span>
-              </span>
+            {[
+              ...(p.pendingSend ? [p.pendingSend] : []),
+              ...p.queue,
+              ...p.failedDeferred,
+            ].map((m, i) => (
+              <QueuedQueryChip query={m} key={m.msg_id ?? i}
+                onOpen={p.onInspectQueued}
+                onRemove={() => p.onRemoveQueued(m)} />
             ))}
           </div>
         )}

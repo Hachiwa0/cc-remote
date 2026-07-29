@@ -83,7 +83,9 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   terminal boundary and launches the next item without any browser callback.
   Web/PWA code only renders `QueryQueueState`; never reintroduce an idle-driven
   browser drain. Queued contexts (including a worker's pop-to-preflight window)
-  are not eligible for pool eviction or deletion.
+  are not eligible for pool eviction or deletion. Full prompt inspection is a
+  private one-shot read, and edits atomically replace the prompt under the queue
+  lock; never put complete queued payloads in the replay ring.
 - **External ownership is engine-specific**: a native Claude CLI owns its
   transcript and is mirrored read-only until it exits or the user explicitly
   takes over. Codex Code sessions use the official app-server; shared-daemon

@@ -12,7 +12,8 @@ import {
 } from "../src/session-auth.ts";
 import {
   canEnqueueQuery,
-  collectWaitingQueries,
+  collectUnconfirmedQueries,
+  MAX_QUEUED_QUERY_BYTES,
   queuedQueryWireBytes,
   reduceTargetedRuntime,
 } from "../src/runtime-drain.ts";
@@ -915,15 +916,48 @@ const sizedQuery = {
   files: [{ filename: "secret.txt", data: "sensitive-body" }],
 };
 const sizedQueryBytes = queuedQueryWireBytes(sizedQuery);
-assert.equal(canEnqueueQuery([], sizedQuery, 32, sizedQueryBytes), true);
-assert.equal(canEnqueueQuery([], sizedQuery, 32, sizedQueryBytes - 1), false);
-assert.equal(canEnqueueQuery([sizedQuery], sizedQuery, 1, sizedQueryBytes * 3), false);
+assert.equal(canEnqueueQuery([], sizedQuery, {
+  maxCount: 32, maxBytes: sizedQueryBytes,
+}), true);
+assert.equal(canEnqueueQuery([], sizedQuery, {
+  maxCount: 32, maxBytes: sizedQueryBytes - 1,
+}), false);
+assert.equal(canEnqueueQuery([sizedQuery], sizedQuery, {
+  maxCount: 1, maxBytes: sizedQueryBytes * 3,
+}), false);
 assert.equal(canEnqueueQuery(
-  [sizedQuery], sizedQuery, 32, sizedQueryBytes * 2), true);
-assert.deepEqual(collectWaitingQueries({
-  one: { queue: ["queued"], pendingSend: "replace-me" },
-  two: { queue: [], pendingSend: "other-pending" },
-}, "one"), ["queued", "other-pending"]);
+  [sizedQuery], sizedQuery, {
+    maxCount: 32, maxBytes: sizedQueryBytes * 2,
+  }), true);
+assert.equal(canEnqueueQuery([], sizedQuery, {
+  authoritativeCount: 1,
+  authoritativeBytes: MAX_QUEUED_QUERY_BYTES,
+}), false, "truncated server previews cannot undercount retained queue bytes");
+assert.equal(canEnqueueQuery([], sizedQuery, {
+  authoritativeCount: 1,
+  authoritativeBytes: MAX_QUEUED_QUERY_BYTES,
+  replacingCount: 1,
+  replacingBytes: MAX_QUEUED_QUERY_BYTES,
+}), true, "an authoritative replacement subtracts the exact retained item");
+assert.deepEqual(collectUnconfirmedQueries({
+  one: {
+    queue: [
+      { prompt: "queued", queueState: "queued" as const },
+      { prompt: "submitting", queueState: "submitting" as const },
+    ],
+    pendingSend: {
+      prompt: "replace-me", queueState: "submitting" as const,
+    },
+  },
+  two: {
+    queue: [],
+    pendingSend: {
+      prompt: "other-pending", queueState: "submitting" as const,
+    },
+  },
+}, "one").map((query) => query.prompt), [
+  "submitting", "other-pending",
+]);
 
 const a = {
   state: "idle", syncReady: true, pendingSend: null, queue: [{ prompt: "a" }],
@@ -4570,7 +4604,24 @@ try {
       syncReady: true,
       model: "gpt-5.6-terra",
       effort: "high",
-      queue: [{ prompt: "queued follow-up" }],
+      queue: [{
+        prompt: "queued follow-up",
+        queueKind: "queue",
+        queueState: "queued",
+      }],
+      pendingSend: {
+        msg_id: "replace-render",
+        prompt: "replacement follow-up",
+        queueKind: "replace",
+        queueState: "queued",
+      },
+      failedDeferred: [{
+        msg_id: "failed-render",
+        prompt: "retryable failed follow-up",
+        queueKind: "queue",
+        queueState: "failed",
+        queueError: "submission rejected",
+      }],
     },
     engine: "codex",
     opening: false,
@@ -4580,8 +4631,10 @@ try {
     draftKey: "btw-render-draft",
     draftStore: btwDraftStore,
     sendMode: "steer",
-    allQueued: [{ prompt: "queued follow-up" }],
-    replaceableQueued: [{ prompt: "queued follow-up" }],
+    unconfirmedQueued: [],
+    unconfirmedReplaceable: [],
+    queueCapacity: {},
+    replaceQueueCapacity: {},
     onTab: () => {},
     onSend: () => true,
     onSteer: () => true,
@@ -4589,7 +4642,8 @@ try {
     onSetSendMode: () => {},
     onEnqueue: () => {},
     onSetPending: () => {},
-    onDequeue: () => {},
+    onRemoveQueued: () => {},
+    onInspectQueued: () => {},
     onSetModel: () => {},
     onSetEffort: () => {},
     onOpenFile: () => {},
@@ -4599,8 +4653,12 @@ try {
   assert.match(btwPanelMarkup, /GPT-5\.6 Terra/);
   assert.match(btwPanelMarkup, />high</);
   assert.match(btwPanelMarkup, /queued follow-up/);
+  assert.match(btwPanelMarkup, /replacement follow-up/);
+  assert.match(btwPanelMarkup, /retryable failed follow-up/);
   assert.match(btwPanelMarkup, />引导</);
   assert.match(btwPanelMarkup, />排队</);
+  assert.match(btwPanelMarkup, />替换</);
+  assert.match(btwPanelMarkup, />未发送</);
   assert.match(btwPanelMarkup, /aria-label="停止"/);
   state = { ...state,
     newChat: { cwd: "/other", model: null, effort: null } };
@@ -5699,8 +5757,9 @@ try {
     type: "query_queue", sid: progressSid, items: [{
       msg_id: "queued-replace", kind: "replace",
       prompt_preview: "send after interrupt drain",
-      image_count: 0, file_count: 0,
+      image_count: 0, file_count: 0, retained_bytes: 256,
     }],
+    total_count: 1, total_bytes: 256,
   }) });
   state = reduce(state, { type: "event", event: event({
     type: "state", sid: progressSid, state: "idle",
@@ -5709,9 +5768,175 @@ try {
     "browser idle state must not consume wrapper-owned queued work");
   state = reduce(state, { type: "event", event: event({
     type: "query_queue", sid: progressSid, items: [],
+    total_count: 0, total_bytes: 0,
   }) });
   assert.equal(state.runtimes[progressSid].pendingSend, null,
     "only the wrapper's authoritative queue projection removes deferred work");
+
+  const rejectedSid = "rejected-deferred";
+  let rejectedState = {
+    ...initialState,
+    focusedSid: rejectedSid,
+    runtimes: { [rejectedSid]: createRuntime() },
+  };
+  rejectedState = reduce(rejectedState, {
+    type: "enqueue",
+    sid: rejectedSid,
+    query: {
+      msg_id: "rejected-message",
+      prompt: "complete rejected instruction",
+      images: [{ media_type: "image/png", data: "full-image-body" }],
+      files: [{ filename: "context.txt", data: "full-file-body" }],
+    },
+  });
+  rejectedState = reduce(rejectedState, {
+    type: "event",
+    event: event({
+      type: "error",
+      sid: rejectedSid,
+      msg_id: "rejected-message",
+      request_id: "rejected-command",
+      code: "queue_full",
+      message: "server queue full",
+    }),
+  });
+  assert.equal(rejectedState.runtimes[rejectedSid].queue.length, 0);
+  assert.deepEqual(
+    rejectedState.runtimes[rejectedSid].failedDeferred[0],
+    {
+      msg_id: "rejected-message",
+      prompt: "complete rejected instruction",
+      images: [{ media_type: "image/png", data: "full-image-body" }],
+      files: [{ filename: "context.txt", data: "full-file-body" }],
+      queueKind: "queue",
+      queueState: "failed",
+      queueError: rejectedState.runtimes[rejectedSid]
+        .failedDeferred[0].queueError,
+      retainedBytes: queuedQueryWireBytes({
+        prompt: "complete rejected instruction",
+        images: [{ media_type: "image/png", data: "full-image-body" }],
+        files: [{ filename: "context.txt", data: "full-file-body" }],
+      }),
+      failedAt: rejectedState.runtimes[rejectedSid]
+        .failedDeferred[0].failedAt,
+    },
+    "a wrapper rejection must retain the complete retryable browser payload",
+  );
+
+  let acceptedQueueState = {
+    ...initialState,
+    focusedSid: rejectedSid,
+    runtimes: { [rejectedSid]: createRuntime() },
+  };
+  acceptedQueueState = reduce(acceptedQueueState, {
+    type: "enqueue",
+    sid: rejectedSid,
+    query: {
+      msg_id: "accepted-deferred",
+      prompt: "full prompt that becomes a bounded preview",
+      images: [{ media_type: "image/png", data: "discard-after-acceptance" }],
+    },
+  });
+  acceptedQueueState = reduce(acceptedQueueState, {
+    type: "event",
+    event: event({
+      type: "query_queue",
+      sid: rejectedSid,
+      items: [{
+        msg_id: "accepted-deferred",
+        kind: "queue",
+        prompt_preview: "full prompt that becomes a bounded preview",
+        image_count: 1,
+        file_count: 0,
+        retained_bytes: 4096,
+        error: "daemon reconnect pending",
+      }],
+      total_count: 1,
+      total_bytes: 4096,
+    }),
+  });
+  const acceptedProjection =
+    acceptedQueueState.runtimes[rejectedSid].queue[0];
+  assert.equal(acceptedProjection.queueState, "queued");
+  assert.equal(acceptedProjection.images, undefined,
+    "full attachment payload is released only after wrapper acceptance");
+  assert.equal(acceptedProjection.retainedBytes, 4096);
+  assert.equal(acceptedProjection.queueError, "daemon reconnect pending");
+  assert.equal(acceptedQueueState.queryQueueCount, 1);
+  assert.equal(acceptedQueueState.queryQueueBytes, 4096);
+  acceptedQueueState = reduce(acceptedQueueState, {
+    type: "event",
+    event: event({
+      type: "error",
+      sid: rejectedSid,
+      msg_id: "accepted-deferred",
+      code: "not_running",
+      message: "preflight still blocked",
+    }),
+  });
+  assert.equal(
+    acceptedQueueState.runtimes[rejectedSid].queue[0].msg_id,
+    "accepted-deferred",
+    "a launch-preflight error must not remove server-owned queued work",
+  );
+  assert.equal(
+    acceptedQueueState.runtimes[rejectedSid].queue[0].queueError,
+    "当前会话暂时不可用，请重新进入后重试。",
+  );
+
+  let replacementRejectionState = {
+    ...initialState,
+    focusedSid: rejectedSid,
+    runtimes: { [rejectedSid]: createRuntime() },
+  };
+  const oldReplacementProjection = event({
+    type: "query_queue",
+    sid: rejectedSid,
+    items: [{
+      msg_id: "old-replacement",
+      kind: "replace",
+      prompt_preview: "existing replacement",
+      image_count: 0,
+      file_count: 0,
+      retained_bytes: 300,
+    }],
+    total_count: 1,
+    total_bytes: 300,
+  });
+  replacementRejectionState = reduce(replacementRejectionState, {
+    type: "event", event: oldReplacementProjection,
+  });
+  replacementRejectionState = reduce(replacementRejectionState, {
+    type: "set_pending",
+    sid: rejectedSid,
+    query: {
+      msg_id: "rejected-replacement",
+      prompt: "new replacement whose submission fails",
+    },
+  });
+  replacementRejectionState = reduce(replacementRejectionState, {
+    type: "event",
+    event: event({
+      type: "error",
+      sid: rejectedSid,
+      msg_id: "rejected-replacement",
+      code: "busy",
+      message: "replacement is starting",
+    }),
+  });
+  replacementRejectionState = reduce(replacementRejectionState, {
+    type: "event", event: oldReplacementProjection,
+  });
+  assert.equal(
+    replacementRejectionState.runtimes[rejectedSid].pendingSend?.msg_id,
+    "old-replacement",
+    "an unchanged authoritative projection restores a replacement hidden by "
+      + "a rejected optimistic submission",
+  );
+  assert.equal(
+    replacementRejectionState.runtimes[rejectedSid].failedDeferred[0].msg_id,
+    "rejected-replacement",
+  );
 
   const pinnedBtwSid = "btw-pinned";
   const pinnedBtwTurn = {
@@ -5768,12 +5993,12 @@ try {
   pinnedBtwState = reduce(pinnedBtwState, {
     type: "enqueue",
     sid: pinnedBtwSid,
-    query: { prompt: "queued in btw" },
+    query: { msg_id: "btw-queue", prompt: "queued in btw" },
   });
   pinnedBtwState = reduce(pinnedBtwState, {
     type: "set_pending",
     sid: pinnedBtwSid,
-    query: { prompt: "replace after interrupt" },
+    query: { msg_id: "btw-replace", prompt: "replace after interrupt" },
   });
   assert.deepEqual(
     pinnedBtwState.runtimes[pinnedBtwSid]?.queue.map(
@@ -5795,14 +6020,16 @@ try {
         {
           msg_id: "btw-replace", kind: "replace",
           prompt_preview: "server replacement",
-          image_count: 0, file_count: 0,
+          image_count: 0, file_count: 0, retained_bytes: 300,
         },
         {
           msg_id: "btw-queue", kind: "queue",
           prompt_preview: "server queued",
-          image_count: 0, file_count: 0,
+          image_count: 0, file_count: 0, retained_bytes: 200,
         },
       ],
+      total_count: 2,
+      total_bytes: 500,
     }),
   });
   assert.equal(
@@ -5987,7 +6214,7 @@ assert.deepEqual(keepsCompletedAnswerWithBackgroundWork.map((turn) => turn.id), 
 const idleRuntime = () => ({
   state: "idle", syncReady: true, replaying: false,
   turns: [] as Array<{ done: boolean }>, queue: [] as unknown[],
-  pendingSend: null, pendingQuestion: null,
+  pendingSend: null, failedDeferred: [] as unknown[], pendingQuestion: null,
 });
 const prunedRuntimes = pruneRuntimeMap({
   protected: idleRuntime(), oldestIdle: idleRuntime(), newestIdle: idleRuntime(),
@@ -7335,6 +7562,25 @@ assert.equal(typeof deferredFrame.cmd_id, "string");
 assert.equal(typeof deferredFrame.client_id, "string");
 assert.equal(deferredRelay.pendingQueryFor("deferred-session"), null,
   "wrapper-owned queues must not wait on a browser narrative latch");
+const queuedDetailCommand = deferredRelay.sendGetQueuedQueryTo(
+  "deferred-session", "deferred-message");
+assert.equal(typeof queuedDetailCommand, "string");
+const queuedDetailFrame = JSON.parse(deferredSocket.sent.at(-1) ?? "{}");
+assert.equal(queuedDetailFrame.type, "get_queued_query");
+assert.equal(queuedDetailFrame.sid, "deferred-session");
+assert.equal(queuedDetailFrame.msg_id, "deferred-message");
+assert.equal(queuedDetailFrame.cmd_id, queuedDetailCommand);
+assert.equal(typeof queuedDetailFrame.client_id, "string");
+const queuedUpdateCommand = deferredRelay.sendUpdateQueuedQueryTo(
+  "deferred-session", "deferred-message", "edited while queued");
+assert.equal(typeof queuedUpdateCommand, "string");
+const queuedUpdateFrame = JSON.parse(deferredSocket.sent.at(-1) ?? "{}");
+assert.equal(queuedUpdateFrame.type, "update_queued_query");
+assert.equal(queuedUpdateFrame.sid, "deferred-session");
+assert.equal(queuedUpdateFrame.msg_id, "deferred-message");
+assert.equal(queuedUpdateFrame.prompt, "edited while queued");
+assert.equal(queuedUpdateFrame.cmd_id, queuedUpdateCommand);
+assert.equal(typeof queuedUpdateFrame.client_id, "string");
 assert.equal(deferredRelay.sendCancelQueuedQueryTo(
   "deferred-session", "deferred-message"), true);
 const cancelDeferredFrame = JSON.parse(deferredSocket.sent.at(-1) ?? "{}");

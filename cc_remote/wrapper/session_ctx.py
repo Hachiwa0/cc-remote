@@ -71,6 +71,11 @@ class SessionContext:
     # suspended and starts entries only after the current native turn settles.
     queued_queries: list[Any] = field(default_factory=list)
     queued_query_bytes: int = 0
+    queued_query_errors: dict[str, str] = field(default_factory=dict)
+    # A launch preflight may await daemon/ownership checks.  The item remains
+    # wrapper-owned and visible until that preflight accepts it, while this
+    # marker prevents concurrent cancel/edit/replace from mutating it.
+    queued_query_starting_msg_id: Optional[str] = None
     queued_query_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     queued_query_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     queued_query_drain_task: Optional[asyncio.Task] = None

@@ -612,7 +612,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 ## 可靠性边界
 
 - Web 与 TUI 会给可重试命令附加稳定的 `cmd_id`，断线重连或 wrapper 恢复后重发；wrapper 在同一进程生命周期内去重并返回 ACK。每个实时会话还用 wrapper generation 配对 cursor，避免 wrapper 重启后把旧序号误当成新序号。
-- 排队及打断后的替换消息一经 wrapper 接收，就由 wrapper 的有界内存队列持有；即使所有浏览器/PWA 休眠、断线或硬刷新，也会在当前回合真正结束后继续执行，并在客户端重连时恢复队列摘要。该队列不会跨 wrapper 进程崩溃或重启持久化。
+- 排队及打断后的替换消息一经 wrapper 接收，就由 wrapper 的有界内存队列持有；即使所有浏览器/PWA 休眠、断线或硬刷新，也会在当前回合真正结束后继续执行，并在客户端重连时恢复队列摘要。点击摘要会私有按需读取完整指令，可在执行前原子编辑文字且保留附件；完整 payload 不进入可重放 ring。该队列不会跨 wrapper 进程崩溃或重启持久化。
 - 未确认命令队列和通用命令去重表是**有界内存状态**：浏览器硬刷新、TUI 退出或 wrapper 进程崩溃，不承诺跨进程的 exactly-once。cc-remote 是交互控制面，不是持久任务队列；这类故障后应先核对 transcript/rollout 和会话状态，再决定是否重发。
 - 已落盘的 Claude transcript / Codex rollout 是历史事实来源；wrapper 的 SQLite 摘要索引和浏览器 IndexedDB 都是可重建投影，实时 ring 只负责有界的断线补流。工具/思考等大块详情按单轮展开，不阻塞会话首屏。
 - Work 定时任务是例外：计划、运行记录、租约、心跳、重试次数和下次运行时间写入 SQLite；wrapper 重启后会恢复过期租约，但仍不会把不确定结果伪装成成功。

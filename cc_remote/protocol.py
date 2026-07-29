@@ -348,8 +348,54 @@ class CancelQueuedQuery(_Command):
     client_id: WireId
 
 
+class GetQueuedQuery(_Command):
+    """Read one wrapper-owned query without putting its payload in the ring."""
+
+    type: Literal["get_queued_query"] = "get_queued_query"
+    sid: WireId
+    msg_id: WireId
+    cmd_id: WireId
+    client_id: WireId
+
+
+class QueuedQueryDetail(_Base):
+    """Private, on-demand full prompt for one queued query."""
+
+    type: Literal["queued_query_detail"] = "queued_query_detail"
+    sid: WireId
+    msg_id: WireId
+    request_id: WireId
+    prompt: Optional[str] = Field(default=None, max_length=2 * 1024 * 1024)
+    kind: Optional[Literal["queue", "replace"]] = None
+    image_count: int = Field(default=0, ge=0, le=MAX_ATTACHMENT_COUNT)
+    file_count: int = Field(default=0, ge=0, le=MAX_ATTACHMENT_COUNT)
+    error: Optional[str] = Field(default=None, max_length=4096)
+
+
+class UpdateQueuedQuery(_Command):
+    """Replace only the prompt of one queued query, preserving attachments."""
+
+    type: Literal["update_queued_query"] = "update_queued_query"
+    sid: WireId
+    msg_id: WireId
+    prompt: str = Field(max_length=2 * 1024 * 1024)
+    cmd_id: WireId
+    client_id: WireId
+
+
+class QueuedQueryUpdated(_Base):
+    """Private result for one atomic queued-query edit."""
+
+    type: Literal["queued_query_updated"] = "queued_query_updated"
+    sid: WireId
+    msg_id: WireId
+    request_id: WireId
+    updated: bool
+    error: Optional[str] = Field(default=None, max_length=4096)
+
+
 class QueuedQueryInfo(BaseModel):
-    """Payload-free queue projection safe to replay to browsers."""
+    """Payload-bounded queue projection safe to replay to browsers."""
 
     model_config = ConfigDict(extra="forbid")
     msg_id: WireId
@@ -357,6 +403,8 @@ class QueuedQueryInfo(BaseModel):
     prompt_preview: str = Field(max_length=MAX_QUERY_QUEUE_PREVIEW_CHARS)
     image_count: int = Field(ge=0, le=MAX_ATTACHMENT_COUNT)
     file_count: int = Field(ge=0, le=MAX_ATTACHMENT_COUNT)
+    retained_bytes: int = Field(ge=0, le=MAX_QUERY_QUEUE_BYTES)
+    error: Optional[str] = Field(default=None, max_length=4096)
 
 
 class QueryQueueState(_Base):
@@ -365,6 +413,11 @@ class QueryQueueState(_Base):
     type: Literal["query_queue"] = "query_queue"
     items: list[QueuedQueryInfo] = Field(
         default_factory=list, max_length=MAX_QUERY_QUEUE_ITEMS)
+    # The queue bound is wrapper-global, not per session.  Browsers need the
+    # authoritative aggregate because prompt previews intentionally omit almost
+    # all retained bytes (especially base64 attachment bodies).
+    total_count: int = Field(ge=0, le=MAX_QUERY_QUEUE_ITEMS)
+    total_bytes: int = Field(ge=0, le=MAX_QUERY_QUEUE_BYTES)
 
 
 class Steer(_Command):
@@ -2023,7 +2076,7 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, CancelQueuedQuery, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, DirList,
@@ -2050,6 +2103,10 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "hello": Hello,
     "query": Query,
     "cancel_queued_query": CancelQueuedQuery,
+    "get_queued_query": GetQueuedQuery,
+    "queued_query_detail": QueuedQueryDetail,
+    "update_queued_query": UpdateQueuedQuery,
+    "queued_query_updated": QueuedQueryUpdated,
     "query_queue": QueryQueueState,
     "steer": Steer,
     "interrupt": Interrupt,

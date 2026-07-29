@@ -24,7 +24,15 @@ import type { Catalog } from "./data";
 import type { DiffLine, GitDiffSection } from "./diff";
 import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
-import { canEnqueueQuery, collectWaitingQueries, reduceTargetedRuntime } from "./runtime-drain";
+import {
+  canEnqueueQuery,
+  collectUnconfirmedQueries,
+  MAX_QUEUED_QUERIES,
+  MAX_QUEUED_QUERY_BYTES,
+  queuedQueryWireBytes,
+  reduceTargetedRuntime,
+  type QueueCapacity,
+} from "./runtime-drain";
 import {
   historyContainsTurn, installAuthoritativeTurnDetailPage,
   mergeAuthoritativeTurnDetail, mergeInitialHistory,
@@ -102,6 +110,12 @@ export interface PendingQuery {
   files?: QueryFile[];
   imageCount?: number;
   fileCount?: number;
+  queueKind?: "queue" | "replace";
+  queueState?: "submitting" | "queued" | "failed";
+  retainedBytes?: number;
+  replacesRetainedBytes?: number;
+  queueError?: string;
+  failedAt?: number;
 }
 
 export interface PreviewAssetState {
@@ -234,6 +248,10 @@ export interface SessionRuntime {
   sendMode: SendMode;
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
+  // Rejected reliable submissions retain their complete browser payload until
+  // the user retries or dismisses them.  This collection is globally bounded
+  // by the same 32-item / 64-MiB budget as the wrapper queue.
+  failedDeferred: PendingQuery[];
   // Browser query accepted into the reliable outbox but not yet confirmed by
   // its exact user echo / native turn binding / correlated terminal Error.
   acceptancePending: string | null;
@@ -260,6 +278,10 @@ export interface AppState {
   sessions: SessionInfo[];
   focusedSid: string | null;
   runtimes: Record<string, SessionRuntime>;
+  // Exact wrapper-global queue accounting. Prompt previews cannot be used for
+  // this because they omit attachment bodies and all text after 512 chars.
+  queryQueueCount: number;
+  queryQueueBytes: number;
   // At most one current, display-only transcript projection survives a replay
   // gap. It never participates in control, queue draining, or cache writes.
   historyRecovery: HistoryRecoveryProjection | null;
@@ -310,7 +332,8 @@ export function createRuntime(): SessionRuntime {
     contextRequestId: null, contextError: null, goal: null,
     statusReport: null, statusRequestId: null, statusError: null,
     notices: [], sendMode: "steer",
-    queue: [], pendingSend: null, acceptancePending: null,
+    queue: [], pendingSend: null, failedDeferred: [],
+    acceptancePending: null,
     acceptanceHistoryBaseline: null,
   };
 }
@@ -327,6 +350,8 @@ export type Action =
   | { type: "set_send_mode"; sid: string; mode: SendMode }
   | { type: "set_pending"; sid?: string; query: PendingQuery }
   | { type: "clear_pending"; sid: string }
+  | { type: "remove_deferred"; sid: string; msgId: string }
+  | { type: "update_failed_deferred"; sid: string; msgId: string; prompt: string }
   | { type: "set_model"; model: string }
   | { type: "set_effort"; effort: string }
   | { type: "set_perm"; perm: string }
@@ -382,6 +407,8 @@ export const initialState: AppState = {
   sessions: [],
   focusedSid: null,
   runtimes: {},
+  queryQueueCount: 0,
+  queryQueueBytes: 0,
   historyRecovery: null,
   historyBrowse: null,
   btwByParentSid: {},
@@ -390,6 +417,68 @@ export const initialState: AppState = {
   catalogDefaultEffort: {},
   catalogDefaultCwd: {},
 };
+
+export function deferredQueueCapacity(
+  state: Pick<
+    AppState, "queryQueueCount" | "queryQueueBytes" | "runtimes"
+  >,
+  replacingSid?: string | null,
+): QueueCapacity {
+  const pending = replacingSid
+    ? state.runtimes[replacingSid]?.pendingSend : null;
+  const replacingBytes = pending?.queueState === "queued"
+    ? pending.retainedBytes ?? 0
+    : pending?.queueState === "submitting"
+      ? pending.replacesRetainedBytes ?? 0
+      : 0;
+  return {
+    authoritativeCount: state.queryQueueCount,
+    authoritativeBytes: state.queryQueueBytes,
+    replacingCount: replacingBytes > 0 ? 1 : 0,
+    replacingBytes,
+  };
+}
+
+function boundFailedDeferred(
+  runtimes: Record<string, SessionRuntime>,
+): Record<string, SessionRuntime> {
+  const retained = Object.entries(runtimes).flatMap(([sid, runtime]) =>
+    runtime.failedDeferred.map((query) => ({ sid, query })));
+  let bytes = retained.reduce(
+    (total, entry) => total + queuedQueryWireBytes(entry.query), 0);
+  if (
+    retained.length <= MAX_QUEUED_QUERIES
+    && bytes <= MAX_QUEUED_QUERY_BYTES
+  ) return runtimes;
+
+  retained.sort((left, right) =>
+    (left.query.failedAt ?? 0) - (right.query.failedAt ?? 0));
+  const remove = new Map<string, Set<string>>();
+  while (
+    retained.length > MAX_QUEUED_QUERIES
+    || (bytes > MAX_QUEUED_QUERY_BYTES && retained.length > 1)
+  ) {
+    const oldest = retained.shift();
+    if (!oldest) break;
+    bytes -= queuedQueryWireBytes(oldest.query);
+    if (!oldest.query.msg_id) continue;
+    const ids = remove.get(oldest.sid) ?? new Set<string>();
+    ids.add(oldest.query.msg_id);
+    remove.set(oldest.sid, ids);
+  }
+  if (!remove.size) return runtimes;
+  const next = { ...runtimes };
+  for (const [sid, ids] of remove) {
+    const runtime = next[sid];
+    if (!runtime) continue;
+    next[sid] = {
+      ...runtime,
+      failedDeferred: runtime.failedDeferred.filter(
+        (query) => !query.msg_id || !ids.has(query.msg_id)),
+    };
+  }
+  return next;
+}
 
 function cloneTurns(turns: Turn[]): Turn[] {
   return turns.map((t) => ({ ...t, blocks: t.blocks.map((b) => ({ ...b })) }));
@@ -972,11 +1061,18 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, runtimes, sessions, historyBrowse };
     }
     case "enqueue": {
-      const allQueued = collectWaitingQueries(state.runtimes);
-      if (!canEnqueueQuery(allQueued, action.query)) return state;
       const targetSid = action.sid ?? state.focusedSid;
+      const unconfirmed = collectUnconfirmedQueries(state.runtimes);
+      if (!canEnqueueQuery(
+        unconfirmed, action.query, deferredQueueCapacity(state),
+      )) return state;
+      const optimistic: PendingQuery = {
+        ...action.query,
+        queueKind: "queue",
+        queueState: action.query.queueState ?? "submitting",
+      };
       const next = patch(state, targetSid, (rt) => {
-        rt.queue = [...rt.queue, action.query];
+        rt.queue = [...rt.queue, optimistic];
       });
       return targetSid && next.historyBrowse?.sid === targetSid
         ? { ...next, historyBrowse: null }
@@ -991,10 +1087,29 @@ export function reduce(state: AppState, action: Action): AppState {
       return patch(state, action.sid, (rt) => { rt.sendMode = action.mode; });
     case "set_pending": {
       const targetSid = action.sid ?? state.focusedSid;
-      const waiting = collectWaitingQueries(state.runtimes, targetSid);
-      if (!canEnqueueQuery(waiting, action.query)) return state;
+      const unconfirmed = collectUnconfirmedQueries(
+        state.runtimes, targetSid);
+      if (!canEnqueueQuery(
+        unconfirmed,
+        action.query,
+        deferredQueueCapacity(state, targetSid),
+      )) return state;
+      const current = targetSid
+        ? state.runtimes[targetSid]?.pendingSend : null;
+      const replacesRetainedBytes = current?.queueState === "queued"
+        ? current.retainedBytes
+        : current?.queueState === "submitting"
+          ? current.replacesRetainedBytes
+          : undefined;
+      const optimistic: PendingQuery = {
+        ...action.query,
+        queueKind: "replace",
+        queueState: action.query.queueState ?? "submitting",
+        replacesRetainedBytes:
+          action.query.replacesRetainedBytes ?? replacesRetainedBytes,
+      };
       const next = patch(
-        state, targetSid, (rt) => { rt.pendingSend = action.query; });
+        state, targetSid, (rt) => { rt.pendingSend = optimistic; });
       return targetSid && next.historyBrowse?.sid === targetSid
         ? { ...next, historyBrowse: null }
         : next;
@@ -1004,6 +1119,29 @@ export function reduce(state: AppState, action: Action): AppState {
         state.runtimes, action.sid, { type: "clear_pending" });
       return runtimes === state.runtimes ? state : { ...state, runtimes };
     }
+    case "remove_deferred":
+      return patch(state, action.sid, (rt) => {
+        rt.queue = rt.queue.filter(
+          (query) => query.msg_id !== action.msgId);
+        if (rt.pendingSend?.msg_id === action.msgId) {
+          rt.pendingSend = null;
+        }
+        rt.failedDeferred = rt.failedDeferred.filter(
+          (query) => query.msg_id !== action.msgId);
+      });
+    case "update_failed_deferred":
+      return patch(state, action.sid, (rt) => {
+        rt.failedDeferred = rt.failedDeferred.map((query) =>
+          query.msg_id === action.msgId
+            ? {
+                ...query,
+                prompt: action.prompt,
+                retainedBytes: queuedQueryWireBytes({
+                  ...query, prompt: action.prompt,
+                }),
+              }
+            : query);
+      });
     case "set_model":
       return patch(state, state.focusedSid, (rt) => { rt.model = action.model; });
     case "set_effort":
@@ -1615,6 +1753,13 @@ function reduceEvent(
             turns: mergedTurns,
             queue: [...source.queue, ...target.queue],
             pendingSend: source.pendingSend ?? target.pendingSend,
+            failedDeferred: [
+              ...source.failedDeferred,
+              ...target.failedDeferred.filter((query) => (
+                !source.failedDeferred.some(
+                  (sourceQuery) => sourceQuery.msg_id === query.msg_id)
+              )),
+            ],
             acceptancePending:
               source.acceptancePending ?? target.acceptancePending,
             acceptanceHistoryBaseline: source.acceptancePending
@@ -2403,8 +2548,8 @@ function reduceEvent(
       });
       return changed ? { ...next, sessions } : next;
     }
-    case "query_queue":
-      return patch(state, e.sid, (rt) => {
+    case "query_queue": {
+      const next = patch(state, e.sid, (rt) => {
         // The wrapper owns deferred payloads. Retain only bounded display
         // metadata after its authoritative projection arrives so a sleeping
         // browser is no longer responsible for either execution or attachment
@@ -2414,13 +2559,47 @@ function reduceEvent(
           prompt: item.prompt_preview,
           imageCount: item.image_count,
           fileCount: item.file_count,
+          queueKind: item.kind,
+          queueState: "queued",
+          retainedBytes: item.retained_bytes,
+          queueError: item.error ?? undefined,
         }));
-        rt.queue = projected.filter((_, index) =>
-          e.items[index].kind === "queue");
+        const projectedIds = new Set(
+          projected.map((query) => query.msg_id));
+        const submittingQueue = rt.queue.filter((query) => (
+          query.queueState !== "queued"
+          && query.queueState !== "failed"
+          && !projectedIds.has(query.msg_id)
+        ));
+        rt.queue = [
+          ...projected.filter((_, index) =>
+            e.items[index].kind === "queue"),
+          ...submittingQueue,
+        ];
         const replacement = projected.find((_, index) =>
           e.items[index].kind === "replace");
-        rt.pendingSend = replacement ?? null;
+        const currentReplacement = rt.pendingSend;
+        const submittingReplacement = (
+          currentReplacement !== null
+          && currentReplacement.queueState !== "queued"
+          && currentReplacement.queueState !== "failed"
+          && !projectedIds.has(currentReplacement.msg_id)
+        ) ? {
+            ...currentReplacement,
+            replacesRetainedBytes:
+              replacement?.retainedBytes
+              ?? currentReplacement.replacesRetainedBytes,
+          } : null;
+        rt.pendingSend = submittingReplacement ?? replacement ?? null;
+        rt.failedDeferred = rt.failedDeferred.filter(
+          (query) => !projectedIds.has(query.msg_id));
       }, true);
+      return {
+        ...next,
+        queryQueueCount: e.total_count,
+        queryQueueBytes: e.total_bytes,
+      };
+    }
     case "session_control":
       // Direct control events require an explicit runtime key. Snapshot and
       // History controls are routed by their outer envelope above.
@@ -2653,18 +2832,56 @@ function reduceEvent(
       if (e.msg_id) {
         const key = e.sid ?? state.focusedSid;
         const runtime = key ? state.runtimes[key] : undefined;
-        const queued = runtime?.queue.some(
-          (query) => query.msg_id === e.msg_id) ?? false;
-        const pending = runtime?.pendingSend?.msg_id === e.msg_id;
-        if (queued || pending) {
+        const queued = runtime?.queue.find(
+          (query) => query.msg_id === e.msg_id);
+        const pending = runtime?.pendingSend?.msg_id === e.msg_id
+          ? runtime.pendingSend : undefined;
+        const deferred = queued ?? pending;
+        if (deferred && key) {
+          const problem = presentCommandProblem(e);
+          if (deferred.queueState === "queued") {
+            const next = patch(state, key, (rt) => {
+              rt.queue = rt.queue.map((query) =>
+                query.msg_id === e.msg_id
+                  ? { ...query, queueError: problem }
+                  : query);
+              const currentPending = rt.pendingSend;
+              if (
+                currentPending !== null
+                && currentPending.msg_id === e.msg_id
+              ) {
+                rt.pendingSend = {
+                  ...currentPending, queueError: problem,
+                };
+              }
+            });
+            return { ...next, banner: problem };
+          }
           const next = patch(state, key, (rt) => {
             rt.queue = rt.queue.filter(
               (query) => query.msg_id !== e.msg_id);
             if (rt.pendingSend?.msg_id === e.msg_id) {
               rt.pendingSend = null;
             }
+            rt.failedDeferred = [
+              ...rt.failedDeferred.filter(
+                (query) => query.msg_id !== e.msg_id),
+              {
+                ...deferred,
+                queueKind: deferred.queueKind
+                  ?? (pending ? "replace" : "queue"),
+                queueState: "failed",
+                queueError: problem,
+                retainedBytes: queuedQueryWireBytes(deferred),
+                failedAt: Date.now(),
+              },
+            ];
           });
-          return { ...next, banner: presentCommandProblem(e) };
+          return {
+            ...next,
+            runtimes: boundFailedDeferred(next.runtimes),
+            banner: problem,
+          };
         }
       }
       if (!e.msg_id) {
@@ -2700,6 +2917,8 @@ function reduceEvent(
         // the accepted message.
         rt.queue = rt.queue.filter((query) => query.msg_id !== e.msg_id);
         if (rt.pendingSend?.msg_id === e.msg_id) rt.pendingSend = null;
+        rt.failedDeferred = rt.failedDeferred.filter(
+          (query) => query.msg_id !== e.msg_id);
         if (rt.acceptancePending === e.msg_id) {
           rt.acceptancePending = null;
           rt.acceptanceHistoryBaseline = null;
@@ -3103,6 +3322,8 @@ function reduceEvent(
       });
     case "pong":
     case "command_ack":
+    case "queued_query_detail":
+    case "queued_query_updated":
     case "history_image":
     case "session_forked":
     case "hello":

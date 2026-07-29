@@ -563,6 +563,29 @@ export class RelayWs {
     });
   }
 
+  sendGetQueuedQueryTo(sid: string, msg_id: string): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "get_queued_query",
+      sid,
+      msg_id,
+      ts: nowTs(),
+    });
+  }
+
+  sendUpdateQueuedQueryTo(
+    sid: string, msg_id: string, prompt: string,
+  ): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "update_queued_query",
+      sid,
+      msg_id,
+      prompt,
+      ts: nowTs(),
+    });
+  }
+
   /** Append input to the active Codex turn. The reliable command and the
    *  narrative acceptance latch are separate: an ACK alone must not clear the
    *  draft/runtime protection before the wrapper echoes the steered user row. */

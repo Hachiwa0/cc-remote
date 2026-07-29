@@ -37,32 +37,64 @@ export function queuedQueryWireBytes(query: WireSizedQuery): number {
   return bytes;
 }
 
-/** All memory-resident work counted by the global queue limit. The focused
- * pending query is omitted when a new interrupt-and-send replaces it. */
-export function collectWaitingQueries<Query>(
+/** Browser-owned commands which have not appeared in an authoritative wrapper
+ * projection yet.  Server-owned previews and failed local drafts must not be
+ * counted as if their truncated payload were the retained queue body. */
+export function collectUnconfirmedQueries<Query extends {
+  queueState?: "submitting" | "queued" | "failed";
+}>(
   runtimes: Record<string, Pick<DrainableRuntime<Query>, "queue" | "pendingSend">>,
   replacingSid?: string | null,
 ): Query[] {
   const waiting: Query[] = [];
   for (const [sid, runtime] of Object.entries(runtimes)) {
-    waiting.push(...runtime.queue);
-    if (runtime.pendingSend && sid !== replacingSid) waiting.push(runtime.pendingSend);
+    waiting.push(...runtime.queue.filter(
+      (query) => query.queueState !== "queued"
+        && query.queueState !== "failed"));
+    if (
+      runtime.pendingSend
+      && runtime.pendingSend.queueState !== "queued"
+      && runtime.pendingSend.queueState !== "failed"
+      && sid !== replacingSid
+    ) {
+      waiting.push(runtime.pendingSend);
+    }
   }
   return waiting;
 }
 
-/** Browser-memory guard for busy-session queue mode. */
+export interface QueueCapacity {
+  authoritativeCount?: number;
+  authoritativeBytes?: number;
+  replacingCount?: number;
+  replacingBytes?: number;
+  maxCount?: number;
+  maxBytes?: number;
+}
+
+/** Queue guard which combines the wrapper's exact global aggregate with only
+ * commands that are still in this browser's reliable-submit window. */
 export function canEnqueueQuery(
-  queue: readonly WireSizedQuery[],
+  unconfirmed: readonly WireSizedQuery[],
   query: WireSizedQuery,
-  maxCount = MAX_QUEUED_QUERIES,
-  maxBytes = MAX_QUEUED_QUERY_BYTES,
+  capacity: QueueCapacity = {},
 ): boolean {
-  if (queue.length >= maxCount) return false;
+  const maxCount = capacity.maxCount ?? MAX_QUEUED_QUERIES;
+  const maxBytes = capacity.maxBytes ?? MAX_QUEUED_QUERY_BYTES;
+  const authoritativeCount = capacity.authoritativeCount ?? 0;
+  const authoritativeBytes = capacity.authoritativeBytes ?? 0;
+  const replacingCount = Math.min(
+    capacity.replacingCount ?? 0, authoritativeCount);
+  const replacingBytes = Math.min(
+    capacity.replacingBytes ?? 0, authoritativeBytes);
+  if (
+    authoritativeCount - replacingCount + unconfirmed.length >= maxCount
+  ) return false;
   const nextBytes = queuedQueryWireBytes(query);
   if (nextBytes > maxBytes) return false;
-  let used = 0;
-  for (const queued of queue) {
+  let used = authoritativeBytes - replacingBytes;
+  if (used > maxBytes - nextBytes) return false;
+  for (const queued of unconfirmed) {
     used += queuedQueryWireBytes(queued);
     if (used > maxBytes - nextBytes) return false;
   }

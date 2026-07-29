@@ -6,7 +6,8 @@
 
 - 将忙碌会话的后续消息队列从浏览器内存移交给常驻 wrapper。Protocol v25
   允许排队消息和打断后的替换消息在所有 Web/PWA 客户端休眠或断线时，仍于当前
-  回合结束后立即继续执行；客户端重连时会恢复 wrapper 的权威队列状态。
+  回合结束后立即继续执行；客户端重连时会恢复 wrapper 的权威队列状态。队列标签
+  只保留有界摘要，点击后私有按需读取完整指令，并可在 wrapper 中原子编辑而不丢附件。
 - 新增 Codex 官方 named permission profile 控制，并与审批策略分开管理。紧凑的
   权限面板可选择 Read Only、Workspace、Full Access 及按 cwd 生效的自定义
   profile，不增加输入框底栏控件；protocol v24 在 Wrapper、Relay 与 Web
