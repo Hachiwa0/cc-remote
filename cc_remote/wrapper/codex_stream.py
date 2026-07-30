@@ -573,6 +573,8 @@ class CodexStreamTranslator:
         self._open_msg: str | None = None
         self._open_channel = "unknown"
         self._visible_output = False
+        self._final_output = False
+        self._completed_plan: tuple[str, str] | None = None
         self._terminal_error = False
         self._delta_chars: dict[tuple[str, str], int] = {}
         self._delta_events: dict[tuple[str, str], int] = {}
@@ -607,6 +609,8 @@ class CodexStreamTranslator:
             if isinstance(delta, str) and delta:
                 self._text_seen.add(iid)
                 self._visible_output = True
+                if channel == "final":
+                    self._final_output = True
                 out.append(Delta(message_id=iid, text=delta, channel=channel))
 
         elif method == "item/started":
@@ -667,6 +671,8 @@ class CodexStreamTranslator:
                     self._visible_output = True
                     out.append(Delta(
                         message_id=iid, text=text, channel=channel))
+                if text and channel == "final":
+                    self._final_output = True
                 if iid in self._started:
                     out.append(AssistantMsgEnd(
                         message_id=iid, channel=channel))
@@ -685,6 +691,8 @@ class CodexStreamTranslator:
                 out.append(self._tool_result(item))
             elif t in _PROCESS_ITEM_TYPES:
                 iid = _live_id(item.get("id"), str(t or "process"))
+                if t == "plan":
+                    self._remember_completed_plan(item, iid)
                 if not self._admit_live_item(iid, out):
                     return out
                 event = self._process_item(item, p, completed=True)
@@ -1061,6 +1069,8 @@ class CodexStreamTranslator:
                         message="Codex 本次回复未完成，请重试。",
                     ))
                     self._terminal_error = True
+            if st == "completed" and not self._terminal_error:
+                self._append_completed_plan_answer(out)
             # Codex 0.144.1 can record an upstream 503 as completed/error=null with
             # only the userMessage item. Treat that impossible "empty success" as
             # a terminal failure, while allowing tool-only turns as visible output.
@@ -1090,6 +1100,7 @@ class CodexStreamTranslator:
             ), turn_id=(completed_turn_id
                         if isinstance(completed_turn_id, str) else None)))
             self._clear_all_delta_budgets()
+            self._completed_plan = None
             self._turn_closed = True
 
         # everything else (raw reasoning, userMessage, mcpServer/startupStatus,
@@ -1180,6 +1191,25 @@ class CodexStreamTranslator:
         ))
         self._open_msg = None
         self._open_channel = "unknown"
+
+    def _remember_completed_plan(self, item: dict, item_id: str) -> None:
+        """Keep the last authoritative completed Plan as a bounded fallback."""
+        text, _ = bounded_text(item.get("text"), 256 * 1024)
+        self._completed_plan = (item_id, text) if text else None
+
+    def _append_completed_plan_answer(self, out: list) -> None:
+        """Expose a plan-only turn as the final answer without duplicating one."""
+        if self._final_output or self._completed_plan is None:
+            return
+        item_id, text = self._completed_plan
+        message_id = _live_id(f"{item_id}:final", "plan-answer")
+        out.extend([
+            AssistantMsgStart(message_id=message_id, channel="final"),
+            Delta(message_id=message_id, text=text, channel="final"),
+            AssistantMsgEnd(message_id=message_id, channel="final"),
+        ])
+        self._visible_output = True
+        self._final_output = True
 
     def _ensure_block(self, mid: str, out: list) -> None:
         """A tool card needs an assistant message block to hang under (the reducer
@@ -2006,6 +2036,7 @@ def codex_translate_history(
         tuple[str, float | None, str | None]
     ] = []
     pending_agent_message: tuple[dict, int, str] | None = None
+    completed_plan: tuple[str, str] | None = None
     task_has_user = False
     seen_tool_uses: set[str] = set()
     seen_tool_results: set[str] = set()
@@ -2248,6 +2279,31 @@ def codex_translate_history(
             message_id=cur_mid, text=text, channel=channel))
         close_assistant()
 
+    def emit_completed_plan_answer(
+        line_no: int,
+        raw_ts: str,
+    ) -> None:
+        nonlocal turn_visible, turn_text_visible, turn_final_visible
+        if turn_final_visible or completed_plan is None:
+            return
+        item_id, text = completed_plan
+        turn_key = str(active_turn_id or pending_turn_id or "")
+        close_assistant()
+        ensure_assistant(
+            line_no,
+            raw_ts,
+            _live_id(f"{item_id}:final", "plan-answer"),
+            channel="final",
+            force_new=True,
+        )
+        events.append(Delta(
+            message_id=cur_mid, text=text, channel="final"))
+        close_assistant()
+        seen_agent_messages.add((turn_key, "final", text))
+        turn_visible = True
+        turn_text_visible = True
+        turn_final_visible = True
+
     def paired_agent_item_id(
         payload: dict,
         pending: tuple[dict, int, str],
@@ -2287,6 +2343,7 @@ def codex_translate_history(
         nonlocal turn_open, active_turn_id, active_msg_id, pending_turn_id
         nonlocal assistant_open, cur_mid, turn_visible, turn_text_visible
         nonlocal turn_final_visible, turn_has_user, turn_continuation_reason
+        nonlocal completed_plan
         if not turn_open:
             return
         close_assistant()
@@ -2317,6 +2374,7 @@ def codex_translate_history(
         turn_final_visible = False
         turn_has_user = False
         turn_continuation_reason = None
+        completed_plan = None
         pending_compactions.clear()
 
     try:
@@ -2643,10 +2701,13 @@ def codex_translate_history(
                     open_assistant_only_turn()
                     item_id = _history_id(
                         item.get("id"), "plan-detail", line_no, raw_ts)
+                    detail, truncated = bounded_text(
+                        item.get("text"), 256 * 1024)
+                    completed_plan = (
+                        (item_id, detail) if detail else None
+                    )
                     if item_id not in seen_process_items:
                         seen_process_items.add(item_id)
-                        detail, truncated = bounded_text(
-                            item.get("text"), 256 * 1024)
                         events.append(ProcessEvent(
                             item_id=item_id,
                             kind="plan",
@@ -2818,6 +2879,7 @@ def codex_translate_history(
                         turn_visible = True
                         turn_text_visible = True
                         turn_final_visible = True
+                    emit_completed_plan_answer(line_no, raw_ts)
                     if turn_visible:
                         close_turn("success", _duration(p), False,
                                    _completed_ts(p, ts), p.get("turn_id"))
