@@ -49,6 +49,18 @@ import {
   historyImageDisplaySource,
   TurnImagePreviewCache,
 } from "../src/turn-image-previews.ts";
+import {
+  HistoryImageAssetCache,
+  historyImageAssetKey,
+  historyImageAssetCacheSnapshot,
+  HISTORY_IMAGE_REQUEST_TIMEOUT_MS,
+  shouldAutoloadHistoryImage,
+} from "../src/history-image-assets.ts";
+import {
+  InlineImageAssetCache,
+  inlineImageAssetCacheSnapshot,
+  INLINE_IMAGE_REQUEST_TIMEOUT_MS,
+} from "../src/inline-image-assets.ts";
 import { boundCachedTurns, controlForCachedSession } from "../src/cache.ts";
 import {
   boundRuntimeTurns,
@@ -1223,7 +1235,8 @@ const transcriptTurn = {
   blocks: [{ kind: "text" as const, message_id: "engine-text", text: "answer", done: true }],
 };
 const optimisticTurn = {
-  id: "client-id", prompt: "same prompt", done: false, ts: 1100,
+  id: "client-id", historyTurnId: "engine-id",
+  prompt: "same prompt", done: false, ts: 1100,
   blocks: [{ kind: "text" as const, message_id: "live-text", text: "answer tail", done: false }],
 };
 const laggingDone = {
@@ -1238,6 +1251,29 @@ assert.equal(mergedHistory[0].historyTurnId, "engine-id",
   "an attachment-free optimistic alias retains its native history lookup id");
 assert.equal(mergedHistory[1].prompt, "not flushed");
 
+const nativeAliasMerged = mergeInitialHistory(
+  [{
+    id: "native-alias", prompt: "same prompt", done: true,
+    blocks: [{
+      kind: "text" as const, message_id: "native-alias-final",
+      text: "answer", done: true, channel: "final" as const,
+    }],
+  }],
+  [{
+    id: "client-alias", historyTurnId: "native-alias",
+    prompt: "same prompt", done: false,
+    blocks: [{
+      kind: "text" as const, message_id: "live-alias-final",
+      text: "answer", done: false, channel: "final" as const,
+    }],
+  }],
+);
+assert.deepEqual(
+  nativeAliasMerged.map((turn) => turn.id),
+  ["client-alias"],
+  "historyTurnId is an exact native/client identity even without timestamps",
+);
+
 const repeatedOld = {
   id: "old-engine", prompt: "继续", done: true, ts: 10_000,
   blocks: [{ kind: "text" as const, message_id: "old-answer", text: "old", done: true }],
@@ -1251,7 +1287,12 @@ assert.equal(repeatedMerged[1].done, false);
 
 const delayedEcho = mergeInitialHistory(
   [{ ...transcriptTurn, id: "engine-delayed", ts: 20_000 }],
-  [{ ...optimisticTurn, id: "client-delayed", ts: 22_500 }],
+  [{
+    ...optimisticTurn,
+    id: "client-delayed",
+    historyTurnId: "engine-delayed",
+    ts: 22_500,
+  }],
 );
 assert.deepEqual(delayedEcho.map((turn) => turn.id), ["client-delayed"]);
 
@@ -1271,7 +1312,8 @@ const multiCommentHistory = {
   ],
 };
 const multiCommentLive = {
-  id: "multi-live", prompt: "inspect", done: true, ts: 30_100,
+  id: "multi-live", historyTurnId: "multi-history",
+  prompt: "inspect", done: true, ts: 30_100,
   blocks: [
     { kind: "text" as const, message_id: "live-a", text: "A", done: true,
       channel: "commentary" as const },
@@ -1286,6 +1328,40 @@ const multiCommentMerged = mergeInitialHistory(
   [multiCommentHistory], [multiCommentLive]);
 assert.deepEqual(multiCommentMerged[0].blocks.filter(
   (block) => block.kind === "text").map((block) => block.text), ["A", "B"]);
+
+const unrelatedSameChannelHistory = {
+  id: "same-turn-unrelated-text",
+  prompt: "inspect",
+  done: true,
+  blocks: [{
+    kind: "text" as const,
+    message_id: "history-unrelated",
+    text: "canonical earlier commentary",
+    done: true,
+    channel: "commentary" as const,
+  }],
+};
+const unrelatedSameChannelLive = {
+  ...unrelatedSameChannelHistory,
+  done: false,
+  blocks: [{
+    kind: "text" as const,
+    message_id: "live-unrelated",
+    text: "a distinct later update",
+    done: false,
+    channel: "commentary" as const,
+  }],
+};
+assert.deepEqual(
+  mergeInitialHistory(
+    [unrelatedSameChannelHistory],
+    [unrelatedSameChannelLive],
+    { preserveLiveTailOpen: true },
+  )[0].blocks.flatMap((block) =>
+    block.kind === "text" ? [block.text] : []),
+  ["canonical earlier commentary", "a distinct later update"],
+  "same-channel text with zero affinity must remain separate blocks",
+);
 
 // Tool-only assistant envelopes have a start/end but no text delta. Summary
 // history omits those invisible shells while loaded detail retains them. A
@@ -1456,7 +1532,8 @@ const imageHistory = {
   blocks: [],
 };
 const imageLive = {
-  id: "image-live", prompt: "看图", done: false, ts: 36_100,
+  id: "image-live", historyTurnId: "image-history",
+  prompt: "看图", done: false, ts: 36_100,
   images: [{ media_type: "image/png" as const, data: "inline-body" }],
   blocks: [],
 };
@@ -1485,6 +1562,356 @@ assert.equal(
 turnImagePreviews.release(imageMerged[0].id);
 assert.equal(turnImagePreviews.get(imageMerged[0].id, 0), undefined);
 
+function imageCapacityWakeHarness() {
+  let nextHandle = 1;
+  const scheduled = new Map<number, {
+    callback: () => void;
+    delayMs: number;
+  }>();
+  return {
+    scheduler: {
+      schedule(callback: () => void, delayMs: number): unknown {
+        const handle = nextHandle++;
+        scheduled.set(handle, { callback, delayMs });
+        return handle;
+      },
+      cancel(handle: unknown): void {
+        if (typeof handle === "number") scheduled.delete(handle);
+      },
+    },
+    scheduledDelays(): number[] {
+      return [...scheduled.values()].map((task) => task.delayMs);
+    },
+    fireNext(): boolean {
+      const next = scheduled.entries().next().value;
+      if (!next) return false;
+      const [handle, task] = next;
+      scheduled.delete(handle);
+      task.callback();
+      return true;
+    },
+  };
+}
+
+const rotatingHistoryImages = new HistoryImageAssetCache(1);
+const rotatingHistoryAKey = historyImageAssetKey(
+  "rotation-turn", "rotation-a", "thumbnail");
+const rotatingHistoryBKey = historyImageAssetKey(
+  "rotation-turn", "rotation-b", "thumbnail");
+assert.equal(rotatingHistoryImages.begin({
+  sid: "rotation-session",
+  turnId: "rotation-turn",
+  imageId: "rotation-a",
+  variant: "thumbnail",
+  requestId: "rotation-a-first",
+  revision: "rotation-r1",
+}), true);
+assert.equal(rotatingHistoryImages.accept({
+  v: 26,
+  ts: 10,
+  type: "history_image",
+  session_id: "rotation-session",
+  turn_id: "rotation-turn",
+  image_id: "rotation-a",
+  variant: "thumbnail",
+  request_id: "rotation-a-first",
+  revision: "rotation-r1",
+  media_type: "image/png",
+  data: "AA==",
+}), true);
+let rotatingHistoryAObserved = false;
+const rotatingHistoryA = rotatingHistoryImages.forSession(
+  "rotation-session")[rotatingHistoryAKey];
+rotatingHistoryAObserved ||= !!rotatingHistoryA;
+assert.equal(rotatingHistoryA?.status, "ready");
+assert.equal(rotatingHistoryImages.begin({
+  sid: "rotation-session",
+  turnId: "rotation-turn",
+  imageId: "rotation-b",
+  variant: "thumbnail",
+  requestId: "rotation-b-first",
+  revision: "rotation-r1",
+}), true);
+assert.equal(
+  shouldAutoloadHistoryImage(
+    rotatingHistoryImages.forSession("rotation-session")[
+      rotatingHistoryAKey
+    ],
+    rotatingHistoryAObserved,
+  ),
+  false,
+  "an image which already held an asset must not auto-compete after LRU eviction",
+);
+assert.equal(rotatingHistoryImages.accept({
+  v: 26,
+  ts: 11,
+  type: "history_image",
+  session_id: "rotation-session",
+  turn_id: "rotation-turn",
+  image_id: "rotation-b",
+  variant: "thumbnail",
+  request_id: "rotation-b-first",
+  revision: "rotation-r1",
+  media_type: "image/png",
+  data: "AQ==",
+}), true);
+assert.deepEqual(
+  Object.keys(rotatingHistoryImages.forSession("rotation-session")),
+  [rotatingHistoryBKey],
+  "limit-one A/B demand must settle on B instead of automatically rotating to A",
+);
+assert.equal(rotatingHistoryImages.begin({
+  sid: "rotation-session",
+  turnId: "rotation-turn",
+  imageId: "rotation-a",
+  variant: "thumbnail",
+  requestId: "rotation-a-explicit",
+  revision: "rotation-r1",
+}), true, "the evicted image remains available to an explicit retry");
+rotatingHistoryImages.clear();
+
+let historyCapacityNow = 20_000;
+const historyCapacityWake = imageCapacityWakeHarness();
+const silentHistoryCapacity = new HistoryImageAssetCache(
+  1,
+  () => historyCapacityNow,
+  historyCapacityWake.scheduler,
+);
+assert.equal(silentHistoryCapacity.begin({
+  sid: "history-capacity-session",
+  turnId: "history-capacity-turn",
+  imageId: "occupied",
+  variant: "thumbnail",
+  requestId: "history-capacity-occupied",
+  revision: "history-capacity-r1",
+}), true);
+assert.equal(silentHistoryCapacity.begin({
+  sid: "history-capacity-session",
+  turnId: "history-capacity-turn",
+  imageId: "waiting",
+  variant: "thumbnail",
+  requestId: "history-capacity-waiting",
+  revision: "history-capacity-r1",
+}), false);
+assert.deepEqual(
+  historyCapacityWake.scheduledDelays(),
+  [HISTORY_IMAGE_REQUEST_TIMEOUT_MS],
+  "a blocked history image schedules the earliest loading-slot expiry",
+);
+const historyCapacitySnapshot = historyImageAssetCacheSnapshot();
+historyCapacityNow += HISTORY_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(historyCapacityWake.fireNext(), true);
+assert.ok(historyImageAssetCacheSnapshot() > historyCapacitySnapshot,
+  "time alone publishes a history-image capacity wake");
+assert.equal(silentHistoryCapacity.begin({
+  sid: "history-capacity-session",
+  turnId: "history-capacity-turn",
+  imageId: "waiting",
+  variant: "thumbnail",
+  requestId: "history-capacity-retry",
+  revision: "history-capacity-r1",
+}), true, "the mounted history-image waiter can claim the expired slot");
+silentHistoryCapacity.clear();
+
+let inlineCapacityNow = 30_000;
+const inlineCapacityWake = imageCapacityWakeHarness();
+const silentInlineCapacity = new InlineImageAssetCache(
+  1,
+  () => inlineCapacityNow,
+  inlineCapacityWake.scheduler,
+);
+assert.equal(silentInlineCapacity.begin({
+  sid: "inline-capacity-session",
+  path: "/tmp/occupied.png",
+  previewId: "inline-capacity-occupied-preview",
+  requestId: "inline-capacity-occupied",
+}), true);
+assert.equal(silentInlineCapacity.begin({
+  sid: "inline-capacity-session",
+  path: "/tmp/waiting.png",
+  previewId: "inline-capacity-waiting-preview",
+  requestId: "inline-capacity-waiting",
+}), false);
+assert.deepEqual(
+  inlineCapacityWake.scheduledDelays(),
+  [INLINE_IMAGE_REQUEST_TIMEOUT_MS],
+  "a blocked inline image schedules the earliest loading-slot expiry",
+);
+const inlineCapacitySnapshot = inlineImageAssetCacheSnapshot();
+inlineCapacityNow += INLINE_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(inlineCapacityWake.fireNext(), true);
+assert.ok(inlineImageAssetCacheSnapshot() > inlineCapacitySnapshot,
+  "time alone publishes an inline-image capacity wake");
+assert.equal(silentInlineCapacity.begin({
+  sid: "inline-capacity-session",
+  path: "/tmp/waiting.png",
+  previewId: "inline-capacity-retry-preview",
+  requestId: "inline-capacity-retry",
+}), true, "the mounted inline-image waiter can claim the expired slot");
+silentInlineCapacity.clear();
+
+let historyImageNow = 1_000;
+const retryableHistoryImages = new HistoryImageAssetCache(
+  1, () => historyImageNow);
+assert.equal(retryableHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "image-id",
+  variant: "thumbnail",
+  requestId: "history-image-first",
+  revision: "image-r1",
+}), true);
+assert.equal(retryableHistoryImages.has(
+  "image-session", "image-turn", "image-id", "thumbnail"), true);
+historyImageNow += HISTORY_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(retryableHistoryImages.has(
+  "image-session", "image-turn", "image-id", "thumbnail"), false,
+"a silent history-image request becomes retryable after its timeout");
+assert.equal(retryableHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "image-id",
+  variant: "thumbnail",
+  requestId: "history-image-second",
+  revision: "image-r1",
+}), true);
+assert.equal(retryableHistoryImages.accept({
+  v: 26,
+  ts: 10,
+  type: "history_image",
+  session_id: "image-session",
+  turn_id: "image-turn",
+  image_id: "image-id",
+  variant: "thumbnail",
+  request_id: "history-image-second",
+  revision: "image-r1",
+  error: "temporary read failure",
+}), true);
+assert.equal(retryableHistoryImages.has(
+  "image-session", "image-turn", "image-id", "thumbnail"), false,
+"an explicit history-image failure must not poison future retries");
+assert.equal(retryableHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "image-id",
+  variant: "thumbnail",
+  requestId: "history-image-third",
+  revision: "image-r1",
+}), true);
+
+let lateHistoryNow = 3_000;
+const lateHistoryImages = new HistoryImageAssetCache(
+  1, () => lateHistoryNow);
+assert.equal(lateHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "evicted-a",
+  variant: "thumbnail",
+  requestId: "history-evicted-a",
+  revision: "image-r1",
+}), true);
+lateHistoryNow += HISTORY_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(lateHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "active-b",
+  variant: "thumbnail",
+  requestId: "history-active-b",
+  revision: "image-r1",
+}), true);
+assert.equal(lateHistoryImages.accept({
+  v: 26,
+  ts: 10,
+  type: "history_image",
+  session_id: "image-session",
+  turn_id: "image-turn",
+  image_id: "evicted-a",
+  variant: "thumbnail",
+  request_id: "history-evicted-a",
+  revision: "image-r1",
+  media_type: "image/png",
+  data: "AA==",
+}), false,
+"a late response for a timeout-evicted history image must be rejected");
+assert.deepEqual(
+  Object.keys(lateHistoryImages.forSession("image-session")),
+  ["image-turn\u0000active-b\u0000thumbnail"],
+  "late responses cannot grow the history-image cache beyond its hard limit",
+);
+
+let inlineImageNow = 2_000;
+const retryableInlineImages = new InlineImageAssetCache(
+  1, () => inlineImageNow);
+assert.equal(retryableInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/diagram.png",
+  previewId: "inline-preview-one",
+  requestId: "inline-request-one",
+}), true);
+inlineImageNow += INLINE_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(retryableInlineImages.has(
+  "inline-session", "/tmp/diagram.png"), false,
+"a silent inline-image request becomes retryable after its timeout");
+assert.equal(retryableInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/diagram.png",
+  previewId: "inline-preview-two",
+  requestId: "inline-request-two",
+}), true);
+assert.equal(retryableInlineImages.accept({
+  v: 26,
+  ts: 10,
+  type: "preview_asset",
+  sid: "inline-session",
+  path: "/tmp/diagram.png",
+  preview_id: "inline-preview-two",
+  request_id: "inline-request-two",
+  error: "temporary read failure",
+}), true);
+assert.equal(retryableInlineImages.has(
+  "inline-session", "/tmp/diagram.png"), false,
+"an explicit inline-image failure must not poison future retries");
+assert.equal(retryableInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/diagram.png",
+  previewId: "inline-preview-three",
+  requestId: "inline-request-three",
+}), true);
+
+let lateInlineNow = 4_000;
+const lateInlineImages = new InlineImageAssetCache(
+  1, () => lateInlineNow);
+assert.equal(lateInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/evicted-a.png",
+  previewId: "inline-evicted-preview",
+  requestId: "inline-evicted-request",
+}), true);
+lateInlineNow += INLINE_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(lateInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/active-b.png",
+  previewId: "inline-active-preview",
+  requestId: "inline-active-request",
+}), true);
+assert.equal(lateInlineImages.accept({
+  v: 26,
+  ts: 10,
+  type: "preview_asset",
+  sid: "inline-session",
+  path: "/tmp/evicted-a.png",
+  preview_id: "inline-evicted-preview",
+  request_id: "inline-evicted-request",
+  media_type: "image/png",
+  data: "AA==",
+}), false,
+"a late response for a timeout-evicted inline image must be rejected");
+assert.deepEqual(
+  Object.keys(lateInlineImages.forSession("inline-session")),
+  ["/tmp/active-b.png"],
+  "late responses cannot grow the inline-image cache beyond its hard limit",
+);
+
 // A complete transcript must not be reopened forever by stale cache state.
 const terminalHistory = {
   id: "terminal-history", prompt: "run", done: true, ts: 40_000,
@@ -1497,7 +1924,8 @@ const terminalHistory = {
   ],
 };
 const staleLive = {
-  id: "terminal-live", prompt: "run", done: false, ts: 40_100,
+  id: "terminal-live", historyTurnId: "terminal-history",
+  prompt: "run", done: false, ts: 40_100,
   blocks: [
     { kind: "tool" as const, message_id: "tool-msg-live", tool_use_id: "tool-terminal",
       tool: "shell", input: {}, done: false },
@@ -1535,6 +1963,14 @@ assert.deepEqual(
   mergeInitialHistory(repeatedAnswerTurns, []).map((turn) => turn.id),
   ["repeat-1", "repeat-2"],
 );
+assert.deepEqual(
+  mergeInitialHistory(
+    [repeatedAnswerTurns[0]],
+    [{ ...repeatedAnswerTurns[1], done: false }],
+  ).map((turn) => turn.id),
+  ["repeat-1", "repeat-2"],
+  "same prompt and nearby timestamps cannot replace an authoritative alias",
+);
 
 // Exact production race at the pure merge boundary: a focus-triggered History
 // synthesizes TurnEnd while the matching live tail is still running. Preserve
@@ -1546,7 +1982,8 @@ const partialHistory = {
   blocks: [] as Array<{ kind: "text"; message_id: string; text: string; done: boolean }>,
 };
 const liveActive = {
-  id: "client-active", prompt: "在？", done: false, ts: 10_100,
+  id: "client-active", historyTurnId: "engine-active",
+  prompt: "在？", done: false, ts: 10_100,
   blocks: [{ kind: "text" as const, message_id: "live-active-answer",
     text: "", done: false }],
 };
@@ -1908,8 +2345,118 @@ try {
     }),
   });
   assert.deepEqual(rekeyedPlaceholder.sessions.map((session: { session_id: string }) =>
-    session.session_id), ["real-created"],
+  session.session_id), ["real-created"],
   "rekey must atomically migrate the temporary sidebar row");
+  const lifecycleRekey = reduce({
+    ...initialState,
+    focusedSid: "tmp-running",
+    runtimes: {
+      "tmp-running": {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        lastLifecycleSeq: 12,
+      },
+      "real-running": {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+        lastLifecycleSeq: 4,
+      },
+    },
+  }, {
+    type: "event",
+    ownership: ownerB,
+    event: event({
+      type: "session_rekey",
+      old_key: "tmp-running",
+      session_id: "real-running",
+      cwd: "/work/new",
+    }),
+  });
+  assert.equal(
+    lifecycleRekey.runtimes["real-running"].state,
+    "running",
+    "rekey keeps the lifecycle from the runtime with the newer lifecycle sequence",
+  );
+  assert.equal(lifecycleRekey.focusedSid, "real-running");
+  const aliasRekey = reduce({
+    ...initialState,
+    focusedSid: "tmp-alias-running",
+    runtimes: {
+      "tmp-alias-running": {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "rekey-client-turn",
+          historyTurnId: "rekey-native-turn",
+          prompt: "same rekeyed turn",
+          blocks: [{
+            kind: "text",
+            message_id: "rekey-live-answer",
+            channel: "final",
+            text: "live tail",
+            done: false,
+          }],
+          done: false,
+        }],
+      },
+      "real-alias-running": {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+        turns: [{
+          id: "rekey-native-turn",
+          clientMsgId: "rekey-client-turn",
+          prompt: "same rekeyed turn",
+          blocks: [{
+            kind: "text",
+            message_id: "rekey-history-answer",
+            channel: "final",
+            text: "history",
+            done: true,
+          }],
+          done: true,
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    ownership: ownerB,
+    event: event({
+      type: "session_rekey",
+      old_key: "tmp-alias-running",
+      session_id: "real-alias-running",
+      cwd: "/work/new",
+    }),
+  });
+  const aliasRekeyTurns =
+    aliasRekey.runtimes["real-alias-running"].turns;
+  assert.equal(
+    aliasRekeyTurns.length,
+    1,
+    "rekey merges a temp client id with its already-replayed native alias",
+  );
+  assert.deepEqual(
+    {
+      id: aliasRekeyTurns[0].id,
+      historyTurnId: aliasRekeyTurns[0].historyTurnId,
+      done: aliasRekeyTurns[0].done,
+    },
+    {
+      id: "rekey-client-turn",
+      historyTurnId: "rekey-native-turn",
+      done: false,
+    },
+    "rekey preserves the live temp identity while retaining native history authority",
+  );
+  assert.equal(
+    aliasRekeyTurns[0].blocks.some((block: Block) =>
+      block.kind === "text" && block.text.includes("live tail")),
+    true,
+    "rekey cannot discard the live tail when its native alias already exists",
+  );
   const authoritativeCreated = reduce(rekeyedPlaceholder, {
     type: "event", ownership: ownerB,
     event: event({
@@ -2128,7 +2675,16 @@ try {
           id: "older-browser", forkPointId: "older-native",
           prompt: "older", blocks: [], done: false,
         }, {
-          id: "promptless-tail", prompt: "", blocks: [], done: false,
+          id: "promptless-tail", prompt: "", blocks: [{
+            kind: "process",
+            item_id: "promptless-claude-process",
+            processKind: "agent",
+            phase: "start",
+            status: "running",
+            turn_id: "promptless-tail",
+            title: "Claude child process",
+            done: false,
+          }], done: false,
         }],
       },
     },
@@ -2154,6 +2710,11 @@ try {
   assert.equal(
     exactEndState.runtimes[exactEndSid].turns[1].forkPointId,
     "new-native",
+  );
+  assert.equal(
+    exactEndState.runtimes[exactEndSid].turns[1].blocks[0]?.done,
+    true,
+    "Claude child process ids cannot disable the unbound TurnEnd fallback",
   );
   assert.equal(exactEndState.runtimes[exactEndSid].acceptancePending, null);
 
@@ -2194,6 +2755,118 @@ try {
       },
     },
   };
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "steer_sent",
+    sid: steeredTurnSid,
+    prompt: "change direction",
+    msg_id: "steered-follow-up",
+    images: [{ media_type: "image/png", data: "steered-image" }],
+    files: [{ filename: "steered.txt", data: "steered-file" }],
+    ts: 10_500,
+  });
+  assert.deepEqual(
+    steeredTurnState.runtimes[steeredTurnSid].turns.map((turn: Turn) => ({
+      id: turn.id,
+      prompt: turn.prompt,
+      done: turn.done,
+    })),
+    [{
+      id: "steered-original",
+      prompt: "start the task",
+      done: false,
+    }, {
+      id: "steered-follow-up",
+      prompt: "change direction",
+      done: false,
+    }],
+    "a sent steer paints immediately without waiting for the wrapper echo",
+  );
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].acceptancePending,
+    "steered-follow-up",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "assistant_msg_start",
+      sid: steeredTurnSid,
+      message_id: "new-pre-fence-message",
+      channel: "commentary",
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "delta",
+      sid: steeredTurnSid,
+      message_id: "new-pre-fence-message",
+      channel: "commentary",
+      text: "new item admitted before the steer fence",
+    }),
+  });
+  assert.ok(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks.some(
+      (block: Block) => block.kind === "text"
+        && block.message_id === "new-pre-fence-message"),
+    "a new pre-fence assistant item still belongs to the pre-steer segment",
+  );
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[1].blocks.length,
+    0,
+    "an unseen pre-fence item cannot leak into the optimistic steer segment",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "delta",
+      sid: steeredTurnSid,
+      message_id: "steered-original-commentary",
+      channel: "commentary",
+      text: " before the steer fence",
+    }),
+  });
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks[0].kind
+      === "text"
+      ? steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks[0].text
+      : "",
+    "working before the steer fence",
+    "a delayed assistant delta must return to the turn which owns its message id",
+  );
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[1].blocks.length,
+    0,
+    "the delayed pre-steer delta cannot leak into the optimistic steer segment",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "tool_use",
+      sid: steeredTurnSid,
+      message_id: "steered-original-commentary",
+      tool_use_id: "steered-original-tool",
+      tool: "Read",
+      input: { file_path: "/tmp/old" },
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "tool_use",
+      sid: steeredTurnSid,
+      message_id: "steered-original-commentary",
+      tool_use_id: "steered-original-tool",
+      tool: "Read",
+      input: { file_path: "/tmp/old-updated" },
+    }),
+  });
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks.filter(
+      (block: Block) => block.kind === "tool"
+        && block.tool_use_id === "steered-original-tool").length,
+    1,
+    "a replayed delayed tool start updates its original owner exactly once",
+  );
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[1].blocks.length,
+    0,
+    "a delayed tool start cannot attach to the optimistic steer segment",
+  );
   steeredTurnState = reduce(steeredTurnState, {
     type: "event", event: event({
       type: "turn_steered",
@@ -2239,6 +2912,585 @@ try {
   assert.deepEqual(firstSteeredTurns[1].files, [{
     filename: "steered.txt", data: "",
   }]);
+
+  const idleSnapshotRepairSid = "idle-history-repairs-dangling";
+  let idleRepairState = {
+    ...initialState,
+    focusedSid: idleSnapshotRepairSid,
+    runtimes: {
+      [idleSnapshotRepairSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+        turns: [{
+          id: "dangling-history-turn",
+          prompt: "finished while disconnected",
+          done: false,
+          blocks: [{
+            kind: "text" as const,
+            message_id: "dangling-history-answer",
+            text: "partial answer",
+            done: false,
+            channel: "final" as const,
+          }],
+        }],
+      },
+    },
+  };
+  idleRepairState = reduce(idleRepairState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: idleSnapshotRepairSid,
+      revision: "idle-r1",
+      generation: "idle-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "dangling-history-turn",
+        prompt: "finished while disconnected",
+        done: false,
+        blocks: [{
+          kind: "text",
+          message_id: "dangling-history-answer",
+          text: "partial answer",
+          done: false,
+          channel: "final",
+        }],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    idleRepairState.runtimes[idleSnapshotRepairSid].turns[0].done,
+    true,
+    "an authoritative idle History closes a dangling row even after an idle snapshot",
+  );
+  assert.equal(
+    idleRepairState.runtimes[idleSnapshotRepairSid].turns[0].interrupted,
+    true,
+    "missing terminal evidence must not disguise partial output as a successful turn",
+  );
+
+  const optimisticIdleSid = "idle-history-protects-optimistic";
+  let optimisticIdleState = reduce({
+    ...initialState,
+    focusedSid: optimisticIdleSid,
+    runtimes: {
+      [optimisticIdleSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "query_sent",
+    sid: optimisticIdleSid,
+    prompt: "not accepted yet",
+    msg_id: "optimistic-idle-query",
+    ts: 20_000,
+  });
+  optimisticIdleState = reduce(optimisticIdleState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: optimisticIdleSid,
+      revision: "optimistic-idle-r1",
+      generation: "optimistic-idle-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [],
+    }),
+  });
+  assert.equal(
+    optimisticIdleState.runtimes[optimisticIdleSid].turns[0].done,
+    false,
+    "idle History cannot close a query which is still awaiting acceptance",
+  );
+
+  const acceptedIdleSid = "idle-history-confirms-and-closes";
+  let acceptedIdleState = reduce({
+    ...initialState,
+    focusedSid: acceptedIdleSid,
+    runtimes: {
+      [acceptedIdleSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "query_sent",
+    sid: acceptedIdleSid,
+    prompt: "accepted but terminal was lost",
+    msg_id: "accepted-idle-query",
+    ts: 21_000,
+  });
+  acceptedIdleState = reduce(acceptedIdleState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: acceptedIdleSid,
+      revision: "accepted-idle-r1",
+      generation: "accepted-idle-g1",
+      build_seq: 1,
+      live_seq: 1,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "accepted-idle-query",
+        prompt: "accepted but terminal was lost",
+        done: false,
+        blocks: [],
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    acceptedIdleState.runtimes[acceptedIdleSid].acceptancePending,
+    null,
+    "the authoritative row confirms the optimistic query",
+  );
+  assert.equal(
+    acceptedIdleState.runtimes[acceptedIdleSid].turns[0].done,
+    true,
+    "the same idle History must close the just-confirmed dangling row",
+  );
+  assert.equal(
+    acceptedIdleState.runtimes[acceptedIdleSid].turns[0].interrupted,
+    true,
+    "a confirmed row without a terminal remains interrupted rather than successful",
+  );
+
+  const historyAliasSid = "history-client-message-alias";
+  let historyAliasState = reduce({
+    ...initialState,
+    focusedSid: historyAliasSid,
+    runtimes: {
+      [historyAliasSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: historyAliasSid,
+    prompt: "alias steer",
+    msg_id: "browser-alias-steer",
+    ts: 22_000,
+  });
+  historyAliasState = reduce(historyAliasState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: historyAliasSid,
+      revision: "alias-r1",
+      generation: "alias-g1",
+      build_seq: 1,
+      live_seq: 2,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "native-alias-steer",
+        clientMsgId: "browser-alias-steer",
+        prompt: "alias steer",
+        done: true,
+        blocks: [],
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    historyAliasState.runtimes[historyAliasSid].acceptancePending,
+    null,
+    "History clientMsgId must release the same reducer latch as RelayWs",
+  );
+  assert.deepEqual(
+    historyAliasState.runtimes[historyAliasSid].turns.map(
+      (turn: Turn) => turn.id),
+    ["browser-alias-steer"],
+    "a native History alias reconciles into the optimistic steer exactly once",
+  );
+
+  const runningAliasSid = "history-running-steer-alias";
+  const runningAliasNativeTurn = "history-running-native-task";
+  let runningAliasState = reduce({
+    ...initialState,
+    focusedSid: runningAliasSid,
+    runtimes: {
+      [runningAliasSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "history-running-original",
+          forkPointId: runningAliasNativeTurn,
+          liveTaskId: runningAliasNativeTurn,
+          prompt: "start",
+          blocks: [],
+          done: false,
+          ts: 10_000,
+        }],
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: runningAliasSid,
+    prompt: "history confirms this steer",
+    msg_id: "history-running-client-steer",
+    ts: 20_000,
+  });
+  runningAliasState = reduce(runningAliasState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: runningAliasSid,
+      revision: "history-running-r1",
+      generation: "history-running-g1",
+      build_seq: 1,
+      live_seq: 2,
+      detail: "summary",
+      has_more: true,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "history-running-native-steer",
+        clientMsgId: "history-running-client-steer",
+        prompt: "history confirms this steer",
+        done: false,
+        blocks: [],
+        ts: 20_000,
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    runningAliasState.runtimes[runningAliasSid].turns.map((turn: Turn) => ({
+      id: turn.id,
+      done: turn.done,
+      liveTaskId: turn.liveTaskId,
+    })),
+    [{
+      id: "history-running-original",
+      done: true,
+      liveTaskId: undefined,
+    }, {
+      id: "history-running-client-steer",
+      done: false,
+      liveTaskId: runningAliasNativeTurn,
+    }],
+    "a running History alias moves native ownership across the steer fence",
+  );
+  runningAliasState = reduce(runningAliasState, {
+    type: "event", event: event({
+      type: "process",
+      sid: runningAliasSid,
+      item_id: "history-running-process",
+      turn_id: runningAliasNativeTurn,
+      kind: "command",
+      phase: "start",
+      status: "running",
+      title: "new segment work",
+    }),
+  });
+  assert.equal(
+    runningAliasState.runtimes[runningAliasSid].turns[1].blocks[0]?.kind,
+    "process",
+    "native process events follow the History-confirmed steer segment",
+  );
+  runningAliasState = reduce(runningAliasState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: runningAliasSid,
+      turn_id: runningAliasNativeTurn,
+      result: { subtype: "success", duration_ms: 3, is_error: false },
+    }),
+  });
+  assert.equal(
+    runningAliasState.runtimes[runningAliasSid].turns[1].done,
+    true,
+    "the native terminal closes the History-confirmed steer segment",
+  );
+
+  const exactSteerSid = "history-running-exact-steer";
+  const exactSteerNativeTurn = "history-running-exact-native-task";
+  let exactSteerState = reduce({
+    ...initialState,
+    focusedSid: exactSteerSid,
+    runtimes: {
+      [exactSteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "history-running-exact-original",
+          forkPointId: exactSteerNativeTurn,
+          liveTaskId: exactSteerNativeTurn,
+          prompt: "start",
+          blocks: [],
+          done: false,
+          ts: 10_000,
+        }],
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: exactSteerSid,
+    prompt: "history confirms the exact steer id",
+    msg_id: "history-running-exact-client-steer",
+    ts: 20_000,
+  });
+  exactSteerState = reduce(exactSteerState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: exactSteerSid,
+      revision: "history-running-exact-r1",
+      generation: "history-running-exact-g1",
+      build_seq: 1,
+      live_seq: 2,
+      detail: "summary",
+      has_more: true,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "history-running-exact-client-steer",
+        prompt: "history confirms the exact steer id",
+        done: false,
+        blocks: [],
+        ts: 20_000,
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    exactSteerState.runtimes[exactSteerSid].turns.map((turn: Turn) => ({
+      id: turn.id,
+      done: turn.done,
+      liveTaskId: turn.liveTaskId,
+    })),
+    [{
+      id: "history-running-exact-original",
+      done: true,
+      liveTaskId: undefined,
+    }, {
+      id: "history-running-exact-client-steer",
+      done: false,
+      liveTaskId: exactSteerNativeTurn,
+    }],
+    "an exact History steer id moves ownership without clientMsgId metadata",
+  );
+  exactSteerState = reduce(exactSteerState, {
+    type: "event", event: event({
+      type: "process",
+      sid: exactSteerSid,
+      item_id: "history-running-exact-process",
+      turn_id: exactSteerNativeTurn,
+      kind: "command",
+      phase: "start",
+      status: "running",
+      title: "new exact segment work",
+    }),
+  });
+  assert.equal(
+    exactSteerState.runtimes[exactSteerSid].turns[1].blocks[0]?.kind,
+    "process",
+    "native process follows an exact-id History-confirmed steer",
+  );
+
+  const unknownSteerSid = "unknown-steer-terminal-owner";
+  const unknownCurrentNative = "unknown-current-native";
+  let unknownSteerState = reduce({
+    ...initialState,
+    focusedSid: unknownSteerSid,
+    runtimes: {
+      [unknownSteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "unknown-old",
+          forkPointId: "unknown-old-native",
+          prompt: "old",
+          blocks: [],
+          done: true,
+        }, {
+          id: "unknown-current",
+          forkPointId: unknownCurrentNative,
+          liveTaskId: unknownCurrentNative,
+          prompt: "current",
+          blocks: [],
+          done: false,
+        }],
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: unknownSteerSid,
+    prompt: "uncertain steer",
+    msg_id: "unknown-client-steer",
+    ts: 30_000,
+  });
+  unknownSteerState = reduce(unknownSteerState, {
+    type: "event", event: event({
+      type: "error",
+      sid: unknownSteerSid,
+      msg_id: "unknown-client-steer",
+      code: "steer_outcome_unknown",
+      message: "connection closed before acceptance was observed",
+    }),
+  });
+  const secondUnknownDispatch = reduce(unknownSteerState, {
+    type: "steer_sent",
+    sid: unknownSteerSid,
+    prompt: "must not be sent",
+    msg_id: "unknown-second-steer",
+    ts: 31_000,
+  });
+  assert.equal(
+    secondUnknownDispatch.runtimes[unknownSteerSid].turns.some(
+      (turn: Turn) => turn.id === "unknown-second-steer"),
+    false,
+    "the reducer keeps one steer acceptance lane while its outcome is unknown",
+  );
+  unknownSteerState = reduce(unknownSteerState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: unknownSteerSid,
+      turn_id: "unknown-old-native",
+      result: { subtype: "success", duration_ms: 1, is_error: false },
+    }),
+  });
+  assert.equal(
+    unknownSteerState.runtimes[unknownSteerSid].acceptancePending,
+    "unknown-client-steer",
+    "a stale older TurnEnd cannot resolve the current unknown steer",
+  );
+  assert.equal(
+    unknownSteerState.runtimes[unknownSteerSid].turns[1].done,
+    false,
+  );
+  unknownSteerState = reduce(unknownSteerState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: unknownSteerSid,
+      turn_id: unknownCurrentNative,
+      result: { subtype: "success", duration_ms: 2, is_error: false },
+    }),
+  });
+  assert.equal(
+    unknownSteerState.runtimes[unknownSteerSid].acceptancePending,
+    null,
+    "the active native owner's terminal resolves the unknown steer",
+  );
+  assert.equal(
+    unknownSteerState.runtimes[unknownSteerSid].turns.at(-1)?.interrupted,
+    true,
+  );
+
+  const prunedStaleSid = "unknown-steer-pruned-stale-terminal";
+  const prunedCurrentNative = "unknown-pruned-current-native";
+  let prunedStaleState = reduce({
+    ...initialState,
+    focusedSid: prunedStaleSid,
+    runtimes: {
+      [prunedStaleSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "unknown-pruned-current",
+          prompt: "current after old rows were pruned",
+          blocks: [{
+            kind: "process",
+            item_id: "unknown-pruned-process",
+            processKind: "command",
+            phase: "start",
+            status: "running",
+            turn_id: prunedCurrentNative,
+            title: "current work",
+            done: false,
+          }],
+          done: false,
+        }],
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: prunedStaleSid,
+    prompt: "uncertain steer after pruning",
+    msg_id: "unknown-pruned-client-steer",
+    ts: 35_000,
+  });
+  prunedStaleState = reduce(prunedStaleState, {
+    type: "event", event: event({
+      type: "error",
+      sid: prunedStaleSid,
+      msg_id: "unknown-pruned-client-steer",
+      code: "steer_outcome_unknown",
+      message: "connection closed before acceptance was observed",
+    }),
+  });
+  prunedStaleState = reduce(prunedStaleState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: prunedStaleSid,
+      turn_id: "unknown-pruned-unrelated-old-native",
+      result: { subtype: "success", duration_ms: 1, is_error: false },
+    }),
+  });
+  assert.equal(
+    prunedStaleState.runtimes[prunedStaleSid].acceptancePending,
+    "unknown-pruned-client-steer",
+    "a pruned stale TurnEnd cannot consume the sole explicitly-bound owner",
+  );
+  assert.equal(
+    prunedStaleState.runtimes[prunedStaleSid].turns[0].done,
+    false,
+  );
+  prunedStaleState = reduce(prunedStaleState, {
+    type: "event", event: event({
+      type: "state",
+      sid: prunedStaleSid,
+      state: "idle",
+      ts: 36,
+    }),
+  });
+  const prunedIdleTurns =
+    prunedStaleState.runtimes[prunedStaleSid].turns;
+  assert.equal(
+    prunedStaleState.runtimes[prunedStaleSid].acceptancePending,
+    null,
+    "authoritative idle resolves an unknown steer without a TurnEnd",
+  );
+  assert.deepEqual(
+    prunedIdleTurns.map((turn: Turn) => ({
+      done: turn.done,
+      interrupted: turn.interrupted,
+    })),
+    [
+      { done: true, interrupted: true },
+      { done: true, interrupted: true },
+    ],
+    "authoritative idle closes both the predecessor and unknown steer segment",
+  );
+  assert.equal(
+    prunedIdleTurns[0].blocks[0]?.done,
+    true,
+    "authoritative idle cannot leave the predecessor process spinning",
+  );
 
   steeredTurnState = reduce(steeredTurnState, {
     type: "event", event: event({
@@ -2338,6 +3590,71 @@ try {
     "the native TurnEnd closes and binds only the latest steered segment",
   );
 
+  const concurrentSteerSid = "codex-concurrent-steer";
+  const concurrentTurnId = "native-concurrent-turn";
+  let concurrentSteerState = {
+    ...initialState,
+    focusedSid: concurrentSteerSid,
+    runtimes: {
+      [concurrentSteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "concurrent-original",
+          forkPointId: concurrentTurnId,
+          liveTaskId: concurrentTurnId,
+          prompt: "original",
+          blocks: [],
+          done: false,
+        }],
+      },
+    },
+  };
+  concurrentSteerState = reduce(concurrentSteerState, {
+    type: "steer_sent",
+    sid: concurrentSteerSid,
+    prompt: "mine",
+    msg_id: "mine-steer",
+    ts: 40_000,
+  });
+  concurrentSteerState = reduce(concurrentSteerState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      sid: concurrentSteerSid,
+      msg_id: "external-steer",
+      turn_id: concurrentTurnId,
+      prompt: "external",
+      ts: 41,
+    }),
+  });
+  concurrentSteerState = reduce(concurrentSteerState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      sid: concurrentSteerSid,
+      msg_id: "mine-steer",
+      turn_id: concurrentTurnId,
+      prompt: "mine",
+      ts: 42,
+    }),
+  });
+  assert.deepEqual(
+    concurrentSteerState.runtimes[concurrentSteerSid].turns.map(
+      (turn: Turn) => ({
+        id: turn.id,
+        done: turn.done,
+        liveTaskId: turn.liveTaskId,
+      })),
+    [{
+      id: "concurrent-original", done: true, liveTaskId: undefined,
+    }, {
+      id: "external-steer", done: true, liveTaskId: undefined,
+    }, {
+      id: "mine-steer", done: false, liveTaskId: concurrentTurnId,
+    }],
+    "an external steer accepted first must stay before the later local optimistic steer",
+  );
+
   const rejectedSteerSid = "codex-steer-rejected";
   const rejectedSteerBefore: Turn = {
     id: "still-running-after-rejection",
@@ -2364,6 +3681,13 @@ try {
     },
   };
   rejectedSteerState = reduce(rejectedSteerState, {
+    type: "steer_sent",
+    sid: rejectedSteerSid,
+    prompt: "rejected steer",
+    msg_id: "rejected-steer-message",
+    ts: 30_000,
+  });
+  rejectedSteerState = reduce(rejectedSteerState, {
     type: "event", event: event({
       type: "error",
       sid: rejectedSteerSid,
@@ -2376,6 +3700,11 @@ try {
     rejectedSteerState.runtimes[rejectedSteerSid].turns,
     [rejectedSteerBefore],
     "a rejected steer is a command problem and cannot close the active turn",
+  );
+  assert.equal(
+    rejectedSteerState.runtimes[rejectedSteerSid].acceptancePending,
+    null,
+    "a definitive steer rejection releases the optimistic acceptance latch",
   );
   assert.equal(
     rejectedSteerState.runtimes[rejectedSteerSid].state,
@@ -2647,6 +3976,32 @@ try {
     repeatedPromptRestores.map(processFingerprint),
     [["process-0"], ["process-1"]],
     "nearby repeated prompts must restore each turn's own cached process exactly once",
+  );
+  const aliasSummaries: Turn[] = ["a", "b"].map((suffix, index) => ({
+    ...repeatedPromptSummaries[index],
+    id: `client-${suffix}`,
+    historyTurnId: `native-${suffix}`,
+  }));
+  const aliasCaches: Turn[] = ["a", "b"].map((suffix, index) => ({
+    ...repeatedPromptCaches[index],
+    id: `native-${suffix}`,
+    // Deliberately make timestamp affinity prefer the wrong repeated prompt.
+    ts: index === 0 ? aliasSummaries[1].ts : aliasSummaries[0].ts,
+    blocks: [{
+      kind: "process",
+      item_id: `native-${suffix}-process`,
+      processKind: "command",
+      phase: "snapshot",
+      status: "succeeded",
+      title: `native-process-${suffix}`,
+      done: true,
+    }, ...repeatedPromptSummaries[index].blocks],
+  }));
+  const aliasRestores = restoreCachedTurnDetails(aliasSummaries, aliasCaches);
+  assert.deepEqual(
+    aliasRestores.map(processFingerprint),
+    [["native-process-a"], ["native-process-b"]],
+    "historyTurnId must beat repeated-prompt timestamp affinity during cache restore",
   );
 
   let cacheFirstRefresh = reduce({
@@ -5335,7 +6690,8 @@ try {
     type: "history", sid, session_id: sid, revision: "main-rev",
     in_progress: true, has_more: false,
     events: [
-      event({ type: "user_msg", sid, msg_id: "engine-a", prompt: "在？", ts: 10 }),
+      event({ type: "user_msg", sid, msg_id: "engine-a",
+        client_msg_id: "client-a", prompt: "在？", ts: 10 }),
       event({ type: "turn_end", sid, ts: 11, turn_id: "codex-turn-a",
         result: { subtype: "success", duration_ms: 0, is_error: false } }),
     ],
@@ -5355,7 +6711,8 @@ try {
     type: "history", sid, session_id: sid, revision: "main-rev",
     in_progress: false, has_more: false,
     events: [
-      event({ type: "user_msg", sid, msg_id: "engine-a", prompt: "在？", ts: 10 }),
+      event({ type: "user_msg", sid, msg_id: "engine-a",
+        client_msg_id: "client-a", prompt: "在？", ts: 10 }),
       event({ type: "assistant_msg_start", sid, message_id: "engine-answer" }),
       event({ type: "delta", sid, message_id: "engine-answer", text: "only once" }),
       event({ type: "assistant_msg_end", sid, message_id: "engine-answer" }),
@@ -5841,6 +7198,78 @@ try {
   assert.equal((codexHookWrappedBatchMarkup.match(/class="tool-group"/g) || []).length, 1,
     "successful Codex hooks must not split one tool batch into many rows");
   assert.doesNotMatch(codexHookWrappedBatchMarkup, /Hook · preToolUse/);
+  const deferredToolMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: false,
+    deferredCount: 20,
+    onLoadDetail: () => {},
+    blocks: [{
+      kind: "tool",
+      message_id: "summary-placeholder-message",
+      tool_use_id: "summary-placeholder-tool",
+      tool: "shell",
+      category: "command",
+      title: "运行命令",
+      input: {},
+      done: false,
+    }],
+  }));
+  assert.match(deferredToolMarkup, /20 项/);
+  assert.doesNotMatch(deferredToolMarkup, /class="tool-group"/,
+    "payload-free summary tools stay hidden until authoritative detail arrives");
+  assert.doesNotMatch(deferredToolMarkup, /运行命令/,
+    "summary placeholders cannot render an empty command card");
+  const retainedZeroArgToolMarkup = renderToStaticMarkup(
+    createElement(ProcessTimeline, {
+      engine: "codex",
+      done: true,
+      deferredCount: 20,
+      openOverride: true,
+      onLoadDetail: () => {},
+      blocks: [{
+        kind: "tool",
+        message_id: "retained-zero-arg-message",
+        tool_use_id: "retained-zero-arg-tool",
+        tool: "list_resources",
+        title: "List resources",
+        input: {},
+        done: true,
+        result: { content: "", is_error: false, status: "succeeded" },
+      }],
+    }),
+  );
+  assert.match(
+    retainedZeroArgToolMarkup,
+    /class="tool-group"/,
+    "a completed zero-argument cached tool is real retained detail, not a summary shell",
+  );
+  const retainedCommandMetadataMarkup = renderToStaticMarkup(
+    createElement(ProcessTimeline, {
+      engine: "codex",
+      done: true,
+      deferredCount: 20,
+      openOverride: true,
+      onLoadDetail: () => {},
+      blocks: [{
+        kind: "process",
+        item_id: "retained-command-metadata",
+        processKind: "command",
+        phase: "end",
+        status: "succeeded",
+        title: "Command finished",
+        exit_code: 0,
+        duration_ms: 1250,
+        done: true,
+      }],
+    }),
+  );
+  assert.match(
+    retainedCommandMetadataMarkup,
+    /Command finished/,
+    "completed command metadata remains visible while authoritative detail is deferred",
+  );
+  assert.match(retainedCommandMetadataMarkup, /exit 0/);
+  assert.match(retainedCommandMetadataMarkup, /1s/);
 
   const codexFailedHookMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     engine: "codex", done: false,

@@ -145,7 +145,8 @@ function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
   const filePaths = block.processKind === "file_change"
     ? filePathsFromInput(block.input) : [];
   const hasBody = !!(block.summary || block.detail || block.output || block.diff
-    || block.progress || block.command || block.cwd || block.plan?.length
+    || block.progress || block.explanation || block.command || block.cwd
+    || block.plan?.length || block.exit_code != null || block.duration_ms != null
     || (block.input && Object.keys(block.input).length));
   const body = (
     <>
@@ -285,6 +286,61 @@ function isCodexPresentationNoise(block: Block): boolean {
   return !["failed", "declined", "cancelled", "interrupted"].includes(block.status);
 }
 
+const TERMINAL_PROCESS_STATUSES = new Set([
+  "succeeded", "failed", "declined", "cancelled", "interrupted",
+]);
+
+function isCommandTool(block: ToolBlock): boolean {
+  if (block.category === "command") return true;
+  return ["bash", "shell", "commandexecution"].includes(
+    block.tool.toLowerCase(),
+  );
+}
+
+function isGenericCommandTitle(title: string | null | undefined): boolean {
+  return !title || title === "运行命令" || title === "Run command";
+}
+
+function isPayloadFreeUnfinishedCommandShell(block: Block): boolean {
+  if (block.kind === "text") return false;
+  if (block.kind === "tool") {
+    if (block.done || !isCommandTool(block)) return false;
+    const result = block.result;
+    const hasPayload = Object.keys(block.input).length > 0
+      || !isGenericCommandTitle(block.title)
+      || !!block.server
+      || !!block.output
+      || !!block.diff
+      || !!block.progress
+      || !!result?.content
+      || !!result?.summary
+      || !!result?.diff
+      || result?.status != null
+      || result?.exit_code != null
+      || result?.duration_ms != null
+      || result?.is_error === true;
+    return !hasPayload;
+  }
+  if (block.processKind !== "command"
+      || block.done
+      || TERMINAL_PROCESS_STATUSES.has(block.status)) return false;
+  const hasPayload = !!block.command
+    || !!block.output
+    || !!block.diff
+    || !!block.summary
+    || !!block.detail
+    || !!block.progress
+    || !!block.explanation
+    || !!block.plan?.length
+    || !!(block.input && Object.keys(block.input).length > 0)
+    || !!block.cwd
+    || !!block.server
+    || !!block.tool
+    || block.exit_code != null
+    || block.duration_ms != null;
+  return !hasPayload;
+}
+
 export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onOpenFile,
   deferredCount = 0, detailLoading = false, onLoadDetail,
   imageAssets, onLoadImage, onPreviewImage, engine = "claude",
@@ -314,10 +370,22 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   // Keep actionable commentary, plans, hook failures and tools, but suppress
   // synthetic reasoning and successful hook plumbing so consecutive tool calls
   // collapse into one useful group.
-  const items = processBlocks(blocks).filter((block) => engine !== "codex" || !(
+  const projectedItems = processBlocks(blocks).filter(
+    (block) => engine !== "codex" || !(
     isCodexPresentationNoise(block)
   ));
-  const complete = done && !hasActiveProcess(items);
+  const needsAuthoritativeDetail = deferredCount > 0;
+  // Summary History may include bounded lifecycle/tool shells so the header can
+  // report that work exists, but their inputs and outputs are intentionally
+  // absent. Hide only those payload-free command shells: a same-revision cache
+  // may already contain useful recent rows which must remain visible while one
+  // click fetches the rest of the authoritative detail.
+  const items = needsAuthoritativeDetail
+    ? projectedItems.filter(
+        (block) => !isPayloadFreeUnfinishedCommandShell(block),
+      )
+    : projectedItems;
+  const complete = done && !hasActiveProcess(projectedItems);
   const [uncontrolledOpen, setUncontrolledOpen] = useState(!complete);
   const open = openOverride ?? uncontrolledOpen;
   const [now, setNow] = useState(Date.now());
@@ -345,7 +413,6 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
     interactionTokens.current.clear();
   }, [onInteractionEnd]);
 
-  const needsAuthoritativeDetail = deferredCount > 0;
   const hasDeferredOnly = items.length === 0 && needsAuthoritativeDetail;
   if (!items.length && !hasDeferredOnly) return null;
   // A completed timeline is collapsed. Do not allocate/group hundreds of

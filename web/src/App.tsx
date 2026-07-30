@@ -2808,8 +2808,21 @@ export default function App() {
   ): boolean => {
     const ws = wsRef.current;
     if (!ws || !focusedSid || focusedEngine !== "codex") return false;
+    const runtime = stateRef.current.runtimes[focusedSid];
+    if (ws.pendingQueryFor(focusedSid) || runtime?.acceptancePending) {
+      return false;
+    }
     const msg_id = uuid();
     if (!ws.sendSteerTo(focusedSid, prompt, msg_id, images, files)) return false;
+    dispatch({
+      type: "steer_sent",
+      sid: focusedSid,
+      prompt,
+      msg_id,
+      images,
+      files,
+      ts: Date.now(),
+    });
     if (stateRef.current.historyBrowse?.sid === focusedSid) {
       dispatch({ type: "return_to_latest", sid: focusedSid });
     }
@@ -3298,7 +3311,14 @@ export default function App() {
     const sid = activeBtwSid;
     const ws = wsRef.current;
     if (!sid || !ws || activeBtw?.engine !== "codex") return false;
-    return ws.sendSteerTo(sid, prompt, uuid());
+    const runtime = stateRef.current.runtimes[sid];
+    if (ws.pendingQueryFor(sid) || runtime?.acceptancePending) return false;
+    const msg_id = uuid();
+    if (!ws.sendSteerTo(sid, prompt, msg_id)) return false;
+    dispatch({
+      type: "steer_sent", sid, prompt, msg_id, ts: Date.now(),
+    });
+    return true;
   };
   const interruptBtw = (sid: string) => {
     wsRef.current?.sendInterruptTo(sid);

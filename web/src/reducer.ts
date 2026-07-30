@@ -256,6 +256,7 @@ export interface SessionRuntime {
   // Browser query accepted into the reliable outbox but not yet confirmed by
   // its exact user echo / native turn binding / correlated terminal Error.
   acceptancePending: string | null;
+  acceptanceKind: "query" | "steer" | "steer_unknown" | null;
   acceptanceHistoryBaseline: QueryAcceptanceHistoryHead | null;
 }
 
@@ -340,6 +341,7 @@ export function createRuntime(): SessionRuntime {
     notices: [], sendMode: "steer",
     queue: [], pendingSend: null, failedDeferred: [],
     acceptancePending: null,
+    acceptanceKind: null,
     acceptanceHistoryBaseline: null,
   };
 }
@@ -348,6 +350,7 @@ export type Action =
   | { type: "reset" }
   | { type: "event"; event: ServerEvent; ownership?: EventOwnership }
   | { type: "query_sent"; sid: string; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[]; ts: number }
+  | { type: "steer_sent"; sid: string; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[]; ts: number }
   | { type: "conn"; connState: ConnState; detail?: string }
   | { type: "command_error"; detail: string }
   | { type: "dismiss_banner"; banner: string }
@@ -499,6 +502,62 @@ function openTurn(turns: Turn[], fallbackId: string, ts?: number): Turn {
   return turn;
 }
 
+function findTurnOwningMessage(
+  turns: Turn[], messageId: string | null | undefined,
+): Turn | undefined {
+  if (!messageId) return undefined;
+  return [...turns].reverse().find((turn) => turn.blocks.some((block) =>
+    block.kind === "text"
+      ? block.message_id === messageId
+      : block.kind === "tool"
+        ? block.message_id === messageId
+        : false));
+}
+
+function turnIdentityAliases(
+  turn: Pick<Turn, "id" | "clientMsgId" | "historyTurnId">,
+): string[] {
+  return [turn.id, turn.clientMsgId, turn.historyTurnId]
+    .filter((value): value is string => !!value);
+}
+
+function turnHasIdentityAlias(
+  turn: Pick<Turn, "id" | "clientMsgId" | "historyTurnId">,
+  id: string | null | undefined,
+): boolean {
+  return !!id && turnIdentityAliases(turn).includes(id);
+}
+
+function turnsShareIdentityAlias(
+  first: Pick<Turn, "id" | "clientMsgId" | "historyTurnId">,
+  second: Pick<Turn, "id" | "clientMsgId" | "historyTurnId">,
+): boolean {
+  const firstAliases = new Set(turnIdentityAliases(first));
+  return turnIdentityAliases(second).some((alias) =>
+    firstAliases.has(alias));
+}
+
+function pendingOptimisticSteerIndex(
+  runtime: SessionRuntime, turns: Turn[],
+): number {
+  if ((runtime.acceptanceKind !== "steer"
+      && runtime.acceptanceKind !== "steer_unknown")
+      || !runtime.acceptancePending) return -1;
+  return turns.findIndex((turn) =>
+    turn.id === runtime.acceptancePending
+    && turn.clientMsgId === runtime.acceptancePending
+    && !turn.liveTaskId);
+}
+
+function preSteerTurn(
+  runtime: SessionRuntime, turns: Turn[],
+): Turn | undefined {
+  const pendingIndex = pendingOptimisticSteerIndex(runtime, turns);
+  if (pendingIndex < 0) return undefined;
+  return [...turns.slice(0, pendingIndex)]
+    .reverse().find((turn) => !turn.done);
+}
+
 function eventTimestampMs(ts: number | null | undefined): number | undefined {
   return typeof ts === "number" ? Math.round(ts * 1000) : undefined;
 }
@@ -510,6 +569,18 @@ function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn 
     || turn.forkPointId === id || turn.codexTurnId === id
     || turn.blocks.some((block) => block.kind === "process"
       && block.turn_id === id));
+}
+
+function turnHasBoundEngineId(turn: Turn): boolean {
+  // Child process rows do not establish terminal ownership. Claude can stamp
+  // them with the browser message id while its ResultMessage reveals a distinct
+  // assistant UUID only at TurnEnd, which is precisely the legacy fallback
+  // this guard must preserve. A process id outside every visible alias is an
+  // independent native binding, though, and must reject an unrelated terminal.
+  const aliases = turnIdentityAliases(turn);
+  return !!(turn.liveTaskId || turn.forkPointId || turn.codexTurnId
+    || turn.blocks.some((block) => block.kind === "process"
+      && !!block.turn_id && !aliases.includes(block.turn_id)));
 }
 
 function findTurnOwningItem(turns: Turn[], id: string | null | undefined): Turn | undefined {
@@ -729,22 +800,97 @@ function finishOpenBlocks(
   }
 }
 
+const UNKNOWN_TERMINAL_ERROR =
+  "会话已结束，但未收到完整的终止状态。";
+const UNKNOWN_STEER_TERMINAL_ERROR =
+  "任务已结束，但本次引导是否生效未得到确认。";
+
+function clearAcceptance(runtime: SessionRuntime): void {
+  runtime.acceptancePending = null;
+  runtime.acceptanceKind = null;
+  runtime.acceptanceHistoryBaseline = null;
+}
+
+function finishTurnWithoutTerminal(
+  turn: Turn, doneTs: number,
+  message: string | null = UNKNOWN_TERMINAL_ERROR,
+): void {
+  if (turn.done) return;
+  turn.done = true;
+  turn.doneTs ??= doneTs;
+  turn.progress = undefined;
+  turn.interrupted = true;
+  if (message) turn.error ??= message;
+  finishOpenBlocks(turn, "interrupted", true);
+}
+
+function finishTurnAtSteerFence(
+  turn: Turn, nativeTurnId: string, doneTs: number,
+): void {
+  if (turn.done) return;
+  turn.done = true;
+  turn.durationMs = 0;
+  turn.doneTs = doneTs;
+  turn.progress = undefined;
+  if (turn.forkPointId === nativeTurnId) {
+    turn.forkPointId = undefined;
+  }
+  turn.liveTaskId = undefined;
+  finishOpenBlocks(turn, "succeeded", false);
+}
+
+function reconcileAcceptedSteerHistory(
+  turns: Turn[], pendingId: string, doneTs: number,
+): void {
+  const acceptedIndex = turns.findIndex((turn) =>
+    turnHasIdentityAlias(turn, pendingId));
+  if (acceptedIndex < 0) return;
+  const accepted = turns[acceptedIndex];
+  const previous = [...turns.slice(0, acceptedIndex)]
+    .reverse().find((turn) => !turn.done);
+  if (!previous) return;
+  // History can confirm the client/native user alias before the live
+  // TurnSteered frame arrives. Move the active app-server task identity across
+  // the same narrative fence so later process/TurnEnd events target the new
+  // segment rather than resurrecting its predecessor.
+  const nativeTurnId = previous.liveTaskId ?? previous.forkPointId;
+  finishTurnAtSteerFence(previous, nativeTurnId ?? "", doneTs);
+  if (nativeTurnId && !accepted.done) {
+    accepted.liveTaskId ??= nativeTurnId;
+  }
+}
+
+function resolveUnknownPendingSteer(
+  runtime: SessionRuntime, turns: Turn[], doneTs: number,
+): void {
+  if (runtime.acceptanceKind !== "steer_unknown"
+      || !runtime.acceptancePending) return;
+  const pending = turns.find((turn) =>
+    turn.id === runtime.acceptancePending
+    && turn.clientMsgId === runtime.acceptancePending);
+  if (pending) {
+    finishTurnWithoutTerminal(
+      pending, doneTs, UNKNOWN_STEER_TERMINAL_ERROR);
+  }
+  clearAcceptance(runtime);
+}
+
 /** Reconcile an unfinished browser tail against a current authoritative History
  * snapshot which explicitly says the session is idle. This is a lost-terminal
  * recovery path: keep already-rendered text/process detail, but never leave its
  * timer and child blocks running forever. */
 function finishOpenTurnsFromIdleHistory(
   turns: Turn[], interrupted: boolean, doneTs: number,
+  preserveTurnId?: string | null,
 ): Turn[] {
   return turns.map((turn) => {
-    if (turn.done) return turn;
+    if (turn.done || turn.id === preserveTurnId) return turn;
     const next = { ...turn, blocks: turn.blocks.map((block) => ({ ...block })) };
-    next.done = true;
-    next.doneTs ??= doneTs;
-    next.progress = undefined;
-    if (interrupted) next.interrupted = true;
-    finishOpenBlocks(
-      next, interrupted ? "interrupted" : "succeeded", interrupted);
+    finishTurnWithoutTerminal(
+      next,
+      doneTs,
+      interrupted ? null : UNKNOWN_TERMINAL_ERROR,
+    );
     return next;
   });
 }
@@ -1025,7 +1171,8 @@ export function reduce(state: AppState, action: Action): AppState {
       return state.banner === action.banner
         ? { ...state, banner: undefined }
         : state;
-    case "query_sent": {
+    case "query_sent":
+    case "steer_sent": {
       const current = state.runtimes[action.sid];
       if (!current || (current.acceptancePending
           && current.acceptancePending !== action.msg_id)) return state;
@@ -1043,18 +1190,23 @@ export function reduce(state: AppState, action: Action): AppState {
         : null;
       const turn: Turn = {
         id: action.msg_id, prompt: action.prompt, blocks: [], done: false,
+        clientMsgId: action.type === "steer_sent"
+          ? action.msg_id : undefined,
         images: action.images,
         files: action.files?.map((file) => ({ filename: file.filename, data: "" })),
         ts: action.ts,
       };
       let runtimes = reduceTargetedRuntime(
         state.runtimes, action.sid, { type: "query_sent", turn });
-      if (runtimes[action.sid]?.acceptancePending !== action.msg_id) {
+      if (runtimes[action.sid]?.acceptancePending !== action.msg_id
+          || runtimes[action.sid]?.acceptanceKind == null) {
         runtimes = {
           ...runtimes,
           [action.sid]: {
             ...runtimes[action.sid],
             acceptancePending: action.msg_id,
+            acceptanceKind: action.type === "steer_sent"
+              ? "steer" : "query",
             acceptanceHistoryBaseline,
           },
         };
@@ -1726,17 +1878,46 @@ function reduceEvent(
         const source = runtimes[old_key];
         const target = runtimes[session_id];
         if (target) {
-          const seen = new Set(target.turns.map((turn) => turn.id));
-          const mergedTurns = [
-            ...target.turns,
-            ...source.turns.filter((turn) => !seen.has(turn.id)),
-          ];
+          const mergedTurns = [...target.turns];
+          const usedTargetIndexes = new Set<number>();
+          for (let sourceIndex = 0; sourceIndex < source.turns.length;
+            sourceIndex += 1) {
+            const sourceTurn = source.turns[sourceIndex];
+            const targetIndex = mergedTurns.findIndex((targetTurn, index) =>
+              !usedTargetIndexes.has(index)
+              && turnsShareIdentityAlias(targetTurn, sourceTurn));
+            if (targetIndex < 0) {
+              mergedTurns.push(sourceTurn);
+              continue;
+            }
+            const merged = mergeInitialHistory(
+              [mergedTurns[targetIndex]],
+              [sourceTurn],
+              {
+                preserveLiveTailOpen:
+                  sourceIndex === source.turns.length - 1
+                  && source.state !== "idle"
+                  && !sourceTurn.done,
+              },
+            )[0];
+            if (merged) mergedTurns[targetIndex] = merged;
+            usedTargetIndexes.add(targetIndex);
+          }
           const mergedControlGeneration =
             source.controlGeneration ?? target.controlGeneration;
           const mergedControl = source.controlGeneration
               && source.controlGeneration !== target.controlGeneration
             ? source.control
             : newestSessionControl(target.control, source.control);
+          const lifecycleRuntime = source.lastLifecycleSeq > target.lastLifecycleSeq
+            ? source
+            : target.lastLifecycleSeq > source.lastLifecycleSeq
+              ? target
+              : source.state !== "idle" && target.state === "idle"
+                ? source
+                : target.state !== "idle" && source.state === "idle"
+                  ? target
+                  : source;
           const mergedRuntime: SessionRuntime = {
             ...target,
             ...source,
@@ -1744,7 +1925,8 @@ function reduceEvent(
             controlGeneration: null,
             hasRevisionedControl:
               target.hasRevisionedControl || source.hasRevisionedControl,
-            state: target.state,
+            state: lifecycleRuntime.state,
+            mirroredRunning: lifecycleRuntime.mirroredRunning,
             syncReady: target.syncReady || source.syncReady,
             historyInvalidated:
               target.historyInvalidated || source.historyInvalidated,
@@ -1791,6 +1973,8 @@ function reduceEvent(
             ],
             acceptancePending:
               source.acceptancePending ?? target.acceptancePending,
+            acceptanceKind: source.acceptancePending
+              ? source.acceptanceKind : target.acceptanceKind,
             acceptanceHistoryBaseline: source.acceptancePending
               ? source.acceptanceHistoryBaseline
               : target.acceptanceHistoryBaseline,
@@ -2126,9 +2310,10 @@ function reduceEvent(
         return state;
       }
       const pendingAcceptanceTurn = base.acceptancePending
-        ? base.turns.find((turn) => turn.id === base.acceptancePending)
+        ? base.turns.find((turn) =>
+            turnHasIdentityAlias(turn, base.acceptancePending))
         : undefined;
-      const acceptedNativeTurnId = pendingAcceptanceTurn
+      const baselineAcceptedNativeTurnId = pendingAcceptanceTurn
           && base.acceptanceHistoryBaseline
         ? matchQueryAcceptanceHistory(
           queryAcceptanceDescriptor(
@@ -2141,6 +2326,24 @@ function reduceEvent(
           e,
         )
         : null;
+      const acceptedHistoryTurn = base.acceptancePending
+        ? built.turns.find((turn) =>
+            turnHasIdentityAlias(turn, base.acceptancePending))
+        : undefined;
+      const acceptedNativeTurnId = acceptedHistoryTurn?.id
+        ?? baselineAcceptedNativeTurnId;
+      const acceptanceConfirmed = !!base.acceptancePending && (
+        !!acceptedNativeTurnId
+        || e.events.some((ev) => {
+          if (ev.type === "user_msg"
+              && ev.client_msg_id === base.acceptancePending) return true;
+          return (
+            ev.type === "user_msg" || ev.type === "turn_steered"
+              || ev.type === "turn_binding"
+              || (ev.type === "error" && ev.code !== "wrapper_offline")
+          ) && ev.msg_id === base.acceptancePending;
+        })
+      );
       if (acceptedNativeTurnId && base.acceptancePending
           && acceptedNativeTurnId !== base.acceptancePending) {
         // The materialized transcript owns a native user id while live UI owns
@@ -2157,6 +2360,14 @@ function reduceEvent(
       }
       const racedLiveEvent = !e.before && e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
+      const resolveUnknownSteerFromIdle = !e.before
+        && e.in_progress === false
+        && !racedLiveEvent
+        && base.acceptanceKind === "steer_unknown"
+        && !!base.acceptancePending
+        && !acceptanceConfirmed;
+      const acceptanceRuntime = { ...base };
+      if (acceptanceConfirmed) clearAcceptance(acceptanceRuntime);
       const preserveStableHeadHistory = !e.before
         && base.turns.length > 0
         && (base.hasLoadedOlderHistory || e.has_more === true)
@@ -2215,25 +2426,47 @@ function reduceEvent(
           preserveLiveTailOpen: racedLiveEvent || e.in_progress === true
             || (e.in_progress == null && base.state !== "idle"),
         });
+        if (acceptanceConfirmed && base.acceptancePending
+            && (base.acceptanceKind === "steer"
+              || base.acceptanceKind === "steer_unknown")
+            && acceptedNativeTurnId) {
+          reconcileAcceptedSteerHistory(
+            turns,
+            base.acceptancePending,
+            e.ts ? Math.round(e.ts * 1000) : Date.now(),
+          );
+        }
         // A current first page which explicitly reports idle is the recovery
         // boundary for a lost TurnEnd. Do not close a merely optimistic local
         // query (base is still idle), or a tail advanced after this History read.
-        if (e.in_progress === false && !racedLiveEvent && base.state !== "idle") {
+        if (e.in_progress === false && !racedLiveEvent) {
           const wasInterrupting = base.state === "interrupting"
             || base.state === "draining";
+          const doneTs = e.ts ? Math.round(e.ts * 1000) : Date.now();
           turns = finishOpenTurnsFromIdleHistory(
             turns, wasInterrupting,
-            e.ts ? Math.round(e.ts * 1000) : Date.now());
+            doneTs,
+            acceptanceConfirmed ? null : base.acceptancePending);
+          if (resolveUnknownSteerFromIdle) {
+            resolveUnknownPendingSteer(
+              acceptanceRuntime, turns, doneTs);
+          }
         }
       }
       if (e.detail === "summary" && !base.historyInvalidated
           && base.historyRevision === e.revision) {
-        const loadedDetail = new Map(base.turns
-          .filter((turn) => turn.detailLoaded
-            || (turn.detailProjection?.segments.length ?? 0) > 0)
-          .map((turn) => [turn.id, turn]));
+        const loadedDetail = new Map<string, Turn>();
+        for (const turn of base.turns) {
+          if (!turn.detailLoaded
+              && (turn.detailProjection?.segments.length ?? 0) === 0) continue;
+          for (const alias of turnIdentityAliases(turn)) {
+            loadedDetail.set(alias, turn);
+          }
+        }
         turns = turns.map((turn) => {
-          const detail = loadedDetail.get(turn.id);
+          const detail = turnIdentityAliases(turn)
+            .map((alias) => loadedDetail.get(alias))
+            .find((candidate): candidate is Turn => !!candidate);
           if (!detail) return turn;
           const merged = mergeAuthoritativeTurnDetail(turn, detail);
           if (turn.done) {
@@ -2272,16 +2505,6 @@ function reduceEvent(
           && base.lastLifecycleSeq <= e.live_seq));
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
-      const acceptanceConfirmed = !!base.acceptancePending && (
-        !!acceptedNativeTurnId
-        || built.turns.some((turn) => turn.id === base.acceptancePending)
-        || e.events.some((ev) => (
-          (ev.type === "user_msg" || ev.type === "turn_steered"
-            || ev.type === "turn_binding"
-            || (ev.type === "error" && ev.code !== "wrapper_offline"))
-          && ev.msg_id === base.acceptancePending
-        ))
-      );
       let historyBrowse = state.historyBrowse;
       if (historyBrowse?.sid === sid) {
         if (historyBrowse.revision !== e.revision
@@ -2375,10 +2598,10 @@ function reduceEvent(
             takeoverMessage: acceptsOwnershipState
               ? (e.takeover_pending ? base.takeoverMessage : null)
               : base.takeoverMessage,
-            acceptancePending: acceptanceConfirmed
-              ? null : base.acceptancePending,
-            acceptanceHistoryBaseline: acceptanceConfirmed
-              ? null : base.acceptanceHistoryBaseline,
+            acceptancePending: acceptanceRuntime.acceptancePending,
+            acceptanceKind: acceptanceRuntime.acceptanceKind,
+            acceptanceHistoryBaseline:
+              acceptanceRuntime.acceptanceHistoryBaseline,
           },
         },
         historyRecovery: advanceHistoryRecovery(state.historyRecovery, e),
@@ -2611,6 +2834,15 @@ function reduceEvent(
         }
         if (e.state === "idle") {
           rt.pendingQuestion = null;
+          const doneTs = eventTimestampMs(e.ts) ?? Date.now();
+          if (rt.acceptanceKind === "steer_unknown") {
+            for (const candidate of turns) {
+              if (candidate.id === rt.acceptancePending) continue;
+              finishTurnWithoutTerminal(candidate, doneTs);
+            }
+          }
+          resolveUnknownPendingSteer(
+            rt, turns, doneTs);
         }
         rt.turns = turns;
       });
@@ -2904,10 +3136,27 @@ function reduceEvent(
       }
       if ((e.code === "not_steerable"
           || e.code === "steer_outcome_unknown") && e.msg_id) {
-        // A rejected steer is a control failure, not the terminal state of the
-        // still-running native turn. Never fabricate an empty failed turn that
-        // would steal subsequent deltas from the active segment.
-        return { ...state, banner: presentCommandProblem(e) };
+        const next = patch(state, e.sid, (rt) => {
+          if (rt.acceptancePending !== e.msg_id
+              || rt.acceptanceKind !== "steer") return;
+          if (e.code === "steer_outcome_unknown") {
+            // Transport loss after submission is not a rejection. Keep both
+            // the reliable acceptance latch and the optimistic row until a
+            // narrative echo or an authoritative terminal boundary resolves it.
+            rt.acceptanceKind = "steer_unknown";
+            return;
+          }
+          // A definitive rejection is a control failure, not the terminal state
+          // of the still-running native turn. Remove only the exact untouched
+          // optimistic segment; never close or rewrite its active predecessor.
+          rt.turns = rt.turns.filter((turn) => !(
+            turn.id === e.msg_id
+            && turn.clientMsgId === e.msg_id
+            && !turn.liveTaskId
+          ));
+          clearAcceptance(rt);
+        });
+        return { ...next, banner: presentCommandProblem(e) };
       }
       if (e.msg_id) {
         const key = e.sid ?? state.focusedSid;
@@ -2970,8 +3219,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         rt.loading = false; // never leave a spinner spinning behind an error
         if (rt.acceptancePending === e.msg_id) {
-          rt.acceptancePending = null;
-          rt.acceptanceHistoryBaseline = null;
+          clearAcceptance(rt);
         }
         markTurnAsLive(rt, e.msg_id!, boundCompletedTurns, e.seq);
         const turns = cloneTurns(rt.turns);
@@ -2995,17 +3243,28 @@ function reduceEvent(
         // query_queue removal normally precedes the user boundary. This fallback
         // also reconciles a replay gap or an older wrapper which emitted only
         // the accepted message.
-        rt.queue = rt.queue.filter((query) => query.msg_id !== e.msg_id);
-        if (rt.pendingSend?.msg_id === e.msg_id) rt.pendingSend = null;
+        const acceptedIds = new Set(
+          [e.msg_id, e.client_msg_id].filter(
+            (id): id is string => !!id));
+        rt.queue = rt.queue.filter(
+          (query) => !query.msg_id || !acceptedIds.has(query.msg_id));
+        if (rt.pendingSend?.msg_id
+            && acceptedIds.has(rt.pendingSend.msg_id)) rt.pendingSend = null;
         rt.failedDeferred = rt.failedDeferred.filter(
-          (query) => query.msg_id !== e.msg_id);
-        if (rt.acceptancePending === e.msg_id) {
-          rt.acceptancePending = null;
-          rt.acceptanceHistoryBaseline = null;
+          (query) => !query.msg_id || !acceptedIds.has(query.msg_id));
+        if (rt.acceptancePending
+            && acceptedIds.has(rt.acceptancePending)) {
+          clearAcceptance(rt);
         }
         markTurnAsLive(rt, e.msg_id, boundCompletedTurns, e.seq);
+        if (e.client_msg_id && e.client_msg_id !== e.msg_id) {
+          markTurnAsLive(
+            rt, e.client_msg_id, boundCompletedTurns, e.seq);
+        }
         const turns = cloneTurns(rt.turns);
-        const existing = turns.find((t) => t.id === e.msg_id);
+        const existing = turns.find((turn) =>
+          turnHasIdentityAlias(turn, e.msg_id)
+          || turnHasIdentityAlias(turn, e.client_msg_id));
         const imgs = (e.images && e.images.length) ? e.images : undefined;
         const fileMeta = (e.files && e.files.length)
           ? e.files.map((file) => ({ filename: file.filename, data: "" }))
@@ -3020,9 +3279,21 @@ function reduceEvent(
           else if (existing.files) existing.files = existing.files.map(
             (file) => ({ filename: file.filename, data: "" }));
           if (stamp) existing.ts = stamp;
+          if (e.client_msg_id) existing.clientMsgId ??= e.client_msg_id;
+          if (e.client_msg_id === existing.id && e.msg_id !== existing.id) {
+            existing.historyTurnId ??= e.msg_id;
+          }
         } else {
-          turns.push({ id: e.msg_id, prompt: e.prompt, images: imgs,
-            files: fileMeta, blocks: [], done: false, ts: stamp });
+          turns.push({
+            id: e.msg_id,
+            clientMsgId: e.client_msg_id ?? undefined,
+            prompt: e.prompt,
+            images: imgs,
+            files: fileMeta,
+            blocks: [],
+            done: false,
+            ts: stamp,
+          });
         }
         rt.turns = turns;
       });
@@ -3033,49 +3304,63 @@ function reduceEvent(
     }
     case "turn_steered": {
       const next = patch(state, e.sid, (rt) => {
-        if (rt.acceptancePending === e.msg_id) {
-          rt.acceptancePending = null;
-          rt.acceptanceHistoryBaseline = null;
-        }
-        markTurnAsLive(rt, e.msg_id, boundCompletedTurns, e.seq);
         const turns = cloneTurns(rt.turns);
         const imgs = (e.images && e.images.length) ? e.images : undefined;
         const fileMeta = (e.files && e.files.length)
           ? e.files.map((file) => ({ filename: file.filename, data: "" }))
           : undefined;
         const stamp = eventTimestampMs(e.ts);
-        const existing = turns.find((turn) =>
-          turn.id === e.msg_id || turn.clientMsgId === e.msg_id);
+        const doneTs = stamp ?? Date.now();
+        const localAcceptance = rt.acceptancePending === e.msg_id
+          && (rt.acceptanceKind === "steer"
+            || rt.acceptanceKind === "steer_unknown");
+        const optimisticIndex = pendingOptimisticSteerIndex(rt, turns);
+        let existing = turns.find((turn) =>
+          turnHasIdentityAlias(turn, e.msg_id));
         if (existing) {
+          if (localAcceptance) {
+            // An external steer can be accepted while this browser's own
+            // optimistic row waits for its echo. Keep every accepted segment
+            // in source order and make the local segment the latest owner.
+            turns.splice(turns.indexOf(existing), 1);
+            const previous = [...turns].reverse()
+              .find((turn) => !turn.done);
+            if (previous) {
+              finishTurnAtSteerFence(previous, e.turn_id, doneTs);
+            }
+            existing.done = false;
+            existing.doneTs = undefined;
+            existing.durationMs = undefined;
+            existing.interrupted = undefined;
+            existing.error = undefined;
+            existing.progress = undefined;
+            turns.push(existing);
+            clearAcceptance(rt);
+          }
           // Reliable-command replay can deliver the correlated narrative frame
-          // again after reconnect. Refresh metadata without closing another
-          // segment or duplicating the user bubble.
+          // again after reconnect. Other duplicates only refresh metadata.
           existing.prompt ||= e.prompt;
           existing.images ??= imgs;
           if (fileMeta) existing.files = fileMeta;
           existing.ts ??= stamp;
           existing.clientMsgId ??= e.msg_id;
           existing.liveTaskId ??= e.turn_id;
+          markTurnAsLive(rt, existing.id, boundCompletedTurns, e.seq);
           rt.turns = turns;
           return;
         }
 
-        const previous = [...turns].reverse().find((turn) => !turn.done);
+        const insertBeforeOptimistic = optimisticIndex >= 0
+          && !localAcceptance;
+        const predecessorPool = insertBeforeOptimistic
+          ? turns.slice(0, optimisticIndex)
+          : turns;
+        const previous = [...predecessorPool].reverse()
+          .find((turn) => !turn.done);
         if (previous) {
-          previous.done = true;
-          previous.durationMs = 0;
-          previous.doneTs = stamp ?? Date.now();
-          previous.progress = undefined;
-          // Before steer, TurnBinding temporarily attached the native task to
-          // the first visible segment. The task's real fork boundary belongs to
-          // the final segment after all steered input has run.
-          if (previous.forkPointId === e.turn_id) {
-            previous.forkPointId = undefined;
-          }
-          previous.liveTaskId = undefined;
-          finishOpenBlocks(previous, "succeeded", false);
+          finishTurnAtSteerFence(previous, e.turn_id, doneTs);
         }
-        turns.push({
+        existing = {
           id: e.msg_id,
           clientMsgId: e.msg_id,
           liveTaskId: e.turn_id,
@@ -3085,7 +3370,14 @@ function reduceEvent(
           blocks: [],
           done: false,
           ts: stamp,
-        });
+        };
+        if (insertBeforeOptimistic) {
+          turns.splice(optimisticIndex, 0, existing);
+        } else {
+          turns.push(existing);
+        }
+        if (localAcceptance) clearAcceptance(rt);
+        markTurnAsLive(rt, existing.id, boundCompletedTurns, e.seq);
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
       }, true);
@@ -3097,7 +3389,9 @@ function reduceEvent(
     case "assistant_msg_start":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = openTurn(turns, e.message_id, eventTimestampMs(e.ts));
+        const t = findTurnOwningMessage(turns, e.message_id)
+          ?? preSteerTurn(rt, turns)
+          ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const block = t.blocks.find((b) => b.kind === "text"
@@ -3113,7 +3407,9 @@ function reduceEvent(
     case "delta":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = openTurn(turns, e.message_id, eventTimestampMs(e.ts));
+        const t = findTurnOwningMessage(turns, e.message_id)
+          ?? preSteerTurn(rt, turns)
+          ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         let block = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
@@ -3131,7 +3427,10 @@ function reduceEvent(
     case "tool_use":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = openTurn(turns, e.message_id, eventTimestampMs(e.ts));
+        const t = findTurnOwningItem(turns, e.tool_use_id)
+          ?? findTurnOwningMessage(turns, e.message_id)
+          ?? preSteerTurn(rt, turns)
+          ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const existing = t.blocks.find((b) => b.kind === "tool"
@@ -3332,11 +3631,11 @@ function reduceEvent(
     case "turn_binding":
       return patch(state, e.sid, (rt) => {
         if (rt.acceptancePending === e.msg_id) {
-          rt.acceptancePending = null;
-          rt.acceptanceHistoryBaseline = null;
+          clearAcceptance(rt);
         }
         const turns = cloneTurns(rt.turns);
-        const optimisticIndex = turns.findIndex((turn) => turn.id === e.msg_id);
+        const optimisticIndex = turns.findIndex((turn) =>
+          turnHasIdentityAlias(turn, e.msg_id));
         if (optimisticIndex < 0) return;
         turns[optimisticIndex].forkPointId = e.turn_id;
         const authoritativeIndex = turns.findIndex((turn, index) => (
@@ -3360,19 +3659,26 @@ function reduceEvent(
     case "turn_end":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
+        const unknownSteerOwner = preSteerTurn(rt, turns);
         let t = findTurnByEngineId(turns, e.turn_id);
         if (!t) {
-          const openTurns = turns.filter((turn) => !turn.done);
+          const openTurns = turns.filter((turn) => !turn.done
+            && !(rt.acceptanceKind === "steer_unknown"
+              && turn.id === rt.acceptancePending
+              && turn.clientMsgId === rt.acceptancePending
+              && !turn.liveTaskId));
           // Claude and older producers may reveal the native id only at the
           // terminal boundary. Preserve that legacy path when there is exactly
           // one unclosed owner, while never closing an unrelated completed row.
-          if (openTurns.length === 1) t = openTurns[0];
+          if (openTurns.length === 1
+              && !turnHasBoundEngineId(openTurns[0])) {
+            t = openTurns[0];
+          }
         }
         if (t) {
           markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
           if (rt.acceptancePending === t.id) {
-            rt.acceptancePending = null;
-            rt.acceptanceHistoryBaseline = null;
+            clearAcceptance(rt);
           }
           t.done = true;
           t.durationMs = e.result.duration_ms;
@@ -3391,6 +3697,10 @@ function reduceEvent(
           t.doneTs = e.ts ? Math.round(e.ts * 1000) : (t.ts || Date.now());
           finishOpenBlocks(t, e.result.is_error ? "interrupted" : "succeeded",
             e.result.is_error);
+        }
+        if (t && t === unknownSteerOwner) {
+          resolveUnknownPendingSteer(
+            rt, turns, eventTimestampMs(e.ts) ?? Date.now());
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;

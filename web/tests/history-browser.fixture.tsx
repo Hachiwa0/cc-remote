@@ -1,13 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 
 import "../src/index.css";
 import "../src/App.css";
-import { OMITTED_PROCESS_ITEM_ID, type Turn } from "../src/reducer";
+import {
+  createRuntime,
+  initialState,
+  OMITTED_PROCESS_ITEM_ID,
+  reduce,
+  type AppState,
+  type Turn,
+} from "../src/reducer";
 import type {
   PermissionProfileInfo,
   QueryFile,
   QueryImg,
+  ServerEvent,
   Space,
   StatusReport,
 } from "../src/protocol";
@@ -15,6 +30,17 @@ import { PROTOCOL_VERSION } from "../src/protocol";
 import {
   ChatView,
 } from "../src/components/ChatView";
+import { MessageBlock } from "../src/components/MessageBlock";
+import {
+  historyImageAssetKey,
+  type HistoryImageAsset,
+  type HistoryImageVariant,
+} from "../src/history-image-assets";
+import {
+  InlineImageAssetCache,
+  INLINE_IMAGE_REQUEST_TIMEOUT_MS,
+  type InlineImageAsset,
+} from "../src/inline-image-assets";
 import type { TextSelectionGuard } from "../src/history-selection-guard";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
 import { UsageMeter } from "../src/components/UsageMeter";
@@ -27,6 +53,7 @@ import {
 import { DirPicker } from "../src/components/DirPicker";
 import { HeaderMenu } from "../src/components/HeaderMenu";
 import { UsageActivitySheet } from "../src/components/UsageActivitySheet";
+import { displayHistoryProjection } from "../src/history-recovery";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -465,6 +492,223 @@ function UsageActivityBrowserFixture({
       onRefresh={() => {}}
     />
   </main>;
+}
+
+const REDUCER_SESSION_A = "reducer-history-session-a";
+const REDUCER_SESSION_B = "reducer-history-session-b";
+const REDUCER_HISTORY_SCOPE = "fixture-reducer-history-scope";
+const REDUCER_HISTORY_REVISION = "reducer-revision-1";
+const REDUCER_HISTORY_GENERATION = "reducer-generation-1";
+
+function reducerHistoryEvent(
+  sid: string,
+  turns: Turn[],
+  options: {
+    buildSeq: number;
+    hasMore: boolean;
+    oldestId?: string | null;
+    newestId?: string | null;
+    liveSeq?: number;
+  },
+): ServerEvent {
+  return {
+    v: 26,
+    ts: Date.now() / 1000,
+    type: "history",
+    session_id: sid,
+    revision: REDUCER_HISTORY_REVISION,
+    generation: REDUCER_HISTORY_GENERATION,
+    build_seq: options.buildSeq,
+    live_seq: options.liveSeq ?? 0,
+    authoritative: true,
+    detail: "summary",
+    events: [],
+    turns,
+    has_more: options.hasMore,
+    oldest_id: options.oldestId ?? turns[0]?.id ?? null,
+    newest_id: options.newestId ?? turns.at(-1)?.id ?? null,
+    in_progress: false,
+  };
+}
+
+function reducerHistoryInitialState(): AppState {
+  let state: AppState = {
+    ...initialState,
+    focusedSid: REDUCER_SESSION_A,
+    runtimes: {
+      [REDUCER_SESSION_A]: createRuntime(),
+      [REDUCER_SESSION_B]: createRuntime(),
+    },
+  };
+  state = reduce(state, {
+    type: "event",
+    event: reducerHistoryEvent(
+      REDUCER_SESSION_A,
+      Array.from({ length: 20 }, (_, index) =>
+        finalTurn(`reducer-m${index + 21}`, 3)),
+      {
+        buildSeq: 1,
+        hasMore: true,
+        oldestId: "reducer-m21",
+        newestId: "reducer-m40",
+      },
+    ),
+  });
+  state = reduce(state, {
+    type: "event",
+    event: reducerHistoryEvent(
+      REDUCER_SESSION_B,
+      Array.from({ length: 8 }, (_, index) =>
+        finalTurn(`reducer-b${index + 1}`, 3)),
+      {
+        buildSeq: 1,
+        hasMore: false,
+        oldestId: "reducer-b1",
+        newestId: "reducer-b8",
+      },
+    ),
+  });
+  return state;
+}
+
+function ReducerHistoryBrowserFixture() {
+  const [state, dispatch] = useReducer(
+    reduce,
+    undefined,
+    reducerHistoryInitialState,
+  );
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const [loads, setLoads] = useState(0);
+  const [refreshes, setRefreshes] = useState(0);
+  const sid = state.focusedSid ?? REDUCER_SESSION_A;
+  const runtime = state.runtimes[sid] ?? createRuntime();
+  const historyView = displayHistoryProjection(
+    state.historyRecovery,
+    sid,
+    runtime,
+    state.historyBrowse,
+  );
+
+  const loadOlder = useCallback((): boolean | {
+    accepted: true;
+    viewId: string;
+  } => {
+    const current = stateRef.current;
+    const requestSid = current.focusedSid;
+    const requestRuntime = requestSid
+      ? current.runtimes[requestSid] : undefined;
+    if (!requestSid || requestSid !== REDUCER_SESSION_A
+        || !requestRuntime?.historyRevision
+        || !requestRuntime.hasMore
+        || !requestRuntime.oldestId
+        || current.historyBrowse) return false;
+    const viewId = "reducer-browse-1";
+    dispatch({
+      type: "begin_history_browse",
+      sid: requestSid,
+      scopeKey: REDUCER_HISTORY_SCOPE,
+      revision: requestRuntime.historyRevision,
+      generation: requestRuntime.historyGeneration,
+      viewId,
+      basePageKey: "reducer-latest-page",
+    });
+    setLoads((value) => value + 1);
+    window.setTimeout(() => {
+      const latest = stateRef.current;
+      const browse = latest.historyBrowse;
+      if (!browse || latest.focusedSid !== requestSid) return;
+      dispatch({
+        type: "install_history_browse_page",
+        sid: requestSid,
+        scopeKey: browse.scopeKey,
+        revision: browse.revision,
+        generation: browse.generation,
+        viewId: browse.viewId,
+        windowEpoch: browse.windowEpoch,
+        before: browse.olderCursor!,
+        page: {
+          pageKey: "reducer-older-page",
+          turns: Array.from({ length: 20 }, (_, index) =>
+            finalTurn(`reducer-m${index + 1}`, index === 14 ? 4 : 3)),
+          hasOlder: false,
+          olderCursor: null,
+          newerPageKey: browse.oldestPageKey,
+        },
+      });
+    }, 25);
+    return { accepted: true, viewId };
+  }, []);
+
+  const refreshLiveRuntime = useCallback(() => {
+    const current = stateRef.current;
+    const target = current.runtimes[REDUCER_SESSION_A];
+    const nextBuildSeq = Math.max(2, (target?.historyBuildSeq ?? 0) + 1);
+    dispatch({
+      type: "event",
+      event: reducerHistoryEvent(
+        REDUCER_SESSION_A,
+        Array.from({ length: 16 }, (_, index) =>
+          finalTurn(`reducer-m${index + 25}`, index === 15 ? 5 : 3)),
+        {
+          buildSeq: nextBuildSeq,
+          hasMore: true,
+          oldestId: "reducer-m25",
+          newestId: "reducer-m40",
+          liveSeq: target?.lastLiveSeq ?? 0,
+        },
+      ),
+    });
+    setRefreshes((value) => value + 1);
+  }, []);
+
+  const switchSession = useCallback(() => {
+    const target = stateRef.current.focusedSid === REDUCER_SESSION_A
+      ? REDUCER_SESSION_B : REDUCER_SESSION_A;
+    dispatch({ type: "focus_session", sid: target });
+  }, []);
+
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: "none", minHeight: 24 }}>
+        <output data-testid="load-count">{loads}</output>
+        <output data-testid="reducer-refresh-count">{refreshes}</output>
+        <output data-testid="reducer-focused-sid">{sid}</output>
+        <output data-testid="reducer-turn-count">{historyView.turns.length}</output>
+        <output data-testid="reducer-unique-turn-count">{
+          new Set(historyView.turns.map(
+            (turn) => turn.historyTurnId ?? turn.id,
+          )).size
+        }</output>
+        <button data-testid="switch-session" type="button"
+          onClick={switchSession}>
+          switch
+        </button>
+        <button data-testid="reducer-live-refresh" type="button"
+          onClick={refreshLiveRuntime}>
+          refresh live runtime
+        </button>
+      </div>
+      <ChatView
+        sid={sid}
+        turns={historyView.turns}
+        engine="codex"
+        hasMore={historyView.hasMore}
+        historyRevision={runtime.historyRevision}
+        historyViewRevision={historyView.viewRevision}
+        historyViewId={historyView.viewId}
+        historyScopeKey={historyView.browsing
+          ? state.historyBrowse?.scopeKey : REDUCER_HISTORY_SCOPE}
+        historyWindowEpoch={historyView.windowEpoch}
+        historyCursor={historyView.oldestId}
+        browseMode={historyView.browsing}
+        hasNewer={historyView.hasNewer}
+        onLoadMore={loadOlder}
+        onEdit={() => {}}
+        onGetDiff={() => {}}
+      />
+    </main>
+  );
 }
 
 function HistoryConversationBrowserFixture() {
@@ -1245,4 +1489,189 @@ export function HistoryBrowserFixture() {
   return <HistoryConversationBrowserFixture />;
 }
 
-createRoot(document.getElementById("root")!).render(<HistoryBrowserFixture />);
+function InlineImageCapacityFixture() {
+  const cacheRef = useRef<InlineImageAssetCache | null>(null);
+  const requestSequenceRef = useRef(0);
+  const occupiedRequestId = "occupied-inline-image";
+  if (cacheRef.current === null) {
+    cacheRef.current = new InlineImageAssetCache(1);
+    if (!cacheRef.current.begin({
+      sid: "other-session",
+      path: "/tmp/occupied.png",
+      previewId: "occupied-preview",
+      requestId: occupiedRequestId,
+    })) {
+      throw new Error("inline image capacity fixture failed to occupy its cache");
+    }
+  }
+  const [assets, setAssets] = useState<Record<string, InlineImageAsset>>({});
+  const [attempts, setAttempts] = useState(0);
+  const [networkLoads, setNetworkLoads] = useState(0);
+  const loadImage = useCallback((path: string): boolean => {
+    setAttempts((value) => value + 1);
+    const sequence = ++requestSequenceRef.current;
+    const accepted = cacheRef.current!.begin({
+      sid: "capacity-session",
+      path,
+      previewId: `capacity-preview-${sequence}`,
+      requestId: `capacity-request-${sequence}`,
+    });
+    if (!accepted) return false;
+    setNetworkLoads((value) => value + 1);
+    setAssets(cacheRef.current!.forSession("capacity-session"));
+    return true;
+  }, []);
+  return (
+    <main>
+      <button type="button" data-testid="release-inline-capacity"
+        onClick={() => cacheRef.current!.cancel(occupiedRequestId)}>
+        release
+      </button>
+      <output data-testid="inline-load-attempts">{attempts}</output>
+      <output data-testid="inline-network-loads">{networkLoads}</output>
+      <MessageBlock text="![capacity image](/tmp/capacity.png)" done
+        imageAssets={assets} onLoadImage={loadImage} />
+    </main>
+  );
+}
+
+function InlineImageEvictionFixture() {
+  const sid = "two-visible-inline-images";
+  const cacheRef = useRef<InlineImageAssetCache | null>(null);
+  const requestSequenceRef = useRef(0);
+  const settleTimersRef = useRef<number[]>([]);
+  if (cacheRef.current === null) {
+    cacheRef.current = new InlineImageAssetCache(1);
+  }
+  const [assets, setAssets] = useState<Record<string, InlineImageAsset>>({});
+  const [attempts, setAttempts] = useState(0);
+  const [networkLoads, setNetworkLoads] = useState(0);
+  const noLoaderAssets = useMemo<Record<string, InlineImageAsset>>(() => ({
+    "/tmp/no-loader-error.png": { status: "error" },
+    "/tmp/no-loader-timeout.png": {
+      status: "loading",
+      startedAt: Date.now() - INLINE_IMAGE_REQUEST_TIMEOUT_MS - 1,
+      requestGeneration: 1,
+    },
+  }), []);
+  useEffect(() => () => {
+    settleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+  }, []);
+  const loadImage = useCallback((path: string): boolean => {
+    setAttempts((value) => value + 1);
+    const cache = cacheRef.current!;
+    if (cache.has(sid, path)) return true;
+    const sequence = ++requestSequenceRef.current;
+    const previewId = `visible-preview-${sequence}`;
+    const requestId = `visible-request-${sequence}`;
+    if (!cache.begin({ sid, path, previewId, requestId })) return false;
+    setNetworkLoads((value) => value + 1);
+    setAssets(cache.forSession(sid));
+    settleTimersRef.current.push(window.setTimeout(() => {
+      if (!cache.accept({
+        v: 26,
+        ts: Date.now() / 1000,
+        type: "preview_asset",
+        sid,
+        path,
+        preview_id: previewId,
+        request_id: requestId,
+        media_type: "image/png",
+        data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlK4h8AAAAASUVORK5CYII=",
+      })) return;
+      setAssets(cache.forSession(sid));
+    }, 20));
+    return true;
+  }, []);
+  return (
+    <main>
+      <output data-testid="visible-inline-attempts">{attempts}</output>
+      <output data-testid="visible-inline-network-loads">{networkLoads}</output>
+      <div data-testid="two-visible-inline-images">
+        <MessageBlock text={[
+          "![A](/tmp/visible-a.png)",
+          "![B](/tmp/visible-b.png)",
+        ].join("\n\n")} done imageAssets={assets} onLoadImage={loadImage} />
+      </div>
+      <div data-testid="inline-no-loader">
+        <MessageBlock text={[
+          "![error](/tmp/no-loader-error.png)",
+          "![timeout](/tmp/no-loader-timeout.png)",
+        ].join("\n\n")} done imageAssets={noLoaderAssets} />
+      </div>
+    </main>
+  );
+}
+
+function HistoryImageFallbackErrorFixture() {
+  const turnId = "history-fallback-error";
+  const imageId = "history-fallback-image";
+  const fallback = useMemo<QueryImg>(() => ({
+    media_type: "image/png",
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlK4h8AAAAASUVORK5CYII=",
+  }), []);
+  const [canonical, setCanonical] = useState(false);
+  const [loads, setLoads] = useState(0);
+  const [lastLoad, setLastLoad] = useState("");
+  useEffect(() => setCanonical(true), []);
+  const turns = useMemo<Turn[]>(() => [{
+    id: turnId,
+    prompt: "fallback 与 canonical 应共用一行图片布局",
+    ...(canonical
+      ? {
+        imageRefs: [{
+          image_id: imageId,
+          media_type: "image/png" as const,
+          width: 1,
+          height: 1,
+          byte_size: 68,
+        }],
+      }
+      : { images: [fallback] }),
+    blocks: [],
+    done: true,
+    ts: 1_000,
+    doneTs: 2_000,
+  }], [canonical, fallback]);
+  const historyImageAssets = useMemo<Record<string, HistoryImageAsset>>(
+    () => ({
+      [historyImageAssetKey(turnId, imageId, "thumbnail")]: {
+        status: "error",
+      },
+    }),
+    [],
+  );
+  const loadHistoryImage = useCallback((
+    requestedTurnId: string,
+    requestedImageId: string,
+    variant: HistoryImageVariant,
+  ): boolean => {
+    setLoads((value) => value + 1);
+    setLastLoad(`${requestedTurnId}|${requestedImageId}|${variant}`);
+    return true;
+  }, []);
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <output data-testid="history-fallback-loads">{loads}</output>
+      <output data-testid="history-fallback-last-load">{lastLoad}</output>
+      <ChatView sid="history-fallback-session" turns={turns}
+        engine="codex" historyRevision="history-fallback-r1"
+        historyImageAssets={historyImageAssets}
+        onLoadHistoryImage={loadHistoryImage}
+        onEdit={() => {}} onGetDiff={() => {}} />
+    </main>
+  );
+}
+
+const rootParams = new URLSearchParams(window.location.search);
+createRoot(document.getElementById("root")!).render(
+  rootParams.has("inline-image-capacity")
+    ? <InlineImageCapacityFixture />
+    : rootParams.has("inline-image-eviction")
+    ? <InlineImageEvictionFixture />
+    : rootParams.has("history-image-fallback-error")
+    ? <HistoryImageFallbackErrorFixture />
+    : rootParams.has("reducer-pipeline")
+    ? <ReducerHistoryBrowserFixture />
+    : <HistoryBrowserFixture />,
+);

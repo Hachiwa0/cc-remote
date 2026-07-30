@@ -1,10 +1,14 @@
 import { createContext, isValidElement, useContext, useEffect, useMemo, useRef,
-  useState, type ComponentPropsWithoutRef, type ReactNode } from "react";
+  useState, useSyncExternalStore, type ComponentPropsWithoutRef,
+  type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import { parseLocalFileTarget } from "../file-link";
 import { Icon } from "../icons";
 import {
   classifyMessageImageTarget,
+  inlineImageAssetCacheSnapshot,
+  INLINE_IMAGE_REQUEST_TIMEOUT_MS,
+  subscribeInlineImageAssetCacheChanges,
   type InlineImageAsset,
 } from "../inline-image-assets";
 import { isMermaidFenceClass } from "../mermaid";
@@ -132,7 +136,24 @@ function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
   onPreviewImage?: (src: string, alt: string) => void;
 }) {
   const target = useMemo(() => classifyMessageImageTarget(src), [src]);
+  const cacheSnapshot = useSyncExternalStore(
+    subscribeInlineImageAssetCacheChanges,
+    inlineImageAssetCacheSnapshot,
+    inlineImageAssetCacheSnapshot,
+  );
+  const loadAttemptRef = useRef<{
+    path: string;
+    loader: NonNullable<typeof onLoadImage>;
+    snapshot: number;
+    waitingForCapacity: boolean;
+  } | null>(null);
+  const assetObservationRef = useRef<{
+    path: string;
+    seen: boolean;
+  }>({ path: "", seen: false });
   const [blocked, setBlocked] = useState(false);
+  const [manualRetryPending, setManualRetryPending] = useState(false);
+  const [stalled, setStalled] = useState(false);
   const [naturalSize, setNaturalSize] = useState<{
     src: string;
     width: number;
@@ -140,16 +161,132 @@ function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
   } | null>(null);
 
   useEffect(() => {
-    setBlocked(false);
-    if (target.kind !== "local" || asset || !onLoadImage) return;
-    setBlocked(!onLoadImage(target.value));
-  }, [asset, onLoadImage, target]);
+    if (target.kind !== "local") {
+      assetObservationRef.current = { path: "", seen: false };
+      loadAttemptRef.current = null;
+      setBlocked(false);
+      setManualRetryPending(false);
+      return;
+    }
+    if (assetObservationRef.current.path !== target.value) {
+      assetObservationRef.current = { path: target.value, seen: false };
+      loadAttemptRef.current = null;
+      setBlocked(false);
+      setManualRetryPending(false);
+    }
+    if (asset) {
+      assetObservationRef.current.seen = true;
+      loadAttemptRef.current = null;
+      setBlocked(false);
+      setManualRetryPending(false);
+      return;
+    }
+    if (!onLoadImage) {
+      loadAttemptRef.current = null;
+      setBlocked(false);
+      setManualRetryPending(false);
+      return;
+    }
+    // Once this mounted image has observed a cache entry, its disappearance is
+    // an eviction rather than initial capacity becoming available. Do not
+    // automatically reclaim the slot: two visible images in a limit-1 cache
+    // would otherwise evict and reload each other forever.
+    if (assetObservationRef.current.seen) {
+      loadAttemptRef.current = null;
+      if (!manualRetryPending) setBlocked(true);
+      return;
+    }
+    const previous = loadAttemptRef.current;
+    if (previous?.path === target.value
+        && previous.loader === onLoadImage
+        && (!previous.waitingForCapacity
+          || previous.snapshot === cacheSnapshot)) return;
+    const accepted = onLoadImage(target.value);
+    loadAttemptRef.current = {
+      path: target.value,
+      loader: onLoadImage,
+      // Consume synchronous begin/cancel publications from this attempt. A
+      // rejected begin() does not publish, so only a later real cache mutation
+      // can wake this mounted image for another capacity attempt.
+      snapshot: inlineImageAssetCacheSnapshot(),
+      waitingForCapacity: !accepted,
+    };
+    setBlocked(!accepted);
+  }, [
+    asset,
+    cacheSnapshot,
+    manualRetryPending,
+    onLoadImage,
+    target,
+  ]);
+  useEffect(() => {
+    setStalled(false);
+    if (asset?.status !== "loading") return;
+    const elapsed = asset.startedAt == null
+      ? 0
+      : Math.max(0, Date.now() - asset.startedAt);
+    const remaining = Math.max(
+      0,
+      INLINE_IMAGE_REQUEST_TIMEOUT_MS - elapsed,
+    );
+    if (remaining === 0) {
+      setStalled(true);
+      return;
+    }
+    const timer = window.setTimeout(
+      () => setStalled(true),
+      remaining,
+    );
+    return () => window.clearTimeout(timer);
+  }, [
+    asset?.requestGeneration,
+    asset?.startedAt,
+    asset?.status,
+    target,
+  ]);
+
+  const retryLocalImage = () => {
+    if (target.kind !== "local" || !onLoadImage) return;
+    const accepted = onLoadImage(target.value);
+    if (accepted) {
+      setManualRetryPending(true);
+      setBlocked(false);
+      setStalled(false);
+    } else {
+      setManualRetryPending(false);
+      setBlocked(true);
+    }
+  };
 
   if (target.kind === "blocked") {
     return <span className="message-image-error">图片不可用</span>;
   }
   if (target.kind === "local" && asset?.status === "error") {
-    return <span className="message-image-error">图片不可用</span>;
+    return onLoadImage
+      ? <button type="button" className="message-image-error"
+          onClick={retryLocalImage}>
+          图片加载失败，点击重试
+        </button>
+      : <span className="message-image-error">图片加载失败</span>;
+  }
+  if (target.kind === "local" && asset?.status === "loading" && stalled) {
+    return onLoadImage
+      ? <button type="button" className="message-image-error"
+          onClick={retryLocalImage}>
+          图片加载超时，点击重试
+        </button>
+      : <span className="message-image-error">图片加载超时</span>;
+  }
+  const evicted = target.kind === "local" && !asset
+    && assetObservationRef.current.path === target.value
+    && assetObservationRef.current.seen;
+  if (evicted && !manualRetryPending) {
+    return onLoadImage
+      ? <button type="button" className="message-image-error"
+          onClick={retryLocalImage}>
+          图片暂时无法加载，点击重试
+        </button>
+      : <span className="message-image-error">图片暂时无法加载</span>;
   }
   if (target.kind === "local" && (blocked || (!onLoadImage && !asset))) {
     return <span className="message-image-error">图片暂时无法加载</span>;

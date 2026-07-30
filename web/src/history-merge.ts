@@ -117,7 +117,14 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
           existingIndex = index;
         }
       }
-      if (existingIndex == null) existingIndex = candidates[0];
+      // An open, empty live envelope has no content to score yet. It may inherit
+      // the sole canonical position so future deltas keep their live message id.
+      // Non-empty zero-affinity text is a distinct narrative block and must not
+      // be concatenated merely because it shares a channel.
+      if (existingIndex == null && block.text.length === 0 && !block.done
+          && candidates.length === 1) {
+        existingIndex = candidates[0];
+      }
     }
     const existing = existingIndex == null
       ? undefined : out[existingIndex] as TextBlock;
@@ -138,13 +145,23 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
   return out;
 }
 
+type TurnIdentity = Pick<Turn, "id" | "clientMsgId" | "historyTurnId">;
+
+function exactTurnAliases(turn: TurnIdentity): Set<string> {
+  return new Set([
+    turn.id,
+    turn.clientMsgId,
+    turn.historyTurnId,
+  ].filter((value): value is string => !!value));
+}
+
+function sharesExactTurnAlias(first: TurnIdentity, second: TurnIdentity): boolean {
+  const firstAliases = exactTurnAliases(first);
+  return [...exactTurnAliases(second)].some((alias) => firstAliases.has(alias));
+}
+
 function sameTurnIdentity(history: Turn, live: Turn): boolean {
-  if (history.id === live.id) return true;
-  if (history.clientMsgId && (
-    history.clientMsgId === live.id
-    || history.clientMsgId === live.clientMsgId
-  )) return true;
-  if (live.clientMsgId && live.clientMsgId === history.id) return true;
+  if (sharesExactTurnAlias(history, live)) return true;
   // Automatic/goal continuations have no user message. Live uses the app-server
   // turn id as its empty anchor, while rollout history may use the first
   // assistant item id; TurnEnd still supplies the same authoritative branch id.
@@ -154,13 +171,17 @@ function sameTurnIdentity(history: Turn, live: Turn): boolean {
 }
 
 function sameTurn(history: Turn, live: Turn): boolean {
-  if (sameTurnIdentity(history, live)) return true;
-  if (!history.prompt || !live.prompt || history.prompt !== live.prompt) return false;
-  // Different ids are an optimistic-client id vs transcript id only when their
-  // authoritative UserMsg times are nearly identical. Prompt text alone is not
-  // an identity: repeated inputs such as "继续" are common.
-  if (history.ts == null || live.ts == null) return false;
-  return Math.abs(history.ts - live.ts) <= 3000;
+  return sameTurnIdentity(history, live);
+}
+
+function sameLegacyCachedTurn(summary: Turn, cached: Turn): boolean {
+  if (sameTurnIdentity(summary, cached)) return true;
+  if (!summary.prompt || summary.prompt !== cached.prompt) return false;
+  // CACHE_VER migrations may predate clientMsgId/historyTurnId. Keep this
+  // compatibility only while restoring a one-to-one completed cache row;
+  // ordinary history/live reconciliation must never infer identity from text.
+  if (summary.ts == null || cached.ts == null) return false;
+  return Math.abs(summary.ts - cached.ts) <= 3000;
 }
 
 export function historyContainsTurn(history: Turn[], live: Turn): boolean {
@@ -268,7 +289,7 @@ export function restoreCachedTurnDetails(
       cachedIndex += 1) {
       if (usedCached.has(cachedIndex)) continue;
       const candidate = cachedTurns[cachedIndex];
-      if (!sameTurn(summary, candidate)) continue;
+      if (!sameLegacyCachedTurn(summary, candidate)) continue;
       const distance = Math.abs((summary.ts ?? 0) - (candidate.ts ?? 0));
       if (distance >= bestDistance) continue;
       bestIndex = cachedIndex;
@@ -563,10 +584,11 @@ export function mergeInitialHistory(
     }
     return a.order - b.order;
   });
-  const seen = new Set<string>();
+  const seenAliases = new Set<string>();
   return rows.map((row) => row.turn).filter((turn) => {
-    if (seen.has(turn.id)) return false;
-    seen.add(turn.id);
+    const aliases = exactTurnAliases(turn);
+    if ([...aliases].some((alias) => seenAliases.has(alias))) return false;
+    aliases.forEach((alias) => seenAliases.add(alias));
     return true;
   });
 }

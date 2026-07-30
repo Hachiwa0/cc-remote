@@ -1,6 +1,59 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
+test("mounted message image retries once when cache capacity is released", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?inline-image-capacity=1");
+
+  await expect(page.getByTestId("inline-load-attempts")).toHaveText("1");
+  await expect(page.getByTestId("inline-network-loads")).toHaveText("0");
+  await expect(page.locator(".message-image-error"))
+    .toContainText("图片暂时无法加载");
+
+  await page.getByTestId("release-inline-capacity").click();
+
+  await expect(page.getByTestId("inline-load-attempts")).toHaveText("2");
+  await expect(page.getByTestId("inline-network-loads")).toHaveText("1");
+  await expect(page.locator(".message-image-loading")).toBeVisible();
+  await page.waitForTimeout(150);
+  await expect(page.getByTestId("inline-load-attempts")).toHaveText("2");
+  await expect(page.getByTestId("inline-network-loads")).toHaveText("1");
+});
+
+test("two visible images do not reclaim one cache slot forever", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?inline-image-eviction=1");
+
+  await expect(page.getByTestId("visible-inline-attempts")).toHaveText("3");
+  await expect(page.getByTestId("visible-inline-network-loads")).toHaveText("2");
+  const visibleImages = page.getByTestId("two-visible-inline-images");
+  await expect(visibleImages.getByRole("button", {
+    name: "图片暂时无法加载，点击重试",
+  })).toBeVisible();
+  await expect(visibleImages.getByRole("img", { name: "B" })).toBeAttached();
+
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("visible-inline-attempts")).toHaveText("3");
+  await expect(page.getByTestId("visible-inline-network-loads")).toHaveText("2");
+
+  await visibleImages.getByRole("button", {
+    name: "图片暂时无法加载，点击重试",
+  }).click();
+  await expect(page.getByTestId("visible-inline-attempts")).toHaveText("4");
+  await expect(page.getByTestId("visible-inline-network-loads")).toHaveText("3");
+  await expect(visibleImages.getByRole("img", { name: "A" })).toBeAttached();
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("visible-inline-attempts")).toHaveText("4");
+  await expect(page.getByTestId("visible-inline-network-loads")).toHaveText("3");
+
+  const noLoader = page.getByTestId("inline-no-loader");
+  await expect(noLoader.getByText("图片加载失败", { exact: true })).toBeVisible();
+  await expect(noLoader.getByText("图片加载超时", { exact: true })).toBeVisible();
+  await expect(noLoader.locator("button.message-image-error")).toHaveCount(0);
+});
+
 const productionCsp = (() => {
   const template = readFileSync(
     new URL("../../deploy/Caddyfile", import.meta.url),
@@ -549,6 +602,52 @@ test("prepend preserves the exact reading row through delayed row growth", async
   expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
 });
 
+test("reducer history paging and live refresh keep one stable projection", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?reducer-pipeline=1");
+  const viewport = page.locator(".thread");
+  await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("20");
+  await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("20");
+
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+  await page.getByRole("button", { name: "加载更早的历史" }).click();
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.locator('[data-turn-id="reducer-m20"]')).toBeAttached();
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("40");
+  await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("40");
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+
+  // A same-revision newest-page refresh is delivered to the authoritative
+  // runtime while the reducer-owned browse projection remains visible.
+  await page.getByTestId("reducer-live-refresh").click();
+  await expect(page.getByTestId("reducer-refresh-count")).toHaveText("1");
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("40");
+  await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("40");
+  const afterRefresh = await readingAnchor(page);
+  expect(afterRefresh.id).toBe(before.id);
+  expect(Math.abs(afterRefresh.offset - before.offset)).toBeLessThan(2);
+
+  // A -> B -> A discards only the display browse window. The accepted runtime
+  // must still contain one canonical copy of every newest turn.
+  await page.getByTestId("switch-session").click();
+  await expect(page.getByTestId("reducer-focused-sid"))
+    .toHaveText("reducer-history-session-b");
+  await expect(page.locator('[data-turn-id="reducer-b8"]')).toBeVisible();
+  await page.getByTestId("switch-session").click();
+  await expect(page.getByTestId("reducer-focused-sid"))
+    .toHaveText("reducer-history-session-a");
+  await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("20");
+  await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("20");
+});
+
 test("one click loads every turn-detail page without collapsing or jumping", async ({
   page,
 }) => {
@@ -799,6 +898,48 @@ test("a canonical image reference does not reserve a second hidden image row", a
   await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
   await page.getByTestId("switch-session").click();
   await assertCanonicalImageLayout();
+});
+
+test("fallback image preview and canonical retry remain independent", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?history-image-fallback-error=1");
+  const turn = page.locator('[data-turn-id="history-fallback-error"]');
+  const imageRow = turn.locator(".ubub-imgs");
+  const preview = turn.getByRole("button", {
+    name: "预览用户发送的图片",
+  });
+  const retry = turn.getByRole("button", { name: "点击重试" });
+
+  await expect(turn).toBeVisible();
+  await expect(imageRow).toHaveCount(1);
+  await expect(imageRow.locator(":scope > .history-image-control"))
+    .toHaveCount(1);
+  await expect(turn.locator(".ubub-image-trigger")).toHaveCount(1);
+  await expect(preview).toBeVisible();
+  await expect(retry).toBeVisible();
+  const gap = await turn.evaluate((node) => {
+    const row = node.querySelector<HTMLElement>(".ubub-imgs");
+    const meta = node.querySelector<HTMLElement>(".ubub-meta");
+    if (!row || !meta) throw new Error("canonical image layout is incomplete");
+    return meta.getBoundingClientRect().top - row.getBoundingClientRect().bottom;
+  });
+  expect(gap).toBeLessThan(20);
+  await expect(page.getByTestId("history-fallback-loads")).toHaveText("0");
+
+  await preview.click();
+  await expect(page.locator(".image-lightbox")).toBeVisible();
+  await expect(page.getByTestId("history-fallback-loads")).toHaveText("0");
+  await page.locator(".image-lightbox-close").click();
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+
+  await retry.click();
+  await expect(page.getByTestId("history-fallback-loads")).toHaveText("1");
+  await expect(page.getByTestId("history-fallback-last-load"))
+    .toHaveText("history-fallback-error|history-fallback-image|thumbnail");
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+  await expect(imageRow).toHaveCount(1);
+  await expect(turn.locator(".ubub-image-trigger")).toHaveCount(1);
 });
 
 test("streaming rerenders cannot cancel an image preview close", async ({
