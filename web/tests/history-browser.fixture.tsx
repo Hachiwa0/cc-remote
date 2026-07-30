@@ -45,6 +45,7 @@ import type { TextSelectionGuard } from "../src/history-selection-guard";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
 import { UsageMeter } from "../src/components/UsageMeter";
 import { NewChatView } from "../src/components/NewChatView";
+import { ArtifactPanel } from "../src/components/ArtifactPanel";
 import {
   QueuedQueryChip,
   QueuedQueryDialog,
@@ -1685,9 +1686,79 @@ function HistoryImageFallbackErrorFixture() {
   );
 }
 
+const UNSAFE_SVG = [
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 40">',
+  "<script>document.documentElement.dataset.bad='yes'</script>",
+  '<foreignObject x="0" y="0" width="20" height="20"><div>bad</div></foreignObject>',
+  '<image href="https://example.com/tracker.png" width="10" height="10"/>',
+  '<rect id="safe-svg-rect" width="120" height="40" fill="#6256b4"/>',
+  "</svg>",
+].join("");
+
+function ArtifactPreviewFixture({ kind }: {
+  kind: "html" | "svg" | "markdown-svg";
+}) {
+  const svgData = window.btoa(UNSAFE_SVG);
+  const artifact = kind === "html"
+    ? {
+      file: "preview.html",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "html" as const,
+      content: `<!doctype html><html><head>
+        <style>#head-style { color: rgb(12, 34, 56); }</style>
+        </head><body><div id="head-style">head css retained</div>
+        <script>
+          document.body.dataset.scriptRan = "yes";
+          try { parent.document.body.dataset.previewEscaped = "yes"; }
+          catch (_) { document.body.dataset.parentBlocked = "yes"; }
+        </script></body></html>`,
+      size: 360,
+      mtimeNs: "1",
+      revision: "a".repeat(64),
+    }
+    : kind === "svg"
+    ? {
+      file: "diagram.svg",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "image" as const,
+      data: svgData,
+      mediaType: "image/svg+xml",
+      size: UNSAFE_SVG.length,
+      mtimeNs: "1",
+    }
+    : {
+      file: "README.md",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "md" as const,
+      content: "![diagram](diagram.svg)",
+      size: 23,
+      mtimeNs: "1",
+      revision: "b".repeat(64),
+      assets: {
+        "diagram.svg": {
+          mediaType: "image/svg+xml",
+          data: svgData,
+        },
+      },
+    };
+  return <main style={{ height: "100dvh" }}>
+    <ArtifactPanel artifact={artifact} active="diff" hasBtw={false}
+      onTab={() => {}} onClose={() => {}} />
+  </main>;
+}
+
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
-  rootParams.has("inline-image-capacity")
+  rootParams.has("artifact-html")
+    ? <ArtifactPreviewFixture kind="html" />
+    : rootParams.has("artifact-svg")
+    ? <ArtifactPreviewFixture kind="svg" />
+    : rootParams.has("artifact-markdown-svg")
+    ? <ArtifactPreviewFixture kind="markdown-svg" />
+    : rootParams.has("inline-image-capacity")
     ? <InlineImageCapacityFixture />
     : rootParams.has("inline-image-eviction")
     ? <InlineImageEvictionFixture />

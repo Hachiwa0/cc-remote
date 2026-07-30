@@ -126,21 +126,30 @@ def test_source_preview_rejects_binary_content(tmp_path):
 def test_rendered_artifacts_read_html_images_and_pdf_without_persistence(tmp_path):
     (tmp_path / "page.html").write_text(
         "<h1>Report</h1><script>window.bad = true</script>", encoding="utf-8")
+    svg_bytes = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+        b'<rect width="10" height="10"/></svg>'
+    )
+    (tmp_path / "diagram.svg").write_bytes(svg_bytes)
     (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\npreview")
     (tmp_path / "report.pdf").write_bytes(b"%PDF-1.7\npreview")
     machine, _ = _mk_machine()
 
     html = machine._read_file_preview(str(tmp_path), "page.html")
+    svg = machine._read_file_preview(str(tmp_path), "diagram.svg")
     image = machine._read_file_preview(str(tmp_path), "image.png")
     pdf = machine._read_file_preview(str(tmp_path), "report.pdf")
 
     assert html["format"] == "html" and "<h1>Report</h1>" in html["content"]
+    assert svg["format"] == "image"
+    assert svg["media_type"] == "image/svg+xml"
+    assert svg["data"] == svg_bytes
     assert image["format"] == "image" and image["media_type"] == "image/png"
     assert image["data"] == b"\x89PNG\r\n\x1a\npreview"
     assert pdf["format"] == "pdf" and pdf["media_type"] == "application/pdf"
     assert pdf["data"] == b"%PDF-1.7\npreview"
     assert sorted(path.name for path in tmp_path.iterdir()) == [
-        "image.png", "page.html", "report.pdf",
+        "diagram.svg", "image.png", "page.html", "report.pdf",
     ]
 
 
@@ -372,17 +381,150 @@ def test_markdown_preview_rejects_invalid_utf8(tmp_path):
 
 def test_preview_asset_is_type_limited_and_bounded(tmp_path):
     (tmp_path / "image.png").write_bytes(b"png")
-    (tmp_path / "vector.svg").write_text("<svg/>", encoding="utf-8")
+    vector = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4">'
+        b'<circle cx="2" cy="2" r="2"/></svg>'
+    )
+    (tmp_path / "vector.svg").write_bytes(vector)
+    (tmp_path / "invalid.svg").write_text("<html/>", encoding="utf-8")
     (tmp_path / "large.webp").write_bytes(b"x" * (PREVIEW_ASSET_MAX_BYTES + 1))
     machine, _ = _mk_machine()
 
     path, media_type, data = machine._read_preview_asset(
         str(tmp_path), "image.png")
     assert (path, media_type, data) == ("image.png", "image/png", b"png")
-    with pytest.raises(ValueError, match="PNG"):
-        machine._read_preview_asset(str(tmp_path), "vector.svg")
+    assert machine._read_preview_asset(str(tmp_path), "vector.svg") == (
+        "vector.svg", "image/svg+xml", vector,
+    )
+    with pytest.raises(ValueError, match="SVG"):
+        machine._read_preview_asset(str(tmp_path), "invalid.svg")
     with pytest.raises(ValueError, match="4 MiB"):
         machine._read_preview_asset(str(tmp_path), "large.webp")
+
+
+@pytest.mark.parametrize("tool", ["Read", "view_image"])
+def test_successful_external_image_read_serves_an_immutable_snapshot(
+    tmp_path, tool,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    original = b"\x89PNG\r\n\x1a\noriginal"
+    replacement = b"\x89PNG\r\n\x1a\nreplacement"
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(original)
+    neighbor = tmp_path / "neighbor.png"
+    neighbor.write_bytes(b"\x89PNG\r\n\x1a\nneighbor")
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        machine.sessions[ctx.key] = ctx
+        machine.focused_sid = ctx.key
+
+        await machine._emit(ctx, ToolUse(
+            message_id="message-1",
+            tool_use_id="image-read-1",
+            tool=tool,
+            input={"file_path": str(outside)}
+            if tool == "Read" else {"path": str(outside)},
+        ))
+        await machine._emit(ctx, ToolResult(
+            tool_use_id="image-read-1",
+            content="image loaded",
+            is_error=False,
+            status="succeeded",
+        ))
+
+        # The browser must receive the exact successful-read snapshot, not
+        # whatever later replaced the reusable /tmp-style path.
+        outside.write_bytes(replacement)
+        preview = await machine._handle_get_preview_asset(GetPreviewAsset(
+            sid=ctx.key,
+            client_id="client-1",
+            path=str(outside),
+            preview_id="preview-1",
+            request_id="asset-1",
+        ))
+        denied = await machine._handle_get_preview_asset(GetPreviewAsset(
+            sid=ctx.key,
+            client_id="client-1",
+            path=str(neighbor),
+            preview_id="preview-1",
+            request_id="asset-2",
+        ))
+        assert preview.error is None
+        assert preview.media_type == "image/png"
+        assert preview.data == "iVBORw0KGgpvcmlnaW5hbA=="
+        assert denied.error and "本会话" in denied.error
+
+    asyncio.run(run())
+
+
+def test_failed_external_image_read_never_grants_a_snapshot(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\nsecret")
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        machine.sessions[ctx.key] = ctx
+        machine.focused_sid = ctx.key
+
+        await machine._emit(ctx, ToolUse(
+            message_id="message-1",
+            tool_use_id="image-read-1",
+            tool="Read",
+            input={"file_path": str(outside)},
+        ))
+        await machine._emit(ctx, ToolResult(
+            tool_use_id="image-read-1",
+            content="permission denied",
+            is_error=True,
+            status="failed",
+        ))
+        preview = await machine._handle_get_preview_asset(GetPreviewAsset(
+            sid=ctx.key,
+            client_id="client-1",
+            path=str(outside),
+            preview_id="preview-1",
+            request_id="asset-1",
+        ))
+        assert preview.error and "本会话" in preview.error
+
+    asyncio.run(run())
+
+
+def test_external_image_snapshots_are_entry_bounded_and_session_purge_isolated():
+    machine, _ = _mk_machine()
+    machine.PREVIEW_IMAGE_SNAPSHOT_SESSION_ENTRIES = 2
+    machine.PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES = 3
+
+    machine._store_preview_image_snapshot("session-a", "/tmp/a.png", "image/png", b"")
+    machine._store_preview_image_snapshot("session-a", "/tmp/b.png", "image/png", b"")
+    machine._store_preview_image_snapshot("session-a", "/tmp/c.png", "image/png", b"")
+    assert list(machine._preview_image_snapshots) == [
+        ("session-a", "/tmp/b.png"),
+        ("session-a", "/tmp/c.png"),
+    ]
+
+    machine._store_preview_image_snapshot("session-b", "/tmp/d.png", "image/png", b"")
+    machine._store_preview_image_snapshot("session-c", "/tmp/e.png", "image/png", b"")
+    assert list(machine._preview_image_snapshots) == [
+        ("session-a", "/tmp/c.png"),
+        ("session-b", "/tmp/d.png"),
+        ("session-c", "/tmp/e.png"),
+    ]
+
+    machine._purge_preview_image_snapshots("session-b")
+    assert list(machine._preview_image_snapshots) == [
+        ("session-a", "/tmp/c.png"),
+        ("session-c", "/tmp/e.png"),
+    ]
+    assert machine._preview_image_snapshot_bytes == 0
 
 
 def test_preview_responses_are_requester_routed_and_correlated(tmp_path):

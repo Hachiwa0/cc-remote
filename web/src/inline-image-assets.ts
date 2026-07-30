@@ -7,7 +7,7 @@ export type MessageImageTarget =
   | { kind: "external"; value: string }
   | { kind: "blocked"; value: "" };
 
-const IMAGE_SUFFIX = /\.(?:png|jpe?g|gif|webp|avif)$/i;
+const IMAGE_SUFFIX = /\.(?:png|jpe?g|gif|webp|avif|svg)$/i;
 
 /** Classify an image emitted inside a chat message. Local filesystem paths are
  * never assigned to an HTML src; the caller must materialize them over the

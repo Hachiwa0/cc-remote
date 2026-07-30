@@ -15,7 +15,10 @@ import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { ToolGroup } from "./ToolGroup";
 import { hasActiveProcess, processBlocks } from "../process-blocks";
-import { filePathsFromInput } from "../file-changes";
+import {
+  filePathsFromInput,
+  presentFileOperation,
+} from "../file-changes";
 import type { InlineImageAsset } from "../inline-image-assets";
 import { PointerTapGuard } from "../pointer-tap";
 
@@ -119,7 +122,7 @@ const PROCESS_IC: Record<ProcessBlock["processKind"], string> = {
   reasoning: "spark",
   plan: "plan",
   command: "bash",
-  file_change: "edit",
+  file_change: "code",
   mcp: "term",
   agent: "spark",
   hook: "shield",
@@ -129,7 +132,7 @@ const PROCESS_IC: Record<ProcessBlock["processKind"], string> = {
   terminal: "bash",
   model: "cpu",
   safety: "shield",
-  diff: "edit",
+  diff: "code",
   compaction: "simplify",
 };
 
@@ -144,6 +147,15 @@ function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
 }) {
   const filePaths = block.processKind === "file_change"
     ? filePathsFromInput(block.input) : [];
+  const semanticIcon = (
+    block.processKind === "file_change" || block.processKind === "diff"
+  )
+    ? presentFileOperation(
+        block.processKind === "file_change" ? "filechange" : "apply_patch",
+        block.input ?? {},
+      )?.icon
+    : undefined;
+  const icon = semanticIcon ?? PROCESS_IC[block.processKind];
   const hasBody = !!(block.summary || block.detail || block.output || block.diff
     || block.progress || block.explanation || block.command || block.cwd
     || block.plan?.length || block.exit_code != null || block.duration_ms != null
@@ -189,7 +201,7 @@ function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
   if (!hasBody) {
     return (
       <div className={`process-activity process-${block.status}`}>
-        <span className="process-item-ic"><Icon name={PROCESS_IC[block.processKind]} size={15} /></span>
+        <span className="process-item-ic"><Icon name={icon} size={15} /></span>
         <span className="process-item-title">{block.title}</span>
         <span className="process-item-status">{statusIcon(block.status, block.done)}</span>
       </div>
@@ -202,7 +214,7 @@ function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
       onInteractionEnd={onInteractionEnd}
       summary={
         <>
-        <span className="process-item-ic"><Icon name={PROCESS_IC[block.processKind]} size={15} /></span>
+        <span className="process-item-ic"><Icon name={icon} size={15} /></span>
         <span className="process-item-title">{block.title}</span>
         <span className="process-item-status">{statusIcon(block.status, block.done)}</span>
         <span className="process-item-chev"><Icon name="chev" size={14} /></span>

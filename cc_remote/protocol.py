@@ -1776,7 +1776,7 @@ class FilePreview(_Base):
     content: PreviewContent = ""
     media_type: Optional[Literal[
         "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
-        "application/pdf",
+        "image/svg+xml", "application/pdf",
     ]] = None
     data: Optional[ArtifactPreviewData] = None
     converted_from: Optional[str] = Field(default=None, max_length=16)
@@ -1830,6 +1830,7 @@ class PreviewAsset(_Base):
     request_id: WireId
     media_type: Optional[Literal[
         "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
+        "image/svg+xml",
     ]] = None
     data: Optional[PreviewAssetData] = None
     error: Optional[str] = Field(default=None, max_length=512)

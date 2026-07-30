@@ -23,6 +23,7 @@ const PATHS: Record<string, string> = {
   user: '<circle cx="12" cy="8" r="3.4"/><path d="M5.5 20a6.5 6.5 0 0113 0"/>',
   spark: '<path d="M12 3l1.6 4.9L18.5 9.5l-4.9 1.6L12 16l-1.6-4.9L5.5 9.5l4.9-1.6L12 3z"/>',
   read: '<path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5"/>',
+  'file-plus': '<path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5M9 14h6M12 11v6"/>',
   bash: '<rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M7 10l2.5 2L7 14M12.5 14.5H16"/>',
   edit: '<path d="M4 20h4L18.5 9.5a2.1 2.1 0 00-3-3L5 17v3z"/>',
   plan: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="M4.5 6h.01M4.5 12h.01M4.5 18h.01"/>',

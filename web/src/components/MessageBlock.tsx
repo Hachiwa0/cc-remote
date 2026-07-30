@@ -18,6 +18,7 @@ import {
   STREAMING_REMARK_PLUGINS,
   useMarkdownMathPlugins,
 } from "../markdown-math";
+import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import { MermaidBlock } from "./MermaidBlock";
 
 const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
@@ -159,6 +160,10 @@ function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
     width: number;
     height: number;
   } | null>(null);
+  const svg = useSanitizedSvgUrl(
+    asset?.status === "ready" ? asset.data : undefined,
+    asset?.status === "ready" ? asset.mediaType : undefined,
+  );
 
   useEffect(() => {
     if (target.kind !== "local") {
@@ -291,11 +296,16 @@ function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
   if (target.kind === "local" && (blocked || (!onLoadImage && !asset))) {
     return <span className="message-image-error">图片暂时无法加载</span>;
   }
+  if (svg.error) {
+    return <span className="message-image-error">{svg.error}</span>;
+  }
 
   const resolved = target.kind === "external"
     ? target.value
     : asset?.status === "ready" && asset.data && asset.mediaType
-      ? `data:${asset.mediaType};base64,${asset.data}`
+      ? asset.mediaType === "image/svg+xml"
+        ? svg.url
+        : `data:${asset.mediaType};base64,${asset.data}`
       : null;
   if (!resolved) {
     return <span className="message-image-loading" role="status">

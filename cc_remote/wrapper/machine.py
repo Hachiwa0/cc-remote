@@ -773,6 +773,11 @@ class WrapperMachine:
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
     PREVIEW_EXTERNAL_PATH_CAP = 256
     PREVIEW_WRITE_CANDIDATE_CAP = 64
+    PREVIEW_IMAGE_CANDIDATE_CAP = 64
+    PREVIEW_IMAGE_SNAPSHOT_SESSION_BYTES = 16 * 1024 * 1024
+    PREVIEW_IMAGE_SNAPSHOT_GLOBAL_BYTES = 64 * 1024 * 1024
+    PREVIEW_IMAGE_SNAPSHOT_SESSION_ENTRIES = 64
+    PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES = 256
     NOTIFICATION_TITLE_CAP = 512
     NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
@@ -787,7 +792,7 @@ class WrapperMachine:
     FORK_BACKGROUND_ATTEMPTS = 100
     UNCERTAIN_FORK_CAP = 4096
     MARKDOWN_PREVIEW_SUFFIXES = frozenset({".md", ".markdown"})
-    HTML_PREVIEW_SUFFIXES = frozenset({".htm", ".html", ".svg"})
+    HTML_PREVIEW_SUFFIXES = frozenset({".htm", ".html"})
     OFFICE_PREVIEW_SUFFIXES = frozenset({
         ".doc", ".docx", ".odt", ".rtf", ".xls", ".xlsx", ".ods",
         ".ppt", ".pptx", ".odp",
@@ -803,6 +808,7 @@ class WrapperMachine:
         ".gif": "image/gif",
         ".webp": "image/webp",
         ".avif": "image/avif",
+        ".svg": "image/svg+xml",
     }
     ARTIFACT_PREVIEW_MEDIA_TYPES = {
         **PREVIEW_ASSET_MEDIA_TYPES,
@@ -868,6 +874,13 @@ class WrapperMachine:
         # rejected by a browser that still holds the previous control watermark.
         self._control_revision_epochs: dict[str, int] = {}
         self._preview_conversion_limit = asyncio.Semaphore(2)
+        # Immutable snapshots created only after a successful built-in image
+        # read.  They are process-local by design: no temporary user image is
+        # copied to the relay or persisted on disk.
+        self._preview_image_snapshots: OrderedDict[
+            tuple[str, str], tuple[str, bytes]
+        ] = OrderedDict()
+        self._preview_image_snapshot_bytes = 0
         # Pool of resident sessions, keyed by real session_id (or a `tmp-<uuid>`
         # temp key for a brand-new session until its id is captured).
         self.sessions: dict[str, SessionContext] = {}
@@ -3135,6 +3148,8 @@ class WrapperMachine:
                 except Exception:
                     pass
                 self.sessions.pop(ctx.key, None)
+                self._purge_preview_image_snapshots(
+                    ctx.preview_snapshot_token)
             if record is not None and record.session_id is None:
                 await asyncio.to_thread(store.abandon, record.work_id)
             await self._broadcast_work_schedule_state(
@@ -3246,6 +3261,7 @@ class WrapperMachine:
             # replacement wrapper connected. It was spawned only for recovery;
             # leave the resident slot available until the user focuses it.
             self.sessions.pop(ctx.key, None)
+            self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
             try:
                 await ctx.sdk.disconnect()
             except Exception as exc:
@@ -3309,6 +3325,136 @@ class WrapperMachine:
             paths[candidate] = None
         while len(paths) > self.PREVIEW_EXTERNAL_PATH_CAP:
             paths.pop(next(iter(paths)))
+
+    @staticmethod
+    def _preview_image_read_path(msg: ToolUse) -> Optional[str]:
+        """Return the exact path for a built-in image-reading tool."""
+        tool = re.sub(r"[^a-z0-9]", "", (msg.tool or "").lower())
+        if tool not in {"read", "readfile", "viewimage"}:
+            return None
+        for key in ("file_path", "path"):
+            candidate = msg.input.get(key)
+            if (
+                isinstance(candidate, str)
+                and candidate
+                and not candidate.startswith("~")
+                and len(candidate) <= 4096
+            ):
+                return candidate
+        return None
+
+    async def _observe_preview_image_event(
+        self, ctx: SessionContext, msg,
+    ) -> None:
+        """Capture cwd-external images only after their tool read succeeds."""
+        if isinstance(msg, ToolUse):
+            raw_path = self._preview_image_read_path(msg)
+            if raw_path is None:
+                return
+            root = os.path.realpath(ctx.cwd)
+            candidate = os.path.realpath(
+                raw_path if os.path.isabs(raw_path)
+                else os.path.join(root, raw_path))
+            if self._path_is_below(root, candidate):
+                return
+            if os.path.splitext(candidate)[1].lower() not in (
+                    self.PREVIEW_ASSET_MEDIA_TYPES):
+                return
+            pending = ctx.preview_image_candidates
+            pending[msg.tool_use_id] = candidate
+            while len(pending) > self.PREVIEW_IMAGE_CANDIDATE_CAP:
+                pending.pop(next(iter(pending)))
+            return
+
+        if not isinstance(msg, ToolResult):
+            return
+        candidate = ctx.preview_image_candidates.pop(msg.tool_use_id, None)
+        if candidate is None or msg.is_error or msg.status in {
+                "failed", "declined", "cancelled", "interrupted"}:
+            return
+        try:
+            _, media_type, data = await asyncio.to_thread(
+                self._read_preview_asset,
+                ctx.cwd,
+                candidate,
+                frozenset({candidate}),
+            )
+        except (OSError, ValueError):
+            # The engine result remains authoritative. A path that disappeared,
+            # changed type, or exceeded the preview bound simply has no Remote
+            # preview capability.
+            return
+        self._store_preview_image_snapshot(
+            ctx.preview_snapshot_token, candidate, media_type, data)
+
+    def _store_preview_image_snapshot(
+        self,
+        token: str,
+        path: str,
+        media_type: str,
+        data: bytes,
+    ) -> None:
+        cache = self._preview_image_snapshots
+        key = (token, path)
+        previous = cache.pop(key, None)
+        if previous is not None:
+            self._preview_image_snapshot_bytes -= len(previous[1])
+        cache[key] = (media_type, data)
+        self._preview_image_snapshot_bytes += len(data)
+
+        session_bytes = sum(
+            len(payload)
+            for (entry_token, _), (_, payload) in cache.items()
+            if entry_token == token
+        )
+        session_entries = sum(
+            1 for entry_token, _ in cache if entry_token == token)
+        while (
+            session_bytes > self.PREVIEW_IMAGE_SNAPSHOT_SESSION_BYTES
+            or session_entries > self.PREVIEW_IMAGE_SNAPSHOT_SESSION_ENTRIES
+        ):
+            oldest = next(
+                (
+                    entry_key for entry_key in cache
+                    if entry_key[0] == token
+                ),
+                None,
+            )
+            if oldest is None:
+                break
+            _, payload = cache.pop(oldest)
+            size = len(payload)
+            session_bytes -= size
+            session_entries -= 1
+            self._preview_image_snapshot_bytes -= size
+
+        while (
+            self._preview_image_snapshot_bytes
+            > self.PREVIEW_IMAGE_SNAPSHOT_GLOBAL_BYTES
+            or len(cache) > self.PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES
+        ) and cache:
+            _, (_, payload) = cache.popitem(last=False)
+            self._preview_image_snapshot_bytes -= len(payload)
+
+    def _purge_preview_image_snapshots(self, token: str) -> None:
+        cache = self._preview_image_snapshots
+        for key in tuple(cache):
+            if key[0] != token:
+                continue
+            _, payload = cache.pop(key)
+            self._preview_image_snapshot_bytes -= len(payload)
+
+    def _preview_image_snapshot(
+        self, ctx: SessionContext, path: str,
+    ) -> Optional[tuple[str, bytes]]:
+        candidate = os.path.realpath(
+            path if os.path.isabs(path)
+            else os.path.join(os.path.realpath(ctx.cwd), path))
+        key = (ctx.preview_snapshot_token, candidate)
+        snapshot = self._preview_image_snapshots.pop(key, None)
+        if snapshot is not None:
+            self._preview_image_snapshots[key] = snapshot
+        return snapshot
 
     @staticmethod
     def _tool_write_paths(tool_input: dict) -> tuple[str, ...]:
@@ -3389,6 +3535,7 @@ class WrapperMachine:
         await self.transport.send(live)
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
+        await self._observe_preview_image_event(ctx, msg)
         self._observe_preview_path_event(ctx, msg)
         async with ctx.emit_lock:
             await self._emit_locked(ctx, msg)
@@ -8743,6 +8890,7 @@ class WrapperMachine:
             return
         await self._discard_query_queue(ctx)
         self.sessions.pop(ctx.key, None)
+        self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
         disconnected = False
         try:
             tasks = {
@@ -10831,9 +10979,13 @@ class WrapperMachine:
             return response
 
         try:
-            _, media_type, data = await asyncio.to_thread(
-                self._read_preview_asset, ctx.cwd, cmd.path,
-                self._preview_external_paths(ctx))
+            snapshot = self._preview_image_snapshot(ctx, cmd.path)
+            if snapshot is None:
+                _, media_type, data = await asyncio.to_thread(
+                    self._read_preview_asset, ctx.cwd, cmd.path,
+                    self._preview_external_paths(ctx))
+            else:
+                media_type, data = snapshot
             response = PreviewAsset(
                 path=cmd.path,
                 preview_id=cmd.preview_id,
@@ -11492,6 +11644,9 @@ class WrapperMachine:
 
     @staticmethod
     def _validate_rendered_preview(media_type: str, data: bytes) -> None:
+        if media_type == "image/svg+xml":
+            WrapperMachine._validate_svg_preview(data)
+            return
         valid = {
             "application/pdf": data.startswith(b"%PDF-"),
             "image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
@@ -11504,6 +11659,23 @@ class WrapperMachine:
         }.get(media_type, False)
         if not valid:
             raise ValueError("文件内容与预览格式不匹配")
+
+    @staticmethod
+    def _validate_svg_preview(data: bytes) -> None:
+        if b"\0" in data:
+            raise ValueError("SVG 文件不是有效的 UTF-8 文本")
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("SVG 文件不是有效的 UTF-8 文本") from exc
+        # This is only a cheap type gate. The browser performs the mandatory
+        # structural sanitizer before creating any SVG blob URL.
+        document = re.sub(r"^\s*<\?xml[^>]*>\s*", "", text, count=1,
+                          flags=re.IGNORECASE)
+        document = re.sub(r"^\s*<!doctype[^>]*>\s*", "", document, count=1,
+                          flags=re.IGNORECASE)
+        if not re.match(r"^\s*<svg(?:\s|>)", document, re.IGNORECASE):
+            raise ValueError("SVG 文件根元素无效")
 
     @classmethod
     def _convert_office_preview(
@@ -11843,6 +12015,8 @@ class WrapperMachine:
             allow_truncate=False,
             allowed_external_paths=allowed_external_paths,
         )
+        if media_type == "image/svg+xml":
+            cls._validate_svg_preview(data)
         return relative, media_type, data
 
     async def _git_diff(
@@ -12359,6 +12533,8 @@ class WrapperMachine:
                 }
                 await self._discard_query_queue(ctx)
                 self.sessions.pop(ctx.key, None)
+                self._purge_preview_image_snapshots(
+                    ctx.preview_snapshot_token)
                 log.error("private btw persistence failed; terminating fork",
                           error_type=type(persist_error).__name__)
                 disconnected = False
@@ -12833,6 +13009,7 @@ class WrapperMachine:
         if ctx is not None:
             await ctx.sdk.disconnect()
             self.sessions.pop(ctx.key or sid, None)
+            self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
         try:
             if engine == "codex":
                 await codex_rpc("thread/delete", {"threadId": sid})
@@ -12963,6 +13140,7 @@ class WrapperMachine:
                 await self.transport.send(error)
                 return error
             self.sessions.pop(ctx.key or sid, None)
+            self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
         try:
             if engine == "codex":
                 try:
@@ -15635,6 +15813,7 @@ class WrapperMachine:
                     ERR_BUSY, "所有会话都在运行,先中断一个再切换")
                 return None
             vc = self.sessions.pop(victim)
+            self._purge_preview_image_snapshots(vc.preview_snapshot_token)
             try:
                 await vc.sdk.disconnect()
             except Exception:
@@ -16267,6 +16446,7 @@ class WrapperMachine:
             if victim is None:
                 raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
             vc = self.sessions.pop(victim)
+            self._purge_preview_image_snapshots(vc.preview_snapshot_token)
             try:
                 await vc.sdk.disconnect()
             except Exception:

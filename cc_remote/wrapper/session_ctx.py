@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from uuid import uuid4
 
 from cc_remote.protocol import State
 from cc_remote.wrapper.ringbuffer import RingBuffer
@@ -207,6 +208,12 @@ class SessionContext:
     # read capability.  Both maps are bounded by WrapperMachine.
     preview_write_candidates: dict[str, tuple[str, ...]] = field(default_factory=dict)
     preview_external_paths: dict[str, None] = field(default_factory=dict)
+    # A successful built-in image read outside cwd grants only the immutable
+    # bytes observed at that exact tool boundary.  The machine owns the bounded
+    # byte cache; this opaque token prevents a later SessionContext (or a re-key)
+    # from inheriting another context's snapshots.
+    preview_snapshot_token: str = field(default_factory=lambda: uuid4().hex)
+    preview_image_candidates: dict[str, str] = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Status reads run outside the serial command lane so a daemon restart
     # barrier cannot delay Query/Interrupt. They can therefore reach the same

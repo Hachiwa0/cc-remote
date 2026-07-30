@@ -296,6 +296,203 @@ def test_active_full_shape_survives_completed_summary_collapse():
     asyncio.run(run())
 
 
+def test_completed_summary_refreshes_stale_active_full_before_projection():
+    calls = []
+    responses = [
+        {
+            "data": [_turn(
+                "native-active",
+                [_user("user-first", "first"),
+                 _agent("answer-working", "working", phase="commentary")],
+                status="interrupted",
+                completed_at=None,
+                duration_ms=None,
+            )],
+            "nextCursor": None,
+        },
+        {
+            "data": [_turn(
+                "native-active",
+                [
+                    _user("user-first", "first"),
+                    _agent(
+                        "answer-working",
+                        "working",
+                        phase="commentary",
+                    ),
+                    _user("user-steer", "continue"),
+                ],
+                status="interrupted",
+                items_view="full",
+                completed_at=None,
+                duration_ms=None,
+            )],
+            "nextCursor": None,
+        },
+        {
+            "data": [_turn(
+                "native-active",
+                [_user("user-first", "first"),
+                 _agent("answer-final", "final answer")],
+                status="completed",
+                completed_at=109,
+                duration_ms=9000,
+            )],
+            "nextCursor": None,
+        },
+        {
+            "data": [_turn(
+                "native-active",
+                [
+                    _user("user-first", "first"),
+                    _agent(
+                        "answer-working",
+                        "working",
+                        phase="commentary",
+                    ),
+                    _user("user-steer", "continue"),
+                    _agent("answer-final", "final answer"),
+                ],
+                status="completed",
+                items_view="full",
+                completed_at=109,
+                duration_ms=9000,
+            )],
+            "nextCursor": None,
+        },
+    ]
+
+    async def rpc(method, params, cwd=None):
+        calls.append((method, params))
+        assert cwd is None
+        return responses.pop(0)
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        await history.summary_page(
+            "thread-active",
+            before=None,
+            limit=1,
+            active_turn_ids={"native-active"},
+        )
+        completed = await history.summary_page(
+            "thread-active",
+            before=None,
+            limit=1,
+            hydrate_recent=1,
+        )
+
+        assert [params["itemsView"] for _method, params in calls] == [
+            "summary", "full", "summary", "full"]
+        assert [turn["id"] for turn in completed.turns] == [
+            "user-first", "user-steer"]
+        assert completed.turns[-1]["blocks"][-1]["text"] == "final answer"
+        assert completed.turns[-1]["done"] is True
+        assert responses == []
+
+    asyncio.run(run())
+
+
+def test_terminal_summary_keeps_final_when_full_refresh_is_oversized():
+    calls = []
+    responses = [
+        {
+            "data": [_turn(
+                "native-active",
+                [_user("user-first", "first")],
+                status="interrupted",
+                completed_at=None,
+                duration_ms=None,
+            )],
+            "nextCursor": None,
+        },
+        {
+            "data": [_turn(
+                "native-active",
+                [
+                    _user("user-first", "first"),
+                    _agent(
+                        "answer-working",
+                        "working",
+                        phase="commentary",
+                    ),
+                    _user("user-steer", "continue"),
+                ],
+                status="interrupted",
+                items_view="full",
+                completed_at=None,
+                duration_ms=None,
+            )],
+            "nextCursor": None,
+        },
+        {
+            "data": [_turn(
+                "native-active",
+                [_user("user-first", "first"),
+                 _agent("answer-final", "final answer")],
+                status="completed",
+                completed_at=109,
+                duration_ms=9000,
+            )],
+            "nextCursor": None,
+        },
+        CodexRpcResponseTooLarge("terminal full turn is oversized"),
+        {
+            "data": [_turn(
+                "native-active",
+                [_user("user-first", "first"),
+                 _agent("answer-final", "final answer")],
+                status="completed",
+                completed_at=109,
+                duration_ms=9000,
+            )],
+            "nextCursor": None,
+        },
+    ]
+
+    async def rpc(method, params, cwd=None):
+        calls.append((method, params))
+        assert cwd is None
+        if responses:
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        raise CodexRpcResponseTooLarge("terminal full turn is oversized")
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        await history.summary_page(
+            "thread-active",
+            before=None,
+            limit=1,
+            active_turn_ids={"native-active"},
+        )
+        completed = await history.summary_page(
+            "thread-active",
+            before=None,
+            limit=1,
+            hydrate_recent=1,
+        )
+        refreshed = await history.summary_page(
+            "thread-active",
+            before=None,
+            limit=1,
+            hydrate_recent=1,
+        )
+
+        assert [params["itemsView"] for _method, params in calls] == [
+            "summary", "full", "summary", "full", "summary"]
+        assert [turn["id"] for turn in completed.turns] == [
+            "user-first", "user-steer"]
+        assert completed.turns[-1]["blocks"][-1]["text"] == "final answer"
+        assert completed.turns[-1]["done"] is True
+        assert refreshed.turns == completed.turns
+        assert responses == []
+
+    asyncio.run(run())
+
+
 def test_newest_completed_turn_hydration_restores_cold_steer_segments():
     responses = [
         {

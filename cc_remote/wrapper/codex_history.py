@@ -51,6 +51,7 @@ _MAX_LOCATORS = 8192
 _MAX_DETAIL_CACHE_ENTRIES = 64
 _MAX_DETAIL_CACHE_BYTES = 64 * 1024 * 1024
 _MAX_ACTIVE_TURN_CACHE_ENTRIES = 4
+_MAX_TERMINAL_REFRESH_FALLBACKS = 64
 
 
 class CodexHistoryError(RuntimeError):
@@ -394,6 +395,44 @@ def _unsupported(exc: CodexRpcRejected) -> bool:
     return exc.code == -32601
 
 
+def _needs_terminal_full_refresh(
+    summary_turn: dict[str, Any],
+    cached_full: dict[str, Any] | None,
+) -> bool:
+    """Return whether an active full snapshot predates terminal content."""
+    return bool(
+        cached_full is not None
+        and cached_full.get("status") == "inProgress"
+        and summary_turn.get("status") != "inProgress"
+    )
+
+
+def _merge_terminal_summary_agents(
+    cached_items: list[dict[str, Any]],
+    summary_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep steer shape while restoring terminal agents after full-read failure."""
+    merged = list(cached_items)
+    indices = {
+        item.get("id"): index
+        for index, item in enumerate(merged)
+        if isinstance(item.get("id"), str)
+    }
+    for item in summary_items:
+        if item.get("type") != "agentMessage":
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str):
+            continue
+        index = indices.get(item_id)
+        if index is None:
+            indices[item_id] = len(merged)
+            merged.append(item)
+        else:
+            merged[index] = item
+    return merged
+
+
 class CodexOfficialHistory:
     """Generation-local official history reader with opaque cursor isolation."""
 
@@ -424,6 +463,14 @@ class CodexOfficialHistory:
         self._native_full_turns: OrderedDict[
             tuple[str, str], dict[str, Any]
         ] = OrderedDict()
+        # A terminal summary is sufficient after the official full view proves
+        # permanently unavailable (unsupported or over the bounded RPC size).
+        # Keep that fact separate from the exact full cache: explicit detail
+        # requests may still use thread/items/list, while passive refreshes must
+        # not repeat the same oversized full-turn request forever.
+        self._terminal_refresh_fallbacks: OrderedDict[
+            tuple[str, str], None
+        ] = OrderedDict()
         self._detail_events: OrderedDict[
             tuple[str, str], tuple[dict[str, Any], ...]
         ] = OrderedDict()
@@ -443,6 +490,18 @@ class CodexOfficialHistory:
         mapping.move_to_end(key)
         while len(mapping) > _MAX_LOCATORS:
             mapping.popitem(last=False)
+
+    def _remember_terminal_refresh_fallback(
+        self,
+        key: tuple[str, str],
+    ) -> None:
+        self._terminal_refresh_fallbacks[key] = None
+        self._terminal_refresh_fallbacks.move_to_end(key)
+        while (
+            len(self._terminal_refresh_fallbacks)
+            > _MAX_TERMINAL_REFRESH_FALLBACKS
+        ):
+            self._terminal_refresh_fallbacks.popitem(last=False)
 
     async def summary_page(
         self,
@@ -495,6 +554,18 @@ class CodexOfficialHistory:
             for row in rows
         ]
         prefetched_full: dict[int, dict[str, Any]] = {}
+        terminal_refresh_indices: dict[int, tuple[str, str]] = {}
+        for index, turn in enumerate(validated_rows):
+            native_id = _wire_id(turn["id"], "turn")
+            key = (thread_id, native_id)
+            if (
+                before is None
+                and index < hydrate_recent
+                and key not in self._terminal_refresh_fallbacks
+                and _needs_terminal_full_refresh(
+                    turn, self._native_full_turns.get(key))
+            ):
+                terminal_refresh_indices[index] = key
         hydration_indices = [
             index
             for index, turn in enumerate(validated_rows)
@@ -503,12 +574,16 @@ class CodexOfficialHistory:
                 or (
                     index < hydrate_recent
                     and (
-                        thread_id,
-                        _wire_id(turn["id"], "turn"),
-                    ) not in self._native_full_turns
+                        (
+                            thread_id,
+                            _wire_id(turn["id"], "turn"),
+                        ) not in self._native_full_turns
+                        or index in terminal_refresh_indices
+                    )
                 )
             )
         ]
+        failed_terminal_prefetch: set[tuple[str, str]] = set()
         # A single descending full page is cheaper than walking an opaque cursor
         # once per recent row. Include any preceding cached row only when needed
         # to reach a later uncached row.
@@ -540,13 +615,24 @@ class CodexOfficialHistory:
             except CodexRpcRejected as exc:
                 if not _unsupported(exc):
                     raise
-            except (
-                CodexHistoryInvalidResponse,
-                CodexRpcResponseTooLarge,
-            ):
+                failed_terminal_prefetch.update(
+                    terminal_refresh_indices.values())
+                for key in failed_terminal_prefetch:
+                    self._remember_terminal_refresh_fallback(key)
+            except CodexRpcResponseTooLarge:
+                failed_terminal_prefetch.update(
+                    terminal_refresh_indices.values())
+                for key in failed_terminal_prefetch:
+                    self._remember_terminal_refresh_fallback(key)
+                prefetched_full.clear()
+            except CodexHistoryInvalidResponse:
                 # A combined recent page is an optimization. Exact active-turn
                 # hydration below remains mandatory; completed rows can retain
-                # their valid summary if the batch exceeds the stdio bound.
+                # their valid summary if the native page moved during the read.
+                # Invalid/moving pages are retried on a later refresh, but never
+                # issue the identical request twice in this one refresh.
+                failed_terminal_prefetch.update(
+                    terminal_refresh_indices.values())
                 prefetched_full.clear()
         native_seen: set[str] = set()
         visible_seen: set[str] = set()
@@ -573,12 +659,29 @@ class CodexOfficialHistory:
             active_turn = native_id in active_turn_ids
             cached_full = self._native_full_turns.get(
                 (thread_id, native_id))
+            terminal_refresh = _needs_terminal_full_refresh(
+                summary_turn, cached_full)
+            terminal_fallback = (
+                (thread_id, native_id)
+                in self._terminal_refresh_fallbacks
+            )
             hydrate_turn = active_turn or (
                 hydrate_recent > native_index
                 and before is None
-                and cached_full is None
+                and (
+                    cached_full is None
+                    or (terminal_refresh and not terminal_fallback)
+                )
             )
-            if hydrate_turn and turn.get("itemsView") != "full":
+            if (
+                hydrate_turn
+                and turn.get("itemsView") != "full"
+                and (
+                    active_turn
+                    or (thread_id, native_id)
+                    not in failed_terminal_prefetch
+                )
+            ):
                 try:
                     turn = await self._full_turn(thread_id, locator)
                 except CodexRpcRejected as exc:
@@ -595,6 +698,8 @@ class CodexOfficialHistory:
                         raise CodexHistoryUnsupported(
                             "active Codex full turn is incompatible") from exc
             if turn.get("itemsView") == "full":
+                self._terminal_refresh_fallbacks.pop(
+                    (thread_id, native_id), None)
                 if active_turn:
                     # App-server 0.147 can persist ``interrupted`` on a steered
                     # native turn while that exact turn continues producing
@@ -616,9 +721,17 @@ class CodexOfficialHistory:
             if turn.get("itemsView") != "full":
                 if cached_full is not None:
                     # Keep the exact full item sequence but accept lifecycle and
-                    # timing only from the newest official summary response.
+                    # timing from the newest official summary response. If the
+                    # terminal full read failed, at least merge its authoritative
+                    # final agent so the collapsed process row cannot hide the
+                    # completed answer behind a detail click.
+                    items = cached_full["items"]
+                    if terminal_refresh:
+                        items = _merge_terminal_summary_agents(
+                            items, summary_turn["items"])
                     turn = {
                         **cached_full,
+                        "items": items,
                         "status": turn["status"],
                         "startedAt": turn.get("startedAt"),
                         "completedAt": turn.get("completedAt"),

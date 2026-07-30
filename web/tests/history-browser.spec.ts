@@ -78,6 +78,95 @@ async function applyProductionCsp(
   }, productionCsp);
 }
 
+test("HTML preview retains head CSS and runs scripts only after explicit consent", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?artifact-html=1");
+  await applyProductionCsp(page);
+
+  const previewGeometry = async () => page.locator(
+    ".artifact-html-stage",
+  ).evaluate((stage) => {
+    const body = stage.parentElement;
+    const frame = stage.querySelector("iframe");
+    return {
+      bodyWidth: body?.getBoundingClientRect().width ?? 0,
+      stageWidth: stage.getBoundingClientRect().width,
+      frameWidth: frame?.getBoundingClientRect().width ?? 0,
+    };
+  });
+  const expectPreviewFillsBody = async () => {
+    await expect.poll(async () => {
+      const geometry = await previewGeometry();
+      return geometry.bodyWidth > 0
+        && Math.abs(geometry.stageWidth - geometry.bodyWidth) <= 1
+        && Math.abs(geometry.frameWidth - geometry.bodyWidth) <= 1;
+    }).toBe(true);
+  };
+
+  const staticFrame = page.frameLocator('iframe[title="HTML 静态预览"]');
+  await expectPreviewFillsBody();
+  await expect(staticFrame.locator("#head-style")).toHaveCSS(
+    "color",
+    "rgb(12, 34, 56)",
+  );
+  await expect(staticFrame.locator("body")).not.toHaveAttribute(
+    "data-script-ran",
+    "yes",
+  );
+
+  await page.getByRole("button", { name: "运行交互预览" }).click();
+  const interactiveFrame = page.frameLocator('iframe[title="HTML 交互预览"]');
+  await expectPreviewFillsBody();
+  await expect(interactiveFrame.locator("body")).toHaveAttribute(
+    "data-script-ran",
+    "yes",
+  );
+  await expect(interactiveFrame.locator("body")).toHaveAttribute(
+    "data-parent-blocked",
+    "yes",
+  );
+  await expect(page.locator("body")).not.toHaveAttribute(
+    "data-preview-escaped",
+    "yes",
+  );
+
+  await page.getByRole("button", { name: "停止交互预览" }).click();
+  await page.getByRole("button", { name: "运行交互预览" }).click();
+  const warmInteractiveFrame = page.frameLocator(
+    'iframe[title="HTML 交互预览"]',
+  );
+  await expect(warmInteractiveFrame.locator("body")).toHaveAttribute(
+    "data-script-ran",
+    "yes",
+  );
+});
+
+for (const fixture of ["artifact-svg", "artifact-markdown-svg"] as const) {
+  test(`${fixture} sanitizes SVG before creating a blob URL`, async ({
+    page,
+  }) => {
+    await page.goto(`/tests/history-browser.html?${fixture}=1`);
+    const image = page.getByRole("img", { name: fixture === "artifact-svg"
+      ? "diagram.svg" : "diagram" });
+    await expect(image).toBeVisible();
+    const sanitized = await image.evaluate(async (node) => {
+      const src = (node as HTMLImageElement).src;
+      return {
+        src,
+        text: await (await fetch(src)).text(),
+      };
+    });
+    expect(sanitized.src).toMatch(/^blob:/);
+    expect(sanitized.text).toContain("safe-svg-rect");
+    expect(sanitized.text).not.toMatch(
+      /<script|foreignObject|example\.com|<image/i,
+    );
+    await applyProductionCsp(page);
+    await expect(image).toBeVisible();
+  });
+}
+
 async function pinchThenPanPreview(
   page: import("@playwright/test").Page,
 ): Promise<{

@@ -14,6 +14,13 @@
   directory, preserves its deferred-query queue, and rolls back to the original
   cwd if the new resume fails. The selected cwd survives wrapper restarts;
   migration never forks or steals browser focus.
+- Add isolated artifact and file-activity rendering under the coordinated v28
+  Wrapper/Relay/Web wire gate. HTML
+  artifacts now retain document CSS and offer an explicit isolated interactive
+  preview; standalone, Markdown, and conversation SVG images share one bounded
+  sanitizer. Successful built-in reads can preview exact cwd-external image
+  snapshots without granting directory access, and file activities use
+  read/create/update/delete/move semantics instead of one generic edit icon.
 - Move busy-session follow-up queues from browser memory to the always-on
   wrapper. Protocol v25 lets queued and interrupt-replacement messages continue
   as soon as the active turn ends even when every Web/PWA client is asleep or

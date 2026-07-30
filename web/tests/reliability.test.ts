@@ -7184,6 +7184,50 @@ try {
     kind: "tool", message_id: "w", tool_use_id: "web", tool: "webSearch",
     input: { query: "sdk" }, category: "web_search", title: "搜索 sdk", done: false,
   }).icon, "research");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "r", tool_use_id: "read", tool: "Read",
+    input: { file_path: "/tmp/report.md" }, category: "file",
+    title: "读取 report.md", done: true,
+  }).icon, "read",
+  "an engine title must not turn a read-only file tool into a pen icon");
+  for (const tool of ["Glob", "Grep"]) {
+    const presentation = presentTool({
+      kind: "tool", message_id: tool, tool_use_id: tool, tool,
+      input: { pattern: "*.tsx", path: "web/src" }, category: "file",
+      title: tool === "Glob" ? "查找文件 · *.tsx" : "搜索 · *.tsx", done: true,
+    });
+    assert.equal(presentation.icon, "research",
+      `${tool} must remain a read-only search activity`);
+    assert.equal(presentation.group, "搜索");
+  }
+  assert.equal(presentTool({
+    kind: "tool", message_id: "image", tool_use_id: "image", tool: "view_image",
+    input: { path: "/tmp/chart.png" }, category: "file",
+    title: "查看图片", done: true,
+  }).icon, "read",
+  "view_image must remain a read-only file activity");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "a", tool_use_id: "add", tool: "fileChange",
+    input: { changes: [{ path: "new.ts", kind: "add" }] },
+    category: "file", title: "修改", done: true,
+  }).icon, "file-plus");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "x", tool_use_id: "delete", tool: "fileChange",
+    input: { changes: [{ path: "old.ts", kind: "delete" }] },
+    category: "file", title: "修改", done: true,
+  }).icon, "trash");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "m", tool_use_id: "move", tool: "fileChange",
+    input: { changes: [{
+      path: "old.ts", move_path: "new.ts", kind: "move",
+    }] },
+    category: "file", title: "修改", done: true,
+  }).icon, "branch");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "u", tool_use_id: "update", tool: "apply_patch",
+    input: { changes: [{ path: "app.ts", kind: "update" }] },
+    category: "file", title: "修改", done: true,
+  }).icon, "code");
   assert.equal(isToolFailure({
     kind: "tool", message_id: "d", tool_use_id: "declined", tool: "shell",
     input: {}, done: true,
@@ -9267,6 +9311,9 @@ assert.match(serviceWorkerSource, /existing\.postMessage\(\{[\s\S]*cc-remote-not
   "an already-open page must receive the exact notification target");
 assert.match(serviceWorkerSource, /self\.clients\.openWindow\(target\)/,
   "cold notification clicks must retain the fragment route");
+assert.match(serviceWorkerSource,
+  /url\.pathname === "\/html-preview-runner\.html"[\s\S]*url\.pathname === "\/html-preview-runner\.js"[\s\S]*return/,
+  "the isolated HTML runner must bypass shell and asset caching");
 assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\)/,
   "keyboard-aware mobile sheets must account for the virtual keyboard inset");
 

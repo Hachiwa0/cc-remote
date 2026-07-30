@@ -8,9 +8,13 @@ import { PanelTabs } from "./PanelTabs";
 import { GIT_DIFF_PAGE_LINES, pageGitDiff, type GitDiffSection } from "../diff";
 import { classifyPreviewTarget } from "../preview-path";
 import { parseLocalFileTarget } from "../file-link";
-import { buildSandboxDocument } from "../html-preview";
+import {
+  buildInteractiveSandboxDocument,
+  buildSandboxDocument,
+} from "../html-preview";
 import { clampPanelWidth } from "../responsive-layout";
 import { isMermaidFenceClass } from "../mermaid";
+import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import {
   isMathFenceClass,
   normalizeMathDelimiters,
@@ -64,6 +68,10 @@ function MarkdownPreviewCode({
 
 function HtmlArtifactPreview({ content }: { content: string }) {
   const [document, setDocument] = useState<string | null>(null);
+  const [interactiveDocument, setInteractiveDocument] =
+    useState<string | null>(null);
+  const [interactive, setInteractive] = useState(false);
+  const interactiveFrameRef = useRef<HTMLIFrameElement>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -72,11 +80,12 @@ function HtmlArtifactPreview({ content }: { content: string }) {
       try {
         const { default: DOMPurify } = await import("dompurify");
         const clean = DOMPurify.sanitize(content, {
+          WHOLE_DOCUMENT: true,
           FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "meta", "link"],
           FORBID_ATTR: ["srcset", "action", "formaction"],
         });
         const parsed = new DOMParser().parseFromString(clean, "text/html");
-        for (const element of parsed.body.querySelectorAll("*")) {
+        for (const element of parsed.documentElement.querySelectorAll("*")) {
           for (const attribute of Array.from(element.attributes)) {
             const name = attribute.name.toLowerCase();
             const value = attribute.value.trim();
@@ -92,15 +101,54 @@ function HtmlArtifactPreview({ content }: { content: string }) {
             }
           }
         }
-        for (const style of parsed.body.querySelectorAll("style")) {
+        for (const style of parsed.documentElement.querySelectorAll("style")) {
+          if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
+        }
+
+        const runnable = new DOMParser().parseFromString(content, "text/html");
+        for (const element of Array.from(runnable.querySelectorAll(
+          "iframe,object,embed,form,base,link,meta[http-equiv],script[src]",
+        ))) {
+          element.remove();
+        }
+        for (const element of runnable.documentElement.querySelectorAll("*")) {
+          for (const attribute of Array.from(element.attributes)) {
+            const name = attribute.name.toLowerCase();
+            const value = attribute.value.trim();
+            if (name === "srcset" || name === "action"
+                || name === "formaction") {
+              element.removeAttribute(attribute.name);
+            } else if (URL_ATTRIBUTES.has(name)) {
+              const allowedAnchor = name === "href" && value.startsWith("#");
+              const allowedImage = name === "src"
+                && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i
+                  .test(value);
+              if (!allowedAnchor && !allowedImage) {
+                element.removeAttribute(attribute.name);
+              }
+            } else if (name === "style" && UNSAFE_CSS.test(value)) {
+              element.removeAttribute(attribute.name);
+            }
+          }
+        }
+        for (const style of runnable.documentElement.querySelectorAll("style")) {
           if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
         }
         if (cancelled) return;
-        setDocument(buildSandboxDocument(parsed.body.innerHTML));
+        setDocument(buildSandboxDocument(
+          parsed.body.innerHTML,
+          parsed.head.innerHTML,
+        ));
+        setInteractiveDocument(buildInteractiveSandboxDocument(
+          runnable.body.innerHTML,
+          runnable.head.innerHTML,
+        ));
+        setInteractive(false);
         setError(null);
       } catch {
         if (cancelled) return;
         setDocument(null);
+        setInteractiveDocument(null);
         setError("HTML 安全处理失败");
       }
     };
@@ -108,10 +156,31 @@ function HtmlArtifactPreview({ content }: { content: string }) {
     return () => { cancelled = true; };
   }, [content]);
 
+  const loadInteractiveDocument = useCallback(() => {
+    if (!interactiveDocument) return;
+    interactiveFrameRef.current?.contentWindow?.postMessage({
+        type: "cc-remote-html-preview",
+        document: interactiveDocument,
+      }, "*");
+  }, [interactiveDocument]);
+
   if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
   if (!document) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 HTML…</div>;
-  return <iframe className="artifact-html-preview" title="HTML 预览"
-    sandbox="" referrerPolicy="no-referrer" srcDoc={document} />;
+  return <div className="artifact-html-stage">
+    <div className="artifact-html-controls">
+      <span>外部资源已禁用</span>
+      <button type="button" onClick={() => setInteractive((value) => !value)}>
+        {interactive ? "停止交互预览" : "运行交互预览"}
+      </button>
+    </div>
+    {interactive
+      ? <iframe ref={interactiveFrameRef} className="artifact-html-preview"
+          title="HTML 交互预览" sandbox="allow-scripts"
+          referrerPolicy="no-referrer" src="/html-preview-runner.html"
+          onLoad={loadInteractiveDocument} />
+      : <iframe className="artifact-html-preview" title="HTML 静态预览"
+          sandbox="" referrerPolicy="no-referrer" srcDoc={document} />}
+  </div>;
 }
 
 function BinaryArtifactPreview({ data, mediaType, kind, title }: {
@@ -122,8 +191,14 @@ function BinaryArtifactPreview({ data, mediaType, kind, title }: {
 }) {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const svg = useSanitizedSvgUrl(data, mediaType);
 
   useEffect(() => {
+    if (mediaType === "image/svg+xml") {
+      setObjectUrl(null);
+      setError(null);
+      return;
+    }
     if (!data || !mediaType) {
       setObjectUrl(null);
       setError("预览数据不完整");
@@ -145,12 +220,14 @@ function BinaryArtifactPreview({ data, mediaType, kind, title }: {
     }
   }, [data, mediaType]);
 
-  if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
-  if (!objectUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
+  const resolvedUrl = mediaType === "image/svg+xml" ? svg.url : objectUrl;
+  const resolvedError = mediaType === "image/svg+xml" ? svg.error : error;
+  if (resolvedError) return <div className="preview-error"><Icon name="read" size={18} />{resolvedError}</div>;
+  if (!resolvedUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
   if (kind === "image") {
-    return <div className="artifact-image-stage"><img src={objectUrl} alt={title} /></div>;
+    return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title} /></div>;
   }
-  return <iframe className="artifact-pdf-preview" src={objectUrl} title={`${title} PDF 预览`} />;
+  return <iframe className="artifact-pdf-preview" src={resolvedUrl} title={`${title} PDF 预览`} />;
 }
 
 function SourceFile({ content, targetLine, artifactKey }: {
@@ -211,6 +288,7 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset }: {
 }) {
   const target = classifyPreviewTarget(markdownPath, src);
   const [blocked, setBlocked] = useState(false);
+  const svg = useSanitizedSvgUrl(asset?.data, asset?.mediaType);
 
   useEffect(() => {
     if (target.kind !== "local" || asset?.data || asset?.error) return;
@@ -225,7 +303,15 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset }: {
     return <span className="preview-image-error" title={src}>图片路径不可用：{alt || src}</span>;
   }
   if (asset?.data && asset.mediaType) {
-    return <img src={`data:${asset.mediaType};base64,${asset.data}`}
+    if (svg.error) {
+      return <span className="preview-image-error">{svg.error}</span>;
+    }
+    if (asset.mediaType === "image/svg+xml" && !svg.url) {
+      return <span className="preview-image-loading"><span className="thinking"><span/><span/><span/></span> {alt || "正在处理 SVG"}</span>;
+    }
+    return <img src={asset.mediaType === "image/svg+xml"
+      ? svg.url!
+      : `data:${asset.mediaType};base64,${asset.data}`}
       alt={alt || ""} title={title} loading="lazy" />;
   }
   if (asset?.error) {
