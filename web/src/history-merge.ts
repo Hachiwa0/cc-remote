@@ -24,7 +24,9 @@ function textChannel(block: TextBlock): string {
   return block.channel ?? "final";
 }
 
-function isFinalTextBlock(block: Block): block is TextBlock {
+function isFinalTextBlock(
+  block: Block,
+): block is TextBlock & { channel: "final" } {
   return block.kind === "text" && block.channel === "final";
 }
 
@@ -254,6 +256,63 @@ function installCachedDetailRestore(
     // 1..N reading experience; large projections remain one tap away.
     detailRestoreOpen: reveal && blocks.length <= 256,
   };
+}
+
+/** Keep heavyweight process which this browser painted from the live stream
+ * visible across the first authoritative summary after completion/interrupt.
+ *
+ * This path is intentionally stricter than cache migration: only exact native
+ * identity aliases match, and the summary remains authoritative for prompt,
+ * final text, lifecycle, and ordering. The caller scopes observedTurns to one
+ * accepted history revision/generation, so rollback cannot resurrect a row.
+ */
+export function restoreObservedLiveTurnDetails(
+  summaries: Turn[],
+  observedTurns: readonly Turn[],
+): Turn[] {
+  const usedObserved = new Set<number>();
+  const restored = [...summaries];
+  let revealNewest = true;
+  for (let summaryIndex = restored.length - 1; summaryIndex >= 0;
+    summaryIndex -= 1) {
+    const summary = restored[summaryIndex];
+    const observedIndex = observedTurns.findIndex((candidate, index) =>
+      !usedObserved.has(index) && sameTurnIdentity(summary, candidate));
+    if (observedIndex < 0) continue;
+    usedObserved.add(observedIndex);
+    const observed = observedTurns[observedIndex];
+    if (!summary.done || !observed.done || summary.detailLoaded
+        || summary.detailProjection) continue;
+    const source = observed.detailProjection?.blocks ?? observed.blocks;
+    const blocks = source.filter((block) => !isFinalTextBlock(block)
+        && (block.kind !== "text" || block.text.length > 0))
+      .map(cloneDetailBlock);
+    if (blocks.length === 0) continue;
+    restored[summaryIndex] = {
+      ...summary,
+      detailLoaded: false,
+      detailLoading: false,
+      detailProjection: {
+        segments: [],
+        blocks,
+        capped: observed.detailProjection?.capped ?? false,
+        hasMore: false,
+        oldestCursor: null,
+        hasNewer: false,
+        newerCursor: null,
+      },
+      detailHasMore: false,
+      detailOldestCursor: null,
+      detailHasNewer: false,
+      detailNewerCursor: null,
+      detailAutoLoad: false,
+      detailRestorePending: false,
+      detailRestoreIncomplete: false,
+      detailRestoreOpen: revealNewest && blocks.length <= 256,
+    };
+    revealNewest = false;
+  }
+  return restored;
 }
 
 /** Reconcile cached process with canonical summary identities without

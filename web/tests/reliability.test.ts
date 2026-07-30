@@ -3071,6 +3071,157 @@ try {
     "a confirmed row without a terminal remains interrupted rather than successful",
   );
 
+  const interruptedClaudeSid = "claude-interrupted-live-detail";
+  let interruptedClaudeState = {
+    ...initialState,
+    focusedSid: interruptedClaudeSid,
+    runtimes: {
+      [interruptedClaudeSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        historyRevision: "claude-live-r1",
+        historyGeneration: "claude-live-g1",
+        historyBuildSeq: 1,
+        historyLiveSeq: 10,
+      },
+    },
+  };
+  for (const liveEvent of [
+    {
+      type: "user_msg", sid: interruptedClaudeSid, seq: 11,
+      msg_id: "claude-live-turn", prompt: "inspect",
+    },
+    {
+      type: "assistant_msg_start", sid: interruptedClaudeSid, seq: 12,
+      message_id: "claude-thinking", channel: "thinking",
+    },
+    {
+      type: "delta", sid: interruptedClaudeSid, seq: 13,
+      message_id: "claude-thinking", channel: "thinking",
+      text: "visible reasoning",
+    },
+    {
+      type: "assistant_msg_end", sid: interruptedClaudeSid, seq: 14,
+      message_id: "claude-thinking", channel: "thinking",
+    },
+    {
+      type: "tool_use", sid: interruptedClaudeSid, seq: 15,
+      message_id: "claude-tools", tool_use_id: "claude-tool",
+      tool: "Read", input: { file_path: "README.md" },
+    },
+    {
+      type: "tool_result", sid: interruptedClaudeSid, seq: 16,
+      tool_use_id: "claude-tool", content: "ok", is_error: false,
+    },
+    {
+      type: "assistant_msg_start", sid: interruptedClaudeSid, seq: 17,
+      message_id: "claude-final", channel: "final",
+    },
+    {
+      type: "delta", sid: interruptedClaudeSid, seq: 18,
+      message_id: "claude-final", channel: "final", text: "partial final",
+    },
+    {
+      type: "assistant_msg_end", sid: interruptedClaudeSid, seq: 19,
+      message_id: "claude-final", channel: "final",
+    },
+    {
+      type: "turn_end", sid: interruptedClaudeSid, seq: 20,
+      turn_id: "claude-native-turn",
+      result: {
+        subtype: "error_during_execution",
+        duration_ms: 750,
+        is_error: true,
+      },
+    },
+  ]) {
+    interruptedClaudeState = reduce(interruptedClaudeState, {
+      type: "event", event: event(liveEvent),
+    });
+  }
+  const interruptedSummary = (buildSeq: number) => event({
+    type: "history",
+    session_id: interruptedClaudeSid,
+    revision: "claude-live-r1",
+    generation: "claude-live-g1",
+    build_seq: buildSeq,
+    live_seq: 20,
+    detail: "summary",
+    authoritative: true,
+    in_progress: false,
+    has_more: false,
+    events: [],
+    turns: [{
+      id: "claude-live-turn",
+      forkPointId: "claude-native-turn",
+      prompt: "inspect",
+      done: true,
+      interrupted: true,
+      blocks: [{
+        kind: "text",
+        message_id: "history-final",
+        text: "partial final",
+        channel: "final",
+        done: true,
+      }],
+      detailEventCount: 4,
+      detailLoaded: false,
+    }],
+  });
+  interruptedClaudeState = reduce(interruptedClaudeState, {
+    type: "event", event: interruptedSummary(2),
+  });
+  const interruptedClaudeTurn =
+    interruptedClaudeState.runtimes[interruptedClaudeSid].turns[0];
+  const describeInterruptedBlock = (
+    block: { kind: string; channel?: string; text?: string },
+  ) => block.kind === "text" ? `${block.channel}:${block.text}` : block.kind;
+  assert.deepEqual(
+    interruptedClaudeTurn.blocks.map(describeInterruptedBlock),
+    ["final:partial final"],
+    "authoritative summary keeps ownership of the final answer",
+  );
+  assert.deepEqual(
+    interruptedClaudeTurn.detailProjection?.blocks.map(describeInterruptedBlock),
+    ["thinking:visible reasoning", "tool"],
+    "the process already painted before an interrupt survives summary install",
+  );
+  interruptedClaudeState = reduce(interruptedClaudeState, {
+    type: "event", event: interruptedSummary(3),
+  });
+  assert.deepEqual(
+    interruptedClaudeState.runtimes[interruptedClaudeSid].turns[0]
+      .detailProjection?.blocks.map(describeInterruptedBlock),
+    ["thinking:visible reasoning", "tool"],
+    "repeated summary refreshes do not duplicate restored live detail",
+  );
+  interruptedClaudeState = reduce(interruptedClaudeState, {
+    type: "event", event: event({
+      type: "history_invalidated",
+      session_id: interruptedClaudeSid,
+      revision: "claude-live-r2",
+    }),
+  });
+  assert.deepEqual(
+    interruptedClaudeState.runtimes[interruptedClaudeSid].turns,
+    [],
+    "rollback invalidation removes the completed local projection",
+  );
+  interruptedClaudeState = reduce(interruptedClaudeState, {
+    type: "event", event: event({
+      ...interruptedSummary(1),
+      revision: "claude-live-r2",
+      build_seq: 1,
+    }),
+  });
+  assert.equal(
+    interruptedClaudeState.runtimes[interruptedClaudeSid].turns[0]
+      .detailProjection,
+    undefined,
+    "a replacement revision cannot resurrect pre-rollback live process",
+  );
+
   const historyAliasSid = "history-client-message-alias";
   let historyAliasState = reduce({
     ...initialState,

@@ -1141,6 +1141,22 @@ function HistoryConversationBrowserFixture() {
     });
   };
 
+  const growBackgroundStreamingTurn = () => {
+    setSessions((current) => {
+      const targetSid = "history-browser-session-a";
+      const session = current[targetSid];
+      return {
+        ...current,
+        [targetSid]: {
+          ...session,
+          turns: session.turns.map((turn) => turn.id === "streaming"
+            ? streamingTurn("streaming", 48)
+            : turn),
+        },
+      };
+    });
+  };
+
   const replaceHistoryRevision = () => {
     if (recoveryReplacement) {
       setSessions((current) => {
@@ -1305,10 +1321,16 @@ function HistoryConversationBrowserFixture() {
           </div>
         )}
         {interactiveTimeline && (
-          <button data-testid="grow-stream" type="button"
-            onClick={growStreamingTurn}>
-            grow stream
-          </button>
+          <>
+            <button data-testid="grow-stream" type="button"
+              onClick={growStreamingTurn}>
+              grow stream
+            </button>
+            <button data-testid="grow-background-stream" type="button"
+              onClick={growBackgroundStreamingTurn}>
+              grow background stream
+            </button>
+          </>
         )}
         {manualGrowth && (
           <button data-testid="grow-row" type="button"

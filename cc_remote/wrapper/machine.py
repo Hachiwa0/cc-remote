@@ -11205,6 +11205,7 @@ class WrapperMachine:
                         question.question,
                         list(question.options),
                         header=question.header,
+                        allow_text=True,
                         multi_select=question.multi_select,
                     )
                     answers[question.question] = answer

@@ -48,6 +48,7 @@ import {
   shouldAutoLoadOlderHistory,
   shouldAutoLoadNewerHistory,
   ScrollFollowController,
+  createFrameCoalescer,
   type HistoryAnchorPoint,
   type HistoryPageDirection,
   type ScrollFollowSnapshot,
@@ -244,9 +245,12 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onTextSelectionGuardChange?: (guard: TextSelectionGuard | null) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentSizerRef = useRef<HTMLDivElement>(null);
   const controllerRef = useRef<ScrollFollowController | null>(null);
   if (!controllerRef.current) controllerRef.current = new ScrollFollowController();
   const scrollCoordinatorRef = useRef(new ScrollCoordinator());
+  const applyScrollCommandRef =
+    useRef<((command: ScrollCommand | null) => void) | null>(null);
   const [scrollPolicyEpoch, setScrollPolicyEpoch] = useState(0);
   const [scrollState, setScrollState] = useState<ScrollFollowSnapshot>(() =>
     controllerRef.current!.snapshot());
@@ -306,6 +310,13 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   const scrollScope = historyViewId == null
     ? `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${resolvedHistoryViewId}`
     : `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${historyRevision ?? ""}\u0000${resolvedHistoryViewId}`;
+  const activeScrollScopeRef = useRef(scrollScope);
+  activeScrollScopeRef.current = scrollScope;
+  const hasOpenTailRef = useRef(false);
+  const newestTurn = turns.at(-1);
+  hasOpenTailRef.current = !!newestTurn && (
+    !newestTurn.done || newestTurn.blocks.some((block) => !block.done)
+  );
   const turnKeySnapshot = updateTurnKeySnapshot(
     turnKeySnapshotRef.current,
     turns,
@@ -586,6 +597,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     lastScrollTopRef.current = el.scrollTop;
     syncScrollState(controller.recordProgrammaticScroll(readScrollMetrics(el)));
   }, [syncScrollState, virtualizer]);
+  applyScrollCommandRef.current = applyScrollCommand;
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -618,6 +630,45 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       if (frame !== null) window.cancelAnimationFrame(frame);
     };
   }, [applyScrollCommand, scrollScope]);
+
+  useLayoutEffect(() => {
+    const content = contentSizerRef.current;
+    if (!content || typeof ResizeObserver === "undefined") return;
+    const expectedScope = scrollScope;
+    let disposed = false;
+    const coalescer = createFrameCoalescer(
+      (callback) => window.requestAnimationFrame(callback),
+      (frameId) => window.cancelAnimationFrame(frameId),
+    );
+    const followMeasuredTail = () => {
+      coalescer.schedule(() => {
+        if (disposed
+            || activeScrollScopeRef.current !== expectedScope
+            || renderedScrollScopeRef.current !== expectedScope
+            || browseMode
+            || !hasOpenTailRef.current
+            || !controllerRef.current?.isFollowing()
+            || userScrollIntentRef.current
+            || touchYRef.current !== null
+            || historyAnchorRef.current.current() !== null
+            || scrollCoordinatorRef.current.isInteractionLocked()) return;
+        applyScrollCommandRef.current?.(
+          scrollCoordinatorRef.current.requestBottom("auto"),
+        );
+      });
+    };
+    const observer = new ResizeObserver(followMeasuredTail);
+    observer.observe(content);
+    // Session/revision switches request bottom before every virtual row has
+    // necessarily been measured. Re-assert the same follow intent on the next
+    // frame after the replacement sizer is mounted.
+    followMeasuredTail();
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      coalescer.cancel();
+    };
+  }, [browseMode, scrollScope]);
 
   const pauseOutputFollow = useCallback(() => {
     const el = scrollRef.current;
@@ -1868,7 +1919,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         onPointerDown={onThreadPointerDown}
         onTouchStart={onTouchStart} onTouchMove={onTouchMove}
         onTouchEnd={clearTouch} onTouchCancel={clearTouch}>
-        <div className="thread-in virtual-thread-in" style={{
+        <div ref={contentSizerRef} className="thread-in virtual-thread-in" style={{
           height: `${virtualizer.getTotalSize()}px`,
           position: "relative",
         }}>

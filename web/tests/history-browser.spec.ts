@@ -2128,6 +2128,48 @@ test("live append follows at the bottom but not while reading history", async ({
   expect(await page.locator(".turn").count()).toBeLessThan(40);
 });
 
+test("returning to a background-grown live turn settles at its current tail", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?interactive-timeline=1&engine=claude",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await expect(page.locator('[data-turn-id="streaming"] .turn-working'))
+    .toBeVisible();
+
+  await page.getByTestId("switch-session").click();
+  await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
+  const before = await readingAnchor(page);
+  await page.getByTestId("grow-background-stream").click();
+  await page.waitForTimeout(200);
+  const unchanged = await readingAnchor(page);
+  expect(unchanged.id).toBe(before.id);
+  expect(Math.abs(unchanged.offset - before.offset)).toBeLessThan(2);
+
+  await page.getByTestId("switch-session").click();
+  const working = page.locator(
+    '[data-turn-id="streaming"] .turn-working',
+  );
+  await expect(working).toBeVisible();
+  await expect.poll(async () => working.evaluate((node) => {
+    const thread = document.querySelector<HTMLElement>(".thread");
+    if (!thread) return false;
+    return node.getBoundingClientRect().bottom
+      <= thread.getBoundingClientRect().bottom + 1;
+  })).toBe(true);
+  for (let index = 0; index < 4; index += 1) {
+    await page.getByTestId("grow-stream").click();
+    await expect.poll(async () => working.evaluate((node) => {
+      const thread = document.querySelector<HTMLElement>(".thread");
+      if (!thread) return false;
+      return node.getBoundingClientRect().bottom
+        <= thread.getBoundingClientRect().bottom + 1;
+    })).toBe(true);
+  }
+});
+
 test("composer action growth keeps the live tail visible without stealing history", async ({
   page,
 }, testInfo) => {

@@ -36,7 +36,7 @@ import {
 import {
   historyContainsTurn, installAuthoritativeTurnDetailPage,
   mergeAuthoritativeTurnDetail, mergeInitialHistory,
-  restoreCachedTurnDetails,
+  restoreCachedTurnDetails, restoreObservedLiveTurnDetails,
 } from "./history-merge";
 import {
   installTurnDetailProjectionPage,
@@ -207,6 +207,11 @@ export interface SessionRuntime {
   // not a genuine live tail, even when an old cache row happens to be marked
   // unfinished (for example a tab closed halfway through streaming).
   hydratedCacheTurnIds: string[];
+  // Completed turns whose heavyweight process was painted from this
+  // connection's live stream. A same-revision summary may omit those blocks;
+  // this bounded, memory-only identity list preserves only that observed
+  // detail without retaining arbitrary completed transcript rows.
+  liveDetailTurnIds: string[];
   // Native newest turn id from the last authoritative first History page. A
   // query freezes this together with revision/build/live watermarks so a later
   // materialized page can prove acceptance even when its UserMsg id is native.
@@ -334,6 +339,7 @@ export function createRuntime(): SessionRuntime {
     lastLiveSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
+    liveDetailTurnIds: [],
     historyNewestId: null,
     pendingQuestion: null, contextReport: null,
     contextRequestId: null, contextError: null, goal: null,
@@ -978,6 +984,18 @@ function markTurnAsLive(
   }
 }
 
+const MAX_LIVE_DETAIL_TURN_IDS = 128;
+
+function markTurnDetailAsLive(
+  runtime: SessionRuntime, turnId: string, liveEvent: boolean,
+): void {
+  if (!liveEvent || runtime.liveDetailTurnIds.includes(turnId)) return;
+  runtime.liveDetailTurnIds = [
+    ...runtime.liveDetailTurnIds,
+    turnId,
+  ].slice(-MAX_LIVE_DETAIL_TURN_IDS);
+}
+
 // Patch a runtime by sid (explicit sid wins; null/undefined → focused). `create`
 // creates the runtime if missing (used by snapshot for a session we haven't
 // seen). Unknown sid with create=false → no-op (drop the frame: it's for a
@@ -1009,7 +1027,12 @@ function clearSessionControl(runtime: SessionRuntime): void {
 function switchControlGeneration(
   runtime: SessionRuntime, generation: string | null | undefined,
 ): void {
-  if (!generation || generation === runtime.controlGeneration) return;
+  if (!generation) return;
+  if (runtime.historyGeneration !== null
+      && generation !== runtime.historyGeneration) {
+    runtime.liveDetailTurnIds = [];
+  }
+  if (generation === runtime.controlGeneration) return;
   clearSessionControl(runtime);
   runtime.controlGeneration = generation;
   // History pages are scoped to one wrapper generation. A cursor/page loaded
@@ -1960,6 +1983,10 @@ function reduceEvent(
               ...target.hydratedCacheTurnIds,
               ...source.hydratedCacheTurnIds,
             ])),
+            liveDetailTurnIds: Array.from(new Set([
+              ...target.liveDetailTurnIds,
+              ...source.liveDetailTurnIds,
+            ])).slice(-MAX_LIVE_DETAIL_TURN_IDS),
             ccSessionId: session_id,
             turns: mergedTurns,
             queue: [...source.queue, ...target.queue],
@@ -2130,6 +2157,7 @@ function reduceEvent(
         rt.historyLiveSeq = 0;
         rt.hasLoadedOlderHistory = false;
         rt.hydratedCacheTurnIds = [];
+        rt.liveDetailTurnIds = [];
         rt.loading = true;
       }, true);
       if (next.historyRecovery?.sid === e.session_id) {
@@ -2486,6 +2514,21 @@ function reduceEvent(
             base.turns.filter((turn) => cachedIds.has(turn.id)),
           );
         }
+      }
+      const liveDetailScopeMatches = e.detail === "summary"
+        && !base.historyInvalidated
+        && (base.historyRevision == null
+          || base.historyRevision === e.revision)
+        && (e.generation != null
+          ? base.historyGeneration == null
+            || base.historyGeneration === e.generation
+          : base.historyGeneration == null);
+      if (liveDetailScopeMatches && base.liveDetailTurnIds.length > 0) {
+        const observedIds = new Set(base.liveDetailTurnIds);
+        turns = restoreObservedLiveTurnDetails(
+          turns,
+          base.turns.filter((turn) => observedIds.has(turn.id)),
+        );
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
@@ -3064,6 +3107,7 @@ function reduceEvent(
           // inside this envelope will immediately replace this with its token.
           rt.pendingHistoryRevision = null;
           rt.hydratedCacheTurnIds = [];
+          rt.liveDetailTurnIds = [];
           rt.hasLoadedOlderHistory = false;
           if (e.rebuild) {
             // The wrapper generation (and every SessionContext seq) restarted.
@@ -3421,6 +3465,9 @@ function reduceEvent(
         }
         block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
         block.text = appendField(block.text, e.text, MAX_LIVE_TEXT_CHARS);
+        if (block.channel !== "final" && e.text.length > 0) {
+          markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
+        }
         if (boundCompletedTurns) limitTurnBlocks(t);
         rt.turns = turns;
       });
@@ -3432,6 +3479,7 @@ function reduceEvent(
           ?? preSteerTurn(rt, turns)
           ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         t.progress = undefined;
         const existing = t.blocks.find((b) => b.kind === "tool"
           && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
@@ -3459,6 +3507,7 @@ function reduceEvent(
             && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (!block) continue;
           markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+          markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
           if (e.stream === "progress" || e.stream === "summary") {
             block.progress = appendField(
               block.progress, e.delta, MAX_LIVE_PROGRESS_CHARS);
@@ -3481,6 +3530,7 @@ function reduceEvent(
           const b = t.blocks.find((b) => b.kind === "tool" && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (b) {
             markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+            markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
             b.result = { content: e.content, is_error: e.is_error,
               truncated: e.truncated ?? undefined, status: e.status,
               summary: e.summary, diff: e.diff, exit_code: e.exit_code,
@@ -3530,6 +3580,7 @@ function reduceEvent(
             turns, e.turn_id || e.item_id, eventTimestampMs(e.ts));
         }
         markTurnAsLive(rt, owner.id, boundCompletedTurns, e.seq);
+        markTurnDetailAsLive(rt, owner.id, boundCompletedTurns);
         if (!block) {
           block = { kind: "process", item_id: e.item_id, processKind: e.kind,
             phase: e.phase, status: e.status, turn_id: e.turn_id,
@@ -3587,6 +3638,7 @@ function reduceEvent(
             turns, e.turn_id || e.item_id, eventTimestampMs(e.ts));
         }
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         let block = t.blocks.find((b) => b.kind === "process"
           && b.item_id === e.item_id) as ProcessBlock | undefined;
         if (!block) {
@@ -3614,6 +3666,7 @@ function reduceEvent(
             turns, e.turn_id || e.item_id, eventTimestampMs(e.ts));
         }
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         let block = t.blocks.find((b) => b.kind === "process"
           && b.item_id === e.item_id) as ProcessBlock | undefined;
         if (!block) {

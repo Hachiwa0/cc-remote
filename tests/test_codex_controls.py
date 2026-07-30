@@ -3446,8 +3446,9 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
             if message.type == "ask_user" and message.ask_id == first_id)
         assert first_event.header == "Target"
         assert first_event.multi_select is False
+        assert first_event.allow_text is True
         assert [option["label"] for option in first_event.options] == ["Mac", "Linux"]
-        ctx.pending_asks[first_id].set_result("Mac")
+        ctx.pending_asks[first_id].set_result("Windows")
 
         while not ctx.pending_asks or first_id in ctx.pending_asks:
             await asyncio.sleep(0)
@@ -3457,15 +3458,16 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
             if message.type == "ask_user" and message.ask_id == second_id)
         assert second_event.header == "Checks"
         assert second_event.multi_select is True
-        ctx.pending_asks[second_id].set_result(["Tests", "Lint"])
+        assert second_event.allow_text is True
+        ctx.pending_asks[second_id].set_result(["Tests", "Custom audit"])
 
         result = await task
         assert isinstance(result, PermissionResultAllow)
         assert result.updated_input == {
             **tool_input,
             "answers": {
-                "Which target?": "Mac",
-                "Which checks?": ["Tests", "Lint"],
+                "Which target?": "Windows",
+                "Which checks?": ["Tests", "Custom audit"],
             },
         }
         assert not any(
