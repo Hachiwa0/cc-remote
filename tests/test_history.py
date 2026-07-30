@@ -37,6 +37,7 @@ from cc_remote.wrapper.codex_history import (
     CodexHistoryUnsupported,
 )
 from cc_remote.wrapper.codex_rpc import CodexRpcRejected
+from cc_remote.wrapper.codex_stream import CodexHistoryImageView
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
@@ -51,6 +52,339 @@ from cc_remote.wrapper.stream import (
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def test_codex_image_view_supplement_keeps_official_detail_and_deduplicates():
+    official = [
+        {"type": "user_msg", "msg_id": "user-1", "prompt": "inspect"},
+        {
+            "type": "process",
+            "item_id": "reason-1",
+            "kind": "reasoning",
+            "phase": "end",
+            "status": "succeeded",
+            "title": "思考",
+        },
+        {
+            "type": "tool_use",
+            "message_id": "message-1",
+            "tool_use_id": "call-image-1",
+            "tool": "view_image",
+            "input": {"path": "/tmp/chart.png"},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-image-1",
+            "content": "data:image/png;base64,SHOULD_NOT_SURVIVE",
+            "is_error": False,
+        },
+        {
+            "type": "process",
+            "item_id": "command-after-image",
+            "kind": "command",
+            "phase": "end",
+            "status": "succeeded",
+            "title": "运行命令",
+        },
+        {
+            "type": "assistant_msg_start",
+            "message_id": "final-1",
+            "channel": "final",
+        },
+        {
+            "type": "delta",
+            "message_id": "final-1",
+            "channel": "final",
+            "text": "done",
+        },
+        {
+            "type": "assistant_msg_end",
+            "message_id": "final-1",
+            "channel": "final",
+        },
+        {
+            "type": "turn_end",
+            "turn_id": "native-1",
+            "result": {
+                "subtype": "success",
+                "duration_ms": 1,
+                "is_error": False,
+            },
+        },
+    ]
+    image_event = ProcessEvent(
+        item_id="fc-image-1",
+        kind="server_tool",
+        phase="end",
+        status="succeeded",
+        turn_id="native-1",
+        title="查看图片",
+        tool="view_image",
+        input={
+            "file_path": "/tmp/chart.png",
+            "history_image": {
+                "image_id": "img-123",
+                "media_type": "image/png",
+                "width": 1,
+                "height": 1,
+                "byte_size": 68,
+            },
+        },
+    )
+    view = CodexHistoryImageView(
+        call_id="call-image-1",
+        event=image_event,
+        next_item_id="command-after-image",
+    )
+
+    merged = mm._merge_codex_history_image_views(official, (view,))
+
+    assert any(row.get("item_id") == "reason-1" for row in merged)
+    image_rows = [
+        row for row in merged
+        if row.get("type") == "process" and row.get("tool") == "view_image"
+    ]
+    assert len(image_rows) == 1
+    assert image_rows[0]["item_id"] == "fc-image-1"
+    assert all(row.get("tool_use_id") != "call-image-1" for row in merged)
+    assert "SHOULD_NOT_SURVIVE" not in json.dumps(merged)
+    assert merged.index(image_rows[0]) < next(
+        index for index, row in enumerate(merged)
+        if row.get("item_id") == "command-after-image"
+    )
+    assert merged.index(image_rows[0]) < next(
+        index for index, row in enumerate(merged)
+        if row.get("type") == "assistant_msg_start"
+        and row.get("channel") == "final"
+    )
+
+    official_with_image = [
+        official[0],
+        official[1],
+        {
+            **image_event.model_dump(mode="json"),
+            "input": {"file_path": "/tmp/chart.png"},
+        },
+        *official[2:],
+    ]
+    deduplicated = mm._merge_codex_history_image_views(
+        official_with_image, (view,))
+    official_image_rows = [
+        row for row in deduplicated
+        if row.get("type") == "process" and row.get("tool") == "view_image"
+    ]
+    assert len(official_image_rows) == 1
+    assert official_image_rows[0]["input"]["history_image"]["image_id"] == "img-123"
+    assert all(
+        row.get("tool_use_id") != "call-image-1"
+        for row in deduplicated
+    )
+
+    official_without_image_shell = [
+        row for row in official
+        if row.get("tool_use_id") != "call-image-1"
+    ]
+    anchored = mm._merge_codex_history_image_views(
+        official_without_image_shell, (view,))
+    anchored_image = next(
+        row for row in anchored
+        if row.get("type") == "process"
+        and row.get("tool") == "view_image"
+    )
+    assert anchored.index(anchored_image) < next(
+        index for index, row in enumerate(anchored)
+        if row.get("item_id") == "command-after-image"
+    )
+
+
+def test_codex_turn_detail_lazily_recovers_missing_official_image_view(
+    monkeypatch, tmp_path,
+):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 32), (70, 90, 130)).save(buffer, "PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    rollout = tmp_path / "rollout-image-view.jsonl"
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in [
+        {"timestamp": "2026-07-30T06:40:00Z", "type": "session_meta",
+         "payload": {"id": "session-image-view"}},
+        {"timestamp": "2026-07-30T06:40:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "native-1"}},
+        {"timestamp": "2026-07-30T06:40:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "turn_id": "native-1",
+                     "message": "inspect"}},
+        {"timestamp": "2026-07-30T06:40:03Z", "type": "response_item",
+         "payload": {
+             "type": "function_call", "id": "fc-image-1",
+             "name": "view_image", "call_id": "call-image-1",
+             "arguments": '{"path":"/tmp/chart.png","detail":"original"}',
+             "internal_chat_message_metadata_passthrough": {
+                 "turn_id": "native-1",
+             },
+         }},
+        {"timestamp": "2026-07-30T06:40:04Z", "type": "response_item",
+         "payload": {
+             "type": "function_call_output", "call_id": "call-image-1",
+             "output": [{
+                 "type": "input_image",
+                 "image_url": f"data:image/png;base64,{encoded}",
+                 "detail": "original",
+             }],
+             "internal_chat_message_metadata_passthrough": {
+                 "turn_id": "native-1",
+             },
+         }},
+        {"timestamp": "2026-07-30T06:40:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "native-1"}},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    image_view_reads = 0
+    real_image_view_reader = mm.codex_history_image_views
+
+    def counted_image_view_reader(*args, **kwargs):
+        nonlocal image_view_reads
+        image_view_reads += 1
+        return real_image_view_reader(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mm, "codex_history_image_views", counted_image_view_reader)
+    official = (
+        {"type": "user_msg", "msg_id": "user-1", "prompt": "inspect"},
+        ProcessEvent(
+            item_id="official-plan",
+            kind="plan",
+            phase="end",
+            status="succeeded",
+            turn_id="native-1",
+            title="计划",
+        ).model_dump(mode="json"),
+        {"type": "assistant_msg_start", "message_id": "answer-1",
+         "channel": "final"},
+        {"type": "delta", "message_id": "answer-1",
+         "channel": "final", "text": "done"},
+        {"type": "assistant_msg_end", "message_id": "answer-1",
+         "channel": "final"},
+        {"type": "turn_end", "turn_id": "native-1",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    )
+
+    class OfficialHistory:
+        async def turn_events(self, _sid, _turn_id):
+            return official
+
+        def rollout_fallback(self, _sid, _turn_id):
+            return SimpleNamespace(
+                before=None,
+                limit=4,
+                native_turn_id="native-1",
+                segment_index=0,
+                segment_count=1,
+            )
+
+        def summary_events(self, _sid, _turn_id):
+            return None
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-image-view")
+        machine._codex_history = OfficialHistory()
+        ctx = _mk_ctx("session-image-view", "session-image-view")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        revision = machine._history_revision("session-image-view")
+
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id="session-image-view",
+            turn_id="user-1",
+            client_id="client-1",
+            revision=revision,
+            before=None,
+            limit=192,
+        ))
+        assert any(
+            event.get("item_id") == "official-plan"
+            for event in detail.events
+        )
+        image_events = [
+            event for event in detail.events
+            if event.get("type") == "process"
+            and event.get("tool") == "view_image"
+        ]
+        assert len(image_events) == 1
+        wire = detail.model_dump_json()
+        assert encoded not in wire
+        image_id = image_events[0]["input"]["history_image"]["image_id"]
+
+        image = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-image-view",
+            turn_id="user-1",
+            image_id=image_id,
+            variant="full",
+            request_id="image-request",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert image.error is None and image.media_type == "image/png"
+        assert image.width == 64 and image.height == 32
+        assert base64.b64decode(image.data) == buffer.getvalue()
+        assert image_view_reads == 1
+
+        with rollout.open("a", encoding="utf-8") as output:
+            output.write(json.dumps({
+                "timestamp": "2026-07-30T06:41:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "native-2",
+                },
+            }) + "\n")
+        appended_detail = await machine._handle_get_turn_detail(
+            SimpleNamespace(
+                session_id="session-image-view",
+                turn_id="user-1",
+                client_id="client-1",
+                revision=revision,
+                before=None,
+                limit=192,
+            )
+        )
+        assert any(
+            event.get("type") == "process"
+            and event.get("tool") == "view_image"
+            for event in appended_detail.events
+        )
+        assert image_view_reads == 1, (
+            "a validated append must reuse a completed turn's supplement"
+        )
+
+        machine._history_index.invalidate_session("session-image-view")
+        rehydrated = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-image-view",
+            turn_id="user-1",
+            image_id=image_id,
+            variant="full",
+            request_id="image-request-after-eviction",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert rehydrated.error is None
+        assert base64.b64decode(rehydrated.data) == buffer.getvalue()
+        assert image_view_reads == 2, (
+            "an evicted image asset must be rehydrated from the rollout"
+        )
+        assert any(
+            key[0] == "session-image-view"
+            for key in machine._codex_history_image_views
+        )
+        machine._bump_history_revision("session-image-view")
+        assert not any(
+            key[0] == "session-image-view"
+            for key in machine._codex_history_image_views
+        )
+
+    asyncio.run(go())
 
 
 def test_requested_codex_summary_uses_official_turns_without_rollout_parse(
@@ -879,6 +1213,95 @@ def test_get_history_image_is_revision_bound_lazy_and_cached(
         assert stale.to == "client-2" and stale.data is None
         assert stale.error == "会话历史已更新，请重新加载图片"
         assert transport.sent[-4:] == [thumbnail, full, cached, stale]
+
+    asyncio.run(go())
+
+
+def test_history_image_tool_asset_is_served_only_from_current_turn_reference(
+    monkeypatch, tmp_path,
+):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (320, 160), (34, 120, 88)).save(buffer, "PNG")
+    raw = buffer.getvalue()
+    rollout = tmp_path / "rollout-tool-image.jsonl"
+    rollout.write_text("{}\n")
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    image_id = "img-tool-view-1"
+    events = (
+        {"type": "user_msg", "sid": "session-1", "msg_id": "message-1",
+         "prompt": "inspect"},
+        ProcessEvent(
+            item_id="view-1",
+            kind="server_tool",
+            phase="end",
+            status="succeeded",
+            turn_id="native-1",
+            title="查看图片",
+            tool="view_image",
+            input={
+                "file_path": "/tmp/chart.png",
+                "history_image": {
+                    "image_id": image_id,
+                    "media_type": "image/png",
+                    "width": 320,
+                    "height": 160,
+                    "byte_size": len(raw),
+                },
+            },
+        ).model_dump(mode="json"),
+        {"type": "turn_end", "sid": "session-1", "turn_id": "native-1",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-tool-image")
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        page = MaterializedHistoryPage(
+            events=events,
+            has_more=False,
+            oldest_id="message-1",
+            newest_id="message-1",
+            turns=materialize_history_turns(events),
+        )
+        machine._history_index.put_page(
+            "session-1", "codex", source, before=None, limit=4, page=page)
+        machine._history_index.put_image_asset(
+            "session-1", "codex", source, "message-1", image_id, "full",
+            "image/png", 320, 160, raw,
+        )
+        revision = machine._history_revision("session-1")
+
+        thumbnail = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-1",
+            turn_id="message-1",
+            image_id=image_id,
+            variant="thumbnail",
+            request_id="request-tool-image",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert thumbnail.error is None
+        assert thumbnail.media_type == "image/webp"
+        assert thumbnail.width == 320 and thumbnail.height == 160
+
+        missing = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-1",
+            turn_id="message-1",
+            image_id="img-guessed",
+            variant="full",
+            request_id="request-guessed",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert missing.data is None
+        assert missing.error == "未找到这张历史图片"
 
     asyncio.run(go())
 

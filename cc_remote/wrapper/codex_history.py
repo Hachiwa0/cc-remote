@@ -84,6 +84,8 @@ class CodexRolloutFallback:
     before: str | None
     limit: int
     native_turn_id: str
+    segment_index: int
+    segment_count: int
 
 
 @dataclass(frozen=True)
@@ -1115,6 +1117,8 @@ class CodexOfficialHistory:
             before=locator.request_before,
             limit=locator.request_limit,
             native_turn_id=locator.native_turn_id,
+            segment_index=locator.segment_index,
+            segment_count=locator.segment_count,
         )
 
     def summary_events(

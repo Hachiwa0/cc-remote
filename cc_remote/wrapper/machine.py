@@ -96,7 +96,7 @@ from cc_remote.protocol import (
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
     GoalState, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg, TurnSteered,
-    ToolUse, ToolResult, TurnBinding, TurnEnd, TurnNotificationContext,
+    ToolUse, ToolResult, ProcessEvent, TurnBinding, TurnEnd, TurnNotificationContext,
     TurnResult, is_downstream,
     is_reliable_command,
     SessionInfo, SessionList, SessionActivity, ListSessions, SessionFocus,
@@ -154,6 +154,7 @@ from cc_remote.wrapper.history_store import (
     HistorySourceFingerprint,
     MaterializedHistoryPage,
     history_image_from_events,
+    history_source_extends,
     materialize_history_turns,
 )
 from cc_remote.wrapper.stream import (
@@ -171,7 +172,8 @@ from cc_remote.wrapper.codex_handle import (
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
-    CodexStreamTranslator, codex_session_id, is_turn_terminal,
+    CodexHistoryImageView, CodexStreamTranslator,
+    codex_history_image_views, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_turn_user,
     codex_history_window,
     codex_native_rollback_turns,
@@ -679,6 +681,157 @@ def _render_history_image(
         return "image/webp", source.width, source.height, thumb
 
 
+def _normalized_tool_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _merge_codex_history_image_views(
+    rows: tuple[dict, ...] | list[dict],
+    views: tuple[CodexHistoryImageView, ...],
+) -> list[dict]:
+    """Add only missing image-view rows without replacing official detail."""
+    merged = [dict(row) for row in rows]
+    if not views:
+        return merged
+
+    official_indexes: list[int] = []
+    for index, row in enumerate(merged):
+        if (
+            row.get("type") == "process"
+            and _normalized_tool_name(row.get("tool")) == "viewimage"
+        ):
+            official_indexes.append(index)
+
+    used_official: set[int] = set()
+    matched_official_calls: set[str] = set()
+    view_events: dict[str, dict] = {}
+    for view in views:
+        event = view.event.model_dump(mode="json")
+        view_events[view.call_id] = event
+        event_input = event.get("input")
+        image_path = (
+            event_input.get("file_path")
+            if isinstance(event_input, dict)
+            else None
+        )
+        matched_index = next((
+            index for index in official_indexes
+            if index not in used_official
+            and merged[index].get("item_id") == event.get("item_id")
+        ), None)
+        if matched_index is None and isinstance(image_path, str):
+            matched_index = next((
+                index for index in official_indexes
+                if index not in used_official
+                and isinstance(merged[index].get("input"), dict)
+                and (
+                    merged[index]["input"].get("file_path")
+                    or merged[index]["input"].get("path")
+                ) == image_path
+            ), None)
+        if matched_index is not None:
+            used_official.add(matched_index)
+            official = dict(merged[matched_index])
+            official_input = dict(
+                official.get("input")
+                if isinstance(official.get("input"), dict)
+                else {}
+            )
+            if isinstance(event_input, dict):
+                history_ref = event_input.get("history_image")
+                if isinstance(history_ref, dict):
+                    official_input["history_image"] = history_ref
+            if image_path:
+                official_input.setdefault("file_path", image_path)
+            official["input"] = official_input or None
+            official["tool"] = "view_image"
+            merged[matched_index] = official
+            matched_official_calls.add(view.call_id)
+
+    legacy_view_calls = {
+        str(row.get("tool_use_id"))
+        for row in merged
+        if (
+            row.get("type") == "tool_use"
+            and row.get("tool_use_id") in view_events
+            and _normalized_tool_name(row.get("tool")) == "viewimage"
+        )
+    }
+    placed_calls: set[str] = set(matched_official_calls)
+    base: list[dict] = []
+    for row in merged:
+        call_id = row.get("tool_use_id")
+        if (
+            row.get("type") == "tool_use"
+            and call_id in legacy_view_calls
+        ):
+            call_key = str(call_id)
+            if call_key not in placed_calls:
+                base.append(view_events[call_key])
+                placed_calls.add(call_key)
+            continue
+        if (
+            row.get("type") in {"tool_delta", "tool_result"}
+            and call_id in legacy_view_calls
+        ):
+            continue
+        base.append(row)
+
+    additions = [
+        view for view in views
+        if view.call_id not in placed_calls
+    ]
+    if not additions:
+        return base
+
+    first_by_id: dict[str, int] = {}
+    last_by_id: dict[str, int] = {}
+    for index, row in enumerate(base):
+        for key in ("item_id", "tool_use_id", "message_id"):
+            identity = row.get(key)
+            if not isinstance(identity, str):
+                continue
+            first_by_id.setdefault(identity, index)
+            last_by_id[identity] = index
+
+    fallback_index = next((
+        index for index, row in enumerate(base)
+        if (
+            row.get("type") == "assistant_msg_start"
+            and row.get("channel") == "final"
+        )
+    ), None)
+    if fallback_index is None:
+        fallback_index = next((
+            index for index, row in enumerate(base)
+            if row.get("type") == "turn_end"
+        ), len(base))
+
+    insertions: dict[int, list[dict]] = {}
+    for view in additions:
+        if (
+            view.next_item_id is not None
+            and view.next_item_id in first_by_id
+        ):
+            insert_at = first_by_id[view.next_item_id]
+        elif (
+            view.previous_item_id is not None
+            and view.previous_item_id in last_by_id
+        ):
+            insert_at = last_by_id[view.previous_item_id] + 1
+        else:
+            insert_at = fallback_index
+        insertions.setdefault(insert_at, []).append(
+            view.event.model_dump(mode="json"))
+
+    ordered: list[dict] = []
+    for index in range(len(base) + 1):
+        ordered.extend(insertions.get(index, ()))
+        if index < len(base):
+            ordered.append(base[index])
+    return ordered
+
+
 def _session_permission_mode(ctx: SessionContext) -> str:
     """Return the permission mode actually configured on this live engine."""
     if ctx.engine == "codex":
@@ -778,6 +931,7 @@ class WrapperMachine:
     PREVIEW_IMAGE_SNAPSHOT_GLOBAL_BYTES = 64 * 1024 * 1024
     PREVIEW_IMAGE_SNAPSHOT_SESSION_ENTRIES = 64
     PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES = 256
+    CODEX_HISTORY_IMAGE_VIEW_CACHE_ENTRIES = 256
     NOTIFICATION_TITLE_CAP = 512
     NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
@@ -878,9 +1032,21 @@ class WrapperMachine:
         # read.  They are process-local by design: no temporary user image is
         # copied to the relay or persisted on disk.
         self._preview_image_snapshots: OrderedDict[
-            tuple[str, str], tuple[str, bytes]
+            tuple[str, str], tuple[str, str, bytes]
         ] = OrderedDict()
+        self._preview_image_path_aliases: dict[
+            tuple[str, str], str
+        ] = {}
         self._preview_image_snapshot_bytes = 0
+        # Event-only cache for repeated TurnDetail pages. Exact image bytes live
+        # in the source-bound SQLite asset cache, never in this second LRU.
+        self._codex_history_image_views: OrderedDict[
+            tuple[str, str, str, int],
+            tuple[
+                HistorySourceFingerprint,
+                tuple[CodexHistoryImageView, ...],
+            ],
+        ] = OrderedDict()
         # Pool of resident sessions, keyed by real session_id (or a `tmp-<uuid>`
         # temp key for a brand-new session until its id is captured).
         self.sessions: dict[str, SessionContext] = {}
@@ -1118,6 +1284,9 @@ class WrapperMachine:
                     "history index invalidation failed", session_id=sid,
                     error=str(exc),
                 )
+        for key in tuple(self._codex_history_image_views):
+            if key[0] == sid:
+                self._codex_history_image_views.pop(key, None)
         return self._history_revision(sid)
 
     def _focused_ctx(self) -> Optional[SessionContext]:
@@ -3347,6 +3516,64 @@ class WrapperMachine:
         self, ctx: SessionContext, msg,
     ) -> None:
         """Capture cwd-external images only after their tool read succeeds."""
+        if isinstance(msg, ProcessEvent):
+            tool = re.sub(r"[^a-z0-9]", "", (msg.tool or "").lower())
+            if msg.kind != "server_tool" or tool != "viewimage":
+                return
+            raw_path = None
+            if isinstance(msg.input, dict):
+                for key in ("file_path", "path"):
+                    candidate = msg.input.get(key)
+                    if (
+                        isinstance(candidate, str)
+                        and candidate
+                        and not candidate.startswith("~")
+                        and len(candidate) <= 4096
+                    ):
+                        raw_path = candidate
+                        break
+            if raw_path is None:
+                return
+            if isinstance(msg.input, dict) and "preview_id" in msg.input:
+                msg.input = dict(msg.input)
+                msg.input.pop("preview_id", None)
+            root = os.path.realpath(ctx.cwd)
+            candidate = os.path.realpath(
+                raw_path if os.path.isabs(raw_path)
+                else os.path.join(root, raw_path))
+            if os.path.splitext(candidate)[1].lower() not in (
+                    self.PREVIEW_ASSET_MEDIA_TYPES):
+                return
+            pending = ctx.preview_image_candidates
+            if msg.phase != "end":
+                pending[msg.item_id] = candidate
+                while len(pending) > self.PREVIEW_IMAGE_CANDIDATE_CAP:
+                    pending.pop(next(iter(pending)))
+                return
+            candidate = pending.pop(msg.item_id, candidate)
+            if msg.status in {
+                    "failed", "declined", "cancelled", "interrupted"}:
+                return
+            try:
+                _, media_type, data = await asyncio.to_thread(
+                    self._read_preview_asset,
+                    ctx.cwd,
+                    candidate,
+                    frozenset({candidate}),
+                )
+            except (OSError, ValueError):
+                return
+            self._store_preview_image_snapshot(
+                ctx.preview_snapshot_token,
+                candidate,
+                media_type,
+                data,
+                snapshot_id=msg.item_id,
+            )
+            msg.input = dict(msg.input or {})
+            msg.input["preview_id"] = msg.item_id
+            return
+
         if isinstance(msg, ToolUse):
             raw_path = self._preview_image_read_path(msg)
             if raw_path is None:
@@ -3385,7 +3612,12 @@ class WrapperMachine:
             # preview capability.
             return
         self._store_preview_image_snapshot(
-            ctx.preview_snapshot_token, candidate, media_type, data)
+            ctx.preview_snapshot_token,
+            candidate,
+            media_type,
+            data,
+            snapshot_id=msg.tool_use_id,
+        )
 
     def _store_preview_image_snapshot(
         self,
@@ -3393,18 +3625,25 @@ class WrapperMachine:
         path: str,
         media_type: str,
         data: bytes,
+        *,
+        snapshot_id: str | None = None,
     ) -> None:
         cache = self._preview_image_snapshots
-        key = (token, path)
+        asset_id = snapshot_id or path
+        key = (token, asset_id)
         previous = cache.pop(key, None)
         if previous is not None:
-            self._preview_image_snapshot_bytes -= len(previous[1])
-        cache[key] = (media_type, data)
+            self._preview_image_snapshot_bytes -= len(previous[2])
+            previous_alias = (token, previous[0])
+            if self._preview_image_path_aliases.get(previous_alias) == asset_id:
+                self._preview_image_path_aliases.pop(previous_alias, None)
+        cache[key] = (path, media_type, data)
+        self._preview_image_path_aliases[(token, path)] = asset_id
         self._preview_image_snapshot_bytes += len(data)
 
         session_bytes = sum(
             len(payload)
-            for (entry_token, _), (_, payload) in cache.items()
+            for (entry_token, _), (_, _, payload) in cache.items()
             if entry_token == token
         )
         session_entries = sum(
@@ -3422,7 +3661,10 @@ class WrapperMachine:
             )
             if oldest is None:
                 break
-            _, payload = cache.pop(oldest)
+            evicted_path, _, payload = cache.pop(oldest)
+            alias_key = (oldest[0], evicted_path)
+            if self._preview_image_path_aliases.get(alias_key) == oldest[1]:
+                self._preview_image_path_aliases.pop(alias_key, None)
             size = len(payload)
             session_bytes -= size
             session_entries -= 1
@@ -3433,7 +3675,10 @@ class WrapperMachine:
             > self.PREVIEW_IMAGE_SNAPSHOT_GLOBAL_BYTES
             or len(cache) > self.PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES
         ) and cache:
-            _, (_, payload) = cache.popitem(last=False)
+            evicted_key, (evicted_path, _, payload) = cache.popitem(last=False)
+            alias_key = (evicted_key[0], evicted_path)
+            if self._preview_image_path_aliases.get(alias_key) == evicted_key[1]:
+                self._preview_image_path_aliases.pop(alias_key, None)
             self._preview_image_snapshot_bytes -= len(payload)
 
     def _purge_preview_image_snapshots(self, token: str) -> None:
@@ -3441,20 +3686,40 @@ class WrapperMachine:
         for key in tuple(cache):
             if key[0] != token:
                 continue
-            _, payload = cache.pop(key)
+            path, _, payload = cache.pop(key)
+            alias_key = (key[0], path)
+            if self._preview_image_path_aliases.get(alias_key) == key[1]:
+                self._preview_image_path_aliases.pop(alias_key, None)
             self._preview_image_snapshot_bytes -= len(payload)
+        for alias_key in tuple(self._preview_image_path_aliases):
+            if alias_key[0] == token:
+                self._preview_image_path_aliases.pop(alias_key, None)
 
     def _preview_image_snapshot(
-        self, ctx: SessionContext, path: str,
+        self,
+        ctx: SessionContext,
+        path: str,
+        preview_id: str | None = None,
     ) -> Optional[tuple[str, bytes]]:
         candidate = os.path.realpath(
             path if os.path.isabs(path)
             else os.path.join(os.path.realpath(ctx.cwd), path))
-        key = (ctx.preview_snapshot_token, candidate)
+        token = ctx.preview_snapshot_token
+        key = (
+            (token, preview_id)
+            if preview_id and (token, preview_id) in self._preview_image_snapshots
+            else (
+                token,
+                self._preview_image_path_aliases.get(
+                    (token, candidate), candidate),
+            )
+        )
         snapshot = self._preview_image_snapshots.pop(key, None)
         if snapshot is not None:
             self._preview_image_snapshots[key] = snapshot
-        return snapshot
+            _stored_path, media_type, data = snapshot
+            return media_type, data
+        return None
 
     @staticmethod
     def _tool_write_paths(tool_input: dict) -> tuple[str, ...]:
@@ -6884,6 +7149,161 @@ class WrapperMachine:
                  elapsed_ms=round((time.perf_counter() - started_at) * 1000))
         return hist
 
+    async def _supplement_codex_history_image_views(
+        self,
+        sid: str,
+        visible_turn_id: str,
+        rows: tuple[dict, ...] | list[dict],
+        *,
+        required_image_id: str | None = None,
+    ) -> list[dict]:
+        """Add rollout-only image views while preserving official detail."""
+        try:
+            locator = self._codex_history.rollout_fallback(
+                sid, visible_turn_id)
+            path = await asyncio.to_thread(codex_rollout_path, sid)
+            if not path:
+                return list(rows)
+            source = await asyncio.to_thread(
+                HistorySourceFingerprint.capture, path)
+            cache_key = (
+                sid,
+                source.path,
+                locator.native_turn_id,
+                locator.segment_index,
+            )
+            cached = self._codex_history_image_views.get(cache_key)
+            views: tuple[CodexHistoryImageView, ...] | None = None
+            parsed = False
+            if cached is not None:
+                cached_source, cached_views = cached
+                if await asyncio.to_thread(
+                    history_source_extends, cached_source, source,
+                ):
+                    views = cached_views
+                    self._codex_history_image_views.move_to_end(cache_key)
+                else:
+                    self._codex_history_image_views.pop(cache_key, None)
+            if views is None:
+                views = await asyncio.to_thread(
+                    codex_history_image_views,
+                    path,
+                    locator.native_turn_id,
+                    segment_index=locator.segment_index,
+                )
+                parsed = True
+
+            required_view = None
+            if required_image_id is not None:
+                required_view = next((
+                    view for view in views
+                    if (
+                        isinstance(view.event.input, dict)
+                        and isinstance(
+                            view.event.input.get("history_image"), dict)
+                        and view.event.input["history_image"].get("image_id")
+                        == required_image_id
+                    )
+                ), None)
+            if (
+                required_view is not None
+                and not parsed
+                and self._history_index is not None
+            ):
+                cached_asset = await asyncio.to_thread(
+                    self._history_index.get_image_asset,
+                    sid,
+                    "codex",
+                    source,
+                    visible_turn_id,
+                    required_image_id,
+                    "full",
+                )
+                if cached_asset is None:
+                    views = await asyncio.to_thread(
+                        codex_history_image_views,
+                        path,
+                        locator.native_turn_id,
+                        segment_index=locator.segment_index,
+                    )
+                    parsed = True
+            merged = _merge_codex_history_image_views(rows, views)
+            if self._history_index is None:
+                return merged
+            views_to_store = list(views)
+            if required_image_id is not None:
+                views_to_store.sort(key=lambda view: bool(
+                    isinstance(view.event.input, dict)
+                    and isinstance(
+                        view.event.input.get("history_image"), dict)
+                    and view.event.input["history_image"].get("image_id")
+                    == required_image_id
+                ))
+            for view in views_to_store:
+                if (
+                    view.data is None
+                    or view.media_type is None
+                    or view.width is None
+                    or view.height is None
+                    or not isinstance(view.event.input, dict)
+                ):
+                    continue
+                image_ref = view.event.input.get("history_image")
+                image_id = (
+                    image_ref.get("image_id")
+                    if isinstance(image_ref, dict)
+                    else None
+                )
+                if not isinstance(image_id, str):
+                    continue
+                await asyncio.to_thread(
+                    self._history_index.put_image_asset,
+                    sid,
+                    "codex",
+                    source,
+                    visible_turn_id,
+                    image_id,
+                    "full",
+                    view.media_type,
+                    view.width,
+                    view.height,
+                    view.data,
+                )
+            if parsed:
+                self._codex_history_image_views[cache_key] = (
+                    source,
+                    tuple(
+                        CodexHistoryImageView(
+                            call_id=view.call_id,
+                            event=view.event,
+                            previous_item_id=view.previous_item_id,
+                            next_item_id=view.next_item_id,
+                        )
+                        for view in views
+                    ),
+                )
+                self._codex_history_image_views.move_to_end(cache_key)
+                while (
+                    len(self._codex_history_image_views)
+                    > self.CODEX_HISTORY_IMAGE_VIEW_CACHE_ENTRIES
+                ):
+                    self._codex_history_image_views.popitem(last=False)
+            return merged
+        except (
+            CodexHistoryCursorError,
+            OSError,
+            ValueError,
+        ):
+            return list(rows)
+        except Exception as exc:
+            log.warning(
+                "Codex history image-view supplement failed",
+                session_id=sid,
+                turn_id=visible_turn_id,
+                error_type=type(exc).__name__,
+            )
+            return list(rows)
+
     async def _handle_get_turn_detail(self, cmd) -> TurnDetail:
         """Return one heavyweight turn projection to its requesting browser."""
         started_at = time.perf_counter()
@@ -7034,6 +7454,9 @@ class WrapperMachine:
             rows = None
         if rows is None:
             return await send(error="详细过程已过期，请刷新会话后重试")
+        if is_codex:
+            rows = await self._supplement_codex_history_image_views(
+                sid, cmd.turn_id, rows)
         try:
             page, has_more, oldest, has_newer, newer = _turn_detail_page(
                 rows,
@@ -7140,7 +7563,40 @@ class WrapperMachine:
             source = await asyncio.to_thread(
                 HistorySourceFingerprint.capture, source_path)
 
-            if cmd.variant == "thumbnail":
+            rows = None
+            if is_codex:
+                try:
+                    official_rows = await self._codex_history.turn_events(
+                        sid, cmd.turn_id)
+                    rows = await self._supplement_codex_history_image_views(
+                        sid,
+                        cmd.turn_id,
+                        official_rows,
+                        required_image_id=cmd.image_id,
+                    )
+                except (
+                    CodexHistoryCursorError,
+                    CodexHistoryInvalidResponse,
+                    CodexHistoryUnsupported,
+                    CodexRpcOutcomeUnknown,
+                    CodexRpcRejected,
+                    OSError,
+                    RuntimeError,
+                ):
+                    rows = None
+            if rows is None:
+                rows = await asyncio.to_thread(
+                    self._history_index.get_turn_detail,
+                    sid, engine, source, cmd.turn_id,
+                )
+            if rows is None:
+                return await send(error="历史图片已过期，请刷新会话")
+            image = history_image_from_events(
+                rows, cmd.turn_id, cmd.image_id)
+            if image is None:
+                return await send(error="未找到这张历史图片")
+
+            if isinstance(image.get("data"), str):
                 cached = await asyncio.to_thread(
                     self._history_index.get_image_asset,
                     sid, engine, source, cmd.turn_id, cmd.image_id,
@@ -7149,29 +7605,68 @@ class WrapperMachine:
                 if cached is not None:
                     media_type, width, height, data = cached
                     return await send(
-                        media_type=media_type, width=width,
-                        height=height, data=data)
-
-            rows = await asyncio.to_thread(
-                self._history_index.get_turn_detail,
-                sid, engine, source, cmd.turn_id,
-            )
-            if rows is None:
-                return await send(error="历史图片已过期，请刷新会话")
-            image = history_image_from_events(
-                rows, cmd.turn_id, cmd.image_id)
-            if image is None:
-                return await send(error="未找到这张历史图片")
-            media_type, width, height, data = await asyncio.to_thread(
-                _render_history_image, image, cmd.variant)
-            if cmd.variant == "thumbnail":
-                await asyncio.to_thread(
-                    self._history_index.put_image_asset,
-                    sid, engine, source, cmd.turn_id, cmd.image_id,
-                    cmd.variant, media_type, width, height, data,
+                        media_type=media_type,
+                        width=width,
+                        height=height,
+                        data=data,
+                    )
+                media_type, width, height, data = await asyncio.to_thread(
+                    _render_history_image, image, cmd.variant)
+                if cmd.variant == "thumbnail":
+                    await asyncio.to_thread(
+                        self._history_index.put_image_asset,
+                        sid, engine, source, cmd.turn_id, cmd.image_id,
+                        cmd.variant, media_type, width, height, data,
+                    )
+                return await send(
+                    media_type=media_type,
+                    width=width,
+                    height=height,
+                    data=data,
                 )
+
+            cached = await asyncio.to_thread(
+                self._history_index.get_image_asset,
+                sid, engine, source, cmd.turn_id, cmd.image_id,
+                cmd.variant,
+            )
+            if cached is not None:
+                media_type, width, height, data = cached
+                return await send(
+                    media_type=media_type,
+                    width=width,
+                    height=height,
+                    data=data,
+                )
+            if cmd.variant != "thumbnail":
+                return await send(error="历史图片已过期，请重新展开该轮")
+            full = await asyncio.to_thread(
+                self._history_index.get_image_asset,
+                sid, engine, source, cmd.turn_id, cmd.image_id,
+                "full",
+            )
+            if full is None:
+                return await send(error="历史图片已过期，请重新展开该轮")
+            full_media_type, _full_width, _full_height, full_data = full
+            media_type, width, height, data = await asyncio.to_thread(
+                _render_history_image,
+                {
+                    "media_type": full_media_type,
+                    "data": base64.b64encode(full_data).decode("ascii"),
+                },
+                "thumbnail",
+            )
+            await asyncio.to_thread(
+                self._history_index.put_image_asset,
+                sid, engine, source, cmd.turn_id, cmd.image_id,
+                "thumbnail", media_type, width, height, data,
+            )
             return await send(
-                media_type=media_type, width=width, height=height, data=data)
+                media_type=media_type,
+                width=width,
+                height=height,
+                data=data,
+            )
         except ValueError as exc:
             return await send(error=str(exc))
         except Exception as exc:
@@ -10979,7 +11474,8 @@ class WrapperMachine:
             return response
 
         try:
-            snapshot = self._preview_image_snapshot(ctx, cmd.path)
+            snapshot = self._preview_image_snapshot(
+                ctx, cmd.path, cmd.preview_id)
             if snapshot is None:
                 _, media_type, data = await asyncio.to_thread(
                     self._read_preview_asset, ctx.cwd, cmd.path,

@@ -10,6 +10,7 @@ from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
     MaterializedHistoryPage,
+    history_source_extends,
     materialize_history_turns,
 )
 
@@ -48,6 +49,27 @@ def test_history_index_roundtrip_is_bound_to_exact_source_snapshot(tmp_path):
     assert changed.token != source.token
     assert store.get_page(
         "session-1", "codex", changed, before=None, limit=4) is None
+
+
+def test_history_source_append_validation_rejects_truncate_and_replace(tmp_path):
+    source_path = tmp_path / "rollout.jsonl"
+    source_path.write_bytes(b"first\n")
+    original = HistorySourceFingerprint.capture(source_path)
+
+    with source_path.open("ab") as source:
+        source.write(b"second\n")
+    appended = HistorySourceFingerprint.capture(source_path)
+    assert history_source_extends(original, appended)
+
+    source_path.write_bytes(b"first\n")
+    truncated = HistorySourceFingerprint.capture(source_path)
+    assert not history_source_extends(appended, truncated)
+
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_bytes(b"first\nsecond\n")
+    os.replace(replacement, source_path)
+    replaced = HistorySourceFingerprint.capture(source_path)
+    assert not history_source_extends(appended, replaced)
 
 
 def test_history_index_invalidates_obsolete_cached_turn_schema_and_rebuilds(

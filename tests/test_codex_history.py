@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+import cc_remote.wrapper.codex_stream as codex_stream_module
 from cc_remote.wrapper.codex_history import (
     CodexHistoryCursorError,
     CodexHistoryInvalidResponse,
@@ -16,7 +17,11 @@ from cc_remote.wrapper.codex_rpc import (
     CodexRpcRejected,
     CodexRpcResponseTooLarge,
 )
-from cc_remote.wrapper.codex_stream import codex_history_turn_user
+from cc_remote.wrapper.codex_stream import (
+    codex_history_image_views,
+    codex_history_turn_user,
+    codex_translate_history,
+)
 from cc_remote.protocol import UserMsg
 
 
@@ -73,6 +78,157 @@ def _turn(
             else None
         ),
     }
+
+
+def test_rollout_image_view_supplement_is_turn_bound_and_binary_free(
+    monkeypatch, tmp_path,
+):
+    path = tmp_path / "rollout.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-07-30T06:40:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-1"},
+        },
+        {
+            "timestamp": "2026-07-30T06:40:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "turn_id": "native-1",
+                "message": "inspect",
+            },
+        },
+        {
+            "timestamp": "2026-07-30T06:40:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "id": "fc-image-1",
+                "name": "view_image",
+                "arguments": json.dumps({
+                    "path": "/tmp/chart.png",
+                    "detail": "original",
+                }),
+                "call_id": "call-image-1",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "native-1",
+                },
+            },
+        },
+        {
+            "timestamp": "2026-07-30T06:40:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-image-1",
+                "output": [{
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{_PNG_1X1}",
+                    "detail": "original",
+                }],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "native-1",
+                },
+            },
+        },
+        {
+            "timestamp": "2026-07-30T06:40:04Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "turn_id": "native-1",
+                "message": "now inspect the second image",
+            },
+        },
+        {
+            "timestamp": "2026-07-30T06:40:05Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "id": "fc-image-steer",
+                "name": "view_image",
+                "arguments": '{"path":"/tmp/steered.png"}',
+                "call_id": "call-image-steer",
+            },
+        },
+        {
+            "timestamp": "2026-07-30T06:40:06Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-image-steer",
+                "output": [{
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{_PNG_1X1}",
+                }],
+            },
+        },
+        {
+            "timestamp": "2026-07-30T06:41:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "native-1"},
+        },
+        {
+            "timestamp": "2026-07-30T06:42:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-2"},
+        },
+        {
+            "timestamp": "2026-07-30T06:42:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "id": "fc-image-2",
+                "name": "view_image",
+                "arguments": '{"path":"/tmp/other.png"}',
+                "call_id": "call-image-2",
+            },
+        },
+    ]
+    path.write_text(
+        "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_stream_module,
+        "_reverse_jsonl_records",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("exact turn lookup must not walk every JSONL row")
+        ),
+    )
+
+    views = codex_history_image_views(
+        str(path), "native-1", segment_index=0)
+
+    assert len(views) == 1
+    view = views[0]
+    assert view.call_id == "call-image-1"
+    assert view.event.item_id == "fc-image-1"
+    assert view.event.tool == "view_image"
+    assert view.event.input is not None
+    assert view.event.input["file_path"] == "/tmp/chart.png"
+    assert view.event.input["history_image"]["image_id"].startswith("img-")
+    assert view.media_type == "image/png"
+    assert view.width == 1 and view.height == 1
+    assert view.data is not None
+    wire = view.event.model_dump_json()
+    assert _PNG_1X1 not in wire
+    assert "steered.png" not in wire
+    assert "other.png" not in wire
+    steered = codex_history_image_views(
+        str(path), "native-1", segment_index=1)
+    assert len(steered) == 1
+    assert steered[0].event.input is not None
+    assert steered[0].event.input["file_path"] == "/tmp/steered.png"
+    assert "chart.png" not in steered[0].event.model_dump_json()
+    assert codex_history_image_views(
+        str(path), "native-1", segment_index=2) == ()
+    translated, _model = codex_translate_history(str(path), 64 * 1024)
+    translated_wire = "\n".join(
+        event.model_dump_json() for event in translated)
+    assert _PNG_1X1 not in translated_wire
+    assert "图片已读取" in translated_wire
 
 
 def test_summary_page_is_chronological_and_preserves_native_identity():

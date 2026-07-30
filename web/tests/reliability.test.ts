@@ -100,6 +100,7 @@ import {
 import type {
   EngineCapabilities,
   History,
+  PreviewAsset,
   ServerEvent,
   SessionControl,
 } from "../src/protocol.ts";
@@ -1749,6 +1750,35 @@ assert.equal(silentInlineCapacity.begin({
   requestId: "inline-capacity-retry",
 }), true, "the mounted inline-image waiter can claim the expired slot");
 silentInlineCapacity.clear();
+
+const stableInlineImages = new InlineImageAssetCache(2);
+for (const id of ["view-a", "view-b"]) {
+  assert.equal(stableInlineImages.begin({
+    sid: "inline-stable-session",
+    path: "/tmp/reused.png",
+    assetKey: id,
+    previewId: id,
+    requestId: `request-${id}`,
+  }), true);
+  assert.equal(stableInlineImages.accept({
+    v: 27,
+    ts: 10,
+    type: "preview_asset",
+    sid: "inline-stable-session",
+    path: "/tmp/reused.png",
+    preview_id: id,
+    request_id: `request-${id}`,
+    media_type: "image/png",
+    data: id === "view-a" ? "aW1hZ2UtYQ==" : "aW1hZ2UtYg==",
+  } as PreviewAsset), true);
+}
+assert.deepEqual(
+  Object.keys(stableInlineImages.forSession(
+    "inline-stable-session")).sort(),
+  ["view-a", "view-b"],
+  "two imageView items that reuse one path retain independent snapshots",
+);
+stableInlineImages.clear();
 
 let historyImageNow = 1_000;
 const retryableHistoryImages = new HistoryImageAssetCache(
@@ -7387,6 +7417,95 @@ try {
   assert.match(codexProcessMarkup, /2 个工具调用/);
   assert.doesNotMatch(codexProcessMarkup, /class="tool-group"/,
     "a completed Codex process must not render tool details until the user opens it");
+
+  const imageViewMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: true,
+    openOverride: true,
+    blocks: [{
+      kind: "process",
+      item_id: "view-1",
+      processKind: "server_tool",
+      phase: "end",
+      status: "succeeded",
+      title: "查看图片",
+      tool: "view_image",
+      input: {
+        file_path: "/tmp/chart.png",
+        preview_id: "view-1",
+      },
+      done: true,
+    }],
+    imageAssets: {
+      "view-1": {
+        status: "ready",
+        mediaType: "image/png",
+        data: "iVBORw0KGgo=",
+      },
+    },
+  }));
+  assert.match(imageViewMarkup, /class="process-image-preview"/);
+  assert.match(imageViewMarkup, /\/tmp\/chart\.png/);
+  assert.match(imageViewMarkup, /data:image\/png;base64,iVBORw0KGgo=/);
+  assert.doesNotMatch(imageViewMarkup, /&quot;preview_id&quot;/,
+    "image-view metadata must not render as a raw JSON tool payload");
+
+  const pendingImageViewMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: false,
+    openOverride: true,
+    blocks: [{
+      kind: "process",
+      item_id: "view-pending",
+      processKind: "server_tool",
+      phase: "start",
+      status: "running",
+      title: "查看图片",
+      tool: "view_image",
+      input: { file_path: "/tmp/pending.png" },
+      done: false,
+    }],
+  }));
+  assert.match(pendingImageViewMarkup, /process-image-preview[^>]*disabled/,
+    "a live image view stays inert until its immutable snapshot is ready");
+
+  const historyImageViewMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: true,
+    openOverride: true,
+    historyTurnId: "turn-1",
+    blocks: [{
+      kind: "process",
+      item_id: "history-view-1",
+      processKind: "server_tool",
+      phase: "end",
+      status: "succeeded",
+      title: "查看图片",
+      tool: "view_image",
+      input: {
+        file_path: "/tmp/history.png",
+        history_image: {
+          image_id: "img-history-1",
+          media_type: "image/png",
+          width: 1,
+          height: 1,
+          byte_size: 68,
+        },
+      },
+      done: true,
+    }],
+    historyImageAssets: {
+      [historyImageAssetKey(
+        "turn-1", "img-history-1", "thumbnail")]: {
+        status: "ready",
+        mediaType: "image/webp",
+        data: "UklGRg==",
+      },
+    },
+  }));
+  assert.match(historyImageViewMarkup, /\/tmp\/history\.png/);
+  assert.match(historyImageViewMarkup, /data:image\/webp;base64,UklGRg==/);
+  assert.doesNotMatch(historyImageViewMarkup, /&quot;history_image&quot;/);
 
   const codexHookWrappedBatchMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     engine: "codex", done: false,

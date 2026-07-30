@@ -515,6 +515,13 @@ button.message-image-error{ font:inherit; cursor:pointer; }
 .process-file-link{ display:flex; width:min(100%,max-content); align-items:center; gap:6px; padding:0; border:0; border-bottom:1px solid var(--accent-line); border-radius:0; background:none; color:var(--accent-ink); font:inherit; cursor:pointer; text-align:left; }
 .process-file-link span{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .process-file-link:hover{ color:var(--accent); border-bottom-color:var(--accent); }
+.process-image-preview{ display:flex; width:min(100%,420px); min-height:46px; align-items:center; gap:9px; padding:6px; border:1px solid var(--line); border-radius:10px; background:var(--raised); color:var(--text); text-align:left; cursor:pointer; }
+.process-image-preview:hover{ border-color:var(--accent-line); background:var(--accent-weak); }
+.process-image-preview:disabled{ cursor:default; opacity:.72; }
+.process-image-preview:disabled:hover{ border-color:var(--line); background:var(--raised); }
+.process-image-preview img,.process-image-placeholder{ width:42px; height:34px; flex:0 0 auto; border-radius:7px; object-fit:cover; background:var(--panel); }
+.process-image-placeholder{ display:grid; place-items:center; color:var(--muted); }
+.process-image-preview>span:last-child{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:12px; }
 .process-meta{ color:var(--faint); font:10.5px/1.4 var(--mono); overflow-wrap:anywhere; }
 .process-plan{ display:flex; flex-direction:column; gap:5px; margin:2px 0; padding:0; list-style:none; }
 .process-plan li{ display:grid; grid-template-columns:17px 1fr; gap:6px; color:var(--dim); font-size:12.5px; line-height:1.45; }

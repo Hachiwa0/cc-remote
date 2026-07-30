@@ -808,6 +808,8 @@ def test_codex_new_runtime_items_are_visible_without_forwarding_binary_results()
         ("生成图片", "end"), ("进入 Review", "end"),
         ("退出 Review", "end"),
     ]
+    viewed = [event for event in events if event.title == "查看图片"]
+    assert all(event.tool == "view_image" for event in viewed)
     image = next(event for event in events if event.title == "生成图片")
     assert image.input == {"file_path": "/tmp/generated.png"}
     assert image.summary == "一张架构图"

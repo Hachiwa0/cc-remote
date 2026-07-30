@@ -43,12 +43,14 @@ export interface InlineImageAsset {
 interface AssetEntry extends InlineImageAsset {
   sid: string;
   path: string;
+  assetKey: string;
   lastUsed: number;
 }
 
 export interface InlineImageRequest {
   sid: string;
   path: string;
+  assetKey?: string;
   previewId: string;
   requestId: string;
 }
@@ -117,8 +119,8 @@ export class InlineImageAssetCache {
     this.wakeScheduler = wakeScheduler;
   }
 
-  private key(sid: string, path: string): string {
-    return `${sid}\u0000${path}`;
+  private key(sid: string, assetKey: string): string {
+    return `${sid}\u0000${assetKey}`;
   }
 
   /** Remove both halves of one request atomically. A pending response without
@@ -179,7 +181,8 @@ export class InlineImageAssetCache {
 
   begin(request: InlineImageRequest): boolean {
     if (this.limit === 0 || this.pending.has(request.requestId)) return false;
-    const key = this.key(request.sid, request.path);
+    const assetKey = request.assetKey ?? request.path;
+    const key = this.key(request.sid, assetKey);
     const now = this.now();
     const existing = this.entries.get(key);
     if (existing && (
@@ -203,6 +206,7 @@ export class InlineImageAssetCache {
     this.entries.set(key, {
       sid: request.sid,
       path: request.path,
+      assetKey,
       status: "loading",
       lastUsed: ++this.tick,
       startedAt: now,
@@ -218,8 +222,8 @@ export class InlineImageAssetCache {
     return true;
   }
 
-  has(sid: string, path: string): boolean {
-    const entry = this.entries.get(this.key(sid, path));
+  has(sid: string, path: string, assetKey = path): boolean {
+    const entry = this.entries.get(this.key(sid, assetKey));
     if (!entry || entry.status === "error") return false;
     return entry.status === "ready"
       || this.now() - (entry.startedAt ?? 0)
@@ -258,6 +262,7 @@ export class InlineImageAssetCache {
     this.entries.set(request.key, {
       sid: request.sid,
       path: request.path,
+      assetKey: request.assetKey ?? request.path,
       status: ready ? "ready" : "error",
       mediaType: ready ? event.media_type ?? undefined : undefined,
       data: ready ? event.data ?? undefined : undefined,
@@ -274,7 +279,7 @@ export class InlineImageAssetCache {
     for (const entry of this.entries.values()) {
       if (entry.sid !== sid) continue;
       entry.lastUsed = ++this.tick;
-      assets[entry.path] = {
+      assets[entry.assetKey] = {
         status: entry.status,
         mediaType: entry.mediaType,
         data: entry.data,

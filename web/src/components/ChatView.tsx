@@ -237,7 +237,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onFork?: (forkPointId: string) => void;
   forkingPointId?: string | null;
   imageAssets?: Record<string, InlineImageAsset>;
-  onLoadImage?: (path: string) => boolean;
+  onLoadImage?: (path: string, previewId?: string) => boolean;
   historyImageAssets?: Record<string, HistoryImageAsset>;
   onLoadHistoryImage?: (
     turnId: string, imageId: string, variant: HistoryImageVariant,
@@ -2057,6 +2057,15 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                   : undefined}
                 onOpenFile={onOpenFile} imageAssets={imageAssets}
                 onLoadImage={onLoadImage}
+                historyTurnId={historyTurnId}
+                historyImageAssets={historyImageAssets}
+                onLoadHistoryImage={onLoadHistoryImage}
+                onPreviewHistoryImage={(turnId, imageId) => setZoom({
+                  kind: "history",
+                  turnId,
+                  imageId,
+                  alt: "查看过的图片",
+                })}
                 onInteractionStart={beginProcessInteraction}
                 onInteractionEnd={endProcessInteraction}
                 openOverride={

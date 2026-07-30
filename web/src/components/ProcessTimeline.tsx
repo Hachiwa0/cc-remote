@@ -20,6 +20,11 @@ import {
   presentFileOperation,
 } from "../file-changes";
 import type { InlineImageAsset } from "../inline-image-assets";
+import {
+  historyImageAssetKey,
+  type HistoryImageAsset,
+  type HistoryImageVariant,
+} from "../history-image-assets";
 import { PointerTapGuard } from "../pointer-tap";
 
 function durationLabel(ms: number): string {
@@ -136,22 +141,160 @@ const PROCESS_IC: Record<ProcessBlock["processKind"], string> = {
   compaction: "simplify",
 };
 
-function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
+interface ProcessHistoryImageRef {
+  image_id: string;
+  media_type: string;
+  width: number;
+  height: number;
+  byte_size: number;
+}
+
+function processImageRef(input?: Record<string, unknown> | null):
+  ProcessHistoryImageRef | null {
+  const value = input?.history_image;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const ref = value as Record<string, unknown>;
+  if (typeof ref.image_id !== "string"
+      || typeof ref.media_type !== "string"
+      || typeof ref.width !== "number"
+      || typeof ref.height !== "number"
+      || typeof ref.byte_size !== "number") return null;
+  return ref as unknown as ProcessHistoryImageRef;
+}
+
+function ProcessImagePreview({
+  path,
+  previewId,
+  imageAssets,
+  onLoadImage,
+  historyTurnId,
+  historyRef,
+  historyImageAssets,
+  onLoadHistoryImage,
+  onPreviewImage,
+  onPreviewHistoryImage,
+}: {
+  path: string;
+  previewId?: string;
+  imageAssets?: Record<string, InlineImageAsset>;
+  onLoadImage?: (path: string, previewId?: string) => boolean;
+  historyTurnId?: string;
+  historyRef?: ProcessHistoryImageRef | null;
+  historyImageAssets?: Record<string, HistoryImageAsset>;
+  onLoadHistoryImage?: (
+    turnId: string,
+    imageId: string,
+    variant: HistoryImageVariant,
+  ) => boolean;
+  onPreviewImage?: (src: string, alt: string) => void;
+  onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
+}) {
+  const historyAsset = historyTurnId && historyRef
+    ? historyImageAssets?.[historyImageAssetKey(
+        historyTurnId, historyRef.image_id, "thumbnail")]
+    : undefined;
+  const liveAsset = !historyRef && previewId
+    ? imageAssets?.[previewId]
+    : undefined;
+  useEffect(() => {
+    if (historyTurnId && historyRef) {
+      if (!historyAsset) {
+        onLoadHistoryImage?.(
+          historyTurnId, historyRef.image_id, "thumbnail");
+      }
+      return;
+    }
+    if (previewId && !liveAsset && path) {
+      onLoadImage?.(path, previewId);
+    }
+  }, [
+    historyAsset,
+    historyRef,
+    historyTurnId,
+    liveAsset,
+    onLoadHistoryImage,
+    onLoadImage,
+    path,
+    previewId,
+  ]);
+  const asset = historyRef ? historyAsset : liveAsset;
+  const src = asset?.status === "ready" && asset.data && asset.mediaType
+    ? `data:${asset.mediaType};base64,${asset.data}`
+    : null;
+  const canLoad = Boolean(
+    (historyTurnId && historyRef) || previewId,
+  );
+  return (
+    <button type="button" className="process-image-preview"
+      disabled={!canLoad}
+      aria-label={
+        src
+          ? "预览查看过的图片"
+          : canLoad ? "加载查看过的图片" : "等待图片读取完成"
+      }
+      onClick={() => {
+        if (historyTurnId && historyRef) {
+          onLoadHistoryImage?.(
+            historyTurnId, historyRef.image_id, "full");
+          onPreviewHistoryImage?.(historyTurnId, historyRef.image_id);
+          return;
+        }
+        if (src) {
+          onPreviewImage?.(src, path || "查看过的图片");
+        } else if (previewId) {
+          onLoadImage?.(path, previewId);
+        }
+      }}>
+      {src
+        ? <img src={src} alt="" />
+        : <span className="process-image-placeholder">
+            <Icon name="read" size={16} />
+          </span>}
+      <span>{path || "查看过的图片"}</span>
+    </button>
+  );
+}
+
+function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
+  historyTurnId, historyImageAssets, onLoadHistoryImage,
+  onPreviewImage, onPreviewHistoryImage, openOverride, onOpenChange,
   onInteractionStart, onInteractionEnd }: {
   block: ProcessBlock;
   onOpenFile?: (path: string, line?: number) => void;
+  imageAssets?: Record<string, InlineImageAsset>;
+  onLoadImage?: (path: string, previewId?: string) => boolean;
+  historyTurnId?: string;
+  historyImageAssets?: Record<string, HistoryImageAsset>;
+  onLoadHistoryImage?: (
+    turnId: string,
+    imageId: string,
+    variant: HistoryImageVariant,
+  ) => boolean;
+  onPreviewImage?: (src: string, alt: string) => void;
+  onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
   openOverride?: boolean;
   onOpenChange?: (open: boolean) => void;
   onInteractionStart?: () => number;
   onInteractionEnd?: (token: number) => void;
 }) {
+  const imageView = block.tool?.toLowerCase().replaceAll("_", "") === "viewimage";
+  const imagePath = imageView
+    ? filePathsFromInput(block.input)[0] ?? ""
+    : "";
+  const previewId = imageView && typeof block.input?.preview_id === "string"
+    ? block.input.preview_id
+    : undefined;
+  const historyRef = imageView ? processImageRef(block.input) : null;
   const filePaths = block.processKind === "file_change"
     ? filePathsFromInput(block.input) : [];
   const semanticIcon = (
     block.processKind === "file_change" || block.processKind === "diff"
+    || imageView
   )
     ? presentFileOperation(
-        block.processKind === "file_change" ? "filechange" : "apply_patch",
+        imageView
+          ? "view_image"
+          : block.processKind === "file_change" ? "filechange" : "apply_patch",
         block.input ?? {},
       )?.icon
     : undefined;
@@ -176,7 +319,8 @@ function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
       )}
       {block.command && <pre className="tool-pre process-command">$ {block.command}</pre>}
       {block.cwd && <div className="process-meta">{block.cwd}</div>}
-      {block.summary && <div className="process-copy">{block.summary}</div>}
+      {block.summary && !imageView
+        && <div className="process-copy">{block.summary}</div>}
       {block.detail && <pre className="tool-pre">{block.detail}</pre>}
       {onOpenFile && filePaths.map((filePath) => (
         <button key={filePath} type="button" className="process-file-link"
@@ -184,7 +328,17 @@ function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
           <Icon name="file" size={14} /><span>{filePath}</span>
         </button>
       ))}
-      {block.input && Object.keys(block.input).length > 0 && filePaths.length === 0 && (
+      {imageView && (
+        <ProcessImagePreview path={imagePath} previewId={previewId}
+          imageAssets={imageAssets} onLoadImage={onLoadImage}
+          historyTurnId={historyTurnId} historyRef={historyRef}
+          historyImageAssets={historyImageAssets}
+          onLoadHistoryImage={onLoadHistoryImage}
+          onPreviewImage={onPreviewImage}
+          onPreviewHistoryImage={onPreviewHistoryImage} />
+      )}
+      {block.input && Object.keys(block.input).length > 0
+        && filePaths.length === 0 && !imageView && (
         <pre className="tool-pre">{JSON.stringify(block.input, null, 2)}</pre>
       )}
       {block.output && <pre className="tool-pre">{block.output}{block.truncated ? "\n…(truncated)" : ""}</pre>}
@@ -226,12 +380,22 @@ function ProcessActivity({ block, onOpenFile, openOverride, onOpenChange,
 }
 
 function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewImage,
+  historyTurnId, historyImageAssets, onLoadHistoryImage,
+  onPreviewHistoryImage,
   itemOpen, onItemOpenChange, onInteractionStart, onInteractionEnd }: {
   block: Block;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
-  onLoadImage?: (path: string) => boolean;
+  onLoadImage?: (path: string, previewId?: string) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
+  historyTurnId?: string;
+  historyImageAssets?: Record<string, HistoryImageAsset>;
+  onLoadHistoryImage?: (
+    turnId: string,
+    imageId: string,
+    variant: HistoryImageVariant,
+  ) => boolean;
+  onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
   itemOpen?: (key: string) => boolean | undefined;
   onItemOpenChange?: (key: string, open: boolean) => void;
   onInteractionStart?: () => number;
@@ -241,6 +405,12 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewIm
     const key = `process:${block.item_id}`;
     return <ProcessActivity
       block={block as ProcessBlock} onOpenFile={onOpenFile}
+      imageAssets={imageAssets} onLoadImage={onLoadImage}
+      historyTurnId={historyTurnId}
+      historyImageAssets={historyImageAssets}
+      onLoadHistoryImage={onLoadHistoryImage}
+      onPreviewImage={onPreviewImage}
+      onPreviewHistoryImage={onPreviewHistoryImage}
       openOverride={itemOpen?.(key)}
       onOpenChange={(open) => onItemOpenChange?.(key, open)}
       onInteractionStart={onInteractionStart}
@@ -356,6 +526,8 @@ function isPayloadFreeUnfinishedCommandShell(block: Block): boolean {
 export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onOpenFile,
   deferredCount = 0, detailLoading = false, onLoadDetail,
   imageAssets, onLoadImage, onPreviewImage, engine = "claude",
+  historyTurnId, historyImageAssets, onLoadHistoryImage,
+  onPreviewHistoryImage,
   openOverride, onOpenChange, itemOpen, onItemOpenChange,
   onInteractionStart, onInteractionEnd }: {
   blocks: Block[];
@@ -368,8 +540,16 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   detailLoading?: boolean;
   onLoadDetail?: () => void;
   imageAssets?: Record<string, InlineImageAsset>;
-  onLoadImage?: (path: string) => boolean;
+  onLoadImage?: (path: string, previewId?: string) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
+  historyTurnId?: string;
+  historyImageAssets?: Record<string, HistoryImageAsset>;
+  onLoadHistoryImage?: (
+    turnId: string,
+    imageId: string,
+    variant: HistoryImageVariant,
+  ) => boolean;
+  onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
   engine?: "claude" | "codex";
   openOverride?: boolean;
   onOpenChange?: (open: boolean) => void;
@@ -523,6 +703,10 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
                 block={row.block} onOpenFile={onOpenFile}
                 imageAssets={imageAssets} onLoadImage={onLoadImage}
                 onPreviewImage={onPreviewImage}
+                historyTurnId={historyTurnId}
+                historyImageAssets={historyImageAssets}
+                onLoadHistoryImage={onLoadHistoryImage}
+                onPreviewHistoryImage={onPreviewHistoryImage}
                 itemOpen={itemOpen} onItemOpenChange={onItemOpenChange}
                 onInteractionStart={onInteractionStart}
                 onInteractionEnd={onInteractionEnd} />

@@ -665,14 +665,21 @@ export default function App() {
       setCapabilitiesLoading(false);
     }
   }, []);
-  const loadMessageImage = useCallback((sid: string, path: string): boolean => {
+  const loadMessageImage = useCallback((
+    sid: string,
+    path: string,
+    stablePreviewId?: string,
+  ): boolean => {
     const ws = wsRef.current;
     if (!ws || stateRef.current.focusedSid !== sid) return false;
     const cache = inlineImageAssetsRef.current;
-    if (cache.has(sid, path)) return true;
-    const previewId = uuid();
+    const assetKey = stablePreviewId ?? path;
+    if (cache.has(sid, path, assetKey)) return true;
+    const previewId = stablePreviewId ?? uuid();
     const requestId = uuid();
-    if (!cache.begin({ sid, path, previewId, requestId })) return false;
+    if (!cache.begin({
+      sid, path, assetKey, previewId, requestId,
+    })) return false;
     if (!ws.sendGetPreviewAsset(path, previewId, requestId)) {
       cache.cancel(requestId);
       return false;
@@ -680,8 +687,13 @@ export default function App() {
     bumpInlineImageRevision();
     return true;
   }, []);
-  const loadFocusedMessageImage = useCallback((path: string) => (
-    focusedSid ? loadMessageImage(focusedSid, path) : false
+  const loadFocusedMessageImage = useCallback((
+    path: string,
+    stablePreviewId?: string,
+  ) => (
+    focusedSid
+      ? loadMessageImage(focusedSid, path, stablePreviewId)
+      : false
   ), [focusedSid, loadMessageImage]);
   const loadHistoryImage = useCallback((
     turnId: string,

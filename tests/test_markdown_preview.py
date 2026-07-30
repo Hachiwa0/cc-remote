@@ -16,6 +16,7 @@ from cc_remote.protocol import (
     GetPreviewAsset,
     FILE_PREVIEW_MAX_BYTES,
     PREVIEW_ASSET_MAX_BYTES,
+    ProcessEvent,
     PreviewAsset,
     SaveMarkdown,
     ToolResult,
@@ -494,6 +495,94 @@ def test_failed_external_image_read_never_grants_a_snapshot(tmp_path):
             request_id="asset-1",
         ))
         assert preview.error and "本会话" in preview.error
+
+    asyncio.run(run())
+
+
+def test_codex_image_view_process_uses_its_item_snapshot_not_reused_path(
+    tmp_path,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.png"
+    first = b"\x89PNG\r\n\x1a\nfirst"
+    second = b"\x89PNG\r\n\x1a\nsecond"
+    outside.write_bytes(first)
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        machine.sessions[ctx.key] = ctx
+        machine.focused_sid = ctx.key
+
+        await machine._emit(ctx, ProcessEvent(
+            item_id="image-view-1",
+            kind="server_tool",
+            phase="start",
+            status="running",
+            turn_id="turn-1",
+            title="查看图片",
+            tool="view_image",
+            input={"file_path": str(outside)},
+        ))
+        assert "preview_id" not in transport.sent[-1].input
+
+        await machine._emit(ctx, ProcessEvent(
+            item_id="image-view-1",
+            kind="server_tool",
+            phase="end",
+            status="succeeded",
+            turn_id="turn-1",
+            title="查看图片",
+            tool="view_image",
+            input={"file_path": str(outside)},
+        ))
+
+        assert transport.sent[-1].input["preview_id"] == "image-view-1"
+        outside.write_bytes(second)
+        preview = await machine._handle_get_preview_asset(GetPreviewAsset(
+            sid=ctx.key,
+            client_id="client-1",
+            path=str(outside),
+            preview_id="image-view-1",
+            request_id="asset-1",
+        ))
+        assert preview.error is None
+        assert preview.data == "iVBORw0KGgpmaXJzdA=="
+
+    asyncio.run(run())
+
+
+def test_failed_codex_image_view_never_advertises_a_preview(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\nfailed")
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        machine.sessions[ctx.key] = ctx
+
+        for phase, status in (("start", "running"), ("end", "failed")):
+            await machine._emit(ctx, ProcessEvent(
+                item_id="image-view-failed",
+                kind="server_tool",
+                phase=phase,
+                status=status,
+                turn_id="turn-1",
+                title="查看图片",
+                tool="view_image",
+                input={"file_path": str(outside)},
+            ))
+            assert "preview_id" not in transport.sent[-1].input
+
+        assert (
+            ctx.preview_snapshot_token,
+            "image-view-failed",
+        ) not in machine._preview_image_snapshots
 
     asyncio.run(run())
 

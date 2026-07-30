@@ -94,6 +94,41 @@ class HistorySourceFingerprint:
         return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def history_source_extends(
+    previous: HistorySourceFingerprint,
+    current: HistorySourceFingerprint,
+) -> bool:
+    """Return whether ``current`` preserves the exact previous file prefix."""
+    if previous.token == current.token:
+        return True
+    if (
+        previous.path != current.path
+        or previous.device != current.device
+        or previous.inode != current.inode
+        or current.size < previous.size
+    ):
+        return False
+    sample_size = min(previous.size, _FINGERPRINT_SAMPLE_BYTES)
+    try:
+        with open(current.path, "rb") as source:
+            stat = os.fstat(source.fileno())
+            if (
+                int(stat.st_dev) != current.device
+                or int(stat.st_ino) != current.inode
+                or int(stat.st_size) < current.size
+            ):
+                return False
+            head = source.read(sample_size)
+            source.seek(max(0, previous.size - sample_size))
+            tail = source.read(sample_size)
+    except OSError:
+        return False
+    return (
+        hashlib.sha256(head).hexdigest() == previous.head_sha256
+        and hashlib.sha256(tail).hexdigest() == previous.tail_sha256
+    )
+
+
 @dataclass(frozen=True)
 class MaterializedHistoryPage:
     """Immutable narrative projection stored independently of live control."""
@@ -290,11 +325,24 @@ def history_image_from_events(
 ) -> dict[str, Any] | None:
     """Resolve an opaque history image id inside one indexed turn group."""
     for event in events:
+        if event.get("type") == "process":
+            tool_input = event.get("input")
+            image = (
+                tool_input.get("history_image")
+                if isinstance(tool_input, dict)
+                else None
+            )
+            if (
+                isinstance(image, dict)
+                and image.get("image_id") == image_id
+            ):
+                return image
+            continue
         if event.get("type") != "user_msg" or event.get("msg_id") != turn_id:
             continue
         images = event.get("images")
         if not isinstance(images, list):
-            return None
+            continue
         for index, image in enumerate(images):
             if history_image_id(turn_id, index) == image_id and isinstance(image, dict):
                 return image
