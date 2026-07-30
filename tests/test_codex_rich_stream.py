@@ -95,6 +95,58 @@ def test_codex_agent_phase_and_public_reasoning_are_separate():
     assert "ENCRYPTED_REASONING_MUST_NOT_CROSS" not in wire
 
 
+def test_codex_completed_plan_becomes_final_answer_without_agent_message():
+    translator = CodexStreamTranslator(8_000)
+    events = _feed(translator, [
+        {"method": "item/plan/delta", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "itemId": "plan-1", "delta": "draft plan",
+        }},
+        {"method": "item/completed", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "item": {"type": "plan", "id": "plan-1",
+                     "text": "1. inspect\n2. repair"},
+        }},
+        {"method": "turn/completed", "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "completed"},
+        }},
+    ])
+
+    plans = [event for event in events
+             if isinstance(event, ProcessEvent) and event.kind == "plan"]
+    final = [event for event in events
+             if isinstance(event, Delta) and event.channel == "final"]
+    assert plans[-1].detail == "1. inspect\n2. repair"
+    assert [event.text for event in final] == ["1. inspect\n2. repair"]
+    assert isinstance(events[-1], TurnEnd)
+    assert events[-1].result.subtype == "success"
+
+
+def test_codex_completed_plan_does_not_duplicate_agent_final():
+    translator = CodexStreamTranslator(8_000)
+    events = _feed(translator, [
+        {"method": "item/completed", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "item": {"type": "plan", "id": "plan-1",
+                     "text": "authoritative plan"},
+        }},
+        {"method": "item/completed", "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "item": {"type": "agentMessage", "id": "answer-1",
+                     "text": "final summary", "phase": "final_answer"},
+        }},
+        {"method": "turn/completed", "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "completed"},
+        }},
+    ])
+
+    final = [event.text for event in events
+             if isinstance(event, Delta) and event.channel == "final"]
+    assert final == ["final summary"]
+
+
 def test_codex_plan_command_file_diff_and_delta_metadata():
     translator = CodexStreamTranslator(8_000)
     events = _feed(translator, [
@@ -993,6 +1045,65 @@ def test_codex_history_preserves_steered_user_message_image_and_page_boundary(
         "first"
     ]
     assert older_more is False
+
+
+def test_codex_history_plan_only_turn_has_final_answer(tmp_path):
+    rollout = tmp_path / "rollout-plan-only.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-plan"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-plan"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "make a plan",
+                     "turn_id": "turn-plan"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {
+             "type": "item_completed", "turn_id": "turn-plan",
+             "item": {"id": "plan-1", "type": "Plan",
+                      "text": "1. inspect\n2. repair"},
+         }},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+         "payload": {
+             "type": "message", "role": "assistant",
+             "phase": "final_answer",
+             "content": [{"type": "output_text",
+                          "text": "<proposed_plan>draft</proposed_plan>"}],
+         }},
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-plan",
+                     "last_agent_message": None}},
+        {"timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-summary"}},
+        {"timestamp": "2026-01-01T00:00:07Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "make another plan",
+                     "turn_id": "turn-summary"}},
+        {"timestamp": "2026-01-01T00:00:08Z", "type": "event_msg",
+         "payload": {
+             "type": "item_completed", "turn_id": "turn-summary",
+             "item": {"id": "plan-2", "type": "Plan",
+                      "text": "second plan"},
+         }},
+        {"timestamp": "2026-01-01T00:00:09Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "final_answer",
+                     "message": "final summary"}},
+        {"timestamp": "2026-01-01T00:00:10Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-summary",
+                     "last_agent_message": "final summary"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 8_000)
+    plans = [event.detail for event in events
+             if isinstance(event, ProcessEvent) and event.kind == "plan"]
+    final = [event.text for event in events
+             if isinstance(event, Delta) and event.channel == "final"]
+    terminals = [event for event in events if isinstance(event, TurnEnd)]
+
+    assert plans == ["1. inspect\n2. repair", "second plan"]
+    assert final == ["1. inspect\n2. repair", "final summary"]
+    assert [event.result.subtype for event in terminals] == [
+        "success", "success"]
 
 
 def test_codex_history_keeps_ambient_wrapped_prompt_when_turn_is_aborted(
