@@ -429,9 +429,12 @@ def materialize_history_turns(
                     checkpoint_id = event["checkpoint_id"]
                 result = event.get("result")
                 if isinstance(result, dict):
-                    if isinstance(result.get("duration_ms"), int):
-                        duration_ms = result["duration_ms"]
                     subtype = str(result.get("subtype") or "")
+                    if (
+                        subtype != "steered"
+                        and isinstance(result.get("duration_ms"), int)
+                    ):
+                        duration_ms = result["duration_ms"]
                     interrupted = subtype in {
                         "interrupted", "error_during_execution", "aborted",
                     }

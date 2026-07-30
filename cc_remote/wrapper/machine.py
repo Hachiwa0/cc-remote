@@ -172,9 +172,16 @@ from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator, codex_session_id, is_turn_terminal,
-    codex_history_boundary_user, codex_history_window,
+    codex_history_boundary_user, codex_history_turn_user,
+    codex_history_window,
     codex_native_rollback_turns,
     codex_translate_history,
+)
+from cc_remote.wrapper.codex_history import (
+    CodexHistoryCursorError,
+    CodexHistoryInvalidResponse,
+    CodexHistoryUnsupported,
+    CodexOfficialHistory,
 )
 from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
@@ -932,6 +939,13 @@ class WrapperMachine:
         except Exception as exc:
             self._history_index = None
             log.warning("history index unavailable", error=str(exc))
+        # Codex's official app-server owns persisted turns and native compact
+        # state. Keep opaque turn/item cursors generation-local; the browser
+        # receives only stable wire ids and IndexedDB remains the instant paint.
+        self._codex_history = CodexOfficialHistory(
+            cfg.tool_result_max,
+            recover_user=self._recover_official_codex_user,
+        )
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
         # resets this window (documented residual risk, not durable exactly-once).
@@ -1327,7 +1341,11 @@ class WrapperMachine:
                 session_id,
                 turn_id,
                 logical_msg_id,
-                daemon_epoch=ctx.codex_daemon_epoch,
+                daemon_epoch=(
+                    None
+                    if ctx.codex_daemon_epoch == _CODEX_DAEMON_UNMARKED_EPOCH
+                    else ctx.codex_daemon_epoch
+                ),
                 automatic=automatic,
             )
         except Exception as exc:
@@ -4744,6 +4762,11 @@ class WrapperMachine:
                 "holders": set(),
                 "writers": set(),
                 "active_external_turns": active_turns,
+                # A task_started observed incrementally after watch creation is
+                # authoritative live-tail evidence, not cold-start debris. Keep
+                # it across a later shared-context attach even though it was not
+                # part of ``seeded_external_turns``.
+                "observed_external_turns": set(),
                 # A cold tail cannot distinguish a live turn from a crashed old
                 # task_started record. The first complete /proc scan confirms it.
                 "seeded_external_turns": set(active_turns),
@@ -5062,8 +5085,13 @@ class WrapperMachine:
         # the old full translated page made every external append re-send
         # megabytes to every browser. Keep the same authoritative replacement
         # semantics with the lightweight projection; detail remains on demand.
-        hist = await self._build_history(
-            sid, limit=self.MIRROR_LIMIT, detail="summary", allow_stale=True)
+        hist = await self._build_requested_history(
+            sid,
+            before=None,
+            limit=self.MIRROR_LIMIT,
+            cwd=None,
+            detail="summary",
+        )
         hist.sid = sid
         await self.transport.send(hist)
         return hist
@@ -5178,10 +5206,16 @@ class WrapperMachine:
             # running creates this shared context mid-turn; that passive attach
             # must not erase the App's authoritative task_started marker.
             seeded = set(w.get("seeded_external_turns", ()))
+            observed = set(w.get("observed_external_turns", ()))
             active = w.setdefault("active_external_turns", {})
             for turn_id in list(active):
-                if turn_id not in seeded and not private_holders:
+                if (
+                    turn_id not in seeded
+                    and turn_id not in observed
+                    and not private_holders
+                ):
                     active.pop(turn_id, None)
+            w.setdefault("observed_external_turns", set()).clear()
             w.setdefault("pending_wrapper_turns", {}).clear()
             w["takeover_pending"] = None
             w["shared_activity_initialized"] = True
@@ -5212,6 +5246,7 @@ class WrapperMachine:
             w["size"] = st.st_size
             w["partial"] = b""
             w["active_external_turns"].clear()
+            w.setdefault("observed_external_turns", set()).clear()
             w["pending_wrapper_turns"].clear()
             if w.get("takeover_pending"):
                 takeover_cleared = True
@@ -5226,6 +5261,7 @@ class WrapperMachine:
         sdk = ctx.sdk if ctx is not None else None
         own_turn_ids = set(getattr(sdk, "owned_turn_ids", ())) if sdk else set()
         active: dict[str, float] = w["active_external_turns"]
+        observed: set[str] = w.setdefault("observed_external_turns", set())
         pending: dict[str, dict[str, object]] = w["pending_wrapper_turns"]
         attribution_pending = bool(
             sdk is not None and getattr(
@@ -5248,6 +5284,7 @@ class WrapperMachine:
         # may identify a marker after an earlier implementation already promoted it.
         for turn_id in own_turn_ids:
             active.pop(turn_id, None)
+            observed.discard(turn_id)
         for turn_id, record in list(pending.items()):
             seen_at = float(record.get("seen_at", now))
             if turn_id in own_turn_ids:
@@ -5269,6 +5306,7 @@ class WrapperMachine:
                 self._revoke_codex_takeover(w, holders, writers)
                 if not bool(record.get("finished")):
                     self._remember_watch_turn(active, turn_id, now)
+                    observed.add(turn_id)
                 pending.pop(turn_id, None)
                 external_growth = True
 
@@ -5305,6 +5343,9 @@ class WrapperMachine:
                     # governed by the active marker below.
                     self._revoke_codex_takeover(w, holders, writers)
                     self._remember_watch_turn(active, turn_id, now)
+                    observed.add(turn_id)
+                    while len(observed) > self.CODEX_TURN_TRACK_MAX:
+                        observed.pop()
                     external_growth = True
             for turn_id in markers.finished:
                 if turn_id in pending:
@@ -5312,6 +5353,7 @@ class WrapperMachine:
                 elif turn_id in active:
                     external_growth = True
                     active.pop(turn_id, None)
+                observed.discard(turn_id)
 
             if holders or active:
                 external_growth = True
@@ -5327,6 +5369,7 @@ class WrapperMachine:
             # Fallback for a crashed short-lived writer that never recorded a
             # terminal marker. A live writer's FD keeps the session locked.
             active.clear()
+            observed.clear()
 
         # Clicking takeover during a live terminal response records the user's
         # ownership intent immediately, but waits for that response to reach a
@@ -6460,6 +6503,112 @@ class WrapperMachine:
             self.HISTORY_REFRESH_MAX_INTERVAL_SECONDS,
         )
 
+    async def _recover_official_codex_user(
+        self,
+        sid: str,
+        native_turn_id: str,
+        visible_turn_id: str,
+        user_index: int,
+    ) -> UserMsg | None:
+        """Recover inline image bytes hidden behind expired localImage paths."""
+        path = await asyncio.to_thread(codex_rollout_path, sid)
+        if not path:
+            return None
+        return await asyncio.to_thread(
+            codex_history_turn_user,
+            path,
+            native_turn_id,
+            visible_turn_id,
+            user_index,
+        )
+
+    async def _build_official_codex_history(
+        self,
+        sid: str,
+        *,
+        before: str | None,
+        limit: int | None,
+    ) -> History:
+        """Build one summary page from Codex's persisted app-server turns.
+
+        This control-plane read never resumes the thread. Opaque official
+        cursors stay inside ``CodexOfficialHistory`` and are invalidated with
+        the wrapper generation; the wire keeps the existing safe turn ids.
+        """
+        revision = self._history_revision(sid)
+        if before is None:
+            build_seq = self._history_build_sequences.get(sid, 0) + 1
+            self._history_build_sequences[sid] = build_seq
+        else:
+            build_seq = self._history_build_sequences.get(sid, 0)
+        ctx = self._ctx_by_sid(sid)
+        watch = self._watch.get(sid) or {}
+        active_external_turns = watch.get("active_external_turns")
+        active_turn_ids = (
+            set(active_external_turns)
+            if isinstance(active_external_turns, dict)
+            else set()
+        )
+        if ctx is not None and ctx.state != "idle" and not active_turn_ids:
+            for candidate in (
+                ctx.codex_owned_turn_id,
+                ctx.codex_spontaneous_turn_id,
+                getattr(ctx.sdk, "turn_id", None),
+            ):
+                if isinstance(candidate, str) and candidate:
+                    active_turn_ids.add(candidate)
+                    break
+        in_progress = bool(
+            (ctx is not None and ctx.state != "idle")
+            or (
+                isinstance(active_external_turns, dict)
+                and active_external_turns
+            )
+        )
+        page = await self._codex_history.summary_page(
+            sid,
+            before=before,
+            limit=limit or 4,
+            include_live_detail=in_progress and before is None,
+            active_turn_ids=active_turn_ids if before is None else set(),
+            # The latest row can be the new active turn while the just-finished
+            # previous row is exactly the steered turn being reconciled. Hydrate
+            # both once; later mirrors reuse the generation-local bounded cache.
+            hydrate_recent=2 if before is None else 0,
+        )
+
+        control_rows: list[dict] = []
+        if before is None and ctx is not None:
+            model = _session_model(ctx)
+            effort = _session_effort(ctx)
+            if model:
+                control_rows.append(
+                    Model(model=model, sid=sid).model_dump(mode="json"))
+            if effort:
+                control_rows.append(
+                    Effort(effort=effort, sid=sid).model_dump(mode="json"))
+        return History(
+            session_id=sid,
+            revision=revision,
+            generation=self.instance_id,
+            build_seq=build_seq,
+            live_seq=ctx.seq if ctx is not None else None,
+            events=control_rows,
+            turns=[
+                ConversationTurn.model_validate(turn)
+                for turn in page.turns
+            ],
+            detail="summary",
+            has_more=page.has_more,
+            before=before,
+            control=self._session_control(ctx) if ctx is not None else None,
+            oldest_id=page.oldest_id,
+            newest_id=page.newest_id,
+            external=self._is_external(sid),
+            takeover_pending=bool(watch.get("takeover_pending")),
+            in_progress=in_progress,
+        )
+
     async def _build_requested_history(
         self,
         sid: str,
@@ -6475,6 +6624,68 @@ class WrapperMachine:
         # scan can take seconds on macOS and must not hold the conversation
         # first paint. The watch loop and switch/query safety paths refresh
         # SessionControl separately; history uses the last known control value.
+        watch = self._watch.get(sid) or {}
+        ctx = self._ctx_by_sid(sid)
+        is_codex = bool(
+            (ctx is not None and ctx.engine == "codex")
+            or watch.get("engine") == "codex"
+        )
+        if is_codex and detail == "summary":
+            try:
+                return await self._build_official_codex_history(
+                    sid, before=before, limit=limit)
+            except CodexHistoryUnsupported:
+                # Older app-server builds retain the source-window rollout
+                # parser. This is a capability fallback, never a response/error
+                # fallback: auth, timeout and malformed official data must stay
+                # visible instead of being mistaken for empty history.
+                log.info(
+                    "official Codex history unsupported; using rollout",
+                    session_id=sid,
+                )
+            except (
+                CodexHistoryCursorError,
+                CodexHistoryInvalidResponse,
+                CodexRpcOutcomeUnknown,
+                CodexRpcRejected,
+                OSError,
+                RuntimeError,
+            ) as exc:
+                log.warning(
+                    "official Codex history failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+                revision = self._history_revision(sid)
+                # The attempted official newest-page build already advanced the
+                # sequence before issuing I/O. Preserve that exact watermark
+                # for its correlated error instead of creating a phantom build.
+                build_seq = self._history_build_sequences.get(sid, 0)
+                return History(
+                    session_id=sid,
+                    revision=revision,
+                    generation=self.instance_id,
+                    build_seq=build_seq,
+                    live_seq=ctx.seq if ctx is not None else None,
+                    authoritative=False,
+                    error="历史暂时不可用，请稍后重试",
+                    events=[],
+                    turns=[],
+                    detail="summary",
+                    has_more=False,
+                    before=before,
+                    control=(
+                        self._session_control(ctx)
+                        if ctx is not None else None
+                    ),
+                    external=self._is_external(sid),
+                    takeover_pending=bool(
+                        watch.get("takeover_pending")),
+                    in_progress=bool(
+                        (ctx is not None and ctx.state != "idle")
+                        or watch.get("active_external_turns")
+                    ),
+                )
         return await self._build_history(
             sid, before=before, limit=limit, cwd_hint=cwd, detail=detail,
             allow_stale=True)
@@ -6576,8 +6787,6 @@ class WrapperMachine:
         requested_revision = getattr(cmd, "revision", None)
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新展开该轮")
-        if self._history_index is None:
-            return await send(error="详细过程暂时不可用，请稍后重试")
 
         self._watch_session(sid)
         watch = self._watch.get(sid) or {}
@@ -6586,20 +6795,86 @@ class WrapperMachine:
             (ctx is not None and ctx.engine == "codex")
             or watch.get("engine") == "codex"
         )
+        rows = None
+        indexed_turn_id = cmd.turn_id
+        if is_codex:
+            try:
+                rows = await self._codex_history.turn_events(
+                    sid, cmd.turn_id)
+            except CodexHistoryUnsupported:
+                # A summary-capable app-server may still lack item pagination
+                # and full turn views. Materialize only the rollout page that
+                # originally contained this turn, then reuse the source-bound
+                # compatibility detail index.
+                try:
+                    fallback = self._codex_history.rollout_fallback(
+                        sid, cmd.turn_id)
+                    fallback_history = await self._build_history(
+                        sid,
+                        before=fallback.before,
+                        limit=fallback.limit,
+                        cwd_hint=None,
+                        detail="summary",
+                        allow_stale=False,
+                    )
+                    if fallback_history.error:
+                        return await send(
+                            error="详细过程暂时不可用，请稍后重试")
+                    indexed_turn_id = next((
+                        turn.id
+                        for turn in fallback_history.turns
+                        if turn.forkPointId == fallback.native_turn_id
+                    ), cmd.turn_id)
+                except Exception as exc:
+                    log.warning(
+                        "Codex rollout detail fallback failed",
+                        session_id=sid,
+                        turn_id=cmd.turn_id,
+                        error_type=type(exc).__name__,
+                    )
+                    return await send(
+                        error="详细过程暂时不可用，请稍后重试")
+            except CodexHistoryCursorError:
+                # A compatibility rollout page (or a page cached before this
+                # official-reader generation) has no in-memory locator. Its
+                # source-bound SQLite detail remains valid and should still be
+                # served below. Without that index, fail closed as expired.
+                if self._history_index is None:
+                    return await send(
+                        error="详细过程已过期，请刷新会话后重试")
+            except (
+                CodexHistoryInvalidResponse,
+                CodexRpcOutcomeUnknown,
+                CodexRpcRejected,
+                OSError,
+                RuntimeError,
+            ) as exc:
+                log.warning(
+                    "official Codex turn detail failed",
+                    session_id=sid,
+                    turn_id=cmd.turn_id,
+                    error_type=type(exc).__name__,
+                )
+                return await send(
+                    error="详细过程暂时不可用，请稍后重试")
+
+        if rows is None and self._history_index is None:
+            return await send(error="详细过程暂时不可用，请稍后重试")
         try:
-            source_path = await asyncio.to_thread(
-                codex_rollout_path if is_codex else transcript_path, sid)
-            if not source_path:
-                return await send(error="详细过程尚未生成")
-            source = await asyncio.to_thread(
-                HistorySourceFingerprint.capture, source_path)
-            rows = await asyncio.to_thread(
-                self._history_index.get_turn_detail,
-                sid,
-                "codex" if is_codex else "claude",
-                source,
-                cmd.turn_id,
-            )
+            if rows is None:
+                source_path = await asyncio.to_thread(
+                    codex_rollout_path if is_codex else transcript_path, sid)
+                if not source_path:
+                    return await send(error="详细过程尚未生成")
+                source = await asyncio.to_thread(
+                    HistorySourceFingerprint.capture, source_path)
+                rows = await asyncio.to_thread(
+                    self._history_index.get_turn_detail,
+                    sid,
+                    "codex" if is_codex else "claude",
+                    source,
+                    indexed_turn_id,
+                )
         except OSError:
             rows = None
         except Exception as exc:
@@ -6680,8 +6955,6 @@ class WrapperMachine:
         requested_revision = getattr(cmd, "revision", None)
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新加载图片")
-        if self._history_index is None:
-            return await send(error="历史图片暂时不可用")
 
         self._watch_session(sid)
         watch = self._watch.get(sid) or {}
@@ -6692,6 +6965,27 @@ class WrapperMachine:
         )
         engine = "codex" if is_codex else "claude"
         try:
+            if is_codex:
+                official_rows = self._codex_history.summary_events(
+                    sid, cmd.turn_id)
+                if official_rows is not None:
+                    official_image = history_image_from_events(
+                        official_rows, cmd.turn_id, cmd.image_id)
+                    if official_image is not None:
+                        media_type, width, height, data = await asyncio.to_thread(
+                            _render_history_image,
+                            official_image,
+                            cmd.variant,
+                        )
+                        return await send(
+                            media_type=media_type,
+                            width=width,
+                            height=height,
+                            data=data,
+                        )
+
+            if self._history_index is None:
+                return await send(error="历史图片暂时不可用")
             source_path = await asyncio.to_thread(
                 codex_rollout_path if is_codex else transcript_path, sid)
             if not source_path:

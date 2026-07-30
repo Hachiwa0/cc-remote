@@ -424,12 +424,14 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
     : engine === "codex" && toolCount === items.length
       ? `${toolCount} 个工具调用`
       : `${items.length} 项`;
-  const elapsed = complete
+  const elapsed: number | null = complete
     ? durationMs != null && durationMs > 0
       ? durationMs
       : engine === "claude" && startTs != null && doneTs != null
         ? Math.max(0, doneTs - startTs)
-        : durationMs ?? 0
+        : durationMs === 0 && startTs != null && doneTs != null && doneTs > startTs
+          ? 0
+          : null
     : Math.max(0, now - (startTs ?? now));
   const toggle = () => {
     manuallyToggled.current = true;
@@ -495,7 +497,8 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
             ? <span className="process-spin" />
             : <Icon name="verify" size={14} />}
         </span>
-        <span>{complete ? "已处理" : "正在处理"} {durationLabel(elapsed)}</span>
+        <span>{complete ? "已处理" : "正在处理"}
+          {elapsed == null ? null : ` ${durationLabel(elapsed)}`}</span>
         <span className="turn-process-count">{countLabel}</span>
         <Icon name="chev" size={15} />
       </button>

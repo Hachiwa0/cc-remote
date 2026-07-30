@@ -7121,6 +7121,22 @@ try {
   }));
   assert.match(cachedCodexDurationMarkup, /已处理 0s/,
     "Claude cache compatibility must not reinterpret a valid Codex duration");
+  const unknownCodexDurationMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "unknown-codex-duration", engine: "codex",
+    turns: [{
+      id: "unknown-codex-turn", prompt: "继续", done: true,
+      ts: 1000, doneTs: 1000,
+      blocks: [{
+        kind: "tool", message_id: "unknown-codex-message",
+        tool_use_id: "unknown-codex-tool", tool: "shell",
+        input: {}, done: true, result: { content: "ok", is_error: false },
+      }],
+    }],
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(unknownCodexDurationMarkup, />已处理</);
+  assert.doesNotMatch(unknownCodexDurationMarkup, /已处理 0s/,
+    "a synthetic steer boundary without duration evidence must not invent 0s");
 
   // The animated turn marker is driven by the turn lifecycle, not by an empty
   // placeholder. It must survive reasoning expansion, process activity, final

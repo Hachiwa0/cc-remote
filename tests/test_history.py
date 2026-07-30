@@ -32,6 +32,11 @@ from cc_remote.protocol import (
     TurnEnd, TurnResult, Error, is_downstream,
 )
 from cc_remote.wrapper import machine as mm
+from cc_remote.wrapper.codex_history import (
+    CodexHistoryPage,
+    CodexHistoryUnsupported,
+)
+from cc_remote.wrapper.codex_rpc import CodexRpcRejected
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
@@ -46,6 +51,321 @@ from cc_remote.wrapper.stream import (
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def test_requested_codex_summary_uses_official_turns_without_rollout_parse(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "official-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"official-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_translate_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("official summary parsed the rollout")),
+    )
+    events = (
+        UserMsg(
+            sid="official-summary",
+            msg_id="user-1",
+            client_msg_id="client-1",
+            prompt="hello",
+            ts=100,
+        ).model_dump(mode="json"),
+        AssistantMsgStart(
+            sid="official-summary",
+            message_id="answer-1",
+            channel="final",
+            ts=100,
+        ).model_dump(mode="json"),
+        Delta(
+            sid="official-summary",
+            message_id="answer-1",
+            channel="final",
+            text="world",
+            ts=100,
+        ).model_dump(mode="json"),
+        AssistantMsgEnd(
+            sid="official-summary",
+            message_id="answer-1",
+            channel="final",
+            ts=100,
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="official-summary",
+            turn_id="native-1",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+            ts=101,
+        ).model_dump(mode="json"),
+    )
+
+    class Official:
+        async def summary_page(
+            self, sid, *, before, limit, include_live_detail=False,
+            active_turn_ids=frozenset(), hydrate_recent=0,
+        ):
+            assert (
+                sid, before, limit, include_live_detail, active_turn_ids,
+                hydrate_recent,
+            ) == ("official-summary", None, 4, False, frozenset(), 2)
+            return CodexHistoryPage(
+                events=events,
+                turns=materialize_history_turns(events),
+                has_more=True,
+                oldest_id="user-1",
+                newest_id="user-1",
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("official-summary", "official-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_requested_history(
+            "official-summary",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert history.authoritative is True
+        assert history.detail == "summary"
+        assert [turn.id for turn in history.turns] == ["user-1"]
+        assert history.turns[0].clientMsgId == "client-1"
+        assert history.turns[0].forkPointId == "native-1"
+        assert history.has_more is True
+        assert all(row["type"] in {"model", "effort"}
+                   for row in history.events)
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_binds_exact_active_native_turn_ids(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "active-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"active-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    seen = []
+
+    class Official:
+        async def summary_page(self, sid, **kwargs):
+            seen.append((sid, kwargs))
+            return CodexHistoryPage(
+                events=(),
+                turns=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("active-summary", "active-summary")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.codex_owned_turn_id = "owned-turn"
+        ctx.codex_spontaneous_turn_id = "goal-turn"
+        ctx.sdk = SimpleNamespace(turn_id="managed-turn")
+        machine.sessions[ctx.key] = ctx
+        machine._watch["active-summary"] = {
+            "engine": "codex",
+            "active_external_turns": {"desktop-turn": 1.0},
+            "takeover_pending": None,
+        }
+
+        history = await machine._build_requested_history(
+            "active-summary",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert history.in_progress is True
+        assert seen == [("active-summary", {
+            "before": None,
+            "limit": 4,
+            "include_live_detail": True,
+            "active_turn_ids": {"desktop-turn"},
+            "hydrate_recent": 2,
+        })]
+        seen.clear()
+        machine._watch["active-summary"]["active_external_turns"] = {}
+        await machine._build_requested_history(
+            "active-summary",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+        assert seen == [("active-summary", {
+            "before": None,
+            "limit": 4,
+            "include_live_detail": True,
+            "active_turn_ids": {"owned-turn"},
+            "hydrate_recent": 2,
+        })]
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "unsupported-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"unsupported-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Unsupported:
+        async def summary_page(self, *_args, **_kwargs):
+            raise CodexHistoryUnsupported("old app-server")
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Unsupported()
+        ctx = _mk_ctx("unsupported-summary", "unsupported-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        fallback_calls = []
+
+        async def fallback(*args, **kwargs):
+            fallback_calls.append((args, kwargs))
+            return History(
+                session_id="unsupported-summary",
+                revision=machine._history_revision("unsupported-summary"),
+                detail="summary",
+            )
+
+        monkeypatch.setattr(machine, "_build_history", fallback)
+        history = await machine._build_requested_history(
+            "unsupported-summary",
+            before=None,
+            limit=4,
+            cwd=None,
+            detail="summary",
+        )
+        assert history.error is None
+        assert len(fallback_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_does_not_hide_auth_failure_with_rollout(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "auth-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"auth-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Rejected:
+        async def summary_page(self, *_args, **_kwargs):
+            raise CodexRpcRejected(
+                "codex app-server error -32001: unauthorized",
+                code=-32001,
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Rejected()
+        ctx = _mk_ctx("auth-summary", "auth-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        monkeypatch.setattr(
+            machine,
+            "_build_history",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("auth failure fell back to rollout")),
+        )
+
+        history = await machine._build_requested_history(
+            "auth-summary",
+            before=None,
+            limit=4,
+            cwd=None,
+            detail="summary",
+        )
+        assert history.authoritative is False
+        assert history.error == "历史暂时不可用，请稍后重试"
+        assert history.turns == []
+
+    asyncio.run(run())
+
+
+def test_codex_turn_detail_uses_official_items_without_history_index(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "official-detail.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"official-detail"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    rows = (
+        UserMsg(
+            sid="official-detail",
+            msg_id="user-1",
+            prompt="inspect",
+        ).model_dump(mode="json"),
+        ProcessEvent(
+            sid="official-detail",
+            item_id="process-1",
+            kind="compaction",
+            phase="end",
+            status="succeeded",
+            title="压缩上下文",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="official-detail",
+            turn_id="native-1",
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class Official:
+        async def turn_events(self, sid, turn_id):
+            assert (sid, turn_id) == ("official-detail", "user-1")
+            return rows
+
+    async def run():
+        machine, transport = _mk_machine()
+        machine._history_index = None
+        machine._codex_history = Official()
+        ctx = _mk_ctx("official-detail", "official-detail")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id="official-detail",
+            turn_id="user-1",
+            revision=machine._history_revision("official-detail"),
+            client_id="client-1",
+            before=None,
+            limit=192,
+        ))
+        assert detail.authoritative is True
+        assert detail.error is None
+        assert any(
+            row.get("item_id") == "process-1"
+            for row in detail.events
+        )
+        assert transport.sent[-1] == detail
+
+    asyncio.run(run())
 
 
 def test_protocol_v21_get_history_and_materialized_summary_roundtrip():
@@ -413,6 +733,10 @@ def test_history_content_does_not_wait_for_external_ownership_scan():
 
         machine._prime_codex_ownership = blocked_prime
         machine._build_history = build
+        machine._codex_history = SimpleNamespace(
+            summary_page=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                CodexHistoryUnsupported("compatibility path"))
+        )
         history = await asyncio.wait_for(machine._build_requested_history(
             "session-1", before=None, limit=4, cwd=None, detail="summary",
         ), timeout=0.1)
@@ -914,6 +1238,11 @@ def test_codex_history_append_paints_cached_page_before_revalidation(
             "_schedule_history_refresh",
             lambda sid, **kwargs: refreshes.append((sid, kwargs)),
         )
+        class Unsupported:
+            async def summary_page(self, *_args, **_kwargs):
+                raise CodexHistoryUnsupported("compatibility path")
+
+        machine._codex_history = Unsupported()
 
         history = await machine._build_requested_history(
             "codex-fast", before=None, limit=4, cwd=ctx.cwd,

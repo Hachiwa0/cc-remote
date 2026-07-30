@@ -435,21 +435,27 @@ def codex_history_boundary_user(
     boundary_offset: int,
     cursor: str,
     *,
+    user_index: int = 0,
     max_scan_bytes: int = _MAX_HISTORY_BOUNDARY_FORWARD_BYTES,
 ) -> UserMsg | None:
-    """Recover the user row omitted from a bounded single-turn tail.
+    """Recover one user row omitted from a bounded single-turn tail.
 
     A single Codex turn can grow far beyond the history byte window, especially
     after one or more ``compacted`` records.  Reading only its recent tail keeps
     memory bounded but otherwise leaves the browser with tool/assistant events
     that have no prompt.  Scan forward from the already-discovered turn boundary
-    only until the first visible user record and reuse the paging cursor as its
-    stable id.  Oversized JSONL records are skipped by ``_bounded_jsonl_records``
-    rather than materialized.
+    only until the requested visible user record and reuse the paging cursor as
+    its stable id.  ``user_index`` also lets the official-history adapter recover
+    images from later steer messages without translating the whole rollout.
+    Oversized JSONL records are skipped by ``_bounded_jsonl_records`` rather than
+    materialized.
     """
     if (not isinstance(boundary_offset, int) or boundary_offset < 0
             or not isinstance(cursor, str)
-            or not _SAFE_WIRE_ID.fullmatch(cursor)):
+            or not _SAFE_WIRE_ID.fullmatch(cursor)
+            or isinstance(user_index, bool)
+            or not isinstance(user_index, int)
+            or user_index < 0):
         return None
     try:
         size = os.path.getsize(path)
@@ -496,7 +502,12 @@ def codex_history_boundary_user(
                 continue
             prompt = visible_codex_user_message(payload.get("message"))
             if not prompt:
-                return None
+                pending_images = []
+                continue
+            if user_index:
+                user_index -= 1
+                pending_images = []
+                continue
             event = UserMsg(msg_id=cursor, prompt=prompt)
             if pending_images:
                 event.images = pending_images
@@ -508,6 +519,39 @@ def codex_history_boundary_user(
                 except (TypeError, ValueError):
                     pass
             return event
+    return None
+
+
+def codex_history_turn_user(
+    path: str,
+    turn_id: str,
+    cursor: str,
+    user_index: int = 0,
+) -> UserMsg | None:
+    """Recover one visible user row for one native Codex turn.
+
+    Official summary items retain expired ``localImage`` paths rather than the
+    inline image bytes persisted in the rollout. Locate only the requested
+    native turn boundary, then reuse the bounded forward reader above so image
+    thumbnails remain available without translating the whole rollout.
+    """
+    if (
+        not isinstance(turn_id, str)
+        or not _SAFE_WIRE_ID.fullmatch(turn_id)
+        or not isinstance(cursor, str)
+        or not _SAFE_WIRE_ID.fullmatch(cursor)
+        or isinstance(user_index, bool)
+        or not isinstance(user_index, int)
+        or user_index < 0
+    ):
+        return None
+    try:
+        for offset, boundary in _history_boundaries(path, use_turns=True):
+            if boundary == turn_id:
+                return codex_history_boundary_user(
+                    path, offset, cursor, user_index=user_index)
+    except OSError:
+        return None
     return None
 
 

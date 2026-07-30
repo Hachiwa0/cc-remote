@@ -20,9 +20,23 @@ _STREAM_LIMIT = 16 * 1024 * 1024
 class CodexRpcRejected(RuntimeError):
     """The app-server returned an explicit JSON-RPC rejection."""
 
+    def __init__(self, message: str, *, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
 
 class CodexRpcOutcomeUnknown(RuntimeError):
     """The mutating request may have committed before transport failure."""
+
+
+class CodexRpcResponseTooLarge(CodexRpcOutcomeUnknown):
+    """One JSON-RPC response exceeded the bounded stdio frame.
+
+    The subtype lets bounded read-only consumers choose another source. It must
+    remain an outcome-unknown failure for mutating callers because the app-server
+    may have committed before producing the oversized response.
+    """
 
 
 def _rpc_error(error: Any) -> CodexRpcRejected:
@@ -31,7 +45,10 @@ def _rpc_error(error: Any) -> CodexRpcRejected:
     code = error.get("code")
     message = str(error.get("message") or "request failed")[:512]
     if isinstance(code, int):
-        return CodexRpcRejected(f"codex app-server error {code}: {message}")
+        return CodexRpcRejected(
+            f"codex app-server error {code}: {message}",
+            code=code,
+        )
     return CodexRpcRejected(f"codex app-server error: {message}")
 
 
@@ -94,7 +111,16 @@ async def codex_rpc(
         if proc.stdout is None:
             raise RuntimeError("codex app-server stdout unavailable")
         while True:
-            line = await proc.stdout.readline()
+            try:
+                line = await proc.stdout.readline()
+            except ValueError as exc:
+                # asyncio StreamReader.readline() raises ValueError when one
+                # newline-delimited JSON-RPC frame exceeds its configured
+                # limit. Preserve this distinction so bounded read-only
+                # consumers can choose a narrower compatibility source.
+                raise CodexRpcResponseTooLarge(
+                    "codex app-server response exceeded the stdio limit"
+                ) from exc
             if not line:
                 raise RuntimeError("codex app-server closed before responding")
             try:
@@ -133,6 +159,8 @@ async def codex_rpc(
             await send(request)
             return await asyncio.wait_for(result(2), timeout=_RPC_TIMEOUT)
         except CodexRpcRejected:
+            raise
+        except CodexRpcResponseTooLarge:
             raise
         except Exception as exc:
             raise CodexRpcOutcomeUnknown(
