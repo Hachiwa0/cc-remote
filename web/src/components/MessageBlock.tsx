@@ -11,6 +11,7 @@ import {
   subscribeInlineImageAssetCacheChanges,
   type InlineImageAsset,
 } from "../inline-image-assets";
+import type { PreviewAuthorizationState } from "../reducer";
 import { isMermaidFenceClass } from "../mermaid";
 import {
   isMathFenceClass,
@@ -20,6 +21,7 @@ import {
 } from "../markdown-math";
 import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import { MermaidBlock } from "./MermaidBlock";
+import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 
 const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
   "git-stage": "Git 变更已暂存",
@@ -106,6 +108,10 @@ interface MessageMarkdownContextValue {
   done?: boolean;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   onOpenFile?: (path: string, line?: number) => void;
   onPreviewImage?: (src: string, alt: string) => void;
 }
@@ -128,12 +134,17 @@ function rememberExternalImageDimensions(
   }
 }
 
-function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
+function MessageImage({ src, alt, title, asset, onLoadImage,
+  onAuthorizeImage, onPreviewImage }: {
   src: string;
   alt?: string;
   title?: string;
   asset?: InlineImageAsset;
   onLoadImage?: (path: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
 }) {
   const target = useMemo(() => classifyMessageImageTarget(src), [src]);
@@ -266,10 +277,16 @@ function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
   if (target.kind === "blocked") {
     return <span className="message-image-error">图片不可用</span>;
   }
+  if (target.kind === "local" && asset?.authorization) {
+    return <PreviewAuthorizationPrompt
+      authorization={asset.authorization}
+      compact
+      onDecision={onAuthorizeImage} />;
+  }
   if (target.kind === "local" && asset?.status === "error") {
     return onLoadImage
       ? <button type="button" className="message-image-error"
-          onClick={retryLocalImage}>
+          title={asset.error} onClick={retryLocalImage}>
           图片加载失败，点击重试
         </button>
       : <span className="message-image-error">图片加载失败</span>;
@@ -340,13 +357,14 @@ function MessageImage({ src, alt, title, asset, onLoadImage, onPreviewImage }: {
 
 function MarkdownImage({ src, alt, title }: ComponentPropsWithoutRef<"img">) {
   const {
-    imageAssets, onLoadImage, onPreviewImage,
+    imageAssets, onLoadImage, onAuthorizeImage, onPreviewImage,
   } = useContext(MessageMarkdownContext);
   const source = typeof src === "string" ? src : "";
   const target = classifyMessageImageTarget(source);
   const asset = target.kind === "local" ? imageAssets?.[target.value] : undefined;
   return <MessageImage src={source} alt={alt} title={title} asset={asset}
-    onLoadImage={onLoadImage} onPreviewImage={onPreviewImage} />;
+    onLoadImage={onLoadImage} onAuthorizeImage={onAuthorizeImage}
+    onPreviewImage={onPreviewImage} />;
 }
 
 function MarkdownLink({
@@ -410,12 +428,16 @@ const MESSAGE_MARKDOWN_COMPONENTS: Components = Object.freeze({
 // token delta is wasteful, so we hold a "shown" buffer that catches up on a
 // timer while streaming, and snaps to the full text when the block is done.
 export function MessageBlock({ text, done, onOpenFile, imageAssets,
-  onLoadImage, onPreviewImage }: {
+  onLoadImage, onAuthorizeImage, onPreviewImage }: {
   text: string;
   done: boolean;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
 }) {
   const [shown, setShown] = useState(text);
@@ -441,8 +463,16 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
   }, []);
 
   const markdownContext = useMemo<MessageMarkdownContextValue>(() => ({
-    done, imageAssets, onLoadImage, onOpenFile, onPreviewImage,
-  }), [done, imageAssets, onLoadImage, onOpenFile, onPreviewImage]);
+    done, imageAssets, onLoadImage, onAuthorizeImage,
+    onOpenFile, onPreviewImage,
+  }), [
+    done,
+    imageAssets,
+    onAuthorizeImage,
+    onLoadImage,
+    onOpenFile,
+    onPreviewImage,
+  ]);
   const mathPlugins = useMarkdownMathPlugins(shown, done);
   const parts = useMemo(() => splitCodexDirectives(
     mathPlugins ? normalizeMathDelimiters(shown) : shown,

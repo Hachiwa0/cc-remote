@@ -13,6 +13,7 @@ import type {
 } from "../domain/conversation";
 import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
+import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { ToolGroup } from "./ToolGroup";
 import { hasActiveProcess, processBlocks } from "../process-blocks";
 import {
@@ -20,6 +21,7 @@ import {
   presentFileOperation,
 } from "../file-changes";
 import type { InlineImageAsset } from "../inline-image-assets";
+import type { PreviewAuthorizationState } from "../reducer";
 import {
   historyImageAssetKey,
   type HistoryImageAsset,
@@ -167,6 +169,7 @@ function ProcessImagePreview({
   previewId,
   imageAssets,
   onLoadImage,
+  onAuthorizeImage,
   historyTurnId,
   historyRef,
   historyImageAssets,
@@ -178,6 +181,10 @@ function ProcessImagePreview({
   previewId?: string;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string, previewId?: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   historyTurnId?: string;
   historyRef?: ProcessHistoryImageRef | null;
   historyImageAssets?: Record<string, HistoryImageAsset>;
@@ -224,6 +231,12 @@ function ProcessImagePreview({
   const canLoad = Boolean(
     (historyTurnId && historyRef) || previewId,
   );
+  if (!historyRef && liveAsset?.authorization) {
+    return <PreviewAuthorizationPrompt
+      authorization={liveAsset.authorization}
+      compact
+      onDecision={onAuthorizeImage} />;
+  }
   return (
     <button type="button" className="process-image-preview"
       disabled={!canLoad}
@@ -256,6 +269,7 @@ function ProcessImagePreview({
 }
 
 function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
+  onAuthorizeImage,
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewImage, onPreviewHistoryImage, openOverride, onOpenChange,
   onInteractionStart, onInteractionEnd }: {
@@ -263,6 +277,10 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string, previewId?: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   historyTurnId?: string;
   historyImageAssets?: Record<string, HistoryImageAsset>;
   onLoadHistoryImage?: (
@@ -331,6 +349,7 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
       {imageView && (
         <ProcessImagePreview path={imagePath} previewId={previewId}
           imageAssets={imageAssets} onLoadImage={onLoadImage}
+          onAuthorizeImage={onAuthorizeImage}
           historyTurnId={historyTurnId} historyRef={historyRef}
           historyImageAssets={historyImageAssets}
           onLoadHistoryImage={onLoadHistoryImage}
@@ -379,7 +398,8 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   );
 }
 
-function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewImage,
+function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage,
+  onAuthorizeImage, onPreviewImage,
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewHistoryImage,
   itemOpen, onItemOpenChange, onInteractionStart, onInteractionEnd }: {
@@ -387,6 +407,10 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewIm
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string, previewId?: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
   historyTurnId?: string;
   historyImageAssets?: Record<string, HistoryImageAsset>;
@@ -406,6 +430,7 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewIm
     return <ProcessActivity
       block={block as ProcessBlock} onOpenFile={onOpenFile}
       imageAssets={imageAssets} onLoadImage={onLoadImage}
+      onAuthorizeImage={onAuthorizeImage}
       historyTurnId={historyTurnId}
       historyImageAssets={historyImageAssets}
       onLoadHistoryImage={onLoadHistoryImage}
@@ -429,13 +454,15 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage, onPreviewIm
           <Icon name="chev" size={13} /></>}>
         <div className="process-reasoning-body"><MessageBlock text={text.text}
           done={text.done} onOpenFile={onOpenFile} imageAssets={imageAssets}
-          onLoadImage={onLoadImage} onPreviewImage={onPreviewImage} /></div>
+          onLoadImage={onLoadImage} onAuthorizeImage={onAuthorizeImage}
+          onPreviewImage={onPreviewImage} /></div>
       </ProcessDisclosure>
     );
   }
   return <div className="process-commentary"><MessageBlock text={text.text}
     done={text.done} onOpenFile={onOpenFile} imageAssets={imageAssets}
-    onLoadImage={onLoadImage} onPreviewImage={onPreviewImage} /></div>;
+    onLoadImage={onLoadImage} onAuthorizeImage={onAuthorizeImage}
+    onPreviewImage={onPreviewImage} /></div>;
 }
 
 type TimelineRow =
@@ -525,7 +552,7 @@ function isPayloadFreeUnfinishedCommandShell(block: Block): boolean {
 
 export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onOpenFile,
   deferredCount = 0, detailLoading = false, onLoadDetail,
-  imageAssets, onLoadImage, onPreviewImage, engine = "claude",
+  imageAssets, onLoadImage, onAuthorizeImage, onPreviewImage, engine = "claude",
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewHistoryImage,
   openOverride, onOpenChange, itemOpen, onItemOpenChange,
@@ -541,6 +568,10 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   onLoadDetail?: () => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string, previewId?: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
   historyTurnId?: string;
   historyImageAssets?: Record<string, HistoryImageAsset>;
@@ -702,6 +733,7 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
                 ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}
                 block={row.block} onOpenFile={onOpenFile}
                 imageAssets={imageAssets} onLoadImage={onLoadImage}
+                onAuthorizeImage={onAuthorizeImage}
                 onPreviewImage={onPreviewImage}
                 historyTurnId={historyTurnId}
                 historyImageAssets={historyImageAssets}

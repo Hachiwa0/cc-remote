@@ -2127,7 +2127,7 @@ for (const id of ["view-a", "view-b"]) {
     requestId: `request-${id}`,
   }), true);
   assert.equal(stableInlineImages.accept({
-    v: 27,
+    v: 28,
     ts: 10,
     type: "preview_asset",
     sid: "inline-stable-session",
@@ -2145,6 +2145,68 @@ assert.deepEqual(
   "two imageView items that reuse one path retain independent snapshots",
 );
 stableInlineImages.clear();
+
+const reconnectingAuthorizedImage = new InlineImageAssetCache(1);
+assert.equal(reconnectingAuthorizedImage.begin({
+  sid: "authorization-session",
+  path: "/tmp/authorized.png",
+  previewId: "authorization-preview",
+  requestId: "authorization-request",
+}), true);
+assert.equal(reconnectingAuthorizedImage.requireAuthorization({
+  v: 28,
+  ts: 11,
+  type: "preview_authorization_required",
+  sid: "authorization-session",
+  authorization_id: "authorization-id",
+  request_id: "authorization-request",
+  operation: "preview_asset",
+  path: "/tmp/authorized.png",
+  resolved_path: "/private/tmp/authorized.png",
+  format: "image",
+  preview_id: "authorization-preview",
+}), true);
+const reconnectingAuthorization = reconnectingAuthorizedImage.forSession(
+  "authorization-session")["/tmp/authorized.png"].authorization!;
+assert.equal(reconnectingAuthorizedImage.markAuthorizationSubmitting(
+  reconnectingAuthorization), true);
+assert.equal(reconnectingAuthorizedImage.acceptAuthorizationResult({
+  v: 28,
+  ts: 12,
+  type: "preview_authorization_result",
+  sid: "stale-socket-session",
+  authorization_id: "authorization-id",
+  request_id: "authorization-request",
+  operation: "preview_asset",
+  path: "/tmp/authorized.png",
+  preview_id: "authorization-preview",
+  status: "granted",
+}), false, "a stale socket result cannot complete another session's challenge");
+assert.notEqual(reconnectingAuthorizedImage.acceptAuthorizationResult({
+  v: 28,
+  ts: 13,
+  type: "preview_authorization_result",
+  sid: "authorization-session",
+  authorization_id: "authorization-id",
+  request_id: "authorization-request",
+  operation: "preview_asset",
+  path: "/tmp/authorized.png",
+  preview_id: "authorization-preview",
+  status: "granted",
+}), false, "the same cache survives a RelayWs reconnect and accepts its result");
+assert.equal(reconnectingAuthorizedImage.acceptAuthorizationResult({
+  v: 28,
+  ts: 14,
+  type: "preview_authorization_result",
+  sid: "authorization-session",
+  authorization_id: "authorization-id",
+  request_id: "authorization-request",
+  operation: "preview_asset",
+  path: "/tmp/authorized.png",
+  preview_id: "authorization-preview",
+  status: "granted",
+}), false, "a duplicate result cannot issue the authorized read twice");
+reconnectingAuthorizedImage.clear();
 
 let historyImageNow = 1_000;
 const retryableHistoryImages = new HistoryImageAssetCache(
@@ -9701,6 +9763,8 @@ assert.equal(
 );
 
 const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
+const btwPanelSource = readFileSync(
+  resolve(process.cwd(), "src/components/BtwPanel.tsx"), "utf8");
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
   assert.doesNotMatch(appSource, new RegExp(`dispatch\\(\\{ type: ["']${optimisticAction}["']`));
 }
@@ -9754,6 +9818,18 @@ assert.match(appSource,
 assert.match(appSource,
   /const previewBtwFile = [\s\S]{0,120}previewFileForSid\(activeBtwSid/,
   "BTW file actions must stay bound to the visible session's fork");
+assert.match(appSource,
+  /activeBtwSid\s*\?\s*inlineImageAssetsRef\.current\.forSession\(activeBtwSid\)/,
+  "the visible BTW must read only its own inline-image cache projection");
+assert.match(appSource,
+  /sendGetPreviewAsset\(path,\s*previewId,\s*requestId,\s*sid\)/,
+  "message image reads must carry their explicit main or BTW session id");
+assert.match(appSource,
+  /focusedSid !== sid[\s\S]{0,180}activeBtwSid !== sid/,
+  "background sessions outside the focused main and visible BTW stay unable to read files");
+assert.match(btwPanelSource,
+  /<ChatView[\s\S]{0,220}imageAssets=\{p\.imageAssets\}[\s\S]{0,120}onLoadImage=\{p\.onLoadImage\}[\s\S]{0,120}onAuthorizeImage=\{p\.onAuthorizeImage\}/,
+  "BTW chat rendering must receive the same bounded image authorization channel");
 assert.match(appSource, /sendInterruptTo\(sid\)/,
   "BTW stop must target the captured fork sid");
 assert.match(appSource, /sendSetModelTo\(sid, model\)/,

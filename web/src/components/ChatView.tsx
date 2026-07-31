@@ -23,6 +23,7 @@ import { finalTextBlocks, hasActiveProcess } from "../process-blocks";
 import { isMarkdownPath } from "../preview-path";
 import { collectTurnFileChanges } from "../file-changes";
 import type { InlineImageAsset } from "../inline-image-assets";
+import type { PreviewAuthorizationState } from "../reducer";
 import {
   historyImageAssetKey,
   type HistoryImageAsset,
@@ -205,6 +206,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   onLoadMore, onLoadNewer, onReturnLatest,
   onLoadDetail, onEdit, onGetDiff, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
+  onAuthorizeImage,
   historyImageAssets, onLoadHistoryImage,
   onTextSelectionGuardChange,
   surface = "code" }: {
@@ -240,6 +242,10 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   forkingPointId?: string | null;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string, previewId?: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   historyImageAssets?: Record<string, HistoryImageAsset>;
   onLoadHistoryImage?: (
     turnId: string, imageId: string, variant: HistoryImageVariant,
@@ -2070,6 +2076,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                   : undefined}
                 onOpenFile={onOpenFile} imageAssets={imageAssets}
                 onLoadImage={onLoadImage}
+                onAuthorizeImage={onAuthorizeImage}
                 historyTurnId={historyTurnId}
                 historyImageAssets={historyImageAssets}
                 onLoadHistoryImage={onLoadHistoryImage}
@@ -2101,6 +2108,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
                   <MessageBlock key={block.message_id} text={block.text}
                     done={block.done} onOpenFile={onOpenFile}
                     imageAssets={imageAssets} onLoadImage={onLoadImage}
+                    onAuthorizeImage={onAuthorizeImage}
                     onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
                 ))}
                 {t.done && (

@@ -15,6 +15,7 @@ import type {
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
+  PreviewAuthorizationOperation,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -120,9 +121,24 @@ export interface PendingQuery {
 }
 
 export interface PreviewAssetState {
+  requestId?: string;
+  previewId?: string;
+  loading?: boolean;
   mediaType?: string;
   data?: string;
   error?: string;
+  authorization?: PreviewAuthorizationState;
+}
+
+export interface PreviewAuthorizationState {
+  authorizationId: string;
+  requestId: string;
+  operation: PreviewAuthorizationOperation;
+  path: string;
+  resolvedPath: string;
+  format: "markdown" | "text" | "html" | "image" | "pdf";
+  previewId?: string;
+  status: "required" | "submitting" | "granted";
 }
 
 export interface Artifact {
@@ -141,6 +157,7 @@ export interface Artifact {
   truncated?: boolean;
   mtimeNs?: string;
   revision?: string;
+  writable?: boolean;
   saveRequestId?: string;
   saving?: boolean;
   saveStatus?: "saved" | "conflict" | "error";
@@ -149,6 +166,7 @@ export interface Artifact {
   line?: number;
   error?: string;
   assets?: Record<string, PreviewAssetState>;
+  authorization?: PreviewAuthorizationState;
 }
 
 export interface SessionRuntime {
@@ -382,6 +400,10 @@ export type Action =
   | { type: "set_artifact"; artifact: Artifact }
   | { type: "open_artifact_loading"; file: string; sid: string | null; requestId: string }
   | { type: "open_file_loading"; file: string; sid: string | null; requestId: string; kind: "md" | "file"; line?: number }
+  | { type: "begin_preview_asset"; sid: string; path: string; previewId: string; requestId: string }
+  | { type: "submit_preview_authorization"; sid: string; authorizationId: string; requestId: string }
+  | { type: "preview_authorization_retry_started"; sid: string; authorizationId: string; requestId: string }
+  | { type: "preview_authorization_retry_failed"; sid: string; authorizationId: string; requestId: string }
   | { type: "start_file_save"; requestId: string; content: string }
   | { type: "clear_artifact" }
   | { type: "clear_btw"; parentSid: string }
@@ -1403,6 +1425,75 @@ export function reduce(state: AppState, action: Action): AppState {
         file: action.file, sid: action.sid, requestId: action.requestId,
         kind: action.kind, line: action.line, content: "", assets: {}, loading: true,
       } };
+    case "begin_preview_asset": {
+      const artifact = state.artifact;
+      if (!artifact || artifact.kind !== "md"
+          || artifact.sid !== action.sid
+          || artifact.requestId !== action.previewId) return state;
+      return { ...state, artifact: {
+        ...artifact,
+        assets: {
+          ...artifact.assets,
+          [action.path]: {
+            requestId: action.requestId,
+            previewId: action.previewId,
+            loading: true,
+          },
+        },
+      } };
+    }
+    case "submit_preview_authorization":
+    case "preview_authorization_retry_started":
+    case "preview_authorization_retry_failed": {
+      const artifact = state.artifact;
+      if (!artifact || artifact.sid !== action.sid) return state;
+      const update = (
+        authorization: PreviewAuthorizationState | undefined,
+      ): PreviewAuthorizationState | undefined => {
+        if (!authorization
+            || authorization.authorizationId !== action.authorizationId
+            || authorization.requestId !== action.requestId) {
+          return authorization;
+        }
+        if (action.type === "submit_preview_authorization") {
+          return { ...authorization, status: "submitting" };
+        }
+        return undefined;
+      };
+      if (artifact.authorization) {
+        const authorization = update(artifact.authorization);
+        if (authorization === artifact.authorization) return state;
+        return { ...state, artifact: {
+          ...artifact,
+          authorization,
+          loading: action.type === "preview_authorization_retry_started",
+          error: action.type === "preview_authorization_retry_failed"
+            ? "授权成功，但读取请求未能排队，请刷新文件重试。"
+            : artifact.error,
+        } };
+      }
+      for (const [path, asset] of Object.entries(artifact.assets ?? {})) {
+        if (!asset.authorization) continue;
+        const authorization = update(asset.authorization);
+        if (authorization === asset.authorization) continue;
+        return { ...state, artifact: {
+          ...artifact,
+          assets: {
+            ...artifact.assets,
+            [path]: {
+              ...asset,
+              authorization,
+              loading:
+                action.type === "preview_authorization_retry_started",
+              error: action.type === "preview_authorization_retry_failed"
+                ? "授权成功，但图片读取请求未能排队，请刷新文件重试。"
+                : asset.error,
+            },
+          },
+        } };
+      }
+      return state;
+    }
     case "start_file_save":
       if (!state.artifact || state.artifact.kind !== "md") return state;
       return { ...state, artifact: {
@@ -2118,6 +2209,9 @@ function reduceEvent(
       const retainedHistoryBrowse =
         state.retainedHistoryBrowse?.sid === old_key
           ? null : state.retainedHistoryBrowse;
+      const artifact = state.artifact?.sid === old_key
+        ? { ...state.artifact, sid: session_id }
+        : state.artifact;
       return {
         ...state,
         runtimes, sessions, historyRecovery, historyBrowse,
@@ -2125,6 +2219,7 @@ function reduceEvent(
         focusedSid: wasFocused ? session_id : state.focusedSid,
         btwByParentSid,
         cwdByScope,
+        artifact,
       };
     }
     case "session_migrated": {
@@ -2909,6 +3004,7 @@ function reduceEvent(
         truncated: e.truncated,
         mtimeNs: e.mtime_ns,
         revision: e.revision ?? undefined,
+        writable: e.writable !== false,
         line: state.artifact.line,
         error: e.error ?? undefined,
         assets: {},
@@ -2942,17 +3038,128 @@ function reduceEvent(
       if (!state.artifact || state.artifact.kind !== "md"
           || state.artifact.requestId !== e.preview_id
           || state.artifact.sid !== (e.sid ?? state.focusedSid)) return state;
+      {
+        const pending = state.artifact.assets?.[e.path];
+        if (!pending
+            || pending.requestId !== e.request_id
+            || pending.previewId !== e.preview_id) return state;
+      }
       return { ...state, artifact: {
         ...state.artifact,
         assets: {
           ...state.artifact.assets,
           [e.path]: {
+            requestId: e.request_id,
+            previewId: e.preview_id,
+            loading: false,
             mediaType: e.media_type ?? undefined,
             data: e.data ?? undefined,
             error: e.error ?? undefined,
           },
         },
       } };
+    case "preview_authorization_required": {
+      const artifact = state.artifact;
+      const sid = e.sid ?? state.focusedSid;
+      if (!artifact || !sid || artifact.sid !== sid) return state;
+      const authorization: PreviewAuthorizationState = {
+        authorizationId: e.authorization_id,
+        requestId: e.request_id,
+        operation: e.operation,
+        path: e.path,
+        resolvedPath: e.resolved_path,
+        format: e.format,
+        previewId: e.preview_id ?? undefined,
+        status: "required",
+      };
+      if (e.operation === "file_preview") {
+        if (artifact.requestId !== e.request_id
+            || artifact.file !== e.path) return state;
+        return { ...state, artifact: {
+          ...artifact,
+          loading: false,
+          error: undefined,
+          authorization,
+        } };
+      }
+      if (artifact.kind !== "md"
+          || artifact.requestId !== e.preview_id) return state;
+      const pending = artifact.assets?.[e.path];
+      if (!pending
+          || pending.requestId !== e.request_id
+          || pending.previewId !== e.preview_id) return state;
+      return { ...state, artifact: {
+        ...artifact,
+        assets: {
+          ...artifact.assets,
+          [e.path]: {
+            ...pending,
+            loading: false,
+            error: undefined,
+            authorization,
+          },
+        },
+      } };
+    }
+    case "preview_authorization_result": {
+      const artifact = state.artifact;
+      const sid = e.sid ?? state.focusedSid;
+      if (!artifact || !sid || artifact.sid !== sid) return state;
+      const matches = (authorization?: PreviewAuthorizationState) => (
+        !!authorization
+        && authorization.authorizationId === e.authorization_id
+        && authorization.requestId === e.request_id
+        && (!e.operation || authorization.operation === e.operation)
+        && (!e.path || authorization.path === e.path)
+        && (!e.preview_id || authorization.previewId === e.preview_id)
+      );
+      const problem = e.error || (
+        e.status === "denied"
+          ? "已取消读取外部文件。"
+          : "该预览确认已过期，请重新打开文件。"
+      );
+      if (matches(artifact.authorization)) {
+        if (e.status === "granted") {
+          return { ...state, artifact: {
+            ...artifact,
+            authorization: {
+              ...artifact.authorization!,
+              status: "granted",
+            },
+          } };
+        }
+        return { ...state, artifact: {
+          ...artifact,
+          authorization: undefined,
+          loading: false,
+          error: problem,
+        } };
+      }
+      for (const [path, asset] of Object.entries(artifact.assets ?? {})) {
+        if (!matches(asset.authorization)) continue;
+        return { ...state, artifact: {
+          ...artifact,
+          assets: {
+            ...artifact.assets,
+            [path]: e.status === "granted"
+              ? {
+                  ...asset,
+                  authorization: {
+                    ...asset.authorization!,
+                    status: "granted",
+                  },
+                }
+              : {
+                  ...asset,
+                  authorization: undefined,
+                  loading: false,
+                  error: problem,
+                },
+          },
+        } };
+      }
+      return state;
+    }
     case "state": {
       const next = patch(state, e.sid, (rt) => {
         rt.state = e.state;

@@ -27,9 +27,19 @@ assert.deepEqual(classifyPreviewTarget("docs/README.md", "./img/a.png"), {
 assert.deepEqual(classifyPreviewTarget("docs/README.md", "../root.png?raw=1"), {
   kind: "local", value: "root.png",
 });
-assert.equal(classifyPreviewTarget("README.md", "../secret.png").kind, "blocked");
-assert.equal(classifyPreviewTarget("README.md", "/etc/passwd").kind, "blocked");
+assert.deepEqual(classifyPreviewTarget("README.md", "../secret.png"), {
+  kind: "local", value: "../secret.png",
+});
+assert.deepEqual(classifyPreviewTarget("README.md", "/tmp/report.png"), {
+  kind: "local", value: "/tmp/report.png",
+});
+assert.deepEqual(classifyPreviewTarget(
+  "/tmp/report.md", "./images/chart.png"), {
+  kind: "local", value: "/tmp/images/chart.png",
+});
 assert.equal(classifyPreviewTarget("README.md", "file:///etc/passwd").kind, "blocked");
+assert.equal(classifyPreviewTarget(
+  "README.md", `${"图".repeat(1400)}.png`).kind, "blocked");
 assert.equal(classifyPreviewTarget("README.md", "//example.com/a.png").kind, "blocked");
 assert.deepEqual(classifyPreviewTarget("README.md", "https://example.com/a.png"), {
   kind: "external", value: "https://example.com/a.png",
@@ -139,6 +149,203 @@ assert.deepEqual(sizedInlineAssets.forSession("session-1")["sized-qr.png"], {
   status: "ready", mediaType: "image/png", data: pngHeaderBase64,
   width: 640, height: 480,
 }, "local Markdown images keep an intrinsic first-frame aspect ratio");
+
+const authorizedInlineAssets = new InlineImageAssetCache(3);
+assert.equal(authorizedInlineAssets.begin({
+  sid: "temp-session",
+  path: "/tmp/outside.png",
+  previewId: "preview-auth",
+  requestId: "request-auth",
+}), true);
+assert.equal(authorizedInlineAssets.rekeySession(
+  "temp-session", "real-session"), true);
+assert.equal(authorizedInlineAssets.forSession(
+  "temp-session")["/tmp/outside.png"], undefined);
+assert.equal(authorizedInlineAssets.requireAuthorization({
+  v: 28,
+  type: "preview_authorization_required",
+  ts: 4,
+  sid: "wrong-session",
+  authorization_id: "authorization-1",
+  request_id: "request-auth",
+  operation: "preview_asset",
+  path: "/tmp/outside.png",
+  resolved_path: "/tmp/outside.png",
+  format: "image",
+  preview_id: "preview-auth",
+}), false, "a challenge from another session cannot capture the pending image");
+assert.equal(authorizedInlineAssets.requireAuthorization({
+  v: 28,
+  type: "preview_authorization_required",
+  ts: 5,
+  sid: "real-session",
+  authorization_id: "authorization-1",
+  request_id: "request-auth",
+  operation: "preview_asset",
+  path: "/tmp/outside.png",
+  resolved_path: "/tmp/outside.png",
+  format: "image",
+  preview_id: "preview-auth",
+}), true);
+const inlineAuthorization = authorizedInlineAssets.forSession(
+  "real-session")["/tmp/outside.png"].authorization!;
+assert.equal(inlineAuthorization.status, "required");
+assert.equal(inlineAuthorization.sid, "real-session");
+assert.equal(authorizedInlineAssets.markAuthorizationSubmitting(
+  inlineAuthorization), true);
+assert.equal(authorizedInlineAssets.forSession(
+  "real-session")["/tmp/outside.png"].authorization?.status, "submitting");
+assert.equal(authorizedInlineAssets.acceptAuthorizationResult({
+  v: 28,
+  type: "preview_authorization_result",
+  ts: 6,
+  sid: "wrong-session",
+  authorization_id: "authorization-1",
+  request_id: "request-auth",
+  operation: "preview_asset",
+  path: "/tmp/outside.png",
+  preview_id: "preview-auth",
+  status: "granted",
+}), false);
+assert.deepEqual(authorizedInlineAssets.acceptAuthorizationResult({
+  v: 28,
+  type: "preview_authorization_result",
+  ts: 7,
+  sid: "real-session",
+  authorization_id: "authorization-1",
+  request_id: "request-auth",
+  operation: "preview_asset",
+  path: "/tmp/outside.png",
+  preview_id: "preview-auth",
+  status: "granted",
+}), {
+  sid: "real-session",
+  path: "/tmp/outside.png",
+  assetKey: undefined,
+  previewId: "preview-auth",
+  requestId: "request-auth",
+});
+assert.equal(authorizedInlineAssets.acceptAuthorizationResult({
+  v: 28,
+  type: "preview_authorization_result",
+  ts: 8,
+  sid: "real-session",
+  authorization_id: "authorization-1",
+  request_id: "request-auth",
+  operation: "preview_asset",
+  path: "/tmp/outside.png",
+  preview_id: "preview-auth",
+  status: "granted",
+}), false, "a duplicate grant result cannot start another retry");
+assert.equal(authorizedInlineAssets.accept({
+  v: 28,
+  type: "preview_asset",
+  ts: 9,
+  sid: "real-session",
+  path: "/tmp/outside.png",
+  preview_id: "preview-auth",
+  request_id: "request-auth",
+  media_type: "image/png",
+  data: pngHeaderBase64,
+}), true);
+assert.equal(authorizedInlineAssets.forSession(
+  "real-session")["/tmp/outside.png"].status, "ready");
+
+const reorderedAuthorizedImage = new InlineImageAssetCache(1);
+assert.equal(reorderedAuthorizedImage.begin({
+  sid: "btw-session",
+  path: "/tmp/reordered.png",
+  previewId: "reordered-preview",
+  requestId: "reordered-request",
+}), true);
+assert.equal(reorderedAuthorizedImage.requireAuthorization({
+  v: 28,
+  type: "preview_authorization_required",
+  ts: 9.1,
+  sid: "btw-session",
+  authorization_id: "reordered-authorization",
+  request_id: "reordered-request",
+  operation: "preview_asset",
+  path: "/tmp/reordered.png",
+  resolved_path: "/private/tmp/reordered.png",
+  format: "image",
+  preview_id: "reordered-preview",
+}), true);
+const reorderedAuthorization = reorderedAuthorizedImage.forSession(
+  "btw-session")["/tmp/reordered.png"].authorization!;
+const reorderedAsset = {
+  v: 28,
+  type: "preview_asset",
+  ts: 9.2,
+  sid: "btw-session",
+  path: "/tmp/reordered.png",
+  preview_id: "reordered-preview",
+  request_id: "reordered-request",
+  media_type: "image/png",
+  data: pngHeaderBase64,
+} as const;
+assert.equal(reorderedAuthorizedImage.accept(reorderedAsset), false,
+  "an external asset must not bypass the user's confirmation");
+assert.equal(reorderedAuthorizedImage.forSession(
+  "btw-session")["/tmp/reordered.png"].authorization?.status, "required");
+assert.equal(reorderedAuthorizedImage.markAuthorizationSubmitting(
+  reorderedAuthorization), true);
+assert.equal(reorderedAuthorizedImage.accept(reorderedAsset), true,
+  "an authorized asset may overtake its replayed grant result");
+assert.equal(reorderedAuthorizedImage.forSession(
+  "btw-session")["/tmp/reordered.png"].status, "ready");
+assert.equal(reorderedAuthorizedImage.acceptAuthorizationResult({
+  v: 28,
+  type: "preview_authorization_result",
+  ts: 9.3,
+  sid: "btw-session",
+  authorization_id: "reordered-authorization",
+  request_id: "reordered-request",
+  operation: "preview_asset",
+  path: "/tmp/reordered.png",
+  preview_id: "reordered-preview",
+  status: "granted",
+}), false, "the late grant result must not issue a duplicate asset read");
+assert.equal(reorderedAuthorizedImage.forSession(
+  "btw-session")["/tmp/reordered.png"].status, "ready");
+
+assert.equal(authorizedInlineAssets.begin({
+  sid: "real-session",
+  path: "/tmp/denied.png",
+  previewId: "preview-denied",
+  requestId: "request-denied",
+}), true);
+assert.equal(authorizedInlineAssets.requireAuthorization({
+  v: 28,
+  type: "preview_authorization_required",
+  ts: 10,
+  sid: "real-session",
+  authorization_id: "authorization-denied",
+  request_id: "request-denied",
+  operation: "preview_asset",
+  path: "/tmp/denied.png",
+  resolved_path: "/tmp/denied.png",
+  format: "image",
+  preview_id: "preview-denied",
+}), true);
+const deniedInlineAuthorization = authorizedInlineAssets.forSession(
+  "real-session")["/tmp/denied.png"].authorization!;
+assert.equal(authorizedInlineAssets.markAuthorizationSubmitting(
+  deniedInlineAuthorization), true);
+assert.equal(authorizedInlineAssets.acceptAuthorizationResult({
+  v: 28,
+  type: "preview_authorization_result",
+  ts: 11,
+  sid: "real-session",
+  authorization_id: "authorization-denied",
+  request_id: "request-denied",
+  operation: "preview_asset",
+  path: "/tmp/denied.png",
+  preview_id: "preview-denied",
+  status: "denied",
+}), null);
+assert.equal(authorizedInlineAssets.forSession(
+  "real-session")["/tmp/denied.png"].status, "error");
 assert.deepEqual(mutatedFilePaths("Write", {
   file_path: "/tmp/claude.txt",
 }), ["/tmp/claude.txt"]);
@@ -365,6 +572,165 @@ $$`,
   assert.equal(state.artifact?.revision, "a".repeat(64));
   assert.equal(state.artifact?.loading, undefined);
 
+  let authorizationState = reduce(initialState, {
+    type: "open_file_loading",
+    file: "/tmp/outside.md",
+    sid: "session-1",
+    requestId: "external-preview",
+    kind: "md",
+  });
+  const beforeAuthorization = authorizationState;
+  authorizationState = reduce(authorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_required",
+      ts: 20,
+      sid: "other-session",
+      authorization_id: "file-authorization",
+      request_id: "external-preview",
+      operation: "file_preview",
+      path: "/tmp/outside.md",
+      resolved_path: "/tmp/outside.md",
+      format: "markdown",
+    } as ServerEvent,
+  });
+  assert.equal(authorizationState, beforeAuthorization,
+    "another session cannot attach a file confirmation to the open panel");
+  authorizationState = reduce(authorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_required",
+      ts: 21,
+      sid: "session-1",
+      authorization_id: "file-authorization",
+      request_id: "external-preview",
+      operation: "file_preview",
+      path: "/tmp/outside.md",
+      resolved_path: "/private/tmp/outside.md",
+      format: "markdown",
+    } as ServerEvent,
+  });
+  assert.equal(authorizationState.artifact?.loading, false);
+  assert.equal(authorizationState.artifact?.authorization?.status, "required");
+  authorizationState = reduce(authorizationState, {
+    type: "submit_preview_authorization",
+    sid: "session-1",
+    authorizationId: "file-authorization",
+    requestId: "external-preview",
+  });
+  assert.equal(
+    authorizationState.artifact?.authorization?.status,
+    "submitting",
+  );
+  const beforeStaleResult = authorizationState;
+  authorizationState = reduce(authorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_result",
+      ts: 22,
+      sid: "session-1",
+      authorization_id: "stale-authorization",
+      request_id: "external-preview",
+      operation: "file_preview",
+      path: "/tmp/outside.md",
+      status: "granted",
+    } as ServerEvent,
+  });
+  assert.equal(authorizationState, beforeStaleResult);
+  authorizationState = reduce(authorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_result",
+      ts: 23,
+      sid: "session-1",
+      authorization_id: "file-authorization",
+      request_id: "external-preview",
+      operation: "file_preview",
+      path: "/tmp/outside.md",
+      status: "granted",
+    } as ServerEvent,
+  });
+  assert.equal(authorizationState.artifact?.authorization?.status, "granted");
+  const retryFailedState = reduce(authorizationState, {
+    type: "preview_authorization_retry_failed",
+    sid: "session-1",
+    authorizationId: "file-authorization",
+    requestId: "external-preview",
+  });
+  assert.equal(retryFailedState.artifact?.authorization, undefined);
+  assert.match(retryFailedState.artifact?.error ?? "", /刷新文件/);
+  authorizationState = reduce(authorizationState, {
+    type: "preview_authorization_retry_started",
+    sid: "session-1",
+    authorizationId: "file-authorization",
+    requestId: "external-preview",
+  });
+  assert.equal(authorizationState.artifact?.authorization, undefined);
+  assert.equal(authorizationState.artifact?.loading, true);
+  authorizationState = reduce(authorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "file_preview",
+      ts: 24,
+      sid: "session-1",
+      path: "/private/tmp/outside.md",
+      request_id: "external-preview",
+      format: "markdown",
+      content: "# read only",
+      size: 11,
+      truncated: false,
+      mtime_ns: "10",
+      revision: "e".repeat(64),
+      writable: false,
+    } as ServerEvent,
+  });
+  assert.equal(authorizationState.artifact?.content, "# read only");
+  assert.equal(authorizationState.artifact?.writable, false);
+
+  let deniedState = reduce(initialState, {
+    type: "open_file_loading",
+    file: "/tmp/denied.md",
+    sid: "session-1",
+    requestId: "denied-preview",
+    kind: "md",
+  });
+  deniedState = reduce(deniedState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_required",
+      ts: 25,
+      sid: "session-1",
+      authorization_id: "denied-authorization",
+      request_id: "denied-preview",
+      operation: "file_preview",
+      path: "/tmp/denied.md",
+      resolved_path: "/tmp/denied.md",
+      format: "markdown",
+    } as ServerEvent,
+  });
+  deniedState = reduce(deniedState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_result",
+      ts: 26,
+      sid: "session-1",
+      authorization_id: "denied-authorization",
+      request_id: "denied-preview",
+      operation: "file_preview",
+      path: "/tmp/denied.md",
+      status: "denied",
+    } as ServerEvent,
+  });
+  assert.equal(deniedState.artifact?.authorization, undefined);
+  assert.match(deniedState.artifact?.error ?? "", /取消/);
+
   const rendered = state;
   state = reduce(state, { type: "event", event: {
     v: 10,
@@ -379,6 +745,27 @@ $$`,
   } as ServerEvent });
   assert.equal(state, rendered, "assets from another session must be ignored");
 
+  state = reduce(state, {
+    type: "begin_preview_asset",
+    sid: "session-1",
+    path: "docs/image.png",
+    previewId: "preview-new",
+    requestId: "asset-1",
+  });
+  const pendingAsset = state;
+  state = reduce(state, { type: "event", event: {
+    v: 10,
+    type: "preview_asset",
+    ts: 4,
+    sid: "session-1",
+    path: "docs/image.png",
+    preview_id: "preview-new",
+    request_id: "asset-stale",
+    media_type: "image/png",
+    data: "cG5n",
+  } as ServerEvent });
+  assert.equal(state, pendingAsset,
+    "a stale asset response cannot satisfy the active image request");
   state = reduce(state, { type: "event", event: {
     v: 10,
     type: "preview_asset",
@@ -391,8 +778,129 @@ $$`,
     data: "cG5n",
   } as ServerEvent });
   assert.deepEqual(state.artifact?.assets?.["docs/image.png"], {
-    mediaType: "image/png", data: "cG5n", error: undefined,
+    requestId: "asset-1",
+    previewId: "preview-new",
+    loading: false,
+    mediaType: "image/png",
+    data: "cG5n",
+    error: undefined,
   });
+
+  let assetAuthorizationState = reduce(state, {
+    type: "begin_preview_asset",
+    sid: "session-1",
+    path: "/tmp/chart.png",
+    previewId: "preview-new",
+    requestId: "asset-auth",
+  });
+  assetAuthorizationState = reduce(assetAuthorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_required",
+      ts: 27,
+      sid: "session-1",
+      authorization_id: "asset-authorization",
+      request_id: "asset-auth",
+      operation: "preview_asset",
+      path: "/tmp/chart.png",
+      resolved_path: "/private/tmp/chart.png",
+      format: "image",
+      preview_id: "wrong-preview",
+    } as ServerEvent,
+  });
+  assert.equal(
+    assetAuthorizationState.artifact?.assets?.["/tmp/chart.png"]
+      ?.authorization,
+    undefined,
+  );
+  assetAuthorizationState = reduce(assetAuthorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_required",
+      ts: 28,
+      sid: "session-1",
+      authorization_id: "asset-authorization",
+      request_id: "asset-auth",
+      operation: "preview_asset",
+      path: "/tmp/chart.png",
+      resolved_path: "/private/tmp/chart.png",
+      format: "image",
+      preview_id: "preview-new",
+    } as ServerEvent,
+  });
+  assert.equal(
+    assetAuthorizationState.artifact?.assets?.["/tmp/chart.png"]
+      ?.authorization?.status,
+    "required",
+  );
+  assetAuthorizationState = reduce(assetAuthorizationState, {
+    type: "submit_preview_authorization",
+    sid: "session-1",
+    authorizationId: "asset-authorization",
+    requestId: "asset-auth",
+  });
+  assetAuthorizationState = reduce(assetAuthorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_authorization_result",
+      ts: 29,
+      sid: "session-1",
+      authorization_id: "asset-authorization",
+      request_id: "asset-auth",
+      operation: "preview_asset",
+      path: "/tmp/chart.png",
+      preview_id: "preview-new",
+      status: "granted",
+    } as ServerEvent,
+  });
+  assert.equal(
+    assetAuthorizationState.artifact?.assets?.["/tmp/chart.png"]
+      ?.authorization?.status,
+    "granted",
+  );
+  assetAuthorizationState = reduce(assetAuthorizationState, {
+    type: "preview_authorization_retry_started",
+    sid: "session-1",
+    authorizationId: "asset-authorization",
+    requestId: "asset-auth",
+  });
+  assert.equal(
+    assetAuthorizationState.artifact?.assets?.["/tmp/chart.png"]?.loading,
+    true,
+  );
+  assetAuthorizationState = reduce(assetAuthorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "preview_asset",
+      ts: 30,
+      sid: "session-1",
+      path: "/tmp/chart.png",
+      preview_id: "preview-new",
+      request_id: "asset-auth",
+      media_type: "image/png",
+      data: pngHeaderBase64,
+    } as ServerEvent,
+  });
+  assert.equal(
+    assetAuthorizationState.artifact?.assets?.["/tmp/chart.png"]?.data,
+    pngHeaderBase64,
+  );
+  const rekeyedAuthorizationState = reduce(assetAuthorizationState, {
+    type: "event",
+    event: {
+      v: 28,
+      type: "session_rekey",
+      ts: 31,
+      old_key: "session-1",
+      session_id: "session-real",
+      cwd: "/tmp/project",
+    } as ServerEvent,
+  });
+  assert.equal(rekeyedAuthorizationState.artifact?.sid, "session-real");
 
   state = reduce(state, {
     type: "start_file_save",
@@ -502,6 +1010,17 @@ $$`,
   assert.match(markup, />保存</);
   assert.match(markup, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.doesNotMatch(markup, /<script>/);
+  const readOnlyMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: authorizationState.artifact!,
+    active: "diff",
+    hasBtw: false,
+    onTab: () => {},
+    onClose: () => {},
+    onSaveMarkdown: () => "save-should-not-run",
+  }));
+  assert.match(readOnlyMarkup, /title="此文件仅获准查看"/);
+  assert.match(readOnlyMarkup, /class="markdown-save" disabled=""/,
+    "a user-approved external Markdown file remains read-only");
   const mermaidPreviewMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
     artifact: {
       file: "docs/diagram.md",

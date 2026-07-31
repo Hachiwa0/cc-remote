@@ -57,7 +57,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **Codex 大 rollout** | Codex 历史按回合从文件尾部向前读取，保留 app-server 的原生 resume / compact 状态，不把整个 rollout 重新上传给模型。对特定超大 Codex Desktop + OpenAI 恢复场景，才启用严格限定的官方 HTTP 兼容路径。 |
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
 | **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
-| **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
+| **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。工作目录外的精确文件会先在请求它的会话中确认，只授权当前文件身份；用户确认的 Markdown 保持只读，只有本会话成功写入的文件才可保存。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
 | **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v28。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
 
 > **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在

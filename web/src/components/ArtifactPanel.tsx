@@ -2,7 +2,11 @@ import { isValidElement, useCallback, useEffect, useMemo, useRef, useState,
   type ComponentPropsWithoutRef, type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
-import type { Artifact, PreviewAssetState } from "../reducer";
+import type {
+  Artifact,
+  PreviewAssetState,
+  PreviewAuthorizationState,
+} from "../reducer";
 import { Icon } from "../icons";
 import { PanelTabs } from "./PanelTabs";
 import { GIT_DIFF_PAGE_LINES, pageGitDiff, type GitDiffSection } from "../diff";
@@ -22,6 +26,7 @@ import {
   useMarkdownMathPlugins,
 } from "../markdown-math";
 import { MermaidBlock } from "./MermaidBlock";
+import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
@@ -278,22 +283,35 @@ function SourceFile({ content, targetLine, artifactKey }: {
   </>;
 }
 
-function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset }: {
+function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
+  onAuthorizePreview }: {
   markdownPath: string;
   src: string;
   alt?: string;
   title?: string;
   asset?: PreviewAssetState;
   requestAsset: (path: string) => boolean;
+  onAuthorizePreview?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
 }) {
   const target = classifyPreviewTarget(markdownPath, src);
   const [blocked, setBlocked] = useState(false);
   const svg = useSanitizedSvgUrl(asset?.data, asset?.mediaType);
 
   useEffect(() => {
-    if (target.kind !== "local" || asset?.data || asset?.error) return;
+    if (target.kind !== "local" || asset?.data || asset?.error
+        || asset?.authorization) return;
     setBlocked(!requestAsset(target.value));
-  }, [asset?.data, asset?.error, requestAsset, target.kind, target.value]);
+  }, [
+    asset?.authorization,
+    asset?.data,
+    asset?.error,
+    requestAsset,
+    target.kind,
+    target.value,
+  ]);
 
   if (target.kind === "external") {
     return <img src={target.value} alt={alt || ""} title={title}
@@ -301,6 +319,12 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset }: {
   }
   if (target.kind !== "local") {
     return <span className="preview-image-error" title={src}>图片路径不可用：{alt || src}</span>;
+  }
+  if (asset?.authorization) {
+    return <PreviewAuthorizationPrompt
+      authorization={asset.authorization}
+      compact
+      onDecision={onAuthorizePreview} />;
   }
   if (asset?.data && asset.mediaType) {
     if (svg.error) {
@@ -324,7 +348,8 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset }: {
 }
 
 export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
-  onRefresh, onOpenFile, onLoadPreviewAsset, onSaveMarkdown, onDirtyChange }: {
+  onRefresh, onOpenFile, onLoadPreviewAsset, onAuthorizePreview,
+  onSaveMarkdown, onDirtyChange }: {
   artifact: Artifact;
   active: "diff" | "btw";
   hasBtw: boolean;
@@ -333,6 +358,10 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onRefresh?: (path: string, line?: number) => void;
   onOpenFile?: (path: string, line?: number) => void;
   onLoadPreviewAsset?: (path: string, previewId: string) => boolean;
+  onAuthorizePreview?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   onSaveMarkdown?: (path: string, content: string, expectedSize: number,
     expectedMtimeNs: string, expectedRevision: string) => string | null;
   onDirtyChange?: (dirty: boolean) => void;
@@ -423,6 +452,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   }, [artifact.kind, loading, mode]);
 
   const canSave = artifact.kind === "md" && !loading && !artifact.error
+    && artifact.writable !== false
     && !artifact.truncated && typeof artifact.size === "number"
     && typeof artifact.mtimeNs === "string" && !!artifact.revision
     && !!onSaveMarkdown;
@@ -562,7 +592,8 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
       const target = classifyPreviewTarget(artifact.file, source);
       const asset = target.kind === "local" ? artifact.assets?.[target.value] : undefined;
       return <PreviewImage markdownPath={artifact.file} src={source} alt={alt}
-        title={title} asset={asset} requestAsset={requestAsset} />;
+        title={title} asset={asset} requestAsset={requestAsset}
+        onAuthorizePreview={onAuthorizePreview} />;
     },
     a: ({ href, children, title }) => {
       const target = classifyPreviewTarget(artifact.file, href || "");
@@ -580,7 +611,13 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
       }
       return <span className="preview-link-disabled" title="该相对链接不会离开当前工作目录">{children}</span>;
     },
-  }), [artifact.assets, artifact.file, onOpenFile, requestAsset]);
+  }), [
+    artifact.assets,
+    artifact.file,
+    onAuthorizePreview,
+    onOpenFile,
+    requestAsset,
+  ]);
 
   const title = artifact.file.split("/").pop()
     || (["md", "file", "html", "image", "pdf"].includes(artifact.kind) ? "文件预览" : "改动");
@@ -611,7 +648,11 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
           type="button" className="markdown-save"
           disabled={!dirty || artifact.saving || !canSave}
           onClick={saveDraft}
-          title={artifact.truncated ? "截断的文件不可编辑" : "保存 Markdown（Ctrl/⌘+S）"}>
+          title={artifact.writable === false
+            ? "此文件仅获准查看"
+            : artifact.truncated
+              ? "截断的文件不可编辑"
+              : "保存 Markdown（Ctrl/⌘+S）"}>
           <Icon name={artifact.saving ? "refresh" : "check"} size={15} />
           {artifact.saving ? "保存中" : "保存"}
         </button>}
@@ -627,7 +668,11 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         <button className="iconbtn" onClick={leavePanel} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>
       <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}`}>
-        {loading ? (
+        {artifact.authorization ? (
+          <PreviewAuthorizationPrompt
+            authorization={artifact.authorization}
+            onDecision={onAuthorizePreview} />
+        ) : loading ? (
           <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> {["md", "file", "html", "image", "pdf"].includes(artifact.kind) ? "正在读取文件…" : "正在读取 diff…"}</div>
         ) : artifact.error ? (
           <div className="preview-error"><Icon name="read" size={18} />{artifact.error}</div>

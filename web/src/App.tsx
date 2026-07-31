@@ -6,6 +6,7 @@ import {
   initialState,
   reduce,
   type PendingQuery,
+  type PreviewAuthorizationState,
 } from "./reducer";
 import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
@@ -572,6 +573,8 @@ export default function App() {
   );
   const inlineImageAssets = focusedSid
     ? inlineImageAssetsRef.current.forSession(focusedSid) : {};
+  const btwInlineImageAssets = activeBtwSid
+    ? inlineImageAssetsRef.current.forSession(activeBtwSid) : {};
   const historyImageAssets = focusedSid
     ? historyImageAssetsRef.current.forSession(focusedSid) : {};
   const currentWorkArtifacts = focusedSid ? (workArtifactsBySid[focusedSid] ?? []) : [];
@@ -676,7 +679,11 @@ export default function App() {
     stablePreviewId?: string,
   ): boolean => {
     const ws = wsRef.current;
-    if (!ws || stateRef.current.focusedSid !== sid) return false;
+    const current = stateRef.current;
+    const focusedSid = current.newChat ? null : current.focusedSid;
+    const activeBtwSid = focusedSid
+      ? current.btwByParentSid[focusedSid]?.sid ?? null : null;
+    if (!ws || (focusedSid !== sid && activeBtwSid !== sid)) return false;
     const cache = inlineImageAssetsRef.current;
     const assetKey = stablePreviewId ?? path;
     if (cache.has(sid, path, assetKey)) return true;
@@ -685,7 +692,7 @@ export default function App() {
     if (!cache.begin({
       sid, path, assetKey, previewId, requestId,
     })) return false;
-    if (!ws.sendGetPreviewAsset(path, previewId, requestId)) {
+    if (!ws.sendGetPreviewAsset(path, previewId, requestId, sid)) {
       cache.cancel(requestId);
       return false;
     }
@@ -700,6 +707,31 @@ export default function App() {
       ? loadMessageImage(focusedSid, path, stablePreviewId)
       : false
   ), [focusedSid, loadMessageImage]);
+  const loadBtwMessageImage = useCallback((
+    path: string,
+    stablePreviewId?: string,
+  ) => (
+    activeBtwSid
+      ? loadMessageImage(activeBtwSid, path, stablePreviewId)
+      : false
+  ), [activeBtwSid, loadMessageImage]);
+  const authorizeMessageImage = useCallback((
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ): boolean => {
+    const cache = inlineImageAssetsRef.current;
+    const request = cache.authorizationRequest(authorization);
+    if (!request) return false;
+    if (!wsRef.current?.sendAuthorizePreview(
+      authorization.authorizationId,
+      authorization.requestId,
+      decision,
+      request.sid,
+    )) return false;
+    if (!cache.markAuthorizationSubmitting(authorization)) return false;
+    bumpInlineImageRevision();
+    return true;
+  }, []);
   const loadHistoryImage = useCallback((
     turnId: string,
     imageId: string,
@@ -1273,6 +1305,33 @@ export default function App() {
       if (cancelled) return;
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
+          if (msg.type === "session_rekey"
+              && inlineImageAssetsRef.current.rekeySession(
+                msg.old_key,
+                msg.session_id,
+              )) {
+            bumpInlineImageRevision();
+          }
+          if (msg.type === "preview_authorization_required"
+              && inlineImageAssetsRef.current.requireAuthorization(msg)) {
+            bumpInlineImageRevision();
+          }
+          if (msg.type === "preview_authorization_result") {
+            const retry =
+              inlineImageAssetsRef.current.acceptAuthorizationResult(msg);
+            if (retry !== false) {
+              bumpInlineImageRevision();
+              if (retry && !ws.sendGetPreviewAsset(
+                retry.path,
+                retry.previewId,
+                retry.requestId,
+                retry.sid,
+              )) {
+                inlineImageAssetsRef.current.cancel(retry.requestId);
+                bumpInlineImageRevision();
+              }
+            }
+          }
           if (msg.type === "preview_asset"
               && inlineImageAssetsRef.current.accept(msg)) {
             bumpInlineImageRevision();
@@ -2601,6 +2660,39 @@ export default function App() {
     state.wrapperOnline,
   ]);
 
+  useEffect(() => {
+    const artifact = state.artifact;
+    const targetSid = artifact?.sid;
+    if (!artifact || !targetSid) return;
+    const authorization = artifact.authorization?.status === "granted"
+      ? artifact.authorization
+      : Object.values(artifact.assets ?? {}).find(
+        (asset) => asset.authorization?.status === "granted",
+      )?.authorization;
+    if (!authorization) return;
+    const ws = wsRef.current;
+    const sent = authorization.operation === "file_preview"
+      ? !!ws?.sendGetFilePreview(
+        authorization.path,
+        authorization.requestId,
+        targetSid,
+      )
+      : !!authorization.previewId && !!ws?.sendGetPreviewAsset(
+        authorization.path,
+        authorization.previewId,
+        authorization.requestId,
+        targetSid,
+      );
+    dispatch({
+      type: sent
+        ? "preview_authorization_retry_started"
+        : "preview_authorization_retry_failed",
+      sid: targetSid,
+      authorizationId: authorization.authorizationId,
+      requestId: authorization.requestId,
+    });
+  }, [state.artifact]);
+
   if (!authReady) {
     return <div className="login" aria-busy="true">正在连接中继…</div>;
   }
@@ -3254,8 +3346,52 @@ export default function App() {
   const previewMarkdown = (file: string) => previewFile(file);
   const loadPreviewAsset = (file: string, previewId: string): boolean => {
     const targetSid = state.artifact?.sid ?? focusedSid;
-    return !!targetSid && !!wsRef.current?.sendGetPreviewAsset(
-      file, previewId, uuid(), targetSid);
+    if (!targetSid) return false;
+    const requestId = uuid();
+    if (!wsRef.current?.sendGetPreviewAsset(
+      file, previewId, requestId, targetSid)) return false;
+    dispatch({
+      type: "begin_preview_asset",
+      sid: targetSid,
+      path: file,
+      previewId,
+      requestId,
+    });
+    return true;
+  };
+  const authorizePreview = (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ): boolean => {
+    const artifact = stateRef.current.artifact;
+    const targetSid = artifact?.sid;
+    if (!artifact || !targetSid) return false;
+    const activeAuthorization = artifact.authorization
+      ?? Object.values(artifact.assets ?? {}).find(
+        (asset) => (
+          asset.authorization?.authorizationId
+            === authorization.authorizationId
+          && asset.authorization.requestId === authorization.requestId
+        ),
+      )?.authorization;
+    if (!activeAuthorization
+        || activeAuthorization.authorizationId
+          !== authorization.authorizationId
+        || activeAuthorization.requestId !== authorization.requestId
+        || activeAuthorization.status !== "required") return false;
+    if (!wsRef.current?.sendAuthorizePreview(
+      authorization.authorizationId,
+      authorization.requestId,
+      decision,
+      targetSid,
+    )) return false;
+    dispatch({
+      type: "submit_preview_authorization",
+      sid: targetSid,
+      authorizationId: authorization.authorizationId,
+      requestId: authorization.requestId,
+    });
+    return true;
   };
   const saveMarkdown = (file: string, content: string, expectedSize: number,
                         expectedMtimeNs: string, expectedRevision: string): string | null => {
@@ -3673,6 +3809,8 @@ export default function App() {
               imageAssets={inlineImageAssets}
               onLoadImage={historyView.recovering
                 ? undefined : loadFocusedMessageImage}
+              onAuthorizeImage={historyView.recovering
+                ? undefined : authorizeMessageImage}
               historyImageAssets={historyImageAssets}
               onLoadHistoryImage={historyView.recovering
                 ? undefined : loadHistoryImage}
@@ -3852,6 +3990,9 @@ export default function App() {
               if (activeBtwSid) setBtwEffort(activeBtwSid, effort);
             }}
             onOpenFile={previewBtwFile} onClose={closeBtw}
+            imageAssets={btwInlineImageAssets}
+            onLoadImage={loadBtwMessageImage}
+            onAuthorizeImage={authorizeMessageImage}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
             }} />;
@@ -3859,6 +4000,7 @@ export default function App() {
           return <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
             onTab={switchRight} onRefresh={previewArtifactFile}
             onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
+            onAuthorizePreview={authorizePreview}
             onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
             onClose={() => dispatch({ type: "clear_artifact" })} />;
         return null;

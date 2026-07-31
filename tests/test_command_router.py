@@ -40,6 +40,7 @@ EXPECTED_COMMAND_HANDLERS = {
     "get_file_preview": "_handle_get_file_preview",
     "save_markdown": "_handle_save_markdown",
     "get_preview_asset": "_handle_get_preview_asset",
+    "authorize_preview": "_handle_authorize_preview",
     "get_history": "_handle_get_history",
     "get_turn_detail": "_handle_get_turn_detail",
     "get_history_image": "_handle_get_history_image",

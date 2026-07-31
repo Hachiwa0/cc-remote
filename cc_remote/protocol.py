@@ -1784,6 +1784,7 @@ class FilePreview(_Base):
     truncated: bool = False
     mtime_ns: FileMtimeNs = "0"
     revision: Optional[FileRevision] = None
+    writable: bool = True
     error: Optional[str] = Field(default=None, max_length=512)
 
 
@@ -1833,6 +1834,42 @@ class PreviewAsset(_Base):
         "image/svg+xml",
     ]] = None
     data: Optional[PreviewAssetData] = None
+    error: Optional[str] = Field(default=None, max_length=512)
+
+
+class PreviewAuthorizationRequired(_Base):
+    """One external file needs an explicit requester-local user gesture."""
+    type: Literal[
+        "preview_authorization_required"
+    ] = "preview_authorization_required"
+    authorization_id: WireId
+    request_id: WireId
+    operation: Literal["file_preview", "preview_asset"]
+    path: PreviewPath
+    resolved_path: PreviewPath
+    format: Literal["markdown", "text", "html", "image", "pdf"] = "text"
+    preview_id: Optional[WireId] = None
+
+
+class AuthorizePreview(_Command):
+    """Answer one exact, short-lived external preview challenge."""
+    type: Literal["authorize_preview"] = "authorize_preview"
+    authorization_id: WireId
+    request_id: WireId
+    decision: Literal["allow", "deny"]
+
+
+class PreviewAuthorizationResult(_Base):
+    """Small result; after a grant the browser recreates the bounded read."""
+    type: Literal[
+        "preview_authorization_result"
+    ] = "preview_authorization_result"
+    authorization_id: WireId
+    request_id: WireId
+    operation: Optional[Literal["file_preview", "preview_asset"]] = None
+    path: Optional[PreviewPath] = None
+    status: Literal["granted", "denied", "expired", "changed", "error"]
+    preview_id: Optional[WireId] = None
     error: Optional[str] = Field(default=None, max_length=512)
 
 
@@ -2116,8 +2153,8 @@ class GoalState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
+    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
@@ -2173,6 +2210,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_file_preview": GetFilePreview,
     "save_markdown": SaveMarkdown,
     "get_preview_asset": GetPreviewAsset,
+    "authorize_preview": AuthorizePreview,
     "get_history": GetHistory,
     "get_turn_detail": GetTurnDetail,
     "get_history_image": GetHistoryImage,
@@ -2232,6 +2270,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "file_preview": FilePreview,
     "file_save_result": FileSaveResult,
     "preview_asset": PreviewAsset,
+    "preview_authorization_required": PreviewAuthorizationRequired,
+    "preview_authorization_result": PreviewAuthorizationResult,
     "work_artifacts": WorkArtifacts,
     "history": History,
     "turn_detail": TurnDetail,

@@ -12,6 +12,7 @@ from cc_remote.attachments import MAX_ATTACHMENT_COUNT, validate_attachments
 from cc_remote.protocol import (
     ASK_ANSWER_MAX_CHARS,
     AnswerQuestion,
+    AuthorizePreview,
     CollaborationMode,
     ForkSessionWorktree,
     GetDiff,
@@ -24,6 +25,8 @@ from cc_remote.protocol import (
     FILE_PREVIEW_MAX_BYTES,
     NewSession,
     PROTOCOL_VERSION,
+    PreviewAuthorizationRequired,
+    PreviewAuthorizationResult,
     ProtocolError,
     Query,
     SaveMarkdown,
@@ -166,6 +169,16 @@ def test_surrogate_filename_is_a_clean_validation_error():
         lambda: GetFilePreview(path="x" * 4097, request_id="preview-1"),
         lambda: GetPreviewAsset(
             path="image.png", preview_id="preview-1", request_id="x" * 129),
+        lambda: AuthorizePreview(
+            authorization_id="x" * 129,
+            request_id="preview-1",
+            decision="allow",
+        ),
+        lambda: AuthorizePreview(
+            authorization_id="authorization-1",
+            request_id="preview-1",
+            decision="always",
+        ),
         lambda: AnswerQuestion(
             ask_id="ask-1", answer="x" * (ASK_ANSWER_MAX_CHARS + 1)),
         lambda: ForkSessionWorktree(
@@ -195,6 +208,25 @@ def test_known_dynamic_control_values_remain_supported():
     assert ForkSessionWorktree(
         session_id="sid-1", request_id="request-1", name="feature",
     ).name == "feature"
+    required = PreviewAuthorizationRequired(
+        authorization_id="authorization-1",
+        request_id="preview-1",
+        operation="file_preview",
+        path="/tmp/file.md",
+        resolved_path="/private/tmp/file.md",
+        format="markdown",
+    )
+    assert deserialize(serialize(required)) == required
+    result = PreviewAuthorizationResult(
+        authorization_id="authorization-1",
+        request_id="preview-1",
+        operation="file_preview",
+        path="/tmp/file.md",
+        status="granted",
+    )
+    assert deserialize(serialize(result)) == result
+    assert is_downstream(required) is False
+    assert is_downstream(result) is False
 
 
 def test_markdown_save_content_is_bounded_by_utf8_bytes():

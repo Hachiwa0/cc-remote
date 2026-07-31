@@ -207,7 +207,6 @@ class SessionContext:
     # tool/paths binding separate so a failed or declined tool call grants no
     # read capability.  Both maps are bounded by WrapperMachine.
     preview_write_candidates: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    preview_external_paths: dict[str, None] = field(default_factory=dict)
     # A successful built-in image read outside cwd grants only the immutable
     # bytes observed at that exact tool boundary.  The machine owns the bounded
     # byte cache; this opaque token prevents a later SessionContext (or a re-key)

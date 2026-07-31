@@ -53,6 +53,7 @@ import tempfile
 import time
 import unicodedata
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 from typing import Optional
@@ -92,6 +93,7 @@ from cc_remote.protocol import (
     CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
     BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
+    PreviewAuthorizationRequired, PreviewAuthorizationResult,
     ConversationTurn, History, TurnDetail, HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
     GoalState, Snapshot, StateEvent, State, TakeoverState, SessionControl,
@@ -236,6 +238,12 @@ from cc_remote.wrapper.process_scan import (
     process_owner_uid,
 )
 from cc_remote.wrapper.command_router import CommandRouter, UNHANDLED_COMMAND
+from cc_remote.wrapper.preview_capabilities import (
+    PREVIEW_PATH_MAX_BYTES,
+    PreviewCapability,
+    PreviewCapabilityError,
+    PreviewCapabilityStore,
+)
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -909,6 +917,34 @@ class _FileRevisionConflict(RuntimeError):
         self.revision = revision
 
 
+class _PreviewAuthorizationNeeded(ValueError):
+    """An otherwise valid preview points outside cwd without a capability."""
+
+    def __init__(self, path: str, resolved_path: str):
+        super().__init__("外部文件需要确认后才能预览")
+        self.path = path
+        self.resolved_path = resolved_path
+
+
+class _PreviewCapabilityChanged(_PreviewAuthorizationNeeded):
+    """The exact file identity previously authorized no longer matches."""
+
+
+@dataclass(frozen=True)
+class _PreviewChallenge:
+    authorization_id: str
+    session_key: str
+    engine: str
+    space: str
+    client_id: str
+    request_id: str
+    operation: str
+    path: str
+    resolved_path: str
+    preview_id: Optional[str]
+    created_at: float
+
+
 class WrapperMachine:
     # Browser/TUI outboxes hold at most 256 commands. Keep a 2x retry window per
     # client and at most the relay's configured maximum of 64 client identities;
@@ -924,8 +960,9 @@ class WrapperMachine:
     # number of resident sessions allowed by config validation.
     PRIVATE_BTW_CAP = 64
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
-    PREVIEW_EXTERNAL_PATH_CAP = 256
     PREVIEW_WRITE_CANDIDATE_CAP = 64
+    PREVIEW_AUTHORIZATION_CAP = 256
+    PREVIEW_AUTHORIZATION_TTL = 5 * 60
     PREVIEW_IMAGE_CANDIDATE_CAP = 64
     PREVIEW_IMAGE_SNAPSHOT_SESSION_BYTES = 16 * 1024 * 1024
     PREVIEW_IMAGE_SNAPSHOT_GLOBAL_BYTES = 64 * 1024 * 1024
@@ -986,7 +1023,8 @@ class WrapperMachine:
         "set_perm", "get_permission_profiles", "set_permission_profile",
         "set_web_search",
         "get_context", "get_status", "get_diff", "get_file_preview", "save_markdown",
-        "get_preview_asset", "answer_question", "get_goal", "set_goal", "clear_goal",
+        "get_preview_asset", "authorize_preview",
+        "answer_question", "get_goal", "set_goal", "clear_goal",
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
@@ -1028,6 +1066,11 @@ class WrapperMachine:
         # rejected by a browser that still holds the previous control watermark.
         self._control_revision_epochs: dict[str, int] = {}
         self._preview_conversion_limit = asyncio.Semaphore(2)
+        self._preview_capability_store = PreviewCapabilityStore(
+            Path(cfg.state_dir))
+        self._preview_challenges: OrderedDict[
+            str, _PreviewChallenge
+        ] = OrderedDict()
         # Immutable snapshots created only after a successful built-in image
         # read.  They are process-local by design: no temporary user image is
         # copied to the relay or persisted on disk.
@@ -3449,27 +3492,42 @@ class WrapperMachine:
         except ValueError:
             return False
 
-    def _observe_preview_path_event(self, ctx: SessionContext, msg) -> None:
-        """Grant an exact, bounded preview capability after a successful write.
+    def _normalize_preview_write_event(self, msg) -> tuple[str, ...]:
+        """Decorate one write ToolUse without granting filesystem access.
 
-        Normal previews remain cwd-confined.  Claude/Codex can, however, be
+        Historical translation also calls this presentation-only helper. It must
+        never populate the live pending map: a transcript records the old path,
+        but not the device/inode observed when that write completed.
+        """
+        if (
+            not isinstance(msg, ToolUse)
+            or (msg.tool or "").lower() not in self.PREVIEW_WRITE_TOOLS
+        ):
+            return ()
+        raw_paths = self._tool_write_paths(msg.input)
+        if not raw_paths:
+            return ()
+        # ``file_paths`` is the engine-neutral presentation field. Keep the
+        # original payload beside it so old clients and detailed tool views
+        # retain the exact SDK/app-server input.
+        if msg.input.get("file_paths") != list(raw_paths):
+            msg.input = dict(msg.input)
+            msg.input["file_paths"] = list(raw_paths)
+        return raw_paths
+
+    def _observe_preview_path_event(self, ctx: SessionContext, msg) -> None:
+        """Grant an exact capability only at a live successful-write boundary.
+
+        Normal previews remain cwd-confined. Claude/Codex can, however, be
         explicitly asked to create a deliverable elsewhere (for example
-        ``/tmp/test.md``).  The resulting ToolUse + successful ToolResult is an
-        auditable capability for that exact path; knowing any other absolute
-        path is still insufficient to read it through Remote.
+        ``/tmp/test.md``). The live ToolUse + successful ToolResult pair is an
+        auditable capability for the exact file identity inspected at that
+        moment; replaying the same pair from history is not.
         """
         if isinstance(msg, ToolUse):
-            if (msg.tool or "").lower() not in self.PREVIEW_WRITE_TOOLS:
-                return
-            raw_paths = self._tool_write_paths(msg.input)
+            raw_paths = self._normalize_preview_write_event(msg)
             if not raw_paths:
                 return
-            # ``file_paths`` is the engine-neutral presentation field.  Keep the
-            # original payload beside it so old clients and detailed tool views
-            # retain the exact SDK/app-server input.
-            if msg.input.get("file_paths") != list(raw_paths):
-                msg.input = dict(msg.input)
-                msg.input["file_paths"] = list(raw_paths)
             pending = ctx.preview_write_candidates
             pending[msg.tool_use_id] = raw_paths
             while len(pending) > self.PREVIEW_WRITE_CANDIDATE_CAP:
@@ -3483,17 +3541,33 @@ class WrapperMachine:
                 "failed", "declined", "cancelled", "interrupted"}:
             return
         root = os.path.realpath(ctx.cwd)
-        paths = ctx.preview_external_paths
+        session_key = ctx.session_id or ctx.key
+        if not session_key:
+            return
         for raw_path in raw_paths:
             candidate = os.path.realpath(
                 raw_path if os.path.isabs(raw_path)
                 else os.path.join(root, raw_path))
             if self._path_is_below(root, candidate):
                 continue
-            paths.pop(candidate, None)
-            paths[candidate] = None
-        while len(paths) > self.PREVIEW_EXTERNAL_PATH_CAP:
-            paths.pop(next(iter(paths)))
+            try:
+                self._preview_capability_store.grant_path(
+                    ctx.engine,
+                    ctx.space,
+                    session_key,
+                    candidate,
+                    mode="read_write",
+                    source="structured_write",
+                    persist=not ctx.btw,
+                )
+            except PreviewCapabilityError as exc:
+                # A tool may report success before a delayed/background file
+                # exists. Do not guess or retain a path-only capability; the
+                # eventual preview can use the explicit confirmation flow.
+                log.debug(
+                    "structured preview capability not granted",
+                    error=str(exc),
+                )
 
     @staticmethod
     def _preview_image_read_path(msg: ToolUse) -> Optional[str]:
@@ -3555,13 +3629,21 @@ class WrapperMachine:
                     "failed", "declined", "cancelled", "interrupted"}:
                 return
             try:
+                capability = self._preview_capability_store.inspect_path(
+                    ctx.engine,
+                    ctx.space,
+                    ctx.session_id or ctx.key,
+                    candidate,
+                    mode="read",
+                    source="engine_observed",
+                )
                 _, media_type, data = await asyncio.to_thread(
                     self._read_preview_asset,
                     ctx.cwd,
                     candidate,
-                    frozenset({candidate}),
+                    {capability.path: capability},
                 )
-            except (OSError, ValueError):
+            except (OSError, ValueError, PreviewCapabilityError):
                 return
             self._store_preview_image_snapshot(
                 ctx.preview_snapshot_token,
@@ -3600,13 +3682,21 @@ class WrapperMachine:
                 "failed", "declined", "cancelled", "interrupted"}:
             return
         try:
+            capability = self._preview_capability_store.inspect_path(
+                ctx.engine,
+                ctx.space,
+                ctx.session_id or ctx.key,
+                candidate,
+                mode="read",
+                source="engine_observed",
+            )
             _, media_type, data = await asyncio.to_thread(
                 self._read_preview_asset,
                 ctx.cwd,
                 candidate,
-                frozenset({candidate}),
+                {capability.path: capability},
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError, PreviewCapabilityError):
             # The engine result remains authoritative. A path that disappeared,
             # changed type, or exceeded the preview bound simply has no Remote
             # preview capability.
@@ -3765,11 +3855,21 @@ class WrapperMachine:
                 break
         return tuple(paths)
 
-    @staticmethod
-    def _preview_external_paths(ctx: SessionContext) -> frozenset[str]:
-        # Copy before handing the set to a worker thread.  Live tool events may
-        # add another path while an Office conversion or file read is running.
-        return frozenset(ctx.preview_external_paths)
+    def _preview_capabilities(
+        self,
+        ctx: SessionContext,
+        *,
+        require_write: bool = False,
+    ) -> dict[str, PreviewCapability]:
+        session_key = ctx.session_id or ctx.key
+        if not session_key:
+            return {}
+        return self._preview_capability_store.snapshot(
+            ctx.engine,
+            ctx.space,
+            session_key,
+            require_write=require_write,
+        )
 
     async def _emit_locked(self, ctx: SessionContext, msg) -> None:
         # Stamp routing before buffering so byte accounting includes the final
@@ -6243,21 +6343,6 @@ class WrapperMachine:
             cached_events = cached_full_events or [
                 dict(row) for row in indexed_page.events
             ]
-            if ctx is not None:
-                # Rebuild exact preview capabilities from the materialized
-                # ToolUse/ToolResult pairs.  A wrapper restart must not make a
-                # previously valid cross-cwd file preview disappear merely
-                # because JSONL translation was skipped.
-                for row in cached_events:
-                    try:
-                        if row.get("type") == "tool_use":
-                            self._observe_preview_path_event(
-                                ctx, ToolUse.model_validate(row))
-                        elif row.get("type") == "tool_result":
-                            self._observe_preview_path_event(
-                                ctx, ToolResult.model_validate(row))
-                    except (TypeError, ValueError):
-                        continue
             if before is None and ctx is not None:
                 live_model = _session_model(ctx)
                 live_effort = _session_effort(ctx)
@@ -6493,12 +6578,11 @@ class WrapperMachine:
                 in_progress=in_progress,
             )
         for ev in events:
-            if ctx is not None:
-                # Rebuild exact cross-cwd preview capabilities from the durable
-                # transcript after a wrapper restart or resident-session
-                # eviction.  The observer grants only completed Write/Edit
-                # pairs, never a path merely mentioned by the assistant.
-                self._observe_preview_path_event(ctx, ev)
+            # History may normalize file-operation presentation, but it cannot
+            # mint a capability for today's inode from yesterday's write. Normal
+            # sessions restore the identity captured at the live boundary from
+            # PreviewCapabilityStore; legacy rows fail closed and ask once.
+            self._normalize_preview_write_event(ev)
             if isinstance(ev, UserMsg):
                 ev.prompt, restored_files = self._strip_attachment_paths(ev.prompt)
                 if restored_files and not ev.files:
@@ -9386,6 +9470,8 @@ class WrapperMachine:
         await self._discard_query_queue(ctx)
         self.sessions.pop(ctx.key, None)
         self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
+        if ctx.key:
+            self._drop_preview_session(ctx.engine, ctx.key)
         disconnected = False
         try:
             tasks = {
@@ -11310,7 +11396,7 @@ class WrapperMachine:
             return error
         try:
             diff = await self._git_diff(
-                ctx.cwd, cmd.file, self._preview_external_paths(ctx))
+                ctx.cwd, cmd.file, self._preview_capabilities(ctx))
             event = DiffReport(
                 file=cmd.file,
                 diff=diff,
@@ -11330,6 +11416,239 @@ class WrapperMachine:
             await self._emit(ctx, error)
             return error
 
+    def _prune_preview_challenges(self) -> None:
+        cutoff = time.monotonic() - self.PREVIEW_AUTHORIZATION_TTL
+        expired = [
+            authorization_id
+            for authorization_id, challenge
+            in self._preview_challenges.items()
+            if challenge.created_at < cutoff
+        ]
+        for authorization_id in expired:
+            self._preview_challenges.pop(authorization_id, None)
+        while len(self._preview_challenges) > self.PREVIEW_AUTHORIZATION_CAP:
+            self._preview_challenges.popitem(last=False)
+
+    def _drop_preview_session(self, engine: str, session_id: str) -> None:
+        self._preview_capability_store.remove_session(engine, session_id)
+        for authorization_id, challenge in tuple(
+                self._preview_challenges.items()):
+            if (
+                challenge.engine == engine
+                and challenge.session_key == session_id
+            ):
+                self._preview_challenges.pop(authorization_id, None)
+
+    def _rekey_preview_session(
+        self,
+        ctx: SessionContext,
+        old_key: str,
+        session_id: str,
+    ) -> None:
+        self._preview_capability_store.rekey(
+            ctx.engine,
+            ctx.space,
+            old_key,
+            session_id,
+            persist=not ctx.btw,
+        )
+        for authorization_id, challenge in tuple(
+                self._preview_challenges.items()):
+            if (
+                challenge.engine != ctx.engine
+                or challenge.space != ctx.space
+                or challenge.session_key != old_key
+            ):
+                continue
+            self._preview_challenges[authorization_id] = _PreviewChallenge(
+                authorization_id=challenge.authorization_id,
+                session_key=session_id,
+                engine=challenge.engine,
+                space=challenge.space,
+                client_id=challenge.client_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                resolved_path=challenge.resolved_path,
+                preview_id=challenge.preview_id,
+                created_at=challenge.created_at,
+            )
+
+    async def _require_preview_authorization(
+        self,
+        ctx: SessionContext,
+        cmd,
+        needed: _PreviewAuthorizationNeeded,
+        *,
+        operation: str,
+        preview_id: Optional[str] = None,
+    ):
+        client_id = getattr(cmd, "client_id", None)
+        if not client_id:
+            raise ValueError("外部文件预览需要已认证客户端确认")
+        self._prune_preview_challenges()
+        session_key = ctx.session_id or ctx.key
+        assert session_key
+        for challenge in reversed(self._preview_challenges.values()):
+            if (
+                challenge.session_key == session_key
+                and challenge.engine == ctx.engine
+                and challenge.space == ctx.space
+                and challenge.client_id == client_id
+                and challenge.request_id == cmd.request_id
+                and challenge.operation == operation
+                and challenge.path == needed.path
+                and challenge.resolved_path == needed.resolved_path
+                and challenge.preview_id == preview_id
+            ):
+                event = PreviewAuthorizationRequired(
+                    authorization_id=challenge.authorization_id,
+                    request_id=challenge.request_id,
+                    operation=operation,
+                    path=challenge.path,
+                    resolved_path=challenge.resolved_path,
+                    format=(
+                        "image" if operation == "preview_asset"
+                        else self._preview_format(challenge.resolved_path)
+                    ),
+                    preview_id=preview_id,
+                    to=client_id,
+                )
+                await self._emit(ctx, event)
+                return event
+
+        authorization_id = uuid4().hex
+        challenge = _PreviewChallenge(
+            authorization_id=authorization_id,
+            session_key=session_key,
+            engine=ctx.engine,
+            space=ctx.space,
+            client_id=client_id,
+            request_id=cmd.request_id,
+            operation=operation,
+            path=needed.path,
+            resolved_path=needed.resolved_path,
+            preview_id=preview_id,
+            created_at=time.monotonic(),
+        )
+        self._preview_challenges[authorization_id] = challenge
+        self._prune_preview_challenges()
+        event = PreviewAuthorizationRequired(
+            authorization_id=authorization_id,
+            request_id=cmd.request_id,
+            operation=operation,
+            path=needed.path,
+            resolved_path=needed.resolved_path,
+            format=(
+                "image" if operation == "preview_asset"
+                else self._preview_format(needed.resolved_path)
+            ),
+            preview_id=preview_id,
+            to=client_id,
+        )
+        await self._emit(ctx, event)
+        return event
+
+    async def _handle_authorize_preview(self, cmd):
+        client_id = getattr(cmd, "client_id", None)
+        sid = getattr(cmd, "sid", None)
+        self._prune_preview_challenges()
+        challenge = self._preview_challenges.get(cmd.authorization_id)
+        ctx = self._ctx_for(sid)
+        session_key = (ctx.session_id or ctx.key) if ctx is not None else sid
+
+        if (
+            challenge is None
+            or not client_id
+            or challenge.client_id != client_id
+            or challenge.request_id != cmd.request_id
+            or challenge.session_key != session_key
+            or challenge.engine != getattr(ctx, "engine", None)
+            or challenge.space != getattr(ctx, "space", None)
+            or ctx is None
+        ):
+            result = PreviewAuthorizationResult(
+                authorization_id=cmd.authorization_id,
+                request_id=cmd.request_id,
+                status="expired",
+                error="该预览确认已过期，请重新打开文件",
+                sid=sid,
+                to=client_id,
+            )
+            if ctx is not None:
+                await self._emit(ctx, result)
+            else:
+                await self.transport.send(result)
+            return result
+
+        if cmd.decision == "deny":
+            self._preview_challenges.pop(cmd.authorization_id, None)
+            result = PreviewAuthorizationResult(
+                authorization_id=challenge.authorization_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                preview_id=challenge.preview_id,
+                status="denied",
+                to=client_id,
+            )
+            await self._emit(ctx, result)
+            return result
+
+        current_resolved = os.path.realpath(
+            challenge.path if os.path.isabs(challenge.path)
+            else os.path.join(ctx.cwd, challenge.path))
+        if current_resolved != challenge.resolved_path:
+            self._preview_challenges.pop(cmd.authorization_id, None)
+            result = PreviewAuthorizationResult(
+                authorization_id=challenge.authorization_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                preview_id=challenge.preview_id,
+                status="changed",
+                error="文件路径已经变化，请重新确认",
+                to=client_id,
+            )
+            await self._emit(ctx, result)
+            return result
+
+        try:
+            self._preview_capability_store.grant_path(
+                challenge.engine,
+                challenge.space,
+                challenge.session_key,
+                challenge.resolved_path,
+                mode="read",
+                source="user_approved",
+                persist=not ctx.btw,
+            )
+        except PreviewCapabilityError as exc:
+            status = "changed" if "不存在" in str(exc) else "error"
+            result = PreviewAuthorizationResult(
+                authorization_id=challenge.authorization_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                preview_id=challenge.preview_id,
+                status=status,
+                error=str(exc),
+                to=client_id,
+            )
+        else:
+            result = PreviewAuthorizationResult(
+                authorization_id=challenge.authorization_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                preview_id=challenge.preview_id,
+                status="granted",
+                to=client_id,
+            )
+        self._preview_challenges.pop(cmd.authorization_id, None)
+        await self._emit(ctx, result)
+        return result
+
     async def _handle_get_file_preview(self, cmd):
         sid = getattr(cmd, "sid", None)
         client_id = getattr(cmd, "client_id", None)
@@ -11347,7 +11666,7 @@ class WrapperMachine:
 
         try:
             suffix = os.path.splitext(cmd.path)[1].lower()
-            external_paths = self._preview_external_paths(ctx)
+            external_paths = self._preview_capabilities(ctx)
             if suffix in self.OFFICE_PREVIEW_SUFFIXES:
                 async with self._preview_conversion_limit:
                     preview = await asyncio.to_thread(
@@ -11357,6 +11676,12 @@ class WrapperMachine:
                 preview = await asyncio.to_thread(
                     self._read_file_preview, ctx.cwd, cmd.path,
                     external_paths)
+            resolved_path = os.path.realpath(
+                cmd.path if os.path.isabs(cmd.path)
+                else os.path.join(ctx.cwd, cmd.path))
+            inside_root = self._path_is_below(
+                os.path.realpath(ctx.cwd), resolved_path)
+            external_capability = external_paths.get(resolved_path)
             response = FilePreview(
                 path=preview["path"],
                 request_id=cmd.request_id,
@@ -11370,8 +11695,27 @@ class WrapperMachine:
                 truncated=preview.get("truncated", False),
                 mtime_ns=str(preview["mtime_ns"]),
                 revision=preview.get("revision"),
+                writable=(
+                    inside_root
+                    or (
+                        external_capability is not None
+                        and external_capability.mode == "read_write"
+                    )
+                ),
                 to=client_id,
             )
+        except _PreviewCapabilityChanged as exc:
+            self._preview_capability_store.revoke(
+                ctx.engine,
+                ctx.space,
+                ctx.session_id or ctx.key,
+                exc.resolved_path,
+            )
+            return await self._require_preview_authorization(
+                ctx, cmd, exc, operation="file_preview")
+        except _PreviewAuthorizationNeeded as exc:
+            return await self._require_preview_authorization(
+                ctx, cmd, exc, operation="file_preview")
         except (UnicodeDecodeError, ValueError) as exc:
             response = FilePreview(
                 path=cmd.path,
@@ -11416,8 +11760,30 @@ class WrapperMachine:
                 cmd.expected_size,
                 int(cmd.expected_mtime_ns),
                 cmd.expected_revision,
-                self._preview_external_paths(ctx),
+                self._preview_capabilities(ctx, require_write=True),
             )
+            resolved = os.path.realpath(
+                cmd.path if os.path.isabs(cmd.path)
+                else os.path.join(ctx.cwd, cmd.path))
+            if not self._path_is_below(os.path.realpath(ctx.cwd), resolved):
+                try:
+                    self._preview_capability_store.grant_path(
+                        ctx.engine,
+                        ctx.space,
+                        ctx.session_id or ctx.key,
+                        resolved,
+                        mode="read_write",
+                        source="structured_write",
+                        persist=not ctx.btw,
+                    )
+                except PreviewCapabilityError:
+                    # The atomic save already succeeded. A capability refresh
+                    # failure must not turn that completed mutation into a fake
+                    # save error; the next preview will ask again.
+                    log.warning(
+                        "saved external preview capability could not be refreshed",
+                        session_id=ctx.session_id or ctx.key,
+                    )
             response = FileSaveResult(
                 path=path,
                 request_id=cmd.request_id,
@@ -11479,7 +11845,7 @@ class WrapperMachine:
             if snapshot is None:
                 _, media_type, data = await asyncio.to_thread(
                     self._read_preview_asset, ctx.cwd, cmd.path,
-                    self._preview_external_paths(ctx))
+                    self._preview_capabilities(ctx))
             else:
                 media_type, data = snapshot
             response = PreviewAsset(
@@ -11489,6 +11855,28 @@ class WrapperMachine:
                 media_type=media_type,
                 data=base64.b64encode(data).decode("ascii"),
                 to=client_id,
+            )
+        except _PreviewCapabilityChanged as exc:
+            self._preview_capability_store.revoke(
+                ctx.engine,
+                ctx.space,
+                ctx.session_id or ctx.key,
+                exc.resolved_path,
+            )
+            return await self._require_preview_authorization(
+                ctx,
+                cmd,
+                exc,
+                operation="preview_asset",
+                preview_id=cmd.preview_id,
+            )
+        except _PreviewAuthorizationNeeded as exc:
+            return await self._require_preview_authorization(
+                ctx,
+                cmd,
+                exc,
+                operation="preview_asset",
+                preview_id=cmd.preview_id,
             )
         except ValueError as exc:
             response = PreviewAsset(
@@ -11956,7 +12344,9 @@ class WrapperMachine:
         allowed_suffixes: Optional[frozenset[str]],
         max_bytes: int,
         allow_truncate: bool,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, bytes, os.stat_result, bool]:
         """Read a bounded regular file below cwd without following an escape.
 
@@ -11967,18 +12357,36 @@ class WrapperMachine:
         """
         if path.startswith("~"):
             raise ValueError("预览路径必须位于当前工作目录")
+        try:
+            path_bytes = len(path.encode("utf-8", "surrogatepass"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("预览路径无效") from exc
+        if (
+            not path
+            or "\x00" in path
+            or path_bytes > PREVIEW_PATH_MAX_BYTES
+        ):
+            raise ValueError("预览路径过长")
 
         root = os.path.realpath(cwd)
         candidate = os.path.realpath(
             path if os.path.isabs(path) else os.path.join(root, path))
+        if (
+            len(candidate.encode("utf-8", "surrogatepass"))
+            > PREVIEW_PATH_MAX_BYTES
+        ):
+            raise ValueError("预览路径过长")
         inside_root = WrapperMachine._path_is_below(root, candidate)
-        if not inside_root and candidate not in allowed_external_paths:
-            raise ValueError(
-                "预览路径超出当前工作目录，且不是本会话成功创建或编辑的文件")
 
         suffix = os.path.splitext(candidate)[1].lower()
         if allowed_suffixes is not None and suffix not in allowed_suffixes:
             raise ValueError("不支持预览该文件类型")
+        capability = (
+            (allowed_external_paths or {}).get(candidate)
+            if not inside_root else None
+        )
+        if not inside_root and capability is None:
+            raise _PreviewAuthorizationNeeded(path, candidate)
 
         access_root = root if inside_root else os.path.dirname(candidate)
         relative = (os.path.relpath(candidate, root)
@@ -12020,6 +12428,12 @@ class WrapperMachine:
             file_stat = os.fstat(fd)
             if not stat.S_ISREG(file_stat.st_mode):
                 raise ValueError("预览目标必须是普通文件")
+            if (
+                not inside_root
+                and capability is not None
+                and not capability.matches(file_stat)
+            ):
+                raise _PreviewCapabilityChanged(path, candidate)
             if not allow_truncate and file_stat.st_size > max_bytes:
                 raise ValueError(
                     f"预览文件超过 {max_bytes // (1024 * 1024)} MiB 限制")
@@ -12037,7 +12451,9 @@ class WrapperMachine:
     @classmethod
     def _read_text_preview(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, str, int, bool, int, str, Optional[str]]:
         relative, data, file_stat, truncated = cls._read_session_file(
             cwd,
@@ -12067,7 +12483,9 @@ class WrapperMachine:
     @classmethod
     def _read_file_preview(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> dict[str, object]:
         """Read or render one artifact entirely on the wrapper host.
 
@@ -12176,7 +12594,9 @@ class WrapperMachine:
     @classmethod
     def _convert_office_preview(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> dict[str, object]:
         suffix = os.path.splitext(path)[1].lower()
         relative, data, file_stat, _ = cls._read_session_file(
@@ -12285,7 +12705,9 @@ class WrapperMachine:
         expected_size: int,
         expected_mtime_ns: int,
         expected_revision: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, int, int, str]:
         """CAS-style atomic save for one existing Markdown regular file.
 
@@ -12307,14 +12729,16 @@ class WrapperMachine:
         if lexical_inside and not inside_root:
             raise ValueError("保存路径不能包含符号链接")
         if not inside_root:
-            if real_candidate not in allowed_external_paths:
+            capability = (allowed_external_paths or {}).get(real_candidate)
+            if capability is None or capability.mode != "read_write":
                 raise ValueError(
-                    "保存路径超出当前工作目录，且不是本会话成功创建或编辑的文件")
+                    "该外部文件仅获准查看，未获准编辑")
             candidate = real_candidate
             root = os.path.dirname(candidate)
             relative = os.path.basename(candidate)
             display_path = candidate
         else:
+            capability = None
             root = session_root
             relative = os.path.relpath(candidate, root)
             display_path = relative.replace(os.sep, "/")
@@ -12396,6 +12820,12 @@ class WrapperMachine:
                 dir_fd = next_fd
 
             original, original_stat, original_revision = read_current()
+            if (
+                capability is not None
+                and not capability.matches(
+                    original_stat, require_write=True)
+            ):
+                raise ValueError("外部文件已变化，需要重新授权后才能编辑")
             require_expected(original_stat, original_revision)
             if b"\0" in original:
                 raise ValueError("Markdown 文件不是有效的 UTF-8 文本")
@@ -12458,7 +12888,9 @@ class WrapperMachine:
     @classmethod
     def _read_markdown_preview(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, str, int, bool, int]:
         relative, data, file_stat, truncated = cls._read_session_file(
             cwd,
@@ -12497,7 +12929,9 @@ class WrapperMachine:
     @classmethod
     def _read_preview_asset(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, str, bytes]:
         suffix = os.path.splitext(path)[1].lower()
         media_type = cls.PREVIEW_ASSET_MEDIA_TYPES.get(suffix)
@@ -12517,14 +12951,16 @@ class WrapperMachine:
 
     async def _git_diff(
         self, cwd: str, file: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> str:
         max_bytes = max(64 * 1024, min(4 * 1024 * 1024,
                                        self.cfg.ws_max_size_bytes // 2))
         return await read_git_diff(
             cwd,
             file,
-            allowed_external_paths=allowed_external_paths,
+            allowed_external_paths=allowed_external_paths or {},
             max_bytes=max_bytes,
             source_max_bytes=getattr(
                 self.cfg, "history_source_max_bytes", 64 * 1024 * 1024),
@@ -13031,6 +13467,7 @@ class WrapperMachine:
                 self.sessions.pop(ctx.key, None)
                 self._purge_preview_image_snapshots(
                     ctx.preview_snapshot_token)
+                self._drop_preview_session(ctx.engine, ctx.key)
                 log.error("private btw persistence failed; terminating fork",
                           error_type=type(persist_error).__name__)
                 disconnected = False
@@ -13091,6 +13528,7 @@ class WrapperMachine:
                 rekey_goal(sid)
             save_session_id(self.cfg.state_dir, ctx.cwd, sid)
         if old_key and old_key != sid:
+            self._rekey_preview_session(ctx, old_key, sid)
             self._remember_session_alias(old_key, sid, ctx.cwd)
             self.sessions.pop(old_key, None)
             self.sessions[sid] = ctx
@@ -13524,6 +13962,7 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        self._drop_preview_session(engine, sid)
         if self._session_pins is not None:
             try:
                 await asyncio.to_thread(
@@ -13658,6 +14097,7 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        self._drop_preview_session(engine, sid)
         if engine == "codex" and checkpoint_cleanup_journal is not None:
             try:
                 await asyncio.to_thread(

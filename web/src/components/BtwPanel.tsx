@@ -11,7 +11,12 @@ import { CommandSheet } from "./CommandSheet";
 import { Icon } from "../icons";
 import { PanelTabs } from "./PanelTabs";
 import { NoticeStack } from "./NoticeStack";
-import type { Artifact, PendingQuery, SessionRuntime } from "../reducer";
+import type {
+  Artifact,
+  PendingQuery,
+  PreviewAuthorizationState,
+  SessionRuntime,
+} from "../reducer";
 import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
 import { ImeSubmitGuard } from "../ime-submit";
 import {
@@ -24,6 +29,7 @@ import {
 import { canEnqueueQuery, type QueueCapacity } from "../runtime-drain";
 import { effortsFor, modelsFor, type Catalog } from "../data";
 import { QueuedQueryChip } from "./QueuedQueryDialog";
+import type { InlineImageAsset } from "../inline-image-assets";
 
 interface Props {
   sid?: string;
@@ -53,6 +59,12 @@ interface Props {
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
   onOpenFile?: (path: string, line?: number) => void;
+  imageAssets?: Record<string, InlineImageAsset>;
+  onLoadImage?: (path: string, previewId?: string) => boolean;
+  onAuthorizeImage?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   onClose: () => void;
   onDismissNotice: (noticeId: string) => void;
 }
@@ -265,7 +277,10 @@ export function BtwPanel(p: Props) {
               </div>
             : <ChatView sid={p.sid ?? null} turns={turns}
                 onEdit={() => {}} onGetDiff={() => {}}
-                onOpenFile={p.onOpenFile} />}
+                onOpenFile={p.onOpenFile}
+                imageAssets={p.imageAssets}
+                onLoadImage={p.onLoadImage}
+                onAuthorizeImage={p.onAuthorizeImage} />}
       </div>
       <div className="btw-composer">
         {notice && <div className="btw-composer-notice">{notice}</div>}
