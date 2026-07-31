@@ -887,8 +887,8 @@ assert.match(historyAppSource, /replay_start[\s\S]*requestHistory/,
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
   "a replay gap must discard a possibly stale Work artifact inventory");
 assert.match(historyAppSource,
-  /displayHistoryProjection\(\s*state\.historyRecovery,\s*focusedSid,\s*rt,\s*state\.historyBrowse\s*\)/,
-  "ChatView must select recovery, browse, then live runtime without rebuilding rt.turns");
+  /displayHistoryProjection\(\s*state\.historyRecovery,\s*focusedSid,\s*rt,\s*state\.historyBrowse,\s*state\.retainedHistoryBrowse,\s*\)/,
+  "ChatView must select retained recovery, browse, then live runtime without rebuilding rt.turns");
 assert.match(historyAppSource,
   /new HistoryPageCache\(\)/,
   "deep-history pages must use their independent best-effort IndexedDB");
@@ -1274,6 +1274,372 @@ assert.deepEqual(
   ["client-alias"],
   "historyTurnId is an exact native/client identity even without timestamps",
 );
+
+const compactNativeTurnId = "native-compact-turn";
+const compactBoundaryMerged = mergeInitialHistory(
+  [{
+    id: "history-compact-user",
+    forkPointId: compactNativeTurnId,
+    prompt: "修复问题",
+    done: false,
+    blocks: [],
+  }],
+  [{
+    id: "browser-compact-turn",
+    prompt: "修复问题",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "live-context-compaction",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+);
+assert.deepEqual(
+  compactBoundaryMerged.map((turn) => turn.id),
+  ["browser-compact-turn"],
+  "a native compaction binding must reconcile the live row with History",
+);
+assert.equal(
+  compactBoundaryMerged[0].blocks.some((block) =>
+    block.kind === "process" && block.processKind === "compaction"),
+  true,
+  "reconciling a compact boundary must keep its process marker",
+);
+const rolloutCompactBoundaryMerged = mergeInitialHistory(
+  [{
+    id: "rollout-compact-user",
+    prompt: "修复问题",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "rollout-context-compaction",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+  [{
+    id: "browser-rollout-compact-user",
+    prompt: "修复问题",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "live-rollout-context-compaction",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+);
+assert.equal(rolloutCompactBoundaryMerged.length, 1,
+  "rollout and live compaction markers bind one visible user row");
+assert.equal(
+  rolloutCompactBoundaryMerged[0].blocks.filter((block) =>
+    block.kind === "process" && block.processKind === "compaction").length,
+  1,
+  "one compaction observed through rollout and live sources stays one process",
+);
+const compactDoesNotCrossSteer = mergeInitialHistory(
+  [{
+    id: "history-before-steer",
+    forkPointId: compactNativeTurnId,
+    prompt: "first direction",
+    done: true,
+    blocks: [],
+  }, {
+    id: "history-after-steer",
+    forkPointId: compactNativeTurnId,
+    prompt: "second direction",
+    done: false,
+    blocks: [],
+  }],
+  [{
+    id: "browser-after-steer",
+    prompt: "second direction",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "compact-after-steer",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+);
+assert.deepEqual(
+  compactDoesNotCrossSteer.map((turn) => [turn.id, turn.prompt]),
+  [
+    ["history-before-steer", "first direction"],
+    ["browser-after-steer", "second direction"],
+  ],
+  "a compact task alias must not merge a later steer into an older prompt",
+);
+const repeatedCompactSteer = mergeInitialHistory(
+  [{
+    id: "history-repeated-before-steer",
+    prompt: "继续",
+    done: true,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "history-repeated-old-compact",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }, {
+    id: "history-repeated-after-steer",
+    forkPointId: compactNativeTurnId,
+    prompt: "继续",
+    done: false,
+    blocks: [],
+  }],
+  [{
+    id: "browser-repeated-after-steer",
+    prompt: "继续",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "live-repeated-new-compact",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+  { preserveLiveTailOpen: true },
+);
+assert.deepEqual(
+  repeatedCompactSteer.map((turn) => ({
+    id: turn.id,
+    historyTurnId: turn.historyTurnId,
+    done: turn.done,
+  })),
+  [{
+    id: "history-repeated-before-steer",
+    historyTurnId: undefined,
+    done: true,
+  }, {
+    id: "browser-repeated-after-steer",
+    historyTurnId: "history-repeated-after-steer",
+    done: false,
+  }],
+  "a repeated steer prompt binds the newest compatible compact segment",
+);
+const repeatedCompactionEvents = mergeInitialHistory(
+  [{
+    id: "history-two-compactions",
+    prompt: "long task",
+    done: false,
+    blocks: [
+      {
+        kind: "process" as const,
+        item_id: "history-compact-one",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+      {
+        kind: "process" as const,
+        item_id: "history-compact-two",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+    ],
+  }],
+  [{
+    id: "browser-two-compactions",
+    prompt: "long task",
+    done: false,
+    blocks: [
+      {
+        kind: "process" as const,
+        item_id: "live-compact-one",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+      {
+        kind: "process" as const,
+        item_id: "live-compact-two",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+    ],
+  }],
+);
+assert.equal(
+  repeatedCompactionEvents[0].blocks.filter((block) =>
+    block.kind === "process" && block.processKind === "compaction").length,
+  2,
+  "two real compactions stay visible when both sources observed both events",
+);
+const liveHasNewerCompaction = mergeInitialHistory(
+  [{
+    id: "history-one-compaction",
+    prompt: "long task",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "history-known-compact",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+  [{
+    id: "browser-one-history-two-live-compactions",
+    prompt: "long task",
+    done: false,
+    blocks: [
+      {
+        kind: "process" as const,
+        item_id: "live-known-compact",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+      {
+        kind: "process" as const,
+        item_id: "live-newer-compact",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+    ],
+  }],
+);
+assert.deepEqual(
+  liveHasNewerCompaction[0].blocks.flatMap((block) =>
+    block.kind === "process" && block.processKind === "compaction"
+      ? [block.item_id] : []),
+  ["live-known-compact", "live-newer-compact"],
+  "a live-only newer compaction remains visible after the shared occurrence",
+);
+const historyHasOlderCompaction = mergeInitialHistory(
+  [{
+    id: "history-two-live-one-compactions",
+    prompt: "long task",
+    done: false,
+    blocks: [
+      {
+        kind: "process" as const,
+        item_id: "history-older-compact",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+      {
+        kind: "process" as const,
+        item_id: "history-shared-compact",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+    ],
+  }],
+  [{
+    id: "browser-two-history-one-live-compaction",
+    prompt: "long task",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "live-shared-compact",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+);
+assert.deepEqual(
+  historyHasOlderCompaction[0].blocks.flatMap((block) =>
+    block.kind === "process" && block.processKind === "compaction"
+      ? [block.item_id] : []),
+  ["history-older-compact", "live-shared-compact"],
+  "a live tail pairs with the latest history occurrence without hiding older compaction",
+);
+const sharedTaskSegments = mergeInitialHistory([], [{
+  id: "steer-segment-one",
+  prompt: "first",
+  done: true,
+  blocks: [{
+    kind: "process" as const,
+    item_id: "shared-task-process-one",
+    processKind: "command" as const,
+    phase: "end" as const,
+    status: "succeeded" as const,
+    turn_id: "shared-native-task",
+    title: "运行命令",
+    done: true,
+  }],
+}, {
+  id: "steer-segment-two",
+  prompt: "second",
+  done: false,
+  blocks: [{
+    kind: "process" as const,
+    item_id: "shared-task-process-two",
+    processKind: "command" as const,
+    phase: "start" as const,
+    status: "running" as const,
+    turn_id: "shared-native-task",
+    title: "运行命令",
+    done: false,
+  }],
+}]);
+assert.equal(sharedTaskSegments.length, 2,
+  "ordinary process task ids shared by steer segments are not turn aliases");
 
 const repeatedOld = {
   id: "old-engine", prompt: "继续", done: true, ts: 10_000,
@@ -2934,7 +3300,8 @@ try {
     forkPointId: undefined,
     liveTaskId: steeredNativeTurnId,
   }], "TurnSteered atomically closes the prior segment and opens the steered one");
-  assert.equal(firstSteeredTurns[0].durationMs, 0);
+  assert.equal(firstSteeredTurns[0].durationMs, undefined,
+    "a steer fence without one authoritative clock domain has unknown duration");
   assert.equal(firstSteeredTurns[0].doneTs, 11_000);
   assert.ok(firstSteeredTurns[0].blocks.every((block: Block) => block.done),
     "closing the old segment also settles every open block it owned");
@@ -5014,7 +5381,7 @@ try {
       has_more: true, events: [], turns: [
         {
           id: "first-prompt", prompt: "first", done: true,
-          doneTs: 2_000, durationMs: 0,
+          doneTs: 2_000,
           detailEventCount: 2, detailLoaded: false, blocks: [{
             kind: "text", message_id: "commentary-first",
             text: "first progress", done: true, channel: "commentary",
@@ -5044,12 +5411,82 @@ try {
     (turn: { prompt: string; done: boolean }) => [turn.prompt, turn.done]), [
       ["first", true], ["second", false],
     ]);
+  assert.equal(detailedSteerTurns[0].durationMs, undefined,
+    "a synthetic steered TurnEnd must not render a fake zero-second duration");
   assert.equal(detailedSteerTurns[0].blocks.some(
     (block: { done: boolean }) => !block.done), false);
   assert.equal(detailedSteerTurns[1].blocks.some(
     (block: { kind: string; text?: string }) =>
       block.kind === "text" && block.text === "second progress"), true);
   assert.equal(detailedSteerTurns[1].blocks.some(
+    (block: { kind: string; processKind?: string }) =>
+      block.kind === "process" && block.processKind === "compaction"), true);
+
+  // A compact marker can reach the live optimistic row before the next
+  // authoritative History head binds that row's native user-message id. The
+  // reducer must reconcile those two identities instead of painting the same
+  // question twice after automatic context compression.
+  const compactDuplicateSid = "compact-does-not-duplicate-question";
+  const compactDuplicateNativeTurn = "compact-native-turn";
+  const compactDuplicateLiveTurn = {
+    id: "compact-browser-message",
+    clientMsgId: "compact-browser-message",
+    prompt: "继续修复问题",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "compact-live-marker",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactDuplicateNativeTurn,
+      title: "压缩上下文",
+      done: true,
+    }],
+  };
+  let compactDuplicateState = {
+    ...initialState,
+    focusedSid: compactDuplicateSid,
+    runtimes: {
+      [compactDuplicateSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        turns: [compactDuplicateLiveTurn],
+      },
+    },
+  };
+  compactDuplicateState = reduce(compactDuplicateState, {
+    type: "event", event: event({
+      type: "history",
+      sid: compactDuplicateSid,
+      session_id: compactDuplicateSid,
+      revision: "compact-duplicate-revision",
+      generation: "compact-duplicate-generation",
+      build_seq: 1,
+      detail: "summary",
+      in_progress: true,
+      has_more: false,
+      events: [],
+      turns: [{
+        id: "compact-history-message",
+        forkPointId: compactDuplicateNativeTurn,
+        prompt: "继续修复问题",
+        done: false,
+        detailEventCount: 1,
+        detailLoaded: false,
+        blocks: [],
+      }],
+    }),
+  });
+  const compactDuplicateTurns =
+    compactDuplicateState.runtimes[compactDuplicateSid].turns;
+  assert.equal(compactDuplicateTurns.length, 1,
+    "automatic context compression must not add a duplicate user question");
+  assert.equal(compactDuplicateTurns[0].prompt, "继续修复问题");
+  assert.equal(compactDuplicateTurns[0].historyTurnId,
+    "compact-history-message",
+    "the merged row keeps the authoritative History lookup identity");
+  assert.equal(compactDuplicateTurns[0].blocks.some(
     (block: { kind: string; processKind?: string }) =>
       block.kind === "process" && block.processKind === "compaction"), true);
 
@@ -5281,6 +5718,116 @@ try {
   assert.equal(browseAfterDelta.historyBrowse?.turns,
     browseAfterLive.historyBrowse?.turns,
     "live narrative marks the browse stale without appending into its window");
+
+  const reconnectingBrowseSource = {
+    ...orderedHistory,
+    historyBrowse: {
+      ...orderedHistory.historyBrowse!,
+      hasOlder: true,
+      olderCursor: "still-has-older",
+    },
+  };
+  let reconnectingBrowse = reduce(reconnectingBrowseSource, {
+    type: "conn", connState: "reconnecting",
+  });
+  assert.equal(reconnectingBrowse.historyBrowse, null,
+    "disconnect revokes the active browse cursor immediately");
+  assert.deepEqual(
+    reconnectingBrowse.retainedHistoryBrowse?.turns.map(
+      (turn: Turn) => turn.id),
+    ["older-page", "new"],
+    "disconnect keeps the already-painted browse window read-only");
+  const reconnectingView = displayHistoryProjection(
+    reconnectingBrowse.historyRecovery,
+    orderedHistorySid,
+    reconnectingBrowse.runtimes[orderedHistorySid],
+    reconnectingBrowse.historyBrowse,
+    reconnectingBrowse.retainedHistoryBrowse,
+  );
+  assert.equal(reconnectingView.hasMore, true);
+  assert.equal(reconnectingView.pagingReady, false);
+  assert.equal(reconnectingView.recovering, true);
+  assert.equal(
+    reconnectingView.scopeKey,
+    orderedHistory.historyBrowse!.scopeKey,
+    "read-only reconnect paint must preserve the exact virtualizer scope",
+  );
+  const retainedBeforeDelayedPage =
+    reconnectingBrowse.retainedHistoryBrowse;
+  reconnectingBrowse = reduce(reconnectingBrowse, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    generation: orderedHistory.historyBrowse!.generation,
+    viewId: orderedHistory.historyBrowse!.viewId,
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    before: "still-has-older",
+    page: {
+      pageKey: "old-socket-page",
+      turns: [{
+        id: "must-not-install", prompt: "stale", blocks: [], done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "must-not-install",
+    },
+  });
+  assert.equal(
+    reconnectingBrowse.retainedHistoryBrowse,
+    retainedBeforeDelayedPage,
+    "a delayed old-socket page cannot mutate the retained display snapshot");
+
+  reconnectingBrowse = reduce(reconnectingBrowse, {
+    type: "conn", connState: "connected",
+  });
+  reconnectingBrowse = reduce(reconnectingBrowse, {
+    type: "event",
+    event: event({
+      type: "history", sid: orderedHistorySid,
+      session_id: orderedHistorySid,
+      revision: "ordered-rev-new", generation: "wrapper-one",
+      build_seq: 3, has_more: true, oldest_id: "new",
+      events: [event({
+        type: "user_msg", sid: orderedHistorySid,
+        msg_id: "new", prompt: "new",
+      })],
+    }),
+  });
+  assert.equal(reconnectingBrowse.retainedHistoryBrowse, null);
+  assert.deepEqual(
+    reconnectingBrowse.historyBrowse?.turns.map((turn: Turn) => turn.id),
+    ["older-page", "new"],
+    "same revision and wrapper generation reactivate the retained browse");
+  assert.equal(reconnectingBrowse.historyBrowse?.latestDirty, true,
+    "a newer head build marks the reactivated deep window stale");
+
+  let restartedBrowse = reduce(reconnectingBrowseSource, {
+    type: "conn", connState: "reconnecting",
+  });
+  restartedBrowse = reduce(restartedBrowse, {
+    type: "conn", connState: "connected",
+  });
+  restartedBrowse = reduce(restartedBrowse, {
+    type: "event",
+    event: event({
+      type: "history", sid: orderedHistorySid,
+      session_id: orderedHistorySid,
+      revision: "ordered-rev-after-restart", generation: "wrapper-two",
+      build_seq: 1, has_more: true, oldest_id: "restart-head",
+      events: [event({
+        type: "user_msg", sid: orderedHistorySid,
+        msg_id: "restart-head", prompt: "new generation",
+      })],
+    }),
+  });
+  assert.equal(restartedBrowse.retainedHistoryBrowse, null);
+  assert.equal(restartedBrowse.historyBrowse, null,
+    "a different generation atomically replaces rather than reuses old pages");
+  assert.deepEqual(
+    restartedBrowse.runtimes[orderedHistorySid].turns.map(
+      (turn: Turn) => turn.id),
+    ["restart-head"],
+  );
 
   const cacheRaceBrowse = {
     ...browseBeforeLive,
@@ -6040,6 +6587,8 @@ try {
         historyRevision: "boot-old:9",
         historyGeneration: "gap-generation-new",
         historyBuildSeq: 4,
+        hasMore: true,
+        oldestId: staleTurns[0].id,
         syncReady: true,
       },
     },
@@ -6066,7 +6615,15 @@ try {
   assert.equal(
     displayHistoryProjection(
       gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+      gapState.historyBrowse, gapState.retainedHistoryBrowse,
     ).hasMore,
+    true,
+    "known older history stays visible while its old cursor is read-only");
+  assert.equal(
+    displayHistoryProjection(
+      gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+      gapState.historyBrowse, gapState.retainedHistoryBrowse,
+    ).pagingReady,
     false,
     "a retained projection must never paginate with its old generation cursor");
   const queryDuringGapState = reduce(gapState, {
@@ -7278,6 +7835,21 @@ try {
   assert.match(boundedInitialMarkup, /prompt-29</);
   assert.match(boundedInitialMarkup, /virtual-thread-in/,
     "the first paint keeps only a small latest fallback before DOM measurement");
+  const recoveringHistoryMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "recovering-history",
+    turns: [{
+      id: "recovering-turn", prompt: "keep visible", done: true, blocks: [],
+    }],
+    hasMore: true,
+    historyPagingReady: false,
+    engine: "codex",
+    onEdit: () => {},
+    onGetDiff: () => {},
+  }));
+  assert.match(recoveringHistoryMarkup, /正在恢复历史…/,
+    "known older history keeps a truthful disabled affordance during reconnect");
+  assert.doesNotMatch(recoveringHistoryMarkup, /class="load-more-btn"/,
+    "a retained old-generation cursor must never stay clickable");
   const summaryMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "summary-session",
     turns: [{

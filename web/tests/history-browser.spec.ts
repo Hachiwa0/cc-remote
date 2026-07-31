@@ -361,6 +361,51 @@ test("Claude settings does not expose Codex usage activity", async ({ page }) =>
   await expect(page.getByRole("button", { name: /通知/ })).toBeVisible();
 });
 
+async function maxTurnOffsetShiftThroughAction(
+  page: import("@playwright/test").Page,
+  turnId: string,
+  actionTestId: string,
+  frameCount = 36,
+): Promise<{ maxShift: number; missing: boolean }> {
+  return page.evaluate(async ({ id, testId, frames }) => {
+    const viewport = document.querySelector<HTMLElement>(".thread");
+    const row = document.querySelector<HTMLElement>(
+      `[data-turn-id="${CSS.escape(id)}"]`,
+    );
+    const action = document.querySelector<HTMLElement>(
+      `[data-testid="${CSS.escape(testId)}"]`,
+    );
+    if (!viewport || !row || !action) {
+      throw new Error("frame sampling target is missing");
+    }
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const initial = row.getBoundingClientRect().top - viewportTop;
+    let maxShift = 0;
+    let missing = false;
+    action.click();
+    await new Promise<void>((resolve) => {
+      let remaining = frames;
+      const sample = () => {
+        const current = document.querySelector<HTMLElement>(
+          `[data-turn-id="${CSS.escape(id)}"]`,
+        );
+        if (!current) {
+          missing = true;
+        } else {
+          const offset = current.getBoundingClientRect().top
+            - viewport.getBoundingClientRect().top;
+          maxShift = Math.max(maxShift, Math.abs(offset - initial));
+        }
+        remaining -= 1;
+        if (remaining <= 0) resolve();
+        else requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+    return { maxShift, missing };
+  }, { id: turnId, testId: actionTestId, frames: frameCount });
+}
+
 async function processDetailEdge(
   page: import("@playwright/test").Page,
   edge: "start" | "end",
@@ -1790,12 +1835,17 @@ test("user movement after prepend stays stable through delayed growth", async ({
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(initial.id);
   await wheelUntilTurn(page, "o2", 300, testInfo.project.name);
   await waitForScrollIdle(page);
-  await page.waitForTimeout(300);
   const before = await readingAnchor(page);
-  await page.getByTestId("grow-row").click();
+  const sampled = await maxTurnOffsetShiftThroughAction(
+    page,
+    before.id,
+    "grow-row",
+  );
   await expect(page.locator('[data-turn-id="n8"] p')).toHaveCount(28);
   await waitForScrollIdle(page);
   const after = await readingAnchor(page);
+  expect(sampled.missing).toBe(false);
+  expect(sampled.maxShift).toBeLessThan(2);
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 });
@@ -2230,6 +2280,10 @@ test("returning to a background-grown live turn settles at its current tail", as
 
   await page.getByTestId("switch-session").click();
   await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
+  // Visibility can precede ChatView's next-frame session-entry tail settle on
+  // a loaded WebKit worker. Measure the background update only after that
+  // intentional scope transition has finished.
+  await waitForScrollIdle(page);
   const before = await readingAnchor(page);
   await page.getByTestId("grow-background-stream").click();
   await page.waitForTimeout(200);

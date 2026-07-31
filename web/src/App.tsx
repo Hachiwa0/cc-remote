@@ -543,7 +543,12 @@ export default function App() {
   );
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const historyView = displayHistoryProjection(
-    state.historyRecovery, focusedSid, rt, state.historyBrowse);
+    state.historyRecovery,
+    focusedSid,
+    rt,
+    state.historyBrowse,
+    state.retainedHistoryBrowse,
+  );
   const focusedSession = state.sessions.find(
     (session) => session.session_id === focusedSid);
   const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
@@ -3637,15 +3642,11 @@ export default function App() {
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={historyView.hasMore}
+              historyPagingReady={historyView.pagingReady}
               historyRevision={rt.historyRevision}
               historyViewRevision={historyView.viewRevision}
               historyViewId={historyView.viewId}
-              historyScopeKey={
-                historyView.browsing
-                  && state.historyBrowse?.sid === focusedSid
-                  ? state.historyBrowse.scopeKey
-                  : activeScopeKey
-              }
+              historyScopeKey={historyView.scopeKey ?? activeScopeKey}
               historyWindowEpoch={historyView.windowEpoch}
               historyCursor={historyView.oldestId}
               browseMode={historyView.browsing}

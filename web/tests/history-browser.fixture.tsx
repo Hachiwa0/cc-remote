@@ -589,6 +589,7 @@ function ReducerHistoryBrowserFixture() {
     sid,
     runtime,
     state.historyBrowse,
+    state.retainedHistoryBrowse,
   );
 
   const loadOlder = useCallback((): boolean | {

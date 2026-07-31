@@ -301,6 +301,9 @@ export interface AppState {
   // Live turns, control, queue draining and query acceptance remain owned by
   // the per-session runtime even while this older window is visible.
   historyBrowse: HistoryBrowseProjection | null;
+  // A disconnected/rebuilding browse window remains paintable but owns no
+  // request authority. Only a matching authoritative head may reactivate it.
+  retainedHistoryBrowse: HistoryBrowseProjection | null;
   // /btw ephemeral side-forks are owned by their parent sessions. Their
   // runtimes live under each binding's `sid`; navigation only changes which
   // binding is visible and never reassigns a fork to another parent.
@@ -426,6 +429,7 @@ export const initialState: AppState = {
   queryQueueBytes: 0,
   historyRecovery: null,
   historyBrowse: null,
+  retainedHistoryBrowse: null,
   btwByParentSid: {},
   catalog: {},
   catalogDefault: {},
@@ -835,7 +839,12 @@ function finishTurnAtSteerFence(
 ): void {
   if (turn.done) return;
   turn.done = true;
-  turn.durationMs = 0;
+  // A steer fence is a narrative boundary, not an engine terminal carrying a
+  // measured duration. The optimistic start may use the browser clock while
+  // doneTs comes from the wrapper, so manufacturing 0 (or subtracting the two)
+  // produces a false "已处理 0s". Keep the duration unknown until an
+  // authoritative terminal supplies one.
+  turn.durationMs = undefined;
   turn.doneTs = doneTs;
   turn.progress = undefined;
   if (turn.forkPointId === nativeTurnId) {
@@ -945,6 +954,7 @@ function decodeTurnDetailEvents(
     ...state,
     banner: undefined,
     historyBrowse: null,
+    retainedHistoryBrowse: null,
     runtimes: { [sid]: createRuntime() },
   };
   for (const event of events) {
@@ -1158,6 +1168,7 @@ export function reduce(state: AppState, action: Action): AppState {
         sessions: [], runtimes: {}, artifact: null, dirPicker: null,
         newChat: null, btwByParentSid: {}, catalog: {}, catalogDefault: {},
         catalogDefaultEffort: {}, catalogDefaultCwd: {},
+        retainedHistoryBrowse: null,
       };
     case "conn": {
       let banner = state.banner;
@@ -1185,6 +1196,9 @@ export function reduce(state: AppState, action: Action): AppState {
         // newest page after reconnect instead of accepting a delayed old page.
         historyBrowse: action.connState === "connected"
           ? state.historyBrowse : null,
+        retainedHistoryBrowse: action.connState === "connected"
+          ? state.retainedHistoryBrowse
+          : state.historyBrowse ?? state.retainedHistoryBrowse,
         banner,
       };
     }
@@ -1237,9 +1251,17 @@ export function reduce(state: AppState, action: Action): AppState {
       const sessions = bumpSessionActivity(state.sessions, action.sid, action.ts);
       const historyBrowse = state.historyBrowse?.sid === action.sid
         ? null : state.historyBrowse;
+      const retainedHistoryBrowse =
+        state.retainedHistoryBrowse?.sid === action.sid
+          ? null : state.retainedHistoryBrowse;
       if (runtimes === state.runtimes && sessions === state.sessions
-          && historyBrowse === state.historyBrowse) return state;
-      return { ...state, runtimes, sessions, historyBrowse };
+          && historyBrowse === state.historyBrowse
+          && retainedHistoryBrowse === state.retainedHistoryBrowse) {
+        return state;
+      }
+      return {
+        ...state, runtimes, sessions, historyBrowse, retainedHistoryBrowse,
+      };
     }
     case "enqueue": {
       const targetSid = action.sid ?? state.focusedSid;
@@ -1255,8 +1277,16 @@ export function reduce(state: AppState, action: Action): AppState {
       const next = patch(state, targetSid, (rt) => {
         rt.queue = [...rt.queue, optimistic];
       });
-      return targetSid && next.historyBrowse?.sid === targetSid
-        ? { ...next, historyBrowse: null }
+      if (!targetSid) return next;
+      const closesBrowse = next.historyBrowse?.sid === targetSid;
+      const dropsRetained = next.retainedHistoryBrowse?.sid === targetSid;
+      return closesBrowse || dropsRetained
+        ? {
+            ...next,
+            historyBrowse: closesBrowse ? null : next.historyBrowse,
+            retainedHistoryBrowse: dropsRetained
+              ? null : next.retainedHistoryBrowse,
+          }
         : next;
     }
     case "dequeue_at": {
@@ -1291,8 +1321,16 @@ export function reduce(state: AppState, action: Action): AppState {
       };
       const next = patch(
         state, targetSid, (rt) => { rt.pendingSend = optimistic; });
-      return targetSid && next.historyBrowse?.sid === targetSid
-        ? { ...next, historyBrowse: null }
+      if (!targetSid) return next;
+      const closesBrowse = next.historyBrowse?.sid === targetSid;
+      const dropsRetained = next.retainedHistoryBrowse?.sid === targetSid;
+      return closesBrowse || dropsRetained
+        ? {
+            ...next,
+            historyBrowse: closesBrowse ? null : next.historyBrowse,
+            retainedHistoryBrowse: dropsRetained
+              ? null : next.retainedHistoryBrowse,
+          }
         : next;
     }
     case "clear_pending": {
@@ -1396,7 +1434,7 @@ export function reduce(state: AppState, action: Action): AppState {
     case "clear_session_list":
       return {
         ...state, sessions: [], focusedSid: null, historyRecovery: null,
-        historyBrowse: null,
+        historyBrowse: null, retainedHistoryBrowse: null,
       };
     case "restore_session_list":
       // Surface switches are view changes. Paint that surface's last accepted
@@ -1406,6 +1444,7 @@ export function reduce(state: AppState, action: Action): AppState {
       return {
         ...state, sessions: action.sessions, focusedSid: null,
         historyRecovery: null, historyBrowse: null,
+        retainedHistoryBrowse: null,
       };
     case "set_session_pinned": {
       const sessions = setSessionPinned(state.sessions, action.sid, action.pinned);
@@ -1427,6 +1466,8 @@ export function reduce(state: AppState, action: Action): AppState {
         // Switching away and back always opens the authoritative latest
         // runtime. A delayed page from the previous viewId is then harmless.
         historyBrowse: null,
+        retainedHistoryBrowse: state.retainedHistoryBrowse?.sid === sid
+          ? state.retainedHistoryBrowse : null,
       };
     }
     case "turn_detail_requested":
@@ -1471,7 +1512,13 @@ export function reduce(state: AppState, action: Action): AppState {
         hasOlder: !!runtime.hasMore,
         olderCursor: runtime.oldestId,
       });
-      return { ...state, historyBrowse: mutation.projection };
+      return {
+        ...state,
+        historyBrowse: mutation.projection,
+        retainedHistoryBrowse:
+          state.retainedHistoryBrowse?.sid === action.sid
+            ? null : state.retainedHistoryBrowse,
+      };
     }
     case "install_history_browse_page": {
       const browse = state.historyBrowse;
@@ -1696,7 +1743,15 @@ export function reduce(state: AppState, action: Action): AppState {
     }
     case "return_to_latest":
       return state.historyBrowse?.sid === action.sid
-        ? { ...state, historyBrowse: null }
+          || state.retainedHistoryBrowse?.sid === action.sid
+        ? {
+            ...state,
+            historyBrowse: state.historyBrowse?.sid === action.sid
+              ? null : state.historyBrowse,
+            retainedHistoryBrowse:
+              state.retainedHistoryBrowse?.sid === action.sid
+                ? null : state.retainedHistoryBrowse,
+          }
         : state;
     case "hydrate_cache":
       // fill a session's turns from the IndexedDB cache for an INSTANT render;
@@ -1765,6 +1820,7 @@ export function reduce(state: AppState, action: Action): AppState {
         ...state,
         historyRecovery: null,
         historyBrowse: null,
+        retainedHistoryBrowse: null,
         newChat: {
           cwd: action.cwd,
           cwdSource: action.cwdSource ?? "default",
@@ -1886,6 +1942,8 @@ function reduceEvent(
           ? state.historyRecovery : null,
         historyBrowse: state.focusedSid === newF
           ? state.historyBrowse : null,
+        retainedHistoryBrowse: state.retainedHistoryBrowse?.sid === newF
+          ? state.retainedHistoryBrowse : null,
         artifact: state.focusedSid && state.focusedSid !== newF ? null : state.artifact,
         cwdByScope,
       };
@@ -2057,9 +2115,13 @@ function reduceEvent(
       // cache under the wrong durable identity.
       const historyBrowse = state.historyBrowse?.sid === old_key
         ? null : state.historyBrowse;
+      const retainedHistoryBrowse =
+        state.retainedHistoryBrowse?.sid === old_key
+          ? null : state.retainedHistoryBrowse;
       return {
         ...state,
         runtimes, sessions, historyRecovery, historyBrowse,
+        retainedHistoryBrowse,
         focusedSid: wasFocused ? session_id : state.focusedSid,
         btwByParentSid,
         cwdByScope,
@@ -2107,6 +2169,8 @@ function reduceEvent(
         focusedSid: focusedMissing ? null : state.focusedSid,
         historyRecovery: focusedMissing ? null : state.historyRecovery,
         historyBrowse: focusedMissing ? null : state.historyBrowse,
+        retainedHistoryBrowse: focusedMissing
+          ? null : state.retainedHistoryBrowse,
         newChat: focusedMissing
           ? {
             cwd: (ownership
@@ -2163,8 +2227,16 @@ function reduceEvent(
       if (next.historyRecovery?.sid === e.session_id) {
         next = { ...next, historyRecovery: null };
       }
-      if (next.historyBrowse?.sid === e.session_id) {
-        next = { ...next, historyBrowse: null };
+      if (next.historyBrowse?.sid === e.session_id
+          || next.retainedHistoryBrowse?.sid === e.session_id) {
+        next = {
+          ...next,
+          historyBrowse: next.historyBrowse?.sid === e.session_id
+            ? null : next.historyBrowse,
+          retainedHistoryBrowse:
+            next.retainedHistoryBrowse?.sid === e.session_id
+              ? null : next.retainedHistoryBrowse,
+        };
       }
       return next.artifact?.sid === e.session_id
         ? { ...next, artifact: null }
@@ -2549,6 +2621,7 @@ function reduceEvent(
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
       let historyBrowse = state.historyBrowse;
+      let retainedHistoryBrowse = state.retainedHistoryBrowse;
       if (historyBrowse?.sid === sid) {
         if (historyBrowse.revision !== e.revision
             || (e.generation != null
@@ -2559,6 +2632,24 @@ function reduceEvent(
             || (e.build_seq ?? 0) > base.historyBuildSeq) {
           historyBrowse = markBrowseLatestDirty(historyBrowse);
         }
+      }
+      if (retainedHistoryBrowse?.sid === sid) {
+        const responseGeneration = e.generation ?? base.historyGeneration;
+        const retainedMatches =
+          retainedHistoryBrowse.revision === e.revision
+          && retainedHistoryBrowse.generation === responseGeneration;
+        if (retainedMatches && state.focusedSid === sid) {
+          historyBrowse = retainedHistoryBrowse;
+          if ((e.newest_id != null
+              && e.newest_id !== base.historyNewestId)
+              || (e.build_seq ?? 0) > base.historyBuildSeq) {
+            historyBrowse = markBrowseLatestDirty(historyBrowse);
+          }
+        }
+        // Either the exact authority was restored above or this first page
+        // proved the retained revision/generation obsolete. In both cases the
+        // read-only snapshot has reached its atomic terminal boundary.
+        retainedHistoryBrowse = null;
       }
       return {
         ...state,
@@ -2649,6 +2740,7 @@ function reduceEvent(
         },
         historyRecovery: advanceHistoryRecovery(state.historyRecovery, e),
         historyBrowse,
+        retainedHistoryBrowse,
       };
     }
     case "turn_detail": {
@@ -2784,6 +2876,9 @@ function reduceEvent(
           }])),
         wrapperOnline: false,
         banner: "machine offline — waiting for reconnect",
+        historyBrowse: null,
+        retainedHistoryBrowse:
+          state.historyBrowse ?? state.retainedHistoryBrowse,
       };
     case "wrapper_reconnected":
       // The event only proves a process connected to the relay. Wait for this
@@ -3128,6 +3223,10 @@ function reduceEvent(
         historyBrowse: needsAuthoritativeHistory
             && next.historyBrowse?.sid === e.sid
           ? null : next.historyBrowse,
+        retainedHistoryBrowse: needsAuthoritativeHistory
+            && next.historyBrowse?.sid === e.sid
+          ? next.historyBrowse
+          : next.retainedHistoryBrowse,
         artifact: needsAuthoritativeHistory && next.artifact?.sid === e.sid
           ? null : next.artifact,
       };
@@ -3154,6 +3253,9 @@ function reduceEvent(
             }])),
           wrapperOnline: false,
           banner: "设备离线，正在等待重新连接…",
+          historyBrowse: null,
+          retainedHistoryBrowse:
+            state.historyBrowse ?? state.retainedHistoryBrowse,
         };
       }
       if (e.request_id && e.sid) {
@@ -3734,7 +3836,10 @@ function reduceEvent(
             clearAcceptance(rt);
           }
           t.done = true;
-          t.durationMs = e.result.duration_ms;
+          t.durationMs = e.result.subtype === "steered"
+              && e.result.duration_ms === 0
+            ? undefined
+            : e.result.duration_ms;
           if (e.turn_id) {
             t.forkPointId = e.turn_id;
             t.liveTaskId = undefined;

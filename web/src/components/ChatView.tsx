@@ -197,6 +197,7 @@ function detailTurnFingerprint(turn: Turn): string {
 }
 
 export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
+  historyPagingReady = true,
   historyRevision = null, historyViewRevision = historyRevision,
   historyViewId = null, historyScopeKey = null,
   historyWindowEpoch = 0, historyCursor = null,
@@ -213,6 +214,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   engine?: "claude" | "codex";
   loading?: boolean;
   hasMore?: boolean;
+  historyPagingReady?: boolean;
   historyRevision?: string | null;
   // A non-destructive replay recovery keeps the prior view scope across the
   // atomic History swap so the virtualizer preserves the current reading row.
@@ -324,16 +326,8 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
   );
   turnKeySnapshotRef.current = turnKeySnapshot;
   const [activeHistoryGeneration, setActiveHistoryGeneration] = useState<number | null>(null);
-  const measurementBoundaryRef =
-    useRef<RetainedMeasurementBoundary | null>(null);
-  const [measurementBoundary, setMeasurementBoundaryState] =
+  const [measurementBoundary, setMeasurementBoundary] =
     useState<RetainedMeasurementBoundary | null>(null);
-  const setMeasurementBoundary = (
-    boundary: RetainedMeasurementBoundary | null,
-  ) => {
-    measurementBoundaryRef.current = boundary;
-    setMeasurementBoundaryState(boundary);
-  };
   const [processDisclosureOpen, setProcessDisclosureOpen] = useState<
     Record<string, boolean>
   >({});
@@ -345,15 +339,19 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       return next;
     });
   }, []);
-  const canLoadOlder = !!hasMore;
+  const showOlderHistory = !!hasMore;
+  const canLoadOlder = showOlderHistory && historyPagingReady;
   const canLoadNewer = browseMode && !!hasNewer;
   const historyInsetRef = useRef({
     scope: scrollScope,
-    enabled: canLoadOlder,
+    enabled: showOlderHistory,
   });
   if (historyInsetRef.current.scope !== scrollScope) {
-    historyInsetRef.current = { scope: scrollScope, enabled: canLoadOlder };
-  } else if (canLoadOlder) {
+    historyInsetRef.current = {
+      scope: scrollScope,
+      enabled: showOlderHistory,
+    };
+  } else if (showOlderHistory) {
     historyInsetRef.current.enabled = true;
   }
   const historyTopInset = historyInsetRef.current.enabled
@@ -878,6 +876,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
 
   const scheduleHistoryAnchorRelease = useCallback((generation: number) => {
     if (touchYRef.current !== null
+        || wheelGestureActiveRef.current
         || scrollCoordinatorRef.current.isInteractionLocked()) return;
     if (historyReleaseFrameRef.current !== null) {
       window.cancelAnimationFrame(historyReleaseFrameRef.current);
@@ -896,6 +895,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         return;
       }
       if (touchYRef.current !== null
+          || wheelGestureActiveRef.current
           || scrollCoordinatorRef.current.isInteractionLocked()) {
         // Waiting for a real pointer gesture is not failed settlement time.
         // Its release path will schedule a fresh bounded correction.
@@ -993,7 +993,6 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       historyRequestTimeoutRef.current = null;
       historyRequestRef.current = null;
       if (timeoutGeneration != null) cancelHistoryAnchor(timeoutGeneration);
-      setMeasurementBoundary(null);
       completeHistoryLoadGates();
     }, HISTORY_PAGE_REQUEST_TIMEOUT_MS);
     historyRequestTimeoutRef.current = {
@@ -1144,6 +1143,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
         || boundary.revision !== historyRevision
         || boundary.viewId !== resolvedHistoryViewId
         || touchYRef.current !== null
+        || wheelGestureActiveRef.current
         || (userScrollIntentRef.current && !keyedPrependResponseReady
           && !retainedSelectionBoundary)
         || scrollCoordinatorRef.current.isInteractionLocked()) return;
@@ -1248,39 +1248,53 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
 
   useEffect(() => setZoom(null), [sid]);
 
+  const settleUserScrollIntent = () => {
+    if (userScrollIntentTimerRef.current !== null) {
+      window.clearTimeout(userScrollIntentTimerRef.current);
+      userScrollIntentTimerRef.current = null;
+    }
+    userScrollIntentRef.current = false;
+    userScrollDirectionRef.current = null;
+    // A page transaction owns an older exact row until its keyed correction
+    // settles. Capturing the temporarily shifted DOM here would replace that
+    // authority with the very jump we are trying to undo. Explicit movement
+    // after attachment rebases the transaction in onScroll instead.
+    if (historyAnchorRef.current.current()) return;
+    const controller = controllerRef.current;
+    const point = captureHistoryBoundary();
+    const request = historyRequestRef.current;
+    if (point && (!controller?.isFollowing()
+        || (request?.sid === sid
+          && request.revision === historyRevision
+          && request.viewId === resolvedHistoryViewId))) {
+      setMeasurementBoundary({
+        sid,
+        revision: historyRevision,
+        viewId: resolvedHistoryViewId,
+        turnId: point.anchorTurnId,
+        anchorOffset: point.anchorOffset,
+      });
+    }
+  };
+
   const markUserScrollIntent = (direction: UserScrollDirection) => {
     // A real wheel/touch/key/pointer action transfers ownership back to the
     // reader. Late detail responses and ResizeObserver callbacks must not pull
-    // the viewport back to the edge captured before that gesture.
+    // the viewport back to the edge captured before that gesture. Keep the
+    // prior measurement boundary until the first real scroll replaces it:
+    // clearing it here leaves a gap in which a delayed row measurement can
+    // move a viewport that the reader has already stopped.
     releaseTextSelectionViewportAnchor();
     cancelDetailAnchorFnRef.current?.();
-    setMeasurementBoundary(null);
     userScrollIntentRef.current = true;
     userScrollDirectionRef.current = direction;
     if (userScrollIntentTimerRef.current !== null) {
       window.clearTimeout(userScrollIntentTimerRef.current);
     }
-    userScrollIntentTimerRef.current = window.setTimeout(() => {
-      userScrollIntentTimerRef.current = null;
-      userScrollIntentRef.current = false;
-      userScrollDirectionRef.current = null;
-      const controller = controllerRef.current;
-      const point = captureHistoryBoundary();
-      const request = historyRequestRef.current;
-      if (!measurementBoundaryRef.current
-          && point && (!controller?.isFollowing()
-          || (request?.sid === sid
-            && request.revision === historyRevision
-            && request.viewId === resolvedHistoryViewId))) {
-        setMeasurementBoundary({
-          sid,
-          revision: historyRevision,
-          viewId: resolvedHistoryViewId,
-          turnId: point.anchorTurnId,
-          anchorOffset: point.anchorOffset,
-        });
-      }
-    }, USER_SCROLL_INTENT_IDLE_MS);
+    userScrollIntentTimerRef.current = window.setTimeout(
+      settleUserScrollIntent,
+      USER_SCROLL_INTENT_IDLE_MS,
+    );
   };
 
   const onThreadPointerDown = (event: PointerEvent<HTMLDivElement>) => {
@@ -1339,24 +1353,28 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
           || intendedDirection === movementDirection)
         && (!keyedPrependResponseReady || explicitAppliedMovement))
     );
+    const userBoundary = userDrivenScroll ? captureHistoryBoundary() : null;
+    if (userBoundary && !textSelectionDragging) {
+      // Publish the DOM position reached by this native scroll before any
+      // asynchronous measurement or page response can commit. The idle timer
+      // refreshes it once more at the final resting position.
+      setMeasurementBoundary({
+        sid,
+        revision: historyRevision,
+        viewId: resolvedHistoryViewId,
+        turnId: userBoundary.anchorTurnId,
+        anchorOffset: userBoundary.anchorOffset,
+      });
+    }
     if (userDrivenScroll && intendedDirection) {
       markUserScrollIntent(intendedDirection);
     }
     if (userDrivenScroll && currentHistoryAnchor) {
       if (currentHistoryAnchor.phase === "applied") {
-        const point = captureHistoryBoundary();
-        if (point && historyAnchorRef.current.rebase(
+        if (userBoundary) historyAnchorRef.current.rebase(
           currentHistoryAnchor.generation,
-          point,
-        )) {
-          setMeasurementBoundary({
-            sid,
-            revision: historyRevision,
-            viewId: resolvedHistoryViewId,
-            turnId: point.anchorTurnId,
-            anchorOffset: point.anchorOffset,
-          });
-        }
+          userBoundary,
+        );
       } else {
         const stillAtRequestedEdge = currentHistoryAnchor.direction === "newer"
           ? isAtLatestEdge(metrics) : isAtHistoryEdge(metrics);
@@ -1365,21 +1383,6 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
           setActiveHistoryGeneration(null);
           completeHistoryLoadGates();
         }
-      }
-    }
-    const request = historyRequestRef.current;
-    if (userDrivenScroll && request?.sid === sid
-        && request.revision === historyRevision
-        && request.viewId === resolvedHistoryViewId) {
-      const point = captureHistoryBoundary();
-      if (point) {
-        setMeasurementBoundary({
-          sid,
-          revision: historyRevision,
-          viewId: resolvedHistoryViewId,
-          turnId: point.anchorTurnId,
-          anchorOffset: point.anchorOffset,
-        });
       }
     }
     lastScrollTopRef.current = metrics.scrollTop;
@@ -1415,9 +1418,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
     const anchor = historyAnchorRef.current.current();
     if (anchor?.direction && anchor.direction !== direction
         && (anchor.phase === "pending" || anchor.phase === "rendering")) {
-      if (cancelHistoryAnchor(anchor.generation)) {
-        setMeasurementBoundary(null);
-      }
+      cancelHistoryAnchor(anchor.generation);
       completeHistoryLoadGates();
     }
     if (event.deltaY < 0 || browseMode) {
@@ -1434,6 +1435,14 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       wheelGestureTimerRef.current = null;
       wheelGestureActiveRef.current = false;
       wheelHistoryLoadGateRef.current.endGesture();
+      // Wheel-idle is a stronger terminal signal than the generic intent
+      // debounce. Publish the final resting row now so late measurements do
+      // not fall into the remaining debounce window.
+      settleUserScrollIntent();
+      const current = historyAnchorRef.current.current();
+      if (current?.phase === "applied") {
+        scheduleHistoryAnchorRelease(current.generation);
+      }
     }, WHEEL_GESTURE_IDLE_MS);
     const el = scrollRef.current;
     if (el) {
@@ -1477,9 +1486,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       const anchor = historyAnchorRef.current.current();
       if (anchor?.direction === "newer"
           && (anchor.phase === "pending" || anchor.phase === "rendering")) {
-        if (cancelHistoryAnchor(anchor.generation)) {
-          setMeasurementBoundary(null);
-        }
+        cancelHistoryAnchor(anchor.generation);
         completeHistoryLoadGates();
       }
       const el = scrollRef.current;
@@ -1498,9 +1505,7 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
       }
       if (anchor?.direction !== "newer"
           && (anchor?.phase === "pending" || anchor?.phase === "rendering")) {
-        if (cancelHistoryAnchor(anchor.generation)) {
-          setMeasurementBoundary(null);
-        }
+        cancelHistoryAnchor(anchor.generation);
         completeHistoryLoadGates();
       }
       const el = scrollRef.current;
@@ -1923,11 +1928,19 @@ export function ChatView({ sid, turns, engine = "claude", loading, hasMore,
           height: `${virtualizer.getTotalSize()}px`,
           position: "relative",
         }}>
-          {canLoadOlder && (
+          {showOlderHistory && (
             <div className="load-more-wrap virtual-history-loader">
-              <button className="load-more-btn" onClick={doLoadMore}>
-                加载更早的历史
-              </button>
+              {historyPagingReady
+                ? (
+                    <button className="load-more-btn" onClick={doLoadMore}>
+                      加载更早的历史
+                    </button>
+                  )
+                : (
+                    <span className="load-more-status" role="status">
+                      正在恢复历史…
+                    </span>
+                  )}
             </div>
           )}
           {canLoadNewer && (

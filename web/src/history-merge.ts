@@ -50,18 +50,83 @@ function textAffinity(first: string, second: string): number {
   return 0;
 }
 
+function processBlockMatches(
+  history: Block[],
+  live: Block[],
+): Map<number, number> {
+  const matches = new Map<number, number>();
+  const usedHistory = new Set<number>();
+  const historyProcessIndexes = history.flatMap((block, index) =>
+    block.kind === "process" ? [index] : []);
+  const liveProcessIndexes = live.flatMap((block, index) =>
+    block.kind === "process" ? [index] : []);
+
+  // Native item ids are authoritative regardless of process kind.
+  for (const liveIndex of liveProcessIndexes) {
+    const liveBlock = live[liveIndex] as ProcessBlock;
+    const historyIndex = historyProcessIndexes.find((index) =>
+      !usedHistory.has(index)
+      && (history[index] as ProcessBlock).item_id === liveBlock.item_id);
+    if (historyIndex == null) continue;
+    matches.set(liveIndex, historyIndex);
+    usedHistory.add(historyIndex);
+  }
+
+  // Rollout and live app-server projections may assign different item ids to
+  // the same contextCompaction occurrence. Pair only that authoritative process
+  // kind, and pair by occurrence instead of collapsing an entire native task:
+  // one long task can compact more than once.
+  const historyCompactions = new Map<string, number[]>();
+  const liveCompactions = new Map<string, number[]>();
+  for (const historyIndex of historyProcessIndexes) {
+    if (usedHistory.has(historyIndex)) continue;
+    const block = history[historyIndex] as ProcessBlock;
+    if (block.processKind !== "compaction" || !block.turn_id) continue;
+    const indexes = historyCompactions.get(block.turn_id) ?? [];
+    indexes.push(historyIndex);
+    historyCompactions.set(block.turn_id, indexes);
+  }
+  for (const liveIndex of liveProcessIndexes) {
+    if (matches.has(liveIndex)) continue;
+    const block = live[liveIndex] as ProcessBlock;
+    if (block.processKind !== "compaction" || !block.turn_id) continue;
+    const indexes = liveCompactions.get(block.turn_id) ?? [];
+    indexes.push(liveIndex);
+    liveCompactions.set(block.turn_id, indexes);
+  }
+  for (const [turnId, liveIndexes] of liveCompactions) {
+    const historyIndexes = historyCompactions.get(turnId);
+    if (!historyIndexes?.length) continue;
+    const pairCount = Math.min(historyIndexes.length, liveIndexes.length);
+    // Live is normally the current tail of a longer transcript projection.
+    // When History has more occurrences, align that live tail to History's
+    // tail. If live has more, its unmatched suffix is genuinely newer.
+    const historyStart = historyIndexes.length - pairCount;
+    for (let offset = 0; offset < pairCount; offset += 1) {
+      const liveIndex = liveIndexes[offset];
+      const historyIndex = historyIndexes[historyStart + offset];
+      matches.set(liveIndex, historyIndex);
+      usedHistory.add(historyIndex);
+    }
+  }
+  return matches;
+}
+
 function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean): Block[] {
   const out = history.map((block) => ({ ...block }));
+  const processMatches = processBlockMatches(history, live);
   // Engine history often regenerates assistant ids. Pair each same-channel text
   // block at most once: prefer matching content, then preserve channel order.
   // Reverse-finding the last block collapses A -> tool -> B into A -> tool -> BA.
   const historyTextIndexes = out.flatMap((block, index) =>
     block.kind === "text" ? [index] : []);
   const matchedTextIndexes = new Set<number>();
-  for (const block of live) {
+  for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
+    const block = live[liveIndex];
     if (block.kind === "process") {
-      const existing = out.find((candidate) => candidate.kind === "process"
-        && candidate.item_id === block.item_id) as ProcessBlock | undefined;
+      const historyIndex = processMatches.get(liveIndex);
+      const existing = historyIndex == null
+        ? undefined : out[historyIndex] as ProcessBlock;
       if (existing) {
         const historyLifecycle = {
           done: existing.done, phase: existing.phase, status: existing.status,
@@ -147,7 +212,10 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
   return out;
 }
 
-type TurnIdentity = Pick<Turn, "id" | "clientMsgId" | "historyTurnId">;
+type TurnIdentity = Pick<
+  Turn,
+  "id" | "clientMsgId" | "historyTurnId" | "forkPointId"
+>;
 
 function exactTurnAliases(turn: TurnIdentity): Set<string> {
   return new Set([
@@ -162,8 +230,49 @@ function sharesExactTurnAlias(first: TurnIdentity, second: TurnIdentity): boolea
   return [...exactTurnAliases(second)].some((alias) => firstAliases.has(alias));
 }
 
+function compactionTurnAliases(turn: Turn): Set<string> {
+  return new Set(turn.blocks.flatMap((block) =>
+    block.kind === "process"
+      && block.processKind === "compaction"
+      && block.turn_id
+      ? [block.turn_id]
+      : []));
+}
+
+function sharesCompactionTurnAlias(history: Turn, live: Turn): boolean {
+  // Official Codex history keeps the visible user-message id as the row id and
+  // exposes the enclosing native task as forkPointId. A live compaction marker
+  // carries that native task id before the user-message binding can arrive.
+  // This native alias is safe only for compaction: ordinary process rows from
+  // multiple steered segments intentionally share one enclosing task id.
+  // The prompt guard is equally important: compaction and two steered prompts
+  // may all share that task id, but they are still distinct visible rows.
+  if (history.prompt !== live.prompt) return false;
+  const historyAliases = new Set([
+    ...exactTurnAliases(history),
+    ...compactionTurnAliases(history),
+    history.forkPointId,
+  ].filter((value): value is string => !!value));
+  const liveAliases = new Set([
+    ...exactTurnAliases(live),
+    ...compactionTurnAliases(live),
+    live.forkPointId,
+  ].filter((value): value is string => !!value));
+  return [...compactionTurnAliases(live)].some(
+    (alias) => historyAliases.has(alias),
+  ) || [...compactionTurnAliases(history)].some(
+    (alias) => liveAliases.has(alias),
+  );
+}
+
 function sameTurnIdentity(history: Turn, live: Turn): boolean {
   if (sharesExactTurnAlias(history, live)) return true;
+  // Codex may emit contextCompaction before the clean user/message binding.
+  // The process event then carries the only native identity available to the
+  // optimistic row. Treat that one authoritative marker as a turn alias, but
+  // never generalize ordinary process turn ids: multiple steered narrative
+  // segments legitimately share one native task id.
+  if (sharesCompactionTurnAlias(history, live)) return true;
   // Automatic/goal continuations have no user message. Live uses the app-server
   // turn id as its empty anchor, while rollout history may use the first
   // assistant item id; TurnEnd still supplies the same authoritative branch id.
@@ -611,14 +720,39 @@ export function mergeInitialHistory(
   } = {},
 ): Turn[] {
   const merged = history.map((turn) => ({ ...turn, blocks: turn.blocks.map((b) => ({ ...b })) }));
+  const matches = new Array<number>(live.length).fill(-1);
   const used = new Set<number>();
   const unmatched: Turn[] = [];
 
-  for (const liveTurn of live) {
-    let index = merged.findIndex((turn, i) => !used.has(i) && turn.id === liveTurn.id);
-    if (index < 0) {
-      index = merged.findIndex((turn, i) => !used.has(i) && sameTurn(turn, liveTurn));
+  const reserveMatches = (
+    predicate: (historyTurn: Turn, liveTurn: Turn) => boolean,
+  ) => {
+    // Live is generally the newest suffix of History. Match from the tail so
+    // repeated steer prompts within one native task bind their newest segment.
+    for (let liveIndex = live.length - 1; liveIndex >= 0; liveIndex -= 1) {
+      if (matches[liveIndex] >= 0) continue;
+      for (let historyIndex = merged.length - 1; historyIndex >= 0;
+        historyIndex -= 1) {
+        if (used.has(historyIndex)
+            || !predicate(merged[historyIndex], live[liveIndex])) continue;
+        matches[liveIndex] = historyIndex;
+        used.add(historyIndex);
+        break;
+      }
     }
+  };
+
+  // Reserve exact identities for the whole live suffix before the guarded
+  // compaction fallback can consume a row belonging to another live segment.
+  reserveMatches((historyTurn, liveTurn) => historyTurn.id === liveTurn.id);
+  reserveMatches(sharesExactTurnAlias);
+  reserveMatches(sameTurn);
+
+  // Apply the precomputed mapping in original live order. Matching direction
+  // must not reorder unmatched optimistic rows.
+  for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
+    const liveTurn = live[liveIndex];
+    const index = matches[liveIndex];
     if (index >= 0) {
       const isOpenLiveTail = !!options.preserveLiveTailOpen
         && liveTurn === live[live.length - 1]
@@ -628,7 +762,6 @@ export function mergeInitialHistory(
         && index === merged.length - 1
         && !liveTurn.done;
       merged[index] = mergeTurn(merged[index], liveTurn, isOpenLiveTail);
-      used.add(index);
     } else {
       unmatched.push({ ...liveTurn, blocks: liveTurn.blocks.map((b) => ({ ...b })) });
     }
