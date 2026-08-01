@@ -36,7 +36,7 @@ import {
 } from "./runtime-drain";
 import {
   historyContainsTurn, installAuthoritativeTurnDetailPage,
-  mergeAuthoritativeTurnDetail, mergeInitialHistory,
+  mergeAuthoritativeTurnDetail, mergeDetailWithLiveTail, mergeInitialHistory,
   restoreCachedTurnDetails, restoreObservedLiveTurnDetails,
 } from "./history-merge";
 import {
@@ -100,6 +100,9 @@ export type {
 export const MAX_TURN_BLOCKS = 256;
 export const MAX_TURN_BLOCK_CHARS = 16 * 1024 * 1024;
 export const OMITTED_PROCESS_ITEM_ID = "__cc_remote_earlier_process_omitted__";
+const LIVE_SPILL_REFRESH_BLOCKS = 128;
+const MAX_LIVE_SPILL_ARCHIVE_BLOCKS = 4_000;
+const MAX_LIVE_SPILL_ARCHIVE_CHARS = 16 * 1024 * 1024;
 // Notices are ephemeral UI control state, not transcript history.  Eight keeps
 // simultaneous startup/config/security warnings available without allowing a
 // noisy app-server to grow every resident session indefinitely.
@@ -522,7 +525,17 @@ function boundFailedDeferred(
 }
 
 function cloneTurns(turns: Turn[]): Turn[] {
-  return turns.map((t) => ({ ...t, blocks: t.blocks.map((b) => ({ ...b })) }));
+  return turns.map((t) => ({
+    ...t,
+    blocks: t.blocks.map((b) => ({ ...b })),
+    liveSpillBlocks: t.liveSpillBlocks?.map((b) => ({ ...b })),
+  }));
+}
+
+function mutableTurnBlocks(turn: Turn): Block[] {
+  return turn.liveSpillBlocks?.length
+    ? [...turn.liveSpillBlocks, ...turn.blocks]
+    : turn.blocks;
 }
 
 function openTurn(turns: Turn[], fallbackId: string, ts?: number): Turn {
@@ -534,11 +547,27 @@ function openTurn(turns: Turn[], fallbackId: string, ts?: number): Turn {
   return turn;
 }
 
+function appendLiveBlock<T extends Block>(turn: Turn, block: T): T {
+  if (block.liveOrder == null) {
+    let next = turn.nextLiveBlockOrder;
+    if (next == null) {
+      next = turn.blocks.reduce(
+        (maximum, candidate) => Math.max(maximum, candidate.liveOrder ?? -1),
+        -1,
+      ) + 1;
+    }
+    block.liveOrder = next;
+    turn.nextLiveBlockOrder = next + 1;
+  }
+  turn.blocks.push(block);
+  return block;
+}
+
 function findTurnOwningMessage(
   turns: Turn[], messageId: string | null | undefined,
 ): Turn | undefined {
   if (!messageId) return undefined;
-  return [...turns].reverse().find((turn) => turn.blocks.some((block) =>
+  return [...turns].reverse().find((turn) => mutableTurnBlocks(turn).some((block) =>
     block.kind === "text"
       ? block.message_id === messageId
       : block.kind === "tool"
@@ -599,7 +628,7 @@ function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn 
   return [...turns].reverse().find((turn) =>
     turn.id === id || turn.liveTaskId === id
     || turn.forkPointId === id || turn.codexTurnId === id
-    || turn.blocks.some((block) => block.kind === "process"
+    || mutableTurnBlocks(turn).some((block) => block.kind === "process"
       && block.turn_id === id));
 }
 
@@ -611,13 +640,13 @@ function turnHasBoundEngineId(turn: Turn): boolean {
   // independent native binding, though, and must reject an unrelated terminal.
   const aliases = turnIdentityAliases(turn);
   return !!(turn.liveTaskId || turn.forkPointId || turn.codexTurnId
-    || turn.blocks.some((block) => block.kind === "process"
+    || mutableTurnBlocks(turn).some((block) => block.kind === "process"
       && !!block.turn_id && !aliases.includes(block.turn_id)));
 }
 
 function findTurnOwningItem(turns: Turn[], id: string | null | undefined): Turn | undefined {
   if (!id) return undefined;
-  return [...turns].reverse().find((turn) => turn.blocks.some((block) =>
+  return [...turns].reverse().find((turn) => mutableTurnBlocks(turn).some((block) =>
     block.kind === "tool" ? block.tool_use_id === id
       : block.kind === "process" ? block.item_id === id
         : block.message_id === id));
@@ -630,19 +659,6 @@ function resolvedChannel(current: AssistantChannel | undefined, next: AssistantC
 function terminalProcessStatus(status: ProcessStatus): boolean {
   return status === "succeeded" || status === "failed" || status === "declined"
     || status === "cancelled" || status === "interrupted";
-}
-
-function omissionBlock(): ProcessBlock {
-  return {
-    kind: "process",
-    item_id: OMITTED_PROCESS_ITEM_ID,
-    processKind: "compaction",
-    phase: "snapshot",
-    status: "succeeded",
-    title: "较早过程已省略",
-    summary: "为限制此回合的内存占用，较早的处理记录未显示。",
-    done: true,
-  };
 }
 
 function isOmissionBlock(block: Block): boolean {
@@ -752,23 +768,78 @@ function turnBlockPayloadChars(blocks: Block[]): number {
   return total;
 }
 
-/** Mutate one cloned turn into a fixed-size display window.
+function archiveLiveSpillBlocks(turn: Turn, spilled: Block[]): void {
+  if (spilled.length === 0) return;
+  const merged = mergeDetailWithLiveTail(
+    turn.liveSpillBlocks ?? [],
+    spilled,
+  ).sort((left, right) => {
+    if (left.liveOrder == null || right.liveOrder == null) return 0;
+    return left.liveOrder - right.liveOrder;
+  });
+  let start = merged.length;
+  let chars = 0;
+  while (start > 0
+      && merged.length - start < MAX_LIVE_SPILL_ARCHIVE_BLOCKS) {
+    const size = blockPayloadChars(merged[start - 1]);
+    if (start < merged.length
+        && chars + size > MAX_LIVE_SPILL_ARCHIVE_CHARS) break;
+    start -= 1;
+    chars += size;
+  }
+  turn.liveSpillBlocks = merged.slice(start);
+}
+
+function ensureLiveBlockOrder(turn: Turn): void {
+  const archive = turn.liveSpillBlocks ?? [];
+  const allBlocks = [...archive, ...turn.blocks];
+  if (allBlocks.every((block) => block.liveOrder != null)) return;
+
+  if (!turn.liveBlocksSpilled && archive.length === 0) {
+    // The first spill establishes source order for history/cache blocks which
+    // predate liveOrder. Normalize the whole visible sequence so an older
+    // cached block cannot sort after a newly streamed block that already has
+    // order zero.
+    turn.blocks.forEach((block, index) => { block.liveOrder = index; });
+    turn.nextLiveBlockOrder = turn.blocks.length;
+    return;
+  }
+
+  let next = allBlocks.reduce(
+    (maximum, block) => Math.max(maximum, block.liveOrder ?? -1), -1) + 1;
+  for (const block of allBlocks) {
+    if (block.liveOrder != null) continue;
+    block.liveOrder = next;
+    next += 1;
+  }
+  turn.nextLiveBlockOrder = Math.max(turn.nextLiveBlockOrder ?? 0, next);
+}
+
+function continuedLiveSpillRefreshDue(turn: Turn): boolean {
+  if (!turn.liveBlocksSpilled) return false;
+  return (turn.liveSpilledBlockCount ?? 0)
+    - (turn.liveSpillRefreshCount ?? 0) >= LIVE_SPILL_REFRESH_BLOCKS;
+}
+
+/** Mutate one cloned turn into a fixed-size live tail.
  *
  * Keep at least the newest known final answer and newest live activity, then
  * prefer the remaining final blocks, remaining live blocks, and newest
- * completed process records in that order.  A single fixed marker replaces all
- * evicted items; it deliberately carries no ever-growing counter or id set. */
+ * completed process records in that order. Evicted records remain available
+ * through source-backed TurnDetail pages; do not turn the memory boundary into
+ * a visible "history omitted" product state. */
 function limitTurnBlocks(turn: Turn): void {
   const markerCount = turn.blocks.reduce(
     (count, block) => count + (isOmissionBlock(block) ? 1 : 0), 0);
-  if (turn.blocks.length <= MAX_TURN_BLOCKS && markerCount <= 1
+  if (turn.blocks.length <= MAX_TURN_BLOCKS && markerCount === 0
       && turnBlockPayloadChars(turn.blocks) <= MAX_TURN_BLOCK_CHARS) return;
 
+  ensureLiveBlockOrder(turn);
   const candidates = turn.blocks.filter((block) => !isOmissionBlock(block))
     .map(limitedBlockPayload);
-  const capacity = MAX_TURN_BLOCKS - 1;
+  const capacity = MAX_TURN_BLOCKS;
   const keep = new Set<number>();
-  let retainedChars = blockPayloadChars(omissionBlock());
+  let retainedChars = 0;
   const keepNewest = (
     predicate: (block: Block) => boolean,
     one = false,
@@ -794,12 +865,31 @@ function limitTurnBlocks(turn: Turn): void {
   keepNewest(() => true);
 
   const retained = candidates.filter((_, index) => keep.has(index));
-  turn.blocks = [omissionBlock(), ...retained];
+  const spilled = candidates.filter((_, index) => !keep.has(index));
+  archiveLiveSpillBlocks(turn, spilled);
+  const newlySpilled = spilled.length;
+  if (newlySpilled > 0 || markerCount > 0) {
+    const firstSpill = turn.liveBlocksSpilled !== true;
+    turn.liveBlocksSpilled = true;
+    turn.liveSpilledBlockCount =
+      (turn.liveSpilledBlockCount ?? 0) + newlySpilled;
+    turn.detailEventCount = Math.max(
+      turn.detailEventCount ?? 0,
+      retained.length + (turn.liveSpilledBlockCount ?? 0),
+    );
+    turn.detailLoaded = false;
+    if ((firstSpill || continuedLiveSpillRefreshDue(turn))
+        && turn.detailLoading !== true) {
+      turn.detailRestorePending = true;
+      turn.detailRestoreIncomplete = true;
+    }
+  }
+  turn.blocks = retained;
 }
 
 function withLimitedTurnBlocks(turn: Turn): Turn {
   if (turn.blocks.length <= MAX_TURN_BLOCKS
-      && turn.blocks.filter(isOmissionBlock).length <= 1
+      && turn.blocks.filter(isOmissionBlock).length === 0
       && turnBlockPayloadChars(turn.blocks) <= MAX_TURN_BLOCK_CHARS) return turn;
   const limited = { ...turn, blocks: [...turn.blocks] };
   limitTurnBlocks(limited);
@@ -815,7 +905,7 @@ function finishOpenBlocks(
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
 ): void {
-  for (const block of turn.blocks) {
+  for (const block of mutableTurnBlocks(turn)) {
     if (block.kind === "text") {
       block.done = true;
     } else if (block.kind === "process" && !block.done) {
@@ -854,6 +944,29 @@ function finishTurnWithoutTerminal(
   turn.interrupted = true;
   if (message) turn.error ??= message;
   finishOpenBlocks(turn, "interrupted", true);
+}
+
+function finishTurnFromIdleHistory(turn: Turn, doneTs: number): void {
+  if (turn.done) return;
+  const completedFinal = turn.blocks.some((block) =>
+    block.kind === "text"
+    && block.channel === "final"
+    && block.done
+    && block.text.trim().length > 0);
+  const allBlocksClosed = turn.blocks.every((block) => block.done);
+  if (!turn.error && (!completedFinal || !allBlocksClosed)) {
+    finishTurnWithoutTerminal(turn, doneTs);
+    return;
+  }
+  turn.done = true;
+  turn.doneTs ??= doneTs;
+  turn.progress = undefined;
+  // Idle plus a source-complete final block is enough to repair a lost live
+  // TurnEnd. Idle by itself is not: a crash can leave partial text or running
+  // tools in the transcript, and those must remain visibly distinguishable
+  // from success.
+  turn.interrupted = false;
+  finishOpenBlocks(turn, turn.error ? "failed" : "succeeded", !!turn.error);
 }
 
 function finishTurnAtSteerFence(
@@ -923,11 +1036,8 @@ function finishOpenTurnsFromIdleHistory(
   return turns.map((turn) => {
     if (turn.done || turn.id === preserveTurnId) return turn;
     const next = { ...turn, blocks: turn.blocks.map((block) => ({ ...block })) };
-    finishTurnWithoutTerminal(
-      next,
-      doneTs,
-      interrupted ? null : UNKNOWN_TERMINAL_ERROR,
-    );
+    if (interrupted) finishTurnWithoutTerminal(next, doneTs, null);
+    else finishTurnFromIdleHistory(next, doneTs);
     return next;
   });
 }
@@ -1574,6 +1684,10 @@ export function reduce(state: AppState, action: Action): AppState {
               detailRestoreIncomplete: action.before == null
                 ? action.autoLoad === false
                 : turn.detailRestoreIncomplete,
+              liveSpillRefreshCount: action.before == null
+                && turn.liveBlocksSpilled
+                ? turn.liveSpilledBlockCount
+                : turn.liveSpillRefreshCount,
             }
           : turn);
       }, true);
@@ -2886,7 +3000,9 @@ function reduceEvent(
         rt.turns = rt.turns.map((turn) => {
           if (turn.id !== e.turn_id
               && canonicalTurnId(turn) !== e.turn_id) return turn;
-          return installAuthoritativeTurnDetailPage(
+          const refreshAfterInFlight =
+            turn.done && turn.detailRestorePending === true;
+          const next = installAuthoritativeTurnDetailPage(
             turn,
             detailed,
             {
@@ -2897,6 +3013,16 @@ function reduceEvent(
             },
             installed.projection,
           );
+          if (continuedLiveSpillRefreshDue(next)
+              && next.detailLoading !== true) {
+            next.detailRestorePending = true;
+            next.detailRestoreIncomplete = true;
+          }
+          if (refreshAfterInFlight) {
+            next.detailRestorePending = true;
+            next.detailRestoreIncomplete = true;
+          }
+          return next;
         });
       });
     }
@@ -3747,11 +3873,11 @@ function reduceEvent(
           ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
-        const block = t.blocks.find((b) => b.kind === "text"
+        const block = mutableTurnBlocks(t).find((b) => b.kind === "text"
           && b.message_id === e.message_id) as TextBlock | undefined;
         if (block) block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
         else {
-          t.blocks.push({ kind: "text", message_id: e.message_id, text: "",
+          appendLiveBlock(t, { kind: "text", message_id: e.message_id, text: "",
             done: false, channel: e.channel ?? "unknown" });
           if (boundCompletedTurns) limitTurnBlocks(t);
         }
@@ -3765,11 +3891,12 @@ function reduceEvent(
           ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
-        let block = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
+        let block = mutableTurnBlocks(t).find((b) => b.kind === "text"
+          && b.message_id === e.message_id) as TextBlock | undefined;
         if (!block) {
           block = { kind: "text", message_id: e.message_id, text: "", done: false,
             channel: e.channel ?? "unknown" };
-          t.blocks.push(block);
+          appendLiveBlock(t, block);
           if (boundCompletedTurns) limitTurnBlocks(t);
         }
         block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
@@ -3790,7 +3917,7 @@ function reduceEvent(
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         t.progress = undefined;
-        const existing = t.blocks.find((b) => b.kind === "tool"
+        const existing = mutableTurnBlocks(t).find((b) => b.kind === "tool"
           && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
         if (existing) {
           existing.tool = e.tool;
@@ -3800,7 +3927,7 @@ function reduceEvent(
           existing.parent_id = e.parent_id;
           existing.server = e.server;
         } else {
-          t.blocks.push({ kind: "tool", message_id: e.message_id,
+          appendLiveBlock(t, { kind: "tool", message_id: e.message_id,
             tool_use_id: e.tool_use_id, tool: e.tool, input: e.input,
             category: e.category ?? "tool", title: e.title, parent_id: e.parent_id,
             server: e.server, done: false });
@@ -3812,7 +3939,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         for (const t of turns) {
-          const block = t.blocks.find((b) => b.kind === "tool"
+          const block = mutableTurnBlocks(t).find((b) => b.kind === "tool"
             && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (!block) continue;
           markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
@@ -3836,7 +3963,8 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         for (const t of turns) {
-          const b = t.blocks.find((b) => b.kind === "tool" && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
+          const b = mutableTurnBlocks(t).find((b) => b.kind === "tool"
+            && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (b) {
             markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
             markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
@@ -3857,7 +3985,8 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         for (const t of turns) {
-          const b = t.blocks.find((b) => b.kind === "text" && b.message_id === e.message_id) as TextBlock | undefined;
+          const b = mutableTurnBlocks(t).find((b) => b.kind === "text"
+            && b.message_id === e.message_id) as TextBlock | undefined;
           if (b) {
             markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
             b.channel = resolvedChannel(b.channel, e.channel ?? "unknown");
@@ -3873,7 +4002,7 @@ function reduceEvent(
         let owner: Turn | undefined;
         let block: ProcessBlock | undefined;
         for (const candidate of turns) {
-          const found = candidate.blocks.find((b) => b.kind === "process"
+          const found = mutableTurnBlocks(candidate).find((b) => b.kind === "process"
             && b.item_id === e.item_id) as ProcessBlock | undefined;
           if (found) { owner = candidate; block = found; break; }
         }
@@ -3894,7 +4023,7 @@ function reduceEvent(
           block = { kind: "process", item_id: e.item_id, processKind: e.kind,
             phase: e.phase, status: e.status, turn_id: e.turn_id,
             parent_id: e.parent_id, title: e.title, done: false };
-          owner.blocks.push(block);
+          appendLiveBlock(owner, block);
         }
         block.processKind = e.kind;
         block.phase = e.phase;
@@ -3948,13 +4077,13 @@ function reduceEvent(
         }
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
-        let block = t.blocks.find((b) => b.kind === "process"
+        let block = mutableTurnBlocks(t).find((b) => b.kind === "process"
           && b.item_id === e.item_id) as ProcessBlock | undefined;
         if (!block) {
           block = { kind: "process", item_id: e.item_id, processKind: "plan",
             phase: "snapshot", status: "running", turn_id: e.turn_id,
             title: "计划", done: false };
-          t.blocks.push(block);
+          appendLiveBlock(t, block);
         }
         block.explanation = e.explanation;
         block.plan = e.plan.map((entry) => ({ ...entry }));
@@ -3976,13 +4105,13 @@ function reduceEvent(
         }
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
-        let block = t.blocks.find((b) => b.kind === "process"
+        let block = mutableTurnBlocks(t).find((b) => b.kind === "process"
           && b.item_id === e.item_id) as ProcessBlock | undefined;
         if (!block) {
           block = { kind: "process", item_id: e.item_id, processKind: "diff",
             phase: "snapshot", status: "running", turn_id: e.turn_id,
             title: "代码改动", done: false };
-          t.blocks.push(block);
+          appendLiveBlock(t, block);
         }
         block.diff = e.diff;
         block.truncated = e.truncated;
@@ -4062,6 +4191,14 @@ function reduceEvent(
           t.doneTs = e.ts ? Math.round(e.ts * 1000) : (t.ts || Date.now());
           finishOpenBlocks(t, e.result.is_error ? "interrupted" : "succeeded",
             e.result.is_error);
+          if (t.liveBlocksSpilled) {
+            // Refresh the newest source-backed page at the terminal boundary.
+            // If a running snapshot is already in flight, keep this pending
+            // bit through that response and issue one terminal snapshot next.
+            t.detailLoaded = false;
+            t.detailRestorePending = true;
+            t.detailRestoreIncomplete = true;
+          }
         }
         if (t && t === unknownSteerOwner) {
           resolveUnknownPendingSteer(

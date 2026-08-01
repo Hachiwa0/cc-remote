@@ -136,6 +136,16 @@ export class HistoryAnchorController {
     return true;
   }
 
+  /** A touch that was created after the request may move while the response is
+   * staged but before its page is mounted. Freeze that verified position
+   * without cancelling the pending transaction. */
+  rebasePending(generation: number, point: HistoryAnchorPoint): boolean {
+    if (!this.transaction || this.transaction.generation !== generation
+        || this.transaction.phase !== "pending") return false;
+    this.transaction = { ...this.transaction, ...point };
+    return true;
+  }
+
   cancel(generation?: number): boolean {
     if (!this.transaction
         || (generation != null && this.transaction.generation !== generation)) {

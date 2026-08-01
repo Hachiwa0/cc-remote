@@ -361,7 +361,7 @@ test("Claude settings does not expose Codex usage activity", async ({ page }) =>
   await expect(page.getByRole("button", { name: /通知/ })).toBeVisible();
 });
 
-async function maxTurnOffsetShiftThroughAction(
+async function maxPaintedTurnOffsetShiftThroughAction(
   page: import("@playwright/test").Page,
   turnId: string,
   actionTestId: string,
@@ -398,12 +398,72 @@ async function maxTurnOffsetShiftThroughAction(
         }
         remaining -= 1;
         if (remaining <= 0) resolve();
+        else requestAnimationFrame(() => window.setTimeout(sample, 0));
+      };
+      // rAF runs before ResizeObserver delivery. Sample after the paint
+      // opportunity so the test observes user-visible frames, not the
+      // browser's internal pre-observer layout checkpoint.
+      requestAnimationFrame(() => window.setTimeout(sample, 0));
+    });
+    return { maxShift, missing };
+  }, { id: turnId, testId: actionTestId, frames: frameCount });
+}
+
+async function maxTurnOffsetShiftThroughTouchHistoryLoad(
+  page: import("@playwright/test").Page,
+  turnId: string,
+  frameCount = 60,
+): Promise<{ maxShift: number; missing: boolean }> {
+  return page.evaluate(async ({ id, frames }) => {
+    const viewport = document.querySelector<HTMLElement>(".thread");
+    const row = document.querySelector<HTMLElement>(
+      `[data-turn-id="${CSS.escape(id)}"]`,
+    );
+    if (!viewport || !row) throw new Error("touch frame target is missing");
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const initial = row.getBoundingClientRect().top - viewportTop;
+    let maxShift = 0;
+    let missing = false;
+    const dispatch = (type: "touchstart" | "touchmove" | "touchend",
+      clientY: number) => {
+      const touch = {
+        identifier: 1,
+        target: viewport,
+        clientX: 120,
+        clientY,
+      };
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperties(event, {
+        touches: { value: type === "touchend" ? [] : [touch] },
+        targetTouches: { value: type === "touchend" ? [] : [touch] },
+        changedTouches: { value: [touch] },
+      });
+      viewport.dispatchEvent(event);
+    };
+    dispatch("touchstart", 160);
+    dispatch("touchmove", 220);
+    dispatch("touchend", 220);
+    await new Promise<void>((resolve) => {
+      let remaining = frames;
+      const sample = () => {
+        const current = document.querySelector<HTMLElement>(
+          `[data-turn-id="${CSS.escape(id)}"]`,
+        );
+        if (!current) {
+          missing = true;
+        } else {
+          const offset = current.getBoundingClientRect().top
+            - viewport.getBoundingClientRect().top;
+          maxShift = Math.max(maxShift, Math.abs(offset - initial));
+        }
+        remaining -= 1;
+        if (remaining <= 0) resolve();
         else requestAnimationFrame(sample);
       };
       requestAnimationFrame(sample);
     });
     return { maxShift, missing };
-  }, { id: turnId, testId: actionTestId, frames: frameCount });
+  }, { id: turnId, frames: frameCount });
 }
 
 async function processDetailEdge(
@@ -458,6 +518,47 @@ async function waitForScrollIdle(
     await page.waitForTimeout(50);
   }
   throw new Error("thread scroll position did not settle");
+}
+
+async function pauseOutputAndScrollToHistoryStart(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  const viewport = page.locator(".thread");
+  // Initial virtual measurements can finish one frame after the first write
+  // and reassert the mounted tail. Retry the neutral test setup until the
+  // physical viewport itself is stable at the history edge; no user-intent
+  // event is emitted here, so the page request still belongs to the action
+  // under test.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await viewport.evaluate((node) => { node.scrollTop = 0; });
+    await waitForScrollIdle(page);
+    if (await viewport.evaluate((node) => node.scrollTop <= 1)) return;
+  }
+  expect(await viewport.evaluate((node) => node.scrollTop)).toBeLessThanOrEqual(1);
+}
+
+async function waitForReadingPositionIdle(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  let previous: { id: string; offset: number } | null = null;
+  let stableSamples = 0;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const current = await readingAnchor(page).catch(() => null);
+    if (!current) {
+      previous = null;
+      stableSamples = 0;
+      await page.waitForTimeout(50);
+      continue;
+    }
+    stableSamples = previous != null
+      && current.id === previous.id
+      && Math.abs(current.offset - previous.offset) < 0.5
+      ? stableSamples + 1 : 0;
+    if (stableSamples >= 4) return;
+    previous = current;
+    await page.waitForTimeout(50);
+  }
+  throw new Error("thread visual reading position did not settle");
 }
 
 async function nativeSelectionSnapshot(
@@ -535,7 +636,7 @@ async function wheelUntilTurn(
   const box = await viewport.boundingBox();
   if (!box) throw new Error("thread viewport has no bounds");
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  for (let attempt = 0; attempt < 12; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     if (await turnIntersectsViewport(page, turnId)) return;
     await page.mouse.wheel(0, deltaY);
     await page.waitForTimeout(40);
@@ -782,6 +883,76 @@ test("reducer history paging and live refresh keep one stable projection", async
   await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("20");
 });
 
+test("reducer prepend never paints an intermediate reading-row jump", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?reducer-pipeline=1");
+  await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
+  await pauseOutputAndScrollToHistoryStart(page);
+  const before = await readingAnchor(page);
+  const sampled = await maxPaintedTurnOffsetShiftThroughAction(
+    page,
+    before.id,
+    "load-older-history",
+    60,
+  );
+  await expect(page.locator('[data-turn-id="reducer-m20"]')).toBeAttached();
+  const after = await readingAnchor(page);
+  expect(sampled.missing).toBe(false);
+  expect(sampled.maxShift).toBeLessThan(2);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+});
+
+test("touching the history edge never paints an intermediate reading-row jump", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?reducer-pipeline=1");
+  await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
+  await pauseOutputAndScrollToHistoryStart(page);
+  const before = await readingAnchor(page);
+  const sampled = await maxTurnOffsetShiftThroughTouchHistoryLoad(
+    page,
+    before.id,
+  );
+  await expect(page.locator('[data-turn-id="reducer-m20"]')).toBeAttached();
+  const after = await readingAnchor(page);
+  expect(sampled.missing).toBe(false);
+  expect(sampled.maxShift).toBeLessThan(2);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+});
+
+test("a history page waits for the active touch to release before mounting", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?delay=20&manual-growth=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await dispatchTouchPhase(page, "touchstart", 160);
+  await dispatchTouchPhase(page, "touchmove", 220);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await page.waitForTimeout(100);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  const held = await readingAnchor(page);
+  expect(held.id).toBe(before.id);
+  expect(Math.abs(held.offset - before.offset)).toBeLessThan(2);
+
+  await dispatchTouchPhase(page, "touchend", 220);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+  await page.waitForTimeout(350);
+  const settled = await readingAnchor(page);
+  expect(settled.id).toBe(before.id);
+  expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
+});
+
 test("one click loads every turn-detail page without collapsing or jumping", async ({
   page,
 }) => {
@@ -816,7 +987,7 @@ test("retained truncated process still fetches its authoritative first detail pa
   const header = page.locator(".turn-process-head");
   await header.click();
   await expect(page.getByText("已缓存的较新命令")).toBeVisible();
-  await expect(page.getByText("较早过程已省略")).toBeVisible();
+  await expect(page.getByText("较早过程已省略")).toHaveCount(0);
   await expect(header).toHaveAttribute("aria-busy", "true");
   await expect(page.getByText("较早过程已省略")).toHaveCount(0);
   await expect(page.getByText("较新命令 1")).toBeVisible();
@@ -1513,38 +1684,48 @@ test("a pending composer image previews without triggering removal", async ({
   await expect(page.locator(".image-lightbox")).toHaveCount(0);
 });
 
-test("a page that finishes under an active touch restores its retained boundary", async ({
+test("a page waits through post-touch momentum and restores its final boundary", async ({
   page,
 }, testInfo) => {
   test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
   await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = 0; });
-  const before = await readingAnchor(page);
 
   await dispatchTouchPhase(page, "touchstart", 160);
   await dispatchTouchPhase(page, "touchmove", 220);
   await expect(page.getByTestId("load-count")).toHaveText("1");
-  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
-  // WebKit may deliver the scroll that reached the paging edge only after the
-  // prepended rows have committed. Reproduce that stale metrics sequence
-  // deterministically: without a post-commit touchmove it must not replace o1.
-  await viewport.evaluate((node) => {
-    node.scrollTop = 400;
-    node.dispatchEvent(new Event("scroll"));
-    node.scrollTop = 0;
-    node.dispatchEvent(new Event("scroll"));
-  });
+  await page.waitForTimeout(50);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  // The network page may remain ready for multiple frames, but it cannot
+  // rebase the still-active gesture onto a not-yet-mounted older row.
+  await page.waitForTimeout(100);
   await dispatchTouchPhase(page, "touchend", 220);
+  // touchend does not end iOS scroll ownership: native momentum continues to
+  // emit scroll events without a finger. Keep the page staged, allow those
+  // movements and unrelated row growth, then commit at the final idle point.
+  await page.waitForTimeout(60);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  for (const top of [240, 420, 540]) {
+    await viewport.evaluate((node, scrollTop) => {
+      node.scrollTop = scrollTop;
+      node.dispatchEvent(new Event("scroll"));
+    }, top);
+    await page.waitForTimeout(50);
+  }
+  await page.getByTestId("grow-row").click();
+  const momentumEnd = await readingAnchor(page);
+  const momentumScrollTop = await viewport.evaluate((node) => node.scrollTop);
+  expect(momentumScrollTop).toBeGreaterThan(200);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
 
-  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
-  await expect.poll(async () =>
-    Math.abs((await readingAnchor(page)).offset - before.offset),
-  ).toBeLessThan(2);
-  await page.waitForTimeout(300);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect.poll(async () => (await readingAnchor(page)).id)
+    .toBe(momentumEnd.id);
+  await page.waitForTimeout(350);
   const settled = await readingAnchor(page);
-  expect(settled.id).toBe(before.id);
-  expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
+  expect(settled.id).toBe(momentumEnd.id);
+  expect(Math.abs(settled.offset - momentumEnd.offset)).toBeLessThan(2);
 });
 
 test("a delayed pre-commit touchmove never rebases a retained page", async ({
@@ -1561,7 +1742,8 @@ test("a delayed pre-commit touchmove never rebases a retained page", async ({
   await stageDelayedTouchMove(page, 160, 80);
   await dispatchTouchPhase(page, "touchmove", 220);
   await expect(page.getByTestId("load-count")).toHaveText("1");
-  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await page.waitForTimeout(50);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
   await dispatchDelayedTouchMove(page);
   await viewport.evaluate((node) => {
     node.scrollTop = 400;
@@ -1570,6 +1752,7 @@ test("a delayed pre-commit touchmove never rebases a retained page", async ({
     node.dispatchEvent(new Event("scroll"));
   });
   await dispatchTouchPhase(page, "touchend", 80);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
 
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
   await expect.poll(async () =>
@@ -1597,9 +1780,13 @@ test("a cached-newer page that finishes under touch keeps its retained row", asy
   await expect.poll(async () =>
     Math.abs((await readingAnchor(page)).offset - before.offset),
   ).toBeLessThan(2);
+  await page.waitForTimeout(350);
+  const settled = await readingAnchor(page);
+  expect(settled.id).toBe(before.id);
+  expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
 });
 
-test("movement after an attached page rebases the held touch boundary", async ({
+test("movement while a page is staged becomes the release boundary", async ({
   page,
 }, testInfo) => {
   test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
@@ -1611,10 +1798,12 @@ test("movement after an attached page rebases the held touch boundary", async ({
   await dispatchTouchPhase(page, "touchstart", 160);
   await dispatchTouchPhase(page, "touchmove", 220);
   await expect(page.getByTestId("load-count")).toHaveText("1");
-  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await page.waitForTimeout(50);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
 
-  // The response is already installed, but the same finger deliberately
-  // reverses toward newer content before it is lifted.
+  // The response is staged, while the same finger deliberately reverses
+  // toward newer content before it is lifted. That real position becomes the
+  // keyed anchor used when the page finally mounts.
   await dispatchTouchPhase(page, "touchmove", 80);
   await viewport.evaluate((node) => { node.scrollBy({ top: 720 }); });
   await expect.poll(async () => (await readingAnchor(page)).id)
@@ -1625,6 +1814,42 @@ test("movement after an attached page rebases the held touch boundary", async ({
   await waitForScrollIdle(page);
   const moved = await readingAnchor(page);
   await dispatchTouchPhase(page, "touchend", 80);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(moved.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - moved.offset),
+  ).toBeLessThan(2);
+  await page.waitForTimeout(300);
+  const settled = await readingAnchor(page);
+  expect(settled.id).toBe(moved.id);
+  expect(Math.abs(settled.offset - moved.offset)).toBeLessThan(2);
+});
+
+test("continuing to pull at the top keeps the staged page invisible", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  const original = await readingAnchor(page);
+
+  await dispatchTouchPhase(page, "touchstart", 160);
+  await dispatchTouchPhase(page, "touchmove", 220);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await page.waitForTimeout(50);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+
+  // The same finger keeps pulling into the top edge. The old page cannot move
+  // the DOM out from under that gesture; it mounts once, after release.
+  await dispatchTouchPhase(page, "touchmove", 280);
+  await viewport.evaluate((node) => { node.scrollBy({ top: -720 }); });
+  await waitForScrollIdle(page);
+  const moved = await readingAnchor(page);
+  expect(moved.id).toBe(original.id);
+  await dispatchTouchPhase(page, "touchend", 280);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
 
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(moved.id);
   await expect.poll(async () =>
@@ -1836,7 +2061,7 @@ test("user movement after prepend stays stable through delayed growth", async ({
   await wheelUntilTurn(page, "o2", 300, testInfo.project.name);
   await waitForScrollIdle(page);
   const before = await readingAnchor(page);
-  const sampled = await maxTurnOffsetShiftThroughAction(
+  const sampled = await maxPaintedTurnOffsetShiftThroughAction(
     page,
     before.id,
     "grow-row",
@@ -1887,12 +2112,12 @@ test("replay recovery replacement preserves the current reading row", async ({
   await page.goto("/tests/history-browser.html?large=40&recovery-replace=1");
   await expect(page.locator('[data-turn-id="m40"]')).toBeVisible();
   await wheelUntilTurn(page, "m10", -400, testInfo.project.name);
-  await waitForScrollIdle(page);
+  await waitForReadingPositionIdle(page);
   const before = await readingAnchor(page);
 
   await page.getByTestId("replace-revision").click();
   await expect(page.locator('[data-turn-id="m10"] p')).toHaveCount(4);
-  await waitForScrollIdle(page);
+  await waitForReadingPositionIdle(page);
   const after = await readingAnchor(page);
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
@@ -1939,11 +2164,12 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=120");
   const viewport = page.locator(".thread");
-  await viewport.evaluate((node) => {
-    node.scrollTop = node.scrollHeight * (41 / 120);
-  });
-  const startText = page.locator('[data-turn-id="m42"] p').first();
-  await startText.scrollIntoViewIfNeeded();
+  await wheelUntilTurn(page, "m42", -600, testInfo.project.name);
+  await waitForScrollIdle(page);
+  const startTurnId = (await readingAnchor(page)).id;
+  const startText = page.locator(
+    `[data-turn-id="${startTurnId}"] p`,
+  ).first();
   await expect(startText).toBeInViewport();
   const viewportBox = await viewport.boundingBox();
   const startPoint = await textSelectionPoint(startText);
@@ -1971,10 +2197,12 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   const draggedScrollTop = await viewport.evaluate((node) => node.scrollTop);
   const draggingSelection = await nativeSelectionSnapshot(page);
   expect(draggedScrollTop - startScrollTop).toBeGreaterThan(800);
-  expect(draggingSelection.anchorTurnId).toBe("m42");
+  expect(draggingSelection.anchorTurnId).toBe(startTurnId);
   expect(draggingSelection.anchorConnected).toBe(true);
-  expect(draggingSelection.text).toContain("m42");
-  await expect(page.locator('[data-turn-id="m42"]')).toBeAttached();
+  expect(draggingSelection.text).toContain(startTurnId);
+  await expect(page.locator(
+    `[data-turn-id="${startTurnId}"]`,
+  )).toBeAttached();
   const draggedAnchor = await readingAnchor(page);
   await page.mouse.up();
   await expect(viewport).toHaveAttribute(
@@ -2000,7 +2228,7 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   expect(Math.abs(
     releasedAnchor.offset - immediateReleasedAnchor.offset,
   )).toBeLessThan(2);
-  await page.locator('[data-turn-id="m42"]').evaluate((node) => {
+  await page.locator(`[data-turn-id="${startTurnId}"]`).evaluate((node) => {
     (node as HTMLElement).style.paddingBottom = "320px";
   });
   await page.waitForTimeout(120);
@@ -2038,11 +2266,10 @@ test("desktop wheel scrolling remains available after text selection", async ({
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=120");
   const viewport = page.locator(".thread");
-  await viewport.evaluate((node) => {
-    node.scrollTop = node.scrollHeight * (41 / 120);
-  });
-  const text = page.locator('[data-turn-id="m42"] p').first();
-  await text.scrollIntoViewIfNeeded();
+  await wheelUntilTurn(page, "m42", -600, testInfo.project.name);
+  await waitForScrollIdle(page);
+  const startTurnId = (await readingAnchor(page)).id;
+  const text = page.locator(`[data-turn-id="${startTurnId}"] p`).first();
   const box = await text.boundingBox();
   if (!box) throw new Error("selection fixture has no geometry");
 
@@ -2122,11 +2349,9 @@ test("switching sessions clears retained desktop text selection", async ({
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=80");
   const viewport = page.locator(".thread");
-  await viewport.evaluate((node) => {
-    node.scrollTop = node.scrollHeight * 0.25;
-  });
-  const startText = page.locator('[data-turn-id="m20"] p').first();
-  await startText.scrollIntoViewIfNeeded();
+  await wheelUntilTurn(page, "m42", -600, testInfo.project.name);
+  await waitForScrollIdle(page);
+  const startText = page.locator('[data-turn-id="m42"] p').first();
   const start = await textSelectionPoint(startText);
   const textBox = await startText.boundingBox();
   if (!textBox) throw new Error("selection switch fixture has no geometry");
@@ -2155,8 +2380,7 @@ test("nested process disclosures survive virtual row unmounts", async ({
   page,
 }, testInfo) => {
   await page.goto("/tests/history-browser.html?timeline=1&engine=claude");
-  await wheelUntilTurn(page, "timeline", -4_000, testInfo.project.name);
-  await waitForScrollIdle(page);
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   const timeline = page.locator('[data-turn-id="timeline"]');
   await expect(timeline).toBeVisible();
   await timeline.locator(".turn-process-head").click();
@@ -2167,11 +2391,9 @@ test("nested process disclosures survive virtual row unmounts", async ({
   await expect(activity).toHaveAttribute("open", "");
   await expect(reasoning).toHaveAttribute("open", "");
 
-  await wheelUntilTurn(page, "f80", 4_000, testInfo.project.name);
-  await waitForScrollIdle(page);
+  await scrollThreadToEdge(page, "end", testInfo.project.name);
   await expect(timeline).toHaveCount(0);
-  await wheelUntilTurn(page, "timeline", -4_000, testInfo.project.name);
-  await waitForScrollIdle(page);
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   await expect(timeline).toBeVisible();
   await expect(timeline.locator("details.process-activity"))
     .toHaveAttribute("open", "");

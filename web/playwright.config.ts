@@ -1,5 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const NEW_CHAT_CONTROL_TESTS = /new-chat controls|256-character profile id/;
+
 export default defineConfig({
   testDir: "./tests",
   testMatch: "history-browser.spec.ts",
@@ -26,6 +28,17 @@ export default defineConfig({
     },
     {
       name: "webkit",
+      grepInvert: NEW_CHAT_CONTROL_TESTS,
+      use: {
+        ...devices["iPhone 15"],
+      },
+    },
+    {
+      // Keep the serial WebKit browser lifecycle below its macOS context-churn
+      // cliff. These independent control tests otherwise become the 64th+
+      // contexts and can stall before DOMContentLoaded despite passing alone.
+      name: "webkit-controls",
+      grep: NEW_CHAT_CONTROL_TESTS,
       use: {
         ...devices["iPhone 15"],
       },

@@ -18,8 +18,10 @@ import {
   reduceTargetedRuntime,
 } from "../src/runtime-drain.ts";
 import {
+  mergeDetailWithLiveTail,
   mergeInitialHistory,
   restoreCachedTurnDetails,
+  restoreObservedLiveTurnDetails,
 } from "../src/history-merge.ts";
 import {
   HISTORY_INITIAL_PAGE,
@@ -3416,7 +3418,7 @@ try {
           kind: "text",
           message_id: "dangling-history-answer",
           text: "partial answer",
-          done: false,
+          done: true,
           channel: "final",
         }],
         detailEventCount: 1,
@@ -3431,8 +3433,76 @@ try {
   );
   assert.equal(
     idleRepairState.runtimes[idleSnapshotRepairSid].turns[0].interrupted,
+    false,
+    "an idle authoritative transcript must not invent a user interruption",
+  );
+  assert.equal(
+    idleRepairState.runtimes[idleSnapshotRepairSid].turns[0].error,
+    undefined,
+    "normal idle reconciliation must not show an unknown-terminal warning",
+  );
+
+  const ambiguousIdleSid = "idle-history-keeps-ambiguous-terminal";
+  let ambiguousIdleState = {
+    ...initialState,
+    focusedSid: ambiguousIdleSid,
+    runtimes: {
+      [ambiguousIdleSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "ambiguous-idle-turn",
+          prompt: "crashed before a terminal",
+          done: false,
+          blocks: [{
+            kind: "text" as const,
+            message_id: "ambiguous-partial-answer",
+            text: "partial answer",
+            done: false,
+            channel: "final" as const,
+          }],
+        }],
+      },
+    },
+  };
+  ambiguousIdleState = reduce(ambiguousIdleState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: ambiguousIdleSid,
+      revision: "ambiguous-r1",
+      generation: "ambiguous-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "ambiguous-idle-turn",
+        prompt: "crashed before a terminal",
+        done: false,
+        blocks: [{
+          kind: "text",
+          message_id: "ambiguous-partial-answer",
+          text: "partial answer",
+          done: false,
+          channel: "final",
+        }],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    ambiguousIdleState.runtimes[ambiguousIdleSid].turns[0].interrupted,
     true,
-    "missing terminal evidence must not disguise partial output as a successful turn",
+    "idle alone cannot turn a partial dangling answer into success",
+  );
+  assert.match(
+    ambiguousIdleState.runtimes[ambiguousIdleSid].turns[0].error ?? "",
+    /终止状态/,
+    "an ambiguous terminal remains visibly distinguishable from success",
   );
 
   const optimisticIdleSid = "idle-history-protects-optimistic";
@@ -3508,8 +3578,14 @@ try {
         id: "accepted-idle-query",
         prompt: "accepted but terminal was lost",
         done: false,
-        blocks: [],
-        detailEventCount: 0,
+        blocks: [{
+          kind: "text",
+          message_id: "accepted-idle-answer",
+          text: "completed answer",
+          done: true,
+          channel: "final",
+        }],
+        detailEventCount: 1,
         detailLoaded: false,
       }],
     }),
@@ -3526,8 +3602,8 @@ try {
   );
   assert.equal(
     acceptedIdleState.runtimes[acceptedIdleSid].turns[0].interrupted,
-    true,
-    "a confirmed row without a terminal remains interrupted rather than successful",
+    false,
+    "a confirmed idle row without an explicit abort must settle normally",
   );
 
   const interruptedClaudeSid = "claude-interrupted-live-detail";
@@ -7602,7 +7678,10 @@ try {
   const correctedTurns = state.runtimes[correctedSid].turns;
   assert.equal(correctedTurns.length, 1);
   assert.equal(correctedTurns[0].blocks.length, 1);
-  assert.deepEqual(correctedTurns[0].blocks[0], {
+  const { liveOrder: correctedLiveOrder, ...correctedBlock } =
+    correctedTurns[0].blocks[0];
+  assert.equal(correctedLiveOrder, 0);
+  assert.deepEqual(correctedBlock, {
     kind: "text", message_id: "ambiguous-answer", text: "真实正文",
     done: true, channel: "final",
   });
@@ -7714,7 +7793,11 @@ try {
   let boundedBlockTurn = state.runtimes[boundedBlocksSid].turns[0];
   assert.equal(boundedBlockTurn.blocks.length, MAX_TURN_BLOCKS);
   assert.equal(boundedBlockTurn.blocks.filter((block: { kind: string; item_id?: string }) =>
-    block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 1);
+    block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 0,
+  "the routine live memory window must not paint an omission card");
+  assert.ok((boundedBlockTurn.detailEventCount ?? 0) >= generatedBlocks);
+  assert.equal(boundedBlockTurn.detailRestorePending, true,
+    "the first live spill must request an authoritative bounded detail page");
   assert.ok(boundedBlockTurn.blocks.some(
     (block: { kind: string; message_id?: string; channel?: string }) =>
       block.kind === "text" && block.message_id === "early-final"
@@ -7756,6 +7839,274 @@ try {
     kind: string; message_id?: string; channel?: string;
   }) => block.kind === "text" && block.message_id === "late-final"
     && block.channel === "final"));
+  state = reduce(state, {
+    type: "turn_detail_requested",
+    sid: boundedBlocksSid,
+    turnId: "bounded-block-turn",
+    autoLoad: false,
+  });
+  state = reduce(state, { type: "event", event: event({
+    type: "turn_end", sid: boundedBlocksSid, turn_id: "bounded-block-turn",
+    result: { subtype: "success", duration_ms: 1, is_error: false },
+  }) });
+  boundedBlockTurn = state.runtimes[boundedBlocksSid].turns[0];
+  assert.equal(boundedBlockTurn.detailRestorePending, true,
+    "terminal reconciliation survives an already in-flight running snapshot");
+  assert.equal(boundedBlockTurn.detailLoading, true);
+  const mergedLiveDetail = mergeDetailWithLiveTail(
+    [{
+      kind: "process", item_id: "source-old", processKind: "command",
+      phase: "end", status: "succeeded", title: "较早命令", done: true,
+    }],
+    [
+      {
+        kind: "process", item_id: OMITTED_PROCESS_ITEM_ID,
+        processKind: "compaction", phase: "snapshot", status: "succeeded",
+        title: "较早过程已省略", done: true,
+      },
+      {
+        kind: "process", item_id: "live-new", processKind: "agent",
+        phase: "start", status: "running", title: "最新活动", done: false,
+      },
+    ],
+  );
+  assert.deepEqual(mergedLiveDetail.map((block: {
+    kind: string; item_id?: string;
+  }) => block.kind === "process" ? block.item_id : ""), [
+    "source-old", "live-new",
+  ], "a loaded detail page and later live tail must render once in source order");
+  const repeatedDistinctCommentary = mergeDetailWithLiveTail(
+    [{
+      kind: "text", message_id: "history-repeat", text: "same update",
+      done: true, channel: "commentary",
+    }],
+    [{
+      kind: "text", message_id: "live-repeat", text: "same update",
+      done: true, channel: "commentary",
+    }],
+  );
+  assert.deepEqual(
+    repeatedDistinctCommentary.flatMap((block) =>
+      block.kind === "text" ? [block.message_id] : []),
+    ["history-repeat", "live-repeat"],
+    "equal detail/live text with distinct native ids is two real occurrences",
+  );
+  const authoritativePayload = mergeDetailWithLiveTail(
+    [{
+      kind: "process", item_id: "source-complete", processKind: "command",
+      phase: "end", status: "succeeded", title: "完整命令",
+      output: "FULL-AUTHORITATIVE-OUTPUT", done: true,
+    }],
+    [{
+      kind: "process", item_id: "source-complete", processKind: "command",
+      phase: "end", status: "succeeded", title: "完整命令",
+      output: "TRUNCATED-SPILL", done: true,
+    }],
+    true,
+  );
+  assert.equal(
+    authoritativePayload[0]?.kind === "process"
+      ? authoritativePayload[0].output : undefined,
+    "FULL-AUTHORITATIVE-OUTPUT",
+    "a bounded spill cannot overwrite a completed authoritative detail payload",
+  );
+  const authoritativeThroughLiveTail = mergeDetailWithLiveTail(
+    authoritativePayload,
+    [{
+      kind: "process", item_id: "source-complete", processKind: "command",
+      phase: "end", status: "succeeded", title: "完整命令",
+      output: "TRUNCATED-LIVE-TAIL", done: true,
+    }],
+    true,
+  );
+  assert.equal(
+    authoritativeThroughLiveTail[0]?.kind === "process"
+      ? authoritativeThroughLiveTail[0].output : undefined,
+    "FULL-AUTHORITATIVE-OUTPUT",
+    "the live Turn.blocks merge cannot overwrite detail after the spill merge",
+  );
+  const restoredObservedPayload = restoreObservedLiveTurnDetails(
+    [{
+      id: "observed-authoritative", prompt: "inspect", done: true,
+      blocks: [{
+        kind: "text", message_id: "observed-final",
+        text: "done", channel: "final", done: true,
+      }],
+    }],
+    [{
+      id: "observed-authoritative", prompt: "inspect", done: true,
+      blocks: [{
+        kind: "process", item_id: "observed-process",
+        processKind: "command", phase: "end", status: "succeeded",
+        title: "完整命令", output: "TRUNCATED-LIVE-TAIL", done: true,
+      }],
+      liveSpillBlocks: [{
+        kind: "process", item_id: "observed-process",
+        processKind: "command", phase: "end", status: "succeeded",
+        title: "完整命令", output: "TRUNCATED-SPILL", done: true,
+      }],
+      detailProjection: {
+        segments: [],
+        blocks: [{
+          kind: "process", item_id: "observed-process",
+          processKind: "command", phase: "end", status: "succeeded",
+          title: "完整命令", output: "FULL-AUTHORITATIVE-OUTPUT", done: true,
+        }],
+        capped: false,
+        hasMore: false,
+        oldestCursor: null,
+        hasNewer: false,
+        newerCursor: null,
+      },
+    }],
+  );
+  assert.equal(
+    restoredObservedPayload[0].detailProjection?.blocks[0]?.kind === "process"
+      ? restoredObservedPayload[0].detailProjection.blocks[0].output
+      : undefined,
+    "FULL-AUTHORITATIVE-OUTPUT",
+    "summary restoration keeps detail authoritative through spill and live",
+  );
+
+  const rollingSpillSid = "rolling-live-spill";
+  state = {
+    ...state,
+    runtimes: {
+      ...state.runtimes,
+      [rollingSpillSid]: {
+        ...createRuntime(), state: "running", syncReady: true,
+      },
+    },
+  };
+  state = reduce(state, { type: "query_sent", sid: rollingSpillSid,
+    prompt: "keep the whole running process", msg_id: "rolling-turn", ts: 31_600 });
+  const spillBatch = MAX_TURN_BLOCKS + 20;
+  const emitSpillBatch = (prefix: string) => {
+    for (let index = 0; index < spillBatch; index += 1) {
+      state = reduce(state, { type: "event", event: event({
+        type: "process", sid: rollingSpillSid,
+        item_id: `${prefix}-${index}`, kind: "command", phase: "end",
+        status: "succeeded", title: `${prefix} ${index}`,
+      }) });
+    }
+  };
+  emitSpillBatch("first");
+  let rollingTurn = state.runtimes[rollingSpillSid].turns[0];
+  const firstSpillCount = rollingTurn.liveSpilledBlockCount ?? 0;
+  const firstSnapshotBlocks = Array.from({ length: spillBatch }, (_, index) => ({
+    kind: "process" as const,
+    item_id: `first-${index}`,
+    processKind: "command" as const,
+    phase: "end" as const,
+    status: "succeeded" as const,
+    title: `first ${index}`,
+    done: true,
+  }));
+  state = {
+    ...state,
+    runtimes: {
+      ...state.runtimes,
+      [rollingSpillSid]: {
+        ...state.runtimes[rollingSpillSid],
+        turns: [{
+          ...rollingTurn,
+          detailRestorePending: false,
+          detailLoading: false,
+          detailLoaded: true,
+          liveSpillRefreshCount: firstSpillCount,
+          detailProjection: {
+            segments: [],
+            blocks: firstSnapshotBlocks,
+            capped: false,
+            hasMore: false,
+            oldestCursor: null,
+            hasNewer: false,
+            newerCursor: null,
+          },
+        }],
+      },
+    },
+  };
+  emitSpillBatch("second");
+  rollingTurn = state.runtimes[rollingSpillSid].turns[0];
+  const spillArchive = (rollingTurn as typeof rollingTurn & {
+    liveSpillBlocks?: typeof firstSnapshotBlocks;
+  }).liveSpillBlocks ?? [];
+  const completeRollingProcess = mergeDetailWithLiveTail(
+    rollingTurn.detailProjection?.blocks ?? [],
+    [...spillArchive, ...rollingTurn.blocks],
+  );
+  assert.equal(new Set(completeRollingProcess.flatMap((block) =>
+    block.kind === "process" ? [block.item_id] : [])).size, spillBatch * 2,
+  "a second live spill must remain continuous with the earlier detail snapshot");
+  assert.equal(rollingTurn.detailRestorePending, true,
+    "continued spill growth must schedule a coalesced authoritative refresh");
+  const reconciledRollingTurn = mergeInitialHistory(
+    [{
+      id: rollingTurn.id,
+      prompt: rollingTurn.prompt,
+      blocks: [],
+      done: false,
+    }],
+    [rollingTurn],
+    { preserveLiveTailOpen: true },
+  )[0];
+  assert.equal(
+    reconciledRollingTurn.liveSpillBlocks?.length,
+    rollingTurn.liveSpillBlocks?.length,
+    "an in-progress summary refresh cannot discard the provisional spill archive",
+  );
+
+  const interleavedSpillSid = "interleaved-live-spill";
+  state = {
+    ...state,
+    runtimes: {
+      ...state.runtimes,
+      [interleavedSpillSid]: {
+        ...createRuntime(), state: "running", syncReady: true,
+      },
+    },
+  };
+  state = reduce(state, { type: "query_sent", sid: interleavedSpillSid,
+    prompt: "preserve interleaved process order", msg_id: "interleaved-turn",
+    ts: 31_700 });
+  state = reduce(state, { type: "event", event: event({
+    type: "process", sid: interleavedSpillSid, item_id: "process-a",
+    kind: "command", phase: "start", status: "running", title: "A",
+  }) });
+  for (let index = 0; index < MAX_TURN_BLOCKS + 8; index += 1) {
+    state = reduce(state, { type: "event", event: event({
+      type: "process", sid: interleavedSpillSid,
+      item_id: `process-b-${index}`, kind: "command", phase: "start",
+      status: "running", title: `B ${index}`,
+    }) });
+  }
+  let interleavedTurn = state.runtimes[interleavedSpillSid].turns[0];
+  assert.ok(interleavedTurn.liveSpillBlocks?.some((block: Block) =>
+    block.kind === "process" && block.item_id === "process-a"),
+  "the oldest still-open process is represented in the spill archive");
+  state = reduce(state, { type: "event", event: event({
+    type: "process", sid: interleavedSpillSid, item_id: "process-a",
+    kind: "command", phase: "end", status: "succeeded", title: "A",
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "process", sid: interleavedSpillSid, item_id: "process-c",
+    kind: "command", phase: "start", status: "running", title: "C",
+  }) });
+  interleavedTurn = state.runtimes[interleavedSpillSid].turns[0];
+  const interleavedBlocks = [
+    ...(interleavedTurn.liveSpillBlocks ?? []),
+    ...interleavedTurn.blocks,
+  ].sort((left, right) => (left.liveOrder ?? 0) - (right.liveOrder ?? 0));
+  const interleavedIds = interleavedBlocks.flatMap((block) =>
+    block.kind === "process" ? [block.item_id] : []);
+  assert.equal(interleavedIds[0], "process-a");
+  assert.equal(interleavedIds.at(-1), "process-c");
+  assert.equal(interleavedIds.filter((id) => id === "process-a").length, 1,
+    "closing a spilled process updates its original block instead of appending a duplicate");
+  const processA = interleavedBlocks.find((block) =>
+    block.kind === "process" && block.item_id === "process-a");
+  assert.equal(processA?.done, true);
 
   const boundedPayloadSid = "bounded-turn-payload";
   state = {
@@ -7782,7 +8133,7 @@ try {
   assert.ok(payloadBlocks.some((block: { kind: string; item_id?: string }) =>
     block.kind === "process" && block.item_id === "large-diff-9"));
   assert.equal(payloadBlocks.filter((block: { kind: string; item_id?: string }) =>
-    block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 1);
+    block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 0);
 
   // Authoritative History is reduced through the same bounded window and must
   // not recreate an oversized turn after a refresh.
@@ -7816,7 +8167,8 @@ try {
   assert.equal(boundedHistoryTurn.blocks.length, MAX_TURN_BLOCKS);
   assert.equal(boundedHistoryTurn.blocks.filter((block: {
     kind: string; item_id?: string;
-  }) => block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 1);
+  }) => block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 0);
+  assert.ok((boundedHistoryTurn.detailEventCount ?? 0) > MAX_TURN_BLOCKS);
   assert.ok(boundedHistoryTurn.blocks.some((block: {
     kind: string; message_id?: string;
   }) => block.kind === "text" && block.message_id === "history-final"));
@@ -8022,6 +8374,22 @@ try {
   assert.match(answerMarkup, /回答中/);
   const { ProcessTimeline } = await reducerHarness.ssrLoadModule(
     "/src/components/ProcessTimeline.tsx");
+  const pagedProcessMarkup = renderToStaticMarkup(createElement(
+    ProcessTimeline, {
+      blocks: [{
+        kind: "process", item_id: "paged-process",
+        processKind: "command", phase: "end", status: "succeeded",
+        title: "当前过程页", done: true,
+      }],
+      done: true,
+      openOverride: true,
+      canLoadEarlier: true,
+      canLoadNewer: true,
+    },
+  ));
+  assert.match(pagedProcessMarkup, /加载更早过程/);
+  assert.match(pagedProcessMarkup, /返回较新过程/,
+    "a bounded process window keeps both source navigation controls");
   const declinedMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     blocks: [{ kind: "process", item_id: "approval-denied", processKind: "hook",
       phase: "end", status: "declined", title: "Hook 已拒绝", done: false }],

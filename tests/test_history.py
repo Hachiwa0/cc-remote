@@ -47,7 +47,10 @@ from cc_remote.wrapper.history_store import (
 )
 from cc_remote.wrapper.stream import (
     StreamTranslator,
+    transcript_compact_history_page,
+    transcript_compact_snapshot,
     last_assistant_model,
+    transcript_compact_main_chain,
     transcript_internal_user_events,
     translate_history,
 )
@@ -1133,6 +1136,67 @@ def test_get_turn_detail_is_routed_and_revision_bound(monkeypatch, tmp_path):
     asyncio.run(go())
 
 
+def test_running_claude_turn_detail_materializes_current_source_on_cache_miss(
+    monkeypatch, tmp_path,
+):
+    transcript = tmp_path / "session-running.jsonl"
+    transcript.write_text("{}\n")
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    events = (
+        {"type": "user_msg", "sid": "session-running",
+         "msg_id": "message-running", "prompt": "work"},
+        {"type": "process", "sid": "session-running",
+         "item_id": "process-running", "kind": "command",
+         "phase": "end", "status": "succeeded", "title": "运行命令"},
+    )
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-running")
+        ctx = _mk_ctx("session-running", "session-running")
+        ctx.engine = "claude"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+        builds = []
+
+        async def build_history(sid, **kwargs):
+            builds.append((sid, kwargs))
+            source = HistorySourceFingerprint.capture(transcript)
+            machine._history_index.put_turn_details(
+                sid, "claude", source, events)
+            return History(
+                session_id=sid,
+                revision=machine._history_revision(sid),
+                detail=kwargs["detail"],
+            )
+
+        machine._build_history = build_history
+        response = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id="session-running",
+            turn_id="message-running",
+            client_id="client-running",
+            revision=machine._history_revision("session-running"),
+            before=None,
+            limit=192,
+        ))
+
+        assert builds == [("session-running", {
+            "before": None,
+            "limit": 4,
+            "cwd_hint": ctx.cwd,
+            "detail": "summary",
+            "allow_stale": False,
+        })]
+        assert response.authoritative is True
+        assert response.error is None
+        assert any(
+            row.get("item_id") == "process-running"
+            for row in response.events
+        )
+
+    asyncio.run(go())
+
+
 def test_get_history_image_is_revision_bound_lazy_and_cached(
     monkeypatch, tmp_path,
 ):
@@ -1934,6 +1998,656 @@ def test_nonresident_claude_history_uses_authoritative_session_cwd(
     asyncio.run(go())
 
 
+def test_compacted_claude_main_chain_recovers_precompact_history(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "compacted-claude.jsonl"
+    rows = [
+        {
+            "type": "user", "uuid": "user-before", "parentUuid": None,
+            "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:01Z",
+            "message": {"role": "user", "content": "before compact"},
+        },
+        {
+            "type": "assistant", "uuid": "assistant-before",
+            "parentUuid": "user-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:02Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "old answer",
+            }]},
+        },
+        # This abandoned branch is append-adjacent but not part of the active
+        # parent chain. Raw file order must never resurrect it.
+        {
+            "type": "user", "uuid": "abandoned-user",
+            "parentUuid": "user-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:03Z",
+            "message": {"role": "user", "content": "abandoned branch"},
+        },
+        {
+            "type": "system", "subtype": "compact_boundary",
+            "uuid": "compact-boundary", "parentUuid": None,
+            "logicalParentUuid": "assistant-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:04Z",
+            "content": "Conversation compacted",
+        },
+        {
+            "type": "user", "uuid": "compact-summary",
+            "parentUuid": "compact-boundary", "isSidechain": False,
+            "isCompactSummary": True,
+            "timestamp": "2026-08-01T00:00:05Z",
+            "message": {
+                "role": "user",
+                "content": (
+                    "This session is being continued from a previous "
+                    "conversation that ran out of context.\n\nSummary: hidden"
+                ),
+            },
+        },
+        {
+            "type": "user", "uuid": "compact-command",
+            "parentUuid": "compact-summary", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:06Z",
+            "message": {
+                "role": "user",
+                "content": "<command-name>/compact</command-name>",
+            },
+        },
+        {
+            "type": "user", "uuid": "user-after",
+            "parentUuid": "compact-command", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:07Z",
+            "message": {"role": "user", "content": "after compact"},
+        },
+        {
+            "type": "assistant", "uuid": "assistant-after",
+            "parentUuid": "user-after", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:08Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "new answer",
+            }]},
+        },
+        {
+            "type": "assistant", "uuid": "sidechain-tail",
+            "parentUuid": "abandoned-user", "isSidechain": True,
+            "timestamp": "2026-08-01T00:00:09Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "private sidechain",
+            }]},
+        },
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+
+    recovered = transcript_compact_main_chain("claude-compact")
+
+    assert recovered is not None
+    messages, timestamps = recovered
+    assert [message.uuid for message in messages] == [
+        "user-before", "assistant-before", "compact-summary",
+        "compact-command", "user-after", "assistant-after",
+    ]
+    events = translate_history(messages, 10_000, timestamps=timestamps)
+    assert [event.prompt for event in events if isinstance(event, UserMsg)] == [
+        "before compact", "after compact",
+    ]
+    assert timestamps["user-before"] < timestamps["user-after"]
+
+
+def test_compacted_claude_main_chain_rejects_missing_logical_parent(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "broken-compact.jsonl"
+    rows = [
+        {
+            "type": "system", "subtype": "compact_boundary",
+            "uuid": "compact-boundary", "parentUuid": None,
+            "logicalParentUuid": "missing-precompact-parent",
+            "isSidechain": False,
+        },
+        {
+            "type": "user", "uuid": "compact-summary",
+            "parentUuid": "compact-boundary", "isSidechain": False,
+            "message": {
+                "role": "user",
+                "content": (
+                    "This session is being continued from a previous "
+                    "conversation that ran out of context.\n\nSummary: hidden"
+                ),
+            },
+        },
+        {
+            "type": "user", "uuid": "user-after",
+            "parentUuid": "compact-summary", "isSidechain": False,
+            "message": {"role": "user", "content": "after compact"},
+        },
+        {
+            "type": "assistant", "uuid": "assistant-after",
+            "parentUuid": "user-after", "isSidechain": False,
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "new answer",
+            }]},
+        },
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+
+    assert transcript_compact_main_chain("claude-broken-compact") is None
+
+
+def test_compact_index_reuses_snapshot_and_scans_only_appended_rows(
+        monkeypatch, tmp_path):
+    import cc_remote.wrapper.history_store as history_store_module
+
+    transcript = tmp_path / "incremental-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old"}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer"}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": "summary"}},
+    ]
+    transcript.write_bytes(b"".join(
+        (json.dumps(row) + "\n").encode() for row in rows))
+    store = HistoryIndexStore(tmp_path / "incremental-state")
+
+    def visible_user(row):
+        return row.get("type") == "user"
+
+    initial_size = transcript.stat().st_size
+    initial = store.get_claude_compact_index(
+        str(transcript), snapshot_size=initial_size,
+        max_record_bytes=64 * 1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert initial is not None
+    assert initial.leaf == "compact-summary"
+
+    real_loads = history_store_module.json.loads
+    monkeypatch.setattr(
+        history_store_module.json, "loads",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an unchanged page must reuse the compact index")),
+    )
+    assert store.get_claude_compact_index(
+        str(transcript), snapshot_size=initial_size,
+        max_record_bytes=64 * 1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    ) is not None
+
+    parsed = 0
+
+    def count_loads(payload):
+        nonlocal parsed
+        parsed += 1
+        return real_loads(payload)
+
+    monkeypatch.setattr(history_store_module.json, "loads", count_loads)
+    appended = {
+        "type": "user", "uuid": "user-new",
+        "parentUuid": "compact-summary", "isSidechain": False,
+        "message": {"role": "user", "content": "new"},
+    }
+    with transcript.open("ab") as target:
+        target.write((json.dumps(appended) + "\n").encode())
+    updated = store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=64 * 1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert updated is not None
+    assert updated.leaf == "user-new"
+    assert parsed == 1
+
+
+def test_compact_index_never_authorizes_an_incomplete_snapshot(tmp_path):
+    transcript = tmp_path / "growing-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old"}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": []}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": "summary"}},
+    ]
+    transcript.write_bytes(b"".join(
+        (json.dumps(row) + "\n").encode() for row in rows))
+    store = HistoryIndexStore(tmp_path / "growing-state")
+
+    def visible_user(row):
+        return row.get("type") == "user"
+
+    stable_size = transcript.stat().st_size
+    assert store.get_claude_compact_index(
+        str(transcript), snapshot_size=stable_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    ) is not None
+
+    with transcript.open("ab") as target:
+        target.write(b'{"type":"assistant","uuid":"partial')
+    assert store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    ) is None
+    stable = store.get_claude_compact_index(
+        str(transcript), snapshot_size=stable_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert stable is not None
+    assert stable.leaf == "compact-summary"
+
+
+def test_compact_index_rebuilds_after_truncate_and_inode_replacement(tmp_path):
+    transcript = tmp_path / "replaceable-compact.jsonl"
+    store = HistoryIndexStore(tmp_path / "replaceable-state")
+
+    def visible_user(row):
+        return row.get("type") == "user"
+
+    def write_chain(path, suffix, padding=""):
+        rows = [
+            {"type": "user", "uuid": f"user-{suffix}", "parentUuid": None,
+             "isSidechain": False,
+             "message": {"role": "user", "content": padding or suffix}},
+            {"type": "assistant", "uuid": f"answer-{suffix}",
+             "parentUuid": f"user-{suffix}", "isSidechain": False,
+             "message": {"role": "assistant", "content": []}},
+            {"type": "system", "subtype": "compact_boundary",
+             "uuid": f"compact-{suffix}", "parentUuid": None,
+             "logicalParentUuid": f"answer-{suffix}", "isSidechain": False},
+            {"type": "user", "uuid": f"summary-{suffix}",
+             "parentUuid": f"compact-{suffix}", "isSidechain": False,
+             "message": {"role": "user", "content": "summary"}},
+        ]
+        path.write_bytes(b"".join(
+            (json.dumps(row) + "\n").encode() for row in rows))
+
+    write_chain(transcript, "large", "x" * 4096)
+    initial = store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert initial is not None and initial.leaf == "summary-large"
+
+    write_chain(transcript, "small")
+    truncated = store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert truncated is not None and truncated.leaf == "summary-small"
+    assert "summary-large" not in truncated.rows
+
+    replacement = tmp_path / "replacement.jsonl"
+    write_chain(replacement, "inode")
+    os.replace(replacement, transcript)
+    replaced = store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert replaced is not None and replaced.leaf == "summary-inode"
+    assert "summary-small" not in replaced.rows
+
+
+def test_compact_index_loads_large_active_record_and_task_notification(tmp_path):
+    transcript = tmp_path / "large-active-compact.jsonl"
+    notification = (
+        "<task-notification><task-id>task-large</task-id>"
+        "<status>completed</status></task-notification>"
+    )
+    rows = [
+        {"type": "queue-operation", "operation": "enqueue",
+         "content": notification},
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old"}},
+        {"type": "assistant", "uuid": "answer-large",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "x" * (20 * 1024 * 1024)}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-large", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": "summary"}},
+        {"type": "user", "uuid": "task-notification",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "origin": {"kind": "task-notification"},
+         "message": {"role": "user", "content": notification}},
+        {"type": "user", "uuid": "user-new",
+         "parentUuid": "task-notification", "isSidechain": False,
+         "message": {"role": "user", "content": "new"}},
+    ]
+    transcript.write_bytes(b"".join(
+        (json.dumps(row) + "\n").encode() for row in rows))
+    store = HistoryIndexStore(tmp_path / "large-active-state")
+    snapshot = transcript_compact_snapshot(
+        "claude-compact", path=str(transcript), index_store=store,
+        snapshot_size=transcript.stat().st_size,
+        max_record_bytes=64 * 1024 * 1024,
+    )
+    assert snapshot is not None
+    messages, _timestamps, internal_events = snapshot
+    assert "answer-large" in {message.uuid for message in messages}
+    assert len(next(message for message in messages
+                    if message.uuid == "answer-large").message["content"][0][
+                        "text"]) == 20 * 1024 * 1024
+    assert internal_events["task-notification"].kind == "task"
+
+
+def test_compacted_claude_page_loads_only_requested_main_chain_turns(
+        tmp_path):
+    transcript = tmp_path / "paged-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-1", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "question 1"}},
+        {"type": "assistant", "uuid": "answer-1", "parentUuid": "user-1",
+         "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer 1"}]}},
+        {"type": "user", "uuid": "user-2", "parentUuid": "answer-1",
+         "isSidechain": False,
+         "message": {"role": "user", "content": "question 2"}},
+        {"type": "assistant", "uuid": "answer-2", "parentUuid": "user-2",
+         "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer 2"}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-2", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": (
+             "This session is being continued from a previous conversation "
+             "that ran out of context.\n\nSummary: hidden")}},
+        {"type": "user", "uuid": "compact-command",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "message": {"role": "user",
+                     "content": "<command-name>/compact</command-name>"}},
+        {"type": "user", "uuid": "user-3",
+         "parentUuid": "compact-command", "isSidechain": False,
+         "message": {"role": "user", "content": "question 3"}},
+        {"type": "assistant", "uuid": "answer-3", "parentUuid": "user-3",
+         "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer 3"}]}},
+        {"type": "user", "uuid": "user-4", "parentUuid": "answer-3",
+         "isSidechain": False,
+         "message": {"role": "user", "content": "question 4"}},
+        {"type": "assistant", "uuid": "answer-4", "parentUuid": "user-4",
+         "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer 4"}]}},
+        {"type": "assistant", "uuid": "abandoned-large",
+         "parentUuid": "answer-1", "isSidechain": True,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "x" * (1024 * 1024)}]}},
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    newest = transcript_compact_history_page(
+        "claude-compact", path=str(transcript), limit=1)
+    assert newest is not None
+    assert [message.uuid for message in newest.messages] == [
+        "user-4", "answer-4",
+    ]
+    assert newest.has_more is True
+    assert newest.oldest_cursor == "user-4"
+
+    older = transcript_compact_history_page(
+        "claude-compact", path=str(transcript), before="user-4", limit=2)
+    assert older is not None
+    assert [message.uuid for message in older.messages] == [
+        "user-2", "answer-2", "compact-summary", "compact-command",
+        "user-3", "answer-3",
+    ]
+    assert older.has_more is True
+    assert older.oldest_cursor == "user-2"
+
+
+def test_compacted_claude_page_uses_only_visible_human_boundaries(tmp_path):
+    transcript = tmp_path / "internal-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old question"}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "old answer"}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": (
+             "This session is being continued from a previous conversation "
+             "that ran out of context.\n\nSummary: hidden")}},
+        {"type": "user", "uuid": "task-notification",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "origin": {"kind": "task-notification"},
+         "message": {"role": "user", "content": (
+             "<task-notification><task-id>task-1</task-id>"
+             "<status>completed</status></task-notification>")}},
+        {"type": "user", "uuid": "blank-user",
+         "parentUuid": "task-notification", "isSidechain": False,
+         "message": {"role": "user", "content": "   "}},
+        {"type": "user", "uuid": "user-new",
+         "parentUuid": "blank-user", "isSidechain": False,
+         "message": {"role": "user", "content": "new question"}},
+        {"type": "assistant", "uuid": "answer-new",
+         "parentUuid": "user-new", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "new answer"}]}},
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    older = transcript_compact_history_page(
+        "claude-compact", path=str(transcript),
+        before="user-new", limit=1,
+    )
+
+    assert older is not None
+    assert older.oldest_cursor == "user-old"
+    assert older.has_more is False
+    assert [message.uuid for message in older.messages] == [
+        "user-old", "answer-old", "compact-summary",
+        "task-notification", "blank-user",
+    ]
+    exhausted = transcript_compact_history_page(
+        "claude-compact", path=str(transcript),
+        before="user-old", limit=1,
+    )
+    assert exhausted is not None
+    assert exhausted.messages == []
+    assert exhausted.oldest_cursor is None
+    assert exhausted.has_more is False
+    assert transcript_compact_history_page(
+        "claude-compact", path=str(transcript),
+        before="not-a-page-cursor", limit=1,
+    ) is None
+
+
+def test_compacted_claude_page_drops_oldest_turns_to_payload_budget(tmp_path):
+    transcript = tmp_path / "budgeted-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old " + "x" * 400}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "old answer " + "y" * 400}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": (
+             "This session is being continued from a previous conversation "
+             "that ran out of context.\n\nSummary: hidden")}},
+        {"type": "user", "uuid": "user-new",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "message": {"role": "user", "content": "new question"}},
+        {"type": "assistant", "uuid": "answer-new",
+         "parentUuid": "user-new", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "new answer"}]}},
+    ]
+    encoded_rows = [
+        (json.dumps(row) + "\n").encode("utf-8") for row in rows
+    ]
+    transcript.write_bytes(b"".join(encoded_rows))
+    newest_payload_bytes = len(encoded_rows[-2]) + len(encoded_rows[-1])
+
+    page = transcript_compact_history_page(
+        "claude-compact", path=str(transcript), limit=2,
+        max_payload_bytes=newest_payload_bytes,
+    )
+
+    assert page is not None
+    assert [message.uuid for message in page.messages] == [
+        "user-new", "answer-new",
+    ]
+    assert page.oldest_cursor == "user-new"
+    assert page.has_more is True
+    assert transcript_compact_history_page(
+        "claude-compact", path=str(transcript), limit=1,
+        max_payload_bytes=newest_payload_bytes - 1,
+    ) is None
+
+
+def test_compacted_claude_history_pages_across_compact_boundary(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "claude-session.jsonl"
+    rows = [
+        {
+            "type": "user", "uuid": "turn-before", "parentUuid": None,
+            "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:01Z",
+            "message": {"role": "user", "content": "before compact"},
+        },
+        {
+            "type": "assistant", "uuid": "answer-before",
+            "parentUuid": "turn-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:02Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "old answer",
+            }]},
+        },
+        {
+            "type": "system", "subtype": "compact_boundary",
+            "uuid": "compact-boundary", "parentUuid": None,
+            "logicalParentUuid": "answer-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:03Z",
+        },
+        {
+            "type": "user", "uuid": "compact-summary",
+            "parentUuid": "compact-boundary", "isSidechain": False,
+            "isCompactSummary": True,
+            "timestamp": "2026-08-01T00:00:04Z",
+            "message": {
+                "role": "user",
+                "content": (
+                    "This session is being continued from a previous "
+                    "conversation that ran out of context.\n\nSummary: hidden"
+                ),
+            },
+        },
+        {
+            "type": "user", "uuid": "turn-after",
+            "parentUuid": "compact-summary", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:05Z",
+            "message": {"role": "user", "content": "after compact"},
+        },
+        {
+            "type": "assistant", "uuid": "answer-after",
+            "parentUuid": "turn-after", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:06Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "new answer",
+            }]},
+        },
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+    # Characterize the SDK limitation: after compact it exposes only the new
+    # ancestry. _build_history must prefer the raw logical-parent chain.
+    monkeypatch.setattr(
+        mm,
+        "get_session_messages",
+        lambda *_args, **_kwargs: [SimpleNamespace(
+            uuid="turn-after", type="user",
+            message={"role": "user", "content": "after compact"},
+            parent_tool_use_id=None,
+        )],
+    )
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "compact-state")
+        newest = await machine._build_history(
+            "claude-compact", limit=1, detail="summary")
+        assert [turn.prompt for turn in newest.turns] == ["after compact"]
+        assert newest.has_more is True
+
+        older = await machine._build_history(
+            "claude-compact", before="turn-after", limit=1,
+            detail="summary",
+        )
+        assert [turn.prompt for turn in older.turns] == ["before compact"]
+        assert older.has_more is False
+
+    asyncio.run(go())
+
+
 def test_scoped_empty_claude_history_retries_global_lookup(
         monkeypatch, tmp_path):
     transcript = tmp_path / "claude.jsonl"
@@ -2630,6 +3344,93 @@ def test_oversized_transcript_is_rejected_before_full_parse(monkeypatch, tmp_pat
 
     asyncio.run(go())
     assert parsed is False
+
+
+def test_oversized_compacted_claude_transcript_uses_bounded_turn_pages(
+        monkeypatch, tmp_path):
+    source = tmp_path / "huge-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old question"}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "old answer"}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": (
+             "This session is being continued from a previous conversation "
+             "that ran out of context.\n\nSummary: hidden")}},
+        {"type": "user", "uuid": "user-new",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "message": {"role": "user", "content": "new question"}},
+        {"type": "assistant", "uuid": "answer-new",
+         "parentUuid": "user-new", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "new answer"}]}},
+    ]
+    source.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    parsed_by_sdk = False
+
+    def should_not_parse(*_args, **_kwargs):
+        nonlocal parsed_by_sdk
+        parsed_by_sdk = True
+        raise AssertionError("oversized compact history must not use SDK parse")
+
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(source))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(source),
+    )
+    monkeypatch.setattr(mm.os.path, "getsize", lambda _path: 100_000_000)
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+    monkeypatch.setattr(mm, "get_session_messages", should_not_parse)
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine.cfg.history_source_max_bytes = 64 * 1024 * 1024
+        machine._history_index = HistoryIndexStore(tmp_path / "huge-state")
+
+        newest = await machine._build_history(
+            "claude-compact", limit=1, detail="summary")
+        assert [turn.prompt for turn in newest.turns] == ["new question"]
+        assert newest.oldest_id == "user-new"
+        assert newest.has_more is True
+
+        older = await machine._build_history(
+            "claude-compact", before="user-new", limit=1,
+            detail="summary",
+        )
+        assert [turn.prompt for turn in older.turns] == ["old question"]
+        assert older.oldest_id == "user-old"
+        assert older.has_more is False
+
+        exhausted = await machine._build_history(
+            "claude-compact", before="user-old", limit=1,
+            detail="summary",
+        )
+        assert exhausted.turns == []
+        assert exhausted.oldest_id is None
+        assert exhausted.has_more is False
+
+        stale = await machine._build_history(
+            "claude-compact", before="stale-cursor", limit=1,
+            detail="summary",
+        )
+        assert stale.events[0]["type"] == "error"
+        assert "游标已失效" in stale.events[0]["message"]
+        assert "HISTORY_SOURCE_MAX_BYTES" not in stale.events[0]["message"]
+
+    asyncio.run(go())
+    assert parsed_by_sdk is False
 
 
 def test_oversized_codex_rollout_reads_recent_turn_window(monkeypatch, tmp_path):

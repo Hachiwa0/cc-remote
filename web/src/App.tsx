@@ -1616,83 +1616,105 @@ export default function App() {
             }
           }
           if (msg.type === "turn_detail") {
-            const detailTarget =
-              historyDetailRequestsRef.current.complete(msg);
-            if (!detailTarget) return;
+            const detailTargets =
+              historyDetailRequestsRef.current.completeAll(msg);
+            if (detailTargets.length === 0) return;
             const retryKey = [
               "detail", msg.session_id, msg.revision, msg.turn_id,
               msg.before ?? "",
             ].join("\u0000");
             if (msg.authoritative === false) {
-              if (detailTarget.target === "browse") {
-                dispatch({
-                  type: "history_browse_detail",
-                  sid: detailTarget.sid,
-                  scopeKey: detailTarget.scopeKey,
-                  revision: detailTarget.revision,
-                  viewId: detailTarget.viewId,
-                  windowEpoch: detailTarget.windowEpoch,
-                  turnId: detailTarget.turnId,
-                  events: [],
-                  before: detailTarget.before,
-                });
-              } else {
-                dispatch({ type: "event", event: msg, ownership });
-              }
-              recoverableReads.retry(retryKey, () => {
-                if (cancelled) return;
-                if (stateRef.current.focusedSid !== msg.session_id) return;
-                const current = stateRef.current;
-                if (detailTarget.target === "browse") {
-                  const browse = current.historyBrowse;
-                  if (!browse
-                      || browse.scopeKey !== detailTarget.scopeKey
-                      || browse.viewId !== detailTarget.viewId
-                      || browse.revision !== detailTarget.revision
-                      || !browse.turns.some((turn) =>
-                        canonicalTurnId(turn) === detailTarget.turnId
-                        || turn.id === detailTarget.turnId)) return;
-                } else {
-                  const runtime = current.runtimes[msg.session_id];
-                  const turn = runtime?.turns.find(
-                    (item) => canonicalTurnId(item) === msg.turn_id
-                      || item.id === msg.turn_id);
-                  if (!turn || (!detailTarget.before && turn.detailLoaded)
-                      || runtime.historyRevision !== detailTarget.revision) return;
-                }
-                if (!historyDetailRequestsRef.current.begin(detailTarget)) return;
-                const sent = ws.sendGetTurnDetail(
-                  msg.session_id, msg.turn_id, detailTarget.revision,
-                  detailTarget.before);
-                if (!sent) {
-                  historyDetailRequestsRef.current.cancel(detailTarget);
-                  return;
-                }
+              let runtimeReleased = false;
+              for (const detailTarget of detailTargets) {
                 if (detailTarget.target === "browse") {
                   dispatch({
-                    type: "history_browse_detail_requested",
+                    type: "history_browse_detail",
                     sid: detailTarget.sid,
                     scopeKey: detailTarget.scopeKey,
                     revision: detailTarget.revision,
                     viewId: detailTarget.viewId,
                     windowEpoch: detailTarget.windowEpoch,
                     turnId: detailTarget.turnId,
+                    events: [],
                     before: detailTarget.before,
                   });
-                } else {
-                  dispatch({
-                    type: "turn_detail_requested", sid: detailTarget.sid,
-                    turnId: detailTarget.turnId,
-                    before: detailTarget.before,
-                    autoLoad: detailTarget.autoLoad,
-                  });
+                } else if (!runtimeReleased) {
+                  dispatch({ type: "event", event: msg, ownership });
+                  runtimeReleased = true;
+                }
+              }
+              recoverableReads.retry(retryKey, () => {
+                if (cancelled) return;
+                if (stateRef.current.focusedSid !== msg.session_id) return;
+                const current = stateRef.current;
+                const activeTargets = detailTargets.filter((detailTarget) => {
+                  if (detailTarget.target === "browse") {
+                    const browse = current.historyBrowse;
+                    return !!browse
+                      && browse.scopeKey === detailTarget.scopeKey
+                      && browse.viewId === detailTarget.viewId
+                      && browse.revision === detailTarget.revision
+                      && browse.turns.some((turn) =>
+                        canonicalTurnId(turn) === detailTarget.turnId
+                        || turn.id === detailTarget.turnId);
+                  }
+                  const runtime = current.runtimes[msg.session_id];
+                  const turn = runtime?.turns.find(
+                    (item) => canonicalTurnId(item) === msg.turn_id
+                      || item.id === msg.turn_id);
+                  return !!turn && (!!detailTarget.before || !turn.detailLoaded)
+                    && runtime?.historyRevision === detailTarget.revision;
+                });
+                if (activeTargets.length === 0) return;
+                const registrations = activeTargets.map((detailTarget) => ({
+                  detailTarget,
+                  registration:
+                    historyDetailRequestsRef.current.register(detailTarget),
+                })).filter(({ registration }) => registration.accepted);
+                if (registrations.length === 0) return;
+                if (registrations.some(({ registration }) => registration.send)) {
+                  const target = registrations[0].detailTarget;
+                  const sent = ws.sendGetTurnDetail(
+                    msg.session_id, msg.turn_id, target.revision, target.before);
+                  if (!sent) {
+                    for (const { detailTarget } of registrations) {
+                      historyDetailRequestsRef.current.cancel(detailTarget);
+                    }
+                    return;
+                  }
+                }
+                for (const { detailTarget } of registrations) {
+                  if (detailTarget.target === "browse") {
+                    dispatch({
+                      type: "history_browse_detail_requested",
+                      sid: detailTarget.sid,
+                      scopeKey: detailTarget.scopeKey,
+                      revision: detailTarget.revision,
+                      viewId: detailTarget.viewId,
+                      windowEpoch: detailTarget.windowEpoch,
+                      turnId: detailTarget.turnId,
+                      before: detailTarget.before,
+                    });
+                  } else {
+                    dispatch({
+                      type: "turn_detail_requested", sid: detailTarget.sid,
+                      turnId: detailTarget.turnId,
+                      before: detailTarget.before,
+                      autoLoad: detailTarget.autoLoad,
+                    });
+                  }
                 }
               });
               return;
             } else {
               recoverableReads.complete(retryKey);
             }
-            if (detailTarget.target === "browse") {
+            let runtimeTarget = false;
+            for (const detailTarget of detailTargets) {
+              if (detailTarget.target === "runtime") {
+                runtimeTarget = true;
+                continue;
+              }
               dispatch({
                 type: "history_browse_detail",
                 sid: detailTarget.sid,
@@ -1708,8 +1730,8 @@ export default function App() {
                 hasNewer: msg.has_newer,
                 newerCursor: msg.newer_cursor,
               });
-              return;
             }
+            if (!runtimeTarget) return;
           }
           if (msg.type === "rollback_result" && msg.files === "succeeded"
               && stateRef.current.artifact?.sid === msg.session_id) {
@@ -2562,9 +2584,12 @@ export default function App() {
           before,
           autoLoad,
         };
-    if (!historyDetailRequestsRef.current.begin(context)) return false;
-    const sent = wsRef.current?.sendGetTurnDetail(
-      sid, turnId, context.revision, before) ?? false;
+    const registration = historyDetailRequestsRef.current.register(context);
+    if (!registration.accepted) return false;
+    const sent = !registration.send || (
+      wsRef.current?.sendGetTurnDetail(
+        sid, turnId, context.revision, before) ?? false
+    );
     if (!sent) {
       historyDetailRequestsRef.current.cancel(context);
       return false;

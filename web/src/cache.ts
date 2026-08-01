@@ -12,6 +12,7 @@ import {
 import type {
   Block, ProcessBlock, TextBlock, ToolBlock, Turn,
 } from "./domain/conversation.ts";
+import { mergeDetailWithLiveTail } from "./history-merge.ts";
 
 const DB_NAME = "cc_remote_cache";
 const STORE = "sessions";
@@ -165,8 +166,23 @@ function projectTurnForCache(turn: Turn): Turn {
   const finalBudget = { remaining: CACHE_FINAL_TEXT_CHARS };
   const processTextBudget = { remaining: CACHE_PROCESS_TEXT_CHARS };
   const detailBudget = { remaining: CACHE_PROCESS_DETAIL_CHARS };
-  const projectionBlocks = turn.detailProjection?.blocks?.length
-    ? turn.detailProjection.blocks : turn.blocks;
+  const completedDetailAuthoritative = turn.done
+    && !turn.detailRestorePending
+    && !turn.detailRestoreIncomplete;
+  const projectionWithArchive = turn.detailProjection || turn.liveSpillBlocks
+    ? mergeDetailWithLiveTail(
+        turn.detailProjection?.blocks ?? [],
+        turn.liveSpillBlocks ?? [],
+        completedDetailAuthoritative,
+      )
+    : [];
+  const projectionBlocks = projectionWithArchive.length > 0
+    ? mergeDetailWithLiveTail(
+        projectionWithArchive,
+        turn.blocks,
+        completedDetailAuthoritative,
+      )
+    : turn.blocks;
   const finalBlocks = turn.blocks.filter((block): block is TextBlock =>
     block.kind === "text" && block.channel === "final");
   const sourceBlocks = [...projectionBlocks];
@@ -222,6 +238,8 @@ function projectTurnForCache(turn: Turn): Turn {
     detailRestorePending: false,
     detailRestoreOpen: false,
     detailRestoreIncomplete: false,
+    liveSpillBlocks: undefined,
+    liveSpillRefreshCount: undefined,
   };
 }
 
@@ -303,6 +321,8 @@ function projectTurnSkeletonForCache(turn: Turn): Turn {
       filename: clipCacheString(file.filename, 1024) ?? "",
       data: "",
     })),
+    liveSpillBlocks: undefined,
+    liveSpillRefreshCount: undefined,
   };
 }
 

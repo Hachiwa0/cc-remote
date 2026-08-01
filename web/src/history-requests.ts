@@ -198,7 +198,7 @@ export type HistoryDetailRequestContext =
  */
 export class HistoryDetailRequestCoordinator {
   private readonly pending = new Map<string, {
-    context: HistoryDetailRequestContext;
+    contexts: HistoryDetailRequestContext[];
     timer: unknown;
   }>();
   private readonly onTimeout: (context: HistoryDetailRequestContext) => void;
@@ -238,11 +238,30 @@ export class HistoryDetailRequestCoordinator {
       + `\u0000${input.before ?? ""}`;
   }
 
-  begin(context: HistoryDetailRequestContext): boolean {
+  private static contextKey(context: HistoryDetailRequestContext): string {
+    return context.target === "browse"
+      ? [context.target, context.scopeKey, context.viewId, context.windowEpoch]
+        .join("\u0000")
+      : [context.target, context.scopeKey, context.autoLoad ? 1 : 0]
+        .join("\u0000");
+  }
+
+  register(context: HistoryDetailRequestContext): {
+    accepted: boolean;
+    send: boolean;
+  } {
     const key = HistoryDetailRequestCoordinator.key(context);
-    if (this.pending.has(key)) return false;
+    const existing = this.pending.get(key);
+    if (existing) {
+      const contextKey = HistoryDetailRequestCoordinator.contextKey(context);
+      if (!existing.contexts.some((candidate) =>
+        HistoryDetailRequestCoordinator.contextKey(candidate) === contextKey)) {
+        existing.contexts.push({ ...context });
+      }
+      return { accepted: true, send: false };
+    }
     const pending = {
-      context: { ...context },
+      contexts: [{ ...context }],
       timer: null as unknown,
     };
     this.pending.set(key, pending);
@@ -250,13 +269,18 @@ export class HistoryDetailRequestCoordinator {
       pending.timer = this.schedule(() => {
         if (this.pending.get(key) !== pending) return;
         this.pending.delete(key);
-        this.onTimeout({ ...pending.context });
+        for (const target of pending.contexts) this.onTimeout({ ...target });
       }, this.timeoutMs);
     } catch {
       this.pending.delete(key);
-      return false;
+      return { accepted: false, send: false };
     }
-    return true;
+    return { accepted: true, send: true };
+  }
+
+  begin(context: HistoryDetailRequestContext): boolean {
+    const registration = this.register(context);
+    return registration.accepted && registration.send;
   }
 
   complete(response: {
@@ -265,28 +289,40 @@ export class HistoryDetailRequestCoordinator {
     turn_id: string;
     before?: string | null;
   }): HistoryDetailRequestContext | null {
+    return this.completeAll(response)[0] ?? null;
+  }
+
+  completeAll(response: {
+    session_id: string;
+    revision: string;
+    turn_id: string;
+    before?: string | null;
+  }): HistoryDetailRequestContext[] {
     const key = HistoryDetailRequestCoordinator.key(response);
     const pending = this.pending.get(key);
-    if (!pending) return null;
+    if (!pending) return [];
     this.pending.delete(key);
     this.cancelTimer(pending.timer);
-    return { ...pending.context };
+    return pending.contexts.map((context) => ({ ...context }));
   }
 
   cancel(context: HistoryDetailRequestContext): void {
     const key = HistoryDetailRequestCoordinator.key(context);
     const pending = this.pending.get(key);
     if (!pending) return;
-    if (pending.context.target !== context.target
-        || pending.context.scopeKey !== context.scopeKey) return;
-    this.pending.delete(key);
-    this.cancelTimer(pending.timer);
+    const contextKey = HistoryDetailRequestCoordinator.contextKey(context);
+    pending.contexts = pending.contexts.filter((candidate) =>
+      HistoryDetailRequestCoordinator.contextKey(candidate) !== contextKey);
+    if (pending.contexts.length === 0) {
+      this.pending.delete(key);
+      this.cancelTimer(pending.timer);
+    }
   }
 
   clear(): HistoryDetailRequestContext[] {
-    const contexts = [...this.pending.values()].map((pending) => {
+    const contexts = [...this.pending.values()].flatMap((pending) => {
       this.cancelTimer(pending.timer);
-      return { ...pending.context };
+      return pending.contexts.map((context) => ({ ...context }));
     });
     this.pending.clear();
     return contexts;

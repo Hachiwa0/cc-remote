@@ -161,7 +161,9 @@ from cc_remote.wrapper.history_store import (
 )
 from cc_remote.wrapper.stream import (
     StreamTranslator, extract_session_id, extract_model,
-    translate_history, last_assistant_model, transcript_internal_user_events,
+    translate_history, last_assistant_model, transcript_compact_snapshot,
+    transcript_compact_history_page,
+    transcript_internal_user_events,
     transcript_timestamps, transcript_path,
     translate_subagent_history, merge_subagent_history,
 )
@@ -6257,6 +6259,7 @@ class WrapperMachine:
         source_window_has_more = False
         source_window_oldest_cursor = None
         source_window_boundary_offset = None
+        oversized_compact_page = None
         try:
             source_path = await asyncio.to_thread(
                 codex_rollout_path if is_codex_hist else transcript_path, sid)
@@ -6421,7 +6424,6 @@ class WrapperMachine:
                 ]
             if (
                 (stale_indexed_page or not cached_source_stable)
-                and not source_too_large
                 and before is None
             ):
                 self._schedule_history_refresh(
@@ -6433,27 +6435,52 @@ class WrapperMachine:
                 )
             return cached_history
         if source_too_large:
-            notice = Error(
-                code=ERR_INTERNAL,
-                message=("历史文件超过安全读取上限；请调大 "
-                         "HISTORY_SOURCE_MAX_BYTES 或在终端中查看"),
-                sid=sid,
-            )
-            return History(
-                session_id=sid,
-                revision=revision,
-                generation=self.instance_id,
-                build_seq=build_seq,
-                live_seq=live_seq,
-                events=[notice.model_dump(mode="json")],
-                has_more=False,
+            oversized_compact_page = await asyncio.to_thread(
+                transcript_compact_history_page,
+                sid,
+                path=source_path,
                 before=before,
-                external=self._is_external(sid),
-                control=control,
-                takeover_pending=bool(
-                    (self._watch.get(sid) or {}).get("takeover_pending")),
-                in_progress=in_progress,
+                limit=(int(limit) if isinstance(limit, int) and limit > 0
+                       else self.MIRROR_LIMIT),
+                max_payload_bytes=self.cfg.history_source_max_bytes,
+                index_store=self._history_index,
+                snapshot_size=(source_fingerprint.size
+                               if source_fingerprint is not None else None),
+                max_record_bytes=min(
+                    256 * 1024 * 1024,
+                    max(64 * 1024 * 1024,
+                        self.cfg.history_source_max_bytes),
+                ),
             )
+            if oversized_compact_page is None:
+                message = (
+                    "历史页游标已失效，请刷新会话后重试"
+                    if before is not None
+                    else "历史文件超过安全读取上限；请调大 "
+                         "HISTORY_SOURCE_MAX_BYTES 或在终端中查看"
+                )
+                notice = Error(
+                    code=ERR_INTERNAL,
+                    message=message,
+                    sid=sid,
+                )
+                return History(
+                    session_id=sid,
+                    revision=revision,
+                    generation=self.instance_id,
+                    build_seq=build_seq,
+                    live_seq=live_seq,
+                    events=[notice.model_dump(mode="json")],
+                    has_more=False,
+                    before=before,
+                    external=self._is_external(sid),
+                    control=control,
+                    takeover_pending=bool(
+                        (self._watch.get(sid) or {}).get("takeover_pending")),
+                    in_progress=in_progress,
+                )
+            source_window_has_more = oversized_compact_page.has_more
+            source_window_oldest_cursor = oversized_compact_page.oldest_cursor
         history_error = None
         if is_codex_hist:
             # Codex history lives in ~/.codex/sessions rollout files, not the
@@ -6534,13 +6561,38 @@ class WrapperMachine:
                     directory = os.path.realpath(expanded_hint)
             try:
                 def _read():
-                    messages = get_session_messages(sid, directory=directory)
-                    if not messages and directory is not None:
-                        messages = get_session_messages(sid, directory=None)
+                    if oversized_compact_page is not None:
+                        messages = oversized_compact_page.messages
+                        timestamps = oversized_compact_page.timestamps
+                        internal_events = oversized_compact_page.internal_events
+                    else:
+                        compact_snapshot = transcript_compact_snapshot(
+                            sid,
+                            path=source_path,
+                            index_store=self._history_index,
+                            snapshot_size=(source_fingerprint.size
+                                           if source_fingerprint is not None
+                                           else None),
+                            max_record_bytes=min(
+                                256 * 1024 * 1024,
+                                max(64 * 1024 * 1024,
+                                    self.cfg.history_source_max_bytes),
+                            ),
+                        )
+                        if compact_snapshot is not None:
+                            messages, timestamps, internal_events = compact_snapshot
+                        else:
+                            messages = get_session_messages(
+                                sid, directory=directory)
+                            if not messages and directory is not None:
+                                messages = get_session_messages(
+                                    sid, directory=None)
+                            timestamps = transcript_timestamps(sid)
+                            internal_events = transcript_internal_user_events(sid)
                     return (
                         messages,
-                        transcript_timestamps(sid),
-                        transcript_internal_user_events(sid),
+                        timestamps,
+                        internal_events,
                     )
                 msgs, tss, internal_events = await asyncio.to_thread(_read)
                 if internal_events:
@@ -6823,6 +6875,12 @@ class WrapperMachine:
                     HistorySourceFingerprint.capture, source_fingerprint.path)
                 source_snapshot_stable = (
                     current_fingerprint == source_fingerprint
+                    or (
+                        before is not None
+                        and oversized_compact_page is not None
+                        and history_source_extends(
+                            source_fingerprint, current_fingerprint)
+                    )
                 )
             except OSError:
                 source_snapshot_stable = False
@@ -7511,6 +7569,42 @@ class WrapperMachine:
 
         if rows is None and self._history_index is None:
             return await send(error="详细过程暂时不可用，请稍后重试")
+        active_turn = bool(
+            ctx is not None
+            and (
+                ctx.state != "idle"
+                or (not is_codex and ctx.claude_write_active)
+            )
+        )
+        if rows is None and not is_codex and active_turn:
+            # A summary page normally materializes source-complete detail rows,
+            # but the browser can cross its live display window before any
+            # History refresh has indexed this still-growing Claude turn.
+            # Rebuild only the bounded newest page from the current transcript
+            # snapshot. The live tail remains authoritative for bytes appended
+            # after that snapshot, and a terminal refresh replaces it later.
+            try:
+                refreshed = await self._build_history(
+                    sid,
+                    before=None,
+                    limit=4,
+                    cwd_hint=ctx.cwd if ctx is not None else None,
+                    detail="summary",
+                    allow_stale=False,
+                )
+                if refreshed.error:
+                    log.warning(
+                        "running Claude detail materialization failed",
+                        session_id=sid,
+                        turn_id=cmd.turn_id,
+                    )
+            except Exception as exc:
+                log.warning(
+                    "running Claude detail materialization failed",
+                    session_id=sid,
+                    turn_id=cmd.turn_id,
+                    error_type=type(exc).__name__,
+                )
         try:
             if rows is None:
                 source_path = await asyncio.to_thread(
@@ -17455,14 +17549,32 @@ class WrapperMachine:
         except OSError:
             pass
         try:
-            msgs = await asyncio.to_thread(
-                get_session_messages, session_id, directory=ctx.cwd,
+            compact_snapshot = await asyncio.to_thread(
+                transcript_compact_snapshot,
+                session_id,
+                path=path,
+                index_store=self._history_index,
+                snapshot_size=(os.path.getsize(path) if path else None),
+                max_record_bytes=min(
+                    256 * 1024 * 1024,
+                    max(64 * 1024 * 1024,
+                        self.cfg.history_source_max_bytes),
+                ),
             )
+            if compact_snapshot is not None:
+                msgs, timestamps, _internal_events = compact_snapshot
+            else:
+                msgs = await asyncio.to_thread(
+                    get_session_messages, session_id, directory=ctx.cwd,
+                )
+                timestamps = await asyncio.to_thread(
+                    transcript_timestamps, session_id)
         except Exception as e:
             log.warning("get_session_messages failed", session_id=session_id, error=str(e))
             return
         try:
-            events = translate_history(msgs, self.cfg.tool_result_max)
+            events = translate_history(
+                msgs, self.cfg.tool_result_max, timestamps=timestamps)
             subagent_events = await asyncio.to_thread(
                 translate_subagent_history, session_id, self.cfg.tool_result_max)
             events = merge_subagent_history(events, subagent_events)

@@ -1,7 +1,6 @@
 import type { ServerEvent } from "./protocol";
 import type {
   Block,
-  ProcessBlock,
   Turn,
   TurnDetailProjection,
   TurnDetailSegment,
@@ -13,8 +12,6 @@ export type {
 
 export const MAX_DETAIL_PROJECTION_ITEMS = 4_000;
 export const MAX_DETAIL_PROJECTION_CHARS = 32 * 1024 * 1024;
-export const DETAIL_PROJECTION_CAP_ITEM_ID =
-  "__cc_remote_detail_projection_capped__";
 
 const LATEST_DETAIL_PAGE_KEY = "__cc_remote_detail_latest__";
 
@@ -55,19 +52,6 @@ function encodedChars(value: unknown): number {
   } catch {
     return Number.MAX_SAFE_INTEGER;
   }
-}
-
-function capMarker(): ProcessBlock {
-  return {
-    kind: "process",
-    item_id: DETAIL_PROJECTION_CAP_ITEM_ID,
-    processKind: "compaction",
-    phase: "snapshot",
-    status: "succeeded",
-    title: "较早过程已省略",
-    summary: "完整过程超过浏览器 4000 项或 32 MiB 的安全上限，已保留较新的部分。",
-    done: true,
-  };
 }
 
 function isFinal(block: Block): boolean {
@@ -158,32 +142,30 @@ export function installTurnDetailProjectionPage(
     newerCursor: page.newerCursor ?? null,
     encodedChars: encodedChars(page.events),
   };
-
-  // Once the explicit cap is visible, a late in-flight older response cannot
-  // restart the automatic pagination loop or evict newer readable content.
-  if (current?.capped && before !== null
-      && !current.segments.some((segment) =>
-        segment.pageKey === incoming.pageKey)) {
-    return {
-      projection: current,
-      detail: decode(flattenEvents(current.segments)),
-    };
-  }
+  const navigation = before === null
+    ? "latest"
+    : current?.oldestCursor === before
+      ? "older"
+      : current?.newerCursor === before ? "newer" : "unknown";
 
   let segments = insertSegment(current?.segments ?? [], incoming);
   let detail = decode(flattenEvents(segments));
   let blocks = visibleBlocks(detail);
   let capped = current?.capped ?? false;
 
-  // Pages are bounded to 256 events/8 MiB by the wrapper. Drop only complete
-  // oldest segments so lifecycle ordering inside each retained page remains
-  // intact. The canonical final answer lives outside this projection.
+  // Pages are bounded to 256 events/8 MiB by the wrapper. Keep a sliding
+  // in-memory window and drop complete segments from the side opposite the
+  // reader's request. The adjacent source cursor remains available in both
+  // directions, so a memory limit is never presented as a history limit.
+  const retainOlderSide = navigation === "older"
+    || (navigation === "unknown" && incoming.hasNewer);
   while (segments.length > 1 && (
     blocks.length > maxItems
     || encodedChars(blocks) > maxChars
     || segmentChars(segments) > maxChars
   )) {
-    segments = segments.slice(1);
+    segments = retainOlderSide
+      ? segments.slice(0, -1) : segments.slice(1);
     capped = true;
     detail = decode(flattenEvents(segments));
     blocks = visibleBlocks(detail);
@@ -197,8 +179,6 @@ export function installTurnDetailProjectionPage(
     }
     blocks = retained;
   }
-  if (capped) blocks = [capMarker(), ...blocks];
-
   const oldest = segments[0];
   const newest = segments.at(-1);
   return {
@@ -206,8 +186,8 @@ export function installTurnDetailProjectionPage(
       segments,
       blocks,
       capped,
-      hasMore: capped ? false : !!oldest?.hasMore,
-      oldestCursor: capped ? null : oldest?.oldestCursor ?? null,
+      hasMore: !!oldest?.hasMore,
+      oldestCursor: oldest?.oldestCursor ?? null,
       hasNewer: !!newest?.hasNewer,
       newerCursor: newest?.newerCursor ?? null,
     },

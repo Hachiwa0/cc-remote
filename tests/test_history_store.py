@@ -240,8 +240,8 @@ def test_history_index_is_bounded_and_invalidatable(tmp_path):
     assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
 
 
-@pytest.mark.parametrize("old_version", [6, 7, 8])
-def test_v9_migration_rebuilds_all_derived_history_rows(
+@pytest.mark.parametrize("old_version", [6, 7, 8, 9])
+def test_legacy_migration_rebuilds_all_derived_history_rows(
         tmp_path, old_version):
     source_path = tmp_path / "transcript.jsonl"
     source_path.write_text("{}\n")
@@ -276,7 +276,7 @@ def test_v9_migration_rebuilds_all_derived_history_rows(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         for table in (
             "history_pages",
             "history_turn_details",
@@ -298,6 +298,86 @@ def test_v9_migration_rebuilds_all_derived_history_rows(
             session_id, engine, source, session_id, f"{engine}-image",
             "thumbnail",
         ) is None
+
+
+def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id, engine, source, before=None, limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id, engine, source, session_id, f"{engine}-image",
+            "thumbnail", "image/png", 1, 1, engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA user_version=10")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        for table in (
+            "history_pages", "history_turn_details", "history_image_assets",
+        ):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 1
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) == _page("codex-session")
+
+
+def test_v11_migration_preserves_pages_and_adds_compact_index(tmp_path):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+    assert store.put_page(
+        "claude-session", "claude", source, before=None, limit=4,
+        page=_page("claude-session"),
+    )
+
+    with sqlite3.connect(store.path) as connection:
+        for table in (
+            "claude_compact_sources",
+            "claude_compact_records",
+            "claude_compact_queue",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute("PRAGMA user_version=11")
+
+    migrated = HistoryIndexStore(state_dir)
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) == _page("claude-session")
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert {
+        "claude_compact_sources",
+        "claude_compact_records",
+        "claude_compact_queue",
+    } <= tables
 
 
 def test_history_index_rejects_one_page_larger_than_total_budget(tmp_path):

@@ -552,6 +552,8 @@ function isPayloadFreeUnfinishedCommandShell(block: Block): boolean {
 
 export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onOpenFile,
   deferredCount = 0, detailLoading = false, onLoadDetail,
+  canLoadEarlier = false, canLoadNewer = false,
+  onLoadEarlier, onLoadNewer,
   imageAssets, onLoadImage, onAuthorizeImage, onPreviewImage, engine = "claude",
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewHistoryImage,
@@ -566,6 +568,10 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   deferredCount?: number;
   detailLoading?: boolean;
   onLoadDetail?: () => void;
+  canLoadEarlier?: boolean;
+  canLoadNewer?: boolean;
+  onLoadEarlier?: () => void;
+  onLoadNewer?: () => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string, previewId?: string) => boolean;
   onAuthorizeImage?: (
@@ -726,6 +732,13 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
         <Icon name="chev" size={15} />
       </button>
       {open && !hasDeferredOnly && <div className="process-timeline">
+        {canLoadEarlier && (
+          <button type="button" className="process-page-control earlier"
+            disabled={detailLoading} onClick={onLoadEarlier}>
+            <Icon name="chev" size={14} />
+            加载更早过程
+          </button>
+        )}
         {rows.map((row) => (
           row.kind === "tools"
             ? <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools} />
@@ -743,6 +756,13 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
                 onInteractionStart={onInteractionStart}
                 onInteractionEnd={onInteractionEnd} />
         ))}
+        {canLoadNewer && (
+          <button type="button" className="process-page-control newer"
+            disabled={detailLoading} onClick={onLoadNewer}>
+            返回较新过程
+            <Icon name="chev" size={14} />
+          </button>
+        )}
       </div>}
     </section>
   );

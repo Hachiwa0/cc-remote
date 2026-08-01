@@ -24,16 +24,7 @@ function textChannel(block: TextBlock): string {
   return block.channel ?? "final";
 }
 
-function isFinalTextBlock(
-  block: Block,
-): block is TextBlock & { channel: "final" } {
-  return block.kind === "text" && block.channel === "final";
-}
-
-function canFuzzyMatchText(block: TextBlock): boolean {
-  // A completed assistant envelope without a delta is tool scaffolding, not a
-  // semantic text position. Open empty blocks remain eligible so a
-  // focus-triggered History merge can retain the id targeted by future deltas.
+function canCompatibilityMatchText(block: TextBlock): boolean {
   return block.text.length > 0 || !block.done;
 }
 
@@ -43,11 +34,17 @@ function textAffinity(first: string, second: string): number {
     return Math.min(first.length, second.length);
   }
   const max = Math.min(first.length, second.length);
-  for (let overlap = max; overlap > 0; overlap--) {
+  for (let overlap = max; overlap > 0; overlap -= 1) {
     if (first.slice(-overlap) === second.slice(0, overlap)
         || second.slice(-overlap) === first.slice(0, overlap)) return overlap;
   }
   return 0;
+}
+
+function isFinalTextBlock(
+  block: Block,
+): block is TextBlock & { channel: "final" } {
+  return block.kind === "text" && block.channel === "final";
 }
 
 function processBlockMatches(
@@ -112,12 +109,18 @@ function processBlockMatches(
   return matches;
 }
 
-function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean): Block[] {
+function mergeBlocks(
+  history: Block[],
+  live: Block[],
+  preserveLiveOpen: boolean,
+  preferCompletedHistoryPayload = false,
+  allowCompatibilityTextMatch = true,
+): Block[] {
   const out = history.map((block) => ({ ...block }));
   const processMatches = processBlockMatches(history, live);
-  // Engine history often regenerates assistant ids. Pair each same-channel text
-  // block at most once: prefer matching content, then preserve channel order.
-  // Reverse-finding the last block collapses A -> tool -> B into A -> tool -> BA.
+  // Native message identity is the only safe text overlap proof. Two separate
+  // commentary items may intentionally contain identical text; content-based
+  // matching silently deletes the later item and corrupts cache/detail/spill.
   const historyTextIndexes = out.flatMap((block, index) =>
     block.kind === "text" ? [index] : []);
   const matchedTextIndexes = new Set<number>();
@@ -132,8 +135,11 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
           done: existing.done, phase: existing.phase, status: existing.status,
           title: existing.title, progress: existing.progress,
         };
-        const plan = block.plan ?? existing.plan;
-        Object.assign(existing, block);
+        const keepHistoryPayload = preferCompletedHistoryPayload
+          && existing.done && block.done;
+        const plan = keepHistoryPayload
+          ? existing.plan : block.plan ?? existing.plan;
+        if (!keepHistoryPayload) Object.assign(existing, block);
         if (plan) existing.plan = plan.map((entry) => ({ ...entry }));
         // A completed transcript is authoritative over stale cache/live state.
         // Only the explicit in-flight-tail merge may reopen a synthetic history
@@ -154,7 +160,9 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
         const historyResult = existing.result;
         const historyTitle = existing.title;
         const historyProgress = existing.progress;
-        Object.assign(existing, block);
+        const keepHistoryPayload = preferCompletedHistoryPayload
+          && existing.done && block.done;
+        if (!keepHistoryPayload) Object.assign(existing, block);
         if (!preserveLiveOpen && historyDone && !block.done) {
           existing.done = true;
           if (historyResult) existing.result = historyResult;
@@ -169,12 +177,17 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
       const candidate = out[index] as TextBlock;
       return !matchedTextIndexes.has(index) && candidate.message_id === block.message_id;
     });
-    if (existingIndex == null && canFuzzyMatchText(block)) {
+    // Only complete history/live turn reconciliation owns this compatibility
+    // fallback: those two projections already have an authoritative turn alias.
+    // Detail/spill/cache windows do not carry overlap provenance, so equal text
+    // there is never proof that two native items are the same occurrence.
+    if (allowCompatibilityTextMatch && existingIndex == null
+        && canCompatibilityMatchText(block)) {
       const candidates = historyTextIndexes.filter((index) => {
         const candidate = out[index] as TextBlock;
         return !matchedTextIndexes.has(index)
           && textChannel(candidate) === textChannel(block)
-          && canFuzzyMatchText(candidate);
+          && canCompatibilityMatchText(candidate);
       });
       let bestScore = 0;
       for (const index of candidates) {
@@ -184,14 +197,8 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
           existingIndex = index;
         }
       }
-      // An open, empty live envelope has no content to score yet. It may inherit
-      // the sole canonical position so future deltas keep their live message id.
-      // Non-empty zero-affinity text is a distinct narrative block and must not
-      // be concatenated merely because it shares a channel.
       if (existingIndex == null && block.text.length === 0 && !block.done
-          && candidates.length === 1) {
-        existingIndex = candidates[0];
-      }
+          && candidates.length === 1) existingIndex = candidates[0];
     }
     const existing = existingIndex == null
       ? undefined : out[existingIndex] as TextBlock;
@@ -200,6 +207,10 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
       existing.text = combineText(existing.text, block.text);
       existing.done = existing.done || block.done;
       if (block.channel !== "unknown") existing.channel = block.channel;
+      if (block.liveOrder != null) {
+        existing.liveOrder = existing.liveOrder == null
+          ? block.liveOrder : Math.min(existing.liveOrder, block.liveOrder);
+      }
       // History parsers can regenerate an assistant item id. While this turn
       // is still open, future deltas continue targeting the live app-server id.
       // Keeping the history id here makes the next delta create a second block,
@@ -210,6 +221,31 @@ function mergeBlocks(history: Block[], live: Block[], preserveLiveOpen: boolean)
     }
   }
   return out;
+}
+
+/** Combine a source-backed detail window with the bounded live tail.
+ *
+ * Detail pages can be fetched while a turn is still running. New stream frames
+ * continue updating Turn.blocks, so rendering the projection alone would make
+ * those later frames disappear until another history request. Merge by native
+ * block identity and discard only the reducer's old presentation-only marker. */
+export function mergeDetailWithLiveTail(
+  detail: readonly Block[],
+  live: readonly Block[],
+  preferCompletedDetailPayload = false,
+): Block[] {
+  const withoutOldOmissionMarker = (block: Block) => !(
+    block.kind === "process"
+    && (block.item_id === "__cc_remote_earlier_process_omitted__"
+      || block.item_id === "__cc_remote_detail_projection_capped__")
+  );
+  return mergeBlocks(
+    detail.filter(withoutOldOmissionMarker),
+    live.filter(withoutOldOmissionMarker),
+    true,
+    preferCompletedDetailPayload,
+    false,
+  );
 }
 
 type TurnIdentity = Pick<
@@ -392,7 +428,16 @@ export function restoreObservedLiveTurnDetails(
     const observed = observedTurns[observedIndex];
     if (!summary.done || !observed.done || summary.detailLoaded
         || summary.detailProjection) continue;
-    const source = observed.detailProjection?.blocks ?? observed.blocks;
+    const sourceWithArchive = mergeDetailWithLiveTail(
+      observed.detailProjection?.blocks ?? [],
+      observed.liveSpillBlocks ?? [],
+      true,
+    );
+    const source = mergeDetailWithLiveTail(
+      sourceWithArchive,
+      observed.blocks,
+      true,
+    );
     const blocks = source.filter((block) => !isFinalTextBlock(block)
         && (block.kind !== "text" || block.text.length > 0))
       .map(cloneDetailBlock);
@@ -546,6 +591,17 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
       ? detailProjection.newerCursor
       : live.detailNewerCursor ?? history.detailNewerCursor,
     detailAutoLoad: live.detailAutoLoad ?? history.detailAutoLoad,
+    liveBlocksSpilled:
+      live.liveBlocksSpilled ?? history.liveBlocksSpilled,
+    liveSpilledBlockCount: Math.max(
+      live.liveSpilledBlockCount ?? 0,
+      history.liveSpilledBlockCount ?? 0,
+    ) || undefined,
+    liveSpillBlocks: live.liveSpillBlocks ?? history.liveSpillBlocks,
+    liveSpillRefreshCount: Math.max(
+      live.liveSpillRefreshCount ?? 0,
+      history.liveSpillRefreshCount ?? 0,
+    ) || undefined,
   };
 }
 
@@ -694,9 +750,12 @@ export function installAuthoritativeTurnDetailPage(
     detailOldestCursor: oldestCursor,
     detailHasNewer: hasNewer,
     detailNewerCursor: newerCursor,
-    detailAutoLoad: !!summary.detailAutoLoad && hasMore,
+    detailAutoLoad:
+      !!summary.detailAutoLoad && hasMore && !detailProjection?.capped,
     detailRestorePending: false,
     detailRestoreIncomplete: restoreIncomplete,
+    liveSpillBlocks: summary.done && !hasMore && !hasNewer
+      ? undefined : summary.liveSpillBlocks,
   };
 }
 
