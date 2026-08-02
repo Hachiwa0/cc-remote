@@ -177,6 +177,7 @@ from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
     CodexHistoryImageView, CodexStreamTranslator,
+    coalesce_codex_live_notifications,
     codex_history_image_views, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_turn_user,
     codex_history_window,
@@ -10219,7 +10220,9 @@ class WrapperMachine:
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
         current_turn_id = turn_id
         logical_msg_id = recovered_msg_id or turn_id
-        stream = ctx.sdk.receive_spontaneous_response(turn_id).__aiter__()
+        stream = coalesce_codex_live_notifications(
+            ctx.sdk.receive_spontaneous_response(turn_id),
+        ).__aiter__()
         restart_watch_task: Optional[asyncio.Task] = None
         overflowed = False
         terminal_seen = False
@@ -10433,7 +10436,9 @@ class WrapperMachine:
             ctx.codex_spontaneous_turn_id = current_turn_id
             ctx.codex_spontaneous_task = current_task
             ctx.active_msg_id = logical_msg_id
-            stream = ctx.sdk.receive_response().__aiter__()
+            stream = coalesce_codex_live_notifications(
+                ctx.sdk.receive_response(),
+            ).__aiter__()
             overflowed = False
             terminal_seen = False
             stream_closed = False
@@ -10676,7 +10681,9 @@ class WrapperMachine:
         async def reader() -> None:
             cancelled = False
             try:
-                async for message in ctx.sdk.receive_response():
+                async for message in coalesce_codex_live_notifications(
+                    ctx.sdk.receive_response(),
+                ):
                     await queue.put(message)
             except asyncio.CancelledError:
                 cancelled = True
@@ -18000,7 +18007,10 @@ class WrapperMachine:
         ) -> None:
             cancelled = False
             try:
-                async for msg in ctx.sdk.receive_response():
+                messages = ctx.sdk.receive_response()
+                if is_codex:
+                    messages = coalesce_codex_live_notifications(messages)
+                async for msg in messages:
                     await target_queue.put(msg)
             except asyncio.CancelledError:
                 cancelled = True

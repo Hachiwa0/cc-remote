@@ -49,7 +49,6 @@ import {
   shouldAutoLoadOlderHistory,
   shouldAutoLoadNewerHistory,
   ScrollFollowController,
-  createFrameCoalescer,
   type HistoryAnchorPoint,
   type HistoryPageDirection,
   type ScrollFollowSnapshot,
@@ -295,8 +294,6 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const controllerRef = useRef<ScrollFollowController | null>(null);
   if (!controllerRef.current) controllerRef.current = new ScrollFollowController();
   const scrollCoordinatorRef = useRef(new ScrollCoordinator());
-  const applyScrollCommandRef =
-    useRef<((command: ScrollCommand | null) => void) | null>(null);
   const [scrollPolicyEpoch, setScrollPolicyEpoch] = useState(0);
   const [scrollState, setScrollState] = useState<ScrollFollowSnapshot>(() =>
     controllerRef.current!.snapshot());
@@ -429,9 +426,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   activeScrollScopeRef.current = scrollScope;
   const hasOpenTailRef = useRef(false);
   const newestTurn = turns.at(-1);
-  hasOpenTailRef.current = !!newestTurn && (
+  const hasOpenTail = !!newestTurn && (
     !newestTurn.done || newestTurn.blocks.some((block) => !block.done)
   );
+  hasOpenTailRef.current = hasOpenTail;
   const turnKeySnapshot = updateTurnKeySnapshot(
     turnKeySnapshotRef.current,
     turns,
@@ -725,83 +723,87 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     lastScrollTopRef.current = el.scrollTop;
     syncScrollState(controller.recordProgrammaticScroll(readScrollMetrics(el)));
   }, [syncScrollState, virtualizer]);
-  applyScrollCommandRef.current = applyScrollCommand;
+
+  const maintainFollowedLiveTail = useCallback(() => {
+    const el = scrollRef.current;
+    const controller = controllerRef.current;
+    if (!el || !controller
+        || activeScrollScopeRef.current !== scrollScope
+        || renderedScrollScopeRef.current !== scrollScope
+        || browseMode
+        || !controller.isFollowing()
+        || userScrollIntentRef.current
+        || touchYRef.current !== null
+        || wheelGestureActiveRef.current
+        || textSelectionRef.current !== null
+        || historyAnchorRef.current.current() !== null
+        || scrollCoordinatorRef.current.isInteractionLocked()) return;
+    if (measureBottom(readScrollMetrics(el)).distance <= 0.5) return;
+    applyScrollCommand(
+      scrollCoordinatorRef.current.requestBottom("auto"),
+    );
+  }, [applyScrollCommand, browseMode, scrollScope]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
     let previousHeight = el.clientHeight;
-    let frame: number | null = null;
     const observer = new ResizeObserver(() => {
       const nextHeight = el.clientHeight;
       if (Math.abs(nextHeight - previousHeight) < 0.5) return;
       previousHeight = nextHeight;
-      if (!controllerRef.current?.isFollowing()) return;
-      if (frame !== null) window.cancelAnimationFrame(frame);
       // Composer actions and the mobile keyboard resize the thread from
-      // outside the virtual list. Let both ResizeObservers commit the new
-      // viewport size, then restore the live-tail intent through TanStack's
-      // sole scroll writer. Reading-history state never enters this branch.
-      frame = window.requestAnimationFrame(() => {
-        frame = null;
-        if (!controllerRef.current?.isFollowing()
-            || userScrollIntentRef.current
-            || touchYRef.current !== null) return;
-        applyScrollCommand(
-          scrollCoordinatorRef.current.requestBottom("auto"),
-        );
-      });
+      // outside the virtual list. ResizeObserver runs before paint, so retain
+      // the live-tail intent here instead of exposing one wrong-height frame.
+      maintainFollowedLiveTail();
     });
     observer.observe(el);
-    return () => {
-      observer.disconnect();
-      if (frame !== null) window.cancelAnimationFrame(frame);
-    };
-  }, [applyScrollCommand, scrollScope]);
+    return () => observer.disconnect();
+  }, [maintainFollowedLiveTail, scrollScope]);
 
   useLayoutEffect(() => {
     const content = contentSizerRef.current;
     if (!content || typeof ResizeObserver === "undefined") return;
-    const expectedScope = scrollScope;
-    let disposed = false;
-    const coalescer = createFrameCoalescer(
-      (callback) => window.requestAnimationFrame(callback),
-      (frameId) => window.cancelAnimationFrame(frameId),
-    );
     const followMeasuredTail = () => {
       // TanStack updates the in-flow leading spacer from ResizeObserver
       // measurements. Correct the retained reading row in this same
       // pre-paint notification so the spacer update never becomes a visible
       // intermediate jump.
       restoreRetainedMeasurementBoundary();
-      coalescer.schedule(() => {
-        if (disposed
-            || activeScrollScopeRef.current !== expectedScope
-            || renderedScrollScopeRef.current !== expectedScope
-            || browseMode
-            || !hasOpenTailRef.current
-            || !controllerRef.current?.isFollowing()
-            || userScrollIntentRef.current
-            || touchYRef.current !== null
-            || historyAnchorRef.current.current() !== null
-            || scrollCoordinatorRef.current.isInteractionLocked()) return;
-        applyScrollCommandRef.current?.(
-          scrollCoordinatorRef.current.requestBottom("auto"),
-        );
-      });
+      if (!hasOpenTailRef.current) return;
+      maintainFollowedLiveTail();
     };
     const observer = new ResizeObserver(followMeasuredTail);
     observer.observe(content);
+    // WebKit can commit TanStack's in-flow spacer mutation after its current
+    // ResizeObserver delivery, leaving one painted estimate-height gap before
+    // the next delivery. DOM mutations run at the pre-paint microtask boundary,
+    // so observe the actual streamed text/tool/spacer commit as well. The same
+    // strict follow/gesture/selection/transaction gates above still own whether
+    // a bottom command is allowed.
+    const mutationObserver = !hasOpenTail
+        || typeof MutationObserver === "undefined"
+      ? null
+      : new MutationObserver(followMeasuredTail);
+    mutationObserver?.observe(content, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["style"],
+    });
     // Session/revision switches request bottom before every virtual row has
     // necessarily been measured. Re-assert the same follow intent on the next
     // frame after the replacement sizer is mounted.
     followMeasuredTail();
     return () => {
-      disposed = true;
       observer.disconnect();
-      coalescer.cancel();
+      mutationObserver?.disconnect();
     };
-  }, [browseMode, restoreRetainedMeasurementBoundary, scrollScope]);
+  }, [
+    hasOpenTail, maintainFollowedLiveTail,
+    restoreRetainedMeasurementBoundary, scrollScope,
+  ]);
 
   const pauseOutputFollow = useCallback(() => {
     const el = scrollRef.current;
@@ -1333,6 +1335,15 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     resolvedHistoryViewId,
     scrollScope, sid, syncScrollState, turns,
   ]);
+
+  // React commits streamed text/tool rows before paint. Keep the followed tail
+  // physically pinned in this same commit; ResizeObserver above covers later
+  // font/image/virtualizer measurements without introducing a frame-delayed
+  // second writer.
+  useLayoutEffect(() => {
+    if (!hasOpenTailRef.current) return;
+    maintainFollowedLiveTail();
+  });
 
   useEffect(() => {
     return () => {

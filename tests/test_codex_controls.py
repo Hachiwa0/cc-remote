@@ -1501,6 +1501,47 @@ def test_codex_review_overflow_preserves_authoritative_success_terminal():
     asyncio.run(run())
 
 
+def test_codex_review_coalesces_append_burst_before_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("review-burst", "review-burst")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "review-burst-turn"
+        ctx.turn_task = asyncio.current_task()
+
+        class BurstSdk:
+            async def receive_response(self):
+                for delta in ("a", "b", "c"):
+                    yield {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "turnId": "review-burst-turn",
+                            "itemId": "review-burst-message",
+                            "delta": delta,
+                        },
+                    }
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "review-burst-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = BurstSdk()
+        await machine._run_codex_review_turn(ctx, "review-burst-turn")
+
+        deltas = [event.text for event in transport.sent
+                  if isinstance(event, Delta)]
+        assert deltas == ["a", "bc"]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.subtype == "success"
+
+    asyncio.run(run())
+
+
 def test_managed_codex_overflow_preserves_authoritative_success_terminal():
     async def run():
         machine, transport = _mk_machine()

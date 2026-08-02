@@ -2487,6 +2487,7 @@ test("live append follows at the bottom but not while reading history", async ({
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
   await expect(page.locator('[data-turn-id="live-42"]')).toHaveCount(0);
   expect(await page.locator(".turn").count()).toBeLessThan(40);
+  await assertCodexBurstNeverPaintsAboveTail(page, testInfo.project.name);
 });
 
 test("returning to a background-grown live turn settles at its current tail", async ({
@@ -2534,6 +2535,115 @@ test("returning to a background-grown live turn settles at its current tail", as
     })).toBe(true);
   }
 });
+
+async function assertCodexBurstNeverPaintsAboveTail(
+  page: import("@playwright/test").Page,
+  projectName: string,
+): Promise<void> {
+  await page.goto("/tests/history-browser.html?codex-live-burst=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await waitForScrollIdle(page);
+
+  const resultPromise = page.evaluate(async () => {
+    const thread = document.querySelector<HTMLElement>(".thread");
+    const start = document.querySelector<HTMLButtonElement>(
+      '[data-testid="start-codex-burst"]',
+    );
+    if (!thread || !start) throw new Error("Codex burst fixture is incomplete");
+    const distances: number[] = [];
+    const violations: Array<{
+      frame: number;
+      distance: number;
+      scrollTop: number;
+      scrollHeight: number;
+      burst: string | undefined;
+    }> = [];
+    const reverseJumps: Array<{
+      frame: number;
+      previousScrollTop: number;
+      scrollTop: number;
+      previousScrollHeight: number;
+      scrollHeight: number;
+    }> = [];
+    let frames = 0;
+    let doneFrames = 0;
+    let previousScrollTop = thread.scrollTop;
+    let previousScrollHeight = thread.scrollHeight;
+    let previousBurst = document.documentElement.dataset.codexBurst;
+    start.click();
+    await new Promise<void>((resolve) => {
+      const sample = () => {
+        frames += 1;
+        const distance = Math.max(
+          0,
+          thread.scrollHeight - thread.scrollTop - thread.clientHeight,
+        );
+        distances.push(distance);
+        if (distance > 2) {
+          violations.push({
+            frame: frames,
+            distance,
+            scrollTop: thread.scrollTop,
+            scrollHeight: thread.scrollHeight,
+            burst: document.documentElement.dataset.codexBurst,
+          });
+        }
+        const burst = document.documentElement.dataset.codexBurst;
+        if (burst === "running" && previousBurst === "running"
+            && thread.scrollTop < previousScrollTop - 2) {
+          reverseJumps.push({
+            frame: frames,
+            previousScrollTop,
+            scrollTop: thread.scrollTop,
+            previousScrollHeight,
+            scrollHeight: thread.scrollHeight,
+          });
+        }
+        previousScrollTop = thread.scrollTop;
+        previousScrollHeight = thread.scrollHeight;
+        previousBurst = burst;
+        if (burst === "done") {
+          doneFrames += 1;
+          if (doneFrames >= 6) {
+            resolve();
+            return;
+          }
+        }
+        requestAnimationFrame(() => window.setTimeout(sample, 0));
+      };
+      requestAnimationFrame(() => window.setTimeout(sample, 0));
+    });
+    return {
+      frames,
+      worst: Math.max(0, ...distances),
+      reverseJumps,
+      violations,
+    };
+  });
+
+  const result = await resultPromise;
+  expect(result.frames).toBeGreaterThan(10);
+  expect(result.violations, JSON.stringify(result.violations)).toHaveLength(0);
+  expect(result.reverseJumps, JSON.stringify(result.reverseJumps))
+    .toHaveLength(0);
+  expect(result.worst).toBeLessThanOrEqual(2);
+
+  // The pre-paint observer is active only while the newest turn is open. A
+  // reader who has deliberately left the tail must retain the exact row while
+  // the same long Codex tool burst continues in the background.
+  await page.goto("/tests/history-browser.html?codex-live-burst=1");
+  await wheelUntilTurn(page, "burst-history-1", -2_000, projectName);
+  const before = await readingAnchor(page);
+  await page.getByTestId("start-codex-burst").click();
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.codexBurst,
+  )).toBe("done");
+  await page.waitForTimeout(100);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+}
 
 test("composer action growth keeps the live tail visible without stealing history", async ({
   page,

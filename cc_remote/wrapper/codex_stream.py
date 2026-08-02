@@ -7,6 +7,7 @@ marker is still forwarded so the remote timeline does not silently omit the step
 """
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import json
@@ -73,6 +74,7 @@ _EMPTY_COMPLETED_MESSAGE = (
 _MAX_DELTA_STREAMS = 2048
 _MAX_DELTA_EVENTS_PER_STREAM = 1024
 _MAX_FINISHED_DELTA_ITEMS = 4096
+_LIVE_DELTA_FLUSH_SECONDS = 0.05
 _MAX_LIVE_ITEMS = 4096
 _LIVE_ITEMS_OMITTED_ID = "cc-remote-live-items-omitted"
 _DELTA_TRUNCATION_NOTICE = "\n…（后续输出已截断）"
@@ -629,6 +631,163 @@ def codex_native_rollback_turns(path: str, logical_turns: int) -> int:
                     del groups[0]
     native_turns = sum(groups)
     return native_turns if native_turns > 0 else logical_turns
+
+
+_CODEX_APPEND_NOTIFICATION_FIELDS = {
+    "item/agentMessage/delta": "delta",
+    "item/reasoning/summaryTextDelta": "delta",
+    "item/plan/delta": "delta",
+    "item/commandExecution/outputDelta": "delta",
+    "item/fileChange/outputDelta": "delta",
+    "item/mcpToolCall/progress": "message",
+}
+_NO_CODEX_NOTIFICATION = object()
+
+
+def _codex_append_notification_key(message: object) -> tuple | None:
+    """Return the exact append-only field eligible for live burst merging."""
+    if not isinstance(message, dict):
+        return None
+    method = message.get("method")
+    field = _CODEX_APPEND_NOTIFICATION_FIELDS.get(method)
+    params = message.get("params")
+    if field is None or not isinstance(params, dict):
+        return None
+    item_id = params.get("itemId")
+    value = params.get(field)
+    if not isinstance(item_id, str) or not item_id or not isinstance(value, str):
+        return None
+    # Preserve turn/item/stream/index boundaries even if a future app-server
+    # interleaves two append channels under the same item id.
+    return (
+        method,
+        params.get("threadId"),
+        params.get("turnId"),
+        item_id,
+        params.get("stream"),
+        params.get("summaryIndex"),
+        params.get("contentIndex"),
+    )
+
+
+def _merge_codex_append_notifications(
+    previous: dict, incoming: dict,
+) -> dict | None:
+    key = _codex_append_notification_key(previous)
+    if key is None or key != _codex_append_notification_key(incoming):
+        return None
+    method = previous.get("method")
+    field = _CODEX_APPEND_NOTIFICATION_FIELDS.get(method)
+    previous_params = previous.get("params")
+    incoming_params = incoming.get("params")
+    if (field is None or not isinstance(previous_params, dict)
+            or not isinstance(incoming_params, dict)):
+        return None
+    previous_text = previous_params.get(field)
+    incoming_text = incoming_params.get(field)
+    if not isinstance(previous_text, str) or not isinstance(incoming_text, str):
+        return None
+    merged = dict(previous)
+    merged["params"] = {
+        **previous_params,
+        field: previous_text + incoming_text,
+    }
+    return merged
+
+
+async def coalesce_codex_live_notifications(
+    source, *, flush_seconds: float = _LIVE_DELTA_FLUSH_SECONDS,
+):
+    """Bound live append bursts before translation and replay seq allocation.
+
+    The first append for a field is immediate. A following run for that exact
+    field is merged only until the first append's deadline, so a quiet provider
+    cannot strand the final chunk waiting for another notification. Structural,
+    unknown, turn, item and stream boundaries remain strict ordering barriers.
+    """
+    iterator = source.__aiter__()
+    loop = asyncio.get_running_loop()
+    next_task: asyncio.Task | None = None
+    buffered: object = _NO_CODEX_NOTIFICATION
+    source_done = False
+    pending_error: Exception | None = None
+    last_key: tuple | None = None
+    last_emitted_at = float("-inf")
+
+    async def take_next():
+        nonlocal next_task
+        if next_task is None:
+            next_task = asyncio.create_task(anext(iterator))
+        task = next_task
+        try:
+            return await task
+        finally:
+            if task.done():
+                next_task = None
+
+    try:
+        while not source_done or buffered is not _NO_CODEX_NOTIFICATION:
+            if buffered is not _NO_CODEX_NOTIFICATION:
+                message = buffered
+                buffered = _NO_CODEX_NOTIFICATION
+            else:
+                try:
+                    message = await take_next()
+                except StopAsyncIteration:
+                    break
+
+            key = _codex_append_notification_key(message)
+            now = loop.time()
+            if (flush_seconds <= 0 or key is None or key != last_key
+                    or now - last_emitted_at >= flush_seconds):
+                last_key = key
+                last_emitted_at = now
+                yield message
+                continue
+
+            merged = message
+            deadline = last_emitted_at + flush_seconds
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                if next_task is None:
+                    next_task = asyncio.create_task(anext(iterator))
+                done, _ = await asyncio.wait(
+                    {next_task}, timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+                task = next_task
+                next_task = None
+                try:
+                    incoming = task.result()
+                except StopAsyncIteration:
+                    source_done = True
+                    break
+                except Exception as exc:
+                    # The provider may fail after delivering part of an
+                    # append burst.  Flush those confirmed bytes before the
+                    # original stream error reaches the turn lifecycle.
+                    source_done = True
+                    pending_error = exc
+                    break
+                combined = _merge_codex_append_notifications(merged, incoming)
+                if combined is None:
+                    buffered = incoming
+                    break
+                merged = combined
+
+            last_key = key
+            last_emitted_at = loop.time()
+            yield merged
+            if pending_error is not None:
+                raise pending_error
+    finally:
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+            await asyncio.gather(next_task, return_exceptions=True)
 
 
 class CodexStreamTranslator:

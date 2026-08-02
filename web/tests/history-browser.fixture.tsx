@@ -713,6 +713,186 @@ function ReducerHistoryBrowserFixture() {
   );
 }
 
+const CODEX_BURST_SID = "codex-live-burst-session";
+const CODEX_BURST_TICKS = 96;
+
+function codexBurstInitialState(): AppState {
+  return {
+    ...initialState,
+    focusedSid: CODEX_BURST_SID,
+    runtimes: {
+      [CODEX_BURST_SID]: {
+        ...createRuntime(),
+        turns: Array.from(
+          { length: 12 },
+          (_, index) => finalTurn(`burst-history-${index + 1}`, 3),
+        ),
+      },
+    },
+  };
+}
+
+function CodexLiveBurstFixture() {
+  const [state, dispatch] = useReducer(
+    reduce,
+    undefined,
+    codexBurstInitialState,
+  );
+  const runningRef = useRef(false);
+  const timersRef = useRef<number[]>([]);
+  const sequenceRef = useRef(0);
+  const runtime = state.runtimes[CODEX_BURST_SID] ?? createRuntime();
+
+  useEffect(() => () => {
+    for (const timer of timersRef.current) window.clearTimeout(timer);
+    timersRef.current = [];
+  }, []);
+
+  const emit = useCallback((payload: Record<string, unknown>) => {
+    const event = {
+      v: PROTOCOL_VERSION,
+      ts: Date.now() / 1000,
+      sid: CODEX_BURST_SID,
+      seq: ++sequenceRef.current,
+      ...payload,
+    } as ServerEvent;
+    dispatch({ type: "event", event });
+  }, []);
+
+  const startBurst = useCallback(() => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    document.documentElement.dataset.codexBurst = "running";
+    emit({
+      type: "user_msg",
+      msg_id: "burst-turn",
+      prompt: "连续检查工具调用，并保持实时页面稳定。",
+    });
+    emit({
+      type: "assistant_msg_start",
+      message_id: "burst-commentary",
+      channel: "commentary",
+    });
+    emit({
+      type: "process",
+      item_id: "burst-plan",
+      kind: "plan",
+      phase: "start",
+      status: "running",
+      turn_id: "burst-turn-native",
+      title: "计划",
+      summary: "逐项检查实时工具输出。",
+    });
+
+    let activeTool = 0;
+    const finishTool = (toolIndex: number) => {
+      emit({
+        type: "tool_result",
+        tool_use_id: `burst-tool-${toolIndex}`,
+        content: `command ${toolIndex} completed`,
+        is_error: false,
+        status: "succeeded",
+        exit_code: 0,
+        duration_ms: 40,
+      });
+    };
+    for (let tick = 1; tick <= CODEX_BURST_TICKS; tick += 1) {
+      const timer = window.setTimeout(() => {
+        if ((tick - 1) % 4 === 0) {
+          activeTool += 1;
+          emit({
+            type: "tool_use",
+            message_id: "burst-commentary",
+            tool_use_id: `burst-tool-${activeTool}`,
+            tool: activeTool % 3 === 0 ? "mcpToolCall" : "commandExecution",
+            input: activeTool % 3 === 0
+              ? { server: "fixture", tool: "lookup" }
+              : { command: `printf tool-${activeTool}`, cwd: "/repo" },
+            category: activeTool % 3 === 0 ? "mcp" : "command",
+            title: activeTool % 3 === 0
+              ? "查询测试数据"
+              : `运行命令 ${activeTool}`,
+          });
+        }
+        emit({
+          type: "tool_delta",
+          tool_use_id: `burst-tool-${activeTool}`,
+          stream: "output",
+          delta: `tool-${activeTool} output ${tick}\n`,
+        });
+        if (tick % 3 === 0) {
+          emit({
+            type: "delta",
+            message_id: "burst-commentary",
+            channel: "commentary",
+            text: `已完成第 ${tick} 次检查，继续核对下一项工具状态和输出边界。\n\n`,
+          });
+        }
+        if (tick % 4 === 0) finishTool(activeTool);
+        if (tick !== CODEX_BURST_TICKS) return;
+        emit({
+          type: "process",
+          item_id: "burst-plan",
+          kind: "plan",
+          phase: "end",
+          status: "succeeded",
+          turn_id: "burst-turn-native",
+          title: "计划",
+          summary: "实时工具检查完成。",
+        });
+        emit({
+          type: "assistant_msg_end",
+          message_id: "burst-commentary",
+          channel: "commentary",
+        });
+        emit({
+          type: "assistant_msg_start",
+          message_id: "burst-final",
+          channel: "final",
+        });
+        emit({
+          type: "delta",
+          message_id: "burst-final",
+          channel: "final",
+          text: "检查完成，所有工具均已返回。",
+        });
+        emit({
+          type: "assistant_msg_end",
+          message_id: "burst-final",
+          channel: "final",
+        });
+        emit({
+          type: "turn_end",
+          turn_id: "burst-turn-native",
+          result: {
+            subtype: "success",
+            duration_ms: 432,
+            is_error: false,
+          },
+        });
+        runningRef.current = false;
+        document.documentElement.dataset.codexBurst = "done";
+      }, tick * 12);
+      timersRef.current.push(timer);
+    }
+  }, [emit]);
+
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: "none", minHeight: 28 }}>
+        <button data-testid="start-codex-burst" type="button"
+          onClick={startBurst}>
+          start Codex burst
+        </button>
+      </div>
+      <ChatView sid={CODEX_BURST_SID} turns={runtime.turns}
+        engine="codex" historyRevision="codex-burst-r1"
+        historyScopeKey="fixture-codex-burst"
+        onEdit={() => {}} onGetDiff={() => {}} />
+    </main>
+  );
+}
+
 function HistoryConversationBrowserFixture() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const delayMs = Number(params.get("delay") ?? "30");
@@ -1767,5 +1947,7 @@ createRoot(document.getElementById("root")!).render(
     ? <HistoryImageFallbackErrorFixture />
     : rootParams.has("reducer-pipeline")
     ? <ReducerHistoryBrowserFixture />
+    : rootParams.has("codex-live-burst")
+    ? <CodexLiveBurstFixture />
     : <HistoryBrowserFixture />,
 );

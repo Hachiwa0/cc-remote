@@ -5,6 +5,8 @@ import asyncio
 import json
 import re
 
+import pytest
+
 from cc_remote.protocol import (
     AssistantMsgStart,
     Delta,
@@ -21,6 +23,7 @@ from cc_remote.wrapper import codex_stream as codex_stream_module
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator,
     _redact_credentials,
+    coalesce_codex_live_notifications,
     codex_history_window,
     codex_translate_history,
 )
@@ -286,6 +289,128 @@ def test_codex_live_append_streams_have_cumulative_and_event_budgets():
     })
     assert process_translator._delta_chars == {}
     assert process_translator._delta_events == {}
+
+
+@pytest.mark.asyncio
+async def test_codex_delta_bursts_coalesce_before_structural_boundaries():
+    async def source():
+        yield {"method": "item/commandExecution/outputDelta", "params": {
+            "turnId": "turn-1", "itemId": "command-coalesced", "delta": "a",
+        }}
+        await asyncio.sleep(0.001)
+        yield {"method": "item/commandExecution/outputDelta", "params": {
+            "turnId": "turn-1", "itemId": "command-coalesced", "delta": "b",
+        }}
+        yield {"method": "item/commandExecution/outputDelta", "params": {
+            "turnId": "turn-1", "itemId": "command-coalesced", "delta": "c",
+        }}
+        yield {"method": "item/completed", "params": {"item": {
+            "type": "commandExecution", "id": "command-coalesced",
+            "command": "printf abc", "status": "completed",
+            "aggregatedOutput": "abc", "exitCode": 0,
+        }}}
+
+    coalesced = [message async for message in
+                 coalesce_codex_live_notifications(
+                     source(), flush_seconds=0.01)]
+    assert [message["params"].get("delta") for message in coalesced] == [
+        "a", "bc", None,
+    ]
+
+    translator = CodexStreamTranslator(8_000)
+    events = _feed(translator, coalesced)
+    assert [event.delta for event in events if isinstance(event, ToolDelta)] == [
+        "a", "bc",
+    ]
+    result_index = next(
+        index for index, event in enumerate(events) if isinstance(event, ToolResult))
+    last_delta_index = max(
+        index for index, event in enumerate(events) if isinstance(event, ToolDelta))
+    assert last_delta_index < result_index
+
+
+@pytest.mark.asyncio
+async def test_codex_quiet_delta_tail_flushes_without_waiting_for_next_frame():
+    release_tail = asyncio.Event()
+    second_seen = asyncio.Event()
+    collected: list[str] = []
+
+    async def source():
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "a",
+        }}
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "b",
+        }}
+        await release_tail.wait()
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "c",
+        }}
+
+    async def consume() -> None:
+        async for message in coalesce_codex_live_notifications(
+            source(), flush_seconds=0.01,
+        ):
+            collected.append(message["params"]["delta"])
+            if collected == ["a", "b"]:
+                second_seen.set()
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(second_seen.wait(), timeout=0.5)
+    release_tail.set()
+    await task
+    assert collected == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_codex_delta_burst_flushes_confirmed_tail_before_stream_error():
+    async def source():
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "a",
+        }}
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "b",
+        }}
+        raise RuntimeError("app-server stream closed")
+
+    collected: list[str] = []
+    with pytest.raises(RuntimeError, match="app-server stream closed"):
+        async for message in coalesce_codex_live_notifications(
+            source(), flush_seconds=0.01,
+        ):
+            collected.append(message["params"]["delta"])
+
+    assert collected == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_codex_delta_coalescing_keeps_item_and_channel_barriers():
+    messages = [
+        {"method": "item/reasoning/summaryTextDelta", "params": {
+            "turnId": "turn-1", "itemId": "reasoning-a",
+            "summaryIndex": 0, "delta": "a",
+        }},
+        {"method": "item/reasoning/summaryTextDelta", "params": {
+            "turnId": "turn-1", "itemId": "reasoning-b",
+            "summaryIndex": 0, "delta": "b",
+        }},
+        {"method": "item/reasoning/summaryTextDelta", "params": {
+            "turnId": "turn-1", "itemId": "reasoning-a",
+            "summaryIndex": 1, "delta": "c",
+        }},
+        {"method": "turn/completed", "params": {
+            "turn": {"id": "turn-1", "status": "completed"},
+        }},
+    ]
+
+    async def source():
+        for message in messages:
+            yield message
+
+    coalesced = [message async for message in
+                 coalesce_codex_live_notifications(
+                     source(), flush_seconds=0.01)]
+    assert coalesced == messages
 
 
 def test_codex_unique_live_items_are_bounded_and_dropped_results_stay_dropped(
