@@ -138,8 +138,27 @@ def test_idle_codex_session_migrates_without_focus_or_queue_loss(
         handle = _FakeCodexHandle()
         ctx = _install_idle_codex(machine, old_cwd, handle)
         ctx.codex_checkpoint = False
-        ctx.preview_write_candidates["tool-1"] = ("/tmp/outside",)
-        ctx.preview_external_paths["/tmp/outside"] = None
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"preview")
+        outside_path = str(outside.resolve())
+        ctx.preview_write_candidates["tool-1"] = (outside_path,)
+        ctx.preview_image_candidates["image-1"] = outside_path
+        machine._preview_capability_store.grant_path(
+            "codex",
+            "code",
+            "thread-1",
+            outside_path,
+            mode="read",
+            source="user_approved",
+        )
+        machine._store_preview_image_snapshot(
+            ctx.preview_snapshot_token,
+            outside_path,
+            "image/png",
+            b"preview",
+            snapshot_id="image-1",
+        )
+        assert outside_path in machine._preview_capabilities(ctx)
         queued = object()
         ctx.queued_queries.append(queued)
         scheduled = []
@@ -163,7 +182,12 @@ def test_idle_codex_session_migrates_without_focus_or_queue_loss(
         assert ctx.needs_reload is False
         assert ctx.codex_checkpoint is None
         assert ctx.preview_write_candidates == {}
-        assert ctx.preview_external_paths == {}
+        assert ctx.preview_image_candidates == {}
+        assert machine._preview_capabilities(ctx) == {}
+        assert not any(
+            key[0] == ctx.preview_snapshot_token
+            for key in machine._preview_image_snapshots
+        )
         assert ctx.queued_queries == [queued]
         assert (
             machine._codex_controls.get("thread-1").cwd_override

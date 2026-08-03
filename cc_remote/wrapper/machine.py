@@ -16766,7 +16766,10 @@ class WrapperMachine:
                 # pending reload so the queued/next Remote turn resumes the
                 # latest native state in this newly confirmed cwd first.
                 ctx.preview_write_candidates.clear()
-                ctx.preview_external_paths.clear()
+                ctx.preview_image_candidates.clear()
+                self._purge_preview_image_snapshots(
+                    ctx.preview_snapshot_token)
+                self._drop_preview_session(ctx.engine, sid)
                 await self._cleanup_codex_steer_attachments(ctx)
                 self._invalidate_codex_session_catalog()
                 await self._emit(ctx, ArtifactInvalidated(
