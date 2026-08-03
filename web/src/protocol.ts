@@ -474,7 +474,15 @@ export interface StatusContext { used_tokens?: number | null; max_tokens?: numbe
 export interface StatusAccount { auth_type: string; plan_type?: string | null; requires_openai_auth: boolean }
 export interface StatusRateWindow { used_percent?: number | null; resets_at?: number | null; window_duration_mins?: number | null }
 export interface StatusRateLimit { limit_id?: string | null; limit_name?: string | null; plan_type?: string | null; rate_limit_reached_type?: string | null; primary?: StatusRateWindow | null; secondary?: StatusRateWindow | null }
-export interface StatusUsage { lifetime_tokens?: number | null; current_streak_days?: number | null; longest_streak_days?: number | null; peak_daily_tokens?: number | null; longest_running_turn_sec?: number | null }
+export interface StatusDailyUsageBucket { start_date: string; tokens: number }
+export interface StatusUsage {
+  lifetime_tokens?: number | null;
+  current_streak_days?: number | null;
+  longest_streak_days?: number | null;
+  peak_daily_tokens?: number | null;
+  longest_running_turn_sec?: number | null;
+  daily_usage_buckets?: StatusDailyUsageBucket[];
+}
 export interface StatusReport extends Base {
   type: "status_report";
   /** Echoes the GetStatus command id; absent for unsolicited reports. */
@@ -534,7 +542,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 27;
+export const PROTOCOL_VERSION = 28;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

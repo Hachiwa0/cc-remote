@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date, timedelta
 import json
 
 import pytest
@@ -9,17 +10,23 @@ from pydantic import ValidationError
 
 from cc_remote.protocol import (
     CommandAck,
+    DOWNSTREAM_TYPES,
     GetStatus,
+    MAX_SAFE_WIRE_INTEGER,
+    MAX_STATUS_USAGE_BUCKETS,
     StatusContext,
+    StatusDailyUsageBucket,
     StatusReport,
     StatusRuntime,
     StatusThread,
+    StatusUsage,
     deserialize,
     serialize,
 )
 from cc_remote.wrapper.codex_handle import (
     CodexHandle,
     _app_server_version,
+    _sanitize_daily_usage_buckets,
     _status_error_message,
 )
 from tests.test_multisession import _mk_ctx, _mk_machine
@@ -47,6 +54,7 @@ def _minimal_status(thread_id: str = "thread-1") -> dict:
 
 
 def test_status_protocol_is_strict_and_round_trips():
+    assert "status_report" not in DOWNSTREAM_TYPES
     command = GetStatus(
         sid="thread-1", cmd_id="status-1", client_id="client-1")
     assert deserialize(serialize(command)) == command
@@ -63,6 +71,12 @@ def test_status_protocol_is_strict_and_round_trips():
             sandbox_mode="workspace-write",
         ),
         context=StatusContext(used_tokens=25, max_tokens=100, percentage=25.0),
+        usage=StatusUsage(
+            lifetime_tokens=1000,
+            daily_usage_buckets=[StatusDailyUsageBucket(
+                start_date="2026-07-31", tokens=250,
+            )],
+        ),
         component_errors=["usage: unsupported by this Codex app-server"],
     )
     assert deserialize(serialize(report)) == report
@@ -74,6 +88,15 @@ def test_status_protocol_is_strict_and_round_trips():
             runtime=StatusRuntime(), context=StatusContext(),
             component_errors=["x" * 385],
         )
+    with pytest.raises(ValidationError):
+        StatusDailyUsageBucket(start_date="2026-7-31", tokens=1)
+    with pytest.raises(ValidationError):
+        StatusDailyUsageBucket(
+            start_date="2026-07-31", tokens=1, secret="must-not-pass")
+    with pytest.raises(ValidationError):
+        StatusUsage(daily_usage_buckets=[
+            StatusDailyUsageBucket(start_date="2026-07-31", tokens=1)
+        ] * (MAX_STATUS_USAGE_BUCKETS + 1))
 
 
 def test_app_server_version_extracts_only_version():
@@ -85,6 +108,11 @@ def test_app_server_version_extracts_only_version():
 
 
 def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
+    today = date.today()
+    day_2 = (today - timedelta(days=2)).isoformat()
+    day_3 = (today - timedelta(days=3)).isoformat()
+    day_4 = (today - timedelta(days=4)).isoformat()
+
     async def run():
         handle = CodexHandle(_Cfg())
         handle.thread_id = "thread-1"
@@ -135,7 +163,14 @@ def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
                 "lifetimeTokens": 123456, "peakDailyTokens": 3000,
                 "currentStreakDays": 2, "longestStreakDays": 8,
                 "longestRunningTurnSec": 90,
-            }, "dailyUsageBuckets": [{"startDate": "SECRET_DAY", "tokens": 1}]},
+            }, "dailyUsageBuckets": [
+                {"startDate": day_3, "tokens": 900},
+                {"startDate": day_4, "tokens": 400},
+                {"startDate": day_3, "tokens": 800},
+                {"startDate": "SECRET_DAY", "tokens": 1},
+                {"startDate": "2026-02-30", "tokens": 1},
+                {"startDate": day_2, "tokens": MAX_SAFE_WIRE_INTEGER + 1},
+            ]},
         }
 
         async def request(method, params=None):
@@ -174,6 +209,10 @@ def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
         }
         assert status["rate_limits"][0]["primary"]["used_percent"] == 42
         assert status["usage"]["lifetime_tokens"] == 123456
+        assert status["usage"]["daily_usage_buckets"] == [
+            {"start_date": day_4, "tokens": 400},
+            {"start_date": day_3, "tokens": 900},
+        ]
         assert status["component_errors"] == []
 
         wire = json.dumps(status, sort_keys=True)
@@ -187,6 +226,41 @@ def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
         StatusReport(**status)
 
     asyncio.run(run())
+
+
+def test_daily_usage_sanitizer_is_canonical_and_bounded_to_53_weeks():
+    first = date(2024, 1, 1)
+    rows = [
+        {
+            "startDate": (first + timedelta(days=index)).isoformat(),
+            "tokens": index,
+        }
+        for index in range(MAX_STATUS_USAGE_BUCKETS + 25)
+    ]
+    rows.extend([
+        {"startDate": rows[-1]["startDate"], "tokens": 1},
+        {"startDate": "2024-02-30", "tokens": 10},
+        {"startDate": "SECRET_DAY", "tokens": 10},
+        {"startDate": "2024-04-01", "tokens": True},
+        {"startDate": "2024-04-02", "tokens": -1},
+        {"startDate": "2024-04-03", "tokens": MAX_SAFE_WIRE_INTEGER + 1},
+        {"startDate": "2024-04-04", "tokens": 1, "secret": "ignored"},
+        "not-an-object",
+    ])
+
+    today = first + timedelta(days=MAX_STATUS_USAGE_BUCKETS + 24)
+    sanitized = _sanitize_daily_usage_buckets(rows, today=today)
+    assert len(sanitized) == MAX_STATUS_USAGE_BUCKETS
+    assert sanitized == sorted(sanitized, key=lambda item: item["start_date"])
+    assert sanitized[0]["start_date"] == (
+        today - timedelta(days=MAX_STATUS_USAGE_BUCKETS - 1)
+    ).isoformat()
+    assert sanitized[-1] == {
+        "start_date": rows[MAX_STATUS_USAGE_BUCKETS + 24]["startDate"],
+        "tokens": MAX_STATUS_USAGE_BUCKETS + 24,
+    }
+    assert all(set(item) == {"start_date", "tokens"} for item in sanitized)
+    StatusUsage(daily_usage_buckets=sanitized)
 
 
 @pytest.mark.parametrize("auth_type", ["apiKey", "amazonBedrock"])

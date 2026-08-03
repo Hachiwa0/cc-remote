@@ -170,6 +170,55 @@ async function readingAnchor(page: import("@playwright/test").Page): Promise<{
   });
 }
 
+test("Codex settings opens the responsive daily usage activity view", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?header-menu=1&engine=codex");
+  await page.getByRole("button", { name: "更多设置" }).click();
+  const activityEntry = page.getByRole("button", { name: /使用活动/ });
+  await expect(activityEntry).toBeVisible();
+  await activityEntry.click();
+
+  const dialog = page.getByRole("dialog", { name: "Codex 使用活动" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("累计 Token");
+  await expect(dialog).toContainText("9.88亿");
+  await expect(dialog).toContainText("单日峰值");
+  await expect(dialog).toContainText("最长任务");
+  await expect(dialog).toContainText("当前连续");
+  await expect(dialog).toContainText("最长连续");
+  await expect(dialog.locator(".usage-activity-tile")).toHaveCount(371);
+
+  const geometry = await page.locator(".usage-activity-viewport")
+    .evaluate((viewport) => ({
+      viewportWidth: window.innerWidth,
+      pageScrollWidth: document.documentElement.scrollWidth,
+      clientWidth: viewport.clientWidth,
+      scrollWidth: viewport.scrollWidth,
+      scrollLeft: viewport.scrollLeft,
+    }));
+  expect(geometry.pageScrollWidth).toBeLessThanOrEqual(geometry.viewportWidth);
+  if (geometry.scrollWidth > geometry.clientWidth) {
+    expect(geometry.scrollLeft).toBeGreaterThan(0);
+  }
+
+  const busiest = dialog.locator('.usage-activity-tile[data-level="4"]')
+    .first();
+  await expect(busiest).toHaveAttribute(
+    "title", /使用了 \d+(?:\.\d+)?万 个 Token/,
+  );
+  await busiest.click();
+  await expect(dialog.locator(".usage-activity-caption"))
+    .toContainText("Token");
+});
+
+test("Claude settings does not expose Codex usage activity", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?header-menu=1&engine=claude");
+  await page.getByRole("button", { name: "更多设置" }).click();
+  await expect(page.getByRole("button", { name: /使用活动/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /通知/ })).toBeVisible();
+});
+
 async function processDetailEdge(
   page: import("@playwright/test").Page,
   edge: "start" | "end",

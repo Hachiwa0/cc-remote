@@ -28,7 +28,13 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 27
+PROTOCOL_VERSION = 28
+
+# Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
+# payload to that same bounded window so an account response can never turn a
+# one-shot status frame into an unbounded relay/browser allocation.
+MAX_STATUS_USAGE_BUCKETS = 53 * 7
+MAX_SAFE_WIRE_INTEGER = 9_007_199_254_740_991
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -1647,12 +1653,22 @@ class StatusRateLimit(_StatusPart):
     secondary: Optional[StatusRateLimitWindow] = None
 
 
+class StatusDailyUsageBucket(_StatusPart):
+    start_date: Annotated[
+        str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    ]
+    tokens: int = Field(ge=0, le=MAX_SAFE_WIRE_INTEGER)
+
+
 class StatusUsage(_StatusPart):
     lifetime_tokens: Optional[int] = Field(default=None, ge=0)
     peak_daily_tokens: Optional[int] = Field(default=None, ge=0)
     current_streak_days: Optional[int] = Field(default=None, ge=0)
     longest_streak_days: Optional[int] = Field(default=None, ge=0)
     longest_running_turn_sec: Optional[int] = Field(default=None, ge=0)
+    daily_usage_buckets: list[StatusDailyUsageBucket] = Field(
+        default_factory=list, max_length=MAX_STATUS_USAGE_BUCKETS,
+    )
 
 
 class StatusReport(_Base):
@@ -1660,9 +1676,10 @@ class StatusReport(_Base):
 
     Every nested model forbids extras. The wrapper copies only explicitly
     approved display fields; account email, credentials, config instructions,
-    rollout paths/previews, credit balances and daily usage rows never cross the
-    wire. ``component_errors`` makes partial RPC failure visible without hiding
-    the successful sections.
+    rollout paths/previews and credit balances never cross the wire. Daily
+    activity is limited to validated date/token pairs for the latest 53 weeks.
+    ``component_errors`` makes partial RPC failure visible without hiding the
+    successful sections.
     """
     type: Literal["status_report"] = "status_report"
     # Correlates this snapshot with the reliable GetStatus command that

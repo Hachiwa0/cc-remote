@@ -5,11 +5,13 @@ import type { NotificationMode } from "../notification-mode";
 import type { PushBindingState } from "../push";
 
 interface Props {
+  engine: "claude" | "codex";
   theme: "light" | "dark";
   notificationMode: NotificationMode;
   notificationBinding: PushBindingState;
   notificationAvailable: boolean;
   onNotificationMode: (mode: NotificationMode) => Promise<boolean>;
+  onOpenUsageActivity: () => void;
   onToggleTheme: () => void;
   onLogout: () => void;
 }
@@ -26,11 +28,13 @@ const MODE_LABELS: Record<NotificationMode, string> = {
 };
 
 export function HeaderMenu({
+  engine,
   theme,
   notificationMode,
   notificationBinding,
   notificationAvailable,
   onNotificationMode,
+  onOpenUsageActivity,
   onToggleTheme,
   onLogout,
 }: Props) {
@@ -142,7 +146,17 @@ export function HeaderMenu({
                   <b>设置</b>
                 </header>
                 <div className="header-menu-items">
-                  <button ref={firstRef} type="button" className="header-menu-item"
+                  {engine === "codex" && <button ref={firstRef} type="button"
+                    className="header-menu-item" onClick={() => {
+                      close();
+                      onOpenUsageActivity();
+                    }}>
+                    <Icon name="calendar" size={18} />
+                    <span><b>使用活动</b><small>每日 Token、峰值与连续使用记录</small></span>
+                    <Icon name="chevron-right" size={16} />
+                  </button>}
+                  <button ref={engine === "codex" ? undefined : firstRef}
+                    type="button" className="header-menu-item"
                     onClick={() => setPage("notifications")}>
                     <Icon name="notify" size={18} />
                     <span><b>通知</b><small>{MODE_LABELS[notificationMode]} · {bindingLabel}</small></span>

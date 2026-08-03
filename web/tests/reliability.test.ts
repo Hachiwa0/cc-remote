@@ -7643,6 +7643,15 @@ assert.doesNotMatch(headerMenuSource, /header-menu-close/,
 assert.match(headerMenuSource,
   /top: Math\.min\(rect\.bottom \+ 8, window\.innerHeight - 24\)/,
   "the header menu must stay anchored below its trigger within the viewport");
+assert.match(headerMenuSource,
+  /engine === "codex" && <button[\s\S]*使用活动/,
+  "account activity must be a Codex-only header-menu action");
+assert.match(appSource,
+  /<HeaderMenu[\s\S]*engine=\{engine\}[\s\S]*onOpenUsageActivity=\{openUsageActivity\}/,
+  "the app must wire the selected engine and activity opener into the menu");
+assert.match(appSource,
+  /<UsageActivitySheet[\s\S]*open=\{usageActivityOpen && engine === "codex"\}/,
+  "the activity sheet must fail closed when the selected surface is Claude");
 assert.match(layoutCss, /\.header-menu-card\{[^}]*position:fixed/s);
 assert.match(layoutCss,
   /\.header-menu-card\{[^}]*right:max\(var\(--header-menu-right\),env\(safe-area-inset-right\)\)/s,

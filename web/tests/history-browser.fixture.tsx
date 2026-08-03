@@ -2,13 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 import "../src/index.css";
+import "../src/App.css";
 import { OMITTED_PROCESS_ITEM_ID, type Turn } from "../src/reducer";
 import type {
   PermissionProfileInfo,
   QueryFile,
   QueryImg,
   Space,
+  StatusReport,
 } from "../src/protocol";
+import { PROTOCOL_VERSION } from "../src/protocol";
 import {
   ChatView,
 } from "../src/components/ChatView";
@@ -22,6 +25,8 @@ import {
   type QueuedQueryEditor,
 } from "../src/components/QueuedQueryDialog";
 import { DirPicker } from "../src/components/DirPicker";
+import { HeaderMenu } from "../src/components/HeaderMenu";
+import { UsageActivitySheet } from "../src/components/UsageActivitySheet";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -386,7 +391,83 @@ interface FixtureSession {
   windowEpoch?: number;
 }
 
-export function HistoryBrowserFixture() {
+function fixtureUsageReport(): StatusReport {
+  const localNow = new Date();
+  const today = Date.UTC(
+    localNow.getFullYear(),
+    localNow.getMonth(),
+    localNow.getDate(),
+  );
+  const daily_usage_buckets = Array.from({ length: 210 }, (_, index) => ({
+    start_date: new Date(today - index * 86_400_000)
+      .toISOString().slice(0, 10),
+    tokens: index % 5 === 0 ? 0 : (210 - index) * 18_731,
+  }));
+  return {
+    v: PROTOCOL_VERSION,
+    type: "status_report",
+    ts: Date.now() / 1_000,
+    thread: {
+      thread_id: "usage-activity-fixture",
+      status: "idle",
+      active_flags: [],
+    },
+    runtime: {},
+    context: {},
+    account: {
+      auth_type: "chatgpt",
+      plan_type: "plus",
+      requires_openai_auth: false,
+    },
+    rate_limits: [],
+    usage: {
+      lifetime_tokens: 987_654_321,
+      peak_daily_tokens: 3_933_510,
+      longest_running_turn_sec: 10_920,
+      current_streak_days: 17,
+      longest_streak_days: 84,
+      daily_usage_buckets,
+    },
+    component_errors: [],
+  };
+}
+
+function UsageActivityBrowserFixture({
+  engine,
+}: {
+  engine: "claude" | "codex";
+}) {
+  const [activityOpen, setActivityOpen] = useState(false);
+  const report = useMemo(fixtureUsageReport, []);
+  useEffect(() => {
+    document.documentElement.dataset.engine = engine;
+    document.documentElement.dataset.theme = "dark";
+  }, [engine]);
+  return <main style={{ minHeight: "100dvh", background: "var(--bg)" }}>
+    <header className="c-head" style={{ justifyContent: "flex-end" }}>
+      <HeaderMenu
+        engine={engine}
+        theme="dark"
+        notificationMode="off"
+        notificationBinding="off"
+        notificationAvailable
+        onNotificationMode={async () => true}
+        onOpenUsageActivity={() => setActivityOpen(true)}
+        onToggleTheme={() => {}}
+        onLogout={() => {}}
+      />
+    </header>
+    <UsageActivitySheet
+      open={activityOpen}
+      report={report}
+      hasSession
+      onClose={() => setActivityOpen(false)}
+      onRefresh={() => {}}
+    />
+  </main>;
+}
+
+function HistoryConversationBrowserFixture() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const delayMs = Number(params.get("delay") ?? "30");
   const growthDelayMs = Number(params.get("growth-delay") ?? "500");
@@ -1152,6 +1233,16 @@ export function HistoryBrowserFixture() {
       )}
     </main>
   );
+}
+
+export function HistoryBrowserFixture() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has("header-menu")) {
+    return <UsageActivityBrowserFixture
+      engine={params.get("engine") === "claude" ? "claude" : "codex"}
+    />;
+  }
+  return <HistoryConversationBrowserFixture />;
 }
 
 createRoot(document.getElementById("root")!).render(<HistoryBrowserFixture />);
