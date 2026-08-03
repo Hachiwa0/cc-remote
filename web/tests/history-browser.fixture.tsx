@@ -16,6 +16,7 @@ import {
   OMITTED_PROCESS_ITEM_ID,
   reduce,
   type AppState,
+  type Block,
   type Turn,
 } from "../src/reducer";
 import type {
@@ -25,6 +26,7 @@ import type {
   ServerEvent,
   Space,
   StatusReport,
+  ThreadGoal,
 } from "../src/protocol";
 import { PROTOCOL_VERSION } from "../src/protocol";
 import {
@@ -57,6 +59,8 @@ import { UsageActivitySheet } from "../src/components/UsageActivitySheet";
 import { displayHistoryProjection } from "../src/history-recovery";
 import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
+import { GoalPanel } from "../src/components/GoalPanel";
+import { ProcessTimeline } from "../src/components/ProcessTimeline";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -182,8 +186,23 @@ function timelineTurn(id: string): Turn {
         item_id: `${id}-plan`,
         processKind: "plan",
         phase: "end",
-        status: "completed",
+        status: "running",
         title: "计划",
+        explanation: "保持历史窗口稳定，并验证交互状态。",
+        plan: [
+          { step: "检查历史锚点", status: "completed" },
+          { step: "验证计划弹层", status: "inProgress" },
+          { step: "运行浏览器回归", status: "pending" },
+        ],
+        done: true,
+      },
+      {
+        kind: "process",
+        item_id: `${id}-command`,
+        processKind: "command",
+        phase: "end",
+        status: "succeeded",
+        title: "检查结果",
         summary: "这个展开状态应跨虚拟卸载保留。",
         done: true,
       },
@@ -1794,12 +1813,105 @@ function HistoryConversationBrowserFixture() {
 
 export function HistoryBrowserFixture() {
   const params = new URLSearchParams(window.location.search);
+  const planUi = params.get("plan-ui");
+  if (planUi) return <PlanUiFixture mode={planUi} />;
+  if (params.has("goal-ui")) {
+    return <GoalUiFixture status={params.get("goal-status")} />;
+  }
   if (params.has("header-menu")) {
     return <UsageActivityBrowserFixture
       engine={params.get("engine") === "claude" ? "claude" : "codex"}
     />;
   }
   return <HistoryConversationBrowserFixture />;
+}
+
+function PlanUiFixture({ mode }: { mode: string }) {
+  const [detailRequests, setDetailRequests] = useState(0);
+  const [authoritative, setAuthoritative] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const structuredPlan: Block = {
+    kind: "process",
+    item_id: "plan-ui-structured",
+    processKind: "plan",
+    phase: "end",
+    status: "succeeded",
+    title: "计划",
+    explanation: authoritative ? "权威计划已同步" : "缓存计划",
+    plan: authoritative ? [
+      { step: "权威步骤一", status: "completed" },
+      { step: "权威步骤二", status: "inProgress" },
+      { step: "权威步骤三", status: "pending" },
+    ] : [
+      { step: "缓存步骤一", status: "completed" },
+      { step: "缓存步骤二", status: "inProgress" },
+      { step: "缓存步骤三", status: "pending" },
+    ],
+    done: true,
+  };
+  const unstructuredPlan: Block = {
+    kind: "process",
+    item_id: "plan-ui-unstructured",
+    processKind: "plan",
+    phase: "end",
+    status: "succeeded",
+    title: "旧版计划",
+    detail: "先检查协议，再验证移动端，最后发布。",
+    done: true,
+  };
+  const blocks = mode === "refresh" && refreshing
+    ? []
+    : mode === "unstructured"
+    ? [unstructuredPlan]
+    : mode === "mixed"
+      ? [unstructuredPlan, structuredPlan]
+      : [structuredPlan];
+  const deferred = mode === "refresh" && !authoritative;
+  return (
+    <main style={{ minHeight: "100dvh", padding: 24 }}>
+      <output data-testid="plan-detail-requests">{detailRequests}</output>
+      <output data-testid="plan-refresh-state">{
+        refreshing ? "loading" : authoritative ? "ready" : "cached"
+      }</output>
+      <ProcessTimeline blocks={blocks} done active={false}
+        deferredCount={deferred ? 8 : 0}
+        detailLoading={refreshing}
+        onLoadDetail={deferred ? () => {
+          setDetailRequests((value) => value + 1);
+          setRefreshing(true);
+          window.setTimeout(() => {
+            setAuthoritative(true);
+            setRefreshing(false);
+          }, 150);
+          return true;
+        } : undefined} />
+    </main>
+  );
+}
+
+function GoalUiFixture({ status }: { status: string | null }) {
+  const [open, setOpen] = useState(false);
+  const [revealed, setRevealed] = useState(true);
+  const goalStatus = status === "blocked" ? "blocked" : "active";
+  const goal: ThreadGoal = {
+    threadId: "goal-fixture-thread",
+    objective: "完成 protocol v29 发布并验证所有终端同步升级",
+    status: goalStatus,
+    engine: "codex",
+    tokenBudget: 100_000,
+    tokensUsed: 37_000,
+    timeUsedSeconds: 321,
+  };
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
+      <GoalPanel engine="codex" goal={goal} revealed={revealed} open={open}
+        onOpen={() => setOpen(true)} onClose={() => setOpen(false)}
+        onDismiss={() => setRevealed(false)} onSave={() => setOpen(false)}
+        onClear={() => setRevealed(false)} />
+      <div className="composer"><div className="composer-in" /></div>
+    </main>
+  );
 }
 
 function InlineImageCapacityFixture() {

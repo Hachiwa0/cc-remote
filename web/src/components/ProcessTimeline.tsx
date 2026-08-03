@@ -28,6 +28,7 @@ import {
   type HistoryImageVariant,
 } from "../history-image-assets";
 import { PointerTapGuard } from "../pointer-tap";
+import { PlanProgressPopover } from "./PlanProgressPopover";
 
 function durationLabel(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -600,6 +601,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   onInteractionStart?: () => number;
   onInteractionEnd?: (token: number) => void;
 }) {
+  const retainedPlanBlock = useRef<ProcessBlock | null>(null);
   // Codex does not expose its private chain of thought in official clients.
   // Keep actionable commentary, plans, hook failures and tools, but suppress
   // synthetic reasoning and successful hook plumbing so consecutive tool calls
@@ -619,6 +621,21 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
         (block) => !isPayloadFreeUnfinishedCommandShell(block),
       )
     : projectedItems;
+  const planBlocks = items.filter((block): block is ProcessBlock =>
+    block.kind === "process" && block.processKind === "plan");
+  // Prefer the newest structured update for the compact progress control. A
+  // turn can also contain older free-form plan records with a different item
+  // id; keep those in chronology instead of deleting every plan-shaped row.
+  const planBlock = [...planBlocks].reverse().find(
+    (block) => block.plan != null) ?? planBlocks.at(-1);
+  // Authoritative detail replaces the provisional cache page before all older
+  // pages arrive. Keep the already-painted plan affordance mounted through that
+  // transition; otherwise one click makes its own popover disappear briefly.
+  if (planBlock) retainedPlanBlock.current = planBlock;
+  const visiblePlanBlock = planBlock ?? retainedPlanBlock.current;
+  const timelineItems = planBlock
+    ? items.filter((block) => block !== planBlock)
+    : items;
   const processActive = active ?? (!done && (
     hasActiveProcess(projectedItems) || projectedItems.length > 0
   ));
@@ -665,7 +682,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
       && !visibleDetailError) return null;
   // A completed timeline is collapsed. Do not allocate/group hundreds of
   // historical rows until the user actually opens it.
-  const rows = open ? groupTimelineRows(items) : [];
+  const rows = open ? groupTimelineRows(timelineItems) : [];
   const toolCount = items.reduce((count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
   const countLabel = needsAuthoritativeDetail
     ? `${deferredCount} 项`
@@ -746,27 +763,36 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   return (
     <section data-process-detail-root
       className={`turn-process${open ? " open" : ""}`}>
-      <button type="button" className="turn-process-head"
-        aria-expanded={open} aria-busy={detailLoading}
-        onPointerDown={pointerDown} onPointerMove={pointerMove}
-        onPointerUp={pointerUp} onPointerCancel={pointerCancel}
-        onClick={(event) => {
-          if (!tapGuard.current.consumeClick(event.detail)) {
-            event.preventDefault();
-            return;
-          }
-          toggle();
-        }}>
-        <span className={`turn-process-state${processSettled ? " done" : " running"}`}>
-          {detailLoading && !processActive
-            ? <span className="process-spin" />
-            : <Icon name={processActive ? "spark" : "verify"} size={14} />}
-        </span>
-        <span>{processSettled ? "已处理" : "正在处理"}
-          {elapsed == null ? null : ` ${durationLabel(elapsed)}`}</span>
-        <span className="turn-process-count">{countLabel}</span>
-        <Icon name="chev" size={15} />
-      </button>
+      <div className="turn-process-controls">
+        <button type="button" className="turn-process-head"
+          aria-expanded={open} aria-busy={detailLoading}
+          onPointerDown={pointerDown} onPointerMove={pointerMove}
+          onPointerUp={pointerUp} onPointerCancel={pointerCancel}
+          onClick={(event) => {
+            if (!tapGuard.current.consumeClick(event.detail)) {
+              event.preventDefault();
+              return;
+            }
+            toggle();
+          }}>
+          <span className={`turn-process-state${processSettled ? " done" : " running"}`}>
+            {detailLoading && !processActive
+              ? <span className="process-spin" />
+              : <Icon name={processActive ? "spark" : "verify"} size={14} />}
+          </span>
+          <span>{processSettled ? "已处理" : "正在处理"}
+            {elapsed == null ? null : ` ${durationLabel(elapsed)}`}</span>
+          <span className="turn-process-count">{countLabel}</span>
+          <Icon name="chev" size={15} />
+        </button>
+        {visiblePlanBlock && <PlanProgressPopover block={visiblePlanBlock}
+          openOverride={itemOpen?.(`plan:${visiblePlanBlock.item_id}`)}
+          onOpenChange={(next) => onItemOpenChange?.(
+            `plan:${visiblePlanBlock.item_id}`, next)}
+          detailLoading={detailLoading}
+          onNeedDetail={needsAuthoritativeDetail && !detailLoading
+            ? requestDetail : undefined} />}
+      </div>
       {open && <div className="process-timeline">
         {visibleDetailError && (
           <div className="process-detail-error" role="alert">

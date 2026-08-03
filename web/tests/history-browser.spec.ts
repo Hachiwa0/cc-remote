@@ -2327,6 +2327,111 @@ test("virtualization bounds mounted rows and preserves an expanded timeline", as
   await expect(timeline.locator(".turn-process-head")).toHaveAttribute("aria-expanded", "true");
 });
 
+test("plan progress uses a compact popover that closes outside", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?timeline=1");
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
+  const timeline = page.locator('[data-turn-id="timeline"]');
+  const trigger = timeline.getByRole("button", { name: /查看计划进度/ });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(popover).toBeVisible();
+  await expect(popover).toContainText("1 / 3");
+  await expect(popover).toContainText("验证计划弹层");
+
+  const box = await popover.boundingBox();
+  const viewport = page.viewportSize();
+  if (!box || !viewport) throw new Error("plan popover has no geometry");
+  expect(box.x).toBeGreaterThanOrEqual(8);
+  expect(box.x + box.width).toBeLessThanOrEqual(viewport.width - 8);
+  expect(box.y).toBeGreaterThanOrEqual(8);
+  expect(box.y + box.height).toBeLessThanOrEqual(viewport.height - 8);
+
+  await trigger.click();
+  await expect(popover).toHaveCount(0);
+  await trigger.click();
+  await expect(popover).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(popover).toHaveCount(0);
+  await trigger.click();
+  await expect(popover).toBeVisible();
+
+  await page.getByTestId("load-count").click();
+  await expect(popover).toHaveCount(0);
+});
+
+test("terminal turn does not mark unfinished structured plan complete", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?plan-ui=terminal");
+  await page.getByRole("button", { name: /查看计划进度/ }).click();
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(popover).toContainText("1 / 3");
+  await expect(popover).toContainText("执行已结束");
+  await expect(popover).not.toContainText("全部完成");
+});
+
+test("unstructured plan detail remains visible in the compact popover", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?plan-ui=unstructured");
+  await page.getByRole("button", { name: /查看计划进度/ }).click();
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(popover).toContainText("已记录");
+  await expect(popover).not.toContainText("全部完成");
+  await expect(popover).toContainText("先检查协议，再验证移动端，最后发布。");
+});
+
+test("opening a cached plan refreshes authoritative detail", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?plan-ui=refresh");
+  await page.getByRole("button", { name: /查看计划进度/ }).click();
+  await expect(page.getByTestId("plan-detail-requests")).toHaveText("1");
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(page.getByTestId("plan-refresh-state")).toHaveText("loading");
+  await expect(popover).toBeVisible();
+  await expect(popover).toContainText("缓存步骤二");
+  await expect(page.getByTestId("plan-refresh-state")).toHaveText("ready");
+  await expect(popover).toContainText("权威步骤二");
+  await expect(popover).not.toContainText("缓存步骤二");
+});
+
+test("only the selected plan block moves into the compact popover", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?plan-ui=mixed");
+  await page.locator(".turn-process-head").click();
+  await expect(page.getByText("旧版计划", { exact: true })).toBeVisible();
+});
+
+test("goal entry stays compact and opens its editor", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1");
+  const chip = page.getByRole("button", { name: "查看 Goal" });
+  await expect(chip).toBeVisible();
+  const box = await chip.boundingBox();
+  const viewport = page.viewportSize();
+  if (!box || !viewport) throw new Error("goal chip has no geometry");
+  expect(box.height).toBeLessThanOrEqual(42);
+  expect(box.width).toBeLessThan(viewport.width - 20);
+
+  await chip.click();
+  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toBeVisible();
+  await page.locator(".scrim.show").click({ position: { x: 5, y: 5 } });
+  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
+});
+
+test("budgeted goal keeps its blocked status visible on mobile", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-status=blocked");
+  const chip = page.getByRole("button", { name: /查看 Goal/ });
+  await expect(chip).toHaveAttribute("aria-label", /受阻/);
+  await expect(chip.locator(".goal-chip-ring"))
+    .toHaveClass(/goal-chip-ring-blocked/);
+});
+
 test("desktop text selection keeps its original virtual turn while edge-dragging", async ({
   page,
 }, testInfo) => {

@@ -475,9 +475,11 @@ button.message-image-error{ font:inherit; cursor:pointer; }
 
 /* One turn-level process timeline. The final answer stays outside this shell. */
 .turn-process{ margin:5px 0 10px; color:var(--dim); }
+.turn-process-controls{ position:relative; display:flex; align-items:center; gap:3px; width:100%; }
 .turn-process-head{ display:flex; align-items:center; gap:7px; width:100%; min-height:38px;
   padding:6px 8px; border-radius:10px; color:var(--dim); text-align:left; font-size:13px; font-weight:600;
   touch-action:pan-y; user-select:none; -webkit-user-select:none; }
+.turn-process-controls>.turn-process-head{ width:auto; min-width:0; flex:1; }
 @media (hover:hover) and (pointer:fine){
   .turn-process-head:hover{ background:var(--raised); color:var(--text); }
 }
@@ -488,6 +490,46 @@ button.message-image-error{ font:inherit; cursor:pointer; }
 .turn-process-count{ margin-left:auto; color:var(--faint); font-size:11px; font-weight:500; }
 .process-spin{ display:block; width:12px; height:12px; border-radius:50%; border:2px solid currentColor;
   border-right-color:transparent; animation:spin .75s linear infinite; }
+.plan-progress-control{ position:relative; flex:none; }
+.plan-progress-trigger{ width:34px; height:34px; display:grid; place-items:center; border-radius:50%;
+  color:var(--accent); touch-action:pan-y; user-select:none; -webkit-user-select:none; }
+.plan-progress-trigger:hover,.plan-progress-trigger[aria-expanded="true"]{ background:var(--accent-weak); }
+.plan-progress-trigger.complete{ color:var(--ok); }
+.plan-progress-trigger.failed{ color:var(--danger); }
+.plan-progress-ring{ --plan-progress:0deg; position:relative; width:24px; height:24px; display:grid;
+  place-items:center; border-radius:50%; background:conic-gradient(currentColor var(--plan-progress),var(--border-strong) 0); }
+.plan-progress-ring::before{ content:""; position:absolute; inset:3px; border-radius:50%; background:var(--bg); }
+.plan-progress-ring svg{ position:relative; }
+.plan-progress-popover{ position:fixed; z-index:78; overflow:auto; box-sizing:border-box;
+  padding:13px; border:1px solid var(--border-strong); border-radius:15px; color:var(--text);
+  background:var(--surface); box-shadow:var(--shadow-lg); animation:panel-in .15s var(--ease); }
+.plan-progress-popover>header{ display:flex; align-items:center; gap:9px; }
+.plan-progress-popover>header>span:nth-child(2){ min-width:0; flex:1; display:flex; flex-direction:column; }
+.plan-progress-popover>header b{ font-size:13px; }
+.plan-progress-popover>header small{ color:var(--faint); font-size:10.5px; }
+.plan-progress-popover>header strong{ flex:none; color:var(--dim); font:10.5px/1 var(--mono); }
+.plan-progress-mark{ width:29px; height:29px; display:grid; place-items:center; flex:none;
+  border-radius:9px; color:var(--accent); background:var(--accent-weak); }
+.plan-progress-mark.complete{ color:var(--ok); background:var(--ok-weak); }
+.plan-progress-mark.failed{ color:var(--danger); background:var(--danger-weak); }
+.plan-progress-popover>p{ margin:10px 1px 8px; color:var(--dim); font-size:11.5px;
+  line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; }
+.plan-progress-fallback{ margin:9px 0 0; padding:9px 10px; border-radius:9px; overflow:auto;
+  color:var(--dim); background:var(--raised); font:11.5px/1.5 var(--mono); white-space:pre-wrap;
+  overflow-wrap:anywhere; }
+.plan-progress-popover>ol{ display:flex; flex-direction:column; gap:1px; margin:9px 0 0; padding:0; list-style:none; }
+.plan-progress-popover>ol li{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:7px;
+  align-items:flex-start; padding:6px 5px; border-radius:8px; color:var(--dim); font-size:12px; line-height:1.4; }
+.plan-progress-popover>ol li>span:first-child{ width:20px; height:20px; display:grid; place-items:center;
+  color:var(--faint); }
+.plan-progress-popover>ol li>span:last-child{ overflow-wrap:anywhere; }
+.plan-progress-popover li.plan-step-completed{ color:var(--faint); }
+.plan-progress-popover li.plan-step-completed>span:first-child{ color:var(--ok); }
+.plan-progress-popover li.plan-step-inProgress{ color:var(--text); background:var(--accent-weak); font-weight:600; }
+.plan-progress-popover li.plan-step-inProgress>span:first-child i{ width:8px; height:8px; border-radius:50%;
+  background:var(--accent); box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent); animation:pulse 1.4s ease-in-out infinite; }
+.plan-progress-popover li.plan-step-pending>span:first-child em{ font-style:normal; font:9.5px/1 var(--mono); }
+.plan-progress-empty{ padding:18px 4px 8px; color:var(--faint); font-size:12px; text-align:center; }
 .process-timeline{ position:relative; display:flex; flex-direction:column; gap:3px; margin:2px 0 5px 15px;
   padding:5px 0 5px 17px; border-left:1.5px solid var(--border-strong); }
 .process-detail-loading{ min-height:35px; display:flex; align-items:center; padding:5px 8px;
