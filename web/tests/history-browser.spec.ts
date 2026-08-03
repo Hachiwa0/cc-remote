@@ -953,6 +953,52 @@ test("a history page waits for the active touch to release before mounting", asy
   expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
 });
 
+test("older history becoming available during a wheel gesture is restored once", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name === "webkit", "desktop wheel path");
+  await page.goto(
+    "/tests/history-browser.html?delayed-history-availability=1&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  const before = await readingAnchor(page);
+  await viewport.dispatchEvent("wheel", { deltaY: -80 });
+  await page.getByTestId("reveal-older-history").click();
+
+  await expect(page.getByText("正在恢复历史…")).toBeVisible();
+  const pending = await readingAnchor(page);
+  expect(pending.id).toBe(before.id);
+  expect(Math.abs(pending.offset - before.offset)).toBeLessThan(2);
+  await expect(page.getByTestId("load-count")).toHaveText("0");
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+});
+
+test("older history becoming available under touch waits for release", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "webkit", "mobile WebKit touch path");
+  await page.goto(
+    "/tests/history-browser.html?delayed-history-availability=1&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await dispatchTouchPhase(page, "touchstart", 160);
+  await dispatchTouchPhase(page, "touchmove", 220);
+  await page.getByTestId("reveal-older-history").click();
+
+  await expect(page.getByText("正在恢复历史…")).toBeVisible();
+  await expect(page.getByTestId("load-count")).toHaveText("0");
+  await dispatchTouchPhase(page, "touchend", 220);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+});
+
 test("one click loads every turn-detail page without collapsing or jumping", async ({
   page,
 }) => {
@@ -1245,6 +1291,66 @@ test("instant session cache preserves a heavy turn's complete process skeleton",
   expect(result.process).toEqual([
     "2", "heavy-tool-3", "heavy-tool-4", "5", "6",
   ]);
+});
+
+test("session cache rejects v10 Claude rows before replay or hydration", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html");
+  const result = await page.evaluate(async () => {
+    const cache = await import("/src/cache.ts");
+    await cache.clearCache();
+    const legacySid = "legacy-claude-prompt-alias";
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("cc_remote_cache", 1);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const tx = database.transaction("sessions", "readwrite");
+      tx.objectStore("sessions").put({
+        v: 10,
+        turns: [{
+          id: "claude-transcript-uuid",
+          prompt: "legacy prompt",
+          blocks: [],
+          done: false,
+        }],
+        lastSeq: 41,
+        revision: "legacy-r1",
+        generation: "legacy-g1",
+        savedAt: Date.now(),
+      }, legacySid);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+    const legacy = await cache.loadSession(legacySid);
+    const replay = await cache.loadAllReplayState();
+    cache.saveSession("current-claude-prompt-alias", [{
+      id: "browser-prompt-id",
+      clientMsgId: "browser-prompt-id",
+      historyTurnId: "claude-transcript-uuid",
+      prompt: "current prompt",
+      blocks: [],
+      done: false,
+    }], 42, "current-r1", "current-g1");
+    await new Promise((resolve) => window.setTimeout(resolve, 700));
+    const current = await cache.loadSession("current-claude-prompt-alias");
+    database.close();
+    return {
+      legacy,
+      legacyCursor: replay.cursors[legacySid],
+      currentIds: current?.turns.map((turn: {
+        id: string; clientMsgId?: string; historyTurnId?: string;
+      }) => [turn.id, turn.clientMsgId, turn.historyTurnId]),
+    };
+  });
+  expect(result.legacy).toBeNull();
+  expect(result.legacyCursor).toBeUndefined();
+  expect(result.currentIds).toEqual([[
+    "browser-prompt-id", "browser-prompt-id", "claude-transcript-uuid",
+  ]]);
 });
 
 test("a canonical image reference does not reserve a second hidden image row", async ({

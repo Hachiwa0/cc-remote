@@ -98,6 +98,7 @@ class TreeEntry:
 class CompletedCheckpoint:
     turn_id: str
     changed_paths: tuple[str, ...]
+    files_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -378,20 +379,67 @@ class CodexCheckpointJournal:
 
     def _capture_stable_state(
         self,
-    ) -> tuple[str, bytes, dict[str, tuple[str, ...]], dict[str, int]]:
-        """Capture twice so an editor write cannot produce a mixed tree image."""
+    ) -> tuple[
+        str,
+        bytes,
+        dict[str, tuple[str, ...]],
+        dict[str, int],
+        Optional[str],
+    ]:
+        """Capture HEAD/index/tree together without accepting a mixed image."""
+        head_before = self._head_oid()
         index_before, _ = self._index_snapshot()
         first_tree = self._capture_tree()
         first_modes = self._permission_overrides(first_tree)
+        head_middle = self._head_oid()
         index_middle, _ = self._index_snapshot()
         second_tree = self._capture_tree()
         second_modes = self._permission_overrides(second_tree)
+        head_after = self._head_oid()
         index_after, index_entries = self._index_snapshot()
+        if not (head_before == head_middle == head_after):
+            raise CheckpointError("Git HEAD changed while capturing checkpoint")
         if not (index_before == index_middle == index_after):
             raise CheckpointError("Git index changed while capturing checkpoint")
         if first_tree != second_tree or first_modes != second_modes:
             raise CheckpointError("Worktree changed while capturing checkpoint")
-        return second_tree, index_after, index_entries, second_modes
+        return second_tree, index_after, index_entries, second_modes, head_after
+
+    def _head_oid(self) -> Optional[str]:
+        result = self._git(
+            "rev-parse", "--verify", "--quiet", "HEAD", check=False
+        )
+        if result.returncode != 0:
+            return None
+        oid = _decode(result.stdout).strip()
+        if len(oid) < 40:
+            raise CheckpointError("Git returned an invalid HEAD")
+        return oid
+
+    def _clean_head_advance(
+        self,
+        pre_head: Optional[str],
+        post_head: Optional[str],
+        post_tree: str,
+    ) -> bool:
+        """Accept only a forward commit with a clean index and worktree."""
+        if not pre_head or not post_head or pre_head == post_head:
+            return False
+        if self._git(
+            "merge-base", "--is-ancestor", pre_head, post_head, check=False
+        ).returncode != 0:
+            return False
+        head_tree_result = self._git(
+            "rev-parse", "--verify", f"{post_head}^{{tree}}", check=False
+        )
+        index_tree_result = self._git(
+            "write-tree", env=self._git_env(), check=False
+        )
+        if head_tree_result.returncode != 0 or index_tree_result.returncode != 0:
+            return False
+        head_tree = _decode(head_tree_result.stdout).strip()
+        index_tree = _decode(index_tree_result.stdout).strip()
+        return bool(head_tree) and post_tree == head_tree == index_tree
 
     @staticmethod
     def _trim_turn_window(manifest: dict[str, Any]) -> None:
@@ -548,7 +596,9 @@ class CodexCheckpointJournal:
             if any(turn.get("turn_id") == turn_id for turn in manifest["turns"]):
                 raise CheckpointError("This turn already has a checkpoint")
 
-            pre_tree, index_before, _, pre_modes = self._capture_stable_state()
+            pre_tree, index_before, _, pre_modes, pre_head = (
+                self._capture_stable_state()
+            )
 
             checkpoint_id = uuid.uuid4().hex
             index_snapshot_name = f"tmp/{checkpoint_id}.index"
@@ -557,6 +607,7 @@ class CodexCheckpointJournal:
                 "checkpoint_id": checkpoint_id,
                 "turn_id": turn_id,
                 "pre_tree": pre_tree,
+                "pre_head": pre_head,
                 "pre_modes": pre_modes,
                 "index_snapshot": index_snapshot_name,
                 "accepted": False,
@@ -596,7 +647,7 @@ class CodexCheckpointJournal:
                     "Active checkpoint index snapshot is missing"
                 ) from exc
 
-            post_tree, post_index_raw, post_index_entries, post_modes = (
+            post_tree, post_index_raw, post_index_entries, post_modes, post_head = (
                 self._capture_stable_state()
             )
 
@@ -652,6 +703,39 @@ class CodexCheckpointJournal:
                 # Unknown/new index extensions changed. Fail closed rather than
                 # claiming a checkpoint that cannot restore the same Git state.
                 changed_index_paths = ("<index-metadata>",)
+            pre_head = active.get("pre_head")
+            if pre_head is not None and not isinstance(pre_head, str):
+                raise CheckpointError("Active checkpoint HEAD is invalid")
+            if self._clean_head_advance(
+                pre_head, post_head, post_tree
+            ):
+                # A normal commit legitimately advances both HEAD and index.
+                # File rollback cannot rewrite Git history, but this tombstone
+                # keeps native conversation rollback counts aligned.
+                manifest["turns"].append(
+                    {
+                        "checkpoint_id": active["checkpoint_id"],
+                        "turn_id": turn_id,
+                        "available": False,
+                        "files_restored": False,
+                        "reason": "clean HEAD advance",
+                        "paths": [],
+                        "started_at_ns": active["started_at_ns"],
+                        "finished_at_ns": time.time_ns(),
+                    }
+                )
+                manifest["active"] = None
+                self._trim_turn_window(manifest)
+                self._save_manifest(manifest)
+                snapshot_path.unlink(missing_ok=True)
+                if self._object_store_exceeds_limit():
+                    self._invalidate_file_history_for_retention(manifest)
+                    raise CheckpointError("Checkpoint retention limit reached")
+                return CompletedCheckpoint(
+                    turn_id=turn_id,
+                    changed_paths=(),
+                    files_available=False,
+                )
             if changed_index_paths:
                 manifest["active"] = None
                 self._save_manifest(manifest)
@@ -885,7 +969,7 @@ class CodexCheckpointJournal:
         if not isinstance(original_modes, dict) or not isinstance(target_modes, dict):
             raise CheckpointError("Checkpoint restore metadata is invalid")
 
-        current_tree, _, _, current_modes = self._capture_stable_state()
+        current_tree, _, _, current_modes, _ = self._capture_stable_state()
         current_entries = self._tree_entries(current_tree)
         if self._snapshot_matches(
             paths, current_entries, current_modes, target_entries, target_modes
@@ -955,9 +1039,13 @@ class CodexCheckpointJournal:
                     + ", ".join(unavailable[:8])
                 )
 
-            current_tree, current_index_raw, current_index_entries, current_modes = (
-                self._capture_stable_state()
-            )
+            (
+                current_tree,
+                current_index_raw,
+                current_index_entries,
+                current_modes,
+                _,
+            ) = self._capture_stable_state()
             current_entries = self._tree_entries(current_tree)
             target_entries = dict(current_entries)
             target_modes: dict[str, Optional[int]] = {}
@@ -1031,9 +1119,13 @@ class CodexCheckpointJournal:
             # Narrow the race between validation and mutation.  Wrapper ownership
             # prevents ordinary concurrent turns, while this catches a terminal or
             # editor change that arrived during object materialization.
-            latest_tree, latest_index_raw, latest_index_entries, latest_modes = (
-                self._capture_stable_state()
-            )
+            (
+                latest_tree,
+                latest_index_raw,
+                latest_index_entries,
+                latest_modes,
+                _,
+            ) = self._capture_stable_state()
             latest_entries = self._tree_entries(latest_tree)
             if latest_index_raw != current_index_raw:
                 changed_index = tuple(

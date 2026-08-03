@@ -19,7 +19,11 @@ import { MessageBlock } from "./MessageBlock";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
 import { canForkTurn } from "../session-worktree";
 import { ProcessTimeline } from "./ProcessTimeline";
-import { finalTextBlocks, hasActiveProcess } from "../process-blocks";
+import {
+  finalTextBlocks,
+  hasActiveProcess,
+  processBlocks,
+} from "../process-blocks";
 import { isMarkdownPath } from "../preview-path";
 import { collectTurnFileChanges } from "../file-changes";
 import type { InlineImageAsset } from "../inline-image-assets";
@@ -109,6 +113,7 @@ interface RetainedMeasurementBoundary {
 interface HistoryViewportPresentation {
   scope: string;
   authorityScope: string;
+  generation: string | null;
   turns: Turn[];
   hasMore: boolean;
   cursor: string | null;
@@ -123,6 +128,7 @@ function sameHistoryViewportPresentation(
 ): boolean {
   return left.scope === right.scope
     && left.authorityScope === right.authorityScope
+    && left.generation === right.generation
     && left.turns === right.turns
     && left.hasMore === right.hasMore
     && left.cursor === right.cursor
@@ -232,6 +238,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   hasMore: incomingHasMore,
   historyPagingReady = true,
   historyRevision = null, historyViewRevision = historyRevision,
+  historyGeneration = null,
   historyViewId = null, historyScopeKey = null,
   historyWindowEpoch: incomingHistoryWindowEpoch = 0,
   historyCursor: incomingHistoryCursor = null,
@@ -255,6 +262,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   // atomic History swap so the virtualizer preserves the current reading row.
   // Pagination/detail still use the authoritative historyRevision above.
   historyViewRevision?: string | null;
+  historyGeneration?: string | null;
   historyViewId?: string | null;
   historyScopeKey?: string | null;
   historyWindowEpoch?: number;
@@ -354,7 +362,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     scope: scrollScope,
     authorityScope: [
       historyScopeKey ?? "", sid ?? "", historyRevision ?? "",
+      historyGeneration ?? "",
     ].join("\u0000"),
+    generation: historyGeneration,
     turns: incomingTurns,
     hasMore: !!incomingHasMore,
     cursor: incomingHistoryCursor,
@@ -451,19 +461,38 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       return next;
     });
   }, []);
-  const showOlderHistory = !!hasMore;
-  const canLoadOlder = showOlderHistory && historyPagingReady;
+  const stagedOlderMetadata = (
+    scopedPresentedHistory.scope !== incomingHistoryPresentation.scope
+    || scopedPresentedHistory.generation
+      !== incomingHistoryPresentation.generation
+    || scopedPresentedHistory.cursor !== incomingHistoryPresentation.cursor
+    || scopedPresentedHistory.hasMore !== incomingHistoryPresentation.hasMore
+  );
+  const olderHistoryAvailability: "unavailable" | "pending" | "ready" =
+    !incomingHistoryPresentation.hasMore
+      ? "unavailable"
+      : stagedOlderMetadata || !historyPagingReady || !hasMore
+          || !incomingHistoryPresentation.cursor
+        ? "pending"
+        : "ready";
+  const showOlderHistory = olderHistoryAvailability !== "unavailable";
+  const canLoadOlder = olderHistoryAvailability === "ready";
+  const deferredOlderIntentRef = useRef<{
+    authorityScope: string;
+    viewId: string;
+    cursor: string | null;
+  } | null>(null);
   const canLoadNewer = browseMode && !!hasNewer;
   const historyInsetRef = useRef({
     scope: scrollScope,
-    enabled: showOlderHistory,
+    enabled: !!hasMore,
   });
   if (historyInsetRef.current.scope !== scrollScope) {
     historyInsetRef.current = {
       scope: scrollScope,
-      enabled: showOlderHistory,
+      enabled: !!hasMore,
     };
-  } else if (showOlderHistory) {
+  } else if (hasMore) {
     historyInsetRef.current.enabled = true;
   }
   const contentTopInset = surface === "work"
@@ -1126,6 +1155,72 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   };
   const doLoadMore = (): boolean => doLoadPage("older");
   const doLoadNewer = (): boolean => doLoadPage("newer");
+  const doLoadMoreRef = useRef(doLoadMore);
+  doLoadMoreRef.current = doLoadMore;
+
+  const stageDeferredOlderIntent = useCallback((
+    source: "touch" | "wheel" | "other",
+  ): boolean => {
+    const gestureGate = source === "touch"
+      ? historyLoadGateRef.current
+      : source === "wheel" ? wheelHistoryLoadGateRef.current : null;
+    if (gestureGate && !gestureGate.acquire()) return false;
+    deferredOlderIntentRef.current = {
+      authorityScope: incomingHistoryPresentation.authorityScope,
+      viewId: resolvedHistoryViewId,
+      cursor: incomingHistoryPresentation.cursor,
+    };
+    return true;
+  }, [
+    incomingHistoryPresentation.authorityScope,
+    incomingHistoryPresentation.cursor,
+    resolvedHistoryViewId,
+  ]);
+
+  useLayoutEffect(() => {
+    const pending = deferredOlderIntentRef.current;
+    const currentAuthority = incomingHistoryPresentation.authorityScope;
+    if (pending && (pending.authorityScope !== currentAuthority
+        || pending.viewId !== resolvedHistoryViewId)) {
+      deferredOlderIntentRef.current = null;
+      completeHistoryLoadGates();
+    }
+    if (olderHistoryAvailability === "unavailable") {
+      if (deferredOlderIntentRef.current) {
+        deferredOlderIntentRef.current = null;
+        completeHistoryLoadGates();
+      }
+      return;
+    }
+    if (pending && pending.cursor !== incomingHistoryPresentation.cursor) {
+      pending.cursor = incomingHistoryPresentation.cursor;
+    }
+    const el = scrollRef.current;
+    const source = touchYRef.current !== null
+      ? "touch" : wheelGestureActiveRef.current ? "wheel" : null;
+    if (olderHistoryAvailability === "pending"
+        && !deferredOlderIntentRef.current
+        && source
+        && userScrollIntentRef.current
+        && userScrollDirectionRef.current === "history"
+        && el && isAtHistoryEdge(readScrollMetrics(el))) {
+      stageDeferredOlderIntent(source);
+      return;
+    }
+    const intent = deferredOlderIntentRef.current;
+    if (olderHistoryAvailability !== "ready" || !intent
+        || intent.authorityScope !== currentAuthority
+        || intent.viewId !== resolvedHistoryViewId
+        || intent.cursor !== historyCursor) return;
+    deferredOlderIntentRef.current = null;
+    if (!doLoadMoreRef.current()) completeHistoryLoadGates();
+  }, [
+    completeHistoryLoadGates, historyCursor,
+    incomingHistoryPresentation.authorityScope,
+    incomingHistoryPresentation.cursor,
+    olderHistoryAvailability, resolvedHistoryViewId,
+    stageDeferredOlderIntent,
+  ]);
 
   // Scroll/touch events can repeat many times while a finger or wheel remains
   // pinned at the top. Touch/wheel gates allow one request per gesture; plain
@@ -1135,8 +1230,14 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     source: "touch" | "wheel" | "other",
   ) => {
     const el = scrollRef.current;
-    if (!el || !shouldAutoLoadOlderHistory(
-      readScrollMetrics(el), movingTowardHistory, canLoadOlder,
+    if (!el || !movingTowardHistory
+        || !isAtHistoryEdge(readScrollMetrics(el))) return;
+    if (olderHistoryAvailability === "pending") {
+      stageDeferredOlderIntent(source);
+      return;
+    }
+    if (!shouldAutoLoadOlderHistory(
+      readScrollMetrics(el), true, canLoadOlder,
     )) return;
     const boundary = [
       "older", sid ?? "", resolvedHistoryViewId, turns[0]?.id ?? "",
@@ -2122,7 +2223,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
           }} />
           {showOlderHistory && (
             <div className="load-more-wrap virtual-history-loader">
-              {historyPagingReady
+              {olderHistoryAvailability === "ready"
                 ? (
                     <button className="load-more-btn"
                       data-testid="load-older-history" onClick={doLoadMore}>
@@ -2161,14 +2262,30 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 && !t.detailRestoreIncomplete,
             );
             const activeProcess = hasActiveProcess(timelineBlocks);
+            const processItems = processBlocks(timelineBlocks);
+            const activeTimeline = activeProcess
+              || processItems.some((block) => !block.done);
             const finalBlocks = finalTextBlocks(t.blocks);
-            const working = !t.done || activeProcess;
-            const showProcessTimeline = working || timelineBlocks.length > 0
+            const working = !t.done || activeTimeline;
+            const hasProcessTimeline = processItems.length > 0
               || (!!t.detailEventCount && !t.detailLoaded)
               || !!t.detailError;
+            const activePhase = !working
+              ? "complete"
+              : hasProcessTimeline
+                  && (activeTimeline || finalBlocks.length === 0)
+                ? "process"
+                : finalBlocks.length > 0 ? "answering" : "waiting";
+            const showProcessTimeline = hasProcessTimeline;
+            // Keep the live affordance at the physical tail of the turn. The
+            // process disclosure can be far above the viewport once a long
+            // tool stream grows, so it must not be the only place which tells
+            // the reader that the turn is still active.
+            const showWorking = working;
             const workingLabel = t.progress
-              ?? (activeProcess ? "处理中"
-                : finalBlocks.length > 0 ? "回答中" : "思考中");
+              ?? (activePhase === "answering"
+                ? "回答中"
+                : activePhase === "process" ? "处理中" : "思考中");
             const processDisclosureId =
               t.clientMsgId ?? t.historyTurnId ?? t.id;
             const processOpenKey =
@@ -2268,7 +2385,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
               </div>
             )}
             {showProcessTimeline && (
-              <ProcessTimeline blocks={timelineBlocks} done={t.done} engine={engine}
+              <ProcessTimeline blocks={timelineBlocks} done={t.done}
+                active={activePhase === "process"} engine={engine}
                 durationMs={t.durationMs} startTs={t.ts} doneTs={t.doneTs}
                 deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
                 detailLoading={t.detailLoading}
@@ -2361,7 +2479,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 )}
               </>
             )}
-              {working && (
+              {showWorking && (
                 <div className="turn-working" role="status" aria-live="polite">
                   <ClaudeWorking size={24} />
                   <span className="turn-working-tx">{workingLabel}</span>

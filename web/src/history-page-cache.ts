@@ -179,6 +179,7 @@ function validPage(value: unknown): value is HistoryBrowsePage {
   const page = value as Partial<HistoryBrowsePage>;
   return typeof page.pageKey === "string" && page.pageKey.length > 0
     && Array.isArray(page.turns) && page.turns.every(validTurn)
+    && typeof page.hasOlder === "boolean"
     && (page.olderCursor == null || typeof page.olderCursor === "string")
     && (page.newerPageKey == null || typeof page.newerPageKey === "string");
 }

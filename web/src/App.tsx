@@ -3807,6 +3807,7 @@ export default function App() {
               historyPagingReady={historyView.pagingReady}
               historyRevision={rt.historyRevision}
               historyViewRevision={historyView.viewRevision}
+              historyGeneration={historyView.generation}
               historyViewId={historyView.viewId}
               historyScopeKey={historyView.scopeKey ?? activeScopeKey}
               historyWindowEpoch={historyView.windowEpoch}

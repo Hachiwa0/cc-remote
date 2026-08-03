@@ -550,7 +550,7 @@ function isPayloadFreeUnfinishedCommandShell(block: Block): boolean {
   return !hasPayload;
 }
 
-export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onOpenFile,
+export function ProcessTimeline({ blocks, done, active, durationMs, startTs, doneTs, onOpenFile,
   deferredCount = 0, detailLoading = false, detailError, onLoadDetail,
   onRetryDetail,
   canLoadEarlier = false, canLoadNewer = false,
@@ -562,6 +562,8 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   onInteractionStart, onInteractionEnd }: {
   blocks: Block[];
   done: boolean;
+  /** Whether this process shell describes the turn's active live phase. */
+  active?: boolean;
   durationMs?: number;
   startTs?: number;
   doneTs?: number;
@@ -617,8 +619,13 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
         (block) => !isPayloadFreeUnfinishedCommandShell(block),
       )
     : projectedItems;
-  const complete = done && !hasActiveProcess(projectedItems);
-  const [uncontrolledOpen, setUncontrolledOpen] = useState(!complete);
+  const processActive = active ?? (!done && (
+    hasActiveProcess(projectedItems) || projectedItems.length > 0
+  ));
+  const terminalComplete = done && !processActive
+    && !hasActiveProcess(projectedItems);
+  const processSettled = !processActive;
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(!terminalComplete);
   const open = openOverride ?? uncontrolledOpen;
   const [localDetailError, setLocalDetailError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -628,18 +635,18 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   const releaseInteractionFrame = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!manuallyToggled.current) setUncontrolledOpen(!complete);
-  }, [complete]);
+    if (!manuallyToggled.current) setUncontrolledOpen(!terminalComplete);
+  }, [terminalComplete]);
   useEffect(() => {
     if (detailLoading || !needsAuthoritativeDetail) {
       setLocalDetailError(null);
     }
   }, [detailLoading, needsAuthoritativeDetail]);
   useEffect(() => {
-    if (complete) return;
+    if (!processActive) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [complete]);
+  }, [processActive]);
   useEffect(() => () => {
     if (releaseInteractionFrame.current !== null) {
       window.cancelAnimationFrame(releaseInteractionFrame.current);
@@ -652,7 +659,7 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   }, [onInteractionEnd]);
 
   const hasDeferredOnly = items.length === 0 && needsAuthoritativeDetail;
-  const waitingForContent = items.length === 0 && !done;
+  const waitingForContent = items.length === 0 && processActive;
   const visibleDetailError = detailError ?? localDetailError;
   if (!items.length && !hasDeferredOnly && !waitingForContent
       && !visibleDetailError) return null;
@@ -667,7 +674,7 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
     : engine === "codex" && toolCount === items.length
       ? `${toolCount} 个工具调用`
       : `${items.length} 项`;
-  const elapsed: number | null = complete
+  const elapsed: number | null = terminalComplete
     ? durationMs != null && durationMs > 0
       ? durationMs
       : engine === "claude" && startTs != null && doneTs != null
@@ -675,7 +682,9 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
         : durationMs === 0 && startTs != null && doneTs != null && doneTs > startTs
           ? 0
           : null
-    : Math.max(0, now - (startTs ?? now));
+    : processActive
+      ? Math.max(0, now - (startTs ?? now))
+      : durationMs != null && durationMs > 0 ? durationMs : null;
   const requestDetail = () => {
     setLocalDetailError(null);
     if (onLoadDetail?.() === false) {
@@ -748,12 +757,12 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
           }
           toggle();
         }}>
-        <span className={`turn-process-state${complete ? " done" : " running"}`}>
-          {detailLoading || !complete
+        <span className={`turn-process-state${processSettled ? " done" : " running"}`}>
+          {detailLoading && !processActive
             ? <span className="process-spin" />
-            : <Icon name="verify" size={14} />}
+            : <Icon name={processActive ? "spark" : "verify"} size={14} />}
         </span>
-        <span>{complete ? "已处理" : "正在处理"}
+        <span>{processSettled ? "已处理" : "正在处理"}
           {elapsed == null ? null : ` ${durationLabel(elapsed)}`}</span>
         <span className="turn-process-count">{countLabel}</span>
         <Icon name="chev" size={15} />

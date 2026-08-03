@@ -30,7 +30,10 @@ const SCHEMA = 1;
 // assistant blocks after switching away from and back to a running session.
 // v10 separates the instant timeline skeleton from heavyweight detail so one
 // image or tool output can no longer evict an otherwise valid completed turn.
-const CACHE_VER = 10;
+// v11 discards rows written before Claude transcript promptId was retained as
+// clientMsgId. Those rows can otherwise paint beside the live optimistic row
+// after switching engines until authoritative History replaces both.
+const CACHE_VER = 11;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

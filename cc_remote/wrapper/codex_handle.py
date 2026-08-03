@@ -953,6 +953,12 @@ class CodexHandle:
         self.turn_id: Optional[str] = None
         self.turn_start_pending = False
         self.turn_active = False
+        # App-server 0.147 can emit thread/compacted followed by an
+        # ``interrupted`` turn/completed for the same native turn, then keep
+        # appending items to that turn. The compact notification is the only
+        # authoritative evidence that this otherwise-terminal boundary is a
+        # continuation fence rather than a real user interrupt.
+        self._compaction_continuation_turn_id: Optional[str] = None
         # Inline Review has two different app-server turn ids.  The response and
         # visible lifecycle use the outer id, while a nested reviewer turn is the
         # thread's actual interrupt target.  Keep them separate: collapsing both
@@ -1287,6 +1293,7 @@ class CodexHandle:
         self.goal_revision = 0
         self.last_goal_turn_id = None
         self._spontaneous_turn_id = None
+        self._compaction_continuation_turn_id = None
         self.last_token_usage = None
         self.context_window = None
         self._stderr_task = asyncio.create_task(
@@ -2235,6 +2242,7 @@ class CodexHandle:
         spontaneous_turn_id = self._spontaneous_turn_id
         self._close_spontaneous_stream(spontaneous_turn_id)
         self._spontaneous_turn_id = None
+        self._compaction_continuation_turn_id = None
         self._clear_review_tracking()
         tasks = [t for t in (self._reader, self._stderr_task)
                  if t is not None and t is not asyncio.current_task()]
@@ -3811,6 +3819,37 @@ class CodexHandle:
         if method == "turn/completed" and review_execution_frame:
             self._review_execution_turn_id = None
             return
+        if method == "thread/compacted":
+            # This notification has already passed exact thread/turn routing.
+            # Freeze its native owner now; a later different turn cannot inherit
+            # the continuation right.
+            compacted_turn_id = target_turn_id or self.turn_id
+            if (
+                self.turn_active
+                and compacted_turn_id is not None
+                and compacted_turn_id == self.turn_id
+            ):
+                self._compaction_continuation_turn_id = compacted_turn_id
+        compact_continuation_boundary = False
+        if method == "turn/completed":
+            params = m.get("params")
+            raw_turn = (
+                params.get("turn") if isinstance(params, dict) else None
+            )
+            compact_continuation_boundary = bool(
+                isinstance(raw_turn, dict)
+                and raw_turn.get("status") == "interrupted"
+                and target_turn_id is not None
+                and target_turn_id == self._compaction_continuation_turn_id
+                and target_turn_id == self.turn_id
+                and self.turn_active
+            )
+            if compact_continuation_boundary:
+                # Do not deliver a false terminal to either managed or
+                # spontaneous consumers. Consume the one-shot proof so a later
+                # genuine interrupt of this turn still closes normally.
+                self._compaction_continuation_turn_id = None
+                return
         completed_spontaneous_turn_id: Optional[str] = None
         if method == "thread/started" and not self.thread_id:
             self.thread_id = _thread_id_of_notif(m)
@@ -3828,6 +3867,10 @@ class CodexHandle:
             turn_id = turn.get("id")
             if (isinstance(turn_id, str) and turn_id
                     and not review_execution_frame):
+                if self._compaction_continuation_turn_id not in {
+                    None, turn_id,
+                }:
+                    self._compaction_continuation_turn_id = None
                 self.turn_id = turn_id
                 self.remember_owned_turn_id(turn_id)
             self.turn_active = True
@@ -3916,6 +3959,7 @@ class CodexHandle:
                 self.last_goal_turn_id = None
                 await self._publish_goal(None)
         if method == "turn/completed":
+            self._compaction_continuation_turn_id = None
             self.turn_active = False
             turn = (m.get("params") or {}).get("turn") or {}
             completed_turn_id = turn.get("id")

@@ -861,6 +861,10 @@ export function mergeInitialHistory(
   live: Turn[],
   options: {
     preserveLiveTailOpen?: boolean;
+    /** A newest authoritative page may absorb a replay-created assistant row
+     * only when native block identities prove that row belongs to one
+     * canonical turn. Disabled for cache, pagination, re-key and detail merges. */
+    reconcileAuthoritativeReplayOrphans?: boolean;
   } = {},
 ): Turn[] {
   const merged = history.map((turn) => ({ ...turn, blocks: turn.blocks.map((b) => ({ ...b })) }));
@@ -892,12 +896,90 @@ export function mergeInitialHistory(
   reserveMatches(sharesExactTurnAlias);
   reserveMatches(sameTurn);
 
+  const replayOrphanMatches = new Set<number>();
+  if (options.reconcileAuthoritativeReplayOrphans) {
+    const owners = new Map<string, Set<number>>();
+    const addOwner = (key: string, historyIndex: number) => {
+      const indexes = owners.get(key) ?? new Set<number>();
+      indexes.add(historyIndex);
+      owners.set(key, indexes);
+    };
+    const blockKeys = (block: Block): string[] => {
+      if (block.kind === "text") return [`message:${block.message_id}`];
+      if (block.kind === "tool") {
+        return [
+          `message:${block.message_id}`,
+          `tool:${block.tool_use_id}`,
+        ];
+      }
+      return [`process:${block.item_id}`];
+    };
+    merged.forEach((turn, historyIndex) => {
+      for (const block of turn.blocks) {
+        for (const key of blockKeys(block)) addOwner(key, historyIndex);
+      }
+    });
+
+    const claims = new Map<number, number[]>();
+    for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
+      if (matches[liveIndex] >= 0) continue;
+      const candidate = live[liveIndex];
+      if (candidate.prompt
+          || candidate.images?.length || candidate.imageRefs?.length
+          || candidate.files?.length
+          || candidate.clientMsgId || candidate.historyTurnId
+          || candidate.forkPointId || candidate.checkpointId
+          || candidate.codexTurnId || candidate.liveTaskId
+          || candidate.detailProjection
+          || candidate.liveSpillBlocks?.length
+          || candidate.blocks.length === 0) continue;
+      const messageOwners = owners.get(`message:${candidate.id}`);
+      if (!messageOwners || messageOwners.size !== 1) continue;
+      const historyIndex = [...messageOwners][0];
+      if (used.has(historyIndex)) continue;
+      const keys = candidate.blocks.flatMap(blockKeys);
+      if (keys.length === 0 || new Set(keys).size !== keys.length
+          || !keys.every((key) => {
+        const keyOwners = owners.get(key);
+        return keyOwners?.size === 1 && keyOwners.has(historyIndex);
+      })) continue;
+      const candidates = claims.get(historyIndex) ?? [];
+      candidates.push(liveIndex);
+      claims.set(historyIndex, candidates);
+    }
+    for (const [historyIndex, liveIndexes] of claims) {
+      // Two provisional rows claiming one native assistant item are ambiguous;
+      // do not absorb either into the canonical history row.
+      if (liveIndexes.length !== 1 || used.has(historyIndex)) continue;
+      const liveIndex = liveIndexes[0];
+      matches[liveIndex] = historyIndex;
+      used.add(historyIndex);
+      replayOrphanMatches.add(liveIndex);
+    }
+  }
+
   // Apply the precomputed mapping in original live order. Matching direction
   // must not reorder unmatched optimistic rows.
   for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
     const liveTurn = live[liveIndex];
     const index = matches[liveIndex];
     if (index >= 0) {
+      if (replayOrphanMatches.has(liveIndex)) {
+        // History owns row identity, lifecycle and detail authority. Preserve
+        // only newer bytes for the exact native blocks proved above; a stale
+        // orphan detail failure must never replace canonical GetTurnDetail.
+        merged[index] = {
+          ...merged[index],
+          blocks: mergeBlocks(
+            merged[index].blocks,
+            liveTurn.blocks,
+            false,
+            false,
+            false,
+          ),
+        };
+        continue;
+      }
       const isOpenLiveTail = !!options.preserveLiveTailOpen
         && liveTurn === live[live.length - 1]
         // A newer authoritative history turn proves this local placeholder is

@@ -220,6 +220,7 @@ export interface DisplayHistoryProjection {
   pagingReady: boolean;
   oldestId: string | null;
   viewRevision: string | null;
+  generation: string | null;
   recovering: boolean;
   browsing: boolean;
   scopeKey: string | null;
@@ -246,6 +247,7 @@ export function displayHistoryProjection(
       pagingReady: false,
       oldestId: retainedBrowse.olderCursor,
       viewRevision: retainedBrowse.revision,
+      generation: retainedBrowse.generation,
       recovering: true,
       browsing: true,
       scopeKey: retainedBrowse.scopeKey,
@@ -266,6 +268,7 @@ export function displayHistoryProjection(
       pagingReady: false,
       oldestId: recovery!.oldestId,
       viewRevision: recovery!.viewRevision,
+      generation: recovery!.expectedGeneration,
       recovering: true,
       browsing: false,
       scopeKey: null,
@@ -286,6 +289,7 @@ export function displayHistoryProjection(
       pagingReady: true,
       oldestId: browse.olderCursor,
       viewRevision: browse.revision,
+      generation: browse.generation,
       recovering: false,
       browsing: true,
       scopeKey: browse.scopeKey,
@@ -304,6 +308,7 @@ export function displayHistoryProjection(
     pagingReady: !runtime.historyInvalidated,
     oldestId: runtime.oldestId ?? null,
     viewRevision: committed?.viewRevision ?? runtime.historyRevision,
+    generation: runtime.historyGeneration,
     recovering: false,
     browsing: false,
     scopeKey: null,

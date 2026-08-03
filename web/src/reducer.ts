@@ -1112,6 +1112,51 @@ function unfinishedLiveTail(turns: Turn[], hydratedCacheTurnIds: string[]): Turn
   return turns.filter((turn) => !cached.has(turn.id) && turnHasUnfinishedWork(turn));
 }
 
+/** Reopen only the exact newest row named by a current authoritative History.
+ *
+ * Codex 0.147 can persist ``interrupted`` for a native turn at a context
+ * compaction boundary while that same turn keeps producing items. The History
+ * envelope's `in_progress` bit plus its exact `newest_id` are authoritative;
+ * recency, prompt text and timestamps are not. */
+function reopenAuthoritativeActiveHistoryHead(
+  turns: Turn[], newestId: string | null | undefined,
+): Turn[] {
+  if (!newestId) return turns;
+  const matches = turns.map((turn, index) => ({ turn, index })).filter(
+    ({ turn }) => canonicalTurnId(turn) === newestId
+      || turnHasIdentityAlias(turn, newestId),
+  );
+  if (matches.length !== 1) return turns;
+  const { turn, index } = matches[0];
+  // forkPointId is the native task ownership proof supplied by Codex history.
+  // Without it an active-but-not-yet-materialized head could make us reopen the
+  // previous completed prompt.
+  if (!turn.forkPointId || turn.error || (!turn.done && !turn.interrupted)) {
+    return turns;
+  }
+  const next = [...turns];
+  next[index] = {
+    ...turn,
+    done: false,
+    doneTs: undefined,
+    durationMs: undefined,
+    interrupted: undefined,
+  };
+  return next;
+}
+
+function findAuthoritativeActiveHistoryHead(
+  runtime: SessionRuntime, turns: Turn[],
+): Turn | undefined {
+  if ((!runtime.mirroredRunning && runtime.state === "idle")
+      || !runtime.historyNewestId) return undefined;
+  const matches = turns.filter((turn) =>
+    !turn.done
+    && (canonicalTurnId(turn) === runtime.historyNewestId
+      || turnHasIdentityAlias(turn, runtime.historyNewestId)));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 function markTurnAsLive(
   runtime: SessionRuntime, turnId: string, liveEvent: boolean,
   eventSeq?: number | null,
@@ -2769,6 +2814,7 @@ function reduceEvent(
           // wrapper without that field falls back to the local runtime state.
           preserveLiveTailOpen: racedLiveEvent || e.in_progress === true
             || (e.in_progress == null && base.state !== "idle"),
+          reconcileAuthoritativeReplayOrphans: true,
         });
         if (acceptanceConfirmed && base.acceptancePending
             && (base.acceptanceKind === "steer"
@@ -2845,6 +2891,14 @@ function reduceEvent(
           turns,
           base.turns.filter((turn) => observedIds.has(turn.id)),
         );
+      }
+      const currentRunningHistory = !e.before
+        && e.in_progress === true
+        && (!racedLiveEvent || (e.live_seq != null
+          && base.lastLifecycleSeq <= e.live_seq));
+      if (currentRunningHistory) {
+        turns = reopenAuthoritativeActiveHistoryHead(
+          turns, e.newest_id);
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
@@ -3936,6 +3990,7 @@ function reduceEvent(
         const turns = cloneTurns(rt.turns);
         const t = findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
+          ?? findAuthoritativeActiveHistoryHead(rt, turns)
           ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
@@ -3954,6 +4009,7 @@ function reduceEvent(
         const turns = cloneTurns(rt.turns);
         const t = findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
+          ?? findAuthoritativeActiveHistoryHead(rt, turns)
           ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
@@ -3979,6 +4035,7 @@ function reduceEvent(
         const t = findTurnOwningItem(turns, e.tool_use_id)
           ?? findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
+          ?? findAuthoritativeActiveHistoryHead(rt, turns)
           ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         markTurnDetailAsLive(rt, t.id, boundCompletedTurns);

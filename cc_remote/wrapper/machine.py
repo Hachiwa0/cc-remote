@@ -11303,7 +11303,14 @@ class WrapperMachine:
             return
         self._clear_codex_checkpoint_tracking(ctx)
         try:
-            await asyncio.to_thread(journal.finish_turn, turn_id)
+            completed = await asyncio.to_thread(journal.finish_turn, turn_id)
+            if completed is not None and not getattr(
+                completed, "files_available", True
+            ):
+                log.info(
+                    "Codex turn committed cleanly; file rollback is conversation-only",
+                    session_id=ctx.session_id,
+                )
         except CheckpointError as exc:
             try:
                 await asyncio.to_thread(journal.abort_turn, turn_id)

@@ -980,6 +980,7 @@ function HistoryConversationBrowserFixture() {
   const recoveryReplacement = params.has("recovery-replace");
   const deepBrowse = params.has("deep-browse");
   const runtimeBrowse = params.has("runtime-browse");
+  const delayedHistoryAvailability = params.has("delayed-history-availability");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
   const emptyFinalPage = params.has("empty-final");
   const initialA = useMemo(() => {
@@ -1047,7 +1048,8 @@ function HistoryConversationBrowserFixture() {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
       hasMore: !compactTools && !detailPaging && !invalidMermaid && !large && !mermaid
-        && !mermaidHistory && !math && !timeline && !deepBrowse,
+        && !mermaidHistory && !math && !timeline && !deepBrowse
+        && !delayedHistoryAvailability,
       pagesLoaded: 0,
       hasNewer: deepBrowse,
       newerPagesLoaded: 0,
@@ -1134,6 +1136,16 @@ function HistoryConversationBrowserFixture() {
   const [migrationPickerConfirmed, setMigrationPickerConfirmed] =
     useState<string | null>(null);
   const active = sessions[sid];
+  const revealOlderHistory = useCallback(() => {
+    setSessions((current) => ({
+      ...current,
+      [sid]: {
+        ...current[sid],
+        hasMore: true,
+        cursor: current[sid].turns[0]?.id ?? "history-cursor",
+      },
+    }));
+  }, [sid]);
   const growOlderRow = useCallback((targetSid: string) => {
     setSessions((current) => ({
       ...current,
@@ -1528,6 +1540,12 @@ function HistoryConversationBrowserFixture() {
               {migrationPickerConfirmed}
             </output>
           </>
+        )}
+        {delayedHistoryAvailability && (
+          <button data-testid="reveal-older-history" type="button"
+            onClick={revealOlderHistory}>
+            reveal older history
+          </button>
         )}
         {newChatControls && (
           <>

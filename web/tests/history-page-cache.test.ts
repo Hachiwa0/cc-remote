@@ -315,6 +315,37 @@ corruptStorage.records.set(corruptKey, { malformed: true });
 assert.equal(await corruptCache.getPage(scope, "corrupt"), null);
 assert.deepEqual(corruptStorage.deletedKeys, [corruptKey]);
 
+const legacyMissingAvailabilityStorage = new MemoryStorage();
+const legacyMissingAvailabilityCache = new HistoryPageCache({
+  storage: legacyMissingAvailabilityStorage,
+});
+assert.equal((await legacyMissingAvailabilityCache.putPage(scope, {
+  pageKey: "legacy-missing-availability",
+  turns: [turn("1")],
+  hasOlder: true,
+  olderCursor: "1",
+})).ok, true);
+const legacyMissingAvailabilityKey = legacyMissingAvailabilityCache.pageKey(
+  scope,
+  "legacy-missing-availability",
+);
+const legacyMissingAvailabilityRecord = legacyMissingAvailabilityStorage.records.get(
+  legacyMissingAvailabilityKey,
+) as { page: { hasOlder?: boolean } };
+delete legacyMissingAvailabilityRecord.page.hasOlder;
+assert.equal(
+  await legacyMissingAvailabilityCache.getPage(
+    scope,
+    "legacy-missing-availability",
+  ),
+  null,
+  "a legacy page without explicit availability is a cache miss, not EOF",
+);
+assert.deepEqual(
+  legacyMissingAvailabilityStorage.deletedKeys,
+  [legacyMissingAvailabilityKey],
+);
+
 // No IndexedDB (SSR, private mode, denied storage) is a supported cache miss.
 const unavailable = new HistoryPageCache({ indexedDB: null });
 assert.equal(await unavailable.getPage(scope, "missing"), null);

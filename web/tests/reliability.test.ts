@@ -938,8 +938,8 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 10/,
-  "open-turn merge repair must invalidate duplicate IndexedDB projections");
+assert.match(cacheSource, /const CACHE_VER = 11/,
+  "Claude prompt aliases must invalidate v10 rows which can paint twice");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
@@ -2482,6 +2482,146 @@ assert.equal(assistantOnlyMerged.length, 1);
 assert.equal(assistantOnlyMerged[0].id, "goal-turn-1");
 assert.equal(assistantOnlyMerged[0].blocks.filter((block) => block.kind === "text").length, 1);
 
+// A reconnect can begin replay at an assistant item after the user/native turn
+// binding has fallen out of the relay ring. The provisional row then uses the
+// assistant message id as its display id. An authoritative newest History page
+// owns that same message inside the native turn and must absorb the orphan
+// without comparing prompt text or timestamps.
+const replayAssistantMessageId = "msg-replayed-assistant";
+const replayOrphanMerged = mergeInitialHistory(
+  [{
+    id: "native-history-turn",
+    prompt: "inspect the repository",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "one authoritative answer",
+      done: true,
+    }],
+    detailEventCount: 3,
+    detailLoaded: false,
+  }],
+  [{
+    id: replayAssistantMessageId,
+    prompt: "",
+    done: false,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "one authoritative answer",
+      done: false,
+    }],
+    detailError: "stale orphan detail",
+  }],
+  { reconcileAuthoritativeReplayOrphans: true },
+);
+assert.equal(replayOrphanMerged.length, 1);
+assert.equal(replayOrphanMerged[0].id, "native-history-turn");
+assert.equal(replayOrphanMerged[0].detailError, undefined,
+  "an invalid orphan detail request cannot replace canonical detail authority");
+assert.deepEqual(
+  replayOrphanMerged[0].blocks.filter((block) => block.kind === "text")
+    .map((block) => block.text),
+  ["one authoritative answer"],
+);
+assert.equal(mergeInitialHistory(
+  replayOrphanMerged,
+  [{
+    id: replayAssistantMessageId,
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "one authoritative answer",
+      done: true,
+    }],
+  }],
+).length, 2, "non-authoritative merge paths never absorb replay orphans");
+
+const ambiguousReplayOrphans = mergeInitialHistory(
+  replayOrphanMerged,
+  [0, 1].map((index) => ({
+    id: replayAssistantMessageId,
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: `replay candidate ${index}`,
+      done: true,
+    }],
+  })),
+  { reconcileAuthoritativeReplayOrphans: true },
+);
+assert.equal(ambiguousReplayOrphans.length, 2,
+  "multiple provisional rows claiming one item cannot replace canonical history");
+
+const ambiguousCanonicalReplay = mergeInitialHistory(
+  ["canonical-a", "canonical-b"].map((id) => ({
+    id,
+    prompt: `prompt ${id}`,
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: `answer ${id}`,
+      done: true,
+    }],
+  })),
+  [{
+    id: replayAssistantMessageId,
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "ambiguous replay",
+      done: true,
+    }],
+  }],
+  { reconcileAuthoritativeReplayOrphans: true },
+);
+assert.equal(ambiguousCanonicalReplay.length, 3,
+  "a message identity shared by canonical rows is not safe merge evidence");
+
+const unrelatedAssistantOnly = mergeInitialHistory(
+  [{
+    id: "native-history-turn",
+    prompt: "inspect the repository",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "same visible text",
+      done: true,
+    }],
+  }],
+  [{
+    id: "different-assistant-message",
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: "different-assistant-message",
+      channel: "final" as const,
+      text: "same visible text",
+      done: true,
+    }],
+  }],
+  { reconcileAuthoritativeReplayOrphans: true },
+);
+assert.equal(unrelatedAssistantOnly.length, 2,
+  "equal assistant text without an exact message identity remains separate");
+
 // A bounded head refresh merges against rows retained from earlier pages.
 // Replayed assistant-only continuations can come from legacy/cache projections
 // whose synthetic start time is newer than their authoritative terminal time.
@@ -3891,6 +4031,85 @@ try {
       prompt: "我又改完了一版，你看看还有没得问题？",
     }],
     "switching to Codex and back reconciles Claude History with the one live prompt",
+  );
+  const legacyClaudeNativeId = "b1934482-d098-4e11-990d-3e91f2586358";
+  const legacyClaudeClientId = "d37608f7-713d-42e2-b10f-4a93f60b03e1";
+  const legacyClaudePrompt =
+    "int32累加器和fp32累加器有什么区别？和寄存器的关系是什么？";
+  let legacyClaudeCacheState = reduce({
+    ...initialState,
+    focusedSid: claudeSwitchAliasSid,
+    runtimes: {
+      [claudeSwitchAliasSid]: createRuntime(),
+      [claudeOtherSid]: createRuntime(),
+    },
+  }, {
+    type: "hydrate_cache",
+    sid: claudeSwitchAliasSid,
+    revision: "claude-legacy-r1",
+    generation: "claude-legacy-g1",
+    // v10 could persist the transcript UUID before promptId became an exact
+    // client alias. CACHE_VER=11 prevents this row from reaching the reducer;
+    // keep the downstream convergence check as a second safety boundary.
+    turns: [{
+      id: legacyClaudeNativeId,
+      prompt: legacyClaudePrompt,
+      blocks: [],
+      done: false,
+    }],
+  });
+  legacyClaudeCacheState = reduce(legacyClaudeCacheState, {
+    type: "event", event: event({
+      type: "session_focus", session_id: claudeOtherSid,
+    }),
+  });
+  legacyClaudeCacheState = reduce(legacyClaudeCacheState, {
+    type: "event", event: event({
+      type: "session_focus", session_id: claudeSwitchAliasSid,
+    }),
+  });
+  legacyClaudeCacheState = reduce(legacyClaudeCacheState, {
+    type: "event", event: event({
+      type: "user_msg",
+      sid: claudeSwitchAliasSid,
+      msg_id: legacyClaudeClientId,
+      prompt: legacyClaudePrompt,
+    }),
+  });
+  assert.equal(
+    legacyClaudeCacheState.runtimes[claudeSwitchAliasSid].turns.length,
+    2,
+    "the v10 shape explains the transient duplicate before canonical History",
+  );
+  legacyClaudeCacheState = reduce(legacyClaudeCacheState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: claudeSwitchAliasSid,
+      revision: "claude-legacy-r1",
+      generation: "claude-legacy-g1",
+      build_seq: 2,
+      live_seq: 1,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: legacyClaudeNativeId,
+        clientMsgId: legacyClaudeClientId,
+        prompt: legacyClaudePrompt,
+        done: false,
+        blocks: [],
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    legacyClaudeCacheState.runtimes[claudeSwitchAliasSid].turns.map(
+      (turn: Turn) => [turn.id, turn.clientMsgId, turn.historyTurnId]),
+    [[legacyClaudeClientId, legacyClaudeClientId, legacyClaudeNativeId]],
+    "authoritative Claude aliases collapse a legacy projection if one survives",
   );
   const repeatedClaudePrompt = mergeInitialHistory(
     [{
@@ -7778,6 +7997,166 @@ try {
   ["only once"]);
   assert.deepEqual(state.runtimes[otherSid].turns, [untouched]);
 
+  // App-server 0.147 can report an interrupted summary for the exact native
+  // turn which is still appending after context compaction. A newest
+  // authoritative History page says which visible row owns that active head;
+  // the next assistant item has no turn id and must reopen/append there instead
+  // of creating a prompt-less tail after refresh.
+  const compactRefreshSid = "compact-refresh-active-head";
+  const compactRefreshVisibleId = "compact-refresh-user";
+  const compactRefreshNativeId = "compact-refresh-native";
+  let compactRefreshState = reduce({
+    ...initialState,
+    focusedSid: compactRefreshSid,
+    runtimes: {
+      [compactRefreshSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: compactRefreshSid,
+      session_id: compactRefreshSid,
+      revision: "compact-refresh-r1",
+      generation: "compact-refresh-g1",
+      build_seq: 1,
+      live_seq: 10,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      newest_id: compactRefreshVisibleId,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: compactRefreshVisibleId,
+        prompt: "continue the long task",
+        forkPointId: compactRefreshNativeId,
+        done: true,
+        interrupted: true,
+        blocks: [{
+          kind: "text",
+          message_id: "before-compact",
+          channel: "commentary",
+          text: "before compact",
+          done: true,
+        }],
+        detailEventCount: 4,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    compactRefreshState.runtimes[compactRefreshSid].turns[0].done,
+    false,
+    "current authoritative History reopens its exact compacted active row",
+  );
+  assert.equal(
+    compactRefreshState.runtimes[compactRefreshSid].turns[0].interrupted,
+    undefined,
+  );
+  for (const liveEvent of [
+    event({
+      type: "assistant_msg_start",
+      sid: compactRefreshSid,
+      seq: 11,
+      message_id: "after-compact",
+      channel: "commentary",
+    }),
+    event({
+      type: "delta",
+      sid: compactRefreshSid,
+      seq: 12,
+      message_id: "after-compact",
+      channel: "commentary",
+      text: "after compact",
+    }),
+  ]) {
+    compactRefreshState = reduce(compactRefreshState, {
+      type: "event", event: liveEvent,
+    });
+  }
+  assert.equal(
+    compactRefreshState.runtimes[compactRefreshSid].turns.length,
+    1,
+    "post-compact assistant items cannot create a second prompt-less turn",
+  );
+  assert.deepEqual(
+    compactRefreshState.runtimes[compactRefreshSid].turns[0].blocks
+      .filter((block: Block) => block.kind === "text")
+      .map((block: Block) => block.kind === "text" ? block.text : ""),
+    ["before compact", "after compact"],
+  );
+
+  const ambiguousActiveHeadSid = "ambiguous-active-history-head";
+  let ambiguousActiveHeadState = reduce({
+    ...initialState,
+    focusedSid: ambiguousActiveHeadSid,
+    runtimes: {
+      [ambiguousActiveHeadSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: ambiguousActiveHeadSid,
+      session_id: ambiguousActiveHeadSid,
+      revision: "ambiguous-active-r1",
+      generation: "ambiguous-active-g1",
+      build_seq: 1,
+      live_seq: 20,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "missing-active-visible-id",
+      in_progress: true,
+      events: [],
+      turns: [
+        {
+          id: "candidate-a",
+          prompt: "first",
+          forkPointId: "shared-active-native",
+          done: true,
+          blocks: [],
+        },
+        {
+          id: "candidate-b",
+          prompt: "second",
+          forkPointId: "shared-active-native",
+          done: true,
+          blocks: [],
+        },
+      ],
+    }),
+  });
+  assert.ok(
+    ambiguousActiveHeadState.runtimes[ambiguousActiveHeadSid].turns.every(
+      (turn: Turn) => turn.done),
+    "an unmatched active cursor cannot guess between visible steer segments",
+  );
+  ambiguousActiveHeadState = reduce(ambiguousActiveHeadState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: ambiguousActiveHeadSid,
+      seq: 21,
+      message_id: "unbound-after-refresh",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    ambiguousActiveHeadState.runtimes[ambiguousActiveHeadSid].turns.length,
+    3,
+    "missing authoritative ownership fails closed instead of merging by recency",
+  );
+
   const richSid = "rich-process";
   state = {
     ...state,
@@ -8723,9 +9102,9 @@ try {
   assert.doesNotMatch(unknownCodexDurationMarkup, /已处理 0s/,
     "a synthetic steer boundary without duration evidence must not invent 0s");
 
-  // The animated turn marker is driven by the turn lifecycle, not by an empty
-  // placeholder. It must survive reasoning expansion, process activity, final
-  // answer streaming, and terminal-mirrored history alike.
+  // The active marker always stays at the physical tail of the turn so a long
+  // process timeline cannot scroll the only running feedback out of view. The
+  // process shell still reports phase/timing, but its live icon stays static.
   const thinkingMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [{
       id: "thinking-live", prompt: "继续", done: false,
@@ -8733,9 +9112,13 @@ try {
         text: "正在检查实现", done: false }],
     }], engine: "claude", onEdit: () => {}, onGetDiff: () => {},
   }));
-  assert.match(thinkingMarkup, /class="turn-working"/);
-  assert.match(thinkingMarkup, /思考中/);
+  assert.match(thinkingMarkup, /class="turn-process open"/);
+  assert.match(thinkingMarkup, /正在处理/);
   assert.match(thinkingMarkup, /正在检查实现/);
+  assert.match(thinkingMarkup, /class="turn-working"[\s\S]*处理中/,
+    "visible reasoning keeps the animated marker at the turn tail");
+  assert.doesNotMatch(thinkingMarkup, /process-spin/,
+    "the active process header stays static beside the tail animation");
 
   const answerMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [{
@@ -8746,17 +9129,67 @@ try {
   }));
   assert.match(answerMarkup, /class="turn-working"/);
   assert.match(answerMarkup, /回答中/);
+  assert.doesNotMatch(answerMarkup, /class="turn-process/,
+    "final-only streaming does not invent an empty process shell");
+  const answeringAfterProcessMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: richSid, turns: [{
+      id: "answering-after-process", prompt: "继续", done: false,
+      blocks: [{
+        kind: "process", item_id: "completed-command",
+        processKind: "command", phase: "end", status: "succeeded",
+        title: "命令完成", done: true,
+      }, {
+        kind: "text", message_id: "answer-after-process",
+        channel: "final", text: "正在总结", done: false,
+      }],
+    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(answeringAfterProcessMarkup, /class="turn-process open"/,
+    "the process disclosure stays open until the turn terminal boundary");
+  assert.match(answeringAfterProcessMarkup, /turn-process-state done/,
+    "a settled process shell cannot keep spinning while the answer streams");
+  assert.match(answeringAfterProcessMarkup, /class="turn-working"[\s\S]*回答中/);
+  assert.equal(
+    (answeringAfterProcessMarkup.match(/process-spin/g) ?? []).length,
+    0,
+    "the settled process shell cannot add a second live spinner",
+  );
+  const commentaryWhileAnsweringMarkup = renderToStaticMarkup(createElement(
+    ChatView,
+    {
+      sid: richSid,
+      turns: [{
+        id: "commentary-while-answering", prompt: "继续", done: false,
+        blocks: [{
+          kind: "text", message_id: "live-commentary",
+          channel: "commentary", text: "仍在检查", done: false,
+        }, {
+          kind: "text", message_id: "early-final",
+          channel: "final", text: "阶段结论", done: false,
+        }],
+      }],
+      engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    },
+  ));
+  assert.match(commentaryWhileAnsweringMarkup, /turn-process-state running/);
+  assert.match(
+    commentaryWhileAnsweringMarkup,
+    /class="turn-working"[\s\S]*处理中/,
+    "unfinished commentary keeps the live marker at the turn tail",
+  );
+  assert.doesNotMatch(commentaryWhileAnsweringMarkup, /process-spin/,
+    "the process header cannot compete with the tail animation");
   const zeroTokenRunningMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [{
       id: "zero-token-live", clientMsgId: "zero-token-prompt",
       prompt: "开始检查", done: false, blocks: [],
-    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(zeroTokenRunningMarkup, /class="turn-working"/);
-  assert.match(zeroTokenRunningMarkup, /正在处理/);
-  assert.match(zeroTokenRunningMarkup, /等待响应/);
-  assert.match(zeroTokenRunningMarkup, /aria-expanded="true"/,
-    "a running turn keeps one stable process shell before its first token");
+  assert.match(zeroTokenRunningMarkup, /思考中/);
+  assert.doesNotMatch(zeroTokenRunningMarkup, /正在处理|等待响应/,
+    "a pre-token turn cannot render a fake empty process timeline");
+  assert.doesNotMatch(zeroTokenRunningMarkup, /class="turn-process/);
   const { ProcessTimeline } = await reducerHarness.ssrLoadModule(
     "/src/components/ProcessTimeline.tsx");
   const pagedProcessMarkup = renderToStaticMarkup(createElement(
@@ -9157,8 +9590,13 @@ try {
   }));
   assert.match(backgroundMarkup, /正在处理/);
   assert.match(backgroundMarkup, /继续检查/);
-  assert.match(backgroundMarkup, /class="turn-working"/);
-  assert.match(backgroundMarkup, /处理中/);
+  assert.match(backgroundMarkup, /class="turn-working"[\s\S]*处理中/,
+    "a live background process keeps its animated marker at the turn tail");
+  assert.match(
+    backgroundMarkup,
+    /turn-process-state running"><svg/,
+    "the background process header stays static beside the tail animation",
+  );
   assert.doesNotMatch(backgroundMarkup, /class="turn-done-mark"/);
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
