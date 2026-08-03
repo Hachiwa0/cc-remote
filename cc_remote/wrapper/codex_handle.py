@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from datetime import date, timedelta
 import hashlib
 import hmac
 import json
@@ -32,7 +33,13 @@ from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote import __version__
 from cc_remote.log import logger
-from cc_remote.protocol import Notice, RateLimitUpdate, ThreadGoal
+from cc_remote.protocol import (
+    MAX_SAFE_WIRE_INTEGER,
+    MAX_STATUS_USAGE_BUCKETS,
+    Notice,
+    RateLimitUpdate,
+    ThreadGoal,
+)
 from cc_remote.wrapper.codex_daemon import (
     CodexDaemonUpgradeRequired,
     CodexDaemonManager,
@@ -72,6 +79,7 @@ _MAX_SERVER_REQUEST_TASKS = 32
 _THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
+_STATUS_USAGE_BUCKET_SCAN_MAX = 4096
 _RUNTIME_EVENT_PENDING_MAX = 32
 _RUNTIME_EVENT_SEEN_MAX = 128
 _NOTICE_MESSAGE_MAX = 2 * 1024
@@ -3051,6 +3059,8 @@ class CodexHandle:
                     "longest_streak_days": _nonnegative_int(summary.get("longestStreakDays")),
                     "longest_running_turn_sec": _nonnegative_int(
                         summary.get("longestRunningTurnSec")),
+                    "daily_usage_buckets": _sanitize_daily_usage_buckets(
+                        usage_response.get("dailyUsageBuckets")),
                 }
 
         return {
@@ -4231,6 +4241,60 @@ def _nonnegative_int(value: Any) -> Optional[int]:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
     return value
+
+
+def _sanitize_daily_usage_buckets(
+    value: Any,
+    *,
+    today: Optional[date] = None,
+) -> list[dict[str, Any]]:
+    """Return the latest bounded, canonical Codex token-activity calendar.
+
+    The service response is account data and may be absent on unsupported auth.
+    Copy only real ISO calendar dates and JavaScript-safe nonnegative token
+    counts. Duplicate dates collapse to the largest observed total so response
+    ordering cannot make a newer aggregate regress.
+    """
+    if not isinstance(value, list):
+        return []
+    window_end = today or date.today()
+    window_start = window_end - timedelta(days=MAX_STATUS_USAGE_BUCKETS - 1)
+    if len(value) > _STATUS_USAGE_BUCKET_SCAN_MAX:
+        half = _STATUS_USAGE_BUCKET_SCAN_MAX // 2
+        candidates = [*value[:half], *value[-half:]]
+    else:
+        candidates = value
+
+    by_date: dict[str, int] = {}
+    for raw in candidates:
+        if not isinstance(raw, dict):
+            continue
+        start_date = raw.get("startDate")
+        tokens = _nonnegative_int(raw.get("tokens"))
+        if (
+            not isinstance(start_date, str)
+            or len(start_date) != 10
+            or tokens is None
+            or tokens > MAX_SAFE_WIRE_INTEGER
+        ):
+            continue
+        try:
+            parsed = date.fromisoformat(start_date)
+        except ValueError:
+            continue
+        if (
+            parsed.isoformat() != start_date
+            or parsed < window_start
+            or parsed > window_end
+        ):
+            continue
+        by_date[start_date] = max(tokens, by_date.get(start_date, 0))
+
+    dates = sorted(by_date)[-MAX_STATUS_USAGE_BUCKETS:]
+    return [
+        {"start_date": start_date, "tokens": by_date[start_date]}
+        for start_date in dates
+    ]
 
 
 def _status_error_message(error: BaseException) -> str:

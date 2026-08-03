@@ -29,6 +29,7 @@ from cc_remote.config import (
     RelayConfig, relay_config, valid_machine_id, validate_relay_config,
 )
 from cc_remote.log import logger
+from cc_remote.protocol import PROTOCOL_VERSION
 from cc_remote.relay.auth import (
     SESSION_COOKIE_NAME, SessionClaims, authenticate_login,
     make_session_token, session_token_claims, wrapper_machine_scope,
@@ -1070,9 +1071,17 @@ def create_app(
                     websocket, hub, claims.expires_at, revoked, machine_id)
 
     @app.get("/healthz")
-    async def healthz() -> dict:
-        return {"ok": True, "wrapper_connected": hub.wrapper_connected,
-                "machines": hub.machine_ids, "clients": hub.client_count}
+    async def healthz() -> JSONResponse:
+        return JSONResponse(
+            {
+                "ok": True,
+                "protocol": PROTOCOL_VERSION,
+                "wrapper_connected": hub.wrapper_connected,
+                "machines": hub.machine_ids,
+                "clients": hub.client_count,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     # Static web client. Mounted last so /api/login and /ws and /healthz win.
     if cfg.static_dir and os.path.isdir(cfg.static_dir):

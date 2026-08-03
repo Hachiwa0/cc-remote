@@ -22,7 +22,9 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET") return;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin
-      || url.pathname.startsWith("/api/") || url.pathname === "/ws") return;
+      || url.pathname.startsWith("/api/") || url.pathname === "/ws"
+      || url.pathname === "/healthz"
+      || url.pathname === "/cc-remote-build.json") return;
   if (request.mode === "navigate") {
     event.respondWith(fetch(request).then((response) => {
       const copy = response.clone();

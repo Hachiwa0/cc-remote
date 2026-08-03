@@ -34,6 +34,7 @@ import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { GoalPanel } from "./components/GoalPanel";
 import { StatusSheet } from "./components/StatusSheet";
+import { UsageActivitySheet } from "./components/UsageActivitySheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
 import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
@@ -217,6 +218,7 @@ export default function App() {
   // Keep reveal/editor state per session so switching sessions never leaks it.
   const [goalUiBySid, setGoalUiBySid] = useState<Record<string, { revealed: boolean; open: boolean }>>({});
   const [statusOpenSid, setStatusOpenSid] = useState<string | null>(null);
+  const [usageActivityOpen, setUsageActivityOpen] = useState(false);
   const [forkWorktreeSession, setForkWorktreeSession] = useState<SessionInfo | null>(null);
   const [forkWorktreeCreating, setForkWorktreeCreating] = useState(false);
   const [forkWorktreeError, setForkWorktreeError] = useState<string | null>(null);
@@ -489,6 +491,7 @@ export default function App() {
     skillCatalogRequestsRef.current?.reset();
     setSkillCatalogs({});
     setCapabilitiesByScope({});
+    setUsageActivityOpen(false);
     deferredStatusRefreshRef.current.clear();
     historyRequestsRef.current.clear();
     clearHistoryDetailRequests();
@@ -1084,6 +1087,7 @@ export default function App() {
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
+    setUsageActivityOpen(false);
     setWorkArtifactsOpen(false);
     dispatch({ type: "exit_new_chat" });
     dispatch({ type: "focus_session", sid: id });
@@ -1202,6 +1206,7 @@ export default function App() {
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
+    setUsageActivityOpen(false);
     setWorkArtifactsOpen(false);
     setWorkProjectId(null);
     prepareSurfaceSwitch(nextEngine, space);
@@ -2134,6 +2139,7 @@ export default function App() {
           setForkWorktreeError(null);
           setGoalUiBySid({});
           setStatusOpenSid(null);
+          setUsageActivityOpen(false);
           setWorkArtifactsOpen(false);
           setWorkArtifactsBySid({});
           setCompletionReceipts({});
@@ -3092,6 +3098,11 @@ export default function App() {
     setStatusOpenSid(focusedSid);
     refreshStatus();
   };
+  const openUsageActivity = () => {
+    if (engine !== "codex") return;
+    setUsageActivityOpen(true);
+    refreshStatus();
+  };
   const requestContext = () => {
     if (!focusedSid) return;
     const requestId = wsRef.current?.sendGetContext();
@@ -3535,11 +3546,13 @@ export default function App() {
           <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
             title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
           <HeaderMenu
+            engine={engine}
             theme={theme}
             notificationMode={notificationMode}
             notificationBinding={pushBinding.state}
             notificationAvailable={typeof Notification !== "undefined"}
             onNotificationMode={updateNotificationMode}
+            onOpenUsageActivity={openUsageActivity}
             onToggleTheme={toggleTheme}
             onLogout={() => void logout()}
           />
@@ -3857,6 +3870,15 @@ export default function App() {
         onDismissNotice={(noticeId) => {
           if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
         }} />
+      <UsageActivitySheet
+        open={usageActivityOpen && engine === "codex"}
+        report={rt.statusReport}
+        error={rt.statusError}
+        loading={rt.statusRequestId !== null}
+        hasSession={!!focusedSid && focusedEngine === "codex" && !state.newChat}
+        onClose={() => setUsageActivityOpen(false)}
+        onRefresh={refreshStatus}
+      />
       <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
         creating={forkWorktreeCreating} error={forkWorktreeError}
         onConfirm={submitForkWorktree} onClose={closeForkWorktree} />

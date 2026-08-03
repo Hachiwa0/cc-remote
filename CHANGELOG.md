@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Add protocol v28 Codex account activity. The existing one-shot status read
+  carries a validated, bounded 53-week daily token series, and Web exposes a
+  Codex-only Desktop-style activity calendar without storing it in live replay.
+  The five heat levels are relative to the visible daily peak, and localized
+  compact counts keep large token totals readable.
 - Add protocol v27 session-directory migration for idle Codex Code threads.
   The wrapper resumes the same native thread ID in the selected existing
   directory, preserves its deferred-query queue, and rolls back to the original
