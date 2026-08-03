@@ -1636,6 +1636,7 @@ export default function App() {
                     windowEpoch: detailTarget.windowEpoch,
                     turnId: detailTarget.turnId,
                     events: [],
+                    error: msg.error,
                     before: detailTarget.before,
                   });
                 } else if (!runtimeReleased) {

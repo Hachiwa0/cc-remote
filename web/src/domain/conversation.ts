@@ -129,6 +129,11 @@ export interface Turn {
   detailEventCount?: number;
   detailLoaded?: boolean;
   detailLoading?: boolean;
+  /** Transient source/read failure for the heavyweight process disclosure. */
+  detailError?: string;
+  /** Exact failed page request retained only long enough for an in-place retry. */
+  detailRetryBefore?: string | null;
+  detailRetryDirection?: "initial" | "older" | "newer";
   detailHasMore?: boolean;
   detailOldestCursor?: string | null;
   detailHasNewer?: boolean;

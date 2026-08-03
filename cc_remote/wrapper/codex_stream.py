@@ -800,6 +800,7 @@ class CodexStreamTranslator:
         self._tool_message_ids: dict[str, str] = {}
         self._reasoning_started: set[str] = set()
         self._file_diffs: dict[str, str] = {}
+        self._file_diff_stream_aligned: set[str] = set()
         self._open_msg: str | None = None
         self._open_channel = "unknown"
         self._visible_output = False
@@ -940,6 +941,7 @@ class CodexStreamTranslator:
                 finished_id = _live_id(item.get("id"), fallback)
                 self._finish_delta_item(finished_id)
                 self._file_diffs.pop(finished_id, None)
+                self._file_diff_stream_aligned.discard(finished_id)
 
         elif method == "item/reasoning/summaryPartAdded":
             iid = _live_id(p.get("itemId"), "reasoning")
@@ -1058,12 +1060,20 @@ class CodexStreamTranslator:
                     "changes": p.get("changes"),
                 }))
             latest, _ = bounded_text(_changes_diff(p.get("changes")), 2 * 1024 * 1024)
+            seen_snapshot = iid in self._file_diffs
             previous = self._file_diffs.get(iid, "")
             self._file_diffs[iid] = latest
             # patchUpdated is a snapshot. ToolDelta is append-only, so forward
-            # only the genuinely-new suffix; non-monotonic rewrites are still
-            # delivered authoritatively by item/completed.diff.
-            if latest and latest.startswith(previous):
+            # only a genuinely-new suffix while the snapshots remain aligned.
+            # Once the server rewrites an earlier hunk, no future suffix can be
+            # appended safely to the browser's old projection; completion still
+            # replaces it authoritatively through ToolResult.diff.
+            if not seen_snapshot:
+                self._file_diff_stream_aligned.add(iid)
+            elif not latest.startswith(previous):
+                self._file_diff_stream_aligned.discard(iid)
+            if (latest and iid in self._file_diff_stream_aligned
+                    and latest.startswith(previous)):
                 delta = self._bounded_live_delta(
                     iid, "diff", latest[len(previous):], 512 * 1024)
                 if delta:
@@ -1282,7 +1292,7 @@ class CodexStreamTranslator:
                 self._terminal_error = True
                 out.append(Error(
                     code=ERR_CC_CRASH,
-                    message="Codex 本次回复未完成，请重试。",
+                    message=_provider_failure_message(err),
                 ))
 
         elif method == "turn/completed":
@@ -1294,9 +1304,14 @@ class CodexStreamTranslator:
             # copy (the error notification above may not fire for every mode).
             if st == "failed":
                 if not self._terminal_error:
+                    raw_error = (
+                        turn.get("error")
+                        if isinstance(turn.get("error"), dict)
+                        else {}
+                    )
                     out.append(Error(
                         code=ERR_CC_CRASH,
-                        message="Codex 本次回复未完成，请重试。",
+                        message=_provider_failure_message(raw_error),
                     ))
                     self._terminal_error = True
             if st == "completed" and not self._terminal_error:
@@ -1720,6 +1735,64 @@ def _retry_detail(error: dict) -> str:
     return text + "…"
 
 
+_GENERIC_TURN_FAILURE = "Codex 本次回复未完成，请重试。"
+_AUTH_TURN_FAILURE = (
+    "模型服务认证已失效或当前账号无权限，"
+    "请检查当前服务的凭据或账号权限后重试。"
+)
+_RATE_LIMIT_TURN_FAILURE = "请求过于频繁或当前额度受限，请稍后重试。"
+_TIMEOUT_TURN_FAILURE = "请求超时，请重新尝试。"
+_UPSTREAM_TURN_FAILURE = "Codex 上游服务暂时不可用，请稍后重试。"
+_NETWORK_TURN_FAILURE = "网络连接异常，请检查网络后重试。"
+
+
+def _provider_failure_message(error: object) -> str:
+    """Map one provider terminal to bounded, user-actionable product copy."""
+    if not isinstance(error, dict):
+        return _GENERIC_TURN_FAILURE
+    message = error.get("message") if isinstance(error.get("message"), str) else ""
+    details = (
+        error.get("additionalDetails")
+        if isinstance(error.get("additionalDetails"), str)
+        else ""
+    )
+    combined = f"{message} {details}"[:8192].lower()
+    status = _structured_http_status(error)
+    if status is None:
+        status_match = re.search(r"\b([45]\d\d)\b", combined)
+        status = status_match.group(1) if status_match else None
+    if status in {"401", "403"}:
+        return _AUTH_TURN_FAILURE
+    if status == "429":
+        return _RATE_LIMIT_TURN_FAILURE
+    if status == "408":
+        return _TIMEOUT_TURN_FAILURE
+    if status is not None:
+        if status.startswith("5"):
+            return _UPSTREAM_TURN_FAILURE
+        # A concrete provider-side 4xx must not be relabelled as a local
+        # network failure merely because its transport also disconnected.
+        return _GENERIC_TURN_FAILURE
+    if any(marker in combined for marker in (
+        "request timed out",
+        "request timeout",
+        "timed out",
+    )):
+        return _TIMEOUT_TURN_FAILURE
+    if any(marker in combined for marker in (
+        "stream disconnected",
+        "connection reset",
+        "connection closed",
+        "connection refused",
+        "error sending request",
+        "dns error",
+        "tls error",
+        "socket error",
+    )):
+        return _NETWORK_TURN_FAILURE
+    return _GENERIC_TURN_FAILURE
+
+
 def _bounded_model_field(value, max_chars: int) -> str:
     """Copy one declared model-notification string, never arbitrary payloads."""
     if not isinstance(value, str) or not value:
@@ -1992,14 +2065,12 @@ def _change_descriptors(changes) -> list[dict]:
             if not isinstance(entry, dict):
                 continue
             kind = entry.get("kind")
-            if isinstance(kind, dict):
-                kind = kind.get("type")
+            kind_name = kind.get("type") if isinstance(kind, dict) else kind
             descriptor = {
                 "path": str(entry.get("path") or "")[:16 * 1024],
-                "kind": str(kind or "update")[:128],
+                "kind": str(kind_name or "update")[:128],
             }
-            move_path = (entry.get("move_path")
-                         or entry.get("destination_path") or entry.get("to"))
+            move_path = _change_move_path(entry)
             if isinstance(move_path, str) and move_path:
                 descriptor["move_path"] = move_path[:16 * 1024]
             descriptors.append(descriptor)
@@ -2054,26 +2125,48 @@ def _changes_diff(changes) -> str:
     return "\n".join(parts)
 
 
-def _change_diff(path: str, entry: dict) -> str:
-    explicit = entry.get("unified_diff") or entry.get("diff")
-    if isinstance(explicit, str) and explicit:
-        return explicit
+def _change_move_path(entry: dict) -> str | None:
+    kind = entry.get("kind")
+    nested = kind.get("move_path") if isinstance(kind, dict) else None
+    move_path = (entry.get("move_path") or entry.get("destination_path")
+                 or entry.get("to") or nested)
+    return move_path if isinstance(move_path, str) and move_path else None
 
+
+def _change_diff(path: str, entry: dict) -> str:
     kind = entry.get("kind") or entry.get("type") or "update"
     if isinstance(kind, dict):
         kind = kind.get("type") or "update"
+    normalized_kind = str(kind).lower()
+    from_file = "/dev/null" if normalized_kind in {
+        "add", "create", "added",
+    } else path
+    move_path = _change_move_path(entry)
+    to_file = "/dev/null" if normalized_kind in {
+        "delete", "remove", "deleted",
+    } else move_path or path
+
+    explicit = entry.get("unified_diff") or entry.get("diff")
+    if isinstance(explicit, str) and explicit:
+        # FileUpdateChange.diff is authoritative but current app-server builds
+        # may omit file headers. Add only those structural headers so the web
+        # parser can render the native hunks; never derive content from the
+        # current worktree.
+        if ("@@" in explicit
+                and not re.search(r"(?m)^(?:diff --git |--- |\+\+\+ )", explicit)):
+            return f"--- {from_file}\n+++ {to_file}\n{explicit}"
+        return explicit
+
     old_content = entry.get("old_content")
     new_content = entry.get("content")
-    if str(kind).lower() in {"add", "create", "added"}:
+    if normalized_kind in {"add", "create", "added"}:
         old_content = ""
-    elif str(kind).lower() in {"delete", "remove", "deleted"}:
+    elif normalized_kind in {"delete", "remove", "deleted"}:
         old_content = (entry.get("content") if old_content is None
                        else old_content)
         new_content = ""
     if not isinstance(old_content, str) or not isinstance(new_content, str):
         return ""
-    from_file = "/dev/null" if not old_content else path
-    to_file = "/dev/null" if not new_content else path
     return "".join(difflib.unified_diff(
         old_content.splitlines(keepends=True),
         new_content.splitlines(keepends=True),

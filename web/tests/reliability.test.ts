@@ -2704,6 +2704,23 @@ try {
     "本次回复未完成，请重试。");
   assert.doesNotMatch(problemState.runtimes[problemSid].turns[0].error ?? "",
     /cc_crash|provider|private|wrapper/i);
+  const networkProblemSid = "safe-network-problem-presentation";
+  let networkProblemState = reduce({
+    ...initialState, focusedSid: networkProblemSid,
+    runtimes: { [networkProblemSid]: createRuntime() },
+  }, {
+    type: "query_sent", sid: networkProblemSid,
+    msg_id: "network-problem-turn", prompt: "continue", ts: 2,
+  });
+  networkProblemState = reduce(networkProblemState, {
+    type: "event", event: event({
+      type: "error", sid: networkProblemSid,
+      msg_id: "network-problem-turn", code: "cc_crash",
+      message: "网络连接异常，请检查网络后重试。",
+    }),
+  });
+  assert.equal(networkProblemState.runtimes[networkProblemSid].turns[0].error,
+    "网络连接异常，请检查网络后重试。");
   const commandProblem = reduce(problemState, { type: "event", event: event({
     type: "error", sid: problemSid, code: "internal",
     message: "Traceback: secret path /private/token",
@@ -3810,6 +3827,84 @@ try {
     "a native History alias reconciles into the optimistic steer exactly once",
   );
 
+  const claudeSwitchAliasSid = "claude-switch-history-alias";
+  const claudeOtherSid = "codex-viewed-between-claude-history";
+  let claudeSwitchAliasState = reduce({
+    ...initialState,
+    focusedSid: claudeSwitchAliasSid,
+    runtimes: {
+      [claudeSwitchAliasSid]: {
+        ...createRuntime(), state: "running" as const, syncReady: true,
+      },
+      [claudeOtherSid]: createRuntime(),
+    },
+  }, {
+    type: "query_sent",
+    sid: claudeSwitchAliasSid,
+    prompt: "我又改完了一版，你看看还有没得问题？",
+    msg_id: "6b09ee37-f861-4422-b98a-21f509c951b0",
+    ts: 22_100,
+  });
+  claudeSwitchAliasState = reduce(claudeSwitchAliasState, {
+    type: "event", event: event({
+      type: "session_focus", session_id: claudeOtherSid,
+    }),
+  });
+  claudeSwitchAliasState = reduce(claudeSwitchAliasState, {
+    type: "event", event: event({
+      type: "session_focus", session_id: claudeSwitchAliasSid,
+    }),
+  });
+  claudeSwitchAliasState = reduce(claudeSwitchAliasState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: claudeSwitchAliasSid,
+      revision: "claude-switch-r1",
+      generation: "claude-switch-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "2259073b-7676-455f-b7b0-b9b3892dbe93",
+        clientMsgId: "6b09ee37-f861-4422-b98a-21f509c951b0",
+        prompt: "我又改完了一版，你看看还有没得问题？",
+        done: false,
+        blocks: [],
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    claudeSwitchAliasState.runtimes[claudeSwitchAliasSid].turns.map(
+      (turn: Turn) => ({
+        id: turn.id,
+        historyTurnId: turn.historyTurnId,
+        prompt: turn.prompt,
+      })),
+    [{
+      id: "6b09ee37-f861-4422-b98a-21f509c951b0",
+      historyTurnId: "2259073b-7676-455f-b7b0-b9b3892dbe93",
+      prompt: "我又改完了一版，你看看还有没得问题？",
+    }],
+    "switching to Codex and back reconciles Claude History with the one live prompt",
+  );
+  const repeatedClaudePrompt = mergeInitialHistory(
+    [{
+      id: "claude-native-first", clientMsgId: "claude-client-first",
+      prompt: "继续", blocks: [], done: true,
+    }],
+    [{
+      id: "claude-client-second", clientMsgId: "claude-client-second",
+      prompt: "继续", blocks: [], done: false,
+    }],
+  );
+  assert.equal(repeatedClaudePrompt.length, 2,
+    "two real Claude prompts with equal text and distinct ids must both remain");
+
   const runningAliasSid = "history-running-steer-alias";
   const runningAliasNativeTurn = "history-running-native-task";
   let runningAliasState = reduce({
@@ -4494,6 +4589,24 @@ try {
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, true);
   detailState = reduce(detailState, { type: "event", event: event({
     type: "turn_detail", session_id: summarySid, turn_id: "summary-message",
+    revision: "summary-r1", authoritative: false,
+    error: "详细过程暂时不可用，请稍后重试", events: [],
+  }) });
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, false);
+  assert.equal(
+    detailState.runtimes[summarySid].turns[0].detailError,
+    "详细过程暂时不可用，请稍后重试",
+    "a failed detail read remains visible and retryable inside the open disclosure",
+  );
+  detailState = reduce(detailState, {
+    type: "turn_detail_requested", sid: summarySid,
+    turnId: "summary-message",
+  });
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, true);
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailError, undefined,
+    "retry clears the prior detail error without collapsing the process shell");
+  detailState = reduce(detailState, { type: "event", event: event({
+    type: "turn_detail", session_id: summarySid, turn_id: "summary-message",
     revision: "summary-r1", events: [
       event({ type: "user_msg", sid: summarySid, msg_id: "summary-message",
         prompt: "inspect" }),
@@ -4520,6 +4633,12 @@ try {
   assert.equal(detailState.runtimes[summarySid].turns.length, 1);
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoaded, true);
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, false);
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailError, undefined);
+  assert.equal(
+    detailState.runtimes[summarySid].turns[0].detailRetryDirection,
+    undefined,
+    "a successful detail response clears its transient retry target",
+  );
   assert.ok(detailState.runtimes[summarySid].turns[0].detailProjection?.blocks.some(
     (block: Block) => block.kind === "tool"));
   assert.deepEqual(detailState.runtimes[summarySid].turns[0].blocks.map(
@@ -4535,6 +4654,33 @@ try {
   }) });
   assert.equal(staleDetail, detailState,
     "a detail response from another history revision cannot rewrite the turn");
+
+  const runtimeOlderRequested = reduce(detailState, {
+    type: "turn_detail_requested", sid: summarySid,
+    turnId: "summary-message", before: "summary-older-cursor",
+  });
+  const runtimeOlderFailed = reduce(runtimeOlderRequested, {
+    type: "event",
+    event: event({
+      type: "turn_detail", session_id: summarySid,
+      turn_id: "summary-message", revision: "summary-r1",
+      authoritative: false, before: "summary-older-cursor",
+      error: "详细过程暂时不可用，请稍后重试", events: [],
+    }),
+  });
+  assert.equal(
+    runtimeOlderFailed.runtimes[summarySid].turns[0].detailLoaded,
+    true,
+    "an older-page failure keeps the already-loaded newest detail page",
+  );
+  assert.equal(
+    runtimeOlderFailed.runtimes[summarySid].turns[0].detailRetryBefore,
+    "summary-older-cursor",
+  );
+  assert.equal(
+    runtimeOlderFailed.runtimes[summarySid].turns[0].detailRetryDirection,
+    "older",
+  );
 
   const refreshedSummary = reduce(detailState, { type: "event", event: event({
     type: "history", session_id: summarySid, revision: "summary-r1",
@@ -4627,8 +4773,8 @@ try {
   );
   assert.deepEqual(
     twoCachedRestores.map((turn) => !!turn.detailRestorePending),
-    [false, true],
-    "refresh automatically validates only the newest affected turn instead of downloading every cached process",
+    [false, false],
+    "completed cached process stays lazy until the user requests its detail",
   );
   const repeatedPromptSummaries: Turn[] = ["a", "b"].map((suffix, index) => ({
     id: `repeated-${suffix}`,
@@ -4709,15 +4855,15 @@ try {
     (cacheFirstRefresh.runtimes[refreshSid].turns[0] as Turn & {
       detailRestorePending?: boolean;
     }).detailRestorePending,
-    true,
-    "a same-revision cached process should schedule one authoritative detail restore",
+    false,
+    "entering a completed session must not schedule an unsolicited detail read",
   );
   assert.equal(
     (cacheFirstRefresh.runtimes[refreshSid].turns[0] as Turn & {
       detailRestoreOpen?: boolean;
     }).detailRestoreOpen,
-    true,
-    "the newest compact process should stay open across a page refresh",
+    false,
+    "completed cached process stays collapsed until the user opens it",
   );
 
   let historyFirstRefresh = reduce({
@@ -6198,6 +6344,35 @@ try {
   assert.equal(hydratedOlderTurn?.detailLoading, false);
   assert.equal(hydratedOlderTurn?.blocks[0]?.kind, "text");
 
+  const browseOlderRequested = reduce(detailedBrowse, {
+    type: "history_browse_detail_requested",
+    sid: orderedHistorySid,
+    scopeKey: detailedBrowse.historyBrowse!.scopeKey,
+    revision: detailedBrowse.historyBrowse!.revision,
+    viewId: detailedBrowse.historyBrowse!.viewId,
+    windowEpoch: detailedBrowse.historyBrowse!.windowEpoch,
+    turnId: "older-page",
+    before: "browse-older-detail-cursor",
+  });
+  const browseOlderFailed = reduce(browseOlderRequested, {
+    type: "history_browse_detail",
+    sid: orderedHistorySid,
+    scopeKey: detailedBrowse.historyBrowse!.scopeKey,
+    revision: detailedBrowse.historyBrowse!.revision,
+    viewId: detailedBrowse.historyBrowse!.viewId,
+    windowEpoch: detailedBrowse.historyBrowse!.windowEpoch,
+    turnId: "older-page",
+    before: "browse-older-detail-cursor",
+    events: [],
+    error: "详细过程暂时不可用，请稍后重试",
+  });
+  const failedBrowseTurn = browseOlderFailed.historyBrowse?.turns.find(
+    (turn: Turn) => turn.id === "older-page");
+  assert.equal(failedBrowseTurn?.detailLoaded, true);
+  assert.equal(failedBrowseTurn?.detailRetryBefore,
+    "browse-older-detail-cursor");
+  assert.equal(failedBrowseTurn?.detailRetryDirection, "older");
+
   const runtimeDetailRequested = reduce(orderedHistory, {
     type: "turn_detail_requested",
     sid: orderedHistorySid,
@@ -7650,6 +7825,41 @@ try {
   assert.equal(commandBlock.result?.duration_ms, 1250);
   assert.equal(richTurn.blocks.filter((block: { kind: string }) => block.kind === "process").length, 3);
 
+  const clearedDiffSid = "cleared-file-diff";
+  let clearedDiffState = reduce({
+    ...initialState,
+    focusedSid: clearedDiffSid,
+    runtimes: { [clearedDiffSid]: createRuntime() },
+  }, {
+    type: "query_sent", sid: clearedDiffSid,
+    prompt: "edit", msg_id: "diff-turn", ts: 31_000,
+  });
+  for (const diffEvent of [
+    event({
+      type: "tool_use", sid: clearedDiffSid, message_id: "diff-message",
+      tool_use_id: "diff-tool", tool: "apply_patch", category: "file",
+      input: { file_paths: ["/repo/a.py"] },
+    }),
+    event({
+      type: "tool_delta", sid: clearedDiffSid, tool_use_id: "diff-tool",
+      stream: "diff", delta: "@@ -1 +1 @@\n-old\n+first",
+    }),
+    event({
+      type: "tool_result", sid: clearedDiffSid, tool_use_id: "diff-tool",
+      content: "", is_error: false, status: "succeeded", diff: null,
+    }),
+  ]) {
+    clearedDiffState = reduce(clearedDiffState, {
+      type: "event", event: diffEvent,
+    });
+  }
+  const clearedDiffBlock = clearedDiffState.runtimes[clearedDiffSid]
+    .turns[0].blocks.find((block: Block) => block.kind === "tool") as {
+      diff?: string;
+    };
+  assert.equal(clearedDiffBlock.diff, undefined,
+    "an authoritative empty terminal snapshot clears the stale live diff");
+
   // Claude can reveal only at Result that a stop_reason=null text block was the
   // final answer. A repeated End for the same id must reclassify in place, while
   // an End for an unknown id must never manufacture an empty text block/turn.
@@ -7891,6 +8101,76 @@ try {
     ["history-repeat", "live-repeat"],
     "equal detail/live text with distinct native ids is two real occurrences",
   );
+  const interleavedObservedProcess = mergeDetailWithLiveTail(
+    [
+      {
+        kind: "text", message_id: "commentary-before", text: "before",
+        done: true, channel: "commentary", liveOrder: 0,
+      },
+      {
+        kind: "text", message_id: "commentary-after", text: "after",
+        done: true, channel: "commentary", liveOrder: 1,
+      },
+    ],
+    [
+      {
+        kind: "text", message_id: "commentary-before", text: "before",
+        done: true, channel: "commentary", liveOrder: 0,
+      },
+      {
+        kind: "tool", message_id: "tool-message-1", tool_use_id: "tool-1",
+        tool: "exec", input: {}, done: true, liveOrder: 1,
+      },
+      {
+        kind: "text", message_id: "commentary-after", text: "after",
+        done: true, channel: "commentary", liveOrder: 2,
+      },
+      {
+        kind: "tool", message_id: "tool-message-2", tool_use_id: "tool-2",
+        tool: "exec", input: {}, done: true, liveOrder: 3,
+      },
+    ],
+  );
+  assert.deepEqual(
+    interleavedObservedProcess.map((block) => block.kind === "text"
+      ? block.message_id : block.kind === "tool"
+        ? block.tool_use_id : block.item_id),
+    ["commentary-before", "tool-1", "commentary-after", "tool-2"],
+    "an official detail subset must not move observed tools below later commentary",
+  );
+  const unorderedLiveSubset = mergeDetailWithLiveTail(
+    [
+      {
+        kind: "text", message_id: "source-first", text: "first",
+        done: true, channel: "commentary",
+      },
+      {
+        kind: "text", message_id: "source-second", text: "second",
+        done: true, channel: "commentary",
+      },
+    ],
+    [
+      {
+        kind: "text", message_id: "source-second", text: "second",
+        done: true, channel: "commentary",
+      },
+      {
+        kind: "tool", message_id: "unknown-order-tool", tool_use_id: "unknown-order-tool",
+        tool: "exec", input: {}, done: true,
+      },
+      {
+        kind: "text", message_id: "source-first", text: "first",
+        done: true, channel: "commentary",
+      },
+    ],
+  );
+  assert.deepEqual(
+    unorderedLiveSubset.map((block) => block.kind === "text"
+      ? block.message_id : block.kind === "tool"
+        ? block.tool_use_id : block.item_id),
+    ["source-first", "source-second", "unknown-order-tool"],
+    "Set containment without reducer liveOrder is not chronology evidence",
+  );
   const authoritativePayload = mergeDetailWithLiveTail(
     [{
       kind: "process", item_id: "source-complete", processKind: "command",
@@ -7966,6 +8246,100 @@ try {
       : undefined,
     "FULL-AUTHORITATIVE-OUTPUT",
     "summary restoration keeps detail authoritative through spill and live",
+  );
+
+  const sharedNativeSteerId = "native-task-with-steers";
+  const preSteerTools = Array.from({ length: 12 }, (_, index) => ({
+    kind: "process" as const,
+    item_id: `pre-steer-tool-${index}`,
+    processKind: "command" as const,
+    phase: "end" as const,
+    status: "succeeded" as const,
+    title: `tool ${index}`,
+    done: true,
+  }));
+  const restoredSteerSegments = restoreObservedLiveTurnDetails(
+    [
+      {
+        id: "native-user-before-steer", prompt: "initial request",
+        forkPointId: sharedNativeSteerId, blocks: [], done: true,
+      },
+      {
+        id: "native-user-first-steer", prompt: "first steer",
+        forkPointId: sharedNativeSteerId, blocks: [], done: true,
+      },
+      {
+        id: "native-user-second-steer", prompt: "second steer",
+        forkPointId: sharedNativeSteerId, blocks: [], done: false,
+      },
+    ],
+    [
+      {
+        id: "native-user-before-steer", prompt: "initial request",
+        forkPointId: sharedNativeSteerId, blocks: preSteerTools, done: true,
+      },
+      {
+        id: "native-user-first-steer", prompt: "first steer",
+        forkPointId: sharedNativeSteerId,
+        blocks: [{
+          kind: "process", item_id: "first-steer-tool",
+          processKind: "command", phase: "end", status: "succeeded",
+          title: "first steer tool", done: true,
+        }],
+        done: true,
+      },
+      {
+        id: "native-user-second-steer", prompt: "second steer",
+        forkPointId: sharedNativeSteerId,
+        blocks: [{
+          kind: "process", item_id: "second-steer-tool",
+          processKind: "command", phase: "start", status: "running",
+          title: "second steer tool", done: false,
+        }],
+        done: false,
+      },
+    ],
+  );
+  assert.deepEqual(
+    restoredSteerSegments[0].detailProjection?.blocks.flatMap((block) =>
+      block.kind === "process" ? [block.item_id] : []),
+    preSteerTools.map((block) => block.item_id),
+    "a History refresh must not move or erase pre-steer tools when every "
+      + "visible segment shares one native task id",
+  );
+  assert.deepEqual(
+    restoredSteerSegments[1].detailProjection?.blocks.flatMap((block) =>
+      block.kind === "process" ? [block.item_id] : []),
+    ["first-steer-tool"],
+    "each completed steer segment restores only its own observed process",
+  );
+  const restoredCachedSteerSegments = restoreCachedTurnDetails(
+    [
+      {
+        id: "native-user-before-steer", prompt: "initial request",
+        forkPointId: sharedNativeSteerId, blocks: [], done: true,
+        detailEventCount: 12,
+      },
+      {
+        id: "native-user-first-steer", prompt: "first steer",
+        forkPointId: sharedNativeSteerId, blocks: [], done: true,
+        detailEventCount: 1,
+      },
+    ],
+    restoredSteerSegments.slice(0, 2),
+  );
+  assert.deepEqual(
+    restoredCachedSteerSegments[0].detailProjection?.blocks.flatMap((block) =>
+      block.kind === "process" ? [block.item_id] : []),
+    preSteerTools.map((block) => block.item_id),
+    "switching away and back must not let a shared native task id move the "
+      + "pre-steer tools into a later cached segment",
+  );
+  assert.deepEqual(
+    restoredCachedSteerSegments[1].detailProjection?.blocks.flatMap((block) =>
+      block.kind === "process" ? [block.item_id] : []),
+    ["first-steer-tool"],
+    "cached steer segments remain one-to-one after a session switch",
   );
 
   const rollingSpillSid = "rolling-live-spill";
@@ -8372,6 +8746,17 @@ try {
   }));
   assert.match(answerMarkup, /class="turn-working"/);
   assert.match(answerMarkup, /回答中/);
+  const zeroTokenRunningMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: richSid, turns: [{
+      id: "zero-token-live", clientMsgId: "zero-token-prompt",
+      prompt: "开始检查", done: false, blocks: [],
+    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(zeroTokenRunningMarkup, /class="turn-working"/);
+  assert.match(zeroTokenRunningMarkup, /正在处理/);
+  assert.match(zeroTokenRunningMarkup, /等待响应/);
+  assert.match(zeroTokenRunningMarkup, /aria-expanded="true"/,
+    "a running turn keeps one stable process shell before its first token");
   const { ProcessTimeline } = await reducerHarness.ssrLoadModule(
     "/src/components/ProcessTimeline.tsx");
   const pagedProcessMarkup = renderToStaticMarkup(createElement(
@@ -8390,6 +8775,33 @@ try {
   assert.match(pagedProcessMarkup, /加载更早过程/);
   assert.match(pagedProcessMarkup, /返回较新过程/,
     "a bounded process window keeps both source navigation controls");
+  const failedProcessMarkup = renderToStaticMarkup(createElement(
+    ProcessTimeline, {
+      blocks: [],
+      done: true,
+      deferredCount: 12,
+      detailError: "详细过程暂时不可用，请稍后重试",
+      openOverride: true,
+      onLoadDetail: () => true,
+    },
+  ));
+  assert.match(failedProcessMarkup, /role="alert"/);
+  assert.match(failedProcessMarkup, /详细过程暂时不可用，请稍后重试/);
+  assert.match(failedProcessMarkup, />重试</,
+    "detail failure stays in the opened shell instead of requiring a second header click");
+  assert.doesNotMatch(failedProcessMarkup, /正在加载过程/);
+  const failedLoadedPageMarkup = renderToStaticMarkup(createElement(
+    ProcessTimeline, {
+      blocks: [],
+      done: true,
+      deferredCount: 0,
+      detailError: "详细过程暂时不可用，请稍后重试",
+      openOverride: true,
+      onRetryDetail: () => true,
+    },
+  ));
+  assert.match(failedLoadedPageMarkup, /role="alert"/,
+    "a later detail-page failure remains visible after the first page loaded");
   const declinedMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     blocks: [{ kind: "process", item_id: "approval-denied", processKind: "hook",
       phase: "end", status: "declined", title: "Hook 已拒绝", done: false }],
@@ -8417,6 +8829,8 @@ try {
   assert.doesNotMatch(codexProcessMarkup, /private reasoning must stay hidden/);
   assert.doesNotMatch(codexProcessMarkup, /synthetic reasoning row/);
   assert.match(codexProcessMarkup, /2 个工具调用/);
+  assert.match(codexProcessMarkup, /aria-expanded="false"/,
+    "entering a completed Codex turn keeps process collapsed");
   assert.doesNotMatch(codexProcessMarkup, /class="tool-group"/,
     "a completed Codex process must not render tool details until the user opens it");
 
@@ -8508,6 +8922,89 @@ try {
   assert.match(historyImageViewMarkup, /\/tmp\/history\.png/);
   assert.match(historyImageViewMarkup, /data:image\/webp;base64,UklGRg==/);
   assert.doesNotMatch(historyImageViewMarkup, /&quot;history_image&quot;/);
+
+  const noNativeDiffMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "historical-file-without-diff",
+    engine: "codex",
+    turns: [{
+      id: "historical-file-without-diff-turn",
+      prompt: "update the file",
+      done: true,
+      blocks: [{
+        kind: "tool",
+        message_id: "historical-file-message",
+        tool_use_id: "historical-file-tool",
+        tool: "fileChange",
+        input: {
+          changes: [{ path: "/repo/existing.ts", kind: "update" }],
+        },
+        done: true,
+        result: { content: "updated", is_error: false },
+      }],
+    }],
+    // Legacy callers may still pass this callback. Historical cards must not
+    // use it to read today's worktree when this turn persisted no native diff.
+    onGetDiff: () => {},
+    onOpenTurnDiff: () => {},
+  }));
+  assert.match(noNativeDiffMarkup,
+    /class="turn-files-summary"[^>]*disabled/);
+  assert.match(noNativeDiffMarkup,
+    /class="turn-file-chip"[^>]*disabled[^>]*title="本轮没有可用的原生 diff"/);
+
+  const nativeDiffMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "historical-file-with-native-diff",
+    engine: "codex",
+    turns: [{
+      id: "historical-file-with-native-diff-turn",
+      prompt: "update the file",
+      done: true,
+      blocks: [{
+        kind: "tool",
+        message_id: "native-diff-message",
+        tool_use_id: "native-diff-tool",
+        tool: "fileChange",
+        input: {
+          changes: [{ path: "/repo/existing.ts", kind: "update" }],
+        },
+        done: true,
+        result: {
+          content: "updated",
+          is_error: false,
+          diff: "--- /repo/existing.ts\n+++ /repo/existing.ts\n@@ -1 +1 @@\n-old\n+new",
+        },
+      }],
+    }],
+    onOpenTurnDiff: () => {},
+  }));
+  assert.doesNotMatch(nativeDiffMarkup,
+    /class="turn-files-summary"[^>]*disabled/);
+  assert.match(nativeDiffMarkup, /title="查看本轮原生 diff"/);
+
+  const markdownWithoutDiffMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "historical-markdown-without-diff",
+    engine: "codex",
+    turns: [{
+      id: "historical-markdown-without-diff-turn",
+      prompt: "update docs",
+      done: true,
+      blocks: [{
+        kind: "tool",
+        message_id: "historical-markdown-message",
+        tool_use_id: "historical-markdown-tool",
+        tool: "fileChange",
+        input: { changes: [{ path: "/repo/README.md", kind: "update" }] },
+        done: true,
+        result: { content: "updated", is_error: false },
+      }],
+    }],
+    onPreviewMarkdown: () => {},
+  }));
+  assert.match(markdownWithoutDiffMarkup,
+    /class="turn-file-chip markdown"[^>]*title="预览 \/repo\/README.md"/,
+    "Markdown remains previewable even when an old turn has no native diff");
+  assert.doesNotMatch(markdownWithoutDiffMarkup,
+    /class="turn-file-chip markdown"[^>]*disabled/);
 
   const codexHookWrappedBatchMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     engine: "codex", done: false,

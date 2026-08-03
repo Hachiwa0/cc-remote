@@ -551,7 +551,8 @@ function isPayloadFreeUnfinishedCommandShell(block: Block): boolean {
 }
 
 export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onOpenFile,
-  deferredCount = 0, detailLoading = false, onLoadDetail,
+  deferredCount = 0, detailLoading = false, detailError, onLoadDetail,
+  onRetryDetail,
   canLoadEarlier = false, canLoadNewer = false,
   onLoadEarlier, onLoadNewer,
   imageAssets, onLoadImage, onAuthorizeImage, onPreviewImage, engine = "claude",
@@ -567,7 +568,9 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   onOpenFile?: (path: string, line?: number) => void;
   deferredCount?: number;
   detailLoading?: boolean;
-  onLoadDetail?: () => void;
+  detailError?: string | null;
+  onLoadDetail?: () => boolean | void;
+  onRetryDetail?: () => boolean | void;
   canLoadEarlier?: boolean;
   canLoadNewer?: boolean;
   onLoadEarlier?: () => void;
@@ -617,6 +620,7 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   const complete = done && !hasActiveProcess(projectedItems);
   const [uncontrolledOpen, setUncontrolledOpen] = useState(!complete);
   const open = openOverride ?? uncontrolledOpen;
+  const [localDetailError, setLocalDetailError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
   const manuallyToggled = useRef(false);
   const tapGuard = useRef(new PointerTapGuard());
@@ -626,6 +630,11 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   useEffect(() => {
     if (!manuallyToggled.current) setUncontrolledOpen(!complete);
   }, [complete]);
+  useEffect(() => {
+    if (detailLoading || !needsAuthoritativeDetail) {
+      setLocalDetailError(null);
+    }
+  }, [detailLoading, needsAuthoritativeDetail]);
   useEffect(() => {
     if (complete) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -643,13 +652,18 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   }, [onInteractionEnd]);
 
   const hasDeferredOnly = items.length === 0 && needsAuthoritativeDetail;
-  if (!items.length && !hasDeferredOnly) return null;
+  const waitingForContent = items.length === 0 && !done;
+  const visibleDetailError = detailError ?? localDetailError;
+  if (!items.length && !hasDeferredOnly && !waitingForContent
+      && !visibleDetailError) return null;
   // A completed timeline is collapsed. Do not allocate/group hundreds of
   // historical rows until the user actually opens it.
   const rows = open ? groupTimelineRows(items) : [];
   const toolCount = items.reduce((count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
   const countLabel = needsAuthoritativeDetail
     ? `${deferredCount} 项`
+    : waitingForContent
+      ? "等待响应"
     : engine === "codex" && toolCount === items.length
       ? `${toolCount} 个工具调用`
       : `${items.length} 项`;
@@ -662,12 +676,25 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
           ? 0
           : null
     : Math.max(0, now - (startTs ?? now));
+  const requestDetail = () => {
+    setLocalDetailError(null);
+    if (onLoadDetail?.() === false) {
+      setLocalDetailError("无法发起详情请求，请重试");
+    }
+  };
+  const retryDetail = () => {
+    setLocalDetailError(null);
+    if ((onRetryDetail ?? onLoadDetail)?.() === false) {
+      setLocalDetailError("无法发起详情请求，请重试");
+    }
+  };
   const toggle = () => {
     manuallyToggled.current = true;
     if (needsAuthoritativeDetail) {
-      if (!detailLoading) onLoadDetail?.();
-      setUncontrolledOpen(true);
-      onOpenChange?.(true);
+      const next = !open;
+      if (next && !detailLoading) requestDetail();
+      setUncontrolledOpen(next);
+      onOpenChange?.(next);
       return;
     }
     const next = !open;
@@ -709,9 +736,9 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
   };
   return (
     <section data-process-detail-root
-      className={`turn-process${open && !hasDeferredOnly ? " open" : ""}`}>
+      className={`turn-process${open ? " open" : ""}`}>
       <button type="button" className="turn-process-head"
-        aria-expanded={open && !hasDeferredOnly} aria-busy={detailLoading}
+        aria-expanded={open} aria-busy={detailLoading}
         onPointerDown={pointerDown} onPointerMove={pointerMove}
         onPointerUp={pointerUp} onPointerCancel={pointerCancel}
         onClick={(event) => {
@@ -731,7 +758,25 @@ export function ProcessTimeline({ blocks, done, durationMs, startTs, doneTs, onO
         <span className="turn-process-count">{countLabel}</span>
         <Icon name="chev" size={15} />
       </button>
-      {open && !hasDeferredOnly && <div className="process-timeline">
+      {open && <div className="process-timeline">
+        {visibleDetailError && (
+          <div className="process-detail-error" role="alert">
+            <span>{visibleDetailError}</span>
+            <button type="button" disabled={detailLoading}
+              onClick={(event) => {
+                event.stopPropagation();
+                retryDetail();
+              }}>
+              重试
+            </button>
+          </div>
+        )}
+        {(hasDeferredOnly || waitingForContent)
+          && !visibleDetailError && (
+          <div className="process-detail-loading" role="status">
+            {hasDeferredOnly ? "正在加载过程…" : "等待模型响应…"}
+          </div>
+        )}
         {canLoadEarlier && (
           <button type="button" className="process-page-control earlier"
             disabled={detailLoading} onClick={onLoadEarlier}>

@@ -423,7 +423,7 @@ export type Action =
   | { type: "history_browse_newer_unavailable"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number }
   | { type: "history_browse_page_failed"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string }
   | { type: "history_browse_detail_requested"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; before?: string | null }
-  | { type: "history_browse_detail"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; events: ServerEvent[]; before?: string | null; hasMore?: boolean; oldestCursor?: string | null; hasNewer?: boolean; newerCursor?: string | null }
+  | { type: "history_browse_detail"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; events: ServerEvent[]; error?: string | null; before?: string | null; hasMore?: boolean; oldestCursor?: string | null; hasNewer?: boolean; newerCursor?: string | null }
   | { type: "history_detail_cancelled"; context: HistoryDetailRequestContext }
   | { type: "return_to_latest"; sid: string }
   | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null }
@@ -1678,6 +1678,12 @@ export function reduce(state: AppState, action: Action): AppState {
           ? {
               ...turn,
               detailLoading: true,
+              detailError: undefined,
+              detailRetryBefore: action.before ?? null,
+              detailRetryDirection: action.before == null
+                ? "initial"
+                : action.before === turn.detailNewerCursor
+                  ? "newer" : "older",
               detailAutoLoad: action.before == null
                 ? (action.autoLoad ?? true) : turn.detailAutoLoad,
               detailRestorePending: false,
@@ -1858,11 +1864,20 @@ export function reduce(state: AppState, action: Action): AppState {
       // particular page window. Older/newer pagination may legitimately
       // advance windowEpoch while the requested canonical turn remains
       // mounted; rejecting that late response would strand detailLoading.
+      const target = browse.turns.find((turn) =>
+        canonicalTurnId(turn) === action.turnId
+        || turn.id === action.turnId);
       const historyBrowse = markBrowseDetailLoading(
         browse, action.turnId, true, {
           expectedScopeKey: action.scopeKey,
           expectedViewId: action.viewId,
-        }, action.before == null ? true : undefined);
+        }, action.before == null ? true : undefined, null, {
+          before: action.before ?? null,
+          direction: action.before == null
+            ? "initial"
+            : action.before === target?.detailNewerCursor
+              ? "newer" : "older",
+        });
       return historyBrowse === browse ? state : { ...state, historyBrowse };
     }
     case "history_browse_detail": {
@@ -1883,7 +1898,14 @@ export function reduce(state: AppState, action: Action): AppState {
           browse, action.turnId, false, {
             expectedScopeKey: action.scopeKey,
             expectedViewId: action.viewId,
-          }, false);
+          }, false, action.error ?? null, {
+            before: target?.detailRetryBefore ?? action.before ?? null,
+            direction: target?.detailRetryDirection
+              ?? (action.before == null
+                ? "initial"
+                : action.before === target?.detailNewerCursor
+                  ? "newer" : "older"),
+          });
         return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
       const installed = installTurnDetailProjectionPage(
@@ -1905,7 +1927,14 @@ export function reduce(state: AppState, action: Action): AppState {
           browse, action.turnId, false, {
             expectedScopeKey: action.scopeKey,
             expectedViewId: action.viewId,
-          }, false);
+          }, false, "详细过程无法解析，请重试", {
+            before: target.detailRetryBefore ?? action.before ?? null,
+            direction: target.detailRetryDirection
+              ?? (action.before == null
+                ? "initial"
+                : action.before === target.detailNewerCursor
+                  ? "newer" : "older"),
+          });
         return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
       const historyBrowse = markBrowseDetail(
@@ -1933,7 +1962,7 @@ export function reduce(state: AppState, action: Action): AppState {
           browse, context.turnId, false, {
             expectedScopeKey: context.scopeKey,
             expectedViewId: context.viewId,
-          }, false);
+          }, false, undefined, null);
         return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
       const runtime = state.runtimes[context.sid];
@@ -1942,7 +1971,13 @@ export function reduce(state: AppState, action: Action): AppState {
         rt.turns = rt.turns.map((turn) => (
           turn.id === context.turnId
             || canonicalTurnId(turn) === context.turnId)
-          ? { ...turn, detailLoading: false, detailAutoLoad: false }
+          ? {
+              ...turn,
+              detailLoading: false,
+              detailAutoLoad: false,
+              detailRetryBefore: undefined,
+              detailRetryDirection: undefined,
+            }
           : turn);
       }, true);
     }
@@ -2960,7 +2995,19 @@ function reduceEvent(
         const next = patch(state, sid, (rt) => {
           rt.turns = rt.turns.map((turn) => turn.id === e.turn_id
               || canonicalTurnId(turn) === e.turn_id
-            ? { ...turn, detailLoading: false }
+              ? {
+                ...turn,
+                detailLoading: false,
+                detailAutoLoad: false,
+                detailError: e.error ?? "详细过程暂时不可用，请重试",
+                detailRetryBefore:
+                  turn.detailRetryBefore ?? e.before ?? null,
+                detailRetryDirection: turn.detailRetryDirection
+                  ?? (e.before == null
+                    ? "initial"
+                    : e.before === turn.detailNewerCursor
+                      ? "newer" : "older"),
+              }
             : turn);
         });
         return next;
@@ -2971,7 +3018,14 @@ function reduceEvent(
         return patch(state, sid, (rt) => {
           rt.turns = rt.turns.map((turn) => (
             turn.id === e.turn_id || canonicalTurnId(turn) === e.turn_id)
-            ? { ...turn, detailLoading: false, detailAutoLoad: false }
+            ? {
+                ...turn,
+                detailLoading: false,
+                detailAutoLoad: false,
+                detailError: undefined,
+                detailRetryBefore: undefined,
+                detailRetryDirection: undefined,
+              }
             : turn);
         });
       }
@@ -2992,7 +3046,19 @@ function reduceEvent(
         return patch(state, sid, (rt) => {
           rt.turns = rt.turns.map((turn) => (
             turn.id === e.turn_id || canonicalTurnId(turn) === e.turn_id)
-            ? { ...turn, detailLoading: false, detailAutoLoad: false }
+            ? {
+                ...turn,
+                detailLoading: false,
+                detailAutoLoad: false,
+                detailError: "详细过程无法解析，请重试",
+                detailRetryBefore:
+                  turn.detailRetryBefore ?? e.before ?? null,
+                detailRetryDirection: turn.detailRetryDirection
+                  ?? (e.before == null
+                    ? "initial"
+                    : e.before === turn.detailNewerCursor
+                      ? "newer" : "older"),
+              }
             : turn);
         });
       }
@@ -3972,7 +4038,7 @@ function reduceEvent(
               truncated: e.truncated ?? undefined, status: e.status,
               summary: e.summary, diff: e.diff, exit_code: e.exit_code,
               duration_ms: e.duration_ms };
-            if (e.diff) b.diff = e.diff;
+            if ("diff" in e) b.diff = e.diff ?? undefined;
             b.done = true;
             t.progress = undefined;
             if (boundCompletedTurns) limitTurnBlocks(t);

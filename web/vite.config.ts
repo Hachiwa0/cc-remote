@@ -6,6 +6,36 @@ import react from "@vitejs/plugin-react";
 // web/dist on the same origin, so /ws is same-origin naturally.
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Mermaid's generated parser is a single ~663 kB lazy module. Keep Vite's
+    // generic warning above that known boundary; the actual startup path is
+    // enforced separately by scripts/check-bundle-budget.mjs.
+    chunkSizeWarningLimit: 700,
+    rolldownOptions: {
+      output: {
+        // Keep stable framework and parser code in content-addressed chunks so
+        // normal cc-remote releases do not make clients download and parse the
+        // whole application bundle again. Only initial dependencies participate;
+        // Mermaid/KaTeX keep their existing on-demand boundaries.
+        codeSplitting: {
+          groups: [
+            {
+              name: "react-runtime",
+              test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/,
+              tags: ["$initial"],
+              priority: 20,
+            },
+            {
+              name: "initial-vendor",
+              test: /node_modules[\\/]/,
+              tags: ["$initial"],
+              priority: 10,
+            },
+          ],
+        },
+      },
+    },
+  },
   server: {
     proxy: {
       "/api": { target: "http://127.0.0.1:8765" },

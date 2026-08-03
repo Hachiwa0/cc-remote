@@ -356,6 +356,45 @@ def _turn_detail_event_group(event: dict) -> str | None:
     return None
 
 
+def _rebind_turn_detail_visible_id(
+    rows: tuple[dict, ...] | list[dict],
+    *,
+    indexed_turn_id: str,
+    visible_turn_id: str,
+) -> list[dict]:
+    """Bind one proven rollout detail segment to its official visible id.
+
+    Codex may expose a persisted user item id in the official summary while the
+    source-bound rollout index stores that same segment under its rollout user
+    id.  The caller has already resolved the exact native turn and segment
+    index.  Rebind only that verified one-turn group; never guess from prompt
+    text or accept an unrelated singleton detail response.
+    """
+    copied = [dict(row) for row in rows]
+    if indexed_turn_id == visible_turn_id:
+        return copied
+    projected = materialize_history_turns(copied)
+    if (
+        len(projected) != 1
+        or projected[0].get("id") != indexed_turn_id
+    ):
+        raise ValueError("rollout detail identity is not the resolved segment")
+    rebound = False
+    for event in copied:
+        if event.get("msg_id") == indexed_turn_id:
+            event["msg_id"] = visible_turn_id
+            rebound = True
+    if not rebound:
+        raise ValueError("rollout detail has no visible user anchor")
+    rebound_projection = materialize_history_turns(copied)
+    if (
+        len(rebound_projection) != 1
+        or rebound_projection[0].get("id") != visible_turn_id
+    ):
+        raise ValueError("rollout detail could not bind the official identity")
+    return copied
+
+
 def _coalesce_turn_detail_group(rows: list[dict]) -> list[dict]:
     """Fold repeated live snapshots without changing the rendered block.
 
@@ -1333,6 +1372,13 @@ class WrapperMachine:
         for key in tuple(self._codex_history_image_views):
             if key[0] == sid:
                 self._codex_history_image_views.pop(key, None)
+        invalidate_official = getattr(
+            getattr(self, "_codex_history", None),
+            "invalidate_thread",
+            None,
+        )
+        if callable(invalidate_official):
+            invalidate_official(sid)
         return self._history_revision(sid)
 
     def _focused_ctx(self) -> Optional[SessionContext]:
@@ -7507,10 +7553,25 @@ class WrapperMachine:
         )
         rows = None
         indexed_turn_id = cmd.turn_id
+        fallback_official_rows = None
         if is_codex:
+            fallback = None
+            fallback_required = False
             try:
                 rows = await self._codex_history.turn_events(
                     sid, cmd.turn_id)
+                detail_source = getattr(
+                    self._codex_history, "turn_detail_source", None)
+                if (
+                    callable(detail_source)
+                    and detail_source(sid, cmd.turn_id) == "full"
+                ):
+                    # Current app-server full-turn projections can omit every
+                    # command/tool while remaining structurally valid. Keep the
+                    # official lifecycle/final as a graceful fallback, but use
+                    # the source-bound rollout segment for complete process.
+                    fallback = self._codex_history.rollout_fallback(
+                        sid, cmd.turn_id)
             except CodexHistoryUnsupported:
                 # A summary-capable app-server may still lack item pagination
                 # and full turn views. Materialize only the rollout page that
@@ -7519,22 +7580,6 @@ class WrapperMachine:
                 try:
                     fallback = self._codex_history.rollout_fallback(
                         sid, cmd.turn_id)
-                    fallback_history = await self._build_history(
-                        sid,
-                        before=fallback.before,
-                        limit=fallback.limit,
-                        cwd_hint=None,
-                        detail="summary",
-                        allow_stale=False,
-                    )
-                    if fallback_history.error:
-                        return await send(
-                            error="详细过程暂时不可用，请稍后重试")
-                    indexed_turn_id = next((
-                        turn.id
-                        for turn in fallback_history.turns
-                        if turn.forkPointId == fallback.native_turn_id
-                    ), cmd.turn_id)
                 except Exception as exc:
                     log.warning(
                         "Codex rollout detail fallback failed",
@@ -7544,6 +7589,7 @@ class WrapperMachine:
                     )
                     return await send(
                         error="详细过程暂时不可用，请稍后重试")
+                fallback_required = True
             except CodexHistoryCursorError:
                 # A compatibility rollout page (or a page cached before this
                 # official-reader generation) has no in-memory locator. Its
@@ -7568,8 +7614,68 @@ class WrapperMachine:
                 return await send(
                     error="详细过程暂时不可用，请稍后重试")
 
+            if fallback is not None:
+                official_rows = rows
+                try:
+                    fallback_history = await self._build_history(
+                        sid,
+                        before=fallback.before,
+                        limit=fallback.limit,
+                        cwd_hint=None,
+                        detail="summary",
+                        allow_stale=False,
+                    )
+                    if self._history_revision(sid) != revision:
+                        return await send(
+                            error="会话历史已更新，请重新展开该轮")
+                    if fallback_history.error:
+                        raise RuntimeError("rollout history page unavailable")
+                    candidates = [
+                        turn for turn in fallback_history.turns
+                        if turn.forkPointId == fallback.native_turn_id
+                    ]
+                    direct = next((
+                        turn for turn in candidates
+                        if turn.id == cmd.turn_id
+                        or turn.clientMsgId == cmd.turn_id
+                    ), None)
+                    if direct is not None:
+                        indexed_turn_id = direct.id
+                    else:
+                        if (
+                            len(candidates) != fallback.segment_count
+                            or fallback.segment_index < 0
+                            or fallback.segment_index >= len(candidates)
+                        ):
+                            raise CodexHistoryCursorError(
+                                "rollout detail segment no longer resolves")
+                        indexed_turn_id = candidates[
+                            fallback.segment_index].id
+                    # Read this exact source-bound segment from SQLite below.
+                    # Do not merge the incomplete full-turn rows into it: their
+                    # missing tools make their array order non-authoritative.
+                    fallback_official_rows = official_rows
+                    rows = None
+                except Exception as exc:
+                    log.warning(
+                        "Codex rollout detail supplement failed",
+                        session_id=sid,
+                        turn_id=cmd.turn_id,
+                        error_type=type(exc).__name__,
+                    )
+                    if fallback_required or official_rows is None:
+                        return await send(
+                            error="详细过程暂时不可用，请稍后重试")
+                    # A valid official full row still carries the final answer
+                    # and lifecycle. Degrade visibly instead of turning a
+                    # temporary local-index miss into an empty detail panel.
+                    rows = official_rows
+
         if rows is None and self._history_index is None:
-            return await send(error="详细过程暂时不可用，请稍后重试")
+            if fallback_official_rows is None:
+                return await send(error="详细过程暂时不可用，请稍后重试")
+            rows = list(fallback_official_rows)
+            indexed_turn_id = cmd.turn_id
         active_turn = bool(
             ctx is not None
             and (
@@ -7611,16 +7717,20 @@ class WrapperMachine:
                 source_path = await asyncio.to_thread(
                     codex_rollout_path if is_codex else transcript_path, sid)
                 if not source_path:
-                    return await send(error="详细过程尚未生成")
-                source = await asyncio.to_thread(
-                    HistorySourceFingerprint.capture, source_path)
-                rows = await asyncio.to_thread(
-                    self._history_index.get_turn_detail,
-                    sid,
-                    "codex" if is_codex else "claude",
-                    source,
-                    indexed_turn_id,
-                )
+                    if fallback_official_rows is None:
+                        return await send(error="详细过程尚未生成")
+                    rows = list(fallback_official_rows)
+                    indexed_turn_id = cmd.turn_id
+                else:
+                    source = await asyncio.to_thread(
+                        HistorySourceFingerprint.capture, source_path)
+                    rows = await asyncio.to_thread(
+                        self._history_index.get_turn_detail,
+                        sid,
+                        "codex" if is_codex else "claude",
+                        source,
+                        indexed_turn_id,
+                    )
         except OSError:
             rows = None
         except Exception as exc:
@@ -7631,8 +7741,41 @@ class WrapperMachine:
                 error=str(exc),
             )
             rows = None
+        if rows is None and fallback_official_rows is not None:
+            # The official full-turn projection is incomplete on some app-server
+            # generations, but it is still source-authoritative for the rows it
+            # returned.  A pruned, oversized, or temporarily unavailable local
+            # rollout detail index must degrade to those rows instead of making
+            # the same retry fail forever.
+            log.warning(
+                "Codex rollout detail unavailable; using official fallback",
+                session_id=sid,
+                turn_id=cmd.turn_id,
+                indexed_turn_id=indexed_turn_id,
+            )
+            rows = list(fallback_official_rows)
+            indexed_turn_id = cmd.turn_id
         if rows is None:
             return await send(error="详细过程已过期，请刷新会话后重试")
+        if is_codex and indexed_turn_id != cmd.turn_id:
+            try:
+                rows = _rebind_turn_detail_visible_id(
+                    rows,
+                    indexed_turn_id=indexed_turn_id,
+                    visible_turn_id=cmd.turn_id,
+                )
+            except ValueError as exc:
+                log.warning(
+                    "Codex rollout detail identity binding failed",
+                    session_id=sid,
+                    turn_id=cmd.turn_id,
+                    indexed_turn_id=indexed_turn_id,
+                    error_type=type(exc).__name__,
+                )
+                if fallback_official_rows is None:
+                    return await send(
+                        error="详细过程暂时不可用，请稍后重试")
+                rows = list(fallback_official_rows)
         if is_codex:
             rows = await self._supplement_codex_history_image_views(
                 sid, cmd.turn_id, rows)

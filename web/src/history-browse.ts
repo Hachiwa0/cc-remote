@@ -528,6 +528,11 @@ export function markBrowseDetailLoading(
   loading: boolean,
   guard: HistoryBrowseScopeGuard = {},
   autoLoad?: boolean,
+  error?: string | null,
+  retry?: {
+    before: string | null;
+    direction: "initial" | "older" | "newer";
+  } | null,
 ): HistoryBrowseProjection {
   if (!guardMatches(projection, guard)) return projection;
   let changed = false;
@@ -537,12 +542,25 @@ export function markBrowseDetailLoading(
       if (turn.id !== turnId && canonicalTurnId(turn) !== turnId) return turn;
       if (!!turn.detailLoading === loading
           && (autoLoad === undefined
-            || !!turn.detailAutoLoad === autoLoad)) return turn;
+            || !!turn.detailAutoLoad === autoLoad)
+          && (error === undefined
+            || turn.detailError === (error ?? undefined))
+          && (retry === undefined
+            || (turn.detailRetryBefore === (
+              retry === null ? undefined : retry.before)
+              && turn.detailRetryDirection === (
+                retry === null ? undefined : retry.direction)))) return turn;
       changed = true;
       return {
         ...turn,
         detailLoading: loading,
         detailAutoLoad: autoLoad ?? turn.detailAutoLoad,
+        detailError: error === undefined
+          ? turn.detailError : error ?? undefined,
+        detailRetryBefore: retry === undefined
+          ? turn.detailRetryBefore : retry?.before,
+        detailRetryDirection: retry === undefined
+          ? turn.detailRetryDirection : retry?.direction,
       };
     }),
   }));

@@ -237,7 +237,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyCursor: incomingHistoryCursor = null,
   browseMode: incomingBrowseMode = false, hasNewer: incomingHasNewer = false,
   onLoadMore, onLoadNewer, onReturnLatest,
-  onLoadDetail, onEdit, onGetDiff, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
+  onLoadDetail, onEdit, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyImageAssets, onLoadHistoryImage,
@@ -333,6 +333,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const lastScrollTopRef = useRef(0);
   const renderedScrollScopeRef = useRef<string | null>(null);
   const touchYRef = useRef<number | null>(null);
+  const touchMomentumActiveRef = useRef(false);
   const touchEventClockOffsetRef = useRef<number | null>(null);
   const touchTransactionBoundaryRef =
     useRef<TouchTransactionBoundary | null>(null);
@@ -1375,6 +1376,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       );
       return;
     }
+    touchMomentumActiveRef.current = false;
     if (userScrollIntentTimerRef.current !== null) {
       window.clearTimeout(userScrollIntentTimerRef.current);
       userScrollIntentTimerRef.current = null;
@@ -1470,8 +1472,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const postTouchMomentum = movementDirection !== null
       && userScrollIntentRef.current
       && touchYRef.current === null
-      && touchOwnsHistoryAnchor
-      && currentHistoryAnchor.phase === "pending";
+      && touchMomentumActiveRef.current;
     const explicitTransactionMovement = keyedPrependResponseReady
       && currentHistoryAnchor?.phase === "applied"
       && intendedDirection !== null
@@ -1622,6 +1623,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   };
 
   const onTouchStart = (event: TouchEvent<HTMLDivElement>) => {
+    touchMomentumActiveRef.current = false;
     beginHistoryViewportLease();
     markUserScrollIntent("unknown");
     historyLoadGateRef.current.beginGesture();
@@ -1715,6 +1717,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     touchEventClockOffsetRef.current = null;
     touchYRef.current = null;
     historyLoadGateRef.current.endGesture();
+    // touchend only releases the finger. Mobile WebKit can keep scrolling for
+    // several native frames afterwards, so restart the complete idle window
+    // here instead of inheriting a timer armed by the last touchmove. Every
+    // subsequent momentum scroll extends this same lease in onScroll.
+    touchMomentumActiveRef.current = true;
+    markUserScrollIntent(userScrollDirectionRef.current ?? "unknown");
     // A page can finish while the finger is still down. Re-render after the
     // native touch ends so the retained history transaction can correct and
     // release its exact reading boundary without fighting the gesture.
@@ -2008,17 +2016,11 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     if (!changes.paths.length) return null;
     const arr = changes.paths;
     const canOpenSummary = surface !== "work"
-      ? (!!changes.diff && !!onOpenTurnDiff) || (arr.length === 1 && !!onGetDiff)
+      ? !!changes.diff && !!onOpenTurnDiff
       : (arr.length === 1 && !!onOpenFile) || !!onOpenArtifacts;
     const openSummary = () => {
       if (surface !== "work") {
-        if (changes.diff && onOpenTurnDiff) {
-          onOpenTurnDiff(arr, changes.diff);
-        } else if (arr.length === 1 && onGetDiff) {
-          // Compatibility fallback for old history without a persisted diff.
-          // It remains path-scoped and must never open the whole worktree.
-          onGetDiff(arr[0]);
-        }
+        if (changes.diff && onOpenTurnDiff) onOpenTurnDiff(arr, changes.diff);
         return;
       }
       if (arr.length === 1 && onOpenFile) {
@@ -2039,11 +2041,14 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
         <div className="turn-files-list">
           {arr.map((f) => {
             const markdown = surface !== "work" && isMarkdownPath(f) && !!onPreviewMarkdown;
-            const canOpenFile = markdown || !!onGetDiff;
+            const canOpenFile = markdown || (!!changes.diff && !!onOpenTurnDiff);
             return <button key={f} className={"turn-file-chip" + (markdown ? " markdown" : "")}
               disabled={!canOpenFile}
-              onClick={() => markdown ? onPreviewMarkdown(f) : onGetDiff?.(f)}
-              title={markdown ? `预览 ${f}` : `查看 ${f} 的 diff`}>
+              onClick={() => markdown
+                ? onPreviewMarkdown(f)
+                : onOpenTurnDiff?.(arr, changes.diff)}
+              title={markdown ? `预览 ${f}`
+                : changes.diff ? "查看本轮原生 diff" : "本轮没有可用的原生 diff"}>
               <Icon name={markdown ? "read" : "edit"} size={12} />
               {f.split("/").pop()}
               {markdown && <span className="turn-file-action">预览</span>}
@@ -2158,13 +2163,19 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             const activeProcess = hasActiveProcess(timelineBlocks);
             const finalBlocks = finalTextBlocks(t.blocks);
             const working = !t.done || activeProcess;
-            const showProcessTimeline = timelineBlocks.length > 0
-              || (!!t.detailEventCount && !t.detailLoaded);
+            const showProcessTimeline = working || timelineBlocks.length > 0
+              || (!!t.detailEventCount && !t.detailLoaded)
+              || !!t.detailError;
             const workingLabel = t.progress
               ?? (activeProcess ? "处理中"
                 : finalBlocks.length > 0 ? "回答中" : "思考中");
-            const processOpenKey = `${scrollScope}\u0000turn:${t.id}`;
+            const processDisclosureId =
+              t.clientMsgId ?? t.historyTurnId ?? t.id;
+            const processOpenKey =
+              `${scrollScope}\u0000turn:${processDisclosureId}`;
             const historyTurnId = t.historyTurnId ?? t.id;
+            const detailRetryBefore = t.detailRetryBefore;
+            const detailRetryDirection = t.detailRetryDirection;
             const historyImagesReady = !!t.imageRefs?.length
               && t.imageRefs.every((image) => (
                 historyImageAssets?.[historyImageAssetKey(
@@ -2261,9 +2272,17 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 durationMs={t.durationMs} startTs={t.ts} doneTs={t.doneTs}
                 deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
                 detailLoading={t.detailLoading}
+                detailError={t.detailError}
                 onLoadDetail={onLoadDetail
                   ? () => requestProcessDetail(
                       t.id, undefined, "initial", true)
+                  : undefined}
+                onRetryDetail={onLoadDetail && detailRetryDirection
+                  ? () => requestProcessDetail(
+                      t.id,
+                      detailRetryBefore,
+                      detailRetryDirection,
+                      detailRetryDirection === "initial")
                   : undefined}
                 canLoadEarlier={
                   !!t.detailHasMore && !!t.detailOldestCursor

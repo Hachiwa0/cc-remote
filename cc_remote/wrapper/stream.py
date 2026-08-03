@@ -1075,6 +1075,39 @@ class CompactTranscriptPage:
     oldest_cursor: str | None
 
 
+class TranscriptTimestamps(dict[str, float]):
+    """Timestamp map with exact SDK query aliases retained from JSONL.
+
+    ``claude_agent_sdk.get_session_messages()`` intentionally projects only the
+    transcript UUID and message body.  Claude Code nevertheless persists the
+    originating remote query id in ``promptId``.  Keeping that metadata on the
+    existing side-read avoids another full transcript scan while allowing a
+    History row to reconcile with the browser's live optimistic row after a
+    session switch.  It remains a normal ``dict`` for existing callers.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.client_message_ids: dict[str, str] = {}
+
+
+def _remember_transcript_client_id(
+    timestamps: TranscriptTimestamps,
+    row: dict[str, Any],
+) -> None:
+    uid = row.get("uuid")
+    prompt_id = row.get("promptId")
+    if (
+        row.get("type") == "user"
+        and isinstance(uid, str)
+        and _SAFE_WIRE_ID.fullmatch(uid)
+        and isinstance(prompt_id, str)
+        and _SAFE_WIRE_ID.fullmatch(prompt_id)
+        and prompt_id != uid
+    ):
+        timestamps.client_message_ids[uid] = prompt_id
+
+
 def _compact_visible_user(row: dict[str, Any]) -> bool:
     origin = row.get("origin")
     if (
@@ -1241,7 +1274,7 @@ def _load_compact_chain_messages(
     list[SimpleNamespace], dict[str, float], dict[str, ProcessEvent]
 ] | None:
     messages: list[SimpleNamespace] = []
-    timestamps: dict[str, float] = {}
+    timestamps = TranscriptTimestamps()
     internal_events: dict[str, ProcessEvent] = {}
     try:
         with open(source_path, "rb") as source:
@@ -1261,6 +1294,7 @@ def _load_compact_chain_messages(
                     return None
                 if row.get("uuid") != uid:
                     return None
+                _remember_transcript_client_id(timestamps, row)
                 internal = _internal_user_event_from_row(row, queued)
                 if internal is not None:
                     internal_events[uid] = internal
@@ -1299,7 +1333,7 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
     this, history events default their `ts` to now (making every past message show
     the current time — "like a clock"). Best-effort: {} if not found/readable.
     session_id is globally unique, so a glob across all project dirs locates it."""
-    out: dict[str, float] = {}
+    out = TranscriptTimestamps()
     if not _SAFE_SESSION_ID.fullmatch(session_id):
         return out
     try:
@@ -1312,6 +1346,7 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
                     d = json.loads(line)
                 except Exception:
                     continue
+                _remember_transcript_client_id(out, d)
                 uid, ts = d.get("uuid"), d.get("timestamp")
                 if not uid or not isinstance(ts, str):
                     continue
@@ -1622,8 +1657,15 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     def _ts(uid):
         return timestamps.get(uid) if timestamps else None
 
+    client_message_ids = getattr(timestamps, "client_message_ids", {})
+
     def _um(uid, prompt):
-        um = UserMsg(msg_id=uid, prompt=prompt)
+        client_msg_id = client_message_ids.get(uid)
+        um = UserMsg(
+            msg_id=uid,
+            client_msg_id=client_msg_id,
+            prompt=prompt,
+        )
         t = _ts(uid)
         if t is not None:
             um.ts = t   # question time, not load time

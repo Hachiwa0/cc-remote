@@ -263,14 +263,6 @@ def _segments(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return segments or [[]]
 
 
-def _turn_error_text(status: str) -> str | None:
-    return (
-        "Codex 本次回复未完成，请重试。"
-        if status == "failed"
-        else None
-    )
-
-
 def _translate_segment(
     thread_id: str,
     turn: dict[str, Any],
@@ -345,7 +337,7 @@ def _translate_segment(
                     "status": status,
                     "durationMs": turn.get("durationMs") or 0,
                     "error": (
-                        {"message": _turn_error_text(status)}
+                        turn.get("error")
                         if status == "failed"
                         else None
                     ),
@@ -475,6 +467,9 @@ class CodexOfficialHistory:
         ] = OrderedDict()
         self._detail_events: OrderedDict[
             tuple[str, str], tuple[dict[str, Any], ...]
+        ] = OrderedDict()
+        self._detail_sources: OrderedDict[
+            tuple[str, str], str
         ] = OrderedDict()
         self._detail_event_bytes: dict[tuple[str, str], int] = {}
         self._detail_cache_bytes = 0
@@ -888,6 +883,7 @@ class CodexOfficialHistory:
 
     def _drop_detail(self, key: tuple[str, str]) -> None:
         self._detail_events.pop(key, None)
+        self._detail_sources.pop(key, None)
         size = self._detail_event_bytes.pop(key, 0)
         self._detail_cache_bytes = max(
             0, self._detail_cache_bytes - size)
@@ -896,6 +892,7 @@ class CodexOfficialHistory:
         self,
         key: tuple[str, str],
         events: tuple[dict[str, Any], ...],
+        source: str,
     ) -> None:
         encoded_bytes = len(json.dumps(
             events,
@@ -907,6 +904,8 @@ class CodexOfficialHistory:
             return
         self._detail_events[key] = events
         self._detail_events.move_to_end(key)
+        self._detail_sources[key] = source
+        self._detail_sources.move_to_end(key)
         self._detail_event_bytes[key] = encoded_bytes
         self._detail_cache_bytes += encoded_bytes
         while (
@@ -914,6 +913,7 @@ class CodexOfficialHistory:
             or self._detail_cache_bytes > _MAX_DETAIL_CACHE_BYTES
         ):
             oldest, _events = self._detail_events.popitem(last=False)
+            self._detail_sources.pop(oldest, None)
             size = self._detail_event_bytes.pop(oldest, 0)
             self._detail_cache_bytes = max(
                 0, self._detail_cache_bytes - size)
@@ -1025,6 +1025,7 @@ class CodexOfficialHistory:
             self._detail_events.move_to_end(key)
             return cached
         locator = self._locator(thread_id, visible_turn_id)
+        detail_source = "items"
         try:
             try:
                 try:
@@ -1041,6 +1042,7 @@ class CodexOfficialHistory:
                     items = None
                 if items is None:
                     turn = await self._full_turn(thread_id, locator)
+                    detail_source = "full"
                 else:
                     # Item pages do not carry status/timing. Those values were
                     # already validated in summary and remain bound to the
@@ -1104,8 +1106,43 @@ class CodexOfficialHistory:
         if len(turns) != 1 or turns[0].get("id") != visible_turn_id:
             raise CodexHistoryInvalidResponse(
                 "Codex detail resolved another visible turn")
-        self._remember_detail(key, events)
+        self._remember_detail(key, events, detail_source)
         return events
+
+    def turn_detail_source(
+        self,
+        thread_id: str,
+        visible_turn_id: str,
+    ) -> str | None:
+        """Return whether cached detail came from item pages or a full turn.
+
+        ``thread/items/list`` is the only official API which exposes the full
+        process sequence in current app-server builds.  ``itemsView=full`` can
+        be structurally valid while omitting commands, so callers supplement
+        that source from the bounded rollout projection before presenting it as
+        complete history.
+        """
+        key = (thread_id, visible_turn_id)
+        source = self._detail_sources.get(key)
+        if source is not None:
+            self._detail_sources.move_to_end(key)
+        return source
+
+    def invalidate_thread(self, thread_id: str) -> None:
+        """Drop every generation-local cursor/cache entry for one thread."""
+        for mapping in (
+            self._before_cursors,
+            self._locators,
+            self._summary_events,
+            self._native_full_turns,
+            self._terminal_refresh_fallbacks,
+        ):
+            for key in tuple(mapping):
+                if key[0] == thread_id:
+                    mapping.pop(key, None)
+        for key in tuple(self._detail_events):
+            if key[0] == thread_id:
+                self._drop_detail(key)
 
     def rollout_fallback(
         self,

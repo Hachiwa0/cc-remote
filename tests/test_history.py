@@ -15,6 +15,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -52,9 +54,107 @@ from cc_remote.wrapper.stream import (
     last_assistant_model,
     transcript_compact_main_chain,
     transcript_internal_user_events,
+    transcript_timestamps,
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def test_claude_sdk_prompt_id_survives_history_as_exact_client_alias(
+    monkeypatch, tmp_path,
+):
+    """Switch-back History must reconcile one SDK prompt with its live row.
+
+    Claude stores the transcript UUID as ``uuid`` and the browser query id as
+    ``promptId``.  The SDK's SessionMessage projection drops promptId, so the
+    timestamp side read is also the source of this exact, non-textual alias.
+    """
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    transcript_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "user",
+        "uuid": transcript_id,
+        "promptId": client_id,
+        "promptSource": "sdk",
+        "timestamp": "2026-08-02T09:09:16.263Z",
+        "message": {
+            "role": "user",
+            "content": "我又改完了一版，你看看还有没得问题？",
+        },
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _session_id: str(transcript),
+    )
+
+    timestamps = transcript_timestamps(session_id)
+    events = translate_history([
+        SimpleNamespace(
+            type="user",
+            uuid=transcript_id,
+            session_id=session_id,
+            message={
+                "role": "user",
+                "content": "我又改完了一版，你看看还有没得问题？",
+            },
+            parent_tool_use_id=None,
+        ),
+    ], 10_000, timestamps=timestamps)
+
+    user = next(event for event in events if isinstance(event, UserMsg))
+    assert user.msg_id == transcript_id
+    assert user.client_msg_id == client_id
+
+
+def test_claude_repeated_prompt_text_keeps_distinct_prompt_identities(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    transcript_ids = [
+        "2259073b-7676-455f-b7b0-b9b3892dbe93",
+        "3259073b-7676-455f-b7b0-b9b3892dbe93",
+    ]
+    client_ids = [
+        "6b09ee37-f861-4422-b98a-21f509c951b0",
+        "7b09ee37-f861-4422-b98a-21f509c951b0",
+    ]
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("".join(
+        json.dumps({
+            "type": "user",
+            "uuid": transcript_id,
+            "promptId": client_id,
+            "promptSource": "sdk",
+            "timestamp": f"2026-08-02T09:09:{16 + index:02d}.263Z",
+            "message": {"role": "user", "content": "继续"},
+        }) + "\n"
+        for index, (transcript_id, client_id) in enumerate(zip(
+            transcript_ids, client_ids, strict=True))
+    ), encoding="utf-8")
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _session_id: str(transcript),
+    )
+    messages = [
+        SimpleNamespace(
+            type="user",
+            uuid=transcript_id,
+            session_id=session_id,
+            message={"role": "user", "content": "继续"},
+            parent_tool_use_id=None,
+        )
+        for transcript_id in transcript_ids
+    ]
+
+    users = [
+        event for event in translate_history(
+            messages, 10_000, timestamps=transcript_timestamps(session_id))
+        if isinstance(event, UserMsg)
+    ]
+    assert [(user.msg_id, user.client_msg_id) for user in users] == list(zip(
+        transcript_ids, client_ids, strict=True))
 
 
 def test_codex_image_view_supplement_keeps_official_detail_and_deduplicates():
@@ -705,6 +805,306 @@ def test_codex_turn_detail_uses_official_items_without_history_index(
     asyncio.run(run())
 
 
+def test_codex_full_turn_detail_uses_exact_rollout_steer_segment(
+    monkeypatch, tmp_path,
+):
+    """A fresh browser must receive tools omitted by itemsView=full.
+
+    Three visible prompts can share one native Codex turn after steering.  The
+    rollout fallback must use the official locator's segment index rather than
+    taking the first row with the shared forkPointId.
+    """
+    sid = "fresh-browser-steered-detail"
+    native_turn_id = "native-task-with-three-segments"
+    rollout = tmp_path / "fresh-browser-steered-detail.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"fresh-browser-steered-detail"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    official_rows = (
+        UserMsg(
+            sid=sid, msg_id="official-user-second", prompt="second steer",
+        ).model_dump(mode="json"),
+        AssistantMsgStart(
+            sid=sid, message_id="official-final", channel="final",
+        ).model_dump(mode="json"),
+        Delta(
+            sid=sid, message_id="official-final", channel="final",
+            text="done",
+        ).model_dump(mode="json"),
+        AssistantMsgEnd(
+            sid=sid, message_id="official-final", channel="final",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid=sid, turn_id=native_turn_id,
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class OfficialHistory:
+        async def turn_events(self, _sid, _turn_id):
+            return official_rows
+
+        def turn_detail_source(self, _sid, _turn_id):
+            return "full"
+
+        def rollout_fallback(self, _sid, _turn_id):
+            return SimpleNamespace(
+                before=None,
+                limit=4,
+                native_turn_id=native_turn_id,
+                segment_index=1,
+                segment_count=3,
+            )
+
+    selected_ids = []
+
+    class DetailIndex:
+        def get_turn_detail(
+            self, _sid, _engine, _source, turn_id,
+        ):
+            selected_ids.append(turn_id)
+            return (
+                UserMsg(
+                    sid=sid, msg_id=turn_id, prompt="second steer",
+                ).model_dump(mode="json"),
+                ProcessEvent(
+                    sid=sid,
+                    item_id="second-segment-command",
+                    kind="command",
+                    phase="end",
+                    status="succeeded",
+                    title="运行命令",
+                ).model_dump(mode="json"),
+                TurnEnd(
+                    sid=sid, turn_id=native_turn_id,
+                    result=TurnResult(
+                        subtype="success", duration_ms=1, is_error=False),
+                ).model_dump(mode="json"),
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = OfficialHistory()
+        machine._history_index = DetailIndex()
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        async def build_history(_sid, **_kwargs):
+            return History(
+                session_id=sid,
+                revision=machine._history_revision(sid),
+                detail="summary",
+                turns=[
+                    {
+                        "id": "rollout-user-first",
+                        "prompt": "first",
+                        "blocks": [],
+                        "done": True,
+                        "forkPointId": native_turn_id,
+                        "detailEventCount": 1,
+                        "detailLoaded": False,
+                    },
+                    {
+                        "id": "rollout-user-second",
+                        "prompt": "second steer",
+                        "blocks": [],
+                        "done": True,
+                        "forkPointId": native_turn_id,
+                        "detailEventCount": 1,
+                        "detailLoaded": False,
+                    },
+                    {
+                        "id": "rollout-user-third",
+                        "prompt": "third steer",
+                        "blocks": [],
+                        "done": True,
+                        "forkPointId": native_turn_id,
+                        "detailEventCount": 1,
+                        "detailLoaded": False,
+                    },
+                ],
+            )
+
+        async def no_image_supplement(_sid, _turn_id, rows, **_kwargs):
+            return list(rows)
+
+        machine._build_history = build_history
+        machine._supplement_codex_history_image_views = no_image_supplement
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=sid,
+            turn_id="official-user-second",
+            client_id="fresh-browser",
+            revision=machine._history_revision(sid),
+            before=None,
+            limit=192,
+        ))
+
+        assert selected_ids == ["rollout-user-second"]
+        assert any(
+            event.get("item_id") == "second-segment-command"
+            for event in detail.events
+        )
+        assert not any(
+            event.get("message_id") == "official-final"
+            for event in detail.events
+        )
+        projected = materialize_history_turns(detail.events)
+        assert len(projected) == 1
+        assert projected[0]["id"] == "official-user-second"
+        assert projected[0]["prompt"] == "second steer"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "local_detail_state",
+    ["missing-entry", "missing-index", "missing-rollout"],
+)
+def test_codex_full_turn_detail_uses_official_rows_when_local_detail_misses(
+    monkeypatch, tmp_path, local_detail_state,
+):
+    sid = "official-detail-index-miss"
+    native_turn_id = "native-index-miss"
+    rollout = tmp_path / "official-detail-index-miss.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"official-detail-index-miss"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mm,
+        "codex_rollout_path",
+        lambda _sid: (
+            None if local_detail_state == "missing-rollout" else str(rollout)
+        ),
+    )
+    official_rows = (
+        UserMsg(
+            sid=sid, msg_id="official-user", prompt="inspect",
+        ).model_dump(mode="json"),
+        AssistantMsgStart(
+            sid=sid, message_id="official-final", channel="final",
+        ).model_dump(mode="json"),
+        Delta(
+            sid=sid, message_id="official-final", channel="final", text="done",
+        ).model_dump(mode="json"),
+        AssistantMsgEnd(
+            sid=sid, message_id="official-final", channel="final",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid=sid, turn_id=native_turn_id,
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class OfficialHistory:
+        async def turn_events(self, _sid, _turn_id):
+            return official_rows
+
+        def turn_detail_source(self, _sid, _turn_id):
+            return "full"
+
+        def rollout_fallback(self, _sid, _turn_id):
+            return SimpleNamespace(
+                before=None,
+                limit=4,
+                native_turn_id=native_turn_id,
+                segment_index=0,
+                segment_count=1,
+            )
+
+    class MissingDetailIndex:
+        def get_turn_detail(self, *_args):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = OfficialHistory()
+        machine._history_index = (
+            None
+            if local_detail_state == "missing-index"
+            else MissingDetailIndex()
+        )
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        async def build_history(_sid, **_kwargs):
+            return History(
+                session_id=sid,
+                revision=machine._history_revision(sid),
+                detail="summary",
+                turns=[{
+                    "id": "rollout-user",
+                    "prompt": "inspect",
+                    "blocks": [],
+                    "done": True,
+                    "forkPointId": native_turn_id,
+                    "detailEventCount": 5,
+                    "detailLoaded": False,
+                }],
+            )
+
+        async def no_image_supplement(_sid, _turn_id, rows, **_kwargs):
+            return list(rows)
+
+        machine._build_history = build_history
+        machine._supplement_codex_history_image_views = no_image_supplement
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=sid,
+            turn_id="official-user",
+            client_id="fresh-browser",
+            revision=machine._history_revision(sid),
+            before=None,
+            limit=192,
+        ))
+
+        assert detail.authoritative is True
+        assert detail.error is None
+        assert any(
+            event.get("message_id") == "official-final"
+            for event in detail.events
+        )
+        assert materialize_history_turns(detail.events)[0]["id"] == (
+            "official-user"
+        )
+
+    asyncio.run(run())
+
+
+def test_codex_turn_detail_identity_rebind_rejects_another_segment():
+    rows = (
+        UserMsg(
+            sid="identity-guard",
+            msg_id="rollout-user-other",
+            prompt="another steer",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="identity-guard",
+            turn_id="native-shared-turn",
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    try:
+        mm._rebind_turn_detail_visible_id(
+            rows,
+            indexed_turn_id="rollout-user-target",
+            visible_turn_id="official-user-target",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unrelated rollout segment was rebound")
+
+    assert rows[0]["msg_id"] == "rollout-user-other"
+
+
 def test_protocol_v21_get_history_and_materialized_summary_roundtrip():
     gh = GetHistory(
         session_id="s1", client_id="c1", limit=50, detail="summary")
@@ -943,6 +1343,29 @@ def test_materialized_summary_never_exposes_bare_error_sentinel():
         }},
     ))
     assert turns[0]["error"] == "该轮未正常结束"
+
+
+def test_materialized_summary_never_exposes_untrusted_error_text():
+    turns = materialize_history_turns((
+        {"type": "user_msg", "msg_id": "message-private", "prompt": "go"},
+        {"type": "error", "message":
+         "provider crash at /private/token; Authorization: Bearer secret"},
+        {"type": "turn_end", "turn_id": "turn-private", "result": {
+            "subtype": "error", "is_error": True, "duration_ms": 0,
+        }},
+    ))
+
+    assert turns[0]["error"] == "该轮未正常结束"
+    assert "/private/token" not in json.dumps(turns, ensure_ascii=False)
+
+    safe = materialize_history_turns((
+        {"type": "user_msg", "msg_id": "message-network", "prompt": "go"},
+        {"type": "error", "message": "网络连接异常，请检查网络后重试。"},
+        {"type": "turn_end", "turn_id": "turn-network", "result": {
+            "subtype": "error", "is_error": True, "duration_ms": 0,
+        }},
+    ))
+    assert safe[0]["error"] == "网络连接异常，请检查网络后重试。"
     detail = TurnDetail(
         session_id="s1", turn_id="u1", revision="test-revision",
         events=[{"type": "user_msg", "msg_id": "u1", "prompt": "hello"}],

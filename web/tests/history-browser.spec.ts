@@ -960,8 +960,11 @@ test("one click loads every turn-detail page without collapsing or jumping", asy
     "/tests/history-browser.html?detail-paging=1&delay=80&growth-delay=180",
   );
   const header = page.locator(".turn-process-head");
+  await expect(header).toHaveAttribute("aria-expanded", "false");
   const initialStart = await processDetailEdge(page, "start");
   await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByText("正在加载过程…")).toBeVisible();
   await expect(page.locator(".thread"))
     .toHaveAttribute("data-detail-anchor-active", "true");
   await expect(page.getByText("较新命令 1")).toBeVisible();
@@ -975,6 +978,69 @@ test("one click loads every turn-detail page without collapsing or jumping", asy
     .toBeLessThan(2);
   await expect(page.locator(".thread"))
     .toHaveAttribute("data-detail-anchor-active", "false");
+});
+
+test("a loading process can collapse and reopen without issuing a duplicate read", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&delay=500&growth-delay=180",
+  );
+  const header = page.locator(".turn-process-head");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(header).toHaveAttribute("aria-busy", "true");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  expect(await page.evaluate(
+    () => document.documentElement.dataset.detailRequests,
+  )).toBe("1");
+});
+
+test("a failed process detail stays open and retries in place", async ({ page }) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&detail-error-once=1"
+      + "&delay=30&growth-delay=30",
+  );
+  const header = page.locator(".turn-process-head");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByRole("alert")).toContainText(
+    "详细过程暂时不可用，请稍后重试",
+  );
+  await page.getByRole("button", { name: "重试" }).click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(header).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByText("较新命令 1")).toBeVisible();
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+});
+
+test("a failed older process page retries the exact cursor in place", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&detail-older-error-once=1"
+      + "&delay=30&growth-delay=10000",
+  );
+  const header = page.locator(".turn-process-head");
+  await header.click();
+  await expect(page.getByText("较新命令 1")).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText(
+    "详细过程暂时不可用，请稍后重试",
+  );
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.detailLastBefore,
+  )).toBe("detail-older");
+  await page.getByRole("button", { name: "重试" }).click();
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.detailRequests,
+  )).toBe("3");
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.detailLastBefore,
+  )).toBe("detail-older");
 });
 
 test("retained truncated process still fetches its authoritative first detail page", async ({
@@ -2644,6 +2710,127 @@ async function assertCodexBurstNeverPaintsAboveTail(
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 }
+
+test("multi-line IME growth stays pinned during a Codex tool burst", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?codex-live-burst=1&composer-live=1",
+  );
+  const result = await page.evaluate(async () => {
+    const thread = document.querySelector<HTMLElement>(".thread");
+    const input = document.querySelector<HTMLTextAreaElement>(
+      '[data-testid="live-composer-shell"] textarea',
+    );
+    const start = document.querySelector<HTMLButtonElement>(
+      '[data-testid="start-codex-burst"]',
+    );
+    if (!thread || !input || !start) {
+      throw new Error("live composer fixture is incomplete");
+    }
+    const frame = () => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+    thread.scrollTop = thread.scrollHeight;
+    await frame();
+    await frame();
+
+    const distances: number[] = [];
+    let typed = false;
+    let terminalFrames = 0;
+    const monitor = new Promise<void>((resolve) => {
+      const sample = () => {
+        distances.push(Math.max(
+          0,
+          thread.scrollHeight - thread.scrollTop - thread.clientHeight,
+        ));
+        if (typed && document.documentElement.dataset.codexBurst === "done") {
+          terminalFrames += 1;
+          if (terminalFrames >= 6) {
+            resolve();
+            return;
+          }
+        }
+        requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+
+    const setValue = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype, "value",
+    )?.set;
+    if (!setValue) throw new Error("textarea value setter is unavailable");
+    const values = Array.from(
+      { length: 5 },
+      (_, index) => Array.from(
+        { length: index + 1 },
+        (__, line) => `第 ${line + 1} 行拼音输入内容用于验证输入框稳定`,
+      ).join("\n"),
+    );
+    const heights: number[] = [input.getBoundingClientRect().height];
+    input.focus();
+    input.dispatchEvent(new CompositionEvent("compositionstart", {
+      bubbles: true,
+      data: "",
+    }));
+    start.click();
+    for (const value of values) {
+      setValue.call(input, value);
+      input.dispatchEvent(new CompositionEvent("compositionupdate", {
+        bubbles: true,
+        data: value,
+      }));
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        data: value,
+        inputType: "insertCompositionText",
+      }));
+      await frame();
+      await frame();
+      heights.push(input.getBoundingClientRect().height);
+    }
+    input.dispatchEvent(new CompositionEvent("compositionend", {
+      bubbles: true,
+      data: values.at(-1),
+    }));
+    typed = true;
+    await monitor;
+    return {
+      heights,
+      worstDistance: Math.max(0, ...distances),
+    };
+  });
+
+  expect(result.heights.at(-1)).toBeGreaterThan(result.heights[0]);
+  expect(result.heights.at(-1)).toBeLessThanOrEqual(133);
+  expect(result.worstDistance).toBeLessThanOrEqual(2);
+});
+
+test("multi-line composer growth does not move a history reader", async ({
+  page,
+}, testInfo) => {
+  await page.goto(
+    "/tests/history-browser.html?codex-live-burst=1&composer-live=1",
+  );
+  await wheelUntilTurn(
+    page, "burst-history-1", -2_000, testInfo.project.name,
+  );
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+  await page.locator(
+    '[data-testid="live-composer-shell"] textarea',
+  ).fill([
+    "第一行输入",
+    "第二行输入",
+    "第三行输入",
+    "第四行输入",
+    "第五行输入",
+  ].join("\n"));
+  await page.waitForTimeout(120);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+});
 
 test("composer action growth keeps the live tail visible without stealing history", async ({
   page,

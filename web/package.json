@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/check-bundle-budget.mjs",
     "lint": "oxlint",
     "test:compile": "tsc -p tsconfig.tests.json",
     "test:outbox": "npm run test:compile --silent && node node_modules/.tmp/cc-remote-tests/tests/outbox.test.js",

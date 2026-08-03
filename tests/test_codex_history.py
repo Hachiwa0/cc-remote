@@ -63,6 +63,7 @@ def _turn(
     started_at: int = 100,
     completed_at: int | None = 102,
     duration_ms: int | None = 2000,
+    error: dict | None = None,
 ) -> dict:
     return {
         "id": turn_id,
@@ -73,7 +74,7 @@ def _turn(
         "completedAt": completed_at,
         "durationMs": duration_ms,
         "error": (
-            {"message": "provider detail"}
+            error or {"message": "provider detail"}
             if status == "failed"
             else None
         ),
@@ -284,6 +285,38 @@ def test_summary_page_is_chronological_and_preserves_native_identity():
         assert page.has_more is True
         assert page.turns[0]["blocks"][-1]["text"] == "old answer"
         assert page.turns[0]["detailEventCount"] >= 1
+
+    asyncio.run(run())
+
+
+def test_failed_network_summary_keeps_specific_safe_product_copy():
+    async def rpc(_method, _params, cwd=None):
+        assert cwd is None
+        return {
+            "data": [_turn(
+                "native-network",
+                [_user("user-network", "continue"),
+                 _agent("answer-network", "partial answer")],
+                status="failed",
+                error={
+                    "message": "stream disconnected before completion: "
+                               "error sending request for url "
+                               "https://chatgpt.com/backend-api/codex/responses",
+                    "codexErrorInfo": "other",
+                },
+            )],
+            "nextCursor": None,
+        }
+
+    async def run():
+        page = await CodexOfficialHistory(
+            64 * 1024, rpc=rpc,
+        ).summary_page("thread-network", before=None, limit=1)
+
+        assert page.turns[0]["error"] == (
+            "网络连接异常，请检查网络后重试。"
+        )
+        assert "chatgpt.com" not in page.turns[0]["error"]
 
     asyncio.run(run())
 
@@ -1273,12 +1306,58 @@ def test_detail_falls_back_from_items_list_to_exact_full_turn():
             "thread-1", "user-target")
         assert events[0]["msg_id"] == "user-target"
         assert events[-1]["turn_id"] == "native-target"
+        assert history.turn_detail_source(
+            "thread-1", "user-target") == "full"
         assert [method for method, _params in calls] == [
             "thread/turns/list",
             "thread/items/list",
             "thread/turns/list",
             "thread/turns/list",
         ]
+
+    asyncio.run(run())
+
+
+def test_detail_items_list_is_recorded_as_complete_official_source():
+    async def rpc(method, params, cwd=None):
+        if method == "thread/turns/list":
+            return {
+                "data": [_turn(
+                    "native-1",
+                    [_user("user-1", "inspect"), _agent("a-1", "done")],
+                )],
+                "nextCursor": None,
+            }
+        assert method == "thread/items/list"
+        return {
+            "data": [
+                {"turnId": "native-1", "item": item}
+                for item in [
+                    _user("user-1", "inspect"),
+                    {
+                        "type": "commandExecution",
+                        "id": "command-1",
+                        "command": "pwd",
+                        "commandActions": [],
+                        "cwd": "/repo",
+                        "status": "completed",
+                        "aggregatedOutput": "/repo\n",
+                        "exitCode": 0,
+                        "durationMs": 12,
+                    },
+                    _agent("a-1", "done"),
+                ]
+            ],
+            "nextCursor": None,
+        }
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        await history.summary_page("thread-1", before=None, limit=1)
+        await history.turn_events("thread-1", "user-1")
+        assert history.turn_detail_source("thread-1", "user-1") == "items"
+        history.invalidate_thread("thread-1")
+        assert history.turn_detail_source("thread-1", "user-1") is None
 
     asyncio.run(run())
 

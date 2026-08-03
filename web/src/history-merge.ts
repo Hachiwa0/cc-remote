@@ -239,13 +239,54 @@ export function mergeDetailWithLiveTail(
     && (block.item_id === "__cc_remote_earlier_process_omitted__"
       || block.item_id === "__cc_remote_detail_projection_capped__")
   );
-  return mergeBlocks(
-    detail.filter(withoutOldOmissionMarker),
-    live.filter(withoutOldOmissionMarker),
+  const filteredDetail = detail.filter(withoutOldOmissionMarker);
+  const filteredLive = live.filter(withoutOldOmissionMarker);
+  const merged = mergeBlocks(
+    filteredDetail,
+    filteredLive,
     true,
     preferCompletedDetailPayload,
     false,
   );
+
+  const identity = (block: Block): string => block.kind === "text"
+    ? `text:${block.message_id}`
+    : block.kind === "tool"
+      ? `tool:${block.tool_use_id}`
+      : `process:${block.item_id}`;
+  const liveIdentities = filteredLive.map(identity);
+  const liveIds = new Set(liveIdentities);
+  const detailIdentities = filteredDetail.map(identity);
+  const liveOrders = filteredLive.map((block) => block.liveOrder);
+  const hasAuthoritativeLiveOrder = liveOrders.every(
+    (order): order is number => Number.isFinite(order),
+  )
+    && new Set(liveOrders).size === liveOrders.length
+    && liveIds.size === liveIdentities.length
+    && new Set(detailIdentities).size === detailIdentities.length;
+  // Official Codex full/summary views can omit command/tool items while the
+  // browser has already observed the complete interleaved live sequence. When
+  // the source page is a subset of that live sequence, its array order is not a
+  // chronology authority: using it first moves every missing tool behind the
+  // commentary. Keep the source payload merge above, but paint in the complete
+  // live order. A genuine source superset (normal paged detail + live tail)
+  // retains its source order and simply appends the new tail as before.
+  if (filteredLive.length > 0
+      && hasAuthoritativeLiveOrder
+      && detailIdentities.every((key) => liveIds.has(key))) {
+    const byId = new Map(merged.map((block) => [identity(block), block]));
+    const ordered = [...filteredLive]
+      .sort((left, right) => left.liveOrder! - right.liveOrder!)
+      .flatMap((block) => {
+      const key = identity(block);
+      const resolved = byId.get(key);
+      if (!resolved) return [];
+      byId.delete(key);
+      return [resolved];
+      });
+    return [...ordered, ...byId.values()];
+  }
+  return merged;
 }
 
 type TurnIdentity = Pick<
@@ -364,7 +405,6 @@ function cloneDetailBlock(block: Block): Block {
 function installCachedDetailRestore(
   summary: Turn,
   cached: Turn,
-  reveal: boolean,
 ): Turn {
   if (!summary.done || !cached.done || summary.detailLoaded
       || summary.detailProjection
@@ -377,6 +417,9 @@ function installCachedDetailRestore(
     ...summary,
     detailLoaded: false,
     detailLoading: false,
+    detailError: undefined,
+    detailRetryBefore: undefined,
+    detailRetryDirection: undefined,
     detailProjection: {
       // Empty segments distinguish instant-paint cache from authoritative
       // cursor pages. installTurnDetailProjectionPage then replaces this
@@ -394,12 +437,12 @@ function installCachedDetailRestore(
     detailHasNewer: false,
     detailNewerCursor: null,
     detailAutoLoad: false,
-    detailRestorePending: reveal,
+    // Cache paint is already useful and remains explicitly provisional. Do not
+    // turn entering a completed session into a background detail fetch or an
+    // automatic disclosure; the user's first click requests the canonical page.
+    detailRestorePending: false,
     detailRestoreIncomplete: false,
-    // Automatically recreating thousands of DOM rows would defeat the instant
-    // cache paint. Small latest-turn process is reopened to preserve the live
-    // 1..N reading experience; large projections remain one tap away.
-    detailRestoreOpen: reveal && blocks.length <= 256,
+    detailRestoreOpen: false,
   };
 }
 
@@ -415,16 +458,40 @@ export function restoreObservedLiveTurnDetails(
   summaries: Turn[],
   observedTurns: readonly Turn[],
 ): Turn[] {
+  const observedMatches = new Array<number>(summaries.length).fill(-1);
   const usedObserved = new Set<number>();
+  const reserveMatches = (
+    predicate: (summary: Turn, observed: Turn) => boolean,
+  ) => {
+    // A steered Codex task owns several visible user segments which all share
+    // one forkPointId. Reserve exact per-segment identities across the complete
+    // suffix before that native-task compatibility alias can claim any row.
+    // Match newest-to-newest so a legacy projection without exact user ids
+    // still preserves the narrative segment order.
+    for (let summaryIndex = summaries.length - 1; summaryIndex >= 0;
+      summaryIndex -= 1) {
+      if (observedMatches[summaryIndex] >= 0) continue;
+      for (let observedIndex = observedTurns.length - 1;
+        observedIndex >= 0; observedIndex -= 1) {
+        if (usedObserved.has(observedIndex)
+            || !predicate(summaries[summaryIndex], observedTurns[observedIndex])) {
+          continue;
+        }
+        observedMatches[summaryIndex] = observedIndex;
+        usedObserved.add(observedIndex);
+        break;
+      }
+    }
+  };
+  reserveMatches(sharesExactTurnAlias);
+  reserveMatches(sameTurnIdentity);
+
   const restored = [...summaries];
-  let revealNewest = true;
   for (let summaryIndex = restored.length - 1; summaryIndex >= 0;
     summaryIndex -= 1) {
     const summary = restored[summaryIndex];
-    const observedIndex = observedTurns.findIndex((candidate, index) =>
-      !usedObserved.has(index) && sameTurnIdentity(summary, candidate));
+    const observedIndex = observedMatches[summaryIndex];
     if (observedIndex < 0) continue;
-    usedObserved.add(observedIndex);
     const observed = observedTurns[observedIndex];
     if (!summary.done || !observed.done || summary.detailLoaded
         || summary.detailProjection) continue;
@@ -446,6 +513,7 @@ export function restoreObservedLiveTurnDetails(
       ...summary,
       detailLoaded: false,
       detailLoading: false,
+      detailError: undefined,
       detailProjection: {
         segments: [],
         blocks,
@@ -462,9 +530,8 @@ export function restoreObservedLiveTurnDetails(
       detailAutoLoad: false,
       detailRestorePending: false,
       detailRestoreIncomplete: false,
-      detailRestoreOpen: revealNewest && blocks.length <= 256,
+      detailRestoreOpen: false,
     };
-    revealNewest = false;
   }
   return restored;
 }
@@ -478,17 +545,30 @@ export function restoreCachedTurnDetails(
   const matches = new Array<number>(summaries.length).fill(-1);
   const usedCached = new Set<number>();
 
-  // Reserve every authoritative identity before considering the timestamp
-  // compatibility fallback. Otherwise a nearby repeated prompt can consume a
-  // cache row which belongs exactly to another summary.
-  for (let summaryIndex = 0; summaryIndex < summaries.length; summaryIndex += 1) {
-    const cachedIndex = cachedTurns.findIndex((candidate, index) =>
-      !usedCached.has(index)
-      && sameTurnIdentity(summaries[summaryIndex], candidate));
-    if (cachedIndex < 0) continue;
-    matches[summaryIndex] = cachedIndex;
-    usedCached.add(cachedIndex);
-  }
+  const reserveMatches = (
+    predicate: (summary: Turn, cached: Turn) => boolean,
+  ) => {
+    for (let summaryIndex = summaries.length - 1; summaryIndex >= 0;
+      summaryIndex -= 1) {
+      if (matches[summaryIndex] >= 0) continue;
+      for (let cachedIndex = cachedTurns.length - 1;
+        cachedIndex >= 0; cachedIndex -= 1) {
+        if (usedCached.has(cachedIndex)
+            || !predicate(summaries[summaryIndex], cachedTurns[cachedIndex])) {
+          continue;
+        }
+        matches[summaryIndex] = cachedIndex;
+        usedCached.add(cachedIndex);
+        break;
+      }
+    }
+  };
+  // A steered native task gives every visible segment the same forkPointId.
+  // Reserve exact user/client identities for the full suffix before using that
+  // broad compatibility alias, otherwise one segment can consume another's
+  // cached process and make the original tools appear to vanish.
+  reserveMatches(sharesExactTurnAlias);
+  reserveMatches(sameTurnIdentity);
 
   // Older optimistic caches may legitimately have a different id. Keep that
   // compatibility one-to-one and choose the closest timestamp so repeated
@@ -513,7 +593,6 @@ export function restoreCachedTurnDetails(
     usedCached.add(bestIndex);
   }
 
-  let revealNewest = true;
   const restored = [...summaries];
   for (let summaryIndex = restored.length - 1; summaryIndex >= 0;
     summaryIndex -= 1) {
@@ -521,8 +600,7 @@ export function restoreCachedTurnDetails(
     if (cachedIndex < 0) continue;
     const summary = restored[summaryIndex];
     const installed = installCachedDetailRestore(
-      summary, cachedTurns[cachedIndex], revealNewest);
-    if (installed !== summary) revealNewest = false;
+      summary, cachedTurns[cachedIndex]);
     restored[summaryIndex] = installed;
   }
   return restored;
@@ -578,6 +656,7 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     detailLoaded: !!detailProjection
       || !!live.detailLoaded || !!history.detailLoaded,
     detailLoading: live.detailLoading ?? history.detailLoading,
+    detailError: live.detailError ?? history.detailError,
     detailHasMore: detailProjection
       ? detailProjection.hasMore
       : live.detailHasMore ?? history.detailHasMore,
@@ -624,6 +703,9 @@ export function mergeAuthoritativeTurnDetail(
     detailEventCount: summary.detailEventCount,
     detailLoaded: detail.detailLoaded ?? true,
     detailLoading: false,
+    detailError: undefined,
+    detailRetryBefore: undefined,
+    detailRetryDirection: undefined,
     detailProjection: detail.detailProjection ?? summary.detailProjection,
     detailHasMore: detail.detailProjection
       ? detail.detailProjection.hasMore
@@ -745,6 +827,9 @@ export function installAuthoritativeTurnDetailPage(
     detailEventCount: summary.detailEventCount,
     detailLoaded: !restoreIncomplete,
     detailLoading: false,
+    detailError: undefined,
+    detailRetryBefore: undefined,
+    detailRetryDirection: undefined,
     detailProjection,
     detailHasMore: hasMore,
     detailOldestCursor: oldestCursor,

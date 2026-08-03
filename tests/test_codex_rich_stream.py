@@ -240,6 +240,101 @@ def test_codex_plan_command_file_diff_and_delta_metadata():
     assert patch_use.input["file_paths"] == ["/repo/a.py"]
 
 
+def test_codex_file_update_schema_keeps_native_hunks_and_never_invents_update():
+    update = {
+        "path": "/repo/old.py",
+        "kind": {"type": "update", "move_path": "/repo/new.py"},
+        "diff": "@@ -1 +1 @@\n-old\n+new",
+    }
+    descriptors = codex_stream_module._change_descriptors([update])
+    assert descriptors == [{
+        "path": "/repo/old.py",
+        "kind": "update",
+        "move_path": "/repo/new.py",
+    }]
+    assert codex_stream_module._descriptor_paths(descriptors) == [
+        "/repo/old.py", "/repo/new.py",
+    ]
+    diff = codex_stream_module._changes_diff([update])
+    assert diff.startswith("--- /repo/old.py\n+++ /repo/new.py\n@@")
+
+    # An update with only the resulting file body has no before-image. Treating
+    # it as an add paints the entire file green and attributes current worktree
+    # state to a historical turn.
+    assert codex_stream_module._changes_diff([{
+        "path": "/repo/existing.py",
+        "kind": {"type": "update"},
+        "content": "whole resulting file\n",
+    }]) == ""
+
+    added = codex_stream_module._changes_diff({
+        "/repo/new.txt": {"type": "add", "content": "one\n"},
+    })
+    assert added.startswith("--- /dev/null\n+++ /repo/new.txt\n@@")
+    deleted = codex_stream_module._changes_diff({
+        "/repo/old.txt": {"type": "delete", "content": "one\n"},
+    })
+    assert deleted.startswith("--- /repo/old.txt\n+++ /dev/null\n@@")
+
+
+def test_codex_file_patch_snapshot_stops_appending_after_rewrite():
+    translator = CodexStreamTranslator(32_000)
+    events = _feed(translator, [{
+        "method": "item/started",
+        "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "item": {
+                "type": "fileChange", "id": "patch-rewrite",
+                "status": "inProgress", "changes": [],
+            },
+        },
+    }])
+    assert not [event for event in events if isinstance(event, ToolDelta)]
+
+    def patch(diff: str) -> list:
+        return _feed(translator, [{
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "patch-rewrite",
+                "changes": [{
+                    "path": "/repo/a.py",
+                    "kind": {"type": "update"},
+                    "diff": diff,
+                }],
+            },
+        }])
+
+    first = patch("@@ -1 +1 @@\n-old\n+first")
+    cleared = patch("")
+    rewritten = patch("@@ -1 +1 @@\n-old\n+second")
+    extended = patch("@@ -1 +1,2 @@\n-old\n+second\n+third")
+    assert len([event for event in first if isinstance(event, ToolDelta)]) == 1
+    assert not [event for event in cleared if isinstance(event, ToolDelta)]
+    assert not [event for event in rewritten if isinstance(event, ToolDelta)]
+    assert not [event for event in extended if isinstance(event, ToolDelta)]
+
+    completed = _feed(translator, [{
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "item": {
+                "type": "fileChange", "id": "patch-rewrite",
+                "status": "completed",
+                "changes": [{
+                    "path": "/repo/a.py",
+                    "kind": {"type": "update"},
+                    "diff": "@@ -1 +1,2 @@\n-old\n+second\n+third",
+                }],
+            },
+        },
+    }])
+    result = next(event for event in completed if isinstance(event, ToolResult))
+    assert result.diff
+    assert "+second\n+third" in result.diff
+    assert "+first" not in result.diff
+
+
 def test_codex_live_append_streams_have_cumulative_and_event_budgets():
     translator = CodexStreamTranslator(10_000)
     output_events = _feed(translator, [

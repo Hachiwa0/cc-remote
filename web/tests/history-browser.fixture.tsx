@@ -55,6 +55,8 @@ import { DirPicker } from "../src/components/DirPicker";
 import { HeaderMenu } from "../src/components/HeaderMenu";
 import { UsageActivitySheet } from "../src/components/UsageActivitySheet";
 import { displayHistoryProjection } from "../src/history-recovery";
+import { Composer } from "../src/components/Composer";
+import { ComposerDraftStore } from "../src/composer-drafts";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -733,6 +735,8 @@ function codexBurstInitialState(): AppState {
 }
 
 function CodexLiveBurstFixture() {
+  const params = useMemo(() => new URLSearchParams(window.location.search), []);
+  const composerLive = params.has("composer-live");
   const [state, dispatch] = useReducer(
     reduce,
     undefined,
@@ -741,6 +745,7 @@ function CodexLiveBurstFixture() {
   const runningRef = useRef(false);
   const timersRef = useRef<number[]>([]);
   const sequenceRef = useRef(0);
+  const draftStoreRef = useRef(new ComposerDraftStore());
   const runtime = state.runtimes[CODEX_BURST_SID] ?? createRuntime();
 
   useEffect(() => () => {
@@ -889,6 +894,54 @@ function CodexLiveBurstFixture() {
         engine="codex" historyRevision="codex-burst-r1"
         historyScopeKey="fixture-codex-burst"
         onEdit={() => {}} onGetDiff={() => {}} />
+      {composerLive && (
+        <div data-testid="live-composer-shell">
+          <Composer
+            draftKey="fixture-codex-live-composer"
+            draftStore={draftStoreRef.current}
+            state={runtime.state}
+            connState="connected"
+            wrapperOnline
+            sendMode={runtime.sendMode}
+            setSendMode={() => {}}
+            queue={runtime.queue}
+            pendingSend={runtime.pendingSend}
+            failedDeferred={runtime.failedDeferred}
+            unconfirmedQueued={[]}
+            unconfirmedReplaceable={[]}
+            queueCapacity={{}}
+            replaceQueueCapacity={{}}
+            model="gpt-5.6-sol"
+            effort="xhigh"
+            perm="danger-full-access"
+            permissionProfile=":danger-full-access"
+            permissionProfiles={null}
+            webSearch="cached"
+            collaborationMode="default"
+            fast={false}
+            engine="codex"
+            editPrompt={null}
+            onEditConsumed={() => {}}
+            onSendQuery={() => false}
+            onSteerQuery={() => false}
+            onInterrupt={() => {}}
+            onEnqueue={() => false}
+            onSetPending={() => false}
+            onRemoveQueued={() => {}}
+            onInspectQueued={() => {}}
+            onSetModel={() => {}}
+            onSetEffort={() => {}}
+            onSetPerm={() => {}}
+            onSetPermissionProfile={() => {}}
+            onGetPermissionProfiles={() => {}}
+            onSetWebSearch={() => {}}
+            onSetCollaborationMode={() => {}}
+            onClear={() => {}}
+            onContext={() => {}}
+            contextReport={null}
+          />
+        </div>
+      )}
     </main>
   );
 }
@@ -906,6 +959,8 @@ function HistoryConversationBrowserFixture() {
   const dualImage = params.has("dual-image");
   const compactTools = params.has("compact-tools");
   const detailPaging = params.has("detail-paging");
+  const detailErrorOnce = params.has("detail-error-once");
+  const detailOlderErrorOnce = params.has("detail-older-error-once");
   const detailRetainedPreview = params.has("detail-retained-preview");
   const detailScrollCancel = params.has("detail-scroll-cancel");
   const mermaid = params.has("mermaid");
@@ -1023,6 +1078,7 @@ function HistoryConversationBrowserFixture() {
       : []);
   const nextLiveTurnRef = useRef(41);
   const textSelectionGuardRef = useRef<TextSelectionGuard | null>(null);
+  const detailRequestCountRef = useRef(0);
   const updateTextSelectionGuard = useCallback(
     (guard: TextSelectionGuard | null) => {
       textSelectionGuardRef.current = guard;
@@ -1213,18 +1269,50 @@ function HistoryConversationBrowserFixture() {
     before?: string | null,
   ): boolean => {
     if (!detailPaging || turnId !== "detail-page") return false;
-    const requestSid = sid;
+    detailRequestCountRef.current += 1;
+    document.documentElement.dataset.detailRequests =
+      String(detailRequestCountRef.current);
     const page: DetailFixturePage = before === "detail-older"
       ? "older" : "latest";
+    document.documentElement.dataset.detailLastBefore = before ?? "initial";
+    const failThisRequest = (
+      detailErrorOnce && detailRequestCountRef.current === 1
+    ) || (
+      detailOlderErrorOnce && page === "older"
+      && detailRequestCountRef.current === 2
+    );
+    const requestSid = sid;
     setSessions((current) => ({
       ...current,
       [requestSid]: {
         ...current[requestSid],
         turns: current[requestSid].turns.map((turn) =>
-          turn.id === turnId ? { ...turn, detailLoading: true } : turn),
+          turn.id === turnId ? {
+            ...turn,
+            detailLoading: true,
+            detailError: undefined,
+            detailRetryBefore: before ?? null,
+            detailRetryDirection: before == null ? "initial" : "older",
+          } : turn),
       },
     }));
     window.setTimeout(() => {
+      if (failThisRequest) {
+        setSessions((current) => ({
+          ...current,
+          [requestSid]: {
+            ...current[requestSid],
+            turns: current[requestSid].turns.map((turn) =>
+              turn.id === turnId ? {
+                ...turn,
+                detailLoading: false,
+                detailAutoLoad: false,
+                detailError: "详细过程暂时不可用，请稍后重试",
+              } : turn),
+          },
+        }));
+        return;
+      }
       setSessions((current) => ({
         ...current,
         [requestSid]: {
@@ -1248,7 +1336,10 @@ function HistoryConversationBrowserFixture() {
       }, growthDelayMs);
     }, delayMs);
     return true;
-  }, [delayMs, detailPaging, growthDelayMs, sid]);
+  }, [
+    delayMs, detailErrorOnce, detailOlderErrorOnce,
+    detailPaging, growthDelayMs, sid,
+  ]);
 
   useEffect(() => {
     if (!detailPaging) return;

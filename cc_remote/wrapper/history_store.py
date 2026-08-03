@@ -43,6 +43,42 @@ _SUMMARY_BLOCK_MAX = 32
 _VOLATILE_EVENT_FIELDS = frozenset({"ts", "seq", "to", "route_id"})
 _COMPACT_SOURCE_LIMIT = 16
 _SAFE_COMPACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_GENERIC_HISTORY_TURN_FAILURE = "该轮未正常结束"
+_PROVIDER_AUTH_TURN_FAILURE = (
+    "模型服务认证已失效或当前账号无权限，"
+    "请检查当前服务的凭据或账号权限后重试。"
+)
+_SAFE_HISTORY_TURN_FAILURES = frozenset({
+    "网络异常，连接失败，请重新尝试。",
+    "网络连接异常，请检查网络后重试。",
+    _PROVIDER_AUTH_TURN_FAILURE,
+    "请求过于频繁或当前额度受限，请稍后重试。",
+    "请求超时，请重新尝试。",
+    "Codex 上游服务暂时不可用，请稍后重试。",
+})
+_LEGACY_HISTORY_TURN_FAILURES = {
+    "Codex 登录已失效或当前账号无权限，请重新登录后重试。":
+        _PROVIDER_AUTH_TURN_FAILURE,
+    "Codex 本次回复未完成，请重试。": _GENERIC_HISTORY_TURN_FAILURE,
+    "Claude 本次回复未完成，请稍后重试。": _GENERIC_HISTORY_TURN_FAILURE,
+    "本次回复未完成，请重试。": _GENERIC_HISTORY_TURN_FAILURE,
+    "error": _GENERIC_HISTORY_TURN_FAILURE,
+}
+
+
+def _historical_turn_failure(value: Any) -> str:
+    """Keep only reviewed product copy in a persisted history summary."""
+    if not isinstance(value, str):
+        return _GENERIC_HISTORY_TURN_FAILURE
+    message = value.strip()
+    if not message:
+        return _GENERIC_HISTORY_TURN_FAILURE
+    legacy = _LEGACY_HISTORY_TURN_FAILURES.get(message)
+    if legacy is not None:
+        return legacy
+    if message in _SAFE_HISTORY_TURN_FAILURES:
+        return message
+    return _GENERIC_HISTORY_TURN_FAILURE
 
 
 @dataclass(frozen=True)
@@ -511,19 +547,15 @@ def materialize_history_turns(
                     interrupted = subtype in {
                         "interrupted", "error_during_execution", "aborted",
                     }
-                    if bool(result.get("is_error")) and not interrupted:
-                        error = (
-                            "该轮未正常结束"
-                            if not subtype or subtype == "error"
-                            else subtype
-                        )
+                    if (
+                        bool(result.get("is_error"))
+                        and not interrupted
+                    ):
+                        error = _historical_turn_failure(
+                            error if error is not None else subtype)
             elif event_type == "error":
                 if isinstance(event.get("message"), str):
-                    error = (
-                        "该轮未正常结束"
-                        if event["message"].strip().lower() == "error"
-                        else event["message"]
-                    )
+                    error = _historical_turn_failure(event["message"])
             if include_live_detail and event_type == "tool_use":
                 tool_id = event.get("tool_use_id")
                 message_id = event.get("message_id")

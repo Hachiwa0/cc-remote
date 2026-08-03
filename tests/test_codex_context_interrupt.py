@@ -114,16 +114,105 @@ def test_codex_errors_surface():
     evs = tr.feed({"method": "error", "params": {"willRetry": False,
         "error": {"message": "unexpected status 401 Unauthorized", "additionalDetails": "Incorrect API key"}}})
     assert len(evs) == 1 and isinstance(evs[0], Error)
-    assert evs[0].message == "Codex 本次回复未完成，请重试。"
+    assert evs[0].message == (
+        "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。"
+    )
     assert "401" not in evs[0].message and "API key" not in evs[0].message
+    network = CodexStreamTranslator(8000).feed({
+        "method": "error",
+        "params": {
+            "willRetry": False,
+            "error": {
+                "message": "stream disconnected before completion: "
+                           "error sending request for url "
+                           "https://chatgpt.com/backend-api/codex/responses",
+                "codexErrorInfo": "other",
+            },
+        },
+    })
+    assert len(network) == 1 and isinstance(network[0], Error)
+    assert network[0].message == "网络连接异常，请检查网络后重试。"
+    assert "chatgpt.com" not in network[0].message
     # failed turn/completed -> a safe Error, then a TurnEnd(is_error)
     tr2 = CodexStreamTranslator(8000)
     out = tr2.feed({"method": "turn/completed", "params": {"turn": {"status": "failed", "error": {"message": "request timed out"}}}})
     assert any(isinstance(e, Error)
-               and e.message == "Codex 本次回复未完成，请重试。"
+               and e.message == "请求超时，请重新尝试。"
                for e in out), out
     assert out[-1].result.is_error is True and out[-1].result.subtype == "error"
     print("  codex errors surface: retry visible, terminal details sanitized  OK")
+
+
+def test_codex_terminal_provider_failures_keep_distinct_safe_copy():
+    from cc_remote.protocol import Error
+
+    cases = [
+        (
+            {
+                "message": "stream disconnected before completion",
+                "codexErrorInfo": {
+                    "responseStreamDisconnected": {"httpStatusCode": 401},
+                },
+            },
+            "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。",
+        ),
+        (
+            {
+                "message": "error sending request",
+                "codexErrorInfo": {
+                    "responseStreamDisconnected": {"httpStatusCode": 403},
+                },
+            },
+            "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。",
+        ),
+        (
+            {"message": "error sending request: HTTP 429 Too Many Requests"},
+            "请求过于频繁或当前额度受限，请稍后重试。",
+        ),
+        (
+            {"message": "request timed out with status 408"},
+            "请求超时，请重新尝试。",
+        ),
+        (
+            {
+                "message": "stream disconnected before completion",
+                "codexErrorInfo": {
+                    "responseStreamDisconnected": {"httpStatusCode": 503},
+                },
+            },
+            "Codex 上游服务暂时不可用，请稍后重试。",
+        ),
+        (
+            {"message": "TLS error while opening provider socket"},
+            "网络连接异常，请检查网络后重试。",
+        ),
+        (
+            {"message": "model execution failed"},
+            "Codex 本次回复未完成，请重试。",
+        ),
+    ]
+
+    for error, expected in cases:
+        events = CodexStreamTranslator(8000).feed({
+            "method": "error",
+            "params": {"willRetry": False, "error": error},
+        })
+        assert len(events) == 1 and isinstance(events[0], Error)
+        assert events[0].message == expected
+        assert "HTTP" not in events[0].message
+
+    custom_provider = CodexStreamTranslator(8000).feed({
+        "method": "error",
+        "params": {
+            "willRetry": False,
+            "error": {"message": "cubence API key rejected: HTTP 401"},
+        },
+    })
+    assert custom_provider[0].message == (
+        "模型服务认证已失效或当前账号无权限，"
+        "请检查当前服务的凭据或账号权限后重试。"
+    )
+    assert "Codex 登录" not in custom_provider[0].message
 
 
 def test_codex_empty_completed_is_an_error_but_tool_activity_is_not():
