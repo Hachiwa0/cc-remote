@@ -63,8 +63,9 @@ import {
   matchesBtwRequest,
   normalizeDiffTheme,
   normalizeEngine,
+  PROTOCOL_VERSION,
 } from "../src/protocol.ts";
-import { RelayWs } from "../src/ws.ts";
+import { protocolRecoveryAction, RelayWs } from "../src/ws.ts";
 import {
   clientSlashesFor,
   commandsFor,
@@ -6988,6 +6989,7 @@ const browserSessionStorage = {
   removeItem: (key: string) => { sessionValues.delete(key); },
 };
 let protocolReloads = 0;
+const nativeFetch = globalThis.fetch;
 Object.assign(globalThis, {
   window: {
     location: {
@@ -6999,30 +7001,107 @@ Object.assign(globalThis, {
   sessionStorage: browserSessionStorage,
 });
 
-const firstMismatch = new RelayWs({
+assert.deepEqual(
+  protocolRecoveryAction(null, PROTOCOL_VERSION), { kind: "wait" });
+assert.deepEqual(
+  protocolRecoveryAction(PROTOCOL_VERSION - 1, PROTOCOL_VERSION),
+  { kind: "wait" },
+);
+assert.deepEqual(
+  protocolRecoveryAction(PROTOCOL_VERSION, PROTOCOL_VERSION),
+  { kind: "reconnect" },
+);
+assert.deepEqual(
+  protocolRecoveryAction(PROTOCOL_VERSION + 1, PROTOCOL_VERSION + 1),
+  { kind: "reload", protocol: PROTOCOL_VERSION + 1 },
+);
+
+let relayProbeProtocol = PROTOCOL_VERSION;
+let webProbeProtocol = PROTOCOL_VERSION;
+Object.assign(globalThis, {
+  fetch: async (input: string | URL | Request) => ({
+    ok: true,
+    json: async () => ({
+      protocol: String(input).startsWith("/healthz")
+        ? relayProbeProtocol : webProbeProtocol,
+    }),
+  }) as Response,
+});
+
+const alignedMismatchStates: Array<{ state: string; detail?: string }> = [];
+const alignedMismatch = new RelayWs({
+  onEvent: () => {},
+  onConnState: (state, detail) => {
+    alignedMismatchStates.push({ state, detail });
+  },
+});
+alignedMismatch.start();
+const alignedSocketCount = FakeWebSocket.instances.length;
+FakeWebSocket.instances.at(-1)?.onclose?.({ code: 4406 });
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(protocolReloads, 0,
+  "a current bundle must reconnect without an unnecessary page reload");
+assert.equal(FakeWebSocket.instances.length, alignedSocketCount + 1,
+  "the client should reconnect after relay and bundle protocols align");
+assert.deepEqual(alignedMismatchStates.at(-1), {
+  state: "connecting", detail: undefined,
+});
+alignedMismatch.stop();
+
+relayProbeProtocol = PROTOCOL_VERSION - 1;
+webProbeProtocol = PROTOCOL_VERSION;
+const rollingMismatchStates: Array<{ state: string; detail?: string }> = [];
+const rollingMismatchEvents: ServerEvent[] = [];
+const rollingMismatch = new RelayWs({
+  onEvent: (event) => { rollingMismatchEvents.push(event); },
+  onConnState: (state, detail) => {
+    rollingMismatchStates.push({ state, detail });
+  },
+});
+rollingMismatch.start();
+const rollingSocketCount = FakeWebSocket.instances.length;
+const rollingSocket = FakeWebSocket.instances.at(-1);
+rollingSocket?.receive({
+  type: "error", code: "protocol",
+  message: "first frame must be a client hello",
+});
+assert.equal(rollingMismatchEvents.length, 0,
+  "a relay handshake mismatch must not leave a stale refresh banner");
+rollingSocket?.onclose?.({ code: 4406 });
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(protocolReloads, 0,
+  "split relay and web tiers must not trigger a premature reload");
+assert.equal(FakeWebSocket.instances.length, rollingSocketCount,
+  "the client must wait instead of reconnecting to a known-old relay");
+assert.deepEqual(rollingMismatchStates.at(-1), {
+  state: "reconnecting",
+  detail: "页面版本正在更新，等待服务端完成部署…",
+});
+rollingMismatch.stop();
+
+relayProbeProtocol = PROTOCOL_VERSION + 1;
+webProbeProtocol = PROTOCOL_VERSION + 1;
+const staleBundle = new RelayWs({
   onEvent: () => {},
   onConnState: () => {},
 });
-firstMismatch.start();
+staleBundle.start();
 FakeWebSocket.instances.at(-1)?.onclose?.({ code: 4406 });
+await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(protocolReloads, 1,
-  "the first protocol mismatch should refresh the bundle once");
+  "an aligned newer deployment should refresh a stale bundle once");
+staleBundle.stop();
 
-const mismatchStates: Array<{ state: string; detail?: string }> = [];
 const repeatedMismatch = new RelayWs({
   onEvent: () => {},
-  onConnState: (state, detail) => {
-    mismatchStates.push({ state, detail });
-  },
+  onConnState: () => {},
 });
 repeatedMismatch.start();
 FakeWebSocket.instances.at(-1)?.onclose?.({ code: 4406 });
+await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(protocolReloads, 1,
   "a rolling deploy must not trap the browser in a reload loop");
-assert.deepEqual(mismatchStates.at(-1), {
-  state: "disconnected",
-  detail: "页面与服务端版本不一致；请等待部署完成后手动刷新。",
-});
+repeatedMismatch.stop();
 
 Object.assign(globalThis, {
   sessionStorage: {
@@ -7046,14 +7125,24 @@ storageBlockedSocket?.receive({
 });
 assert.equal(storageBlockedEvents.length, 1,
   "blocked sessionStorage must not make a valid frame look malformed");
+storageBlockedSocket?.receive({
+  type: "error", code: "protocol", message: "correlated runtime error",
+});
+assert.equal(storageBlockedEvents.length, 2,
+  "protocol errors after a compatible frame must remain visible");
 storageBlockedSocket?.onclose?.({ code: 4406 });
+await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(protocolReloads, 1,
   "a mismatch cannot auto-reload safely when the reload guard is unavailable");
 assert.deepEqual(storageBlockedStates.at(-1), {
-  state: "disconnected",
-  detail: "页面与服务端版本不一致；请等待部署完成后手动刷新。",
+  state: "reconnecting",
+  detail: "页面版本正在更新，等待服务端完成部署…",
 });
-Object.assign(globalThis, { sessionStorage: browserSessionStorage });
+storageBlocked.stop();
+Object.assign(globalThis, {
+  fetch: nativeFetch,
+  sessionStorage: browserSessionStorage,
+});
 
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;
@@ -7565,6 +7654,10 @@ assert.match(layoutCss, /env\(safe-area-inset-bottom\)/,
   "mobile overlays and composers must preserve the home-indicator safe area");
 const serviceWorkerSource = readFileSync(
   resolve(process.cwd(), "public/sw.js"), "utf8");
+assert.match(serviceWorkerSource, /url\.pathname === "\/healthz"/,
+  "protocol health probes must bypass the service-worker cache");
+assert.match(serviceWorkerSource, /url\.pathname === "\/cc-remote-build\.json"/,
+  "the deployed protocol manifest must bypass the service-worker cache");
 assert.match(serviceWorkerSource, /existing\.postMessage\(\{[\s\S]*cc-remote-notification/,
   "an already-open page must receive the exact notification target");
 assert.match(serviceWorkerSource, /self\.clients\.openWindow\(target\)/,

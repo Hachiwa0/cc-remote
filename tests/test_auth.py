@@ -883,6 +883,17 @@ def test_static_shell_revalidates_across_protocol_upgrades(tmp_path):
         assert "immutable" not in missing.headers.get("cache-control", "")
 
 
+def test_health_reports_loaded_protocol_without_caching():
+    cfg = _cfg()
+
+    with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json()["protocol"] == PROTOCOL_VERSION
+    assert response.headers["cache-control"] == "no-store"
+
+
 def test_allow_insecure_http_permits_a_plain_http_public_ip_origin():
     # Explicit opt-in escape hatch: a bare public IP without a TLS terminator.
     cfg = _cfg(public_origin="http://198.51.100.10:8765", allow_insecure_http=True)

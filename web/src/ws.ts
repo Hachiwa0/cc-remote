@@ -64,6 +64,8 @@ const OUTBOX_MAX_BYTES = 64 * 1024 * 1024;
 const OUTBOX_MAX_FRAME_BYTES = 14 * 1024 * 1024;
 const MAX_REPLAY_SESSIONS = 128;
 const PROTOCOL_RELOAD_KEY = "cc-remote:protocol-reload";
+const PROTOCOL_RECOVERY_POLL_MS = 1000;
+const PROTOCOL_RECOVERY_TIMEOUT_MS = 120000;
 
 function readProtocolReloadMarker(): string | null | undefined {
   try {
@@ -73,10 +75,10 @@ function readProtocolReloadMarker(): string | null | undefined {
   }
 }
 
-function writeProtocolReloadMarker(): boolean {
+function writeProtocolReloadMarker(protocol: number): boolean {
   try {
     globalThis.sessionStorage.setItem(
-      PROTOCOL_RELOAD_KEY, String(PROTOCOL_VERSION));
+      PROTOCOL_RELOAD_KEY, String(protocol));
     return true;
   } catch {
     return false;
@@ -88,6 +90,42 @@ function clearProtocolReloadMarker(): void {
     globalThis.sessionStorage.removeItem(PROTOCOL_RELOAD_KEY);
   } catch {
     // Storage can be unavailable in privacy-restricted or sandboxed contexts.
+  }
+}
+
+type ProtocolRecoveryAction =
+  | { kind: "wait" }
+  | { kind: "reconnect" }
+  | { kind: "reload"; protocol: number };
+
+export function protocolRecoveryAction(
+  relayProtocol: number | null,
+  webProtocol: number | null,
+): ProtocolRecoveryAction {
+  if (relayProtocol === null || webProtocol === null
+      || relayProtocol !== webProtocol) {
+    return { kind: "wait" };
+  }
+  if (relayProtocol === PROTOCOL_VERSION) return { kind: "reconnect" };
+  return { kind: "reload", protocol: relayProtocol };
+}
+
+async function fetchProtocol(url: string): Promise<number | null> {
+  try {
+    // The query keeps probes fresh even while an older service worker is still
+    // controlling the page and cache-first rules from that worker remain live.
+    const separator = url.includes("?") ? "&" : "?";
+    const response = await fetch(
+      `${url}${separator}protocol_probe=${Date.now()}`,
+      { cache: "no-store", credentials: "same-origin" },
+    );
+    if (!response.ok) return null;
+    const body = await response.json() as { protocol?: unknown };
+    return typeof body.protocol === "number" && Number.isInteger(body.protocol)
+      ? body.protocol
+      : null;
+  } catch {
+    return null;
   }
 }
 
@@ -133,6 +171,9 @@ export class RelayWs {
   private backoff = 1;
   private stopped = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private protocolRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private protocolRecoveryStartedAt = 0;
+  private protocolRecoveryGeneration = 0;
   private readonly cb: WsCallbacks;
   private readonly machineId: string;
   // Heartbeat: detect a HALF-OPEN link (dead TCP with no close event) and recover.
@@ -162,6 +203,7 @@ export class RelayWs {
   stop(): void {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.cancelProtocolRecovery();
     this.stopHeartbeat();
     this.ws?.close();
   }
@@ -1227,6 +1269,7 @@ export class RelayWs {
     this.cb.onConnState("connecting");
     const socketGeneration = ++this.connectionGeneration;
     const ws = new WebSocket(this.url);
+    let compatibleFrameSeen = false;
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = 1;
@@ -1238,6 +1281,16 @@ export class RelayWs {
       if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       try {
         const decoded = JSON.parse(e.data) as ServerEvent;
+        if (!compatibleFrameSeen && decoded.type === "error"
+            && decoded.code === "protocol" && !decoded.sid
+            && !decoded.request_id && !decoded.msg_id) {
+          // A mismatched relay sends this uncorrelated handshake error just
+          // before closing with 4406. The close handler owns rollout recovery;
+          // surfacing this frame would leave a stale "refresh" banner behind
+          // even after the connection repairs itself.
+          return;
+        }
+        compatibleFrameSeen = true;
         this.lastRecvAt = Date.now();  // any valid JSON frame proves the link is alive
         // A real frame proves that this bundle and the relay agree. Clear the
         // one-shot mismatch guard so a future deployment may refresh once too.
@@ -1475,21 +1528,7 @@ export class RelayWs {
       if (this.ws === ws) this.ws = null;
       this.stopHeartbeat();
       if (ev.code === 4406) {
-        // Static assets and the relay cannot be swapped atomically on every
-        // deployment target. Refresh once to pick up the matching bundle, but
-        // never trap mobile browsers in an unbounded reload loop while the
-        // other tier is still rolling forward.
-        const reloadMarker = readProtocolReloadMarker();
-        if (reloadMarker !== undefined
-            && reloadMarker !== String(PROTOCOL_VERSION)
-            && writeProtocolReloadMarker()) {
-          window.location.reload();
-        } else {
-          this.cb.onConnState(
-            "disconnected",
-            "页面与服务端版本不一致；请等待部署完成后手动刷新。",
-          );
-        }
+        this.beginProtocolRecovery();
         return;
       }
       if (ev.code === 1008) {
@@ -1507,6 +1546,67 @@ export class RelayWs {
     ws.onerror = () => {
       /* onclose will follow */
     };
+  }
+
+  private beginProtocolRecovery(): void {
+    if (this.protocolRecoveryStartedAt !== 0) return;
+    this.protocolRecoveryStartedAt = Date.now();
+    const generation = ++this.protocolRecoveryGeneration;
+    this.cb.onConnState(
+      "reconnecting",
+      "页面版本正在更新，等待服务端完成部署…",
+    );
+    void this.probeProtocolRecovery(generation);
+  }
+
+  private async probeProtocolRecovery(generation: number): Promise<void> {
+    const [relayProtocol, webProtocol] = await Promise.all([
+      fetchProtocol("/healthz"),
+      fetchProtocol("/cc-remote-build.json"),
+    ]);
+    if (this.stopped || generation !== this.protocolRecoveryGeneration
+        || this.ws !== null) return;
+
+    const action = protocolRecoveryAction(relayProtocol, webProtocol);
+    if (action.kind === "reconnect") {
+      clearProtocolReloadMarker();
+      this.cancelProtocolRecovery();
+      this.connect();
+      return;
+    }
+    if (action.kind === "reload") {
+      const reloadMarker = readProtocolReloadMarker();
+      if (reloadMarker !== undefined
+          && reloadMarker !== String(action.protocol)
+          && writeProtocolReloadMarker(action.protocol)) {
+        this.cancelProtocolRecovery();
+        window.location.reload();
+        return;
+      }
+    }
+
+    if (Date.now() - this.protocolRecoveryStartedAt
+        >= PROTOCOL_RECOVERY_TIMEOUT_MS) {
+      this.cancelProtocolRecovery();
+      this.cb.onConnState(
+        "disconnected",
+        "页面与服务端版本仍未同步，请稍后刷新重试。",
+      );
+      return;
+    }
+    this.protocolRecoveryTimer = setTimeout(() => {
+      this.protocolRecoveryTimer = null;
+      void this.probeProtocolRecovery(generation);
+    }, PROTOCOL_RECOVERY_POLL_MS);
+  }
+
+  private cancelProtocolRecovery(): void {
+    this.protocolRecoveryGeneration += 1;
+    this.protocolRecoveryStartedAt = 0;
+    if (this.protocolRecoveryTimer !== null) {
+      clearTimeout(this.protocolRecoveryTimer);
+      this.protocolRecoveryTimer = null;
+    }
   }
 
   private async reconnectAfterSessionProbe(): Promise<void> {
