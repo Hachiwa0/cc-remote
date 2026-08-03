@@ -841,13 +841,11 @@ test("reducer history paging and live refresh keep one stable projection", async
   page,
 }) => {
   await page.goto("/tests/history-browser.html?reducer-pipeline=1");
-  const viewport = page.locator(".thread");
   await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
   await expect(page.getByTestId("reducer-turn-count")).toHaveText("20");
   await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("20");
 
-  await viewport.evaluate((node) => { node.scrollTop = 0; });
-  await waitForScrollIdle(page);
+  await pauseOutputAndScrollToHistoryStart(page);
   const before = await readingAnchor(page);
   await page.getByRole("button", { name: "加载更早的历史" }).click();
   await expect(page.getByTestId("load-count")).toHaveText("1");
@@ -1048,7 +1046,7 @@ test("a loading process can collapse and reopen without issuing a duplicate read
 test("a failed process detail stays open and retries in place", async ({ page }) => {
   await page.goto(
     "/tests/history-browser.html?detail-paging=1&detail-error-once=1"
-      + "&delay=30&growth-delay=30",
+      + "&delay=500&growth-delay=30",
   );
   const header = page.locator(".turn-process-head");
   await header.click();
@@ -3133,6 +3131,8 @@ test("migration picker follows an external session move", async ({ page }) => {
   const confirm = dialog.getByRole(
     "button", { name: "迁移到此目录" },
   );
+  await expect(page.getByTestId("migration-picker-request"))
+    .toHaveText("/repo/current");
   await page.getByTestId("resolve-migration-picker")
     .evaluate((button) => (button as HTMLButtonElement).click());
   await expect(confirm).toBeEnabled();
