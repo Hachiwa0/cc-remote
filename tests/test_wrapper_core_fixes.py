@@ -454,10 +454,10 @@ def test_interrupt_wakes_existing_queue_wait_and_enforces_drain_deadline():
     asyncio.run(run())
 
 
-def test_codex_idle_watchdog_warns_without_ending_or_replaying_the_turn():
+def test_codex_silence_emits_no_synthetic_waiting_notice_and_later_completes(
+        monkeypatch):
     async def run():
         machine, transport = _mk_machine()
-        machine.cfg.codex_turn_idle_warn_seconds = 0.02
         sdk = _StalledSdk()
         sdk.responses = [
             {"method": "item/reasoning/delta", "params": {
@@ -474,15 +474,25 @@ def test_codex_idle_watchdog_warns_without_ending_or_replaying_the_turn():
         ctx.active_msg_id = "message-stalled"
         machine.sessions[ctx.key] = ctx
 
+        real_wait = machine_module.asyncio.wait
+        wait_options = []
+
+        async def wait_without_idle_deadline(tasks, *args, **kwargs):
+            wait_options.append(dict(kwargs))
+            return await real_wait(tasks, *args, **kwargs)
+
+        monkeypatch.setattr(
+            machine_module.asyncio, "wait", wait_without_idle_deadline,
+        )
         turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
         await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
         await asyncio.sleep(0.04)
 
+        assert wait_options
+        assert all("timeout" not in options for options in wait_options)
         notices = [msg for msg in transport.sent
                    if isinstance(msg, StateEvent) and msg.phase == "waiting"]
-        assert len(notices) == 1
-        assert notices[0].state == "running"
-        assert notices[0].msg_id == "message-stalled"
+        assert notices == []
         assert ctx.state == "running"
         assert sdk.reconnects == 0
 
@@ -491,63 +501,57 @@ def test_codex_idle_watchdog_warns_without_ending_or_replaying_the_turn():
 
         assert ctx.state == "idle"
         assert sdk.reconnects == 0
-        clear_index = next(
-            index for index, msg in enumerate(transport.sent)
-            if isinstance(msg, StateEvent) and msg.msg_id == "message-stalled"
-            and msg.detail is None)
-        wait_index = transport.sent.index(notices[0])
-        assert clear_index > wait_index
+        assert [msg.text for msg in transport.sent
+                if getattr(msg, "type", None) == "delta"] == ["done"]
 
     asyncio.run(run())
 
 
-def test_codex_idle_warning_boundary_never_drops_a_consumed_delta(monkeypatch):
+def test_codex_silence_preserves_later_authoritative_provider_error():
     async def run():
         machine, transport = _mk_machine()
-        machine.cfg.codex_turn_idle_warn_seconds = 0.02
         sdk = _StalledSdk()
         sdk.responses = [
-            {"method": "item/agentMessage/delta", "params": {
-                "itemId": "boundary-answer", "delta": "visible answer"}},
+            {"method": "error", "params": {
+                "willRetry": False,
+                "error": {
+                    "message": "stream disconnected before completion",
+                    "codexErrorInfo": {
+                        "responseStreamDisconnected": {"httpStatusCode": 502},
+                    },
+                },
+            }},
             {"method": "turn/completed", "params": {
-                "turn": {"status": "completed", "durationMs": 30}}},
+                "turn": {
+                    "id": "provider-failed-turn",
+                    "status": "failed",
+                    "durationMs": 30,
+                    "error": {"message": "HTTP 502"},
+                }}},
         ]
-        ctx = _mk_ctx("codex-boundary", "codex-boundary")
+        ctx = _mk_ctx("codex-provider-error", "codex-provider-error")
         ctx.sdk = sdk
         ctx.engine = "codex"
         ctx.state = "running"
-        ctx.active_msg_id = "message-boundary"
+        ctx.active_msg_id = "message-provider-error"
         machine.sessions[ctx.key] = ctx
 
-        real_wait = machine_module.asyncio.wait
-        forced_boundary = False
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.sleep(0.04)
+        assert not [msg for msg in transport.sent
+                    if isinstance(msg, StateEvent) and msg.phase == "waiting"]
 
-        async def boundary_wait(tasks, *args, **kwargs):
-            nonlocal forced_boundary
-            if kwargs.get("timeout") is not None and not forced_boundary:
-                forced_boundary = True
-                task = next(iter(tasks))
-                sdk.release.set()
-                for _ in range(50):
-                    if task.done():
-                        break
-                    await asyncio.sleep(0)
-                assert task.done()
-                # Simulate timeout bookkeeping winning even though the get task
-                # consumed and completed on the same event-loop boundary.
-                return set(), {task}
-            return await real_wait(tasks, *args, **kwargs)
+        sdk.release.set()
+        await asyncio.wait_for(turn, timeout=0.5)
 
-        monkeypatch.setattr(machine_module.asyncio, "wait", boundary_wait)
-        await asyncio.wait_for(machine._run_turn(ctx, "hello"), timeout=0.5)
-
-        assert forced_boundary is True
-        assert not [msg for msg in transport.sent if isinstance(msg, Error)]
-        deltas = [msg.text for msg in transport.sent
-                  if getattr(msg, "type", None) == "delta"]
-        assert deltas == ["visible answer"]
+        errors = [msg for msg in transport.sent if isinstance(msg, Error)]
+        assert errors
+        assert errors[0].msg_id == "message-provider-error"
+        assert errors[0].message == "Codex 上游服务暂时不可用，请稍后重试。"
         terminal = [msg for msg in transport.sent if isinstance(msg, TurnEnd)][-1]
-        assert terminal.result.subtype == "success"
+        assert terminal.result.subtype == "error"
+        assert terminal.result.is_error is True
 
     asyncio.run(run())
 
@@ -863,6 +867,161 @@ def test_codex_history_goal_continuation_after_completed_turn_is_own_turn(tmp_pa
                 if isinstance(event, AssistantMsgStart)]) == 2
     assert [event.turn_id for event in events if isinstance(event, TurnEnd)] == [
         "turn-user", "turn-goal"]
+
+
+def test_codex_history_new_goal_objective_is_a_durable_user_prompt(tmp_path):
+    rollout = tmp_path / "rollout-goal-objective.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-goal-objective"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated",
+                     "threadId": "session-goal-objective",
+                     "goal": {
+                         "threadId": "session-goal-objective",
+                         "objective": "证明泰勒展开",
+                         "status": "active", "tokensUsed": 0,
+                         "timeUsedSeconds": 0,
+                         "createdAt": 1, "updatedAt": 1,
+                     }}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-goal"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "证明过程"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-goal"}},
+        # Resuming the same objective may start another automatic turn, but it
+        # must remain an assistant-only continuation rather than repeating the
+        # original user request.
+        {"timestamp": "2026-01-01T00:01:01Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated",
+                     "threadId": "session-goal-objective",
+                     "goal": {
+                         "threadId": "session-goal-objective",
+                         "objective": "证明泰勒展开",
+                         "status": "active", "tokensUsed": 10,
+                         "timeUsedSeconds": 30,
+                         "createdAt": 1, "updatedAt": 2,
+                     }}},
+        {"timestamp": "2026-01-01T00:01:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-resume"}},
+        {"timestamp": "2026-01-01T00:01:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "继续处理"}},
+        {"timestamp": "2026-01-01T00:01:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-resume"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    prompts = [event for event in events if isinstance(event, UserMsg)]
+    assert [(event.msg_id, event.prompt) for event in prompts] == [
+        ("turn-goal", "证明泰勒展开"),
+    ]
+    assert [event.turn_id for event in events if isinstance(event, TurnEnd)] == [
+        "turn-goal", "turn-resume",
+    ]
+
+
+def test_codex_history_goal_metadata_without_a_turn_never_steals_next_user(
+        tmp_path):
+    rollout = tmp_path / "rollout-paused-goal.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             "objective": "旧目标", "status": "active",
+             "createdAt": 1, "updatedAt": 1,
+         }}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "goal-turn",
+                     "started_at": 1}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "目标结果"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "goal-turn"}},
+        # Editing paused metadata does not launch a Goal turn.
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             "objective": "暂停后的新目标", "status": "paused",
+             "createdAt": 1, "updatedAt": 4,
+         }}},
+        {"timestamp": "2026-01-01T00:01:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "ordinary-turn",
+                     "started_at": 61}},
+        {"timestamp": "2026-01-01T00:01:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "普通问题"}},
+        {"timestamp": "2026-01-01T00:01:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "普通答案"}},
+        {"timestamp": "2026-01-01T00:01:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "ordinary-turn"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    assert [event.prompt for event in events if isinstance(event, UserMsg)] == [
+        "旧目标", "普通问题",
+    ]
+    assert [event.result.subtype for event in events
+            if isinstance(event, TurnEnd)] == ["success", "success"]
+
+
+def test_codex_history_goal_candidate_yields_to_same_task_user_message(
+        tmp_path):
+    rollout = tmp_path / "rollout-goal-user-race.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             "objective": "候选目标", "status": "active",
+             "createdAt": 1.0, "updatedAt": 1.0,
+         }}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "ordinary-turn"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "普通问题"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "普通答案"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "ordinary-turn"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    assert [event.prompt for event in events if isinstance(event, UserMsg)] == [
+        "普通问题",
+    ]
+    assert [event.result.subtype for event in events
+            if isinstance(event, TurnEnd)] == ["success"]
+
+
+def test_codex_history_goal_update_inside_user_turn_does_not_split_prompt(
+        tmp_path):
+    rollout = tmp_path / "rollout-goal-inside-user-turn.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "managed-turn"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "创建目标"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             "objective": "稍后自动执行", "status": "active",
+             "createdAt": 1, "updatedAt": 1,
+         }}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "目标已创建"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "managed-turn"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    assert [event.prompt for event in events if isinstance(event, UserMsg)] == [
+        "创建目标",
+    ]
+    assert [event.result.subtype for event in events
+            if isinstance(event, TurnEnd)] == ["success"]
 
 
 def test_codex_history_goal_continuations_page_as_independent_turns(

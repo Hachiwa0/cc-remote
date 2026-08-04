@@ -682,7 +682,6 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `CODEX_WORK_ROOT` | `~/.codex/cc-remote/work` | Private Codex Work root for the registry, knowledge sources, sessions, and generated policy files. |
 | `MAX_CONCURRENT_SESSIONS` | `20` | Maximum resident agent subprocesses (memory varies by engine/version). Over the cap, an idle process is evicted; client history remains available. |
 | `DRAIN_TIMEOUT` | `15` | Seconds to wait for the terminal ResultMessage after interrupt before forcing a reconnect (drain safety net). |
-| `CODEX_TURN_IDLE_WARN_SECONDS` | `90` | Show a non-terminal waiting notice after this many seconds without a Codex app-server event; `0` disables it. It does not auto-interrupt long reasoning or tools. |
 | `RING_MAX_EVENTS` / `RING_MAX_BYTES` / `TOOL_RESULT_MAX` | see `.env.example` | Live-tail buffer / tool-output truncation tuning. |
 | `HISTORY_SOURCE_MAX_BYTES` | `67108864` | Safe source limit for one Claude transcript; larger SDK transcripts return an explicit error instead of exhausting memory. Codex rollouts are not subject to this whole-file cap. |
 | `CODEX_HISTORY_WINDOW_MAX_BYTES` | `33554432` | Maximum Codex rollout source window parsed per page. Long histories stream backwards by turn; an oversized single turn keeps its recent tail plus a stable cursor for loading older history. |

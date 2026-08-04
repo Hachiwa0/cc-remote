@@ -289,6 +289,90 @@ def test_summary_page_is_chronological_and_preserves_native_identity():
     asyncio.run(run())
 
 
+def test_summary_page_recovers_goal_prompt_for_assistant_only_native_turn():
+    recover_calls = []
+
+    async def rpc(_method, _params, cwd=None):
+        assert cwd is None
+        return {
+            "data": [_turn(
+                "native-goal",
+                [_agent("answer-goal", "proof")],
+            )],
+            "nextCursor": None,
+        }
+
+    async def recover_users(thread_id, native_turn_ids):
+        recover_calls.append((thread_id, native_turn_ids))
+        return {
+            native_turn_id: UserMsg(
+                msg_id=native_turn_id,
+                prompt="证明泰勒展开",
+            )
+            for native_turn_id in native_turn_ids
+        }
+
+    async def run():
+        page = await CodexOfficialHistory(
+            64 * 1024,
+            rpc=rpc,
+            recover_users=recover_users,
+        ).summary_page("thread-goal", before=None, limit=1)
+
+        assert recover_calls == [(
+            "thread-goal", ("native-goal",),
+        )]
+        assert [(turn["id"], turn["prompt"]) for turn in page.turns] == [
+            ("native-goal", "证明泰勒展开"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_summary_page_batches_automatic_user_recovery_and_live_prompt_replaces_miss():
+    recover_calls = []
+
+    async def rpc(_method, _params, cwd=None):
+        assert cwd is None
+        return {
+            "data": [
+                _turn(f"native-{index}", [_agent(f"answer-{index}", "done")])
+                for index in range(4)
+            ],
+            "nextCursor": None,
+        }
+
+    async def recover_users(thread_id, native_turn_ids):
+        recover_calls.append((thread_id, native_turn_ids))
+        return {}
+
+    async def run():
+        history = CodexOfficialHistory(
+            64 * 1024,
+            rpc=rpc,
+            recover_users=recover_users,
+        )
+        first = await history.summary_page("thread-goal", before=None, limit=4)
+        assert recover_calls == [(
+            "thread-goal",
+            ("native-0", "native-1", "native-2", "native-3"),
+        )]
+        assert [turn["prompt"] for turn in first.turns] == ["", "", "", ""]
+
+        history.remember_automatic_user(
+            "thread-goal",
+            "native-3",
+            UserMsg(msg_id="native-3", prompt="后来落盘的 Goal"),
+        )
+        second = await history.summary_page("thread-goal", before=None, limit=4)
+        assert len(recover_calls) == 1
+        assert [turn["prompt"] for turn in second.turns] == [
+            "后来落盘的 Goal", "", "", "",
+        ]
+
+    asyncio.run(run())
+
+
 def test_failed_network_summary_keeps_specific_safe_product_copy():
     async def rpc(_method, _params, cwd=None):
         assert cwd is None
@@ -912,6 +996,44 @@ def test_rollout_user_recovery_is_bound_to_the_native_turn(tmp_path):
     }]
     assert codex_history_turn_user(
         str(rollout), "missing-turn", "user-image") is None
+
+
+def test_rollout_user_recovery_restores_only_a_changed_goal_objective(tmp_path):
+    rollout = tmp_path / "rollout-goal.jsonl"
+    goal = {
+        "threadId": "thread-goal",
+        "objective": "证明泰勒展开",
+        "status": "active",
+        "tokensUsed": 0,
+        "timeUsedSeconds": 0,
+        "createdAt": 1,
+        "updatedAt": 1,
+    }
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in [
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": goal}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "goal-new"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "goal-new"}},
+        {"timestamp": "2026-01-01T00:01:01Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             **goal, "tokensUsed": 10, "updatedAt": 2,
+         }}},
+        {"timestamp": "2026-01-01T00:01:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "goal-resume"}},
+        {"timestamp": "2026-01-01T00:01:03Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "goal-resume"}},
+    ]))
+
+    recovered = codex_history_turn_user(
+        str(rollout), "goal-new", "goal-new",
+    )
+    assert recovered is not None
+    assert recovered.prompt == "证明泰勒展开"
+    assert codex_history_turn_user(
+        str(rollout), "goal-resume", "goal-resume",
+    ) is None
 
 
 def test_rollout_user_recovery_selects_later_steer_images(tmp_path):

@@ -241,12 +241,6 @@ class WrapperConfig:
     # Seconds to wait for the terminal ResultMessage after interrupt() before
     # forcing an SDK reconnect (drain safety net).
     drain_timeout: float = field(default_factory=lambda: _float("DRAIN_TIMEOUT", 15.0))
-    # A Codex turn may legitimately run for a long time, so this is a warning,
-    # not an automatic interrupt. Any raw app-server event resets the idle clock.
-    # Set 0 to disable.
-    codex_turn_idle_warn_seconds: float = field(
-        default_factory=lambda: _float("CODEX_TURN_IDLE_WARN_SECONDS", 90.0)
-    )
     # Code sessions prefer Codex's official shared app-server daemon so the
     # native TUI and Remote can attach to the same thread/control plane. Work
     # intentionally keeps its private stdio app-server for isolation.
@@ -576,10 +570,6 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
             "CODEX_HISTORY_WINDOW_MAX_BYTES must be between 1048576 and 268435456")
     if not (0 < cfg.drain_timeout <= 300):
         errors.append("DRAIN_TIMEOUT must be greater than 0 and at most 300")
-    if (cfg.codex_turn_idle_warn_seconds != 0
-            and not (5 <= cfg.codex_turn_idle_warn_seconds <= 3600)):
-        errors.append(
-            "CODEX_TURN_IDLE_WARN_SECONDS must be 0 or between 5 and 3600")
     if cfg.codex_daemon_mode not in {"auto", "off"}:
         errors.append("CC_REMOTE_CODEX_DAEMON must be auto or off")
 

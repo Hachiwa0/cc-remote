@@ -1559,6 +1559,45 @@ test("completed chat formulas lazy-load accessible KaTeX markup", async ({
     .toHaveCount(0);
 });
 
+test("a completed streaming formula renders while following the live tail", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?streaming-math=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await waitForScrollIdle(page);
+  await expect(page.locator('[data-turn-id="streaming-math"] .katex'))
+    .toHaveCount(0);
+
+  await page.getByTestId("close-streaming-formula").evaluate(
+    (button: HTMLButtonElement) => button.click(),
+  );
+  await expect(page.locator('[data-turn-id="streaming-math"] .katex'))
+    .toHaveCount(1);
+  await expect.poll(async () => viewport.evaluate((node) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight,
+  )).toBeLessThan(2);
+});
+
+test("streaming formula closure preserves a non-bottom reading anchor", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?streaming-math=1");
+  await wheelUntilTurn(
+    page, "math-before-4", -1_200, testInfo.project.name,
+  );
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await page.getByTestId("close-streaming-formula").evaluate(
+    (button: HTMLButtonElement) => button.click(),
+  );
+  await page.waitForTimeout(150);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+});
+
 test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
   page,
 }) => {
@@ -2202,7 +2241,13 @@ test("browse live updates stay passive until the user returns to latest", async 
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
   await expect(page.locator('[data-turn-id="live-41"]')).toHaveCount(0);
 
-  await page.getByRole("button", { name: "回到最新" }).click();
+  const returnButton = page.getByRole("button", { name: "回到最新" });
+  await expect(returnButton).toHaveText("");
+  const buttonBox = await returnButton.boundingBox();
+  expect(buttonBox).not.toBeNull();
+  expect(Math.abs((buttonBox?.width ?? 0) - (buttonBox?.height ?? 0)))
+    .toBeLessThan(1);
+  await returnButton.click();
   await expect(page.locator('[data-turn-id="live-41"]')).toBeVisible();
   await expect(page.getByRole("button", { name: "回到最新" })).toHaveCount(0);
 });
@@ -2440,7 +2485,20 @@ test("goal entry stays compact and opens its editor", async ({ page }) => {
   expect(box.width).toBeLessThan(viewport.width - 20);
 
   await chip.click();
-  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toBeVisible();
+  const dialog = page.getByRole("dialog", { name: "Codex Goal" });
+  await expect(dialog).toBeVisible();
+  const dialogBox = await dialog.boundingBox();
+  if (!dialogBox || !viewport) throw new Error("goal dialog has no geometry");
+  expect(dialogBox.width).toBeLessThanOrEqual(Math.min(580, viewport.width));
+  const statCards = dialog.locator(".goal-stats > div");
+  await expect(statCards).toHaveCount(3);
+  expect(await statCards.first().evaluate((node) =>
+    getComputedStyle(node).borderTopWidth)).toBe("0px");
+  const icon = dialog.locator(".goal-sheet-icon");
+  expect(await icon.evaluate((node) => {
+    const style = getComputedStyle(node);
+    return style.backgroundColor !== style.color;
+  })).toBe(true);
   await page.locator(".scrim.show").click({ position: { x: 5, y: 5 } });
   await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
 });
@@ -2453,6 +2511,36 @@ test("budgeted goal keeps its blocked status visible on mobile", async ({
   await expect(chip).toHaveAttribute("aria-label", /受阻/);
   await expect(chip.locator(".goal-chip-ring"))
     .toHaveClass(/goal-chip-ring-blocked/);
+});
+
+test("goal editor stays inside the tablet visual viewport above the keyboard", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await page.goto("/tests/history-browser.html?goal-ui=1");
+  await page.getByRole("button", { name: "查看 Goal" }).click();
+  const dialog = page.getByRole("dialog", { name: "Codex Goal" });
+  await expect(dialog).toBeVisible();
+
+  const visualTop = 20;
+  const visualHeight = 560;
+  await page.evaluate(({ top, height }) => {
+    const root = document.documentElement;
+    root.style.setProperty("--app-offset-top", `${top}px`);
+    root.style.setProperty("--app-height", `${height}px`);
+    root.style.setProperty(
+      "--keyboard-inset", `${window.innerHeight - top - height}px`,
+    );
+  }, { top: visualTop, height: visualHeight });
+  await dialog.locator("textarea").focus();
+
+  await expect.poll(async () => dialog.boundingBox()).not.toBeNull();
+  const box = await dialog.boundingBox();
+  if (!box) throw new Error("goal dialog has no tablet geometry");
+  expect(box.y).toBeGreaterThanOrEqual(visualTop - 1);
+  expect(box.y + box.height).toBeLessThanOrEqual(
+    visualTop + visualHeight + 1,
+  );
 });
 
 test("desktop text selection keeps its original virtual turn while edge-dragging", async ({

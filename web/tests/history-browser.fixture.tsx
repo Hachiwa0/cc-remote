@@ -238,6 +238,22 @@ function streamingTurn(id: string, paragraphs = 1): Turn {
   };
 }
 
+function streamingMathTurn(complete: boolean): Turn {
+  return {
+    id: "streaming-math",
+    prompt: "流式公式",
+    blocks: [{
+      kind: "text",
+      message_id: "streaming-math-message",
+      channel: "final",
+      text: String.raw`推导：\(x^2 + y^2 = r^2${complete ? String.raw`\)` : ""}`,
+      done: false,
+    }],
+    done: false,
+    ts: Date.now(),
+  };
+}
+
 function dualImageTurn(): Turn {
   return {
     id: "dual-image",
@@ -1020,6 +1036,7 @@ function HistoryConversationBrowserFixture() {
   const invalidMermaid = params.has("invalid-mermaid");
   const mermaidHistory = params.has("mermaid-history");
   const math = params.has("math");
+  const streamingMath = params.has("streaming-math");
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
   const quotaComposer = params.has("quota-composer");
@@ -1058,6 +1075,13 @@ function HistoryConversationBrowserFixture() {
       )];
     }
     if (math) return [mathTurn()];
+    if (streamingMath) {
+      return [
+        ...Array.from({ length: 8 }, (_, index) =>
+          finalTurn(`math-before-${index + 1}`, 3)),
+        streamingMathTurn(false),
+      ];
+    }
     if (mermaidHistory) {
       return [
         mermaidTurn(),
@@ -1090,7 +1114,7 @@ function HistoryConversationBrowserFixture() {
   }, [
     actualMermaid, compactTools, detailPaging, detailRetainedPreview,
     detailScrollCancel, dualImage,
-    interactiveTimeline, math,
+    interactiveTimeline, math, streamingMath,
     deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
     timeline,
   ]);
@@ -1100,7 +1124,7 @@ function HistoryConversationBrowserFixture() {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
       hasMore: !compactTools && !detailPaging && !invalidMermaid && !large && !mermaid
-        && !mermaidHistory && !math && !timeline && !deepBrowse
+        && !mermaidHistory && !math && !streamingMath && !timeline && !deepBrowse
         && !delayedHistoryAvailability,
       pagesLoaded: 0,
       hasNewer: deepBrowse,
@@ -1478,6 +1502,20 @@ function HistoryConversationBrowserFixture() {
     });
   };
 
+  const closeStreamingFormula = () => {
+    setSessions((current) => {
+      const session = current[sid];
+      return {
+        ...current,
+        [sid]: {
+          ...session,
+          turns: session.turns.map((turn) => turn.id === "streaming-math"
+            ? streamingMathTurn(true) : turn),
+        },
+      };
+    });
+  };
+
   const growBackgroundStreamingTurn = () => {
     setSessions((current) => {
       const targetSid = "history-browser-session-a";
@@ -1674,6 +1712,12 @@ function HistoryConversationBrowserFixture() {
               grow background stream
             </button>
           </>
+        )}
+        {streamingMath && (
+          <button data-testid="close-streaming-formula" type="button"
+            onClick={closeStreamingFormula}>
+            close formula
+          </button>
         )}
         {manualGrowth && (
           <button data-testid="grow-row" type="button"
@@ -1934,6 +1978,7 @@ function GoalUiFixture({ status }: { status: string | null }) {
     tokenBudget: 100_000,
     tokensUsed: 37_000,
     timeUsedSeconds: 321,
+    lastReason: "已完成协议兼容性检查，正在验证三端同步状态。",
   };
   return (
     <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>

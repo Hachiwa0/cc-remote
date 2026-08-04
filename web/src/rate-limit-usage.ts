@@ -65,7 +65,7 @@ export function accountQuotaWindows(
 
 export function quotaTone(value: number | null): QuotaTone {
   if (value == null) return "unknown";
-  if (value <= 5) return "critical";
-  if (value <= 20) return "warn";
+  if (value <= 20) return "critical";
+  if (value <= 50) return "warn";
   return "good";
 }

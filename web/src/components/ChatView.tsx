@@ -2502,14 +2502,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       {(!scrollState.followOutput || !scrollState.nearBottom) && (
         <div className="scroll-bottom-wrap">
           <button className="scroll-bottom-btn" onClick={returnToLatest}
-            style={browseMode ? {
-              width: "auto", padding: "0 12px",
-              gridAutoFlow: "column", gap: 5,
-            } : undefined}
             aria-label={browseMode ? "回到最新" : "滚动到底部"}
             data-tooltip={browseMode ? "回到最新" : undefined}>
             <Icon name="chev" size={20} />
-            {browseMode && <span style={{ fontSize: 12 }}>回到最新</span>}
           </button>
         </div>
       )}

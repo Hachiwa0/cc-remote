@@ -87,6 +87,8 @@ _REVERSE_HISTORY_CHUNK_BYTES = 1024 * 1024
 _MAX_HISTORY_REVERSE_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_FORWARD_BYTES = 64 * 1024 * 1024
+_MAX_OFFICIAL_AUTOMATIC_USER_SCAN_BYTES = 64 * 1024 * 1024
+_GOAL_TURN_CORRELATION_SECONDS = 5.0
 _MAX_PENDING_HISTORY_COMPACTIONS = 32
 _MAX_HISTORY_IMAGE_VIEWS_PER_SEGMENT = 128
 _MAX_HISTORY_IMAGE_BYTES_PER_SEGMENT = 64 * 1024 * 1024
@@ -142,7 +144,11 @@ def _bounded_jsonl_records(file, *, end_offset: int | None = None):
             line = file.readline(read_limit)
 
 
-def _reverse_jsonl_records(path: str):
+def _reverse_jsonl_records(
+    path: str,
+    *,
+    max_scan_bytes: int | None = None,
+):
     """Yield ``(byte_offset, line)`` from newest to oldest without buffering.
 
     Fixed-size reverse reads avoid mmap implementations faulting a large part
@@ -153,11 +159,17 @@ def _reverse_jsonl_records(path: str):
         size = os.fstat(source.fileno()).st_size
         if size <= 0:
             return
+        floor = 0
+        if max_scan_bytes is not None:
+            floor = max(0, size - max(0, int(max_scan_bytes)))
         position = size
         carry = b""
         dropping_oversized = False
-        while position > 0:
-            read_size = min(_REVERSE_HISTORY_CHUNK_BYTES, position)
+        while position > floor:
+            read_size = min(
+                _REVERSE_HISTORY_CHUNK_BYTES,
+                position - floor,
+            )
             position -= read_size
             source.seek(position)
             chunk = source.read(read_size)
@@ -188,7 +200,7 @@ def _reverse_jsonl_records(path: str):
             if dropping_oversized:
                 carry = b""
 
-        if (not dropping_oversized and carry
+        if (floor == 0 and not dropping_oversized and carry
                 and len(carry) <= _MAX_HISTORY_REVERSE_RECORD_BYTES):
             yield 0, carry
 
@@ -338,9 +350,188 @@ def _history_account_switch_marker(line: bytes) -> bool:
     )
 
 
-def _history_boundaries(path: str, *, use_turns: bool):
+def _history_goal_record(
+    line: bytes,
+) -> tuple[
+    str, str | None, float | None, float | None, str | None,
+] | None:
+    """Return the public Goal state carried by one bounded rollout record."""
+    if (
+        len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+        or b"thread_goal_" not in line
+    ):
+        return None
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    payload = row.get("payload") if isinstance(row, dict) else None
+    if row.get("type") != "event_msg" or not isinstance(payload, dict):
+        return None
+    payload_type = payload.get("type")
+    if payload_type == "thread_goal_cleared":
+        return ("cleared", None, None, None, None)
+    if payload_type != "thread_goal_updated":
+        return None
+    goal = payload.get("goal")
+    if not isinstance(goal, dict):
+        return None
+    objective = goal.get("objective")
+    if not isinstance(objective, str) or not objective:
+        return None
+    created_at = goal.get("createdAt")
+    updated_at = goal.get("updatedAt")
+    status = goal.get("status")
+    return (
+        "updated",
+        objective,
+        float(created_at)
+        if isinstance(created_at, (int, float))
+        and not isinstance(created_at, bool) else None,
+        float(updated_at)
+        if isinstance(updated_at, (int, float))
+        and not isinstance(updated_at, bool) else None,
+        status if isinstance(status, str) else None,
+    )
+
+
+def _history_record_timestamp(line: bytes) -> float | None:
+    try:
+        row = json.loads(line)
+        return datetime.fromisoformat(
+            str(row.get("timestamp", "")).replace("Z", "+00:00")
+        ).timestamp()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _goal_turn_correlated(
+    goal_timestamp: float | None,
+    turn_timestamp: float | None,
+) -> bool:
+    return bool(
+        goal_timestamp is not None
+        and turn_timestamp is not None
+        and 0 <= turn_timestamp - goal_timestamp
+        <= _GOAL_TURN_CORRELATION_SECONDS
+    )
+
+
+def _history_goal_prompt_before_boundary(
+    path: str,
+    boundary_offset: int,
+    *,
+    max_scan_bytes: int = 4 * 1024 * 1024,
+) -> tuple[str, float | None] | None:
+    """Find a changed Goal objective immediately preceding one task start.
+
+    The lookup is bounded and reads backwards from the already-authoritative
+    native task boundary. A status-only Goal update repeats the previous
+    objective and therefore remains an assistant-only continuation.
+    """
+    if boundary_offset < 0:
+        return None
+    start = max(0, boundary_offset - max_scan_bytes)
+    try:
+        with open(path, "rb") as source:
+            source.seek(start)
+            data = source.read(boundary_offset - start)
+            source.seek(boundary_offset)
+            boundary_line = source.readline(
+                _MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1,
+            )
+    except OSError:
+        return None
+    boundary_timestamp = _history_record_timestamp(
+        boundary_line.rstrip(b"\r\n"))
+    candidate: tuple[
+        str, float | None, float | None, float | None,
+    ] | None = None
+    boundary_record = _history_goal_record(boundary_line.rstrip(b"\r\n"))
+    if (
+        boundary_record is not None
+        and boundary_record[0] == "updated"
+        and boundary_record[4] == "active"
+    ):
+        _kind, objective, created_at, updated_at, _status = boundary_record
+        if objective is not None:
+            timestamp = boundary_timestamp
+            candidate = (objective, created_at, updated_at, timestamp)
+    for raw in reversed(data.splitlines()):
+        if len(raw) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES:
+            continue
+        record = _history_goal_record(raw)
+        if record is not None:
+            kind, objective, created_at, updated_at, status = record
+            if candidate is None:
+                if kind == "cleared" or objective is None or status != "active":
+                    return None
+                timestamp = _history_record_timestamp(raw)
+                candidate = (
+                    objective, created_at, updated_at, timestamp)
+                continue
+            previous_objective = objective if kind == "updated" else None
+            return (
+                (candidate[0], candidate[3])
+                if candidate[0] != previous_objective
+                and _goal_turn_correlated(
+                    candidate[3], boundary_timestamp)
+                else None
+            )
+        if candidate is None:
+            if _history_turn_cursor(raw) is not None:
+                return None
+            user_cursor = _history_user_cursor(path, 0, raw)
+            if user_cursor is not None:
+                return None
+    if candidate is None:
+        return None
+    # At the beginning of a rollout, creation time equality is the only
+    # authoritative proof that this is a new objective rather than a resumed
+    # pre-existing Goal whose earlier state lies outside the bounded window.
+    return (
+        (candidate[0], candidate[3])
+        if candidate[1] is not None and candidate[1] == candidate[2]
+        and _goal_turn_correlated(candidate[3], boundary_timestamp)
+        else None
+    )
+
+
+def _history_goal_objective_before_offset(
+    path: str,
+    offset: int,
+    *,
+    max_scan_bytes: int = 4 * 1024 * 1024,
+) -> tuple[bool, str | None]:
+    """Return the nearest bounded Goal baseline before a history page."""
+    if offset <= 0:
+        return (False, None)
+    start = max(0, offset - max_scan_bytes)
+    try:
+        with open(path, "rb") as source:
+            source.seek(start)
+            data = source.read(offset - start)
+    except OSError:
+        return (False, None)
+    for raw in reversed(data.splitlines()):
+        record = _history_goal_record(raw)
+        if record is None:
+            continue
+        kind, objective, _created_at, _updated_at, _status = record
+        return (True, objective if kind == "updated" else None)
+    return (False, None)
+
+
+def _history_boundaries(
+    path: str,
+    *,
+    use_turns: bool,
+    max_scan_bytes: int | None = None,
+):
     if not use_turns:
-        for offset, line in _reverse_jsonl_records(path):
+        for offset, line in _reverse_jsonl_records(
+            path, max_scan_bytes=max_scan_bytes,
+        ):
             cursor = _history_user_cursor(path, offset, line)
             if cursor is not None:
                 yield offset, cursor
@@ -359,7 +550,9 @@ def _history_boundaries(path: str, *, use_turns: bool):
     segment_users: list[tuple[int, str, str]] = []
     segment_account_switch = False
     pending_assistant_only: tuple[int, str] | None = None
-    for offset, line in _reverse_jsonl_records(path):
+    for offset, line in _reverse_jsonl_records(
+        path, max_scan_bytes=max_scan_bytes,
+    ):
         if _history_account_switch_marker(line):
             segment_account_switch = True
             continue
@@ -398,6 +591,13 @@ def _history_boundaries(path: str, *, use_turns: bool):
                 and _history_terminal_marker(line)):
             yield pending_assistant_only
             pending_assistant_only = None
+    if (
+        pending_assistant_only is not None
+        and _history_goal_prompt_before_boundary(
+            path, pending_assistant_only[0],
+        ) is not None
+    ):
+        yield pending_assistant_only
 
 
 def codex_history_window(
@@ -514,7 +714,7 @@ def codex_history_boundary_user(
             payload_type = payload.get("type")
             if row_type == "event_msg" and payload_type == "task_started":
                 if saw_task_start:
-                    return None
+                    break
                 saw_task_start = True
                 continue
             if (row_type == "response_item"
@@ -548,7 +748,16 @@ def codex_history_boundary_user(
                 except (TypeError, ValueError):
                     pass
             return event
-    return None
+    goal_prompt = _history_goal_prompt_before_boundary(
+        path, boundary_offset,
+    )
+    if goal_prompt is None or user_index != 0:
+        return None
+    prompt, timestamp = goal_prompt
+    event = UserMsg(msg_id=cursor, prompt=prompt)
+    if timestamp is not None:
+        event.ts = timestamp
+    return event
 
 
 def codex_history_turn_user(
@@ -582,6 +791,45 @@ def codex_history_turn_user(
     except OSError:
         return None
     return None
+
+
+def codex_history_turn_users(
+    path: str,
+    turn_ids: tuple[str, ...],
+    *,
+    max_scan_bytes: int = _MAX_OFFICIAL_AUTOMATIC_USER_SCAN_BYTES,
+) -> dict[str, UserMsg]:
+    """Recover a bounded set of assistant-only Goal prompts in one reverse pass.
+
+    Official summary pages must never walk a multi-gigabyte rollout once per
+    row.  The live projection fills misses authoritatively; this compatibility
+    lookup inspects only a bounded recent tail for sessions created before that
+    live overlay existed.
+    """
+    targets = {
+        turn_id for turn_id in turn_ids
+        if isinstance(turn_id, str) and _SAFE_WIRE_ID.fullmatch(turn_id)
+    }
+    if not targets:
+        return {}
+    recovered: dict[str, UserMsg] = {}
+    try:
+        for offset, boundary in _history_boundaries(
+            path,
+            use_turns=True,
+            max_scan_bytes=max_scan_bytes,
+        ):
+            if boundary not in targets:
+                continue
+            user = codex_history_boundary_user(path, offset, boundary)
+            if user is not None and user.prompt:
+                recovered[boundary] = user
+            targets.remove(boundary)
+            if not targets:
+                break
+    except OSError:
+        return recovered
+    return recovered
 
 
 def codex_native_rollback_turns(path: str, logical_turns: int) -> int:
@@ -2364,6 +2612,14 @@ def codex_translate_history(
         tuple[str, float | None, str | None]
     ] = []
     pending_agent_message: tuple[dict, int, str] | None = None
+    goal_baseline_known, goal_objective = (
+        _history_goal_objective_before_offset(path, start_offset)
+    )
+    pending_goal_prompt: tuple[str, float | None] | None = None
+    pending_task_goal_prompt: tuple[
+        str, float | None, str, int, str,
+    ] | None = None
+    pending_task_started: tuple[str, float | None, int, str] | None = None
     completed_plan: tuple[str, str] | None = None
     task_has_user = False
     seen_tool_uses: set[str] = set()
@@ -2523,6 +2779,48 @@ def codex_translate_history(
         seen_tool_results.add(result.tool_use_id)
         turn_visible = True
 
+    def materialize_pending_goal_turn() -> bool:
+        """Create a Goal user anchor only after its native turn is visible.
+
+        ``thread_goal_updated`` and ``task_started`` are metadata, not proof
+        that a model turn ran.  A real assistant/tool/terminal record calls
+        this helper; a following ordinary ``user_message`` discards the
+        candidate before it can steal that prompt.
+        """
+        nonlocal pending_task_goal_prompt, turn_open, active_turn_id
+        nonlocal active_msg_id, pending_turn_id, turn_visible
+        nonlocal turn_text_visible, turn_final_visible, turn_has_user
+        nonlocal turn_continuation_reason, source_continuation_available
+        nonlocal task_has_user
+        candidate = pending_task_goal_prompt
+        if candidate is None:
+            return False
+        pending_task_goal_prompt = None
+        prompt, prompt_ts, turn_id, line_no, raw_ts = candidate
+        if turn_open:
+            close_turn(
+                "error", 0, True,
+                authoritative_boundary=False,
+            )
+        active_turn_id = turn_id
+        pending_turn_id = turn_id
+        uid = _history_id(turn_id, "user", line_no, raw_ts)
+        active_msg_id = uid
+        user = UserMsg(msg_id=uid, prompt=prompt)
+        if prompt_ts is not None:
+            user.ts = prompt_ts
+        events.append(user)
+        turn_open = True
+        turn_visible = False
+        turn_text_visible = False
+        turn_final_visible = False
+        turn_has_user = True
+        turn_continuation_reason = None
+        source_continuation_available = False
+        task_has_user = True
+        flush_pending_compactions(active_turn_id)
+        return True
+
     def open_assistant_only_turn(
         reason: str | None = None,
         turn_id: str | None = None,
@@ -2537,6 +2835,7 @@ def codex_translate_history(
         nonlocal turn_visible, turn_text_visible, turn_final_visible
         nonlocal turn_has_user, turn_continuation_reason
         nonlocal source_continuation_available
+        materialize_pending_goal_turn()
         if turn_open:
             if (not turn_has_user and reason is not None
                     and turn_continuation_reason is None):
@@ -2563,6 +2862,7 @@ def codex_translate_history(
         flush_pending_compactions(active_turn_id)
 
     def materialize_pending_terminal(value) -> None:
+        materialize_pending_goal_turn()
         if not pending_compactions or turn_open:
             return
         terminal_owner = _history_optional_turn_id(value)
@@ -2671,7 +2971,8 @@ def codex_translate_history(
         nonlocal turn_open, active_turn_id, active_msg_id, pending_turn_id
         nonlocal assistant_open, cur_mid, turn_visible, turn_text_visible
         nonlocal turn_final_visible, turn_has_user, turn_continuation_reason
-        nonlocal completed_plan
+        nonlocal completed_plan, pending_task_goal_prompt
+        nonlocal pending_task_started
         if not turn_open:
             return
         close_assistant()
@@ -2703,6 +3004,8 @@ def codex_translate_history(
         turn_has_user = False
         turn_continuation_reason = None
         completed_plan = None
+        pending_task_goal_prompt = None
+        pending_task_started = None
         pending_compactions.clear()
 
     try:
@@ -2766,7 +3069,64 @@ def codex_translate_history(
                         img = _data_uri_to_img(it.get("image_url"))
                         if img:
                             pending_images.append(img)
+            elif t == "event_msg" and payload_type == "thread_goal_updated":
+                goal = p.get("goal")
+                if isinstance(goal, dict):
+                    objective = goal.get("objective")
+                    created_at = goal.get("createdAt")
+                    updated_at = goal.get("updatedAt")
+                    status = goal.get("status")
+                    if isinstance(objective, str) and objective:
+                        objective_changed = bool(
+                            objective != goal_objective
+                            and (
+                                goal_baseline_known
+                                or (
+                                    isinstance(created_at, (int, float))
+                                    and not isinstance(created_at, bool)
+                                    and created_at == updated_at
+                                )
+                            )
+                        )
+                        goal_objective = objective
+                        goal_baseline_known = True
+                        if status != "active":
+                            pending_goal_prompt = None
+                            pending_task_goal_prompt = None
+                        if objective_changed and status == "active":
+                            pending_goal_prompt = (objective, ts)
+                            if (
+                                pending_task_started is not None
+                                and not task_has_user
+                            ):
+                                (
+                                    task_turn_id,
+                                    task_ts,
+                                    task_line_no,
+                                    task_raw_ts,
+                                ) = pending_task_started
+                                if (
+                                    ts is not None
+                                    and task_ts is not None
+                                    and 0 <= ts - task_ts
+                                    <= _GOAL_TURN_CORRELATION_SECONDS
+                                ):
+                                    pending_task_goal_prompt = (
+                                        objective,
+                                        ts,
+                                        task_turn_id,
+                                        task_line_no,
+                                        task_raw_ts,
+                                    )
+                                    pending_goal_prompt = None
+            elif t == "event_msg" and payload_type == "thread_goal_cleared":
+                goal_objective = None
+                goal_baseline_known = True
+                pending_goal_prompt = None
+                pending_task_goal_prompt = None
             elif t == "event_msg" and payload_type == "task_started":
+                pending_task_goal_prompt = None
+                pending_task_started = None
                 next_turn_id = p.get("turn_id")
                 if next_turn_id:
                     next_turn_id = str(next_turn_id)
@@ -2780,7 +3140,25 @@ def codex_translate_history(
                         pending_compactions.clear()
                     pending_turn_id = next_turn_id
                 task_has_user = False
+                if pending_turn_id:
+                    pending_task_started = (
+                        str(pending_turn_id), ts, line_no, raw_ts,
+                    )
+                if pending_goal_prompt is not None and pending_task_started:
+                    prompt, prompt_ts = pending_goal_prompt
+                    if _goal_turn_correlated(prompt_ts, ts):
+                        pending_task_goal_prompt = (
+                            prompt,
+                            prompt_ts if prompt_ts is not None else ts,
+                            pending_task_started[0],
+                            line_no,
+                            raw_ts,
+                        )
+                pending_goal_prompt = None
             elif t == "event_msg" and payload_type == "user_message":
+                pending_goal_prompt = None
+                pending_task_goal_prompt = None
+                pending_task_started = None
                 raw_client_id = p.get("client_id")
                 pending_user_message_id = (
                     raw_client_id

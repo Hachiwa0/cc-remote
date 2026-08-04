@@ -76,8 +76,8 @@ export function GoalPanel(p: Props) {
       <section className="sheet show goal-sheet" role="dialog" aria-modal="true" aria-label={`${engineName} Goal`}>
         <div className="sheet-grip" />
         <header className="goal-sheet-head">
-          <span className="goal-sheet-icon"><Icon name="verify" size={19} /></span>
-          <span><b>{engineName} Goal</b><small>持续运行，直到目标达成或被清除</small></span>
+          <span className="goal-sheet-icon"><Icon name="plan" size={18} /></span>
+          <span><b>{engineName} Goal</b><small>目标、预算与执行进展</small></span>
           <button onClick={p.onClose} aria-label="关闭"><Icon name="close" size={17} /></button>
         </header>
 
@@ -97,7 +97,7 @@ export function GoalPanel(p: Props) {
               <div><small>运行时间</small><b>{duration(goal.timeUsedSeconds)}</b></div>
               <div><small>{p.engine === "claude" ? "检查轮次" : "预算状态"}</small><b>{p.engine === "claude" ? String(goal.iterations ?? 0) : (total ? `${Math.round(progress ?? 0)}%` : "不限")}</b></div>
             </div>
-            {goal.lastReason && <div className="goal-last-check"><small>最近检查</small><p>{goal.lastReason}</p></div>}
+            {goal.lastReason && <div className="goal-last-check"><small>最近进展</small><p>{goal.lastReason}</p></div>}
           </div>}
 
           <div className="goal-editor">

@@ -603,7 +603,6 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `CODEX_WORK_ROOT` | `~/.codex/cc-remote/work` | Codex Work 的私有注册表、资料库、会话目录和策略文件根目录。 |
 | `MAX_CONCURRENT_SESSIONS` | `20` | 常驻 agent 子进程上限（内存随引擎/版本变化）。超了就驱逐 idle 的；客户端缓存仍在，可再切回。 |
 | `DRAIN_TIMEOUT` | `15` | interrupt 后等终止 ResultMessage 的秒数，超时强制重连（排空保险）。 |
-| `CODEX_TURN_IDLE_WARN_SECONDS` | `90` | Codex app-server 连续无事件时显示“仍在等待”提示；`0` 禁用。只提示，不自动打断 ultra 推理或长工具。 |
 | `RING_MAX_EVENTS` / `RING_MAX_BYTES` / `TOOL_RESULT_MAX` | 见 `.env.example` | 实时尾巴缓冲 / 工具输出截断上限调优。 |
 | `HISTORY_SOURCE_MAX_BYTES` | `67108864` | 单个 Claude transcript 的安全读取上限；超限返回明确错误，避免 SDK transcript 全量解析耗尽内存。Codex rollout 不受此总文件上限限制。 |
 | `CODEX_HISTORY_WINDOW_MAX_BYTES` | `33554432` | Codex 超长 rollout 每页最多解析的源窗口；历史按轮次从文件尾流式分页，单轮超限时保留最近窗口和可继续加载的稳定游标。 |

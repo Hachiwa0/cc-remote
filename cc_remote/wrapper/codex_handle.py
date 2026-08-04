@@ -1048,6 +1048,14 @@ class CodexHandle:
         self.last_goal: Optional[dict[str, Any]] = None
         self.goal_revision = 0
         self.last_goal_turn_id: Optional[str] = None
+        # A newly-created or actually-modified Goal objective is a visible user
+        # boundary even though app-server starts its turn without turn/start.
+        # Keep the objective separate from mutable Goal status/usage updates and
+        # consume it exactly once when the correlated native turn is projected.
+        self._goal_objective_baseline: Optional[str] = None
+        self._goal_baseline_loaded = False
+        self._goal_prompt_pending: OrderedDict[str, str] = OrderedDict()
+        self._goal_prompt_unbound: Optional[str] = None
         # A goal/automatic continuation can start without query(), hence without
         # a response queue owned by Machine._run_turn.  Track that one turn
         # separately so the machine can lock the session, expose interrupt, and
@@ -1292,6 +1300,10 @@ class CodexHandle:
         self.last_goal = None
         self.goal_revision = 0
         self.last_goal_turn_id = None
+        self._goal_objective_baseline = None
+        self._goal_baseline_loaded = False
+        self._goal_prompt_pending.clear()
+        self._goal_prompt_unbound = None
         self._spontaneous_turn_id = None
         self._compaction_continuation_turn_id = None
         self.last_token_usage = None
@@ -2646,14 +2658,33 @@ class CodexHandle:
         goal = (result or {}).get("goal")
         if goal is None:
             self.last_goal = None
+            self._goal_objective_baseline = None
+            self._goal_baseline_loaded = True
             return None
         self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
+        self._goal_objective_baseline = self.last_goal.get("objective")
+        self._goal_baseline_loaded = True
         return self.last_goal
+
+    def take_goal_prompt(self, turn_id: str) -> Optional[str]:
+        """Consume the one visible objective owned by ``turn_id``."""
+        return self._goal_prompt_pending.pop(turn_id, None)
 
     async def set_goal(self, *, objective: Optional[str] = None,
                        status: Optional[str] = None,
                        token_budget: Optional[int] = None) -> dict:
         assert self.thread_id, "connect() first"
+        if objective is not None and not self._goal_baseline_loaded:
+            try:
+                await self.get_goal()
+            except Exception as exc:
+                # The explicit mutation can still succeed. Keep the command's
+                # objective as correlation evidence instead of turning a
+                # read-only baseline failure into a false set failure.
+                log.warning(
+                    "codex goal baseline unavailable before mutation",
+                    error_type=type(exc).__name__,
+                )
         params = {"threadId": self.thread_id}
         if objective is not None:
             params["objective"] = objective
@@ -2661,11 +2692,34 @@ class CodexHandle:
             params["status"] = status
         if token_budget is not None:
             params["tokenBudget"] = token_budget
-        result = await self._request("thread/goal/set", params)
+        prompt_candidate = bool(
+            isinstance(objective, str)
+            and objective
+            and objective != self._goal_objective_baseline
+            and status in (None, "active")
+        )
+        if prompt_candidate:
+            # thread/goal/set may synchronously emit turn/started before its RPC
+            # response. Seed the candidate first so that exact spontaneous turn
+            # can claim it even if the goal notification is delayed or omitted.
+            self._goal_prompt_unbound = objective
+        try:
+            result = await self._request("thread/goal/set", params)
+        except BaseException:
+            if prompt_candidate and self._goal_prompt_unbound == objective:
+                self._goal_prompt_unbound = None
+            raise
         goal = (result or {}).get("goal")
         if not isinstance(goal, dict):
             raise RuntimeError("codex app-server did not return a goal")
         self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
+        self._goal_objective_baseline = self.last_goal.get("objective")
+        self._goal_baseline_loaded = True
+        if (
+            self.last_goal.get("status") != "active"
+            and self._goal_prompt_unbound == objective
+        ):
+            self._goal_prompt_unbound = None
         return self.last_goal
 
     async def clear_goal(self) -> bool:
@@ -2674,6 +2728,10 @@ class CodexHandle:
         cleared = bool((result or {}).get("cleared"))
         if cleared:
             self.last_goal = None
+            self._goal_objective_baseline = None
+            self._goal_baseline_loaded = True
+            self._goal_prompt_pending.clear()
+            self._goal_prompt_unbound = None
         return cleared
 
     async def start_review(self, target: dict[str, Any]) -> dict[str, str]:
@@ -3873,6 +3931,21 @@ class CodexHandle:
                     self._compaction_continuation_turn_id = None
                 self.turn_id = turn_id
                 self.remember_owned_turn_id(turn_id)
+            if (
+                isinstance(turn_id, str)
+                and turn_id
+                and self._goal_prompt_unbound is not None
+            ):
+                if not was_active and not review_execution_frame:
+                    self._goal_prompt_pending[turn_id] = (
+                        self._goal_prompt_unbound
+                    )
+                    self._goal_prompt_pending.move_to_end(turn_id)
+                    while len(self._goal_prompt_pending) > 8:
+                        self._goal_prompt_pending.popitem(last=False)
+                # Managed query/review turns have their own authoritative user
+                # boundary. Never let a stale Goal candidate steal one.
+                self._goal_prompt_unbound = None
             self.turn_active = True
             if (not was_active and isinstance(turn_id, str) and turn_id
                     and not review_execution_frame):
@@ -3944,17 +4017,55 @@ class CodexHandle:
                         error_type=type(exc).__name__,
                     )
                 else:
+                    previous_objective = self._goal_objective_baseline
+                    objective = goal.get("objective")
+                    created_at = goal.get("createdAt")
+                    updated_at = goal.get("updatedAt")
+                    objective_changed = bool(
+                        isinstance(objective, str)
+                        and objective
+                        and objective != previous_objective
+                        and (
+                            self._goal_baseline_loaded
+                            or (
+                                isinstance(created_at, (int, float))
+                                and not isinstance(created_at, bool)
+                                and created_at == updated_at
+                            )
+                        )
+                    )
                     self.last_goal = goal
+                    if isinstance(objective, str) and objective:
+                        self._goal_objective_baseline = objective
+                        self._goal_baseline_loaded = True
                     self.goal_revision += 1
                     turn_id = params.get("turnId")
                     self.last_goal_turn_id = (
                         turn_id if isinstance(turn_id, str) and turn_id else None
                     )
+                    if goal.get("status") != "active":
+                        self._goal_prompt_unbound = None
+                    if objective_changed and goal.get("status") == "active":
+                        if self.last_goal_turn_id is not None:
+                            self._goal_prompt_pending[
+                                self.last_goal_turn_id
+                            ] = objective
+                            self._goal_prompt_pending.move_to_end(
+                                self.last_goal_turn_id
+                            )
+                            while len(self._goal_prompt_pending) > 8:
+                                self._goal_prompt_pending.popitem(last=False)
+                        else:
+                            self._goal_prompt_unbound = objective
                     await self._publish_goal(goal)
         elif method == "thread/goal/cleared":
             params = m.get("params") or {}
             if params.get("threadId") == self.thread_id:
                 self.last_goal = None
+                self._goal_objective_baseline = None
+                self._goal_baseline_loaded = True
+                self._goal_prompt_pending.clear()
+                self._goal_prompt_unbound = None
                 self.goal_revision += 1
                 self.last_goal_turn_id = None
                 await self._publish_goal(None)
@@ -3963,6 +4074,8 @@ class CodexHandle:
             self.turn_active = False
             turn = (m.get("params") or {}).get("turn") or {}
             completed_turn_id = turn.get("id")
+            if isinstance(completed_turn_id, str):
+                self._goal_prompt_pending.pop(completed_turn_id, None)
             spontaneous_turn_id = self._spontaneous_turn_id
             if (
                 spontaneous_turn_id is not None

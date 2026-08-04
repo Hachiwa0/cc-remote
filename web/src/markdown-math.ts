@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Options as ReactMarkdownOptions } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -15,7 +15,7 @@ export interface MarkdownMathPlugins {
 let loadedPlugins: MarkdownMathPlugins | null = null;
 let loadingPlugins: Promise<MarkdownMathPlugins> | null = null;
 
-/** Load KaTeX only for a completed message which actually contains math.
+/** Load KaTeX only for a message which actually contains complete math.
  * Keeping this dynamic avoids adding the 259 KiB renderer to every mobile
  * history first paint. Exported for the zero-browser SSR regression harness. */
 export function preloadMarkdownMathPlugins(): Promise<MarkdownMathPlugins> {
@@ -56,12 +56,160 @@ function closesFence(line: string, fence: Fence): boolean {
     && match[1].length >= fence.length;
 }
 
-function slashIsEscaped(line: string, index: number): boolean {
-  let preceding = 0;
-  for (let cursor = index - 1; cursor >= 0 && line[cursor] === "\\"; cursor--) {
-    preceding += 1;
+interface MathSpan {
+  kind: "bracket-inline" | "bracket-display";
+  open: number;
+  close: number;
+  width: number;
+}
+
+interface MathScan {
+  bracketSpans: MathSpan[];
+  hasDollarSpan: boolean;
+}
+
+/** Find complete math delimiters without allocating source-sized masks.
+ *
+ * A later bracket opener replaces an unmatched one. During streaming this
+ * keeps a stale `\\(` from consuming the closer of a newer complete formula.
+ */
+function scanCompleteMath(source: string): MathScan {
+  const bracketSpans: MathSpan[] = [];
+  let hasDollarSpan = false;
+  let fence: Fence | null = null;
+  let inlineTicks = 0;
+  let bracketOpen: { kind: "(" | "["; index: number } | null = null;
+  let dollarOpen: { width: number; index: number } | null = null;
+  let lineStart = 0;
+  while (lineStart <= source.length) {
+    const newline = source.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 ? source.length : newline;
+    const line = source.slice(lineStart, lineEnd);
+    if (fence) {
+      if (closesFence(line, fence)) fence = null;
+    } else {
+      const opening = inlineTicks === 0 ? fenceAtLineStart(line) : null;
+      if (opening) {
+        fence = opening;
+      } else {
+        let slashRun = 0;
+        for (let index = lineStart; index < lineEnd;) {
+          const char = source[index];
+          if (char === "`") {
+            let end = index + 1;
+            while (end < lineEnd && source[end] === "`") end += 1;
+            const run = end - index;
+            if (inlineTicks === 0) inlineTicks = run;
+            else if (inlineTicks === run) inlineTicks = 0;
+            slashRun = 0;
+            index = end;
+            continue;
+          }
+
+          if (inlineTicks !== 0) {
+            slashRun = 0;
+            index += 1;
+            continue;
+          }
+
+          if (char === "\\") {
+            const escaped = slashRun % 2 === 1;
+            const token = source[index + 1];
+            if (!escaped && (token === "(" || token === "[")) {
+              bracketOpen = { kind: token, index };
+              slashRun = 0;
+              index += 2;
+              continue;
+            }
+            const expected = bracketOpen?.kind === "(" ? ")" : "]";
+            if (!escaped && bracketOpen && token === expected
+              && index > bracketOpen.index + 2) {
+              bracketSpans.push({
+                kind: bracketOpen.kind === "("
+                  ? "bracket-inline" : "bracket-display",
+                open: bracketOpen.index,
+                close: index,
+                width: 2,
+              });
+              bracketOpen = null;
+              slashRun = 0;
+              index += 2;
+              continue;
+            }
+            slashRun += 1;
+            index += 1;
+            continue;
+          }
+
+          if (char === "$") {
+            const escaped = slashRun % 2 === 1;
+            slashRun = 0;
+            if (escaped) {
+              index += 1;
+              continue;
+            }
+            const width = source[index + 1] === "$" ? 2 : 1;
+            if (dollarOpen === null || dollarOpen.width !== width) {
+              dollarOpen = { width, index };
+            } else if (index > dollarOpen.index + width) {
+              hasDollarSpan = true;
+              dollarOpen = null;
+            }
+            index += width;
+            continue;
+          }
+
+          slashRun = 0;
+          index += 1;
+        }
+      }
+    }
+    if (newline < 0) break;
+    lineStart = newline + 1;
   }
-  return preceding % 2 === 1;
+
+  return { bracketSpans, hasDollarSpan };
+}
+
+interface MathAnalysis {
+  active: boolean;
+  normalized: string;
+}
+
+function analyzeMath(source: string): MathAnalysis {
+  if (!source.includes("$") && !source.includes("\\(")
+    && !source.includes("\\[")) {
+    return { active: false, normalized: source };
+  }
+  const scan = scanCompleteMath(source);
+  const replacements = new Map<number, { width: number; text: string }>();
+  for (const span of scan.bracketSpans) {
+    if (span.kind === "bracket-inline") {
+      replacements.set(span.open, { width: 2, text: "$" });
+      replacements.set(span.close, { width: 2, text: "$" });
+    } else if (span.kind === "bracket-display") {
+      replacements.set(span.open, { width: 2, text: "\n$$\n" });
+      replacements.set(span.close, { width: 2, text: "\n$$\n" });
+    }
+  }
+  if (replacements.size === 0) {
+    return {
+      active: scan.hasDollarSpan || scan.bracketSpans.length > 0,
+      normalized: source,
+    };
+  }
+  let normalized = "";
+  for (let index = 0; index < source.length;) {
+    const replacement = replacements.get(index);
+    if (replacement) {
+      normalized += replacement.text;
+      index += replacement.width;
+    } else {
+      normalized += source[index];
+      index += 1;
+    }
+  }
+  return { active: true, normalized };
 }
 
 /** Normalize MathJax-style bracket delimiters for remark-math.
@@ -71,71 +219,49 @@ function slashIsEscaped(line: string, index: number): boolean {
  * code so examples and shell snippets remain byte-for-byte readable.
  */
 export function normalizeMathDelimiters(source: string): string {
-  let fence: Fence | null = null;
-  let inlineTicks = 0;
-  const normalized = source.split("\n").map((line) => {
-    if (fence) {
-      if (closesFence(line, fence)) fence = null;
-      return line;
-    }
-    if (inlineTicks === 0) {
-      const opening = fenceAtLineStart(line);
-      if (opening) {
-        fence = opening;
-        return line;
-      }
-    }
-
-    let output = "";
-    for (let index = 0; index < line.length;) {
-      if (line[index] === "`") {
-        let end = index + 1;
-        while (end < line.length && line[end] === "`") end += 1;
-        const run = end - index;
-        if (inlineTicks === 0) inlineTicks = run;
-        else if (inlineTicks === run) inlineTicks = 0;
-        output += line.slice(index, end);
-        index = end;
-        continue;
-      }
-      if (inlineTicks === 0 && line[index] === "\\"
-          && !slashIsEscaped(line, index)) {
-        const delimiter = line[index + 1];
-        if (delimiter === "(" || delimiter === ")") {
-          output += "$";
-          index += 2;
-          continue;
-        }
-        if (delimiter === "[" || delimiter === "]") {
-          output += "\n$$\n";
-          index += 2;
-          continue;
-        }
-      }
-      output += line[index];
-      index += 1;
-    }
-    return output;
-  });
-  return normalized.join("\n");
+  return analyzeMath(source).normalized;
 }
 
 export function hasMathDelimiters(source: string): boolean {
-  if (normalizeMathDelimiters(source) !== source) return true;
-  // remark-math performs the authoritative dollar parsing. This cheap hint may
-  // load the chunk for a literal currency sign; the parser still decides
-  // whether it forms a valid delimiter pair.
-  return source.includes("$");
+  return analyzeMath(source).active;
+}
+
+export interface MarkdownMathRenderState {
+  plugins: MarkdownMathPlugins | null;
+  normalizedSource: string;
 }
 
 export function useMarkdownMathPlugins(
   source: string,
   enabled: boolean,
-): MarkdownMathPlugins | null {
-  const shouldLoad = useMemo(
-    () => enabled && hasMathDelimiters(source),
-    [enabled, source],
-  );
+): MarkdownMathRenderState {
+  const sticky = useRef({
+    source: "",
+    normalized: "",
+    active: false,
+  });
+  if (!enabled) {
+    sticky.current = { source: "", normalized: "", active: false };
+  } else {
+    const previous = sticky.current;
+    const appended = source.startsWith(previous.source);
+    const delta = appended ? source.slice(previous.source.length) : "";
+    if (appended && !delta.includes("\\") && !delta.includes("$")) {
+      sticky.current = {
+        source,
+        normalized: previous.normalized + delta,
+        active: previous.active,
+      };
+    } else {
+      const analysis = analyzeMath(source);
+      sticky.current = {
+        source,
+        normalized: analysis.normalized,
+        active: analysis.active,
+      };
+    }
+  }
+  const shouldLoad = enabled && sticky.current.active;
   const [plugins, setPlugins] = useState<MarkdownMathPlugins | null>(
     shouldLoad ? loadedPlugins : null,
   );
@@ -147,7 +273,11 @@ export function useMarkdownMathPlugins(
     }).catch(() => undefined);
     return () => { cancelled = true; };
   }, [shouldLoad]);
-  return shouldLoad ? (plugins ?? loadedPlugins) : null;
+  const activePlugins = shouldLoad ? (plugins ?? loadedPlugins) : null;
+  return {
+    plugins: activePlugins,
+    normalizedSource: activePlugins ? sticky.current.normalized : source,
+  };
 }
 
 export function isMathFenceClass(className: string | undefined): boolean {

@@ -1623,7 +1623,6 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
 def test_managed_codex_overflow_reports_live_delay_without_idle_warning():
     async def run():
         machine, transport = _mk_machine()
-        machine.cfg.codex_turn_idle_warn_seconds = 0.02
         ctx = _mk_ctx("managed-overflow-wait", "managed-overflow-wait")
         ctx.engine = "codex"
         ctx.state = "running"

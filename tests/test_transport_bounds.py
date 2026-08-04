@@ -47,9 +47,6 @@ def test_wrapper_startup_config_fails_closed():
         validate_wrapper_config(_wrapper_cfg(cc_cwd="x" * 5000))
     with pytest.raises(ValueError, match="CC_RESUME_SESSION_ID"):
         validate_wrapper_config(_wrapper_cfg(resume_session_id="../bad id"))
-    with pytest.raises(ValueError, match="CODEX_TURN_IDLE_WARN_SECONDS"):
-        validate_wrapper_config(_wrapper_cfg(codex_turn_idle_warn_seconds=1))
-    validate_wrapper_config(_wrapper_cfg(codex_turn_idle_warn_seconds=0))
     with pytest.raises(ValueError, match="CC_REMOTE_CODEX_DAEMON"):
         validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="always"))
     validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="auto"))

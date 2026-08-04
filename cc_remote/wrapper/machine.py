@@ -181,6 +181,7 @@ from cc_remote.wrapper.codex_stream import (
     coalesce_codex_live_notifications,
     codex_history_image_views, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_turn_user,
+    codex_history_turn_users,
     codex_history_window,
     codex_native_rollback_turns,
     codex_translate_history,
@@ -1211,6 +1212,7 @@ class WrapperMachine:
         self._codex_history = CodexOfficialHistory(
             cfg.tool_result_max,
             recover_user=self._recover_official_codex_user,
+            recover_users=self._recover_official_codex_users,
         )
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
@@ -7133,6 +7135,21 @@ class WrapperMachine:
             user_index,
         )
 
+    async def _recover_official_codex_users(
+        self,
+        sid: str,
+        native_turn_ids: tuple[str, ...],
+    ) -> dict[str, UserMsg]:
+        """Recover assistant-only Goal prompts with one bounded rollout pass."""
+        path = await asyncio.to_thread(codex_rollout_path, sid)
+        if not path:
+            return {}
+        return await asyncio.to_thread(
+            codex_history_turn_users,
+            path,
+            native_turn_ids,
+        )
+
     async def _build_official_codex_history(
         self,
         sid: str,
@@ -10185,6 +10202,23 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         return ctx
 
+    def _take_codex_goal_prompt(
+        self, ctx: SessionContext, turn_id: str,
+    ) -> Optional[str]:
+        take_prompt = getattr(ctx.sdk, "take_goal_prompt", None)
+        if not callable(take_prompt):
+            return None
+        prompt = take_prompt(turn_id)
+        if not isinstance(prompt, str) or not prompt:
+            return None
+        thread_id = ctx.session_id or ctx.key
+        self._codex_history.remember_automatic_user(
+            thread_id,
+            turn_id,
+            UserMsg(msg_id=turn_id, prompt=prompt),
+        )
+        return prompt
+
     async def _on_codex_goal(self, ctx: SessionContext,
                              goal: Optional[dict]) -> None:
         """Broadcast an authoritative app-server goal notification.
@@ -10195,6 +10229,21 @@ class WrapperMachine:
         """
         if goal is None:
             ctx.codex_goal_mutation = None
+        else:
+            turn_id = getattr(ctx.sdk, "last_goal_turn_id", None)
+            if (
+                isinstance(turn_id, str)
+                and turn_id
+                and ctx.codex_spontaneous_turn_id == turn_id
+            ):
+                prompt = self._take_codex_goal_prompt(ctx, turn_id)
+                if prompt:
+                    # turn/started may win the stdout race and publish its empty
+                    # anchor first. Reusing the native turn id lets every client
+                    # fill that anchor instead of creating a duplicate turn.
+                    await self._emit(
+                        ctx, UserMsg(msg_id=turn_id, prompt=prompt)
+                    )
         await self._emit(ctx, GoalState(goal=goal))
 
     async def _on_codex_runtime_event(
@@ -10313,6 +10362,7 @@ class WrapperMachine:
                 turn_id,
                 announce_running=announce_running,
                 recovered_msg_id=recovered_msg_id,
+                goal_prompt=self._take_codex_goal_prompt(ctx, turn_id),
             ))
             ctx.codex_spontaneous_task = task
             ctx.codex_recovered_turn_id = None
@@ -10368,6 +10418,7 @@ class WrapperMachine:
         announce_running: bool,
         recovered_msg_id: Optional[str] = None,
         pending_switch: Optional[CodexDaemonRestartState] = None,
+        goal_prompt: Optional[str] = None,
     ) -> None:
         """Translate one goal/automatic turn from the handle's bounded bridge."""
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
@@ -10645,11 +10696,14 @@ class WrapperMachine:
                     ),
                 )
 
-            # Automatic continuations have no user prompt. A real empty anchor
-            # gives their assistant/process events a stable turn owner without
-            # rendering a fabricated user bubble.
+            # Ordinary automatic continuations have no user prompt. A newly-set
+            # or modified Goal objective is different: it is the user's durable
+            # request and must survive dismissal of the Goal status panel.
             if recovered_msg_id is None:
-                await self._emit(ctx, UserMsg(msg_id=turn_id, prompt=""))
+                await self._emit(ctx, UserMsg(
+                    msg_id=turn_id,
+                    prompt=goal_prompt or "",
+                ))
 
             if pending_switch is not None:
                 handoff = await handoff_account_switch(pending_switch)
@@ -18816,45 +18870,22 @@ class WrapperMachine:
                     await target_queue.put(None)
 
         async def next_turn_message():
-            nonlocal notice_active
-            """Wait for one raw engine event, warning on a silent Codex turn.
+            """Wait for one raw engine event or an intentional daemon restart.
 
-            This is deliberately not a hard timeout: ultra reasoning and long
-            tools can be valid. A real interrupt still uses the existing bounded
-            drain path, and any raw app-server event rearms the warning timer on
-            the next loop iteration. A managed bridge overflow has already
-            explained why live detail is delayed, so it must not be overwritten
-            later by the generic no-progress warning.
+            Silence is valid while Codex reasons or runs a long tool, so it is
+            never translated into a user-facing warning. Authoritative retry,
+            provider-error and managed-overflow events still flow through the
+            normal translator paths below.
             """
-            warn = (
-                self.cfg.codex_turn_idle_warn_seconds
-                if is_codex and not codex_overflowed else 0
-            )
             wait_task = asyncio.create_task(self._next_from_queue(ctx, queue))
             try:
                 candidates = {wait_task}
                 if codex_restart_watch_task is not None:
                     candidates.add(codex_restart_watch_task)
-                timeout = (
-                    warn if warn > 0 and ctx.state != "interrupting" else None)
                 done, _ = await asyncio.wait(
                     candidates,
-                    timeout=timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if not done and ctx.state == "running":
-                    await self._emit(ctx, StateEvent(
-                        state="running",
-                        phase="waiting",
-                        detail=(f"Codex 已 {warn:g} 秒没有收到新进展，仍在等待；"
-                                "可点击停止。"),
-                        msg_id=ctx.active_msg_id,
-                    ))
-                    notice_active = True
-                    done, _ = await asyncio.wait(
-                        candidates,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
                 # The hook writes its marker before asking the daemon to stop.
                 # If a stale stream frame and the marker become ready together,
                 # account handoff wins so an old terminal cannot falsely unlock

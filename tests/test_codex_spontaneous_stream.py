@@ -6,8 +6,8 @@ import json
 from types import SimpleNamespace
 
 from cc_remote.protocol import (
-    Delta, Error, ProcessEvent, StateEvent, ToolDelta, ToolResult, ToolUse,
-    TurnDiff, TurnEnd, TurnPlan, UserMsg,
+    Delta, Error, GoalState, ProcessEvent, StateEvent, ToolDelta, ToolResult,
+    ToolUse, TurnDiff, TurnEnd, TurnPlan, UserMsg,
 )
 from cc_remote.wrapper.codex_handle import (
     CodexHandle, CodexSpontaneousClosed, CodexSpontaneousOverflow,
@@ -31,6 +31,31 @@ def _notification(method: str, turn_id: str, **params):
             **params,
         },
     }
+
+
+def _goal_notification(
+    objective: str,
+    *,
+    turn_id: str | None,
+    status: str = "active",
+    created_at: int = 1,
+    updated_at: int = 1,
+):
+    params = {
+        "threadId": "thread-spontaneous",
+        "goal": {
+            "threadId": "thread-spontaneous",
+            "objective": objective,
+            "status": status,
+            "tokensUsed": 0,
+            "timeUsedSeconds": 0,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+        },
+    }
+    if turn_id is not None:
+        params["turnId"] = turn_id
+    return {"method": "thread/goal/updated", "params": params}
 
 
 def test_spontaneous_bridge_is_bounded_nonblocking_and_keeps_terminal_frame():
@@ -531,6 +556,211 @@ def test_machine_streams_rich_spontaneous_turn_and_unlocks_on_matching_terminal(
         assert len(terminal) == 1
         assert terminal[0].turn_id == turn_id
         assert terminal[0].result.subtype == "success"
+
+    asyncio.run(run())
+
+
+def test_goal_objective_before_turn_start_becomes_the_user_prompt_once():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.goal_callback = lambda goal: machine._on_codex_goal(ctx, goal)
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+
+        turn_id = "goal-before-start"
+        goal = _goal_notification("证明泰勒展开", turn_id=turn_id)
+        await handle._dispatch(goal)
+        # A retried native notification must not enqueue the objective twice.
+        await handle._dispatch(goal)
+        await handle._dispatch(_notification(
+            "turn/started", turn_id, turn={"id": turn_id},
+        ))
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        ))
+
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+        anchors = [
+            event for event in transport.sent
+            if isinstance(event, UserMsg) and event.prompt
+        ]
+        assert [(event.msg_id, event.prompt) for event in anchors] == [
+            (turn_id, "证明泰勒展开"),
+        ]
+        assert any(isinstance(event, GoalState) for event in transport.sent)
+
+    asyncio.run(run())
+
+
+def test_goal_objective_after_turn_start_patches_the_empty_anchor_once():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.goal_callback = lambda goal: machine._on_codex_goal(ctx, goal)
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+
+        turn_id = "goal-after-start"
+        await handle._dispatch(_notification(
+            "turn/started", turn_id, turn={"id": turn_id},
+        ))
+        await asyncio.sleep(0)
+        goal = _goal_notification("证明余项收敛", turn_id=turn_id)
+        await handle._dispatch(goal)
+        await handle._dispatch(goal)
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        ))
+
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+        anchors = [
+            event for event in transport.sent
+            if isinstance(event, UserMsg) and event.prompt
+        ]
+        assert [(event.msg_id, event.prompt) for event in anchors] == [
+            (turn_id, "证明余项收敛"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_goal_status_only_continuation_keeps_an_empty_anchor():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._goal_objective_baseline = "既有目标"
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.goal_callback = lambda goal: machine._on_codex_goal(ctx, goal)
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+
+        turn_id = "goal-resume"
+        await handle._dispatch(_goal_notification(
+            "既有目标", turn_id=turn_id, created_at=1, updated_at=2,
+        ))
+        await handle._dispatch(_notification(
+            "turn/started", turn_id, turn={"id": turn_id},
+        ))
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        ))
+
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+        anchors = [event for event in transport.sent
+                   if isinstance(event, UserMsg)]
+        assert [(event.msg_id, event.prompt) for event in anchors] == [
+            (turn_id, ""),
+        ]
+
+    asyncio.run(run())
+
+
+def test_goal_modify_after_reconnect_primes_baseline_before_set():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "thread/goal/get":
+                return {"goal": {
+                    "threadId": handle.thread_id,
+                    "objective": "旧目标",
+                    "status": "paused",
+                    "tokensUsed": 10,
+                    "timeUsedSeconds": 20,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                }}
+            if method == "thread/goal/set":
+                goal = {
+                    "threadId": handle.thread_id,
+                    "objective": "新目标",
+                    "status": "active",
+                    "tokensUsed": 10,
+                    "timeUsedSeconds": 20,
+                    "createdAt": 1,
+                    "updatedAt": 3,
+                }
+                await handle._dispatch(_goal_notification(
+                    "新目标", turn_id=None, created_at=1, updated_at=3,
+                ))
+                await handle._dispatch(_notification(
+                    "turn/started", "goal-modified",
+                    turn={"id": "goal-modified"},
+                ))
+                return {"goal": goal}
+            raise AssertionError(method)
+
+        handle._request = request
+        await handle.set_goal(objective="新目标", status="active")
+
+        assert requests == [
+            ("thread/goal/get", {"threadId": handle.thread_id}),
+            ("thread/goal/set", {
+                "threadId": handle.thread_id,
+                "objective": "新目标",
+                "status": "active",
+            }),
+        ]
+        assert handle.take_goal_prompt("goal-modified") == "新目标"
+
+    asyncio.run(run())
+
+
+def test_unbound_goal_prompt_never_binds_a_managed_user_turn():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._goal_objective_baseline = "旧目标"
+        handle._goal_baseline_loaded = True
+
+        await handle._dispatch(_goal_notification(
+            "新目标", turn_id=None, created_at=1, updated_at=2,
+        ))
+        assert handle._goal_prompt_unbound == "新目标"
+
+        # query() claims turn_active before the authoritative notification.  A
+        # stale Goal candidate must be discarded instead of stealing this turn.
+        handle.turn_active = True
+        await handle._dispatch(_notification(
+            "turn/started", "ordinary-turn",
+            turn={"id": "ordinary-turn"},
+        ))
+        assert handle.take_goal_prompt("ordinary-turn") is None
+        assert handle._goal_prompt_unbound is None
 
     asyncio.run(run())
 

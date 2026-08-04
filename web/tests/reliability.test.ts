@@ -4788,6 +4788,33 @@ try {
     "native-turn");
   assert.equal(duplicateState.runtimes[duplicateSid].turns[0].done, true);
 
+  const goalPromptSid = "goal-prompt-race";
+  let goalPromptState = reduce({
+    ...initialState, focusedSid: goalPromptSid,
+    runtimes: { [goalPromptSid]: createRuntime() },
+  }, { type: "event", event: event({
+    type: "user_msg", sid: goalPromptSid, msg_id: "native-goal-turn",
+    prompt: "", ts: 20,
+  }) });
+  goalPromptState = reduce(goalPromptState, {
+    type: "event", event: event({
+      type: "user_msg", sid: goalPromptSid, msg_id: "native-goal-turn",
+      prompt: "证明泰勒展开", ts: 20,
+    }),
+  });
+  goalPromptState = reduce(goalPromptState, {
+    type: "event", event: event({
+      type: "user_msg", sid: goalPromptSid, msg_id: "native-goal-turn",
+      prompt: "证明泰勒展开", ts: 20,
+    }),
+  });
+  assert.equal(goalPromptState.runtimes[goalPromptSid].turns.length, 1,
+    "late and retried Goal objective frames reuse the native empty anchor");
+  assert.equal(
+    goalPromptState.runtimes[goalPromptSid].turns[0].prompt,
+    "证明泰勒展开",
+  );
+
   const summarySid = "materialized-summary";
   const summaryState = reduce({
     ...initialState, focusedSid: summarySid,
