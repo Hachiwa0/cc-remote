@@ -456,8 +456,11 @@ class CodexOfficialHistory:
         self._summary_events: OrderedDict[
             tuple[str, str], tuple[dict[str, Any], ...]
         ] = OrderedDict()
+        # Only authoritative prompts belong here. A recovery miss can be
+        # temporary while Codex is still flushing the correlated Goal records;
+        # caching None would permanently hide that prompt from later pages.
         self._automatic_users: OrderedDict[
-            tuple[str, str], UserMsg | None
+            tuple[str, str], UserMsg
         ] = OrderedDict()
         # The official summary view collapses same-turn steer boundaries to the
         # first user and latest assistant item. Once an active turn has been
@@ -490,7 +493,7 @@ class CodexOfficialHistory:
         native_turn_id: str,
         user: UserMsg,
     ) -> None:
-        """Replace a speculative miss with the authoritative live Goal prompt."""
+        """Remember the authoritative live Goal prompt for one native turn."""
         if not user.prompt:
             return
         self._remember(
@@ -498,6 +501,14 @@ class CodexOfficialHistory:
             (thread_id, native_turn_id),
             user,
         )
+
+    def has_automatic_user(
+        self,
+        thread_id: str,
+        native_turn_id: str,
+    ) -> bool:
+        """Return whether a live or recovered Goal prompt is authoritative."""
+        return (thread_id, native_turn_id) in self._automatic_users
 
     async def _call(self, method: str, params: dict[str, Any]) -> Any:
         return await self._rpc(method, params, None)
@@ -687,11 +698,12 @@ class CodexOfficialHistory:
                     ):
                         raise CodexHistoryInvalidResponse(
                             "invalid automatic Codex user row")
-                    self._remember(
-                        self._automatic_users,
-                        (thread_id, native_id),
-                        recovered,
-                    )
+                    if recovered is not None and recovered.prompt:
+                        self._remember(
+                            self._automatic_users,
+                            (thread_id, native_id),
+                            recovered,
+                        )
         for native_index, summary_turn in enumerate(validated_rows):
             turn = prefetched_full.get(native_index, summary_turn)
             native_id = _wire_id(turn["id"], "turn")
@@ -832,11 +844,12 @@ class CodexOfficialHistory:
                             native_id,
                             0,
                         )
-                        self._remember(
-                            self._automatic_users,
-                            automatic_key,
-                            recovered,
-                        )
+                        if recovered is not None and recovered.prompt:
+                            self._remember(
+                                self._automatic_users,
+                                automatic_key,
+                                recovered,
+                            )
                     else:
                         recovered = None
                     if recovered is not None and recovered.prompt:

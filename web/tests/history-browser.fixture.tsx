@@ -61,6 +61,7 @@ import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
+import { useMobileViewport } from "../src/use-mobile-viewport";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -1046,6 +1047,7 @@ function HistoryConversationBrowserFixture() {
   const migrationPickerNullInitial = params.has("migration-picker-null");
   const newChatControls = params.has("newchat-controls");
   const longProfile = params.has("long-profile");
+  const manyProfiles = params.has("many-profiles");
   const recoveryReplacement = params.has("recovery-replace");
   const deepBrowse = params.has("deep-browse");
   const runtimeBrowse = params.has("runtime-browse");
@@ -1189,7 +1191,14 @@ function HistoryConversationBrowserFixture() {
           allowed: true,
         }]
       : []),
-  ], [longProfile]);
+    ...(manyProfiles
+      ? Array.from({ length: 12 }, (_, index) => ({
+          id: `custom-profile-${index}`,
+          description: `Custom execution profile ${index}`,
+          allowed: true,
+        }))
+      : []),
+  ], [longProfile, manyProfiles]);
   const [pendingImages, setPendingImages] = useState<QueryImg[]>(() =>
     composerAttachment ? [{
       media_type: "image/png",
@@ -1900,6 +1909,14 @@ export function HistoryBrowserFixture() {
       engine={params.get("engine") === "claude" ? "claude" : "codex"}
     />;
   }
+  if (params.has("newchat-controls")) {
+    return <MobileViewportHistoryConversationBrowserFixture />;
+  }
+  return <HistoryConversationBrowserFixture />;
+}
+
+function MobileViewportHistoryConversationBrowserFixture() {
+  useMobileViewport();
   return <HistoryConversationBrowserFixture />;
 }
 

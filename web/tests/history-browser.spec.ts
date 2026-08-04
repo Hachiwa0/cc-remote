@@ -3535,3 +3535,119 @@ test("a 256-character profile id fits a 296 px new-chat row", async ({
   expect(layout.label).toContain("…");
   expect(Array.from(layout.label).length).toBeLessThan(32);
 });
+
+test("new-chat controls fit the default permission picker on a short phone", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 320, height: 568 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await page.locator(".newchat-access").click();
+  const dialog = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  });
+  await expect(dialog).toBeVisible();
+
+  const layout = await dialog.evaluate((sheet) => {
+    const scroll = sheet.querySelector<HTMLElement>(".sheet-scroll");
+    const optionButtons = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".permission-options .cmd"),
+    );
+    const searchButtons = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".cmd-search button"),
+    );
+    const live = searchButtons.find((button) => button.textContent === "Live");
+    if (!scroll || optionButtons.length !== 6 || !live) {
+      throw new Error("compact permission controls are incomplete");
+    }
+    const sheetRect = sheet.getBoundingClientRect();
+    return {
+      viewportHeight: window.innerHeight,
+      viewportWidth: window.innerWidth,
+      pageScrollWidth: document.documentElement.scrollWidth,
+      sheetTop: sheetRect.top,
+      sheetBottom: sheetRect.bottom,
+      scrollTop: scroll.scrollTop,
+      scrollHeight: scroll.scrollHeight,
+      scrollClientHeight: scroll.clientHeight,
+      liveBottom: live.getBoundingClientRect().bottom,
+      minOptionHeight: Math.min(...optionButtons.map(
+        (button) => button.getBoundingClientRect().height,
+      )),
+      minSearchHeight: Math.min(...searchButtons.map(
+        (button) => button.getBoundingClientRect().height,
+      )),
+    };
+  });
+
+  expect(layout.scrollTop).toBe(0);
+  expect(layout.scrollHeight).toBeLessThanOrEqual(
+    layout.scrollClientHeight + 1,
+  );
+  expect(layout.sheetTop).toBeGreaterThanOrEqual(0);
+  expect(layout.sheetBottom).toBeLessThanOrEqual(layout.viewportHeight + 1);
+  expect(layout.liveBottom).toBeLessThanOrEqual(layout.viewportHeight + 1);
+  expect(layout.minOptionHeight).toBeGreaterThanOrEqual(44);
+  expect(layout.minSearchHeight).toBeGreaterThanOrEqual(44);
+  expect(layout.pageScrollWidth).toBeLessThanOrEqual(layout.viewportWidth);
+});
+
+test("new-chat controls keep scrolling for many custom permission profiles", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 320, height: 400 });
+  await page.goto(
+    "/tests/history-browser.html?newchat-controls=1&many-profiles=1",
+  );
+  await page.locator(".newchat-access").click();
+  const dialog = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  });
+  await expect(dialog).toBeVisible();
+
+  const scrollState = await dialog.locator(".sheet-scroll").evaluate((scroll) => ({
+    clientHeight: scroll.clientHeight,
+    scrollHeight: scroll.scrollHeight,
+    overflowY: getComputedStyle(scroll).overflowY,
+  }));
+  expect(scrollState.scrollHeight).toBeGreaterThan(scrollState.clientHeight);
+  expect(scrollState.overflowY).toBe("auto");
+
+  const live = dialog.getByRole("button", { name: "Live", exact: true });
+  await live.scrollIntoViewIfNeeded();
+  await expect(live).toBeInViewport();
+});
+
+test("new-chat controls fit when the visual app height is keyboard-sized", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 393, height: 852 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty("--app-height", "400px");
+    document.documentElement.style.setProperty("--keyboard-inset", "452px");
+    document.documentElement.setAttribute("data-short-viewport", "true");
+  });
+  await page.locator(".newchat-access").click();
+  const dialog = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  });
+  await expect(dialog).toBeVisible();
+
+  const layout = await dialog.evaluate((sheet) => {
+    const scroll = sheet.querySelector<HTMLElement>(".sheet-scroll");
+    const live = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".cmd-search button"),
+    ).find((button) => button.textContent === "Live");
+    if (!scroll || !live) throw new Error("permission search controls missing");
+    return {
+      scrollHeight: scroll.scrollHeight,
+      clientHeight: scroll.clientHeight,
+      liveBottom: live.getBoundingClientRect().bottom,
+      sheetBottom: sheet.getBoundingClientRect().bottom,
+    };
+  });
+  expect(layout.scrollHeight).toBeLessThanOrEqual(layout.clientHeight + 1);
+  expect(layout.liveBottom).toBeLessThanOrEqual(layout.sheetBottom + 1);
+});

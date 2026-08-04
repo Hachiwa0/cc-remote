@@ -14,7 +14,7 @@ import json
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import islice
 
@@ -108,6 +108,14 @@ class CodexHistoryImageView:
     width: int | None = None
     height: int | None = None
     data: bytes | None = None
+
+
+@dataclass(frozen=True)
+class CodexAutomaticUserRecovery:
+    """Goal prompts plus proof of which native task boundaries were inspected."""
+
+    users: dict[str, UserMsg] = field(default_factory=dict)
+    seen_turn_ids: frozenset[str] = frozenset()
 
 
 def _bounded_jsonl_records(file, *, end_offset: int | None = None):
@@ -798,7 +806,7 @@ def codex_history_turn_users(
     turn_ids: tuple[str, ...],
     *,
     max_scan_bytes: int = _MAX_OFFICIAL_AUTOMATIC_USER_SCAN_BYTES,
-) -> dict[str, UserMsg]:
+) -> CodexAutomaticUserRecovery:
     """Recover a bounded set of assistant-only Goal prompts in one reverse pass.
 
     Official summary pages must never walk a multi-gigabyte rollout once per
@@ -811,25 +819,33 @@ def codex_history_turn_users(
         if isinstance(turn_id, str) and _SAFE_WIRE_ID.fullmatch(turn_id)
     }
     if not targets:
-        return {}
+        return CodexAutomaticUserRecovery()
     recovered: dict[str, UserMsg] = {}
+    seen: set[str] = set()
     try:
-        for offset, boundary in _history_boundaries(
-            path,
-            use_turns=True,
-            max_scan_bytes=max_scan_bytes,
+        for offset, line in _reverse_jsonl_records(
+            path, max_scan_bytes=max_scan_bytes,
         ):
+            boundary = _history_turn_cursor(line)
             if boundary not in targets:
                 continue
-            user = codex_history_boundary_user(path, offset, boundary)
-            if user is not None and user.prompt:
+            seen.add(boundary)
+            goal_prompt = _history_goal_prompt_before_boundary(path, offset)
+            if goal_prompt is not None:
+                prompt, timestamp = goal_prompt
+                user = UserMsg(msg_id=boundary, prompt=prompt)
+                if timestamp is not None:
+                    user.ts = timestamp
                 recovered[boundary] = user
             targets.remove(boundary)
             if not targets:
                 break
     except OSError:
-        return recovered
-    return recovered
+        pass
+    return CodexAutomaticUserRecovery(
+        users=recovered,
+        seen_turn_ids=frozenset(seen),
+    )
 
 
 def codex_native_rollback_turns(path: str, logical_turns: int) -> int:

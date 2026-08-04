@@ -1347,6 +1347,55 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .cmd.danger.sel{ background:var(--danger-weak); }
 @media (hover:hover){ .cmd.danger:hover{ background:var(--danger-weak); } }
 .cmd.danger .cmd-nm{ color:var(--danger); } .cmd.danger .cmd-check{ color:var(--danger); }
+/* Short phones need the complete default permission surface at once. Use
+   compact cards instead of scaling the sheet so labels remain legible and
+   every action keeps a full-size touch target. Larger/custom catalogs still
+   use the existing scroll container as their safety boundary. */
+@media (max-width:640px){
+  :root[data-short-viewport="true"] .permission-sheet{
+    max-height:calc(var(--app-height,100dvh) - 8px);
+  }
+  :root[data-short-viewport="true"] .permission-sheet .sheet-title{ padding-top:5px; }
+  :root[data-short-viewport="true"] .permission-sheet .sheet-scroll{ padding:3px 8px 8px; }
+  :root[data-short-viewport="true"] .permission-sheet .cmd-group{ padding:7px 5px 3px; }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options{
+    display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px;
+    padding:0 4px;
+  }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd{
+    position:relative; min-height:64px; padding:6px 4px; gap:4px;
+    flex-direction:column; justify-content:center; text-align:center;
+    border:1px solid var(--border); border-radius:10px;
+  }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd.sel{
+    border-color:var(--accent-line);
+  }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd-ic{
+    width:28px; height:28px; border-radius:8px;
+  }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd-tx{
+    flex:none; width:100%;
+  }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd-nm{
+    display:block; white-space:nowrap; line-height:1.16; font-size:11.5px;
+  }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd-ds{
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+  }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd-kbd{ display:none; }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd-check{
+    position:absolute; top:4px; right:4px;
+  }
+  :root[data-short-viewport="true"] .permission-sheet .permission-options .cmd-check svg{
+    width:15px; height:15px;
+  }
+  :root[data-short-viewport="true"] .permission-sheet .cmd-search{ gap:6px; padding:3px 4px; }
+  :root[data-short-viewport="true"] .permission-sheet .cmd-search button{ min-height:44px; }
+  :root[data-short-viewport="true"] .permission-sheet .cmd-search-note{
+    padding:1px 5px 6px; font-size:10.5px; line-height:1.3;
+  }
+}
 /* LOGIN */
 .login{ position:fixed; inset:var(--app-offset-top,0px) 0 auto; height:var(--app-height,100dvh); z-index:60; background:var(--bg);
   display:flex; align-items:center; justify-content:center; padding:24px; transition:opacity .3s; }

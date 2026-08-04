@@ -989,6 +989,13 @@ class _PreviewChallenge:
     created_at: float
 
 
+@dataclass(frozen=True)
+class _CodexGoalRecoveryMiss:
+    fingerprint: tuple[int, int, int, int]
+    source_scans: int
+    stable: bool
+
+
 class WrapperMachine:
     # Browser/TUI outboxes hold at most 256 commands. Keep a 2x retry window per
     # client and at most the relay's configured maximum of 64 client identities;
@@ -1013,6 +1020,8 @@ class WrapperMachine:
     PREVIEW_IMAGE_SNAPSHOT_SESSION_ENTRIES = 64
     PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES = 256
     CODEX_HISTORY_IMAGE_VIEW_CACHE_ENTRIES = 256
+    CODEX_GOAL_RECOVERY_MISS_CACHE_ENTRIES = 2048
+    CODEX_GOAL_RECOVERY_MAX_SOURCE_SCANS = 3
     NOTIFICATION_TITLE_CAP = 512
     NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
@@ -1134,6 +1143,12 @@ class WrapperMachine:
                 HistorySourceFingerprint,
                 tuple[CodexHistoryImageView, ...],
             ],
+        ] = OrderedDict()
+        # Goal metadata may be appended just after an official summary page is
+        # materialized. Unseen boundaries retry only after the rollout changes;
+        # a seen non-Goal boundary is stable, and both forms stay bounded.
+        self._codex_goal_recovery_misses: OrderedDict[
+            tuple[str, str], _CodexGoalRecoveryMiss
         ] = OrderedDict()
         # Pool of resident sessions, keyed by real session_id (or a `tmp-<uuid>`
         # temp key for a brand-new session until its id is captured).
@@ -1383,6 +1398,9 @@ class WrapperMachine:
         )
         if callable(invalidate_official):
             invalidate_official(sid)
+        for key in tuple(self._codex_goal_recovery_misses):
+            if key[0] == sid:
+                self._codex_goal_recovery_misses.pop(key, None)
         return self._history_revision(sid)
 
     def _focused_ctx(self) -> Optional[SessionContext]:
@@ -7144,11 +7162,68 @@ class WrapperMachine:
         path = await asyncio.to_thread(codex_rollout_path, sid)
         if not path:
             return {}
-        return await asyncio.to_thread(
+        try:
+            source_stat = await asyncio.to_thread(os.stat, path)
+        except OSError:
+            return {}
+        fingerprint = (
+            int(source_stat.st_dev),
+            int(source_stat.st_ino),
+            int(source_stat.st_size),
+            int(source_stat.st_mtime_ns),
+        )
+        pending: list[str] = []
+        previous_misses: dict[
+            tuple[str, str], _CodexGoalRecoveryMiss
+        ] = {}
+        for native_turn_id in native_turn_ids:
+            key = (sid, native_turn_id)
+            miss = self._codex_goal_recovery_misses.get(key)
+            if miss is not None:
+                self._codex_goal_recovery_misses.move_to_end(key)
+                if (
+                    miss.stable
+                    or miss.fingerprint == fingerprint
+                    or miss.source_scans
+                    >= self.CODEX_GOAL_RECOVERY_MAX_SOURCE_SCANS
+                ):
+                    continue
+                previous_misses[key] = miss
+            pending.append(native_turn_id)
+        if not pending:
+            return {}
+        recovery = await asyncio.to_thread(
             codex_history_turn_users,
             path,
-            native_turn_ids,
+            tuple(pending),
         )
+        for native_turn_id in pending:
+            key = (sid, native_turn_id)
+            user = recovery.users.get(native_turn_id)
+            if user is not None and user.prompt:
+                self._codex_goal_recovery_misses.pop(key, None)
+                continue
+            # A live Goal callback can win while the bounded rollout scan is in
+            # a worker thread. Never let that older miss shadow the now
+            # authoritative prompt after the positive LRU is eventually evicted.
+            if self._codex_history.has_automatic_user(
+                sid, native_turn_id,
+            ):
+                self._codex_goal_recovery_misses.pop(key, None)
+                continue
+            previous = previous_misses.get(key)
+            self._codex_goal_recovery_misses[key] = _CodexGoalRecoveryMiss(
+                fingerprint=fingerprint,
+                source_scans=(previous.source_scans if previous else 0) + 1,
+                stable=native_turn_id in recovery.seen_turn_ids,
+            )
+            self._codex_goal_recovery_misses.move_to_end(key)
+        while (
+            len(self._codex_goal_recovery_misses)
+            > self.CODEX_GOAL_RECOVERY_MISS_CACHE_ENTRIES
+        ):
+            self._codex_goal_recovery_misses.popitem(last=False)
+        return recovery.users
 
     async def _build_official_codex_history(
         self,
@@ -10212,6 +10287,8 @@ class WrapperMachine:
         if not isinstance(prompt, str) or not prompt:
             return None
         thread_id = ctx.session_id or ctx.key
+        self._codex_goal_recovery_misses.pop(
+            (thread_id, turn_id), None)
         self._codex_history.remember_automatic_user(
             thread_id,
             turn_id,

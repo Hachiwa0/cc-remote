@@ -20,6 +20,7 @@ from cc_remote.wrapper.codex_rpc import (
 from cc_remote.wrapper.codex_stream import (
     codex_history_image_views,
     codex_history_turn_user,
+    codex_history_turn_users,
     codex_translate_history,
 )
 from cc_remote.protocol import UserMsg
@@ -329,16 +330,64 @@ def test_summary_page_recovers_goal_prompt_for_assistant_only_native_turn():
     asyncio.run(run())
 
 
-def test_summary_page_batches_automatic_user_recovery_and_live_prompt_replaces_miss():
+def test_summary_page_retries_automatic_user_recovery_after_miss():
     recover_calls = []
 
     async def rpc(_method, _params, cwd=None):
         assert cwd is None
         return {
-            "data": [
-                _turn(f"native-{index}", [_agent(f"answer-{index}", "done")])
-                for index in range(4)
-            ],
+            "data": [_turn(
+                "native-goal",
+                [_agent("answer-goal", "proof")],
+            )],
+            "nextCursor": None,
+        }
+
+    async def recover_users(thread_id, native_turn_ids):
+        recover_calls.append((thread_id, native_turn_ids))
+        if len(recover_calls) == 1:
+            return {}
+        return {
+            "native-goal": UserMsg(
+                msg_id="native-goal",
+                prompt="后来落盘的 Goal",
+            ),
+        }
+
+    async def run():
+        history = CodexOfficialHistory(
+            64 * 1024,
+            rpc=rpc,
+            recover_users=recover_users,
+        )
+        first = await history.summary_page(
+            "thread-goal", before=None, limit=1)
+        second = await history.summary_page(
+            "thread-goal", before=None, limit=1)
+        third = await history.summary_page(
+            "thread-goal", before=None, limit=1)
+
+        assert first.turns[0]["prompt"] == ""
+        assert second.turns[0]["prompt"] == "后来落盘的 Goal"
+        assert third.turns[0]["prompt"] == "后来落盘的 Goal"
+        assert recover_calls == [
+            ("thread-goal", ("native-goal",)),
+            ("thread-goal", ("native-goal",)),
+        ]
+
+    asyncio.run(run())
+
+
+def test_summary_page_live_prompt_replaces_automatic_user_miss():
+    recover_calls = []
+
+    async def rpc(_method, _params, cwd=None):
+        assert cwd is None
+        return {
+            "data": [_turn(
+                "native-goal",
+                [_agent("answer-goal", "done")],
+            )],
             "nextCursor": None,
         }
 
@@ -352,23 +401,21 @@ def test_summary_page_batches_automatic_user_recovery_and_live_prompt_replaces_m
             rpc=rpc,
             recover_users=recover_users,
         )
-        first = await history.summary_page("thread-goal", before=None, limit=4)
+        first = await history.summary_page("thread-goal", before=None, limit=1)
         assert recover_calls == [(
             "thread-goal",
-            ("native-0", "native-1", "native-2", "native-3"),
+            ("native-goal",),
         )]
-        assert [turn["prompt"] for turn in first.turns] == ["", "", "", ""]
+        assert first.turns[0]["prompt"] == ""
 
         history.remember_automatic_user(
             "thread-goal",
-            "native-3",
-            UserMsg(msg_id="native-3", prompt="后来落盘的 Goal"),
+            "native-goal",
+            UserMsg(msg_id="native-goal", prompt="实时回调 Goal"),
         )
-        second = await history.summary_page("thread-goal", before=None, limit=4)
+        second = await history.summary_page("thread-goal", before=None, limit=1)
         assert len(recover_calls) == 1
-        assert [turn["prompt"] for turn in second.turns] == [
-            "后来落盘的 Goal", "", "", "",
-        ]
+        assert second.turns[0]["prompt"] == "实时回调 Goal"
 
     asyncio.run(run())
 
@@ -1034,6 +1081,12 @@ def test_rollout_user_recovery_restores_only_a_changed_goal_objective(tmp_path):
     assert codex_history_turn_user(
         str(rollout), "goal-resume", "goal-resume",
     ) is None
+    batch = codex_history_turn_users(
+        str(rollout), ("goal-new", "goal-resume"),
+    )
+    assert batch.seen_turn_ids == frozenset({"goal-new", "goal-resume"})
+    assert set(batch.users) == {"goal-new"}
+    assert batch.users["goal-new"].prompt == "证明泰勒展开"
 
 
 def test_rollout_user_recovery_selects_later_steer_images(tmp_path):

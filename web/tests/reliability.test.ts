@@ -957,6 +957,7 @@ assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
 
 const viewportListeners = new Map<MobileViewportEvent, Set<() => void>>();
 const viewportCss = new Map<string, string>();
+const viewportAttributes = new Map<string, string>();
 const viewportFrames = new Map<number, () => void>();
 const viewportDelays = new Map<number, () => void>();
 let nextViewportTaskId = 1;
@@ -969,6 +970,8 @@ const viewportBindings: MobileViewportBindings = {
   readViewport: () => viewportReading,
   setCssProperty: (name, value) => { viewportCss.set(name, value); },
   clearCssProperty: (name) => { viewportCss.delete(name); },
+  setRootAttribute: (name, value) => { viewportAttributes.set(name, value); },
+  clearRootAttribute: (name) => { viewportAttributes.delete(name); },
   listen: (event, listener) => {
     const listeners = viewportListeners.get(event) ?? new Set();
     listeners.add(listener);
@@ -1003,6 +1006,7 @@ const stopViewportSync = createMobileViewportSync(viewportBindings);
 assert.equal(viewportCss.get("--app-height"), "844px");
 assert.equal(viewportCss.get("--app-offset-top"), "0px");
 assert.equal(viewportCss.get("--keyboard-inset"), "0px");
+assert.equal(viewportAttributes.get("data-short-viewport"), "false");
 
 viewportReading = { height: 510.25, layoutHeight: 844, offsetTop: 0, scale: 1 };
 emitViewport("viewport-resize");
@@ -1010,6 +1014,7 @@ assert.equal(viewportCss.get("--app-height"), "844px");
 flushViewportFrames();
 assert.equal(viewportCss.get("--app-height"), "510.25px");
 assert.equal(viewportCss.get("--keyboard-inset"), "333.75px");
+assert.equal(viewportAttributes.get("data-short-viewport"), "true");
 
 viewportReading = { height: 500, layoutHeight: 844, offsetTop: 24, scale: 1 };
 emitViewport("viewport-scroll");
@@ -1024,6 +1029,7 @@ emitViewport("viewport-resize");
 flushViewportFrames();
 assert.equal(viewportCss.get("--app-offset-top"), "0px");
 assert.equal(viewportCss.get("--keyboard-inset"), "0px");
+assert.equal(viewportAttributes.get("data-short-viewport"), "false");
 
 // Safari can report its pre-blur viewport for a few animation frames. Delayed
 // settling rereads it and clears only the layout-level focus pan.
@@ -1067,6 +1073,7 @@ stopViewportSync();
 assert.equal(viewportCss.has("--app-height"), false);
 assert.equal(viewportCss.has("--app-offset-top"), false);
 assert.equal(viewportCss.has("--keyboard-inset"), false);
+assert.equal(viewportAttributes.has("data-short-viewport"), false);
 assert.equal(viewportFrames.size, 0);
 assert.equal(viewportDelays.size, 0);
 for (const listeners of viewportListeners.values()) assert.equal(listeners.size, 0);
