@@ -856,7 +856,7 @@ assert.equal(claudeWorkSlashes.includes("permissions"), false,
   "Work permissions are fixed by its private workspace and must not be presented as editable");
 assert.equal(isKnownCodeOnlySlash("permissions", "claude"), true);
 assert.equal(isKnownCodeOnlySlash("permissions", "codex"), true);
-for (const slash of ["plan", "code-review", "security-review", "verify", "simplify", "run", "init"]) {
+for (const slash of ["plan", "code-review", "security-review", "verify", "simplify", "run", "init", "diff"]) {
   assert.equal(claudeWorkSlashes.includes(slash), false, `Work must hide Code /${slash}`);
   assert.equal(isKnownCodeOnlySlash(slash, "claude"), true);
 }
@@ -866,6 +866,17 @@ for (const slash of ["review", "init", "plan", "fast", "status", "compact", "rol
 }
 assert.equal(isKnownCodeOnlySlash("my-personal-skill", "claude"), false,
   "unknown user skills must remain available in Work");
+for (const engine of ["claude", "codex"] as const) {
+  assert.equal(commandsFor(engine).some((command) => (
+    "slash" in command && command.slash === "diff"
+  )), true, `/diff must be discoverable for ${engine} Code`);
+  assert.equal(clientSlashesFor(engine).has("diff"), true,
+    `/diff must remain local for ${engine}`);
+}
+assert.match(rewindComposerSource, /case "diff":[\s\S]{0,160}p\.onDiff\?\.\(\)/,
+  "/diff must open the local diff panel instead of becoming a model prompt");
+assert.match(historyAppSource, /onDiff=\{\(\) => getDiff\(""\)\}/,
+  "the composer /diff callback must reuse the existing latest-diff request path");
 assert.deepEqual(matchCommands("", "claude", "work").map((command) => command.slash),
   claudeWorkSlashes);
 assert.deepEqual(matchCommands("pla", "codex", "work"), []);

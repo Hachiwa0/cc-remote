@@ -3923,6 +3923,7 @@ export default function App() {
           })}
           onContext={requestContext}
           onOpenBtw={openBtw}
+          onDiff={() => getDiff("")}
           onPreview={previewMarkdown}
           onGoal={runGoal}
           onStatus={openStatus}

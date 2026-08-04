@@ -39,6 +39,7 @@ export const COMMANDS: Command[] = [
   { g: "会话" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal resume 恢复 Codex · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
+  { slash: "diff", name: "查看改动", ds: "打开当前会话的 Git diff 侧栏", ic: "edit" },
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "clear", name: "清空会话", ds: "开新会话，清空上下文", ic: "close" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
@@ -302,7 +303,7 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // /rewind stays reserved locally while its UI is hidden so manually typing it
 // cannot fall through to Claude's interactive-only slash layer.
 const EXTENSION_SLASHES = ["extensions", "skills", "plugins", "apps", "mcp", "hooks"];
-export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "preview", ...EXTENSION_SLASHES]);
+export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "diff", "preview", ...EXTENSION_SLASHES]);
 
 // Codex engine command palette. Native app-server controls are handled locally
 // and never expanded into natural-language lookalikes. /context is the focused
@@ -333,6 +334,7 @@ export const CODEX_COMMANDS: Command[] = [
   { g: "会话" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal resume 恢复 · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
+  { slash: "diff", name: "查看改动", ds: "打开当前会话的 Git diff 侧栏", ic: "edit" },
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "status", name: "完整状态", ds: "线程 · 配置 · 账户 · 限额 · token", ic: "cpu" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用与容量", ic: "cpu" },
@@ -341,7 +343,7 @@ export const CODEX_COMMANDS: Command[] = [
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
 const WORK_CMD_LIST: Cmd[] = WORK_COMMANDS.filter(isCmd) as Cmd[];
-export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
+export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "diff", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
 const HIDDEN_CODE_ONLY_SLASHES = new Set(["rollback"]);
 export type CommandSurface = "code" | "work";
 export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (

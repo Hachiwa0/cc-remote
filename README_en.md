@@ -146,9 +146,14 @@ commands:
   session through the SDK. It never kills the terminal shell, escalates to SIGKILL,
   or takes over a process silently.
 - **Codex Code:** prefers Codex's official shared app-server daemon, so native
-  Codex clients and Remote share the thread and control state. If the installed
-  version cannot provide it, cc-remote explicitly falls back to a private
-  app-server. Set `CC_REMOTE_CODEX_DAEMON=off` for troubleshooting.
+  Codex clients and Remote share the thread and control state. App-server ships
+  with Codex CLI and does not need a separate installation, but the CLI must
+  support both `app-server daemon` and `app-server proxy` to share this control
+  plane. If the installed version or daemon is unavailable, cc-remote falls back
+  to a private stdio app-server: Remote can still control the session on its own,
+  but it no longer has live bidirectional coordination with native Codex CLI/App.
+  `CC_REMOTE_CODEX_DAEMON=off` forces this private path and is intended only for
+  troubleshooting.
 - **Switching Codex accounts:** configure
   `scripts/codex-auth-daemon-restart` as the `codex-auth` post-switch hook.
   It publishes a local generation barrier around the official daemon restart.
@@ -260,7 +265,14 @@ First get the relay + wrapper + web running on the **machine where the agent CLI
 
 ### Prerequisites
 
-- A machine signed in to **Claude Code** or to a **Codex CLI** that supports `app-server`, with the CLI itself already **able to chat**. The Claude wrapper explicitly launches the daily `~/.local/bin/claude` rather than the SDK-bundled copy; each new Codex app-server reselects the newest usable local install. Make both available to switch engines in the web UI.
+- A machine signed in to **Claude Code** or to a recent **Codex CLI**, with the CLI itself already **able to chat**. Codex app-server ships with the CLI and does not need a separate installation. For live bidirectional coordination between Codex Code, native CLI/App, and Remote, both commands below must exit successfully:
+
+  ```bash
+  codex app-server daemon --help
+  codex app-server proxy --help
+  ```
+
+  If only `codex app-server --stdio` is available, Remote can still operate Codex independently but cannot share the native client's live control state. The Claude wrapper explicitly launches the daily `~/.local/bin/claude` rather than the SDK-bundled copy; each new Codex app-server reselects the newest usable local install. Make both engines available to switch between them in the web UI.
 - **Python 3.10+**, **Node 20.19+** (to build the web client).
 - Optional: Office artifact preview requires **LibreOffice + bubblewrap** on the
   Linux wrapper host (for example, `sudo apt install libreoffice bubblewrap`).
@@ -662,7 +674,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | Interactive pairing credential; the file must be private to the current user. Explicit `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` values take precedence. |
 | `CLAUDE_BIN` | `~/.local/bin/claude` | Daily Claude Code executable launched by the wrapper. Empty still selects this default; use another absolute path only when the CLI is installed elsewhere. |
 | `CC_REMOTE_CODEX_PROXY` | empty | Optional HTTP(S)/SOCKS5 proxy injected only into Codex subprocesses launched by the wrapper. It does not change the wrapper-to-relay connection or the user's terminal `codex`. |
-| `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server. Work is always private and ignores this setting. |
+| `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server and loses live bidirectional coordination with native Codex CLI/App. Work is always private and ignores this setting. |
 | `CC_REMOTE_STATE_DIR` | `~/.cc-remote` | Local wrapper state directory. The account-switch hook and wrapper must use the same value; the daemon generation barrier stored here contains no Codex credentials. |
 | `CC_CWD` | cwd | Default working directory for new sessions. Claude `--resume` needs it to locate `~/.claude/projects/` — **it must be correct**; Codex resume first recovers the original cwd from its rollout. |
 | `CC_RESUME_SESSION_ID` | empty | Resume a specific session UUID; empty starts fresh. The id is persisted to `~/.cc-remote/` after first start. |
@@ -709,7 +721,7 @@ cc-remote **does not touch the model API** — it drives already-configured loca
 
 - **Official Anthropic API**: install `claude`, make sure it can chat, done.
 - **Compatible endpoint (e.g. GLM / z.AI)**: set `ANTHROPIC_BASE_URL` in `settings.json` as usual (pointing at an official-compatible endpoint or your own proxy); cc-remote still only does the control link.
-- **Codex**: first make sure local `codex` can chat and `codex app-server` starts. cc-remote neither reads its API key nor rewrites global authentication.
+- **Codex**: first make sure local `codex` can chat; app-server ships with the CLI. For live bidirectional native CLI/App and Remote coordination in Codex Code, also verify that `codex app-server daemon --help` and `codex app-server proxy --help` both succeed. cc-remote neither reads its API key nor rewrites global authentication.
 
 ## Development
 
