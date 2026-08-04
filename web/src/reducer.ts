@@ -2907,6 +2907,15 @@ function reduceEvent(
       const locallyRetainedCursor = historyTrimmed
         ? (turns[0]?.historyTurnId ?? turns[0]?.id ?? null)
         : null;
+      // Keeping a same-revision painted head and keeping its paging authority
+      // are separate decisions. IndexedDB hydrates only turns/revision, so its
+      // default false/null paging fields must never override an authoritative
+      // newest page which says older history exists. An explicitly paged
+      // runtime (including one which reached the history floor), or a runtime
+      // with a complete usable cursor, still owns its stable reading boundary.
+      const preserveStablePagination = preserveStableHeadHistory && (
+        base.hasLoadedOlderHistory || (!!base.hasMore && !!base.oldestId)
+      );
       const acceptsControlState = !e.before;
       const acceptsOwnershipState = acceptsControlState && !racedLiveEvent
         && !base.hasRevisionedControl;
@@ -3015,10 +3024,10 @@ function reduceEvent(
             // instead of a terminal pagination boundary.
             hasMore: historyTrimmed
               ? true
-              : preserveStableHeadHistory ? base.hasMore : e.has_more,
+              : preserveStablePagination ? base.hasMore : e.has_more,
             oldestId: historyTrimmed
               ? locallyRetainedCursor
-              : preserveStableHeadHistory
+              : preserveStablePagination
                 ? base.oldestId : (e.oldest_id ?? base.oldestId),
             truncated: base.truncated || historyTrimmed,
             // A native `claude`/`codex` in the terminal owns this session and is

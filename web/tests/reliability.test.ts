@@ -7105,6 +7105,55 @@ try {
   assert.deepEqual(sameRevisionState.runtimes[sameRevisionSid].turns.map(
     (turn: { id: string }) => turn.id), ["kept-before-rewind"]);
 
+  // IndexedDB intentionally stores only the bounded visible projection, not
+  // its pagination cursor.  When that instant paint races a same-authority
+  // newest page, keeping the cached rows must not also keep the cache's
+  // default `hasMore=false` / null cursor and hide older server history.
+  const cachedPagingSid = "same-revision-cache-restores-pagination";
+  let cachedPagingState = reduce({
+    ...initialState, focusedSid: cachedPagingSid,
+  }, {
+    type: "hydrate_cache",
+    sid: cachedPagingSid,
+    revision: "cached-paging-rev",
+    generation: "cached-paging-generation",
+    turns: [{
+      id: "cached-current", prompt: "cached current",
+      blocks: [], done: true,
+    }],
+  });
+  assert.equal(!!cachedPagingState.runtimes[cachedPagingSid].hasMore, false);
+  assert.equal(cachedPagingState.runtimes[cachedPagingSid].oldestId ?? null, null);
+  cachedPagingState = reduce(cachedPagingState, {
+    type: "event", event: event({
+      type: "history", sid: cachedPagingSid, session_id: cachedPagingSid,
+      revision: "cached-paging-rev",
+      generation: "cached-paging-generation",
+      build_seq: 1,
+      detail: "summary",
+      has_more: true,
+      oldest_id: "server-older-cursor",
+      events: [],
+      turns: [{
+        id: "cached-current", prompt: "cached current",
+        blocks: [], done: true,
+      }],
+    }),
+  });
+  assert.equal(cachedPagingState.runtimes[cachedPagingSid].hasMore, true,
+    "an authoritative newest page must restore pagination after cache paint");
+  assert.equal(cachedPagingState.runtimes[cachedPagingSid].oldestId,
+    "server-older-cursor",
+    "the load-older affordance must use the authoritative server cursor");
+  const cachedPagingProjection = displayHistoryProjection(
+    cachedPagingState.historyRecovery,
+    cachedPagingSid,
+    cachedPagingState.runtimes[cachedPagingSid],
+  );
+  assert.equal(cachedPagingProjection.hasMore, true);
+  assert.equal(cachedPagingProjection.pagingReady, true);
+  assert.equal(cachedPagingProjection.oldestId, "server-older-cursor");
+
   // When the tiny invalidation marker itself fell out of the ring, the replay
   // gap is still a conservative invalidation boundary. Never leave a stale
   // preview open or finish loading before authoritative History arrives.

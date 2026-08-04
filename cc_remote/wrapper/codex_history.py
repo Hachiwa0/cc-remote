@@ -46,6 +46,7 @@ _DATA_IMAGE = re.compile(
     r"^data:(image/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=]+)$",
 )
 _ITEM_PAGE_LIMIT = 1024
+_MAX_ITEM_PAGES = 16
 _MAX_DETAIL_ITEMS = 4096
 _MAX_LOCATORS = 8192
 _MAX_DETAIL_CACHE_ENTRIES = 64
@@ -927,7 +928,12 @@ class CodexOfficialHistory:
         seen_cursors: set[str] = set()
         items: list[dict[str, Any]] = []
         seen_items: set[str] = set()
+        page_count = 0
         while True:
+            if page_count >= _MAX_ITEM_PAGES:
+                raise CodexHistoryInvalidResponse(
+                    "Codex item pagination exceeded its page limit")
+            page_count += 1
             response = await self._call("thread/items/list", {
                 "threadId": thread_id,
                 "turnId": native_turn_id,
@@ -936,6 +942,9 @@ class CodexOfficialHistory:
                 "sortDirection": "asc",
             })
             rows, next_cursor = _response_page(response)
+            if not rows and next_cursor is not None:
+                raise CodexHistoryInvalidResponse(
+                    "Codex item page is empty before its terminal cursor")
             for row in rows:
                 if not isinstance(row, dict):
                     raise CodexHistoryInvalidResponse(

@@ -7,9 +7,12 @@ import sqlite3
 import stat
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from cc_remote.log import logger
 
@@ -23,6 +26,9 @@ PreviewCapabilitySource = Literal[
 _GLOBAL_CAP = 4096
 _SESSION_CAP = 256
 PREVIEW_PATH_MAX_BYTES = 4096
+_LOCK_TIMEOUT_SECONDS = 5.0
+_LOCK_RETRY_SECONDS = 0.01
+_EPOCH_FILE_MAX_BYTES = 64
 
 
 class PreviewCapabilityError(ValueError):
@@ -70,14 +76,25 @@ class PreviewCapabilityStore:
     """
 
     def __init__(self, state_dir: Path):
-        self._path = Path(state_dir) / "preview-capabilities.sqlite3"
+        state_dir = Path(state_dir)
+        self._path = state_dir / "preview-capabilities.sqlite3"
+        self._lock_path = state_dir / ".preview-capabilities.lock"
+        self._invalidation_path = (
+            state_dir / ".preview-capabilities.invalidated"
+        )
+        self._epoch_path = state_dir / ".preview-capabilities.epoch"
+        self._epoch: str | None = None
         self._entries: OrderedDict[
             CapabilityKey, PreviewCapability
         ] = OrderedDict()
         self._persistent = True
         try:
-            self._initialize()
-            self._load()
+            with self._exclusive_lock():
+                if self._invalidation_path.exists():
+                    self._recover_invalidation_locked()
+                self._ensure_epoch_locked()
+                self._initialize()
+                self._load()
         except Exception as exc:
             self._persistent = False
             self._entries.clear()
@@ -85,6 +102,186 @@ class PreviewCapabilityStore:
                 "preview capability store unavailable; using fail-closed memory",
                 error_type=type(exc).__name__,
             )
+
+    @contextmanager
+    def _exclusive_lock(self):
+        parent = self._path.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(parent, 0o700)
+        descriptor = os.open(
+            self._lock_path,
+            os.O_RDWR | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode)
+                    or getattr(info, "st_uid", -1) != os.geteuid()
+                    or info.st_nlink != 1):
+                raise OSError("preview capability lock file is unsafe")
+            os.fchmod(descriptor, 0o600)
+            deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(
+                        descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "preview capability lock acquisition timed out")
+                    time.sleep(_LOCK_RETRY_SECONDS)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def _fsync_parent(self) -> None:
+        descriptor = os.open(
+            self._path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _mark_invalid_locked(self) -> None:
+        if self._invalidation_path.exists():
+            return
+        temporary = self._invalidation_path.with_name(
+            f".{self._invalidation_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                descriptor = -1
+                stream.write(b"preview capabilities invalidated\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._invalidation_path)
+            os.chmod(self._invalidation_path, 0o600)
+            self._fsync_parent()
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _clear_invalidation_locked(self) -> None:
+        self._invalidation_path.unlink()
+        self._fsync_parent()
+
+    def _write_epoch_locked(self) -> None:
+        value = uuid4().hex
+        temporary = self._epoch_path.with_name(
+            f".{self._epoch_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                descriptor = -1
+                stream.write((value + "\n").encode("ascii"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._epoch_path)
+            os.chmod(self._epoch_path, 0o600)
+            self._fsync_parent()
+            self._epoch = value
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _read_epoch(self) -> str:
+        descriptor = os.open(
+            self._epoch_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode)
+                    or getattr(info, "st_uid", -1) != os.geteuid()
+                    or info.st_nlink != 1
+                    or info.st_size > _EPOCH_FILE_MAX_BYTES):
+                raise ValueError("preview capability epoch file is unsafe")
+            raw = os.read(descriptor, _EPOCH_FILE_MAX_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(raw) > _EPOCH_FILE_MAX_BYTES:
+            raise ValueError("preview capability epoch exceeds its size limit")
+        value = raw.decode("ascii").strip()
+        if len(value) != 32 or any(
+            ch not in "0123456789abcdef" for ch in value
+        ):
+            raise ValueError("preview capability epoch is invalid")
+        return value
+
+    def _ensure_epoch_locked(self) -> None:
+        try:
+            value = self._read_epoch()
+        except FileNotFoundError:
+            self._write_epoch_locked()
+            return
+        self._epoch = value
+
+    def _observe_epoch(self) -> None:
+        """Drop stale in-memory grants changed by another wrapper process."""
+        try:
+            value = self._read_epoch()
+            if self._invalidation_path.exists() or value != self._epoch:
+                self._entries.clear()
+                self._epoch = value
+        except Exception as exc:
+            self._entries.clear()
+            self._persistent = False
+            log.warning(
+                "preview capability epoch unavailable; clearing memory",
+                error_type=type(exc).__name__,
+            )
+
+    def _sync_epoch_locked(self) -> bool:
+        value = self._read_epoch()
+        unchanged = value == self._epoch
+        if not unchanged:
+            self._entries.clear()
+            self._epoch = value
+        return unchanged
+
+    def _recover_invalidation_locked(self) -> None:
+        """Discard every old grant before clearing a crash marker."""
+        self._initialize()
+        with self._connect() as connection:
+            connection.execute("DELETE FROM preview_capabilities")
+        self._write_epoch_locked()
+        self._clear_invalidation_locked()
+        self._entries.clear()
+
+    def _prepare_destructive_write_locked(self) -> None:
+        """Resolve an older failed mutation before starting a new one."""
+        if self._invalidation_path.exists():
+            self._recover_invalidation_locked()
+        else:
+            self._sync_epoch_locked()
 
     @staticmethod
     def _key(
@@ -105,6 +302,7 @@ class PreviewCapabilityStore:
             connection.close()
             raise
         connection.execute("PRAGMA busy_timeout = 1000")
+        connection.execute("PRAGMA synchronous = FULL")
         return connection
 
     def _initialize(self) -> None:
@@ -294,48 +492,67 @@ class PreviewCapabilityStore:
         if not self._persistent:
             return
         try:
-            with self._connect() as connection:
-                for key in removed:
-                    connection.execute(
-                        """
-                        DELETE FROM preview_capabilities
-                        WHERE engine=? AND space=? AND session_id=? AND path=?
-                        """,
-                        key,
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO preview_capabilities (
-                        engine, space, session_id, path, device, inode, uid,
-                        mode, source, granted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(engine, space, session_id, path) DO UPDATE SET
-                        device=excluded.device,
-                        inode=excluded.inode,
-                        uid=excluded.uid,
-                        mode=excluded.mode,
-                        source=excluded.source,
-                        granted_at=excluded.granted_at
-                    """,
-                    (
+            with self._exclusive_lock():
+                if not self._sync_epoch_locked():
+                    key = self._key(
                         capability.engine,
                         capability.space,
                         capability.session_id,
                         capability.path,
-                        str(capability.device),
-                        str(capability.inode),
-                        str(capability.uid),
-                        capability.mode,
-                        capability.source,
-                        capability.granted_at,
-                    ),
-                )
+                    )
+                    self._entries[key] = capability
+                    removed = []
+                if self._invalidation_path.exists():
+                    raise RuntimeError(
+                        "preview capability store is invalidated")
+                with self._connect() as connection:
+                    for key in removed:
+                        connection.execute(
+                            """
+                            DELETE FROM preview_capabilities
+                            WHERE engine=? AND space=? AND session_id=? AND path=?
+                            """,
+                            key,
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO preview_capabilities (
+                            engine, space, session_id, path, device, inode, uid,
+                            mode, source, granted_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(engine, space, session_id, path) DO UPDATE SET
+                            device=excluded.device,
+                            inode=excluded.inode,
+                            uid=excluded.uid,
+                            mode=excluded.mode,
+                            source=excluded.source,
+                            granted_at=excluded.granted_at
+                        """,
+                        (
+                            capability.engine,
+                            capability.space,
+                            capability.session_id,
+                            capability.path,
+                            str(capability.device),
+                            str(capability.inode),
+                            str(capability.uid),
+                            capability.mode,
+                            capability.source,
+                            capability.granted_at,
+                        ),
+                    )
         except Exception as exc:
+            invalidated = self._invalidation_path.exists()
             self._persistent = False
+            if invalidated:
+                self._entries.clear()
             log.warning(
                 "preview capability grant not persisted",
                 error_type=type(exc).__name__,
             )
+            if invalidated:
+                raise PreviewCapabilityError(
+                    "预览授权存储正在安全恢复，请稍后重试") from exc
 
     def grant_path(
         self,
@@ -348,6 +565,10 @@ class PreviewCapabilityStore:
         source: PreviewCapabilitySource,
         persist: bool = True,
     ) -> PreviewCapability:
+        self._observe_epoch()
+        if persist and self._invalidation_path.exists():
+            raise PreviewCapabilityError(
+                "预览授权存储正在安全恢复，请稍后重试")
         capability = self.inspect_path(
             engine,
             space,
@@ -435,6 +656,7 @@ class PreviewCapabilityStore:
         *,
         require_write: bool = False,
     ) -> dict[str, PreviewCapability]:
+        self._observe_epoch()
         return {
             path: capability
             for (entry_engine, entry_space, entry_sid, path), capability
@@ -454,25 +676,33 @@ class PreviewCapabilityStore:
         session_id: str,
         path: str,
     ) -> None:
+        self._observe_epoch()
         canonical = self._canonical_path(path)
         key = self._key(engine, space, session_id, canonical)
         self._entries.pop(key, None)
-        if not self._persistent:
-            return
+        marker_created = False
         try:
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    DELETE FROM preview_capabilities
-                    WHERE engine=? AND space=? AND session_id=? AND path=?
-                    """,
-                    key,
-                )
+            with self._exclusive_lock():
+                self._prepare_destructive_write_locked()
+                self._mark_invalid_locked()
+                marker_created = True
+                with self._connect() as connection:
+                    connection.execute(
+                        """
+                        DELETE FROM preview_capabilities
+                        WHERE engine=? AND space=? AND session_id=? AND path=?
+                        """,
+                        key,
+                    )
+                self._write_epoch_locked()
+                self._clear_invalidation_locked()
+                self._persistent = True
         except Exception as exc:
             self._persistent = False
+            self._entries.clear()
             log.warning(
                 "preview capability revoke not persisted",
-                error_type=type(exc).__name__,
+                error_type=type(exc).__name__, marker_created=marker_created,
             )
 
     def rekey(
@@ -484,12 +714,15 @@ class PreviewCapabilityStore:
         *,
         persist: bool = True,
     ) -> None:
+        self._observe_epoch()
         moving = [
             (key, capability)
             for key, capability in self._entries.items()
             if key[:3] == (engine, space, old_session_id)
         ]
-        if not moving or old_session_id == new_session_id:
+        if old_session_id == new_session_id:
+            return
+        if not moving and not persist:
             return
         for old_key, capability in moving:
             self._entries.pop(old_key, None)
@@ -543,83 +776,100 @@ class PreviewCapabilityStore:
             key=lambda item: item[1].granted_at,
         ))
         removed = self._trim_entries()
-        if not persist or not self._persistent:
+        if not persist:
             return
+        marker_created = False
         try:
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    DELETE FROM preview_capabilities
-                    WHERE engine=? AND space=? AND session_id=?
-                    """,
-                    (engine, space, old_session_id),
-                )
-                for key in removed:
+            with self._exclusive_lock():
+                self._prepare_destructive_write_locked()
+                self._mark_invalid_locked()
+                marker_created = True
+                with self._connect() as connection:
                     connection.execute(
                         """
                         DELETE FROM preview_capabilities
-                        WHERE engine=? AND space=? AND session_id=? AND path=?
+                        WHERE engine=? AND space=? AND session_id=?
                         """,
-                        key,
+                        (engine, space, old_session_id),
                     )
-                for key, capability in self._entries.items():
-                    if key[:3] != (engine, space, new_session_id):
-                        continue
-                    connection.execute(
-                        """
-                        INSERT INTO preview_capabilities (
-                            engine, space, session_id, path, device, inode, uid,
-                            mode, source, granted_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(engine, space, session_id, path) DO UPDATE SET
-                            device=excluded.device,
-                            inode=excluded.inode,
-                            uid=excluded.uid,
-                            mode=excluded.mode,
-                            source=excluded.source,
-                            granted_at=excluded.granted_at
-                        """,
-                        (
-                            capability.engine,
-                            capability.space,
-                            capability.session_id,
-                            capability.path,
-                            str(capability.device),
-                            str(capability.inode),
-                            str(capability.uid),
-                            capability.mode,
-                            capability.source,
-                            capability.granted_at,
-                        ),
-                    )
+                    for key in removed:
+                        connection.execute(
+                            """
+                            DELETE FROM preview_capabilities
+                            WHERE engine=? AND space=? AND session_id=? AND path=?
+                            """,
+                            key,
+                        )
+                    for key, capability in self._entries.items():
+                        if key[:3] != (engine, space, new_session_id):
+                            continue
+                        connection.execute(
+                            """
+                            INSERT INTO preview_capabilities (
+                                engine, space, session_id, path, device, inode, uid,
+                                mode, source, granted_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(engine, space, session_id, path) DO UPDATE SET
+                                device=excluded.device,
+                                inode=excluded.inode,
+                                uid=excluded.uid,
+                                mode=excluded.mode,
+                                source=excluded.source,
+                                granted_at=excluded.granted_at
+                            """,
+                            (
+                                capability.engine,
+                                capability.space,
+                                capability.session_id,
+                                capability.path,
+                                str(capability.device),
+                                str(capability.inode),
+                                str(capability.uid),
+                                capability.mode,
+                                capability.source,
+                                capability.granted_at,
+                            ),
+                        )
+                self._write_epoch_locked()
+                self._clear_invalidation_locked()
+                self._persistent = True
         except Exception as exc:
             self._persistent = False
+            self._entries.clear()
             log.warning(
                 "preview capability rekey not persisted",
-                error_type=type(exc).__name__,
+                error_type=type(exc).__name__, marker_created=marker_created,
             )
 
     def remove_session(self, engine: str, session_id: str) -> None:
+        self._observe_epoch()
         removed = [
             key for key in self._entries
             if key[0] == engine and key[2] == session_id
         ]
         for key in removed:
             self._entries.pop(key, None)
-        if not self._persistent:
-            return
+        marker_created = False
         try:
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    DELETE FROM preview_capabilities
-                    WHERE engine=? AND session_id=?
-                    """,
-                    (engine, session_id),
-                )
+            with self._exclusive_lock():
+                self._prepare_destructive_write_locked()
+                self._mark_invalid_locked()
+                marker_created = True
+                with self._connect() as connection:
+                    connection.execute(
+                        """
+                        DELETE FROM preview_capabilities
+                        WHERE engine=? AND session_id=?
+                        """,
+                        (engine, session_id),
+                    )
+                self._write_epoch_locked()
+                self._clear_invalidation_locked()
+                self._persistent = True
         except Exception as exc:
             self._persistent = False
+            self._entries.clear()
             log.warning(
                 "preview capability session cleanup not persisted",
-                error_type=type(exc).__name__,
+                error_type=type(exc).__name__, marker_created=marker_created,
             )

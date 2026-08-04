@@ -137,6 +137,37 @@ class CodexControlStore:
             self._sessions = updated
         return controls
 
+    def inherit_if_absent(
+        self,
+        session_id: str,
+        *,
+        approval_policy: str | None,
+        permission_profile: str | None,
+    ) -> CodexControls:
+        """Seed a new fork once without overwriting later child choices."""
+        session_id = _session_id(session_id)
+        controls = CodexControls(
+            approval_policy=(
+                approval_policy
+                if approval_policy in CODEX_APPROVAL_POLICIES else None
+            ),
+            permission_profile=_permission_profile(permission_profile),
+        )
+        payload = controls.as_dict()
+        with self._lock:
+            existing = self._sessions.get(session_id)
+            if existing is not None:
+                return _controls(existing)
+            if not payload:
+                return controls
+            updated = dict(self._sessions)
+            updated[session_id] = payload
+            while len(updated) > _MAX_ENTRIES:
+                updated.pop(next(iter(updated)))
+            self._persist(updated)
+            self._sessions = updated
+        return controls
+
     def delete(self, session_id: str) -> None:
         session_id = _session_id(session_id)
         with self._lock:

@@ -553,7 +553,7 @@ function reducerHistoryEvent(
   };
 }
 
-function reducerHistoryInitialState(): AppState {
+function reducerHistoryInitialState(cachedPagingRace = false): AppState {
   let state: AppState = {
     ...initialState,
     focusedSid: REDUCER_SESSION_A,
@@ -562,6 +562,15 @@ function reducerHistoryInitialState(): AppState {
       [REDUCER_SESSION_B]: createRuntime(),
     },
   };
+  if (cachedPagingRace) {
+    return reduce(state, {
+      type: "hydrate_cache",
+      sid: REDUCER_SESSION_A,
+      revision: REDUCER_HISTORY_REVISION,
+      generation: REDUCER_HISTORY_GENERATION,
+      turns: [finalTurn("reducer-cached-current", 3)],
+    });
+  }
   state = reduce(state, {
     type: "event",
     event: reducerHistoryEvent(
@@ -594,9 +603,13 @@ function reducerHistoryInitialState(): AppState {
 }
 
 function ReducerHistoryBrowserFixture() {
+  const cachedPagingRace = useMemo(
+    () => new URLSearchParams(window.location.search).has("cached-paging"),
+    [],
+  );
   const [state, dispatch] = useReducer(
     reduce,
-    undefined,
+    cachedPagingRace,
     reducerHistoryInitialState,
   );
   const stateRef = useRef(state);
@@ -612,6 +625,26 @@ function ReducerHistoryBrowserFixture() {
     state.historyBrowse,
     state.retainedHistoryBrowse,
   );
+
+  useEffect(() => {
+    if (!cachedPagingRace) return;
+    const timer = window.setTimeout(() => {
+      dispatch({
+        type: "event",
+        event: reducerHistoryEvent(
+          REDUCER_SESSION_A,
+          [finalTurn("reducer-cached-current", 3)],
+          {
+            buildSeq: 1,
+            hasMore: true,
+            oldestId: "reducer-server-older-cursor",
+            newestId: "reducer-cached-current",
+          },
+        ),
+      });
+    }, 25);
+    return () => window.clearTimeout(timer);
+  }, [cachedPagingRace]);
 
   const loadOlder = useCallback((): boolean | {
     accepted: true;

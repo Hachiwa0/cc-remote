@@ -881,6 +881,29 @@ test("reducer history paging and live refresh keep one stable projection", async
   await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("20");
 });
 
+test("authoritative paging returns after an IndexedDB first paint", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?reducer-pipeline=1&cached-paging=1",
+  );
+  await expect(page.locator('[data-turn-id="reducer-cached-current"]'))
+    .toBeVisible();
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  const loader = page.getByTestId("load-older-history");
+  await expect(loader).toBeVisible();
+  const [loaderBox, viewportBox] = await Promise.all([
+    loader.boundingBox(),
+    viewport.boundingBox(),
+  ]);
+  expect(loaderBox).not.toBeNull();
+  expect(viewportBox).not.toBeNull();
+  expect(loaderBox!.y).toBeGreaterThanOrEqual(viewportBox!.y);
+  expect(loaderBox!.y + loaderBox!.height)
+    .toBeLessThanOrEqual(viewportBox!.y + viewportBox!.height);
+});
+
 test("reducer prepend never paints an intermediate reading-row jump", async ({
   page,
 }) => {

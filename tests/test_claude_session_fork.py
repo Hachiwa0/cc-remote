@@ -134,6 +134,57 @@ def test_claude_handler_passes_exact_sdk_boundary_then_renames_and_lists(monkeyp
     asyncio.run(run())
 
 
+def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
+    async def run():
+        machine, _ = _resident_machine(monkeypatch)
+        machine.sessions[PARENT].sdk = SimpleNamespace(
+            model="claude-opus-5",
+            permission_mode="acceptEdits",
+        )
+        visible_title = {"value": claude_fork_marker("request-1")}
+
+        def get_info(session_id, directory=None):
+            if session_id == PARENT:
+                return _info(title="Source session")
+            return _info(CHILD, title=visible_title["value"])
+
+        def fork(*_args, **_kwargs):
+            return SimpleNamespace(session_id=CHILD)
+
+        def rename(_session_id, title, directory=None):
+            visible_title["value"] = title
+
+        monkeypatch.setattr(machine_module, "get_session_info", get_info)
+        monkeypatch.setattr(machine_module, "fork_session", fork)
+        monkeypatch.setattr(machine_module, "rename_session", rename)
+        monkeypatch.setattr(machine_module, "list_sessions", lambda **_kwargs: [])
+        monkeypatch.setattr(machine, "_bg_blocked_session_ids", lambda: set())
+
+        command = _command()
+        await machine._handle_fork_session(command)
+        inherited = machine._claude_controls.get(CHILD)
+        assert inherited.model == "claude-opus-5"
+        assert inherited.permission_mode == "acceptEdits"
+        assert machine._claude_forks.entries[
+            "request-1"]["controls"] == {
+                "model": "claude-opus-5",
+                "permission_mode": "acceptEdits",
+            }
+
+        machine._claude_controls.update(
+            CHILD,
+            model="claude-sonnet-5",
+            effort=None,
+            permission_mode="plan",
+        )
+        await machine._handle_fork_session(command)
+        child_choice = machine._claude_controls.get(CHILD)
+        assert child_choice.model == "claude-sonnet-5"
+        assert child_choice.permission_mode == "plan"
+
+    asyncio.run(run())
+
+
 def test_same_reliable_request_replays_result_without_second_sdk_fork(monkeypatch):
     async def run():
         machine, transport = _resident_machine(monkeypatch)

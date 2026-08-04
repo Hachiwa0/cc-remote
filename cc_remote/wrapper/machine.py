@@ -117,6 +117,7 @@ from cc_remote.wrapper.claude_controls import (
     ClaudeControls,
     last_completed_assistant_controls,
     valid_claude_model,
+    valid_claude_permission,
 )
 from cc_remote.wrapper.codex_controls import (
     CODEX_WEB_SEARCH_MODES,
@@ -212,7 +213,7 @@ from cc_remote.wrapper.work_context import (
     work_context_metrics,
 )
 from cc_remote.wrapper.codex_worktrees import (
-    WorktreeError, prepare_worktree, rollback_worktree,
+    WorktreeError, WorktreeSpec, prepare_worktree, rollback_worktree,
 )
 from cc_remote.wrapper.codex_checkpoints import (
     CheckpointConflict, CheckpointError, CodexCheckpointJournal,
@@ -12871,20 +12872,28 @@ class WrapperMachine:
             source = root / f"input{suffix}"
             output = root / "out"
             home = root / "home"
+            xdg_config = root / "xdg-config"
+            xdg_cache = root / "xdg-cache"
+            xdg_runtime = root / "xdg-runtime"
             output.mkdir(mode=0o700)
             home.mkdir(mode=0o700)
+            xdg_config.mkdir(mode=0o700)
+            xdg_cache.mkdir(mode=0o700)
+            xdg_runtime.mkdir(mode=0o700)
             source.write_bytes(data)
             source.chmod(0o600)
 
             command = [
                 bwrap,
                 "--die-with-parent",
-                "--unshare-net",
+                "--unshare-all",
                 "--new-session",
+                "--hostname", "cc-remote-preview",
+                "--clearenv",
                 "--ro-bind", "/usr", "/usr",
                 "--ro-bind", "/etc", "/etc",
-                "--ro-bind", "/lib", "/lib",
-                "--ro-bind", "/lib64", "/lib64",
+                "--ro-bind-try", "/lib", "/lib",
+                "--ro-bind-try", "/lib64", "/lib64",
                 "--symlink", "usr/bin", "/bin",
                 "--symlink", "usr/sbin", "/sbin",
                 "--proc", "/proc",
@@ -12894,8 +12903,15 @@ class WrapperMachine:
                 "--dir", "/mnt",
                 "--bind", temp, "/mnt",
                 "--chdir", "/mnt",
+                "--cap-drop", "ALL",
+                "--setenv", "PATH", "/usr/bin:/bin",
                 "--setenv", "HOME", "/mnt/home",
                 "--setenv", "TMPDIR", "/mnt/home",
+                "--setenv", "LANG", "C.UTF-8",
+                "--setenv", "LC_ALL", "C.UTF-8",
+                "--setenv", "XDG_CONFIG_HOME", "/mnt/xdg-config",
+                "--setenv", "XDG_CACHE_HOME", "/mnt/xdg-cache",
+                "--setenv", "XDG_RUNTIME_DIR", "/mnt/xdg-runtime",
                 soffice,
                 "-env:UserInstallation=file:///mnt/profile",
                 "--headless",
@@ -12935,6 +12951,11 @@ class WrapperMachine:
             stderr=subprocess.DEVNULL,
             close_fds=True,
             start_new_session=True,
+            env={
+                "PATH": os.defpath,
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            },
         )
         try:
             return_code = process.wait(timeout=cls.OFFICE_PREVIEW_TIMEOUT_SECONDS)
@@ -15499,19 +15520,30 @@ class WrapperMachine:
         self._uncertain_codex_forks.move_to_end(request_id)
 
     def _ensure_codex_fork_reconciler(
-        self, cmd, sid: str, cwd: str, marker: str,
+        self,
+        cmd,
+        sid: str,
+        cwd: str,
+        marker: str,
+        worktree: Optional[WorktreeSpec] = None,
     ) -> None:
         current = self._codex_fork_tasks.get(cmd.request_id)
         if current is not None and not current.done():
             return
         task = asyncio.create_task(
-            self._reconcile_codex_fork_command(cmd, sid, cwd, marker),
+            self._reconcile_codex_fork_command(
+                cmd, sid, cwd, marker, worktree),
             name=f"codex-fork-reconcile-{cmd.request_id}",
         )
         self._codex_fork_tasks[cmd.request_id] = task
 
     async def _reconcile_codex_fork_command(
-        self, cmd, sid: str, cwd: str, marker: str,
+        self,
+        cmd,
+        sid: str,
+        cwd: str,
+        marker: str,
+        worktree: Optional[WorktreeSpec] = None,
     ) -> None:
         """Resolve an unknown mutation on the current client connection."""
         request_id = cmd.request_id
@@ -15531,17 +15563,35 @@ class WrapperMachine:
                     child = self._uncertain_codex_forks.get(request_id)
                     if not child and entry.get("status") == "complete":
                         child = entry.get("session_id")
-                    if not child:
-                        meta = await asyncio.to_thread(
-                            find_rollout_fork, marker, sid, cwd)
-                        child = (
-                            meta.get("session_id")
-                            if isinstance(meta, dict) else None)
+                    try:
+                        if not child:
+                            meta = await asyncio.to_thread(
+                                find_rollout_fork, marker, sid, cwd)
+                            child = (
+                                meta.get("session_id")
+                                if isinstance(meta, dict) else None)
+                        if not child and worktree is not None:
+                            thread = await self._find_codex_worktree_fork(
+                                sid, cwd)
+                            child = (
+                                thread.get("id")
+                                if isinstance(thread, dict) else None)
+                    except Exception as exc:
+                        log.warning(
+                            "Codex fork reconciliation lookup failed",
+                            request_id=request_id,
+                            error_type=type(exc).__name__,
+                        )
+                        continue
                     if not isinstance(child, str) or not child:
                         continue
                     try:
-                        event = await self._finish_same_cwd_fork(
-                            cmd, sid, cwd, child)
+                        if worktree is None:
+                            event = await self._finish_same_cwd_fork(
+                                cmd, sid, cwd, child)
+                        else:
+                            event = await self._finish_worktree_fork(
+                                cmd, sid, worktree, child, marker)
                     except _ForkOutcomeUncertain:
                         continue
                     if client_id and cmd_id:
@@ -15570,6 +15620,142 @@ class WrapperMachine:
             if self._codex_fork_tasks.get(request_id) is current:
                 self._codex_fork_tasks.pop(request_id, None)
 
+    async def _claude_fork_control_snapshot(
+        self,
+        sid: str,
+        cwd: str,
+        ctx: Optional[SessionContext],
+    ) -> dict[str, str]:
+        saved = await self._load_claude_session_controls(sid)
+        model = valid_claude_model(
+            _session_model(ctx) if ctx is not None else None
+        ) or saved.model
+        permission = valid_claude_permission(
+            _session_permission_mode(ctx) if ctx is not None else None
+        ) or saved.permission_mode
+        if model is None and ctx is None:
+            try:
+                native = await asyncio.to_thread(
+                    last_completed_assistant_controls,
+                    sid,
+                    directory=cwd,
+                    max_bytes=self.cfg.history_source_max_bytes,
+                )
+                model = native.model
+            except Exception as exc:
+                log.warning(
+                    "Claude fork model snapshot unavailable",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+        return {
+            key: value
+            for key, value in (
+                ("model", model),
+                ("permission_mode", permission),
+            )
+            if isinstance(value, str) and value
+        }
+
+    async def _codex_fork_control_snapshot(
+        self,
+        sid: str,
+        ctx: Optional[SessionContext],
+    ) -> dict[str, str]:
+        saved = await self._load_codex_session_controls(sid)
+        settings = await asyncio.to_thread(
+            codex_session_settings,
+            sid,
+        )
+        model = (
+            _session_model(ctx) if ctx is not None else None
+        ) or settings.get("model")
+        approval: Optional[str] = None
+        granular_approval = bool(settings.get("approval_policy_granular"))
+        if ctx is not None:
+            raw_approval = getattr(ctx.sdk, "approval_policy", None)
+            if (isinstance(raw_approval, str)
+                    and raw_approval in CODEX_PERMISSION_MODES):
+                approval = raw_approval
+            elif (isinstance(raw_approval, dict)
+                    and isinstance(raw_approval.get("granular"), dict)):
+                # ``ctx.sdk.approval`` is only the Web UI projection for this
+                # official object. Omitting the override lets thread/fork retain
+                # the source thread's native granular semantics.
+                granular_approval = True
+            else:
+                projected = _session_permission_mode(ctx)
+                if projected in CODEX_PERMISSION_MODES:
+                    approval = projected
+        if approval is None and not granular_approval:
+            approval = saved.approval_policy or settings.get("approval_policy")
+        profile = (
+            _session_permission_profile(ctx) if ctx is not None else None
+        ) or saved.permission_profile or settings.get("permission_profile")
+        return {
+            key: value
+            for key, value in (
+                ("model", model),
+                ("approval_policy", approval),
+                ("permission_profile", profile),
+            )
+            if isinstance(value, str) and value
+            and len(value) <= 256
+        }
+
+    @staticmethod
+    async def _codex_fork_profile_allowed(
+        controls: dict[str, str],
+        cwd: str,
+    ) -> bool:
+        profile = controls.get("permission_profile")
+        if profile is None:
+            return True
+        profiles = await codex_permission_profiles(cwd)
+        return any(
+            item["id"] == profile and item["allowed"]
+            for item in profiles
+        )
+
+    async def _inherit_claude_fork_controls(
+        self,
+        child_session_id: str,
+        controls: object,
+    ) -> None:
+        values = controls if isinstance(controls, dict) else {}
+        if not values:
+            return
+        if self._claude_controls is None:
+            raise ClaudeControlStoreError(
+                "Claude control store is unavailable")
+        await asyncio.to_thread(
+            self._claude_controls.inherit_if_absent,
+            child_session_id,
+            model=values.get("model"),
+            permission_mode=values.get("permission_mode"),
+        )
+
+    async def _inherit_codex_fork_controls(
+        self,
+        child_session_id: str,
+        controls: object,
+    ) -> None:
+        values = controls if isinstance(controls, dict) else {}
+        if not any(
+            values.get(key)
+            for key in ("approval_policy", "permission_profile")
+        ):
+            return
+        if self._codex_controls is None:
+            raise CodexControlStoreError(
+                "Codex control store is unavailable")
+        await asyncio.to_thread(
+            self._codex_controls.inherit_if_absent,
+            child_session_id,
+            approval_policy=values.get("approval_policy"),
+            permission_profile=values.get("permission_profile"),
+        )
+
     async def _finish_same_cwd_fork(
         self, cmd, sid: str, cwd: str, child_session_id: str,
     ) -> SessionForked | Error:
@@ -15593,6 +15779,23 @@ class WrapperMachine:
             raise _ForkOutcomeUncertain(
                 "fork completed but its durable result is not yet recorded"
             ) from exc
+        try:
+            entry = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            await self._inherit_codex_fork_controls(
+                child_session_id, (entry or {}).get("controls"))
+        except Exception as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, cwd, fork_thread_source(cmd.request_id))
+            log.warning(
+                "Codex fork controls are waiting for durable inheritance",
+                session_id=child_session_id,
+                error_type=type(exc).__name__,
+            )
+            raise _ForkOutcomeUncertain(
+                "fork controls are not durably inherited") from exc
         self._uncertain_codex_forks.pop(cmd.request_id, None)
         event = SessionForked(
             parent_session_id=sid,
@@ -15792,6 +15995,24 @@ class WrapperMachine:
                 "Claude fork completed but its durable result is not recorded"
             ) from exc
 
+        try:
+            fork_entry = await asyncio.to_thread(
+                self._claude_forks.get, cmd.request_id)
+            await self._inherit_claude_fork_controls(
+                child_session_id, (fork_entry or {}).get("controls"))
+        except Exception as exc:
+            self._remember_uncertain_claude_fork(
+                cmd.request_id, child_session_id)
+            self._ensure_claude_fork_reconciler(
+                cmd, sid, cwd, title)
+            log.warning(
+                "Claude fork controls are waiting for durable inheritance",
+                session_id=child_session_id,
+                error_type=type(exc).__name__,
+            )
+            raise _ForkOutcomeUncertain(
+                "Claude fork controls are not durably inherited") from exc
+
         self._uncertain_claude_forks.pop(cmd.request_id, None)
         # The marker must remain list-visible until the child id is durable.
         # Replace only that exact marker: after SessionForked is delivered, an
@@ -15904,10 +16125,13 @@ class WrapperMachine:
                     cmd, ERR_INTERNAL, "无法确定源会话的工作目录")
             source_cwd = os.path.realpath(raw_cwd)
             title = self._claude_fork_title(info)
+            controls = await self._claude_fork_control_snapshot(
+                sid, source_cwd, ctx)
             try:
                 entry = await asyncio.to_thread(
                     self._claude_forks.begin,
-                    cmd.request_id, sid, cmd.last_turn_id, source_cwd)
+                    cmd.request_id, sid, cmd.last_turn_id, source_cwd,
+                    controls)
                 canonical = await asyncio.to_thread(
                     self._claude_forks.get_canonical, cmd.request_id)
                 canonical_status = (canonical or entry).get("status")
@@ -16081,12 +16305,37 @@ class WrapperMachine:
         source_cwd = os.path.realpath(source_cwd)
 
         try:
+            existing_entry = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            controls = (
+                dict(existing_entry.get("controls") or {})
+                if existing_entry is not None
+                else await self._codex_fork_control_snapshot(sid, ctx)
+            )
+            if existing_entry is None:
+                try:
+                    profile_allowed = await self._codex_fork_profile_allowed(
+                        controls, source_cwd)
+                except Exception as exc:
+                    log.warning(
+                        "Codex fork permission profile lookup failed",
+                        parent=sid,
+                        error_type=type(exc).__name__,
+                    )
+                    return await self._send_session_fork_error(
+                        cmd, ERR_INTERNAL,
+                        "当前执行环境状态无法确认，派生未开始")
+                if not profile_allowed:
+                    return await self._send_session_fork_error(
+                        cmd, ERR_AUTH,
+                        "源会话的执行环境不允许用于派生会话")
             entry = await asyncio.to_thread(
                 self._codex_forks.begin,
                 cmd.request_id,
                 sid,
                 cmd.last_turn_id,
                 source_cwd,
+                controls,
             )
         except ForkJournalError as exc:
             log.warning("codex fork intent rejected", error=str(exc))
@@ -16172,6 +16421,17 @@ class WrapperMachine:
             "ephemeral": False,
             "threadSource": marker,
         }
+        parent_model = (entry.get("controls") or {}).get("model")
+        if isinstance(parent_model, str) and parent_model:
+            params["model"] = parent_model
+        parent_approval = (entry.get("controls") or {}).get(
+            "approval_policy")
+        if parent_approval in CODEX_PERMISSION_MODES:
+            params["approvalPolicy"] = parent_approval
+        parent_profile = (entry.get("controls") or {}).get(
+            "permission_profile")
+        if isinstance(parent_profile, str) and parent_profile:
+            params["permissions"] = parent_profile
         try:
             raw_result = await codex_rpc("thread/fork", params)
         except CodexRpcRejected as exc:
@@ -16254,6 +16514,97 @@ class WrapperMachine:
                      last_turn_id=cmd.last_turn_id)
         return event
 
+    async def _finish_worktree_fork(
+        self,
+        cmd,
+        sid: str,
+        spec: WorktreeSpec,
+        child_session_id: str,
+        marker: str,
+    ) -> SessionForked:
+        """Durably publish one worktree fork without replaying its mutation."""
+        try:
+            await asyncio.to_thread(
+                self._codex_forks.complete,
+                cmd.request_id,
+                child_session_id,
+            )
+        except ForkJournalError as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError:
+                pass
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            log.exception(
+                "Codex worktree fork result journal failed", error=str(exc))
+            raise _ForkOutcomeUncertain(
+                "worktree fork completed but its result is not durable"
+            ) from exc
+
+        try:
+            entry = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            await self._inherit_codex_fork_controls(
+                child_session_id, (entry or {}).get("controls"))
+        except Exception as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            log.warning(
+                "worktree fork controls are waiting for durable inheritance",
+                session_id=child_session_id,
+                error_type=type(exc).__name__,
+            )
+            raise _ForkOutcomeUncertain(
+                "worktree fork controls are not durably inherited") from exc
+
+        name = (getattr(cmd, "name", None) or "").strip()
+        if name:
+            try:
+                await codex_rpc("thread/name/set", {
+                    "threadId": child_session_id,
+                    "name": name,
+                }, cwd=spec.cwd)
+            except Exception as exc:
+                # Naming is an independent, retryable convenience after the
+                # persistent fork and its cwd are already authoritative.
+                log.warning(
+                    "forked thread name set failed",
+                    thread_id=child_session_id,
+                    error=str(exc),
+                )
+
+        self._uncertain_codex_forks.pop(cmd.request_id, None)
+        event = SessionForked(
+            parent_session_id=sid,
+            session_id=child_session_id,
+            cwd=spec.cwd,
+            git_branch=spec.branch,
+            target="worktree",
+            last_turn_id=getattr(cmd, "last_turn_id", None),
+            request_id=cmd.request_id,
+            to=cmd.client_id,
+        )
+        await self.transport.send(event)
+        try:
+            await self._list_codex_sessions(cmd)
+        except Exception as exc:
+            log.warning(
+                "worktree fork session list refresh failed", error=str(exc))
+        log.info(
+            "codex session forked into worktree",
+            parent=sid,
+            session_id=child_session_id,
+            cwd=spec.cwd,
+            branch=spec.branch,
+        )
+        return event
+
     async def _find_codex_worktree_fork(
         self, parent_session_id: str, cwd: str,
     ) -> Optional[dict]:
@@ -16304,6 +16655,25 @@ class WrapperMachine:
         return None
 
     async def _handle_fork_session_worktree(self, cmd):
+        """Serialize reliable worktree retries with their reconciler."""
+        request_id = cmd.request_id
+        lock = self._codex_fork_locks.get(request_id)
+        if lock is None:
+            if len(self._codex_fork_locks) >= self.UNCERTAIN_FORK_CAP:
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_INTERNAL, "派生请求锁容量已满，请稍后重试")
+            lock = asyncio.Lock()
+            self._codex_fork_locks[request_id] = lock
+        async with lock:
+            client_id = getattr(cmd, "client_id", None)
+            cmd_id = getattr(cmd, "cmd_id", None)
+            if client_id and cmd_id:
+                seen, cached = self._command_seen(client_id, cmd_id)
+                if seen:
+                    return cached
+            return await self._handle_fork_session_worktree_locked(cmd)
+
+    async def _handle_fork_session_worktree_locked(self, cmd):
         """Create a wrapper-owned Git worktree and persistently fork Codex into it."""
         if not getattr(cmd, "client_id", None):
             return await self._send_worktree_fork_error(
@@ -16346,128 +16716,267 @@ class WrapperMachine:
             return await self._send_worktree_fork_error(
                 cmd, ERR_INTERNAL, "Git 工作树创建未完成，请稍后重试。")
 
-        existing: Optional[dict] = None
+        journal_turn = (
+            getattr(cmd, "last_turn_id", None)
+            or "cc-remote-worktree-head"
+        )
         try:
-            existing = await self._find_codex_worktree_fork(sid, spec.cwd)
-        except Exception as exc:
-            if not spec.created:
-                log.warning("worktree fork recovery lookup failed",
-                            parent=sid, cwd=spec.cwd, error=str(exc))
-                return await self._send_worktree_fork_error(
-                    cmd, ERR_INTERNAL,
-                    "工作树已存在，但暂时无法确认派生会话；请稍后重试",
-                )
-            log.warning("fresh worktree pre-fork lookup failed; continuing",
-                        parent=sid, cwd=spec.cwd, error=str(exc))
-
-        fork_result: Optional[dict] = None
-        if existing is None:
-            params: dict = {
-                "threadId": sid,
-                "cwd": spec.cwd,
-                "ephemeral": False,
-                "threadSource": fork_thread_source(cmd.request_id),
-            }
-            if getattr(cmd, "last_turn_id", None):
-                params["lastTurnId"] = cmd.last_turn_id
-            parent_model = (
-                getattr(ctx.sdk, "model", None) if ctx is not None else None
-            ) or (await asyncio.to_thread(codex_session_settings, sid)).get("model")
-            if parent_model:
-                params["model"] = parent_model
+            prior_entry = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            controls = (
+                dict(prior_entry.get("controls") or {})
+                if prior_entry is not None
+                else await self._codex_fork_control_snapshot(sid, ctx)
+            )
+        except ForkJournalError as exc:
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, f"无法读取派生请求状态: {exc}")
+        if prior_entry is None:
             try:
-                raw_result = await codex_rpc(
-                    "thread/fork", params, cwd=spec.cwd)
-                fork_result = raw_result if isinstance(raw_result, dict) else None
+                profile_allowed = await self._codex_fork_profile_allowed(
+                    controls, spec.cwd)
             except Exception as exc:
+                if spec.created:
+                    await asyncio.to_thread(rollback_worktree, spec)
                 log.warning(
-                    "Codex worktree fork RPC did not complete",
+                    "worktree fork permission profile lookup failed",
                     parent=sid,
-                    cwd=spec.cwd,
                     error_type=type(exc).__name__,
                 )
-                recovered: Optional[dict] = None
-                recovery_failed = False
-                try:
-                    recovered = await self._find_codex_worktree_fork(sid, spec.cwd)
-                except Exception as recovery_exc:
-                    recovery_failed = True
-                    log.warning("worktree fork post-error recovery failed",
-                                parent=sid, cwd=spec.cwd,
-                                error=str(recovery_exc))
-                if recovered is not None:
-                    existing = recovered
-                else:
-                    if spec.created and not recovery_failed:
-                        await asyncio.to_thread(rollback_worktree, spec)
-                    detail = (
-                        "派生结果暂时无法确认，工作树已保留；请稍后重试"
-                        if recovery_failed
-                        else "Codex 会话派生未完成，请稍后重试。"
-                    )
-                    return await self._send_worktree_fork_error(
-                        cmd, ERR_INTERNAL, detail)
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_INTERNAL,
+                    "新工作树的执行环境状态无法确认，派生未开始")
+            if not profile_allowed:
+                if spec.created:
+                    await asyncio.to_thread(rollback_worktree, spec)
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_AUTH,
+                    "源会话的执行环境不允许用于新工作树")
 
-        thread = existing
-        if thread is None and fork_result is not None:
-            candidate = fork_result.get("thread")
-            thread = candidate if isinstance(candidate, dict) else None
+        try:
+            fork_entry = await asyncio.to_thread(
+                self._codex_forks.begin,
+                cmd.request_id,
+                sid,
+                journal_turn,
+                spec.cwd,
+                controls,
+                target="worktree",
+            )
+        except ForkJournalError as exc:
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, f"无法记录派生请求: {exc}")
+        controls = dict(fork_entry.get("controls") or {})
+        marker = fork_entry["thread_source"]
+        if fork_entry.get("status") == "rejected":
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL,
+                fork_entry.get("error_message") or "Codex 会话派生已被拒绝")
+
+        async def recover(attempts: int = 1) -> Optional[str]:
+            for attempt in range(max(1, attempts)):
+                try:
+                    meta = await asyncio.to_thread(
+                        find_rollout_fork, marker, sid, spec.cwd)
+                    child = (
+                        meta.get("session_id")
+                        if isinstance(meta, dict) else None)
+                    if isinstance(child, str) and child:
+                        return child
+                    thread = await self._find_codex_worktree_fork(
+                        sid, spec.cwd)
+                    child = (
+                        thread.get("id")
+                        if isinstance(thread, dict) else None)
+                    if isinstance(child, str) and child:
+                        return child
+                except Exception as exc:
+                    log.warning(
+                        "worktree fork recovery lookup failed",
+                        parent=sid,
+                        cwd=spec.cwd,
+                        error_type=type(exc).__name__,
+                    )
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(self.FORK_RECONCILE_DELAY)
+            return None
+
+        completed_child = fork_entry.get("session_id")
+        if fork_entry.get("status") == "complete" and isinstance(
+            completed_child, str
+        ):
+            return await self._finish_worktree_fork(
+                cmd, sid, spec, completed_child, marker)
+
+        volatile_child = self._uncertain_codex_forks.get(cmd.request_id)
+        if (fork_entry.get("status") in {"submitted", "uncertain"}
+                or cmd.request_id in self._uncertain_codex_forks):
+            recovered = volatile_child or await recover(
+                self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_worktree_fork(
+                    cmd, sid, spec, recovered, marker)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            raise _ForkOutcomeUncertain(
+                "worktree fork is waiting for durable reconciliation")
+
+        recovered = await recover()
+        if recovered:
+            return await self._finish_worktree_fork(
+                cmd, sid, spec, recovered, marker)
+
+        try:
+            claimed_submission = await asyncio.to_thread(
+                self._codex_forks.claim_submission, cmd.request_id)
+        except ForkJournalError as exc:
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL,
+                f"无法持久记录派生提交状态: {exc}")
+        if not claimed_submission:
+            refreshed = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            if refreshed and refreshed.get("status") == "complete":
+                child = refreshed.get("session_id")
+                if isinstance(child, str) and child:
+                    return await self._finish_worktree_fork(
+                        cmd, sid, spec, child, marker)
+            if refreshed and refreshed.get("status") == "rejected":
+                if spec.created:
+                    await asyncio.to_thread(rollback_worktree, spec)
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_INTERNAL,
+                    refreshed.get("error_message")
+                    or "Codex 会话派生已被拒绝")
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_worktree_fork(
+                    cmd, sid, spec, recovered, marker)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            raise _ForkOutcomeUncertain(
+                "canonical worktree fork is still being reconciled")
+
+        params: dict = {
+            "threadId": sid,
+            "cwd": spec.cwd,
+            "ephemeral": False,
+            "threadSource": marker,
+        }
+        if getattr(cmd, "last_turn_id", None):
+            params["lastTurnId"] = cmd.last_turn_id
+        parent_model = controls.get("model")
+        if parent_model:
+            params["model"] = parent_model
+        parent_approval = controls.get("approval_policy")
+        if parent_approval in CODEX_PERMISSION_MODES:
+            params["approvalPolicy"] = parent_approval
+        parent_profile = controls.get("permission_profile")
+        if parent_profile:
+            params["permissions"] = parent_profile
+
+        try:
+            raw_result = await codex_rpc(
+                "thread/fork", params, cwd=spec.cwd)
+        except CodexRpcRejected as exc:
+            log.warning(
+                "Codex worktree fork rejected",
+                parent=sid,
+                cwd=spec.cwd,
+                error=str(exc),
+            )
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.reject,
+                    cmd.request_id,
+                    "Codex 会话派生未完成，请稍后重试。",
+                )
+            except ForkJournalError as journal_exc:
+                log.warning(
+                    "worktree fork rejection journal failed",
+                    error=str(journal_exc),
+                )
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, "Codex 会话派生未完成，请稍后重试。")
+        except CodexRpcOutcomeUnknown as exc:
+            self._remember_uncertain_codex_fork(cmd.request_id, None)
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError as journal_exc:
+                log.warning(
+                    "worktree fork uncertainty journal failed",
+                    error=str(journal_exc),
+                )
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_worktree_fork(
+                    cmd, sid, spec, recovered, marker)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            log.warning(
+                "Codex worktree fork outcome unknown",
+                parent=sid,
+                cwd=spec.cwd,
+                error=str(exc),
+            )
+            raise _ForkOutcomeUncertain(
+                "worktree fork outcome is not yet visible") from exc
+        except Exception as exc:
+            log.warning(
+                "Codex worktree fork could not start",
+                parent=sid,
+                cwd=spec.cwd,
+                error=str(exc),
+            )
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.reject,
+                    cmd.request_id,
+                    f"无法发起 Codex 会话派生: {exc}",
+                )
+            except ForkJournalError as journal_exc:
+                log.warning(
+                    "worktree pre-submit rejection journal failed",
+                    error=str(journal_exc),
+                )
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, "Codex 会话派生未完成，请稍后重试。")
+
+        thread = raw_result.get("thread") if isinstance(raw_result, dict) else None
         new_session_id = thread.get("id") if isinstance(thread, dict) else None
         if not isinstance(new_session_id, str) or not new_session_id:
-            # A malformed/lost response can still follow a committed fork. Query
-            # the state DB once before removing its cwd and potentially orphaning
-            # the new thread.
-            recovery_failed = False
+            self._remember_uncertain_codex_fork(cmd.request_id, None)
             try:
-                recovered = await self._find_codex_worktree_fork(sid, spec.cwd)
-            except Exception as recovery_exc:
-                recovered = None
-                recovery_failed = True
-                log.warning("worktree fork id recovery failed",
-                            parent=sid, cwd=spec.cwd, error=str(recovery_exc))
-            new_session_id = (
-                recovered.get("id") if isinstance(recovered, dict) else None)
-            if not isinstance(new_session_id, str) or not new_session_id:
-                if spec.created and not recovery_failed:
-                    await asyncio.to_thread(rollback_worktree, spec)
-                detail = (
-                    "派生结果暂时无法确认，工作树已保留；请稍后重试"
-                    if recovery_failed
-                    else "Codex 会话派生成功但未返回新会话 ID"
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError as journal_exc:
+                log.warning(
+                    "worktree malformed-result journal failed",
+                    error=str(journal_exc),
                 )
-                return await self._send_worktree_fork_error(
-                    cmd, ERR_INTERNAL, detail)
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if not recovered:
+                self._ensure_codex_fork_reconciler(
+                    cmd, sid, spec.cwd, marker, spec)
+                raise _ForkOutcomeUncertain(
+                    "worktree fork response omitted its child id")
+            new_session_id = recovered
 
-        if name:
-            try:
-                await codex_rpc("thread/name/set", {
-                    "threadId": new_session_id,
-                    "name": name,
-                }, cwd=spec.cwd)
-            except Exception as exc:
-                # The persistent fork and its worktree are already valid. A title
-                # can be retried through the normal rename action without risking
-                # user work, so never roll the fork back here.
-                log.warning("forked thread name set failed",
-                            thread_id=new_session_id, error=str(exc))
-
-        event = SessionForked(
-            parent_session_id=sid,
-            session_id=new_session_id,
-            cwd=spec.cwd,
-            git_branch=spec.branch,
-            target="worktree",
-            last_turn_id=getattr(cmd, "last_turn_id", None),
-            request_id=cmd.request_id,
-            to=cmd.client_id,
-        )
-        await self.transport.send(event)
-        await self._list_codex_sessions(cmd)
-        log.info("codex session forked into worktree",
-                 parent=sid, session_id=new_session_id,
-                 cwd=spec.cwd, branch=spec.branch,
-                 recovered=existing is not None)
-        return event
+        return await self._finish_worktree_fork(
+            cmd, sid, spec, new_session_id, marker)
 
     async def _send_session_migration_error(
         self, cmd, code: str, message: str, *, sid: Optional[str] = None,

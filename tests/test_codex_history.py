@@ -1318,6 +1318,52 @@ def test_detail_falls_back_from_items_list_to_exact_full_turn():
     asyncio.run(run())
 
 
+def test_item_pages_reject_empty_nonterminal_page_immediately():
+    calls = 0
+
+    async def rpc(method, params, cwd=None):
+        nonlocal calls
+        assert method == "thread/items/list"
+        calls += 1
+        return {"data": [], "nextCursor": f"cursor-{calls}"}
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        with pytest.raises(
+            CodexHistoryInvalidResponse,
+            match="empty before its terminal cursor",
+        ):
+            await history._items_for_turn("thread-1", "native-1")
+        assert calls == 1
+
+    asyncio.run(run())
+
+
+def test_item_pages_never_issue_more_than_sixteen_rpcs():
+    calls = 0
+
+    async def rpc(method, params, cwd=None):
+        nonlocal calls
+        assert method == "thread/items/list"
+        calls += 1
+        item = _agent(f"agent-{calls}", f"page {calls}")
+        return {
+            "data": [{"turnId": "native-1", "item": item}],
+            "nextCursor": f"cursor-{calls}",
+        }
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        with pytest.raises(
+            CodexHistoryInvalidResponse,
+            match="exceeded its page limit",
+        ):
+            await history._items_for_turn("thread-1", "native-1")
+        assert calls == 16
+
+    asyncio.run(run())
+
+
 def test_detail_items_list_is_recorded_as_complete_official_source():
     async def rpc(method, params, cwd=None):
         if method == "thread/turns/list":

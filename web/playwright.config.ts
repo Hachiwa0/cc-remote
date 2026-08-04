@@ -1,6 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const NEW_CHAT_CONTROL_TESTS = /new-chat controls|256-character profile id/;
+const WEBKIT_RENDERING_TESTS =
+  /mounted message image|two visible images|HTML preview|artifact-(?:svg|markdown-svg)|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|real wide Robot|pending composer image/;
 
 export default defineConfig({
   testDir: "./tests",
@@ -28,15 +30,23 @@ export default defineConfig({
     },
     {
       name: "webkit",
-      grepInvert: NEW_CHAT_CONTROL_TESTS,
+      grepInvert: [NEW_CHAT_CONTROL_TESTS, WEBKIT_RENDERING_TESTS],
       use: {
         ...devices["iPhone 15"],
       },
     },
     {
-      // Keep the serial WebKit browser lifecycle below its macOS context-churn
-      // cliff. These independent control tests otherwise become the 64th+
-      // contexts and can stall before DOMContentLoaded despite passing alone.
+      // Keep every serial WebKit browser lifecycle below its macOS context-churn
+      // cliff. A 64th+ context can stall before DOMContentLoaded even though the
+      // same test passes alone, so independent rendering and control coverage
+      // run in fresh browser processes without reducing the test matrix.
+      name: "webkit-rendering",
+      grep: WEBKIT_RENDERING_TESTS,
+      use: {
+        ...devices["iPhone 15"],
+      },
+    },
+    {
       name: "webkit-controls",
       grep: NEW_CHAT_CONTROL_TESTS,
       use: {

@@ -105,6 +105,8 @@ def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):
             "lastTurnId": "turn-2",
             "ephemeral": False,
             "threadSource": "cc-remote-fork:request-1",
+            "model": "gpt-test",
+            "approvalPolicy": "never",
         }, None)]
         assert result.session_id == "forked-thread"
         assert result.cwd == "/repo/component"
@@ -120,6 +122,111 @@ def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):
             "request-1", "parent", "turn-2", "/repo/component")
         assert entry["status"] == "complete"
         assert entry["session_id"] == "forked-thread"
+
+    asyncio.run(run())
+
+
+def test_codex_same_cwd_fork_inherits_model_and_permissions_once(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        parent = _ctx()
+        parent.sdk.approval = "on-request"
+        parent.sdk.permission_profile = ":workspace"
+        machine.sessions = {"parent": parent}
+        calls = []
+
+        async def rpc(method, params, cwd=None):
+            calls.append((method, params, cwd))
+            return {"thread": {"id": "forked-thread"}}
+
+        async def profiles(cwd):
+            assert cwd == "/repo/component"
+            return [{
+                "id": ":workspace", "description": None, "allowed": True,
+            }]
+
+        async def is_codex(_sid): return True
+        async def list_sessions(_cmd): return None
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        monkeypatch.setattr(machine_module, "codex_permission_profiles", profiles)
+        monkeypatch.setattr(machine_module, "find_rollout_fork", lambda *_args: None)
+
+        command = _command(last_turn_id="turn-2")
+        await machine._handle_fork_session(command)
+        assert calls[0][1]["model"] == "gpt-test"
+        assert calls[0][1]["approvalPolicy"] == "on-request"
+        assert calls[0][1]["permissions"] == ":workspace"
+        inherited = machine._codex_controls.get("forked-thread")
+        assert inherited.approval_policy == "on-request"
+        assert inherited.permission_profile == ":workspace"
+        assert machine._codex_forks.entries[
+            "request-1"]["controls"] == {
+                "model": "gpt-test",
+                "approval_policy": "on-request",
+                "permission_profile": ":workspace",
+            }
+
+        machine._codex_controls.update(
+            "forked-thread",
+            approval_policy="never",
+            permission_profile=":danger-full-access",
+            web_search=None,
+        )
+        parent.sdk.model = "gpt-changed"
+        parent.sdk.approval = "never"
+        await machine._handle_fork_session(command)
+        child_choice = machine._codex_controls.get("forked-thread")
+        assert child_choice.approval_policy == "never"
+        assert child_choice.permission_profile == ":danger-full-access"
+        assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+def test_codex_same_cwd_fork_does_not_flatten_granular_approval(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        parent = _ctx()
+        parent.sdk.approval = "on-request"
+        parent.sdk.approval_policy = {"granular": {
+            "mcp_elicitations": True,
+            "rules": False,
+            "sandbox_approval": True,
+        }}
+        parent.sdk.permission_profile = ":workspace"
+        machine.sessions = {"parent": parent}
+        calls = []
+
+        async def rpc(method, params, cwd=None):
+            calls.append((method, params, cwd))
+            return {"thread": {"id": "forked-thread"}}
+
+        async def profiles(_cwd):
+            return [{
+                "id": ":workspace", "description": None, "allowed": True,
+            }]
+
+        async def is_codex(_sid): return True
+        async def list_sessions(_cmd): return None
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        monkeypatch.setattr(machine_module, "codex_permission_profiles", profiles)
+        monkeypatch.setattr(machine_module, "find_rollout_fork", lambda *_args: None)
+
+        await machine._handle_fork_session(
+            _command(last_turn_id="turn-2"))
+
+        params = calls[0][1]
+        assert "approvalPolicy" not in params
+        assert params["permissions"] == ":workspace"
+        assert machine._codex_forks.entries[
+            "request-1"]["controls"] == {
+                "model": "gpt-test",
+                "permission_profile": ":workspace",
+            }
 
     asyncio.run(run())
 
@@ -465,6 +572,8 @@ def test_codex_worktree_fork_uses_persistent_rpc_and_returns_correlated_result(m
             if method == "thread/list":
                 return {"data": []}
             if method == "thread/fork":
+                assert machine._codex_forks.entries[
+                    "request-1"]["status"] == "submitted"
                 return {"thread": {"id": "forked-thread"}}
             if method == "thread/name/set":
                 return {}
@@ -487,6 +596,7 @@ def test_codex_worktree_fork_uses_persistent_rpc_and_returns_correlated_result(m
             "ephemeral": False,
             "threadSource": "cc-remote-fork:request-1",
             "model": "gpt-test",
+            "approvalPolicy": "never",
         }
         assert ("thread/name/set", {
             "threadId": "forked-thread", "name": "Feature fork",
@@ -497,6 +607,38 @@ def test_codex_worktree_fork_uses_persistent_rpc_and_returns_correlated_result(m
         assert result.request_id == "request-1"
         assert result.to == "client-1"
         assert transport.sent[-1] is result
+        assert machine._codex_controls.get(
+            "forked-thread").approval_policy == "never"
+
+    asyncio.run(run())
+
+
+def test_codex_cold_fork_does_not_restore_stale_named_over_granular(
+    monkeypatch,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        machine._codex_controls.update(
+            "parent",
+            approval_policy="on-request",
+            permission_profile=":workspace",
+            web_search=None,
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_session_settings",
+            lambda _sid: {
+                "model": "gpt-test",
+                "approval_policy_granular": True,
+            },
+        )
+
+        controls = await machine._codex_fork_control_snapshot("parent", None)
+
+        assert controls == {
+            "model": "gpt-test",
+            "permission_profile": ":workspace",
+        }
 
     asyncio.run(run())
 
@@ -553,7 +695,7 @@ def test_codex_worktree_fork_rolls_back_fresh_worktree_on_confirmed_failure(monk
             if method == "thread/list":
                 return {"data": []}
             if method == "thread/fork":
-                raise RuntimeError("fork rejected")
+                raise CodexRpcRejected("fork rejected")
             raise AssertionError(method)
 
         async def is_codex(_sid): return True
@@ -591,6 +733,258 @@ def test_codex_worktree_fork_rejects_running_parent_before_git(monkeypatch):
 
         assert result.type == "error" and result.code == "busy"
         assert prepared == []
+
+    asyncio.run(run())
+
+
+def test_codex_worktree_fork_revalidates_parent_permission_profile(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        parent = _ctx()
+        parent.sdk.permission_profile = ":workspace"
+        parent.sdk.approval = "on-request"
+        machine.sessions = {"parent": parent}
+        rolled_back = []
+
+        async def is_codex(_sid): return True
+
+        async def profiles(cwd):
+            assert cwd == "/state/worktrees/repo/fork-1/component"
+            return [{
+                "id": ":workspace", "description": None, "allowed": False,
+            }]
+
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(
+            machine_module, "prepare_worktree", lambda *_args: _spec())
+        monkeypatch.setattr(machine_module, "codex_permission_profiles", profiles)
+        monkeypatch.setattr(
+            machine_module,
+            "rollback_worktree",
+            lambda spec: rolled_back.append(spec),
+        )
+
+        result = await machine._handle_fork_session_worktree(_command())
+
+        assert result.type == "error" and result.code == "auth"
+        assert rolled_back == [_spec()]
+        assert transport.sent[-1] is result
+
+    asyncio.run(run())
+
+
+def test_codex_worktree_fork_retry_uses_its_frozen_permission_snapshot(
+    monkeypatch,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        parent = _ctx()
+        parent.sdk.permission_profile = ":workspace"
+        parent.sdk.approval = "on-request"
+        machine.sessions = {"parent": parent}
+        machine._codex_forks.begin(
+            "request-1",
+            "parent",
+            "cc-remote-worktree-head",
+            "/state/worktrees/repo/fork-1/component",
+            {
+                "model": "gpt-test",
+                "approval_policy": "on-request",
+                "permission_profile": ":workspace",
+            },
+            target="worktree",
+        )
+
+        async def is_codex(_sid): return True
+
+        async def profiles(_cwd):
+            raise AssertionError(
+                "a durable retry must not re-probe the frozen profile")
+
+        async def rpc(method, params, cwd=None):
+            if method == "thread/list":
+                return {"data": [{
+                    "id": "existing-fork",
+                    "forkedFromId": "parent",
+                    "cwd": cwd,
+                }] if params["archived"] is False else []}
+            if method == "thread/name/set":
+                return {}
+            raise AssertionError(method)
+
+        async def list_sessions(_cmd): return None
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+        monkeypatch.setattr(
+            machine_module, "prepare_worktree", lambda *_args: _spec(created=False))
+        monkeypatch.setattr(machine_module, "codex_permission_profiles", profiles)
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+
+        result = await machine._handle_fork_session_worktree(_command())
+
+        assert result.session_id == "existing-fork"
+        inherited = machine._codex_controls.get("existing-fork")
+        assert inherited.approval_policy == "on-request"
+        assert inherited.permission_profile == ":workspace"
+
+    asyncio.run(run())
+
+
+def test_codex_worktree_fork_restart_submitted_state_never_reforks(monkeypatch):
+    async def run():
+        first, first_transport = _mk_machine()
+        first._codex_forks.begin(
+            "request-1",
+            "parent",
+            "cc-remote-worktree-head",
+            "/state/worktrees/repo/fork-1/component",
+            {"model": "gpt-test"},
+            target="worktree",
+        )
+        first._codex_forks.mark_submitted("request-1")
+
+        transport = type(first_transport)()
+        machine = machine_module.WrapperMachine(first.cfg, transport)
+        machine.sessions = {"parent": _ctx()}
+        machine.FORK_RECONCILE_DELAY = 0
+        machine.FORK_RECONCILE_ATTEMPTS = 1
+        machine.FORK_BACKGROUND_ATTEMPTS = 1
+        calls = []
+
+        async def rpc(method, params, cwd=None):
+            calls.append((method, params, cwd))
+            if method in {"thread/list", "thread/read"}:
+                return {"data": []} if method == "thread/list" else {}
+            raise AssertionError("submitted worktree fork must never be replayed")
+
+        async def is_codex(_sid): return True
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        monkeypatch.setattr(
+            machine_module, "prepare_worktree", lambda *_args: _spec(created=False))
+        monkeypatch.setattr(machine_module, "find_rollout_fork", lambda *_args: None)
+
+        cmd = _command(cmd_id="cmd-1")
+        with pytest.raises(machine_module._ForkOutcomeUncertain):
+            await machine._handle_fork_session_worktree(cmd)
+        await asyncio.wait_for(
+            machine._codex_fork_tasks["request-1"], timeout=1)
+
+        assert not any(method == "thread/fork" for method, *_rest in calls)
+        assert machine._codex_forks.entries[
+            "request-1"]["status"] == "submitted"
+        assert any(
+            message.type == "error" and message.code == "fork_reconciling"
+            for message in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_codex_worktree_unknown_outcome_keeps_worktree_and_never_acks(
+    monkeypatch,
+):
+    async def run():
+        machine, transport = _mk_machine()
+        machine.sessions = {"parent": _ctx()}
+        machine.FORK_RECONCILE_DELAY = 0
+        machine.FORK_RECONCILE_ATTEMPTS = 1
+        machine.FORK_BACKGROUND_ATTEMPTS = 1
+        rolled_back = []
+
+        async def rpc(method, params, cwd=None):
+            if method == "thread/list":
+                return {"data": []}
+            if method == "thread/fork":
+                raise CodexRpcOutcomeUnknown("response lost after submit")
+            if method == "thread/read":
+                return {}
+            raise AssertionError(method)
+
+        async def is_codex(_sid): return True
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        monkeypatch.setattr(machine_module, "prepare_worktree", lambda *_args: _spec())
+        monkeypatch.setattr(machine_module, "find_rollout_fork", lambda *_args: None)
+        monkeypatch.setattr(
+            machine_module,
+            "rollback_worktree",
+            lambda spec: rolled_back.append(spec),
+        )
+
+        cmd = _command(cmd_id="cmd-1")
+        with pytest.raises(machine_module._ForkOutcomeUncertain):
+            await machine._handle_fork_session_worktree(cmd)
+        await asyncio.wait_for(
+            machine._codex_fork_tasks["request-1"], timeout=1)
+
+        assert rolled_back == []
+        assert machine._codex_forks.entries[
+            "request-1"]["status"] == "uncertain"
+        assert not any(message.type == "command_ack" for message in transport.sent)
+
+    asyncio.run(run())
+
+
+def test_codex_worktree_background_reconcile_publishes_worktree_result(
+    monkeypatch,
+):
+    async def run():
+        machine, transport = _mk_machine()
+        machine.sessions = {"parent": _ctx()}
+        machine.FORK_RECONCILE_DELAY = 0
+        machine.FORK_RECONCILE_ATTEMPTS = 1
+        machine.FORK_BACKGROUND_ATTEMPTS = 1
+        machine._codex_forks.begin(
+            "request-1",
+            "parent",
+            "cc-remote-worktree-head",
+            "/state/worktrees/repo/fork-1/component",
+            {"model": "gpt-test"},
+            target="worktree",
+        )
+        machine._codex_forks.mark_submitted("request-1")
+        marker_reads = 0
+        rpc_methods = []
+
+        def find_marker(*_args):
+            nonlocal marker_reads
+            marker_reads += 1
+            if marker_reads >= 2:
+                return {"session_id": "background-child"}
+            return None
+
+        async def rpc(method, params, cwd=None):
+            rpc_methods.append(method)
+            if method == "thread/list":
+                return {"data": []}
+            if method == "thread/name/set":
+                return {}
+            raise AssertionError(method)
+
+        async def is_codex(_sid): return True
+        async def list_sessions(_cmd): return None
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        monkeypatch.setattr(machine_module, "find_rollout_fork", find_marker)
+        monkeypatch.setattr(
+            machine_module, "prepare_worktree", lambda *_args: _spec(created=False))
+
+        cmd = _command(cmd_id="cmd-1")
+        with pytest.raises(machine_module._ForkOutcomeUncertain):
+            await machine._handle_fork_session_worktree(cmd)
+        await asyncio.wait_for(
+            machine._codex_fork_tasks["request-1"], timeout=1)
+
+        assert "thread/fork" not in rpc_methods
+        event = next(
+            message for message in transport.sent
+            if message.type == "session_forked")
+        assert event.session_id == "background-child"
+        assert event.target == "worktree"
+        assert event.cwd == "/state/worktrees/repo/fork-1/component"
+        assert any(message.type == "command_ack" for message in transport.sent)
 
     asyncio.run(run())
 

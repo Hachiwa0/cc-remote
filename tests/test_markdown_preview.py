@@ -179,6 +179,18 @@ def test_office_preview_converts_inside_ephemeral_sandbox(tmp_path, monkeypatch)
                         lambda name: f"/usr/bin/{name}")
 
     def fake_convert(cls, command):
+        assert "--unshare-all" in command
+        assert "--unshare-net" not in command
+        assert "--clearenv" in command
+        assert command[command.index("--cap-drop") + 1] == "ALL"
+        assert command[command.index("--setenv") + 1:][:2] == [
+            "PATH", "/usr/bin:/bin",
+        ]
+        for variable in (
+            "HOME", "TMPDIR", "LANG", "LC_ALL",
+            "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+        ):
+            assert variable in command
         mount = Path(command[command.index("--bind") + 1])
         (mount / "out" / "input.pdf").write_bytes(b"%PDF-1.7\nconverted")
 
@@ -192,6 +204,39 @@ def test_office_preview_converts_inside_ephemeral_sandbox(tmp_path, monkeypatch)
     assert preview["data"] == b"%PDF-1.7\nconverted"
     assert preview["size"] == len(b"office-source")
     assert list(tmp_path.iterdir()) == [source]
+
+
+def test_office_converter_process_receives_only_minimal_environment(monkeypatch):
+    captured = {}
+
+    class Process:
+        pid = 123
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    def popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return Process()
+
+    monkeypatch.setenv("WRAPPER_TOKEN", "relay-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "model-secret")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid")
+    monkeypatch.setattr(machine_module.subprocess, "Popen", popen)
+
+    machine_module.WrapperMachine._run_office_conversion(
+        ["/usr/bin/bwrap", "--", "/usr/bin/true"])
+
+    assert captured["env"] == {
+        "PATH": os.defpath,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    assert not {
+        "WRAPPER_TOKEN", "ANTHROPIC_API_KEY", "HTTPS_PROXY",
+    }.intersection(captured["env"])
 
 
 def test_markdown_preview_truncates_without_breaking_split_utf8(tmp_path):
@@ -769,6 +814,192 @@ def test_ephemeral_preview_capability_rekey_stays_memory_only(tmp_path):
         "claude", "code", "btw-real")
     assert PreviewCapabilityStore(state).snapshot(
         "claude", "code", "btw-real") == {}
+    assert not (state / ".preview-capabilities.invalidated").exists()
+
+
+def test_failed_preview_revoke_stays_revoked_after_restart(
+    tmp_path, monkeypatch,
+):
+    state = tmp_path / "state"
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    store = PreviewCapabilityStore(state)
+    store.grant_path(
+        "claude", "code", "session-1", str(first),
+        mode="read", source="user_approved")
+    store.grant_path(
+        "codex", "code", "session-2", str(second),
+        mode="read", source="user_approved")
+
+    def broken_connect():
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(store, "_connect", broken_connect)
+    store.revoke("claude", "code", "session-1", str(first))
+
+    assert store.snapshot("claude", "code", "session-1") == {}
+    assert store.snapshot("codex", "code", "session-2") == {}
+    assert (state / ".preview-capabilities.invalidated").exists()
+
+    recovered = PreviewCapabilityStore(state)
+    assert recovered.snapshot("claude", "code", "session-1") == {}
+    assert recovered.snapshot("codex", "code", "session-2") == {}
+    assert not (state / ".preview-capabilities.invalidated").exists()
+
+
+def test_preview_marker_cleanup_failure_keeps_restart_fail_closed(
+    tmp_path, monkeypatch,
+):
+    state = tmp_path / "state"
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("artifact", encoding="utf-8")
+    store = PreviewCapabilityStore(state)
+    store.grant_path(
+        "claude", "code", "session-1", str(artifact),
+        mode="read", source="user_approved")
+
+    monkeypatch.setattr(
+        store,
+        "_clear_invalidation_locked",
+        lambda: (_ for _ in ()).throw(OSError("directory fsync failed")),
+    )
+    store.remove_session("claude", "session-1")
+
+    assert (state / ".preview-capabilities.invalidated").exists()
+    recovered = PreviewCapabilityStore(state)
+    assert recovered.snapshot("claude", "code", "session-1") == {}
+    assert not (state / ".preview-capabilities.invalidated").exists()
+
+
+def test_destructive_retry_recovers_an_existing_invalidation_marker(
+    tmp_path, monkeypatch,
+):
+    state = tmp_path / "state"
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    store = PreviewCapabilityStore(state)
+    store.grant_path(
+        "claude", "code", "session-1", str(first),
+        mode="read", source="user_approved")
+    store.grant_path(
+        "codex", "code", "session-2", str(second),
+        mode="read", source="user_approved")
+    original_connect = store._connect
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        lambda: (_ for _ in ()).throw(OSError("temporary write failure")),
+    )
+    store.revoke("claude", "code", "session-1", str(first))
+    assert (state / ".preview-capabilities.invalidated").exists()
+
+    monkeypatch.setattr(store, "_connect", original_connect)
+    store.rekey("claude", "code", "session-1", "session-3")
+
+    assert store._persistent is True
+    assert not (state / ".preview-capabilities.invalidated").exists()
+    restored = PreviewCapabilityStore(state)
+    assert restored.snapshot("claude", "code", "session-1") == {}
+    assert restored.snapshot("claude", "code", "session-3") == {}
+    assert restored.snapshot("codex", "code", "session-2") == {}
+
+
+def test_preview_epoch_invalidates_an_overlapping_store_process(tmp_path):
+    state = tmp_path / "state"
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("artifact", encoding="utf-8")
+    first = PreviewCapabilityStore(state)
+    first.grant_path(
+        "claude", "code", "session-1", str(artifact),
+        mode="read", source="user_approved")
+    overlapping = PreviewCapabilityStore(state)
+    assert str(artifact.resolve()) in overlapping.snapshot(
+        "claude", "code", "session-1")
+
+    first.revoke("claude", "code", "session-1", str(artifact))
+
+    assert overlapping.snapshot("claude", "code", "session-1") == {}
+
+
+def test_preview_lock_refuses_symlink_without_chmodding_target(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    target = tmp_path / "target"
+    target.write_text("do not touch", encoding="utf-8")
+    target.chmod(0o640)
+    before = target.stat().st_mode & 0o777
+    (state / ".preview-capabilities.lock").symlink_to(target)
+
+    store = PreviewCapabilityStore(state)
+
+    assert store._persistent is False
+    assert target.stat().st_mode & 0o777 == before
+
+
+def test_preview_lock_wait_is_bounded(tmp_path, monkeypatch):
+    store = PreviewCapabilityStore(tmp_path / "state")
+    clock = iter((0.0, 0.0, 6.0))
+
+    def busy_lock(_descriptor, operation):
+        if operation & preview_capabilities.fcntl.LOCK_NB:
+            raise BlockingIOError
+
+    monkeypatch.setattr(
+        preview_capabilities.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        preview_capabilities.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(preview_capabilities.fcntl, "flock", busy_lock)
+
+    with pytest.raises(TimeoutError, match="acquisition timed out"):
+        with store._exclusive_lock():
+            raise AssertionError("busy lock must not be entered")
+
+
+def test_preview_epoch_rejects_oversized_state_file(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".preview-capabilities.epoch").write_bytes(b"a" * 65)
+
+    store = PreviewCapabilityStore(state)
+
+    assert store._persistent is False
+    assert store._entries == {}
+
+
+def test_revoke_recovers_after_an_earlier_grant_persistence_failure(
+    tmp_path, monkeypatch,
+):
+    state = tmp_path / "state"
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    store = PreviewCapabilityStore(state)
+    store.grant_path(
+        "claude", "code", "session-1", str(first),
+        mode="read", source="user_approved")
+    original_connect = store._connect
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        lambda: (_ for _ in ()).throw(OSError("temporary write failure")),
+    )
+    store.grant_path(
+        "claude", "code", "session-1", str(second),
+        mode="read", source="user_approved")
+    assert store._persistent is False
+
+    monkeypatch.setattr(store, "_connect", original_connect)
+    store.revoke("claude", "code", "session-1", str(first))
+
+    assert store._persistent is True
+    restored = PreviewCapabilityStore(state)
+    assert str(first.resolve()) not in restored.snapshot(
+        "claude", "code", "session-1")
 
 
 def test_preview_capability_store_bounds_survive_rekey_and_restart(
