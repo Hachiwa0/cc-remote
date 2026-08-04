@@ -11,11 +11,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cc_remote.attachments import (
     ALLOWED_IMAGE_TYPES,
@@ -28,7 +29,7 @@ from cc_remote.attachments import (
 from cc_remote.protocol import ConversationTurn
 
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 12
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -40,6 +41,44 @@ _SUMMARY_LIVE_FIELD_MAX_CHARS = 4 * 1024
 _SUMMARY_LIVE_BLOCK_MAX = 24
 _SUMMARY_BLOCK_MAX = 32
 _VOLATILE_EVENT_FIELDS = frozenset({"ts", "seq", "to", "route_id"})
+_COMPACT_SOURCE_LIMIT = 16
+_SAFE_COMPACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_GENERIC_HISTORY_TURN_FAILURE = "该轮未正常结束"
+_PROVIDER_AUTH_TURN_FAILURE = (
+    "模型服务认证已失效或当前账号无权限，"
+    "请检查当前服务的凭据或账号权限后重试。"
+)
+_SAFE_HISTORY_TURN_FAILURES = frozenset({
+    "网络异常，连接失败，请重新尝试。",
+    "网络连接异常，请检查网络后重试。",
+    _PROVIDER_AUTH_TURN_FAILURE,
+    "请求过于频繁或当前额度受限，请稍后重试。",
+    "请求超时，请重新尝试。",
+    "Codex 上游服务暂时不可用，请稍后重试。",
+})
+_LEGACY_HISTORY_TURN_FAILURES = {
+    "Codex 登录已失效或当前账号无权限，请重新登录后重试。":
+        _PROVIDER_AUTH_TURN_FAILURE,
+    "Codex 本次回复未完成，请重试。": _GENERIC_HISTORY_TURN_FAILURE,
+    "Claude 本次回复未完成，请稍后重试。": _GENERIC_HISTORY_TURN_FAILURE,
+    "本次回复未完成，请重试。": _GENERIC_HISTORY_TURN_FAILURE,
+    "error": _GENERIC_HISTORY_TURN_FAILURE,
+}
+
+
+def _historical_turn_failure(value: Any) -> str:
+    """Keep only reviewed product copy in a persisted history summary."""
+    if not isinstance(value, str):
+        return _GENERIC_HISTORY_TURN_FAILURE
+    message = value.strip()
+    if not message:
+        return _GENERIC_HISTORY_TURN_FAILURE
+    legacy = _LEGACY_HISTORY_TURN_FAILURES.get(message)
+    if legacy is not None:
+        return legacy
+    if message in _SAFE_HISTORY_TURN_FAILURES:
+        return message
+    return _GENERIC_HISTORY_TURN_FAILURE
 
 
 @dataclass(frozen=True)
@@ -92,6 +131,63 @@ class HistorySourceFingerprint:
             self.sample_sha256,
         ))
         return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ClaudeCompactChainIndex:
+    """Persistent payload-free metadata for one bounded transcript snapshot."""
+
+    leaf: str
+    rows: dict[str, tuple[object, ...]]
+    queued_notifications: frozenset[tuple[int, str]]
+    indexed_size: int
+
+
+def _prefix_samples(source, size: int) -> tuple[str, str]:
+    sample_size = min(max(0, int(size)), _FINGERPRINT_SAMPLE_BYTES)
+    if sample_size == 0:
+        empty = hashlib.sha256(b"").hexdigest()
+        return empty, empty
+    source.seek(0)
+    head = source.read(sample_size)
+    source.seek(max(0, size - sample_size))
+    tail = source.read(sample_size)
+    return hashlib.sha256(head).hexdigest(), hashlib.sha256(tail).hexdigest()
+
+
+def history_source_extends(
+    previous: HistorySourceFingerprint,
+    current: HistorySourceFingerprint,
+) -> bool:
+    """Return whether ``current`` preserves the exact previous file prefix."""
+    if previous.token == current.token:
+        return True
+    if (
+        previous.path != current.path
+        or previous.device != current.device
+        or previous.inode != current.inode
+        or current.size < previous.size
+    ):
+        return False
+    sample_size = min(previous.size, _FINGERPRINT_SAMPLE_BYTES)
+    try:
+        with open(current.path, "rb") as source:
+            stat = os.fstat(source.fileno())
+            if (
+                int(stat.st_dev) != current.device
+                or int(stat.st_ino) != current.inode
+                or int(stat.st_size) < current.size
+            ):
+                return False
+            head = source.read(sample_size)
+            source.seek(max(0, previous.size - sample_size))
+            tail = source.read(sample_size)
+    except OSError:
+        return False
+    return (
+        hashlib.sha256(head).hexdigest() == previous.head_sha256
+        and hashlib.sha256(tail).hexdigest() == previous.tail_sha256
+    )
 
 
 @dataclass(frozen=True)
@@ -290,11 +386,24 @@ def history_image_from_events(
 ) -> dict[str, Any] | None:
     """Resolve an opaque history image id inside one indexed turn group."""
     for event in events:
+        if event.get("type") == "process":
+            tool_input = event.get("input")
+            image = (
+                tool_input.get("history_image")
+                if isinstance(tool_input, dict)
+                else None
+            )
+            if (
+                isinstance(image, dict)
+                and image.get("image_id") == image_id
+            ):
+                return image
+            continue
         if event.get("type") != "user_msg" or event.get("msg_id") != turn_id:
             continue
         images = event.get("images")
         if not isinstance(images, list):
-            return None
+            continue
         for index, image in enumerate(images):
             if history_image_id(turn_id, index) == image_id and isinstance(image, dict):
                 return image
@@ -429,25 +538,24 @@ def materialize_history_turns(
                     checkpoint_id = event["checkpoint_id"]
                 result = event.get("result")
                 if isinstance(result, dict):
-                    if isinstance(result.get("duration_ms"), int):
-                        duration_ms = result["duration_ms"]
                     subtype = str(result.get("subtype") or "")
+                    if (
+                        subtype != "steered"
+                        and isinstance(result.get("duration_ms"), int)
+                    ):
+                        duration_ms = result["duration_ms"]
                     interrupted = subtype in {
                         "interrupted", "error_during_execution", "aborted",
                     }
-                    if bool(result.get("is_error")) and not interrupted:
-                        error = (
-                            "该轮未正常结束"
-                            if not subtype or subtype == "error"
-                            else subtype
-                        )
+                    if (
+                        bool(result.get("is_error"))
+                        and not interrupted
+                    ):
+                        error = _historical_turn_failure(
+                            error if error is not None else subtype)
             elif event_type == "error":
                 if isinstance(event.get("message"), str):
-                    error = (
-                        "该轮未正常结束"
-                        if event["message"].strip().lower() == "error"
-                        else event["message"]
-                    )
+                    error = _historical_turn_failure(event["message"])
             if include_live_detail and event_type == "tool_use":
                 tool_id = event.get("tool_use_id")
                 message_id = event.get("message_id")
@@ -757,7 +865,21 @@ class HistoryIndexStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if current not in (0, _SCHEMA_VERSION):
+            if current == 10:
+                # v11 changes only Claude history translation: compacted
+                # transcripts now reconnect their pre-compact active ancestry.
+                # Exact v10 source fingerprints would otherwise keep serving a
+                # semantically stale post-compact-only page forever. Preserve
+                # Codex pages/images (which can be expensive to rebuild) and
+                # invalidate only the rebuildable Claude projection.
+                for table in (
+                    "history_pages",
+                    "history_turn_details",
+                    "history_image_assets",
+                ):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='claude'")
+            elif current not in (0, 11, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows
                 # must contain the source-complete translated turn, never the
                 # transport-compacted History frame.  Both Claude and Codex v8
@@ -768,6 +890,9 @@ class HistoryIndexStore:
                 connection.execute("DROP TABLE IF EXISTS history_pages")
                 connection.execute("DROP TABLE IF EXISTS history_turn_details")
                 connection.execute("DROP TABLE IF EXISTS history_image_assets")
+                connection.execute("DROP TABLE IF EXISTS claude_compact_sources")
+                connection.execute("DROP TABLE IF EXISTS claude_compact_records")
+                connection.execute("DROP TABLE IF EXISTS claude_compact_queue")
                 current = 0
             connection.execute(
                 """
@@ -856,6 +981,59 @@ class HistoryIndexStore:
                 "CREATE INDEX IF NOT EXISTS history_image_assets_lru "
                 "ON history_image_assets(accessed_at)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS claude_compact_sources (
+                    source_path TEXT PRIMARY KEY,
+                    source_device INTEGER NOT NULL,
+                    source_inode INTEGER NOT NULL,
+                    indexed_size INTEGER NOT NULL,
+                    source_head_sha256 TEXT NOT NULL,
+                    source_tail_sha256 TEXT NOT NULL,
+                    record_count INTEGER NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS claude_compact_records (
+                    source_path TEXT NOT NULL,
+                    source_device INTEGER NOT NULL,
+                    source_inode INTEGER NOT NULL,
+                    uuid TEXT NOT NULL,
+                    row_type TEXT,
+                    subtype TEXT,
+                    parent_uuid TEXT,
+                    logical_parent_uuid TEXT,
+                    is_sidechain INTEGER,
+                    source_offset INTEGER NOT NULL,
+                    record_bytes INTEGER NOT NULL,
+                    visible_user INTEGER NOT NULL,
+                    PRIMARY KEY (source_path, source_device, source_inode, uuid)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS claude_compact_records_offset "
+                "ON claude_compact_records(source_path, source_device, "
+                "source_inode, source_offset)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS claude_compact_queue (
+                    source_path TEXT NOT NULL,
+                    source_device INTEGER NOT NULL,
+                    source_inode INTEGER NOT NULL,
+                    content_length INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    PRIMARY KEY (
+                        source_path, source_device, source_inode,
+                        content_length, content_sha256
+                    )
+                )
+                """
+            )
             if current != _SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
         try:
@@ -866,6 +1044,286 @@ class HistoryIndexStore:
     @staticmethod
     def _cursor(before: str | None) -> str:
         return before or ""
+
+    def get_claude_compact_index(
+        self,
+        source_path: str,
+        *,
+        snapshot_size: int | None,
+        max_record_bytes: int,
+        max_entries: int,
+        visible_user: Callable[[dict[str, Any]], bool],
+    ) -> ClaudeCompactChainIndex | None:
+        """Incrementally index compact ancestry without retaining row payloads.
+
+        The SQLite rows are rebuildable metadata. An append verifies the exact
+        previously indexed prefix, parses only new complete JSONL records, and
+        lets every history page seek directly to its selected payload offsets.
+        """
+        resolved = os.path.realpath(source_path)
+        bounded_record = max(1024, int(max_record_bytes))
+        bounded_entries = max(1, int(max_entries))
+        try:
+            source = open(resolved, "rb")
+        except OSError:
+            return None
+        with source:
+            try:
+                stat = os.fstat(source.fileno())
+            except OSError:
+                return None
+            device = int(stat.st_dev)
+            inode = int(stat.st_ino)
+            target_size = int(stat.st_size)
+            if snapshot_size is not None:
+                target_size = min(target_size, max(0, int(snapshot_size)))
+            with self._connect() as connection:
+                state = connection.execute(
+                    "SELECT * FROM claude_compact_sources WHERE source_path=?",
+                    (resolved,),
+                ).fetchone()
+                rebuild = state is None
+                indexed_size = 0
+                record_count = 0
+                if state is not None:
+                    indexed_size = int(state["indexed_size"])
+                    record_count = int(state["record_count"])
+                    rebuild = (
+                        int(state["source_device"]) != device
+                        or int(state["source_inode"]) != inode
+                        or int(stat.st_size) < indexed_size
+                    )
+                    if not rebuild:
+                        head, tail = _prefix_samples(source, indexed_size)
+                        rebuild = (
+                            head != state["source_head_sha256"]
+                            or tail != state["source_tail_sha256"]
+                        )
+                if rebuild:
+                    connection.execute(
+                        "DELETE FROM claude_compact_records WHERE source_path=?",
+                        (resolved,),
+                    )
+                    connection.execute(
+                        "DELETE FROM claude_compact_queue WHERE source_path=?",
+                        (resolved,),
+                    )
+                    connection.execute(
+                        "DELETE FROM claude_compact_sources WHERE source_path=?",
+                        (resolved,),
+                    )
+                    indexed_size = 0
+                    record_count = 0
+
+                new_records: list[tuple[object, ...]] = []
+                new_queue: list[tuple[object, ...]] = []
+                scan_offset = indexed_size
+                scan_complete = target_size <= indexed_size
+                if target_size > indexed_size:
+                    source.seek(indexed_size)
+                    while source.tell() < target_size:
+                        offset = source.tell()
+                        remaining = target_size - offset
+                        line = source.readline(min(remaining, bounded_record + 1))
+                        if not line:
+                            break
+                        if not line.endswith(b"\n") and len(line) > bounded_record:
+                            # Do not index past an unknown ancestry record. A
+                            # raised configured record cap can safely retry from
+                            # this exact byte on the next request.
+                            scan_offset = offset
+                            break
+                        if not line.endswith(b"\n"):
+                            try:
+                                row = json.loads(line)
+                            except Exception:
+                                # Snapshot captured a writer's partial final row.
+                                scan_offset = offset
+                                break
+                        else:
+                            try:
+                                row = json.loads(line)
+                            except Exception:
+                                scan_offset = source.tell()
+                                continue
+                        scan_offset = source.tell()
+                        if not isinstance(row, dict):
+                            continue
+                        if (row.get("type") == "queue-operation"
+                                and row.get("operation") == "enqueue"):
+                            content = row.get("content")
+                            if (isinstance(content, str) and content.lstrip().startswith(
+                                    "<task-notification>")):
+                                new_queue.append((
+                                    resolved, device, inode, len(content),
+                                    hashlib.sha256(content.encode(
+                                        "utf-8", "surrogatepass")).hexdigest(),
+                                ))
+                        uid = row.get("uuid")
+                        if not (isinstance(uid, str)
+                                and _SAFE_COMPACT_ID.fullmatch(uid)):
+                            continue
+                        def text_field(name: str) -> str | None:
+                            value = row.get(name)
+                            return value if isinstance(value, str) else None
+                        new_records.append((
+                            resolved, device, inode, uid,
+                            text_field("type"), text_field("subtype"),
+                            text_field("parentUuid"),
+                            text_field("logicalParentUuid"),
+                            (1 if row.get("isSidechain") is True else 0
+                             if row.get("isSidechain") is False else None),
+                            offset, len(line), int(bool(visible_user(row))),
+                        ))
+                    scan_complete = scan_offset >= target_size
+                    if new_records:
+                        connection.executemany(
+                            """
+                            INSERT INTO claude_compact_records (
+                                source_path, source_device, source_inode, uuid,
+                                row_type, subtype, parent_uuid,
+                                logical_parent_uuid, is_sidechain,
+                                source_offset, record_bytes, visible_user
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT (
+                                source_path, source_device, source_inode, uuid
+                            ) DO UPDATE SET
+                                row_type=excluded.row_type,
+                                subtype=excluded.subtype,
+                                parent_uuid=excluded.parent_uuid,
+                                logical_parent_uuid=excluded.logical_parent_uuid,
+                                is_sidechain=excluded.is_sidechain,
+                                source_offset=excluded.source_offset,
+                                record_bytes=excluded.record_bytes,
+                                visible_user=excluded.visible_user
+                            """,
+                            new_records,
+                        )
+                    if new_queue:
+                        connection.executemany(
+                            """
+                            INSERT OR IGNORE INTO claude_compact_queue (
+                                source_path, source_device, source_inode,
+                                content_length, content_sha256
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            new_queue,
+                        )
+                    record_count = int(connection.execute(
+                        """
+                        SELECT COUNT(*) FROM claude_compact_records
+                        WHERE source_path=? AND source_device=? AND source_inode=?
+                        """,
+                        (resolved, device, inode),
+                    ).fetchone()[0])
+                    if record_count > bounded_entries:
+                        connection.execute(
+                            "DELETE FROM claude_compact_records "
+                            "WHERE source_path=?",
+                            (resolved,),
+                        )
+                        connection.execute(
+                            "DELETE FROM claude_compact_queue "
+                            "WHERE source_path=?",
+                            (resolved,),
+                        )
+                        connection.execute(
+                            "DELETE FROM claude_compact_sources "
+                            "WHERE source_path=?",
+                            (resolved,),
+                        )
+                        return None
+                indexed_size = max(indexed_size, scan_offset)
+                head, tail = _prefix_samples(source, indexed_size)
+                now = time.time()
+                connection.execute(
+                    """
+                    INSERT INTO claude_compact_sources (
+                        source_path, source_device, source_inode, indexed_size,
+                        source_head_sha256, source_tail_sha256,
+                        record_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (source_path) DO UPDATE SET
+                        source_device=excluded.source_device,
+                        source_inode=excluded.source_inode,
+                        indexed_size=excluded.indexed_size,
+                        source_head_sha256=excluded.source_head_sha256,
+                        source_tail_sha256=excluded.source_tail_sha256,
+                        record_count=excluded.record_count,
+                        updated_at=excluded.updated_at
+                    """,
+                    (resolved, device, inode, indexed_size, head, tail,
+                     record_count, now),
+                )
+                # A partial writer row or a record above the configured cap
+                # leaves a useful resumable prefix in SQLite, but that prefix
+                # is not an authoritative view of this snapshot. In
+                # particular, never return the previous leaf as if the unseen
+                # suffix did not exist.
+                if not scan_complete:
+                    return None
+                rows = connection.execute(
+                    """
+                    SELECT * FROM claude_compact_records
+                    WHERE source_path=? AND source_device=? AND source_inode=?
+                      AND source_offset + record_bytes <= ?
+                    ORDER BY source_offset
+                    """,
+                    (resolved, device, inode, min(target_size, indexed_size)),
+                ).fetchall()
+                queued = connection.execute(
+                    """
+                    SELECT content_length, content_sha256
+                    FROM claude_compact_queue
+                    WHERE source_path=? AND source_device=? AND source_inode=?
+                    """,
+                    (resolved, device, inode),
+                ).fetchall()
+                leaf = next((str(row["uuid"]) for row in reversed(rows)
+                             if row["is_sidechain"] != 1), None)
+                if leaf is None:
+                    return None
+                metadata = {
+                    str(row["uuid"]): (
+                        row["row_type"], row["subtype"], row["parent_uuid"],
+                        row["logical_parent_uuid"],
+                        (True if row["is_sidechain"] == 1 else False
+                         if row["is_sidechain"] == 0 else None),
+                        int(row["source_offset"]), bool(row["visible_user"]),
+                        int(row["record_bytes"]),
+                    )
+                    for row in rows
+                }
+                stale_sources = connection.execute(
+                    """
+                    SELECT source_path FROM claude_compact_sources
+                    ORDER BY updated_at DESC LIMIT -1 OFFSET ?
+                    """,
+                    (_COMPACT_SOURCE_LIMIT,),
+                ).fetchall()
+                for stale in stale_sources:
+                    stale_path = str(stale["source_path"])
+                    connection.execute(
+                        "DELETE FROM claude_compact_records WHERE source_path=?",
+                        (stale_path,),
+                    )
+                    connection.execute(
+                        "DELETE FROM claude_compact_queue WHERE source_path=?",
+                        (stale_path,),
+                    )
+                    connection.execute(
+                        "DELETE FROM claude_compact_sources WHERE source_path=?",
+                        (stale_path,),
+                    )
+                return ClaudeCompactChainIndex(
+                    leaf=leaf,
+                    rows=metadata,
+                    queued_notifications=frozenset(
+                        (int(row["content_length"]), str(row["content_sha256"]))
+                        for row in queued
+                    ),
+                    indexed_size=indexed_size,
+                )
 
     def get_page(
         self,

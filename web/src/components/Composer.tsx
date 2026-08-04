@@ -92,6 +92,7 @@ interface Props {
   onClear: () => void;
   onContext: () => void;
   onOpenBtw?: () => void;
+  onDiff?: () => void;
   onPreview?: (path: string) => void;
   onGoal?: (args: string) => void;
   onStatus?: () => void;
@@ -270,23 +271,29 @@ export function Composer(p: Props) {
       setInput(editPrompt);
       onEditConsumed();
       setTimeout(() => taRef.current?.focus(), 0);
-      if (taRef.current) {
-        taRef.current.style.height = "auto";
-        taRef.current.style.height = Math.min(taRef.current.scrollHeight, 132) + "px";
-      }
     }
   }, [editPrompt, onEditConsumed, setInput]);
 
-  const resetTaHeight = () => { if (taRef.current) taRef.current.style.height = "auto"; };
-  const growTa = () => {
-    if (taRef.current) {
-      taRef.current.style.height = "auto";
-      taRef.current.style.height = Math.min(taRef.current.scrollHeight, 132) + "px";
-    }
+  const nativeTextareaSizing = typeof CSS !== "undefined"
+    && CSS.supports?.("field-sizing", "content");
+  const resetTaHeight = () => {
+    if (!taRef.current) return;
+    if (nativeTextareaSizing) taRef.current.style.removeProperty("height");
+    else taRef.current.style.height = "auto";
   };
+  const growTa = useCallback(() => {
+    const textarea = taRef.current;
+    if (!textarea) return;
+    if (nativeTextareaSizing) {
+      if (textarea.style.height) textarea.style.removeProperty("height");
+      return;
+    }
+    textarea.style.height = "auto";
+    textarea.style.height = Math.min(textarea.scrollHeight, 132) + "px";
+  }, [nativeTextareaSizing]);
   useLayoutEffect(() => {
     growTa();
-  }, [input, p.draftKey]);
+  }, [growTa, input, p.draftKey]);
   const focusTa = () => setTimeout(() => taRef.current?.focus(), 0);
   const flash = (msg: string) => {
     setNotice(msg);
@@ -296,7 +303,6 @@ export function Composer(p: Props) {
 
   const onInput = (v: string) => {
     setInput(v);
-    growTa();
   };
 
   // Command/Skill palette = live suggestions derived from the input. A slash
@@ -503,6 +509,10 @@ export function Composer(p: Props) {
       case "rollback": flash("Codex Rollback 暂未开放"); break;
       // /btw: open an ephemeral side-fork panel (both engines).
       case "btw": p.onOpenBtw?.(); break;
+      case "diff":
+        if (args.trim()) { flash("/diff 不接受参数"); return; }
+        p.onDiff?.();
+        break;
       case "preview":
         if (!args) {
           setInput("/preview ");

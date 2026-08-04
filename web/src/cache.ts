@@ -12,6 +12,7 @@ import {
 import type {
   Block, ProcessBlock, TextBlock, ToolBlock, Turn,
 } from "./domain/conversation.ts";
+import { mergeDetailWithLiveTail } from "./history-merge.ts";
 
 const DB_NAME = "cc_remote_cache";
 const STORE = "sessions";
@@ -29,7 +30,10 @@ const SCHEMA = 1;
 // assistant blocks after switching away from and back to a running session.
 // v10 separates the instant timeline skeleton from heavyweight detail so one
 // image or tool output can no longer evict an otherwise valid completed turn.
-const CACHE_VER = 10;
+// v11 discards rows written before Claude transcript promptId was retained as
+// clientMsgId. Those rows can otherwise paint beside the live optimistic row
+// after switching engines until authoritative History replaces both.
+const CACHE_VER = 11;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
@@ -165,8 +169,23 @@ function projectTurnForCache(turn: Turn): Turn {
   const finalBudget = { remaining: CACHE_FINAL_TEXT_CHARS };
   const processTextBudget = { remaining: CACHE_PROCESS_TEXT_CHARS };
   const detailBudget = { remaining: CACHE_PROCESS_DETAIL_CHARS };
-  const projectionBlocks = turn.detailProjection?.blocks?.length
-    ? turn.detailProjection.blocks : turn.blocks;
+  const completedDetailAuthoritative = turn.done
+    && !turn.detailRestorePending
+    && !turn.detailRestoreIncomplete;
+  const projectionWithArchive = turn.detailProjection || turn.liveSpillBlocks
+    ? mergeDetailWithLiveTail(
+        turn.detailProjection?.blocks ?? [],
+        turn.liveSpillBlocks ?? [],
+        completedDetailAuthoritative,
+      )
+    : [];
+  const projectionBlocks = projectionWithArchive.length > 0
+    ? mergeDetailWithLiveTail(
+        projectionWithArchive,
+        turn.blocks,
+        completedDetailAuthoritative,
+      )
+    : turn.blocks;
   const finalBlocks = turn.blocks.filter((block): block is TextBlock =>
     block.kind === "text" && block.channel === "final");
   const sourceBlocks = [...projectionBlocks];
@@ -213,6 +232,9 @@ function projectTurnForCache(turn: Turn): Turn {
     detailEventCount: Math.max(turn.detailEventCount ?? 0, deferredBlocks),
     detailLoaded: false,
     detailLoading: false,
+    detailError: undefined,
+    detailRetryBefore: undefined,
+    detailRetryDirection: undefined,
     detailProjection: undefined,
     detailHasMore: false,
     detailOldestCursor: null,
@@ -222,6 +244,8 @@ function projectTurnForCache(turn: Turn): Turn {
     detailRestorePending: false,
     detailRestoreOpen: false,
     detailRestoreIncomplete: false,
+    liveSpillBlocks: undefined,
+    liveSpillRefreshCount: undefined,
   };
 }
 
@@ -303,6 +327,8 @@ function projectTurnSkeletonForCache(turn: Turn): Turn {
       filename: clipCacheString(file.filename, 1024) ?? "",
       data: "",
     })),
+    liveSpillBlocks: undefined,
+    liveSpillRefreshCount: undefined,
   };
 }
 

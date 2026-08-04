@@ -12,6 +12,7 @@ from cc_remote.wrapper.codex_checkpoints import (
     CheckpointConflict,
     CheckpointError,
     CheckpointIndexChanged,
+    CompletedCheckpoint,
     CodexCheckpointJournal,
     NotGitWorkspaceError,
 )
@@ -283,6 +284,63 @@ def test_finish_rejects_pure_staging_change_with_unchanged_worktree(tmp_path):
     assert journal.completed_turn_ids() == ()
     assert (root / "tracked.txt").read_text(encoding="utf-8") == "dirty baseline\n"
     assert _git(root, "show", ":tracked.txt") == "dirty baseline"
+
+
+def test_finish_classifies_clean_commit_as_conversation_only(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    journal = CodexCheckpointJournal(
+        str(root), tmp_path / "state", "session-clean-commit"
+    )
+    journal.begin_turn("turn-1")
+    journal.accept_turn("turn-1")
+    (root / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    _git(root, "add", "tracked.txt")
+    _git(root, "commit", "-m", "agent commit")
+
+    completed = journal.finish_turn("turn-1")
+
+    assert completed == CompletedCheckpoint(
+        turn_id="turn-1",
+        changed_paths=(),
+        files_available=False,
+    )
+    assert journal.completed_turn_ids() == ("turn-1",)
+    with pytest.raises(CheckpointError, match="turn-1"):
+        journal.rollback(consume=False)
+
+
+def test_finish_classifies_clean_empty_commit_as_conversation_only(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    journal = CodexCheckpointJournal(
+        str(root), tmp_path / "state", "session-clean-empty-commit"
+    )
+    journal.begin_turn("turn-1")
+    journal.accept_turn("turn-1")
+    _git(root, "commit", "--allow-empty", "-m", "agent empty commit")
+
+    completed = journal.finish_turn("turn-1")
+
+    assert completed.files_available is False
+    assert completed.changed_paths == ()
+    assert journal.completed_turn_ids() == ("turn-1",)
+
+
+def test_finish_rejects_commit_followed_by_dirty_worktree(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    journal = CodexCheckpointJournal(
+        str(root), tmp_path / "state", "session-commit-then-dirty"
+    )
+    journal.begin_turn("turn-1")
+    journal.accept_turn("turn-1")
+    (root / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    _git(root, "add", "tracked.txt")
+    _git(root, "commit", "-m", "agent commit")
+    (root / "tracked.txt").write_text("dirty after commit\n", encoding="utf-8")
+
+    with pytest.raises(CheckpointIndexChanged):
+        journal.finish_turn("turn-1")
+
+    assert journal.completed_turn_ids() == ()
 
 
 def test_capture_rejects_worktree_that_changes_between_images(tmp_path, monkeypatch):

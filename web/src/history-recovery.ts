@@ -216,10 +216,14 @@ export function historyConfirmsRecovery(
 export interface DisplayHistoryProjection {
   turns: Turn[];
   hasMore: boolean;
+  /** The visible cursor belongs to the currently verified wrapper projection. */
+  pagingReady: boolean;
   oldestId: string | null;
   viewRevision: string | null;
+  generation: string | null;
   recovering: boolean;
   browsing: boolean;
+  scopeKey: string | null;
   viewId: string | null;
   windowEpoch: number;
   hasNewer: boolean;
@@ -232,18 +236,42 @@ export function displayHistoryProjection(
   sid: string | null,
   runtime: HistoryRuntimeState,
   browse?: HistoryBrowseProjection | null,
+  retainedBrowse?: HistoryBrowseProjection | null,
 ): DisplayHistoryProjection {
+  if (sid && retainedBrowse?.sid === sid) {
+    return {
+      turns: retainedBrowse.turns,
+      // Preserve the truthful affordance while making its stale cursor
+      // inoperable. A same-revision/generation first page reactivates it.
+      hasMore: retainedBrowse.hasOlder,
+      pagingReady: false,
+      oldestId: retainedBrowse.olderCursor,
+      viewRevision: retainedBrowse.revision,
+      generation: retainedBrowse.generation,
+      recovering: true,
+      browsing: true,
+      scopeKey: retainedBrowse.scopeKey,
+      viewId: retainedBrowse.viewId,
+      windowEpoch: retainedBrowse.windowEpoch,
+      hasNewer: false,
+      newerPageKey: null,
+      latestDirty: retainedBrowse.latestDirty,
+    };
+  }
   if (sid && isHistoryRecoveryPending(recovery, sid)) {
     return {
       turns: recovery!.turns!,
       // The retained cursor belongs to the old generation. Keep the old rows
       // readable, but never issue pagination/detail reads from display-only
       // state while the authoritative projection is rebuilding.
-      hasMore: false,
-      oldestId: null,
+      hasMore: recovery!.hasMore,
+      pagingReady: false,
+      oldestId: recovery!.oldestId,
       viewRevision: recovery!.viewRevision,
+      generation: recovery!.expectedGeneration,
       recovering: true,
       browsing: false,
+      scopeKey: null,
       viewId: null,
       windowEpoch: 0,
       hasNewer: false,
@@ -258,10 +286,13 @@ export function displayHistoryProjection(
     return {
       turns: browse.turns,
       hasMore: browse.hasOlder,
+      pagingReady: true,
       oldestId: browse.olderCursor,
       viewRevision: browse.revision,
+      generation: browse.generation,
       recovering: false,
       browsing: true,
+      scopeKey: browse.scopeKey,
       viewId: browse.viewId,
       windowEpoch: browse.windowEpoch,
       hasNewer: browse.hasNewer,
@@ -274,10 +305,13 @@ export function displayHistoryProjection(
   return {
     turns: runtime.turns,
     hasMore: !!runtime.hasMore,
+    pagingReady: !runtime.historyInvalidated,
     oldestId: runtime.oldestId ?? null,
     viewRevision: committed?.viewRevision ?? runtime.historyRevision,
+    generation: runtime.historyGeneration,
     recovering: false,
     browsing: false,
+    scopeKey: null,
     viewId: null,
     windowEpoch: 0,
     hasNewer: false,

@@ -2,15 +2,23 @@ import { isValidElement, useCallback, useEffect, useMemo, useRef, useState,
   type ComponentPropsWithoutRef, type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
-import type { Artifact, PreviewAssetState } from "../reducer";
+import type {
+  Artifact,
+  PreviewAssetState,
+  PreviewAuthorizationState,
+} from "../reducer";
 import { Icon } from "../icons";
 import { PanelTabs } from "./PanelTabs";
 import { GIT_DIFF_PAGE_LINES, pageGitDiff, type GitDiffSection } from "../diff";
 import { classifyPreviewTarget } from "../preview-path";
 import { parseLocalFileTarget } from "../file-link";
-import { buildSandboxDocument } from "../html-preview";
+import {
+  buildInteractiveSandboxDocument,
+  buildSandboxDocument,
+} from "../html-preview";
 import { clampPanelWidth } from "../responsive-layout";
 import { isMermaidFenceClass } from "../mermaid";
+import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import {
   isMathFenceClass,
   normalizeMathDelimiters,
@@ -18,6 +26,7 @@ import {
   useMarkdownMathPlugins,
 } from "../markdown-math";
 import { MermaidBlock } from "./MermaidBlock";
+import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
@@ -64,6 +73,10 @@ function MarkdownPreviewCode({
 
 function HtmlArtifactPreview({ content }: { content: string }) {
   const [document, setDocument] = useState<string | null>(null);
+  const [interactiveDocument, setInteractiveDocument] =
+    useState<string | null>(null);
+  const [interactive, setInteractive] = useState(false);
+  const interactiveFrameRef = useRef<HTMLIFrameElement>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -72,11 +85,12 @@ function HtmlArtifactPreview({ content }: { content: string }) {
       try {
         const { default: DOMPurify } = await import("dompurify");
         const clean = DOMPurify.sanitize(content, {
+          WHOLE_DOCUMENT: true,
           FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "meta", "link"],
           FORBID_ATTR: ["srcset", "action", "formaction"],
         });
         const parsed = new DOMParser().parseFromString(clean, "text/html");
-        for (const element of parsed.body.querySelectorAll("*")) {
+        for (const element of parsed.documentElement.querySelectorAll("*")) {
           for (const attribute of Array.from(element.attributes)) {
             const name = attribute.name.toLowerCase();
             const value = attribute.value.trim();
@@ -92,15 +106,54 @@ function HtmlArtifactPreview({ content }: { content: string }) {
             }
           }
         }
-        for (const style of parsed.body.querySelectorAll("style")) {
+        for (const style of parsed.documentElement.querySelectorAll("style")) {
+          if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
+        }
+
+        const runnable = new DOMParser().parseFromString(content, "text/html");
+        for (const element of Array.from(runnable.querySelectorAll(
+          "iframe,object,embed,form,base,link,meta[http-equiv],script[src]",
+        ))) {
+          element.remove();
+        }
+        for (const element of runnable.documentElement.querySelectorAll("*")) {
+          for (const attribute of Array.from(element.attributes)) {
+            const name = attribute.name.toLowerCase();
+            const value = attribute.value.trim();
+            if (name === "srcset" || name === "action"
+                || name === "formaction") {
+              element.removeAttribute(attribute.name);
+            } else if (URL_ATTRIBUTES.has(name)) {
+              const allowedAnchor = name === "href" && value.startsWith("#");
+              const allowedImage = name === "src"
+                && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i
+                  .test(value);
+              if (!allowedAnchor && !allowedImage) {
+                element.removeAttribute(attribute.name);
+              }
+            } else if (name === "style" && UNSAFE_CSS.test(value)) {
+              element.removeAttribute(attribute.name);
+            }
+          }
+        }
+        for (const style of runnable.documentElement.querySelectorAll("style")) {
           if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
         }
         if (cancelled) return;
-        setDocument(buildSandboxDocument(parsed.body.innerHTML));
+        setDocument(buildSandboxDocument(
+          parsed.body.innerHTML,
+          parsed.head.innerHTML,
+        ));
+        setInteractiveDocument(buildInteractiveSandboxDocument(
+          runnable.body.innerHTML,
+          runnable.head.innerHTML,
+        ));
+        setInteractive(false);
         setError(null);
       } catch {
         if (cancelled) return;
         setDocument(null);
+        setInteractiveDocument(null);
         setError("HTML 安全处理失败");
       }
     };
@@ -108,10 +161,31 @@ function HtmlArtifactPreview({ content }: { content: string }) {
     return () => { cancelled = true; };
   }, [content]);
 
+  const loadInteractiveDocument = useCallback(() => {
+    if (!interactiveDocument) return;
+    interactiveFrameRef.current?.contentWindow?.postMessage({
+        type: "cc-remote-html-preview",
+        document: interactiveDocument,
+      }, "*");
+  }, [interactiveDocument]);
+
   if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
   if (!document) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 HTML…</div>;
-  return <iframe className="artifact-html-preview" title="HTML 预览"
-    sandbox="" referrerPolicy="no-referrer" srcDoc={document} />;
+  return <div className="artifact-html-stage">
+    <div className="artifact-html-controls">
+      <span>外部资源已禁用</span>
+      <button type="button" onClick={() => setInteractive((value) => !value)}>
+        {interactive ? "停止交互预览" : "运行交互预览"}
+      </button>
+    </div>
+    {interactive
+      ? <iframe ref={interactiveFrameRef} className="artifact-html-preview"
+          title="HTML 交互预览" sandbox="allow-scripts"
+          referrerPolicy="no-referrer" src="/html-preview-runner.html"
+          onLoad={loadInteractiveDocument} />
+      : <iframe className="artifact-html-preview" title="HTML 静态预览"
+          sandbox="" referrerPolicy="no-referrer" srcDoc={document} />}
+  </div>;
 }
 
 function BinaryArtifactPreview({ data, mediaType, kind, title }: {
@@ -122,8 +196,14 @@ function BinaryArtifactPreview({ data, mediaType, kind, title }: {
 }) {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const svg = useSanitizedSvgUrl(data, mediaType);
 
   useEffect(() => {
+    if (mediaType === "image/svg+xml") {
+      setObjectUrl(null);
+      setError(null);
+      return;
+    }
     if (!data || !mediaType) {
       setObjectUrl(null);
       setError("预览数据不完整");
@@ -145,12 +225,14 @@ function BinaryArtifactPreview({ data, mediaType, kind, title }: {
     }
   }, [data, mediaType]);
 
-  if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
-  if (!objectUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
+  const resolvedUrl = mediaType === "image/svg+xml" ? svg.url : objectUrl;
+  const resolvedError = mediaType === "image/svg+xml" ? svg.error : error;
+  if (resolvedError) return <div className="preview-error"><Icon name="read" size={18} />{resolvedError}</div>;
+  if (!resolvedUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
   if (kind === "image") {
-    return <div className="artifact-image-stage"><img src={objectUrl} alt={title} /></div>;
+    return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title} /></div>;
   }
-  return <iframe className="artifact-pdf-preview" src={objectUrl} title={`${title} PDF 预览`} />;
+  return <iframe className="artifact-pdf-preview" src={resolvedUrl} title={`${title} PDF 预览`} />;
 }
 
 function SourceFile({ content, targetLine, artifactKey }: {
@@ -201,21 +283,35 @@ function SourceFile({ content, targetLine, artifactKey }: {
   </>;
 }
 
-function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset }: {
+function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
+  onAuthorizePreview }: {
   markdownPath: string;
   src: string;
   alt?: string;
   title?: string;
   asset?: PreviewAssetState;
   requestAsset: (path: string) => boolean;
+  onAuthorizePreview?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
 }) {
   const target = classifyPreviewTarget(markdownPath, src);
   const [blocked, setBlocked] = useState(false);
+  const svg = useSanitizedSvgUrl(asset?.data, asset?.mediaType);
 
   useEffect(() => {
-    if (target.kind !== "local" || asset?.data || asset?.error) return;
+    if (target.kind !== "local" || asset?.data || asset?.error
+        || asset?.authorization) return;
     setBlocked(!requestAsset(target.value));
-  }, [asset?.data, asset?.error, requestAsset, target.kind, target.value]);
+  }, [
+    asset?.authorization,
+    asset?.data,
+    asset?.error,
+    requestAsset,
+    target.kind,
+    target.value,
+  ]);
 
   if (target.kind === "external") {
     return <img src={target.value} alt={alt || ""} title={title}
@@ -224,8 +320,22 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset }: {
   if (target.kind !== "local") {
     return <span className="preview-image-error" title={src}>图片路径不可用：{alt || src}</span>;
   }
+  if (asset?.authorization) {
+    return <PreviewAuthorizationPrompt
+      authorization={asset.authorization}
+      compact
+      onDecision={onAuthorizePreview} />;
+  }
   if (asset?.data && asset.mediaType) {
-    return <img src={`data:${asset.mediaType};base64,${asset.data}`}
+    if (svg.error) {
+      return <span className="preview-image-error">{svg.error}</span>;
+    }
+    if (asset.mediaType === "image/svg+xml" && !svg.url) {
+      return <span className="preview-image-loading"><span className="thinking"><span/><span/><span/></span> {alt || "正在处理 SVG"}</span>;
+    }
+    return <img src={asset.mediaType === "image/svg+xml"
+      ? svg.url!
+      : `data:${asset.mediaType};base64,${asset.data}`}
       alt={alt || ""} title={title} loading="lazy" />;
   }
   if (asset?.error) {
@@ -238,7 +348,8 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset }: {
 }
 
 export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
-  onRefresh, onOpenFile, onLoadPreviewAsset, onSaveMarkdown, onDirtyChange }: {
+  onRefresh, onOpenFile, onLoadPreviewAsset, onAuthorizePreview,
+  onSaveMarkdown, onDirtyChange }: {
   artifact: Artifact;
   active: "diff" | "btw";
   hasBtw: boolean;
@@ -247,6 +358,10 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onRefresh?: (path: string, line?: number) => void;
   onOpenFile?: (path: string, line?: number) => void;
   onLoadPreviewAsset?: (path: string, previewId: string) => boolean;
+  onAuthorizePreview?: (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ) => boolean;
   onSaveMarkdown?: (path: string, content: string, expectedSize: number,
     expectedMtimeNs: string, expectedRevision: string) => string | null;
   onDirtyChange?: (dirty: boolean) => void;
@@ -337,6 +452,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   }, [artifact.kind, loading, mode]);
 
   const canSave = artifact.kind === "md" && !loading && !artifact.error
+    && artifact.writable !== false
     && !artifact.truncated && typeof artifact.size === "number"
     && typeof artifact.mtimeNs === "string" && !!artifact.revision
     && !!onSaveMarkdown;
@@ -476,7 +592,8 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
       const target = classifyPreviewTarget(artifact.file, source);
       const asset = target.kind === "local" ? artifact.assets?.[target.value] : undefined;
       return <PreviewImage markdownPath={artifact.file} src={source} alt={alt}
-        title={title} asset={asset} requestAsset={requestAsset} />;
+        title={title} asset={asset} requestAsset={requestAsset}
+        onAuthorizePreview={onAuthorizePreview} />;
     },
     a: ({ href, children, title }) => {
       const target = classifyPreviewTarget(artifact.file, href || "");
@@ -494,7 +611,13 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
       }
       return <span className="preview-link-disabled" title="该相对链接不会离开当前工作目录">{children}</span>;
     },
-  }), [artifact.assets, artifact.file, onOpenFile, requestAsset]);
+  }), [
+    artifact.assets,
+    artifact.file,
+    onAuthorizePreview,
+    onOpenFile,
+    requestAsset,
+  ]);
 
   const title = artifact.file.split("/").pop()
     || (["md", "file", "html", "image", "pdf"].includes(artifact.kind) ? "文件预览" : "改动");
@@ -525,7 +648,11 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
           type="button" className="markdown-save"
           disabled={!dirty || artifact.saving || !canSave}
           onClick={saveDraft}
-          title={artifact.truncated ? "截断的文件不可编辑" : "保存 Markdown（Ctrl/⌘+S）"}>
+          title={artifact.writable === false
+            ? "此文件仅获准查看"
+            : artifact.truncated
+              ? "截断的文件不可编辑"
+              : "保存 Markdown（Ctrl/⌘+S）"}>
           <Icon name={artifact.saving ? "refresh" : "check"} size={15} />
           {artifact.saving ? "保存中" : "保存"}
         </button>}
@@ -541,7 +668,11 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         <button className="iconbtn" onClick={leavePanel} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>
       <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}`}>
-        {loading ? (
+        {artifact.authorization ? (
+          <PreviewAuthorizationPrompt
+            authorization={artifact.authorization}
+            onDecision={onAuthorizePreview} />
+        ) : loading ? (
           <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> {["md", "file", "html", "image", "pdf"].includes(artifact.kind) ? "正在读取文件…" : "正在读取 diff…"}</div>
         ) : artifact.error ? (
           <div className="preview-error"><Icon name="read" size={18} />{artifact.error}</div>

@@ -15,6 +15,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -32,6 +34,12 @@ from cc_remote.protocol import (
     TurnEnd, TurnResult, Error, is_downstream,
 )
 from cc_remote.wrapper import machine as mm
+from cc_remote.wrapper.codex_history import (
+    CodexHistoryPage,
+    CodexHistoryUnsupported,
+)
+from cc_remote.wrapper.codex_rpc import CodexRpcRejected
+from cc_remote.wrapper.codex_stream import CodexHistoryImageView
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
@@ -41,11 +49,1060 @@ from cc_remote.wrapper.history_store import (
 )
 from cc_remote.wrapper.stream import (
     StreamTranslator,
+    transcript_compact_history_page,
+    transcript_compact_snapshot,
     last_assistant_model,
+    transcript_compact_main_chain,
     transcript_internal_user_events,
+    transcript_timestamps,
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def test_claude_sdk_prompt_id_survives_history_as_exact_client_alias(
+    monkeypatch, tmp_path,
+):
+    """Switch-back History must reconcile one SDK prompt with its live row.
+
+    Claude stores the transcript UUID as ``uuid`` and the browser query id as
+    ``promptId``.  The SDK's SessionMessage projection drops promptId, so the
+    timestamp side read is also the source of this exact, non-textual alias.
+    """
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    transcript_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "user",
+        "uuid": transcript_id,
+        "promptId": client_id,
+        "promptSource": "sdk",
+        "timestamp": "2026-08-02T09:09:16.263Z",
+        "message": {
+            "role": "user",
+            "content": "我又改完了一版，你看看还有没得问题？",
+        },
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _session_id: str(transcript),
+    )
+
+    timestamps = transcript_timestamps(session_id)
+    events = translate_history([
+        SimpleNamespace(
+            type="user",
+            uuid=transcript_id,
+            session_id=session_id,
+            message={
+                "role": "user",
+                "content": "我又改完了一版，你看看还有没得问题？",
+            },
+            parent_tool_use_id=None,
+        ),
+    ], 10_000, timestamps=timestamps)
+
+    user = next(event for event in events if isinstance(event, UserMsg))
+    assert user.msg_id == transcript_id
+    assert user.client_msg_id == client_id
+
+
+def test_claude_repeated_prompt_text_keeps_distinct_prompt_identities(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    transcript_ids = [
+        "2259073b-7676-455f-b7b0-b9b3892dbe93",
+        "3259073b-7676-455f-b7b0-b9b3892dbe93",
+    ]
+    client_ids = [
+        "6b09ee37-f861-4422-b98a-21f509c951b0",
+        "7b09ee37-f861-4422-b98a-21f509c951b0",
+    ]
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("".join(
+        json.dumps({
+            "type": "user",
+            "uuid": transcript_id,
+            "promptId": client_id,
+            "promptSource": "sdk",
+            "timestamp": f"2026-08-02T09:09:{16 + index:02d}.263Z",
+            "message": {"role": "user", "content": "继续"},
+        }) + "\n"
+        for index, (transcript_id, client_id) in enumerate(zip(
+            transcript_ids, client_ids, strict=True))
+    ), encoding="utf-8")
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _session_id: str(transcript),
+    )
+    messages = [
+        SimpleNamespace(
+            type="user",
+            uuid=transcript_id,
+            session_id=session_id,
+            message={"role": "user", "content": "继续"},
+            parent_tool_use_id=None,
+        )
+        for transcript_id in transcript_ids
+    ]
+
+    users = [
+        event for event in translate_history(
+            messages, 10_000, timestamps=transcript_timestamps(session_id))
+        if isinstance(event, UserMsg)
+    ]
+    assert [(user.msg_id, user.client_msg_id) for user in users] == list(zip(
+        transcript_ids, client_ids, strict=True))
+
+
+def test_codex_image_view_supplement_keeps_official_detail_and_deduplicates():
+    official = [
+        {"type": "user_msg", "msg_id": "user-1", "prompt": "inspect"},
+        {
+            "type": "process",
+            "item_id": "reason-1",
+            "kind": "reasoning",
+            "phase": "end",
+            "status": "succeeded",
+            "title": "思考",
+        },
+        {
+            "type": "tool_use",
+            "message_id": "message-1",
+            "tool_use_id": "call-image-1",
+            "tool": "view_image",
+            "input": {"path": "/tmp/chart.png"},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-image-1",
+            "content": "data:image/png;base64,SHOULD_NOT_SURVIVE",
+            "is_error": False,
+        },
+        {
+            "type": "process",
+            "item_id": "command-after-image",
+            "kind": "command",
+            "phase": "end",
+            "status": "succeeded",
+            "title": "运行命令",
+        },
+        {
+            "type": "assistant_msg_start",
+            "message_id": "final-1",
+            "channel": "final",
+        },
+        {
+            "type": "delta",
+            "message_id": "final-1",
+            "channel": "final",
+            "text": "done",
+        },
+        {
+            "type": "assistant_msg_end",
+            "message_id": "final-1",
+            "channel": "final",
+        },
+        {
+            "type": "turn_end",
+            "turn_id": "native-1",
+            "result": {
+                "subtype": "success",
+                "duration_ms": 1,
+                "is_error": False,
+            },
+        },
+    ]
+    image_event = ProcessEvent(
+        item_id="fc-image-1",
+        kind="server_tool",
+        phase="end",
+        status="succeeded",
+        turn_id="native-1",
+        title="查看图片",
+        tool="view_image",
+        input={
+            "file_path": "/tmp/chart.png",
+            "history_image": {
+                "image_id": "img-123",
+                "media_type": "image/png",
+                "width": 1,
+                "height": 1,
+                "byte_size": 68,
+            },
+        },
+    )
+    view = CodexHistoryImageView(
+        call_id="call-image-1",
+        event=image_event,
+        next_item_id="command-after-image",
+    )
+
+    merged = mm._merge_codex_history_image_views(official, (view,))
+
+    assert any(row.get("item_id") == "reason-1" for row in merged)
+    image_rows = [
+        row for row in merged
+        if row.get("type") == "process" and row.get("tool") == "view_image"
+    ]
+    assert len(image_rows) == 1
+    assert image_rows[0]["item_id"] == "fc-image-1"
+    assert all(row.get("tool_use_id") != "call-image-1" for row in merged)
+    assert "SHOULD_NOT_SURVIVE" not in json.dumps(merged)
+    assert merged.index(image_rows[0]) < next(
+        index for index, row in enumerate(merged)
+        if row.get("item_id") == "command-after-image"
+    )
+    assert merged.index(image_rows[0]) < next(
+        index for index, row in enumerate(merged)
+        if row.get("type") == "assistant_msg_start"
+        and row.get("channel") == "final"
+    )
+
+    official_with_image = [
+        official[0],
+        official[1],
+        {
+            **image_event.model_dump(mode="json"),
+            "input": {"file_path": "/tmp/chart.png"},
+        },
+        *official[2:],
+    ]
+    deduplicated = mm._merge_codex_history_image_views(
+        official_with_image, (view,))
+    official_image_rows = [
+        row for row in deduplicated
+        if row.get("type") == "process" and row.get("tool") == "view_image"
+    ]
+    assert len(official_image_rows) == 1
+    assert official_image_rows[0]["input"]["history_image"]["image_id"] == "img-123"
+    assert all(
+        row.get("tool_use_id") != "call-image-1"
+        for row in deduplicated
+    )
+
+    official_without_image_shell = [
+        row for row in official
+        if row.get("tool_use_id") != "call-image-1"
+    ]
+    anchored = mm._merge_codex_history_image_views(
+        official_without_image_shell, (view,))
+    anchored_image = next(
+        row for row in anchored
+        if row.get("type") == "process"
+        and row.get("tool") == "view_image"
+    )
+    assert anchored.index(anchored_image) < next(
+        index for index, row in enumerate(anchored)
+        if row.get("item_id") == "command-after-image"
+    )
+
+
+def test_codex_turn_detail_lazily_recovers_missing_official_image_view(
+    monkeypatch, tmp_path,
+):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 32), (70, 90, 130)).save(buffer, "PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    rollout = tmp_path / "rollout-image-view.jsonl"
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in [
+        {"timestamp": "2026-07-30T06:40:00Z", "type": "session_meta",
+         "payload": {"id": "session-image-view"}},
+        {"timestamp": "2026-07-30T06:40:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "native-1"}},
+        {"timestamp": "2026-07-30T06:40:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "turn_id": "native-1",
+                     "message": "inspect"}},
+        {"timestamp": "2026-07-30T06:40:03Z", "type": "response_item",
+         "payload": {
+             "type": "function_call", "id": "fc-image-1",
+             "name": "view_image", "call_id": "call-image-1",
+             "arguments": '{"path":"/tmp/chart.png","detail":"original"}',
+             "internal_chat_message_metadata_passthrough": {
+                 "turn_id": "native-1",
+             },
+         }},
+        {"timestamp": "2026-07-30T06:40:04Z", "type": "response_item",
+         "payload": {
+             "type": "function_call_output", "call_id": "call-image-1",
+             "output": [{
+                 "type": "input_image",
+                 "image_url": f"data:image/png;base64,{encoded}",
+                 "detail": "original",
+             }],
+             "internal_chat_message_metadata_passthrough": {
+                 "turn_id": "native-1",
+             },
+         }},
+        {"timestamp": "2026-07-30T06:40:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "native-1"}},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    image_view_reads = 0
+    real_image_view_reader = mm.codex_history_image_views
+
+    def counted_image_view_reader(*args, **kwargs):
+        nonlocal image_view_reads
+        image_view_reads += 1
+        return real_image_view_reader(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mm, "codex_history_image_views", counted_image_view_reader)
+    official = (
+        {"type": "user_msg", "msg_id": "user-1", "prompt": "inspect"},
+        ProcessEvent(
+            item_id="official-plan",
+            kind="plan",
+            phase="end",
+            status="succeeded",
+            turn_id="native-1",
+            title="计划",
+        ).model_dump(mode="json"),
+        {"type": "assistant_msg_start", "message_id": "answer-1",
+         "channel": "final"},
+        {"type": "delta", "message_id": "answer-1",
+         "channel": "final", "text": "done"},
+        {"type": "assistant_msg_end", "message_id": "answer-1",
+         "channel": "final"},
+        {"type": "turn_end", "turn_id": "native-1",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    )
+
+    class OfficialHistory:
+        async def turn_events(self, _sid, _turn_id):
+            return official
+
+        def rollout_fallback(self, _sid, _turn_id):
+            return SimpleNamespace(
+                before=None,
+                limit=4,
+                native_turn_id="native-1",
+                segment_index=0,
+                segment_count=1,
+            )
+
+        def summary_events(self, _sid, _turn_id):
+            return None
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-image-view")
+        machine._codex_history = OfficialHistory()
+        ctx = _mk_ctx("session-image-view", "session-image-view")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        revision = machine._history_revision("session-image-view")
+
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id="session-image-view",
+            turn_id="user-1",
+            client_id="client-1",
+            revision=revision,
+            before=None,
+            limit=192,
+        ))
+        assert any(
+            event.get("item_id") == "official-plan"
+            for event in detail.events
+        )
+        image_events = [
+            event for event in detail.events
+            if event.get("type") == "process"
+            and event.get("tool") == "view_image"
+        ]
+        assert len(image_events) == 1
+        wire = detail.model_dump_json()
+        assert encoded not in wire
+        image_id = image_events[0]["input"]["history_image"]["image_id"]
+
+        image = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-image-view",
+            turn_id="user-1",
+            image_id=image_id,
+            variant="full",
+            request_id="image-request",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert image.error is None and image.media_type == "image/png"
+        assert image.width == 64 and image.height == 32
+        assert base64.b64decode(image.data) == buffer.getvalue()
+        assert image_view_reads == 1
+
+        with rollout.open("a", encoding="utf-8") as output:
+            output.write(json.dumps({
+                "timestamp": "2026-07-30T06:41:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "native-2",
+                },
+            }) + "\n")
+        appended_detail = await machine._handle_get_turn_detail(
+            SimpleNamespace(
+                session_id="session-image-view",
+                turn_id="user-1",
+                client_id="client-1",
+                revision=revision,
+                before=None,
+                limit=192,
+            )
+        )
+        assert any(
+            event.get("type") == "process"
+            and event.get("tool") == "view_image"
+            for event in appended_detail.events
+        )
+        assert image_view_reads == 1, (
+            "a validated append must reuse a completed turn's supplement"
+        )
+
+        machine._history_index.invalidate_session("session-image-view")
+        rehydrated = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-image-view",
+            turn_id="user-1",
+            image_id=image_id,
+            variant="full",
+            request_id="image-request-after-eviction",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert rehydrated.error is None
+        assert base64.b64decode(rehydrated.data) == buffer.getvalue()
+        assert image_view_reads == 2, (
+            "an evicted image asset must be rehydrated from the rollout"
+        )
+        assert any(
+            key[0] == "session-image-view"
+            for key in machine._codex_history_image_views
+        )
+        machine._bump_history_revision("session-image-view")
+        assert not any(
+            key[0] == "session-image-view"
+            for key in machine._codex_history_image_views
+        )
+
+    asyncio.run(go())
+
+
+def test_requested_codex_summary_uses_official_turns_without_rollout_parse(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "official-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"official-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_translate_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("official summary parsed the rollout")),
+    )
+    events = (
+        UserMsg(
+            sid="official-summary",
+            msg_id="user-1",
+            client_msg_id="client-1",
+            prompt="hello",
+            ts=100,
+        ).model_dump(mode="json"),
+        AssistantMsgStart(
+            sid="official-summary",
+            message_id="answer-1",
+            channel="final",
+            ts=100,
+        ).model_dump(mode="json"),
+        Delta(
+            sid="official-summary",
+            message_id="answer-1",
+            channel="final",
+            text="world",
+            ts=100,
+        ).model_dump(mode="json"),
+        AssistantMsgEnd(
+            sid="official-summary",
+            message_id="answer-1",
+            channel="final",
+            ts=100,
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="official-summary",
+            turn_id="native-1",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+            ts=101,
+        ).model_dump(mode="json"),
+    )
+
+    class Official:
+        async def summary_page(
+            self, sid, *, before, limit, include_live_detail=False,
+            active_turn_ids=frozenset(), hydrate_recent=0,
+        ):
+            assert (
+                sid, before, limit, include_live_detail, active_turn_ids,
+                hydrate_recent,
+            ) == ("official-summary", None, 4, False, frozenset(), 2)
+            return CodexHistoryPage(
+                events=events,
+                turns=materialize_history_turns(events),
+                has_more=True,
+                oldest_id="user-1",
+                newest_id="user-1",
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("official-summary", "official-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_requested_history(
+            "official-summary",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert history.authoritative is True
+        assert history.detail == "summary"
+        assert [turn.id for turn in history.turns] == ["user-1"]
+        assert history.turns[0].clientMsgId == "client-1"
+        assert history.turns[0].forkPointId == "native-1"
+        assert history.has_more is True
+        assert all(row["type"] in {"model", "effort"}
+                   for row in history.events)
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_binds_exact_active_native_turn_ids(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "active-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"active-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    seen = []
+
+    class Official:
+        async def summary_page(self, sid, **kwargs):
+            seen.append((sid, kwargs))
+            return CodexHistoryPage(
+                events=(),
+                turns=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("active-summary", "active-summary")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.codex_owned_turn_id = "owned-turn"
+        ctx.codex_spontaneous_turn_id = "goal-turn"
+        ctx.sdk = SimpleNamespace(turn_id="managed-turn")
+        machine.sessions[ctx.key] = ctx
+        machine._watch["active-summary"] = {
+            "engine": "codex",
+            "active_external_turns": {"desktop-turn": 1.0},
+            "takeover_pending": None,
+        }
+
+        history = await machine._build_requested_history(
+            "active-summary",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert history.in_progress is True
+        assert seen == [("active-summary", {
+            "before": None,
+            "limit": 4,
+            "include_live_detail": True,
+            "active_turn_ids": {"desktop-turn"},
+            "hydrate_recent": 2,
+        })]
+        seen.clear()
+        machine._watch["active-summary"]["active_external_turns"] = {}
+        await machine._build_requested_history(
+            "active-summary",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+        assert seen == [("active-summary", {
+            "before": None,
+            "limit": 4,
+            "include_live_detail": True,
+            "active_turn_ids": {"owned-turn"},
+            "hydrate_recent": 2,
+        })]
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "unsupported-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"unsupported-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Unsupported:
+        async def summary_page(self, *_args, **_kwargs):
+            raise CodexHistoryUnsupported("old app-server")
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Unsupported()
+        ctx = _mk_ctx("unsupported-summary", "unsupported-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        fallback_calls = []
+
+        async def fallback(*args, **kwargs):
+            fallback_calls.append((args, kwargs))
+            return History(
+                session_id="unsupported-summary",
+                revision=machine._history_revision("unsupported-summary"),
+                detail="summary",
+            )
+
+        monkeypatch.setattr(machine, "_build_history", fallback)
+        history = await machine._build_requested_history(
+            "unsupported-summary",
+            before=None,
+            limit=4,
+            cwd=None,
+            detail="summary",
+        )
+        assert history.error is None
+        assert len(fallback_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_does_not_hide_auth_failure_with_rollout(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "auth-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"auth-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Rejected:
+        async def summary_page(self, *_args, **_kwargs):
+            raise CodexRpcRejected(
+                "codex app-server error -32001: unauthorized",
+                code=-32001,
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Rejected()
+        ctx = _mk_ctx("auth-summary", "auth-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        monkeypatch.setattr(
+            machine,
+            "_build_history",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("auth failure fell back to rollout")),
+        )
+
+        history = await machine._build_requested_history(
+            "auth-summary",
+            before=None,
+            limit=4,
+            cwd=None,
+            detail="summary",
+        )
+        assert history.authoritative is False
+        assert history.error == "历史暂时不可用，请稍后重试"
+        assert history.turns == []
+
+    asyncio.run(run())
+
+
+def test_codex_turn_detail_uses_official_items_without_history_index(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "official-detail.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"official-detail"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    rows = (
+        UserMsg(
+            sid="official-detail",
+            msg_id="user-1",
+            prompt="inspect",
+        ).model_dump(mode="json"),
+        ProcessEvent(
+            sid="official-detail",
+            item_id="process-1",
+            kind="compaction",
+            phase="end",
+            status="succeeded",
+            title="压缩上下文",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="official-detail",
+            turn_id="native-1",
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class Official:
+        async def turn_events(self, sid, turn_id):
+            assert (sid, turn_id) == ("official-detail", "user-1")
+            return rows
+
+    async def run():
+        machine, transport = _mk_machine()
+        machine._history_index = None
+        machine._codex_history = Official()
+        ctx = _mk_ctx("official-detail", "official-detail")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id="official-detail",
+            turn_id="user-1",
+            revision=machine._history_revision("official-detail"),
+            client_id="client-1",
+            before=None,
+            limit=192,
+        ))
+        assert detail.authoritative is True
+        assert detail.error is None
+        assert any(
+            row.get("item_id") == "process-1"
+            for row in detail.events
+        )
+        assert transport.sent[-1] == detail
+
+    asyncio.run(run())
+
+
+def test_codex_full_turn_detail_uses_exact_rollout_steer_segment(
+    monkeypatch, tmp_path,
+):
+    """A fresh browser must receive tools omitted by itemsView=full.
+
+    Three visible prompts can share one native Codex turn after steering.  The
+    rollout fallback must use the official locator's segment index rather than
+    taking the first row with the shared forkPointId.
+    """
+    sid = "fresh-browser-steered-detail"
+    native_turn_id = "native-task-with-three-segments"
+    rollout = tmp_path / "fresh-browser-steered-detail.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"fresh-browser-steered-detail"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    official_rows = (
+        UserMsg(
+            sid=sid, msg_id="official-user-second", prompt="second steer",
+        ).model_dump(mode="json"),
+        AssistantMsgStart(
+            sid=sid, message_id="official-final", channel="final",
+        ).model_dump(mode="json"),
+        Delta(
+            sid=sid, message_id="official-final", channel="final",
+            text="done",
+        ).model_dump(mode="json"),
+        AssistantMsgEnd(
+            sid=sid, message_id="official-final", channel="final",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid=sid, turn_id=native_turn_id,
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class OfficialHistory:
+        async def turn_events(self, _sid, _turn_id):
+            return official_rows
+
+        def turn_detail_source(self, _sid, _turn_id):
+            return "full"
+
+        def rollout_fallback(self, _sid, _turn_id):
+            return SimpleNamespace(
+                before=None,
+                limit=4,
+                native_turn_id=native_turn_id,
+                segment_index=1,
+                segment_count=3,
+            )
+
+    selected_ids = []
+
+    class DetailIndex:
+        def get_turn_detail(
+            self, _sid, _engine, _source, turn_id,
+        ):
+            selected_ids.append(turn_id)
+            return (
+                UserMsg(
+                    sid=sid, msg_id=turn_id, prompt="second steer",
+                ).model_dump(mode="json"),
+                ProcessEvent(
+                    sid=sid,
+                    item_id="second-segment-command",
+                    kind="command",
+                    phase="end",
+                    status="succeeded",
+                    title="运行命令",
+                ).model_dump(mode="json"),
+                TurnEnd(
+                    sid=sid, turn_id=native_turn_id,
+                    result=TurnResult(
+                        subtype="success", duration_ms=1, is_error=False),
+                ).model_dump(mode="json"),
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = OfficialHistory()
+        machine._history_index = DetailIndex()
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        async def build_history(_sid, **_kwargs):
+            return History(
+                session_id=sid,
+                revision=machine._history_revision(sid),
+                detail="summary",
+                turns=[
+                    {
+                        "id": "rollout-user-first",
+                        "prompt": "first",
+                        "blocks": [],
+                        "done": True,
+                        "forkPointId": native_turn_id,
+                        "detailEventCount": 1,
+                        "detailLoaded": False,
+                    },
+                    {
+                        "id": "rollout-user-second",
+                        "prompt": "second steer",
+                        "blocks": [],
+                        "done": True,
+                        "forkPointId": native_turn_id,
+                        "detailEventCount": 1,
+                        "detailLoaded": False,
+                    },
+                    {
+                        "id": "rollout-user-third",
+                        "prompt": "third steer",
+                        "blocks": [],
+                        "done": True,
+                        "forkPointId": native_turn_id,
+                        "detailEventCount": 1,
+                        "detailLoaded": False,
+                    },
+                ],
+            )
+
+        async def no_image_supplement(_sid, _turn_id, rows, **_kwargs):
+            return list(rows)
+
+        machine._build_history = build_history
+        machine._supplement_codex_history_image_views = no_image_supplement
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=sid,
+            turn_id="official-user-second",
+            client_id="fresh-browser",
+            revision=machine._history_revision(sid),
+            before=None,
+            limit=192,
+        ))
+
+        assert selected_ids == ["rollout-user-second"]
+        assert any(
+            event.get("item_id") == "second-segment-command"
+            for event in detail.events
+        )
+        assert not any(
+            event.get("message_id") == "official-final"
+            for event in detail.events
+        )
+        projected = materialize_history_turns(detail.events)
+        assert len(projected) == 1
+        assert projected[0]["id"] == "official-user-second"
+        assert projected[0]["prompt"] == "second steer"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "local_detail_state",
+    ["missing-entry", "missing-index", "missing-rollout"],
+)
+def test_codex_full_turn_detail_uses_official_rows_when_local_detail_misses(
+    monkeypatch, tmp_path, local_detail_state,
+):
+    sid = "official-detail-index-miss"
+    native_turn_id = "native-index-miss"
+    rollout = tmp_path / "official-detail-index-miss.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"official-detail-index-miss"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mm,
+        "codex_rollout_path",
+        lambda _sid: (
+            None if local_detail_state == "missing-rollout" else str(rollout)
+        ),
+    )
+    official_rows = (
+        UserMsg(
+            sid=sid, msg_id="official-user", prompt="inspect",
+        ).model_dump(mode="json"),
+        AssistantMsgStart(
+            sid=sid, message_id="official-final", channel="final",
+        ).model_dump(mode="json"),
+        Delta(
+            sid=sid, message_id="official-final", channel="final", text="done",
+        ).model_dump(mode="json"),
+        AssistantMsgEnd(
+            sid=sid, message_id="official-final", channel="final",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid=sid, turn_id=native_turn_id,
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class OfficialHistory:
+        async def turn_events(self, _sid, _turn_id):
+            return official_rows
+
+        def turn_detail_source(self, _sid, _turn_id):
+            return "full"
+
+        def rollout_fallback(self, _sid, _turn_id):
+            return SimpleNamespace(
+                before=None,
+                limit=4,
+                native_turn_id=native_turn_id,
+                segment_index=0,
+                segment_count=1,
+            )
+
+    class MissingDetailIndex:
+        def get_turn_detail(self, *_args):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = OfficialHistory()
+        machine._history_index = (
+            None
+            if local_detail_state == "missing-index"
+            else MissingDetailIndex()
+        )
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        async def build_history(_sid, **_kwargs):
+            return History(
+                session_id=sid,
+                revision=machine._history_revision(sid),
+                detail="summary",
+                turns=[{
+                    "id": "rollout-user",
+                    "prompt": "inspect",
+                    "blocks": [],
+                    "done": True,
+                    "forkPointId": native_turn_id,
+                    "detailEventCount": 5,
+                    "detailLoaded": False,
+                }],
+            )
+
+        async def no_image_supplement(_sid, _turn_id, rows, **_kwargs):
+            return list(rows)
+
+        machine._build_history = build_history
+        machine._supplement_codex_history_image_views = no_image_supplement
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=sid,
+            turn_id="official-user",
+            client_id="fresh-browser",
+            revision=machine._history_revision(sid),
+            before=None,
+            limit=192,
+        ))
+
+        assert detail.authoritative is True
+        assert detail.error is None
+        assert any(
+            event.get("message_id") == "official-final"
+            for event in detail.events
+        )
+        assert materialize_history_turns(detail.events)[0]["id"] == (
+            "official-user"
+        )
+
+    asyncio.run(run())
+
+
+def test_codex_turn_detail_identity_rebind_rejects_another_segment():
+    rows = (
+        UserMsg(
+            sid="identity-guard",
+            msg_id="rollout-user-other",
+            prompt="another steer",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="identity-guard",
+            turn_id="native-shared-turn",
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    try:
+        mm._rebind_turn_detail_visible_id(
+            rows,
+            indexed_turn_id="rollout-user-target",
+            visible_turn_id="official-user-target",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unrelated rollout segment was rebound")
+
+    assert rows[0]["msg_id"] == "rollout-user-other"
 
 
 def test_protocol_v21_get_history_and_materialized_summary_roundtrip():
@@ -286,6 +1343,29 @@ def test_materialized_summary_never_exposes_bare_error_sentinel():
         }},
     ))
     assert turns[0]["error"] == "该轮未正常结束"
+
+
+def test_materialized_summary_never_exposes_untrusted_error_text():
+    turns = materialize_history_turns((
+        {"type": "user_msg", "msg_id": "message-private", "prompt": "go"},
+        {"type": "error", "message":
+         "provider crash at /private/token; Authorization: Bearer secret"},
+        {"type": "turn_end", "turn_id": "turn-private", "result": {
+            "subtype": "error", "is_error": True, "duration_ms": 0,
+        }},
+    ))
+
+    assert turns[0]["error"] == "该轮未正常结束"
+    assert "/private/token" not in json.dumps(turns, ensure_ascii=False)
+
+    safe = materialize_history_turns((
+        {"type": "user_msg", "msg_id": "message-network", "prompt": "go"},
+        {"type": "error", "message": "网络连接异常，请检查网络后重试。"},
+        {"type": "turn_end", "turn_id": "turn-network", "result": {
+            "subtype": "error", "is_error": True, "duration_ms": 0,
+        }},
+    ))
+    assert safe[0]["error"] == "网络连接异常，请检查网络后重试。"
     detail = TurnDetail(
         session_id="s1", turn_id="u1", revision="test-revision",
         events=[{"type": "user_msg", "msg_id": "u1", "prompt": "hello"}],
@@ -413,6 +1493,10 @@ def test_history_content_does_not_wait_for_external_ownership_scan():
 
         machine._prime_codex_ownership = blocked_prime
         machine._build_history = build
+        machine._codex_history = SimpleNamespace(
+            summary_page=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                CodexHistoryUnsupported("compatibility path"))
+        )
         history = await asyncio.wait_for(machine._build_requested_history(
             "session-1", before=None, limit=4, cwd=None, detail="summary",
         ), timeout=0.1)
@@ -471,6 +1555,67 @@ def test_get_turn_detail_is_routed_and_revision_bound(monkeypatch, tmp_path):
         assert stale.authoritative is False and stale.events == []
 
         assert transport.sent[-2:] == [response, stale]
+
+    asyncio.run(go())
+
+
+def test_running_claude_turn_detail_materializes_current_source_on_cache_miss(
+    monkeypatch, tmp_path,
+):
+    transcript = tmp_path / "session-running.jsonl"
+    transcript.write_text("{}\n")
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    events = (
+        {"type": "user_msg", "sid": "session-running",
+         "msg_id": "message-running", "prompt": "work"},
+        {"type": "process", "sid": "session-running",
+         "item_id": "process-running", "kind": "command",
+         "phase": "end", "status": "succeeded", "title": "运行命令"},
+    )
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-running")
+        ctx = _mk_ctx("session-running", "session-running")
+        ctx.engine = "claude"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+        builds = []
+
+        async def build_history(sid, **kwargs):
+            builds.append((sid, kwargs))
+            source = HistorySourceFingerprint.capture(transcript)
+            machine._history_index.put_turn_details(
+                sid, "claude", source, events)
+            return History(
+                session_id=sid,
+                revision=machine._history_revision(sid),
+                detail=kwargs["detail"],
+            )
+
+        machine._build_history = build_history
+        response = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id="session-running",
+            turn_id="message-running",
+            client_id="client-running",
+            revision=machine._history_revision("session-running"),
+            before=None,
+            limit=192,
+        ))
+
+        assert builds == [("session-running", {
+            "before": None,
+            "limit": 4,
+            "cwd_hint": ctx.cwd,
+            "detail": "summary",
+            "allow_stale": False,
+        })]
+        assert response.authoritative is True
+        assert response.error is None
+        assert any(
+            row.get("item_id") == "process-running"
+            for row in response.events
+        )
 
     asyncio.run(go())
 
@@ -555,6 +1700,95 @@ def test_get_history_image_is_revision_bound_lazy_and_cached(
         assert stale.to == "client-2" and stale.data is None
         assert stale.error == "会话历史已更新，请重新加载图片"
         assert transport.sent[-4:] == [thumbnail, full, cached, stale]
+
+    asyncio.run(go())
+
+
+def test_history_image_tool_asset_is_served_only_from_current_turn_reference(
+    monkeypatch, tmp_path,
+):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (320, 160), (34, 120, 88)).save(buffer, "PNG")
+    raw = buffer.getvalue()
+    rollout = tmp_path / "rollout-tool-image.jsonl"
+    rollout.write_text("{}\n")
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    image_id = "img-tool-view-1"
+    events = (
+        {"type": "user_msg", "sid": "session-1", "msg_id": "message-1",
+         "prompt": "inspect"},
+        ProcessEvent(
+            item_id="view-1",
+            kind="server_tool",
+            phase="end",
+            status="succeeded",
+            turn_id="native-1",
+            title="查看图片",
+            tool="view_image",
+            input={
+                "file_path": "/tmp/chart.png",
+                "history_image": {
+                    "image_id": image_id,
+                    "media_type": "image/png",
+                    "width": 320,
+                    "height": 160,
+                    "byte_size": len(raw),
+                },
+            },
+        ).model_dump(mode="json"),
+        {"type": "turn_end", "sid": "session-1", "turn_id": "native-1",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-tool-image")
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        page = MaterializedHistoryPage(
+            events=events,
+            has_more=False,
+            oldest_id="message-1",
+            newest_id="message-1",
+            turns=materialize_history_turns(events),
+        )
+        machine._history_index.put_page(
+            "session-1", "codex", source, before=None, limit=4, page=page)
+        machine._history_index.put_image_asset(
+            "session-1", "codex", source, "message-1", image_id, "full",
+            "image/png", 320, 160, raw,
+        )
+        revision = machine._history_revision("session-1")
+
+        thumbnail = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-1",
+            turn_id="message-1",
+            image_id=image_id,
+            variant="thumbnail",
+            request_id="request-tool-image",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert thumbnail.error is None
+        assert thumbnail.media_type == "image/webp"
+        assert thumbnail.width == 320 and thumbnail.height == 160
+
+        missing = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-1",
+            turn_id="message-1",
+            image_id="img-guessed",
+            variant="full",
+            request_id="request-guessed",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert missing.data is None
+        assert missing.error == "未找到这张历史图片"
 
     asyncio.run(go())
 
@@ -914,6 +2148,11 @@ def test_codex_history_append_paints_cached_page_before_revalidation(
             "_schedule_history_refresh",
             lambda sid, **kwargs: refreshes.append((sid, kwargs)),
         )
+        class Unsupported:
+            async def summary_page(self, *_args, **_kwargs):
+                raise CodexHistoryUnsupported("compatibility path")
+
+        machine._codex_history = Unsupported()
 
         history = await machine._build_requested_history(
             "codex-fast", before=None, limit=4, cwd=ctx.cwd,
@@ -1178,6 +2417,656 @@ def test_nonresident_claude_history_uses_authoritative_session_cwd(
         assert [row["prompt"] for row in history.events
                 if row["type"] == "user_msg"] == ["hello"]
         assert calls == ["/authoritative/project"]
+
+    asyncio.run(go())
+
+
+def test_compacted_claude_main_chain_recovers_precompact_history(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "compacted-claude.jsonl"
+    rows = [
+        {
+            "type": "user", "uuid": "user-before", "parentUuid": None,
+            "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:01Z",
+            "message": {"role": "user", "content": "before compact"},
+        },
+        {
+            "type": "assistant", "uuid": "assistant-before",
+            "parentUuid": "user-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:02Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "old answer",
+            }]},
+        },
+        # This abandoned branch is append-adjacent but not part of the active
+        # parent chain. Raw file order must never resurrect it.
+        {
+            "type": "user", "uuid": "abandoned-user",
+            "parentUuid": "user-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:03Z",
+            "message": {"role": "user", "content": "abandoned branch"},
+        },
+        {
+            "type": "system", "subtype": "compact_boundary",
+            "uuid": "compact-boundary", "parentUuid": None,
+            "logicalParentUuid": "assistant-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:04Z",
+            "content": "Conversation compacted",
+        },
+        {
+            "type": "user", "uuid": "compact-summary",
+            "parentUuid": "compact-boundary", "isSidechain": False,
+            "isCompactSummary": True,
+            "timestamp": "2026-08-01T00:00:05Z",
+            "message": {
+                "role": "user",
+                "content": (
+                    "This session is being continued from a previous "
+                    "conversation that ran out of context.\n\nSummary: hidden"
+                ),
+            },
+        },
+        {
+            "type": "user", "uuid": "compact-command",
+            "parentUuid": "compact-summary", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:06Z",
+            "message": {
+                "role": "user",
+                "content": "<command-name>/compact</command-name>",
+            },
+        },
+        {
+            "type": "user", "uuid": "user-after",
+            "parentUuid": "compact-command", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:07Z",
+            "message": {"role": "user", "content": "after compact"},
+        },
+        {
+            "type": "assistant", "uuid": "assistant-after",
+            "parentUuid": "user-after", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:08Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "new answer",
+            }]},
+        },
+        {
+            "type": "assistant", "uuid": "sidechain-tail",
+            "parentUuid": "abandoned-user", "isSidechain": True,
+            "timestamp": "2026-08-01T00:00:09Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "private sidechain",
+            }]},
+        },
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+
+    recovered = transcript_compact_main_chain("claude-compact")
+
+    assert recovered is not None
+    messages, timestamps = recovered
+    assert [message.uuid for message in messages] == [
+        "user-before", "assistant-before", "compact-summary",
+        "compact-command", "user-after", "assistant-after",
+    ]
+    events = translate_history(messages, 10_000, timestamps=timestamps)
+    assert [event.prompt for event in events if isinstance(event, UserMsg)] == [
+        "before compact", "after compact",
+    ]
+    assert timestamps["user-before"] < timestamps["user-after"]
+
+
+def test_compacted_claude_main_chain_rejects_missing_logical_parent(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "broken-compact.jsonl"
+    rows = [
+        {
+            "type": "system", "subtype": "compact_boundary",
+            "uuid": "compact-boundary", "parentUuid": None,
+            "logicalParentUuid": "missing-precompact-parent",
+            "isSidechain": False,
+        },
+        {
+            "type": "user", "uuid": "compact-summary",
+            "parentUuid": "compact-boundary", "isSidechain": False,
+            "message": {
+                "role": "user",
+                "content": (
+                    "This session is being continued from a previous "
+                    "conversation that ran out of context.\n\nSummary: hidden"
+                ),
+            },
+        },
+        {
+            "type": "user", "uuid": "user-after",
+            "parentUuid": "compact-summary", "isSidechain": False,
+            "message": {"role": "user", "content": "after compact"},
+        },
+        {
+            "type": "assistant", "uuid": "assistant-after",
+            "parentUuid": "user-after", "isSidechain": False,
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "new answer",
+            }]},
+        },
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+
+    assert transcript_compact_main_chain("claude-broken-compact") is None
+
+
+def test_compact_index_reuses_snapshot_and_scans_only_appended_rows(
+        monkeypatch, tmp_path):
+    import cc_remote.wrapper.history_store as history_store_module
+
+    transcript = tmp_path / "incremental-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old"}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer"}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": "summary"}},
+    ]
+    transcript.write_bytes(b"".join(
+        (json.dumps(row) + "\n").encode() for row in rows))
+    store = HistoryIndexStore(tmp_path / "incremental-state")
+
+    def visible_user(row):
+        return row.get("type") == "user"
+
+    initial_size = transcript.stat().st_size
+    initial = store.get_claude_compact_index(
+        str(transcript), snapshot_size=initial_size,
+        max_record_bytes=64 * 1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert initial is not None
+    assert initial.leaf == "compact-summary"
+
+    real_loads = history_store_module.json.loads
+    monkeypatch.setattr(
+        history_store_module.json, "loads",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an unchanged page must reuse the compact index")),
+    )
+    assert store.get_claude_compact_index(
+        str(transcript), snapshot_size=initial_size,
+        max_record_bytes=64 * 1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    ) is not None
+
+    parsed = 0
+
+    def count_loads(payload):
+        nonlocal parsed
+        parsed += 1
+        return real_loads(payload)
+
+    monkeypatch.setattr(history_store_module.json, "loads", count_loads)
+    appended = {
+        "type": "user", "uuid": "user-new",
+        "parentUuid": "compact-summary", "isSidechain": False,
+        "message": {"role": "user", "content": "new"},
+    }
+    with transcript.open("ab") as target:
+        target.write((json.dumps(appended) + "\n").encode())
+    updated = store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=64 * 1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert updated is not None
+    assert updated.leaf == "user-new"
+    assert parsed == 1
+
+
+def test_compact_index_never_authorizes_an_incomplete_snapshot(tmp_path):
+    transcript = tmp_path / "growing-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old"}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": []}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": "summary"}},
+    ]
+    transcript.write_bytes(b"".join(
+        (json.dumps(row) + "\n").encode() for row in rows))
+    store = HistoryIndexStore(tmp_path / "growing-state")
+
+    def visible_user(row):
+        return row.get("type") == "user"
+
+    stable_size = transcript.stat().st_size
+    assert store.get_claude_compact_index(
+        str(transcript), snapshot_size=stable_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    ) is not None
+
+    with transcript.open("ab") as target:
+        target.write(b'{"type":"assistant","uuid":"partial')
+    assert store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    ) is None
+    stable = store.get_claude_compact_index(
+        str(transcript), snapshot_size=stable_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert stable is not None
+    assert stable.leaf == "compact-summary"
+
+
+def test_compact_index_rebuilds_after_truncate_and_inode_replacement(tmp_path):
+    transcript = tmp_path / "replaceable-compact.jsonl"
+    store = HistoryIndexStore(tmp_path / "replaceable-state")
+
+    def visible_user(row):
+        return row.get("type") == "user"
+
+    def write_chain(path, suffix, padding=""):
+        rows = [
+            {"type": "user", "uuid": f"user-{suffix}", "parentUuid": None,
+             "isSidechain": False,
+             "message": {"role": "user", "content": padding or suffix}},
+            {"type": "assistant", "uuid": f"answer-{suffix}",
+             "parentUuid": f"user-{suffix}", "isSidechain": False,
+             "message": {"role": "assistant", "content": []}},
+            {"type": "system", "subtype": "compact_boundary",
+             "uuid": f"compact-{suffix}", "parentUuid": None,
+             "logicalParentUuid": f"answer-{suffix}", "isSidechain": False},
+            {"type": "user", "uuid": f"summary-{suffix}",
+             "parentUuid": f"compact-{suffix}", "isSidechain": False,
+             "message": {"role": "user", "content": "summary"}},
+        ]
+        path.write_bytes(b"".join(
+            (json.dumps(row) + "\n").encode() for row in rows))
+
+    write_chain(transcript, "large", "x" * 4096)
+    initial = store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert initial is not None and initial.leaf == "summary-large"
+
+    write_chain(transcript, "small")
+    truncated = store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert truncated is not None and truncated.leaf == "summary-small"
+    assert "summary-large" not in truncated.rows
+
+    replacement = tmp_path / "replacement.jsonl"
+    write_chain(replacement, "inode")
+    os.replace(replacement, transcript)
+    replaced = store.get_claude_compact_index(
+        str(transcript), snapshot_size=transcript.stat().st_size,
+        max_record_bytes=1024 * 1024, max_entries=100,
+        visible_user=visible_user,
+    )
+    assert replaced is not None and replaced.leaf == "summary-inode"
+    assert "summary-small" not in replaced.rows
+
+
+def test_compact_index_loads_large_active_record_and_task_notification(tmp_path):
+    transcript = tmp_path / "large-active-compact.jsonl"
+    notification = (
+        "<task-notification><task-id>task-large</task-id>"
+        "<status>completed</status></task-notification>"
+    )
+    rows = [
+        {"type": "queue-operation", "operation": "enqueue",
+         "content": notification},
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old"}},
+        {"type": "assistant", "uuid": "answer-large",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "x" * (20 * 1024 * 1024)}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-large", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": "summary"}},
+        {"type": "user", "uuid": "task-notification",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "origin": {"kind": "task-notification"},
+         "message": {"role": "user", "content": notification}},
+        {"type": "user", "uuid": "user-new",
+         "parentUuid": "task-notification", "isSidechain": False,
+         "message": {"role": "user", "content": "new"}},
+    ]
+    transcript.write_bytes(b"".join(
+        (json.dumps(row) + "\n").encode() for row in rows))
+    store = HistoryIndexStore(tmp_path / "large-active-state")
+    snapshot = transcript_compact_snapshot(
+        "claude-compact", path=str(transcript), index_store=store,
+        snapshot_size=transcript.stat().st_size,
+        max_record_bytes=64 * 1024 * 1024,
+    )
+    assert snapshot is not None
+    messages, _timestamps, internal_events = snapshot
+    assert "answer-large" in {message.uuid for message in messages}
+    assert len(next(message for message in messages
+                    if message.uuid == "answer-large").message["content"][0][
+                        "text"]) == 20 * 1024 * 1024
+    assert internal_events["task-notification"].kind == "task"
+
+
+def test_compacted_claude_page_loads_only_requested_main_chain_turns(
+        tmp_path):
+    transcript = tmp_path / "paged-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-1", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "question 1"}},
+        {"type": "assistant", "uuid": "answer-1", "parentUuid": "user-1",
+         "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer 1"}]}},
+        {"type": "user", "uuid": "user-2", "parentUuid": "answer-1",
+         "isSidechain": False,
+         "message": {"role": "user", "content": "question 2"}},
+        {"type": "assistant", "uuid": "answer-2", "parentUuid": "user-2",
+         "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer 2"}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-2", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": (
+             "This session is being continued from a previous conversation "
+             "that ran out of context.\n\nSummary: hidden")}},
+        {"type": "user", "uuid": "compact-command",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "message": {"role": "user",
+                     "content": "<command-name>/compact</command-name>"}},
+        {"type": "user", "uuid": "user-3",
+         "parentUuid": "compact-command", "isSidechain": False,
+         "message": {"role": "user", "content": "question 3"}},
+        {"type": "assistant", "uuid": "answer-3", "parentUuid": "user-3",
+         "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer 3"}]}},
+        {"type": "user", "uuid": "user-4", "parentUuid": "answer-3",
+         "isSidechain": False,
+         "message": {"role": "user", "content": "question 4"}},
+        {"type": "assistant", "uuid": "answer-4", "parentUuid": "user-4",
+         "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "answer 4"}]}},
+        {"type": "assistant", "uuid": "abandoned-large",
+         "parentUuid": "answer-1", "isSidechain": True,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "x" * (1024 * 1024)}]}},
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    newest = transcript_compact_history_page(
+        "claude-compact", path=str(transcript), limit=1)
+    assert newest is not None
+    assert [message.uuid for message in newest.messages] == [
+        "user-4", "answer-4",
+    ]
+    assert newest.has_more is True
+    assert newest.oldest_cursor == "user-4"
+
+    older = transcript_compact_history_page(
+        "claude-compact", path=str(transcript), before="user-4", limit=2)
+    assert older is not None
+    assert [message.uuid for message in older.messages] == [
+        "user-2", "answer-2", "compact-summary", "compact-command",
+        "user-3", "answer-3",
+    ]
+    assert older.has_more is True
+    assert older.oldest_cursor == "user-2"
+
+
+def test_compacted_claude_page_uses_only_visible_human_boundaries(tmp_path):
+    transcript = tmp_path / "internal-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old question"}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "old answer"}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": (
+             "This session is being continued from a previous conversation "
+             "that ran out of context.\n\nSummary: hidden")}},
+        {"type": "user", "uuid": "task-notification",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "origin": {"kind": "task-notification"},
+         "message": {"role": "user", "content": (
+             "<task-notification><task-id>task-1</task-id>"
+             "<status>completed</status></task-notification>")}},
+        {"type": "user", "uuid": "blank-user",
+         "parentUuid": "task-notification", "isSidechain": False,
+         "message": {"role": "user", "content": "   "}},
+        {"type": "user", "uuid": "user-new",
+         "parentUuid": "blank-user", "isSidechain": False,
+         "message": {"role": "user", "content": "new question"}},
+        {"type": "assistant", "uuid": "answer-new",
+         "parentUuid": "user-new", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "new answer"}]}},
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    older = transcript_compact_history_page(
+        "claude-compact", path=str(transcript),
+        before="user-new", limit=1,
+    )
+
+    assert older is not None
+    assert older.oldest_cursor == "user-old"
+    assert older.has_more is False
+    assert [message.uuid for message in older.messages] == [
+        "user-old", "answer-old", "compact-summary",
+        "task-notification", "blank-user",
+    ]
+    exhausted = transcript_compact_history_page(
+        "claude-compact", path=str(transcript),
+        before="user-old", limit=1,
+    )
+    assert exhausted is not None
+    assert exhausted.messages == []
+    assert exhausted.oldest_cursor is None
+    assert exhausted.has_more is False
+    assert transcript_compact_history_page(
+        "claude-compact", path=str(transcript),
+        before="not-a-page-cursor", limit=1,
+    ) is None
+
+
+def test_compacted_claude_page_drops_oldest_turns_to_payload_budget(tmp_path):
+    transcript = tmp_path / "budgeted-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old " + "x" * 400}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "old answer " + "y" * 400}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": (
+             "This session is being continued from a previous conversation "
+             "that ran out of context.\n\nSummary: hidden")}},
+        {"type": "user", "uuid": "user-new",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "message": {"role": "user", "content": "new question"}},
+        {"type": "assistant", "uuid": "answer-new",
+         "parentUuid": "user-new", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "new answer"}]}},
+    ]
+    encoded_rows = [
+        (json.dumps(row) + "\n").encode("utf-8") for row in rows
+    ]
+    transcript.write_bytes(b"".join(encoded_rows))
+    newest_payload_bytes = len(encoded_rows[-2]) + len(encoded_rows[-1])
+
+    page = transcript_compact_history_page(
+        "claude-compact", path=str(transcript), limit=2,
+        max_payload_bytes=newest_payload_bytes,
+    )
+
+    assert page is not None
+    assert [message.uuid for message in page.messages] == [
+        "user-new", "answer-new",
+    ]
+    assert page.oldest_cursor == "user-new"
+    assert page.has_more is True
+    assert transcript_compact_history_page(
+        "claude-compact", path=str(transcript), limit=1,
+        max_payload_bytes=newest_payload_bytes - 1,
+    ) is None
+
+
+def test_compacted_claude_history_pages_across_compact_boundary(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "claude-session.jsonl"
+    rows = [
+        {
+            "type": "user", "uuid": "turn-before", "parentUuid": None,
+            "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:01Z",
+            "message": {"role": "user", "content": "before compact"},
+        },
+        {
+            "type": "assistant", "uuid": "answer-before",
+            "parentUuid": "turn-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:02Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "old answer",
+            }]},
+        },
+        {
+            "type": "system", "subtype": "compact_boundary",
+            "uuid": "compact-boundary", "parentUuid": None,
+            "logicalParentUuid": "answer-before", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:03Z",
+        },
+        {
+            "type": "user", "uuid": "compact-summary",
+            "parentUuid": "compact-boundary", "isSidechain": False,
+            "isCompactSummary": True,
+            "timestamp": "2026-08-01T00:00:04Z",
+            "message": {
+                "role": "user",
+                "content": (
+                    "This session is being continued from a previous "
+                    "conversation that ran out of context.\n\nSummary: hidden"
+                ),
+            },
+        },
+        {
+            "type": "user", "uuid": "turn-after",
+            "parentUuid": "compact-summary", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:05Z",
+            "message": {"role": "user", "content": "after compact"},
+        },
+        {
+            "type": "assistant", "uuid": "answer-after",
+            "parentUuid": "turn-after", "isSidechain": False,
+            "timestamp": "2026-08-01T00:00:06Z",
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "new answer",
+            }]},
+        },
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+    # Characterize the SDK limitation: after compact it exposes only the new
+    # ancestry. _build_history must prefer the raw logical-parent chain.
+    monkeypatch.setattr(
+        mm,
+        "get_session_messages",
+        lambda *_args, **_kwargs: [SimpleNamespace(
+            uuid="turn-after", type="user",
+            message={"role": "user", "content": "after compact"},
+            parent_tool_use_id=None,
+        )],
+    )
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "compact-state")
+        newest = await machine._build_history(
+            "claude-compact", limit=1, detail="summary")
+        assert [turn.prompt for turn in newest.turns] == ["after compact"]
+        assert newest.has_more is True
+
+        older = await machine._build_history(
+            "claude-compact", before="turn-after", limit=1,
+            detail="summary",
+        )
+        assert [turn.prompt for turn in older.turns] == ["before compact"]
+        assert older.has_more is False
 
     asyncio.run(go())
 
@@ -1878,6 +3767,93 @@ def test_oversized_transcript_is_rejected_before_full_parse(monkeypatch, tmp_pat
 
     asyncio.run(go())
     assert parsed is False
+
+
+def test_oversized_compacted_claude_transcript_uses_bounded_turn_pages(
+        monkeypatch, tmp_path):
+    source = tmp_path / "huge-compact.jsonl"
+    rows = [
+        {"type": "user", "uuid": "user-old", "parentUuid": None,
+         "isSidechain": False,
+         "message": {"role": "user", "content": "old question"}},
+        {"type": "assistant", "uuid": "answer-old",
+         "parentUuid": "user-old", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "old answer"}]}},
+        {"type": "system", "subtype": "compact_boundary",
+         "uuid": "compact-boundary", "parentUuid": None,
+         "logicalParentUuid": "answer-old", "isSidechain": False},
+        {"type": "user", "uuid": "compact-summary",
+         "parentUuid": "compact-boundary", "isSidechain": False,
+         "message": {"role": "user", "content": (
+             "This session is being continued from a previous conversation "
+             "that ran out of context.\n\nSummary: hidden")}},
+        {"type": "user", "uuid": "user-new",
+         "parentUuid": "compact-summary", "isSidechain": False,
+         "message": {"role": "user", "content": "new question"}},
+        {"type": "assistant", "uuid": "answer-new",
+         "parentUuid": "user-new", "isSidechain": False,
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "new answer"}]}},
+    ]
+    source.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    parsed_by_sdk = False
+
+    def should_not_parse(*_args, **_kwargs):
+        nonlocal parsed_by_sdk
+        parsed_by_sdk = True
+        raise AssertionError("oversized compact history must not use SDK parse")
+
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(source))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(source),
+    )
+    monkeypatch.setattr(mm.os.path, "getsize", lambda _path: 100_000_000)
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+    monkeypatch.setattr(mm, "get_session_messages", should_not_parse)
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine.cfg.history_source_max_bytes = 64 * 1024 * 1024
+        machine._history_index = HistoryIndexStore(tmp_path / "huge-state")
+
+        newest = await machine._build_history(
+            "claude-compact", limit=1, detail="summary")
+        assert [turn.prompt for turn in newest.turns] == ["new question"]
+        assert newest.oldest_id == "user-new"
+        assert newest.has_more is True
+
+        older = await machine._build_history(
+            "claude-compact", before="user-new", limit=1,
+            detail="summary",
+        )
+        assert [turn.prompt for turn in older.turns] == ["old question"]
+        assert older.oldest_id == "user-old"
+        assert older.has_more is False
+
+        exhausted = await machine._build_history(
+            "claude-compact", before="user-old", limit=1,
+            detail="summary",
+        )
+        assert exhausted.turns == []
+        assert exhausted.oldest_id is None
+        assert exhausted.has_more is False
+
+        stale = await machine._build_history(
+            "claude-compact", before="stale-cursor", limit=1,
+            detail="summary",
+        )
+        assert stale.events[0]["type"] == "error"
+        assert "游标已失效" in stale.events[0]["message"]
+        assert "HISTORY_SOURCE_MAX_BYTES" not in stale.events[0]["message"]
+
+    asyncio.run(go())
+    assert parsed_by_sdk is False
 
 
 def test_oversized_codex_rollout_reads_recent_turn_window(monkeypatch, tmp_path):

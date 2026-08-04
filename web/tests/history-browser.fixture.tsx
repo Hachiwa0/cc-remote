@@ -1,24 +1,53 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 
 import "../src/index.css";
 import "../src/App.css";
-import { OMITTED_PROCESS_ITEM_ID, type Turn } from "../src/reducer";
+import {
+  createRuntime,
+  initialState,
+  OMITTED_PROCESS_ITEM_ID,
+  reduce,
+  type AppState,
+  type Block,
+  type Turn,
+} from "../src/reducer";
 import type {
   PermissionProfileInfo,
   QueryFile,
   QueryImg,
+  ServerEvent,
   Space,
   StatusReport,
+  ThreadGoal,
 } from "../src/protocol";
 import { PROTOCOL_VERSION } from "../src/protocol";
 import {
   ChatView,
 } from "../src/components/ChatView";
+import { MessageBlock } from "../src/components/MessageBlock";
+import {
+  historyImageAssetKey,
+  type HistoryImageAsset,
+  type HistoryImageVariant,
+} from "../src/history-image-assets";
+import {
+  InlineImageAssetCache,
+  INLINE_IMAGE_REQUEST_TIMEOUT_MS,
+  type InlineImageAsset,
+} from "../src/inline-image-assets";
 import type { TextSelectionGuard } from "../src/history-selection-guard";
 import { PendingImageAttachments } from "../src/components/PendingImageAttachments";
 import { UsageMeter } from "../src/components/UsageMeter";
 import { NewChatView } from "../src/components/NewChatView";
+import { ArtifactPanel } from "../src/components/ArtifactPanel";
 import {
   QueuedQueryChip,
   QueuedQueryDialog,
@@ -27,6 +56,11 @@ import {
 import { DirPicker } from "../src/components/DirPicker";
 import { HeaderMenu } from "../src/components/HeaderMenu";
 import { UsageActivitySheet } from "../src/components/UsageActivitySheet";
+import { displayHistoryProjection } from "../src/history-recovery";
+import { Composer } from "../src/components/Composer";
+import { ComposerDraftStore } from "../src/composer-drafts";
+import { GoalPanel } from "../src/components/GoalPanel";
+import { ProcessTimeline } from "../src/components/ProcessTimeline";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -152,8 +186,23 @@ function timelineTurn(id: string): Turn {
         item_id: `${id}-plan`,
         processKind: "plan",
         phase: "end",
-        status: "completed",
+        status: "running",
         title: "计划",
+        explanation: "保持历史窗口稳定，并验证交互状态。",
+        plan: [
+          { step: "检查历史锚点", status: "completed" },
+          { step: "验证计划弹层", status: "inProgress" },
+          { step: "运行浏览器回归", status: "pending" },
+        ],
+        done: true,
+      },
+      {
+        kind: "process",
+        item_id: `${id}-command`,
+        processKind: "command",
+        phase: "end",
+        status: "succeeded",
+        title: "检查结果",
         summary: "这个展开状态应跨虚拟卸载保留。",
         done: true,
       },
@@ -467,6 +516,488 @@ function UsageActivityBrowserFixture({
   </main>;
 }
 
+const REDUCER_SESSION_A = "reducer-history-session-a";
+const REDUCER_SESSION_B = "reducer-history-session-b";
+const REDUCER_HISTORY_SCOPE = "fixture-reducer-history-scope";
+const REDUCER_HISTORY_REVISION = "reducer-revision-1";
+const REDUCER_HISTORY_GENERATION = "reducer-generation-1";
+
+function reducerHistoryEvent(
+  sid: string,
+  turns: Turn[],
+  options: {
+    buildSeq: number;
+    hasMore: boolean;
+    oldestId?: string | null;
+    newestId?: string | null;
+    liveSeq?: number;
+  },
+): ServerEvent {
+  return {
+    v: 26,
+    ts: Date.now() / 1000,
+    type: "history",
+    session_id: sid,
+    revision: REDUCER_HISTORY_REVISION,
+    generation: REDUCER_HISTORY_GENERATION,
+    build_seq: options.buildSeq,
+    live_seq: options.liveSeq ?? 0,
+    authoritative: true,
+    detail: "summary",
+    events: [],
+    turns,
+    has_more: options.hasMore,
+    oldest_id: options.oldestId ?? turns[0]?.id ?? null,
+    newest_id: options.newestId ?? turns.at(-1)?.id ?? null,
+    in_progress: false,
+  };
+}
+
+function reducerHistoryInitialState(cachedPagingRace = false): AppState {
+  let state: AppState = {
+    ...initialState,
+    focusedSid: REDUCER_SESSION_A,
+    runtimes: {
+      [REDUCER_SESSION_A]: createRuntime(),
+      [REDUCER_SESSION_B]: createRuntime(),
+    },
+  };
+  if (cachedPagingRace) {
+    return reduce(state, {
+      type: "hydrate_cache",
+      sid: REDUCER_SESSION_A,
+      revision: REDUCER_HISTORY_REVISION,
+      generation: REDUCER_HISTORY_GENERATION,
+      turns: [finalTurn("reducer-cached-current", 3)],
+    });
+  }
+  state = reduce(state, {
+    type: "event",
+    event: reducerHistoryEvent(
+      REDUCER_SESSION_A,
+      Array.from({ length: 20 }, (_, index) =>
+        finalTurn(`reducer-m${index + 21}`, 3)),
+      {
+        buildSeq: 1,
+        hasMore: true,
+        oldestId: "reducer-m21",
+        newestId: "reducer-m40",
+      },
+    ),
+  });
+  state = reduce(state, {
+    type: "event",
+    event: reducerHistoryEvent(
+      REDUCER_SESSION_B,
+      Array.from({ length: 8 }, (_, index) =>
+        finalTurn(`reducer-b${index + 1}`, 3)),
+      {
+        buildSeq: 1,
+        hasMore: false,
+        oldestId: "reducer-b1",
+        newestId: "reducer-b8",
+      },
+    ),
+  });
+  return state;
+}
+
+function ReducerHistoryBrowserFixture() {
+  const cachedPagingRace = useMemo(
+    () => new URLSearchParams(window.location.search).has("cached-paging"),
+    [],
+  );
+  const [state, dispatch] = useReducer(
+    reduce,
+    cachedPagingRace,
+    reducerHistoryInitialState,
+  );
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const [loads, setLoads] = useState(0);
+  const [refreshes, setRefreshes] = useState(0);
+  const sid = state.focusedSid ?? REDUCER_SESSION_A;
+  const runtime = state.runtimes[sid] ?? createRuntime();
+  const historyView = displayHistoryProjection(
+    state.historyRecovery,
+    sid,
+    runtime,
+    state.historyBrowse,
+    state.retainedHistoryBrowse,
+  );
+
+  useEffect(() => {
+    if (!cachedPagingRace) return;
+    const timer = window.setTimeout(() => {
+      dispatch({
+        type: "event",
+        event: reducerHistoryEvent(
+          REDUCER_SESSION_A,
+          [finalTurn("reducer-cached-current", 3)],
+          {
+            buildSeq: 1,
+            hasMore: true,
+            oldestId: "reducer-server-older-cursor",
+            newestId: "reducer-cached-current",
+          },
+        ),
+      });
+    }, 25);
+    return () => window.clearTimeout(timer);
+  }, [cachedPagingRace]);
+
+  const loadOlder = useCallback((): boolean | {
+    accepted: true;
+    viewId: string;
+  } => {
+    const current = stateRef.current;
+    const requestSid = current.focusedSid;
+    const requestRuntime = requestSid
+      ? current.runtimes[requestSid] : undefined;
+    if (!requestSid || requestSid !== REDUCER_SESSION_A
+        || !requestRuntime?.historyRevision
+        || !requestRuntime.hasMore
+        || !requestRuntime.oldestId
+        || current.historyBrowse) return false;
+    const viewId = "reducer-browse-1";
+    dispatch({
+      type: "begin_history_browse",
+      sid: requestSid,
+      scopeKey: REDUCER_HISTORY_SCOPE,
+      revision: requestRuntime.historyRevision,
+      generation: requestRuntime.historyGeneration,
+      viewId,
+      basePageKey: "reducer-latest-page",
+    });
+    setLoads((value) => value + 1);
+    window.setTimeout(() => {
+      const latest = stateRef.current;
+      const browse = latest.historyBrowse;
+      if (!browse || latest.focusedSid !== requestSid) return;
+      dispatch({
+        type: "install_history_browse_page",
+        sid: requestSid,
+        scopeKey: browse.scopeKey,
+        revision: browse.revision,
+        generation: browse.generation,
+        viewId: browse.viewId,
+        windowEpoch: browse.windowEpoch,
+        before: browse.olderCursor!,
+        page: {
+          pageKey: "reducer-older-page",
+          turns: Array.from({ length: 20 }, (_, index) =>
+            finalTurn(`reducer-m${index + 1}`, index === 14 ? 4 : 3)),
+          hasOlder: false,
+          olderCursor: null,
+          newerPageKey: browse.oldestPageKey,
+        },
+      });
+    }, 25);
+    return { accepted: true, viewId };
+  }, []);
+
+  const refreshLiveRuntime = useCallback(() => {
+    const current = stateRef.current;
+    const target = current.runtimes[REDUCER_SESSION_A];
+    const nextBuildSeq = Math.max(2, (target?.historyBuildSeq ?? 0) + 1);
+    dispatch({
+      type: "event",
+      event: reducerHistoryEvent(
+        REDUCER_SESSION_A,
+        Array.from({ length: 16 }, (_, index) =>
+          finalTurn(`reducer-m${index + 25}`, index === 15 ? 5 : 3)),
+        {
+          buildSeq: nextBuildSeq,
+          hasMore: true,
+          oldestId: "reducer-m25",
+          newestId: "reducer-m40",
+          liveSeq: target?.lastLiveSeq ?? 0,
+        },
+      ),
+    });
+    setRefreshes((value) => value + 1);
+  }, []);
+
+  const switchSession = useCallback(() => {
+    const target = stateRef.current.focusedSid === REDUCER_SESSION_A
+      ? REDUCER_SESSION_B : REDUCER_SESSION_A;
+    dispatch({ type: "focus_session", sid: target });
+  }, []);
+
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: "none", minHeight: 24 }}>
+        <output data-testid="load-count">{loads}</output>
+        <output data-testid="reducer-refresh-count">{refreshes}</output>
+        <output data-testid="reducer-focused-sid">{sid}</output>
+        <output data-testid="reducer-turn-count">{historyView.turns.length}</output>
+        <output data-testid="reducer-unique-turn-count">{
+          new Set(historyView.turns.map(
+            (turn) => turn.historyTurnId ?? turn.id,
+          )).size
+        }</output>
+        <button data-testid="switch-session" type="button"
+          onClick={switchSession}>
+          switch
+        </button>
+        <button data-testid="reducer-live-refresh" type="button"
+          onClick={refreshLiveRuntime}>
+          refresh live runtime
+        </button>
+      </div>
+      <ChatView
+        sid={sid}
+        turns={historyView.turns}
+        engine="codex"
+        hasMore={historyView.hasMore}
+        historyRevision={runtime.historyRevision}
+        historyViewRevision={historyView.viewRevision}
+        historyViewId={historyView.viewId}
+        historyScopeKey={historyView.browsing
+          ? state.historyBrowse?.scopeKey : REDUCER_HISTORY_SCOPE}
+        historyWindowEpoch={historyView.windowEpoch}
+        historyCursor={historyView.oldestId}
+        browseMode={historyView.browsing}
+        hasNewer={historyView.hasNewer}
+        onLoadMore={loadOlder}
+        onEdit={() => {}}
+        onGetDiff={() => {}}
+      />
+    </main>
+  );
+}
+
+const CODEX_BURST_SID = "codex-live-burst-session";
+const CODEX_BURST_TICKS = 96;
+
+function codexBurstInitialState(): AppState {
+  return {
+    ...initialState,
+    focusedSid: CODEX_BURST_SID,
+    runtimes: {
+      [CODEX_BURST_SID]: {
+        ...createRuntime(),
+        turns: Array.from(
+          { length: 12 },
+          (_, index) => finalTurn(`burst-history-${index + 1}`, 3),
+        ),
+      },
+    },
+  };
+}
+
+function CodexLiveBurstFixture() {
+  const params = useMemo(() => new URLSearchParams(window.location.search), []);
+  const composerLive = params.has("composer-live");
+  const [state, dispatch] = useReducer(
+    reduce,
+    undefined,
+    codexBurstInitialState,
+  );
+  const runningRef = useRef(false);
+  const timersRef = useRef<number[]>([]);
+  const sequenceRef = useRef(0);
+  const draftStoreRef = useRef(new ComposerDraftStore());
+  const runtime = state.runtimes[CODEX_BURST_SID] ?? createRuntime();
+
+  useEffect(() => () => {
+    for (const timer of timersRef.current) window.clearTimeout(timer);
+    timersRef.current = [];
+  }, []);
+
+  const emit = useCallback((payload: Record<string, unknown>) => {
+    const event = {
+      v: PROTOCOL_VERSION,
+      ts: Date.now() / 1000,
+      sid: CODEX_BURST_SID,
+      seq: ++sequenceRef.current,
+      ...payload,
+    } as ServerEvent;
+    dispatch({ type: "event", event });
+  }, []);
+
+  const startBurst = useCallback(() => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    document.documentElement.dataset.codexBurst = "running";
+    emit({
+      type: "user_msg",
+      msg_id: "burst-turn",
+      prompt: "连续检查工具调用，并保持实时页面稳定。",
+    });
+    emit({
+      type: "assistant_msg_start",
+      message_id: "burst-commentary",
+      channel: "commentary",
+    });
+    emit({
+      type: "process",
+      item_id: "burst-plan",
+      kind: "plan",
+      phase: "start",
+      status: "running",
+      turn_id: "burst-turn-native",
+      title: "计划",
+      summary: "逐项检查实时工具输出。",
+    });
+
+    let activeTool = 0;
+    const finishTool = (toolIndex: number) => {
+      emit({
+        type: "tool_result",
+        tool_use_id: `burst-tool-${toolIndex}`,
+        content: `command ${toolIndex} completed`,
+        is_error: false,
+        status: "succeeded",
+        exit_code: 0,
+        duration_ms: 40,
+      });
+    };
+    for (let tick = 1; tick <= CODEX_BURST_TICKS; tick += 1) {
+      const timer = window.setTimeout(() => {
+        if ((tick - 1) % 4 === 0) {
+          activeTool += 1;
+          emit({
+            type: "tool_use",
+            message_id: "burst-commentary",
+            tool_use_id: `burst-tool-${activeTool}`,
+            tool: activeTool % 3 === 0 ? "mcpToolCall" : "commandExecution",
+            input: activeTool % 3 === 0
+              ? { server: "fixture", tool: "lookup" }
+              : { command: `printf tool-${activeTool}`, cwd: "/repo" },
+            category: activeTool % 3 === 0 ? "mcp" : "command",
+            title: activeTool % 3 === 0
+              ? "查询测试数据"
+              : `运行命令 ${activeTool}`,
+          });
+        }
+        emit({
+          type: "tool_delta",
+          tool_use_id: `burst-tool-${activeTool}`,
+          stream: "output",
+          delta: `tool-${activeTool} output ${tick}\n`,
+        });
+        if (tick % 3 === 0) {
+          emit({
+            type: "delta",
+            message_id: "burst-commentary",
+            channel: "commentary",
+            text: `已完成第 ${tick} 次检查，继续核对下一项工具状态和输出边界。\n\n`,
+          });
+        }
+        if (tick % 4 === 0) finishTool(activeTool);
+        if (tick !== CODEX_BURST_TICKS) return;
+        emit({
+          type: "process",
+          item_id: "burst-plan",
+          kind: "plan",
+          phase: "end",
+          status: "succeeded",
+          turn_id: "burst-turn-native",
+          title: "计划",
+          summary: "实时工具检查完成。",
+        });
+        emit({
+          type: "assistant_msg_end",
+          message_id: "burst-commentary",
+          channel: "commentary",
+        });
+        emit({
+          type: "assistant_msg_start",
+          message_id: "burst-final",
+          channel: "final",
+        });
+        emit({
+          type: "delta",
+          message_id: "burst-final",
+          channel: "final",
+          text: "检查完成，所有工具均已返回。",
+        });
+        emit({
+          type: "assistant_msg_end",
+          message_id: "burst-final",
+          channel: "final",
+        });
+        emit({
+          type: "turn_end",
+          turn_id: "burst-turn-native",
+          result: {
+            subtype: "success",
+            duration_ms: 432,
+            is_error: false,
+          },
+        });
+        runningRef.current = false;
+        document.documentElement.dataset.codexBurst = "done";
+      }, tick * 12);
+      timersRef.current.push(timer);
+    }
+  }, [emit]);
+
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: "none", minHeight: 28 }}>
+        <button data-testid="start-codex-burst" type="button"
+          onClick={startBurst}>
+          start Codex burst
+        </button>
+      </div>
+      <ChatView sid={CODEX_BURST_SID} turns={runtime.turns}
+        engine="codex" historyRevision="codex-burst-r1"
+        historyScopeKey="fixture-codex-burst"
+        onEdit={() => {}} onGetDiff={() => {}} />
+      {composerLive && (
+        <div data-testid="live-composer-shell">
+          <Composer
+            draftKey="fixture-codex-live-composer"
+            draftStore={draftStoreRef.current}
+            state={runtime.state}
+            connState="connected"
+            wrapperOnline
+            sendMode={runtime.sendMode}
+            setSendMode={() => {}}
+            queue={runtime.queue}
+            pendingSend={runtime.pendingSend}
+            failedDeferred={runtime.failedDeferred}
+            unconfirmedQueued={[]}
+            unconfirmedReplaceable={[]}
+            queueCapacity={{}}
+            replaceQueueCapacity={{}}
+            model="gpt-5.6-sol"
+            effort="xhigh"
+            perm="danger-full-access"
+            permissionProfile=":danger-full-access"
+            permissionProfiles={null}
+            webSearch="cached"
+            collaborationMode="default"
+            fast={false}
+            engine="codex"
+            editPrompt={null}
+            onEditConsumed={() => {}}
+            onSendQuery={() => false}
+            onSteerQuery={() => false}
+            onInterrupt={() => {}}
+            onEnqueue={() => false}
+            onSetPending={() => false}
+            onRemoveQueued={() => {}}
+            onInspectQueued={() => {}}
+            onSetModel={() => {}}
+            onSetEffort={() => {}}
+            onSetPerm={() => {}}
+            onSetPermissionProfile={() => {}}
+            onGetPermissionProfiles={() => {}}
+            onSetWebSearch={() => {}}
+            onSetCollaborationMode={() => {}}
+            onClear={() => {}}
+            onContext={() => {}}
+            contextReport={null}
+          />
+        </div>
+      )}
+    </main>
+  );
+}
+
 function HistoryConversationBrowserFixture() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const delayMs = Number(params.get("delay") ?? "30");
@@ -480,6 +1011,8 @@ function HistoryConversationBrowserFixture() {
   const dualImage = params.has("dual-image");
   const compactTools = params.has("compact-tools");
   const detailPaging = params.has("detail-paging");
+  const detailErrorOnce = params.has("detail-error-once");
+  const detailOlderErrorOnce = params.has("detail-older-error-once");
   const detailRetainedPreview = params.has("detail-retained-preview");
   const detailScrollCancel = params.has("detail-scroll-cancel");
   const mermaid = params.has("mermaid");
@@ -499,6 +1032,7 @@ function HistoryConversationBrowserFixture() {
   const recoveryReplacement = params.has("recovery-replace");
   const deepBrowse = params.has("deep-browse");
   const runtimeBrowse = params.has("runtime-browse");
+  const delayedHistoryAvailability = params.has("delayed-history-availability");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
   const emptyFinalPage = params.has("empty-final");
   const initialA = useMemo(() => {
@@ -566,7 +1100,8 @@ function HistoryConversationBrowserFixture() {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
       hasMore: !compactTools && !detailPaging && !invalidMermaid && !large && !mermaid
-        && !mermaidHistory && !math && !timeline && !deepBrowse,
+        && !mermaidHistory && !math && !timeline && !deepBrowse
+        && !delayedHistoryAvailability,
       pagesLoaded: 0,
       hasNewer: deepBrowse,
       newerPagesLoaded: 0,
@@ -597,6 +1132,7 @@ function HistoryConversationBrowserFixture() {
       : []);
   const nextLiveTurnRef = useRef(41);
   const textSelectionGuardRef = useRef<TextSelectionGuard | null>(null);
+  const detailRequestCountRef = useRef(0);
   const updateTextSelectionGuard = useCallback(
     (guard: TextSelectionGuard | null) => {
       textSelectionGuardRef.current = guard;
@@ -652,6 +1188,16 @@ function HistoryConversationBrowserFixture() {
   const [migrationPickerConfirmed, setMigrationPickerConfirmed] =
     useState<string | null>(null);
   const active = sessions[sid];
+  const revealOlderHistory = useCallback(() => {
+    setSessions((current) => ({
+      ...current,
+      [sid]: {
+        ...current[sid],
+        hasMore: true,
+        cursor: current[sid].turns[0]?.id ?? "history-cursor",
+      },
+    }));
+  }, [sid]);
   const growOlderRow = useCallback((targetSid: string) => {
     setSessions((current) => ({
       ...current,
@@ -787,18 +1333,50 @@ function HistoryConversationBrowserFixture() {
     before?: string | null,
   ): boolean => {
     if (!detailPaging || turnId !== "detail-page") return false;
-    const requestSid = sid;
+    detailRequestCountRef.current += 1;
+    document.documentElement.dataset.detailRequests =
+      String(detailRequestCountRef.current);
     const page: DetailFixturePage = before === "detail-older"
       ? "older" : "latest";
+    document.documentElement.dataset.detailLastBefore = before ?? "initial";
+    const failThisRequest = (
+      detailErrorOnce && detailRequestCountRef.current === 1
+    ) || (
+      detailOlderErrorOnce && page === "older"
+      && detailRequestCountRef.current === 2
+    );
+    const requestSid = sid;
     setSessions((current) => ({
       ...current,
       [requestSid]: {
         ...current[requestSid],
         turns: current[requestSid].turns.map((turn) =>
-          turn.id === turnId ? { ...turn, detailLoading: true } : turn),
+          turn.id === turnId ? {
+            ...turn,
+            detailLoading: true,
+            detailError: undefined,
+            detailRetryBefore: before ?? null,
+            detailRetryDirection: before == null ? "initial" : "older",
+          } : turn),
       },
     }));
     window.setTimeout(() => {
+      if (failThisRequest) {
+        setSessions((current) => ({
+          ...current,
+          [requestSid]: {
+            ...current[requestSid],
+            turns: current[requestSid].turns.map((turn) =>
+              turn.id === turnId ? {
+                ...turn,
+                detailLoading: false,
+                detailAutoLoad: false,
+                detailError: "详细过程暂时不可用，请稍后重试",
+              } : turn),
+          },
+        }));
+        return;
+      }
       setSessions((current) => ({
         ...current,
         [requestSid]: {
@@ -822,7 +1400,10 @@ function HistoryConversationBrowserFixture() {
       }, growthDelayMs);
     }, delayMs);
     return true;
-  }, [delayMs, detailPaging, growthDelayMs, sid]);
+  }, [
+    delayMs, detailErrorOnce, detailOlderErrorOnce,
+    detailPaging, growthDelayMs, sid,
+  ]);
 
   useEffect(() => {
     if (!detailPaging) return;
@@ -891,6 +1472,22 @@ function HistoryConversationBrowserFixture() {
                 ? turn.blocks[0].text.split("\n\n").length + 3
                 : 4),
             )
+            : turn),
+        },
+      };
+    });
+  };
+
+  const growBackgroundStreamingTurn = () => {
+    setSessions((current) => {
+      const targetSid = "history-browser-session-a";
+      const session = current[targetSid];
+      return {
+        ...current,
+        [targetSid]: {
+          ...session,
+          turns: session.turns.map((turn) => turn.id === "streaming"
+            ? streamingTurn("streaming", 48)
             : turn),
         },
       };
@@ -996,6 +1593,12 @@ function HistoryConversationBrowserFixture() {
             </output>
           </>
         )}
+        {delayedHistoryAvailability && (
+          <button data-testid="reveal-older-history" type="button"
+            onClick={revealOlderHistory}>
+            reveal older history
+          </button>
+        )}
         {newChatControls && (
           <>
             <button data-testid="switch-newchat-device" type="button"
@@ -1061,10 +1664,16 @@ function HistoryConversationBrowserFixture() {
           </div>
         )}
         {interactiveTimeline && (
-          <button data-testid="grow-stream" type="button"
-            onClick={growStreamingTurn}>
-            grow stream
-          </button>
+          <>
+            <button data-testid="grow-stream" type="button"
+              onClick={growStreamingTurn}>
+              grow stream
+            </button>
+            <button data-testid="grow-background-stream" type="button"
+              onClick={growBackgroundStreamingTurn}>
+              grow background stream
+            </button>
+          </>
         )}
         {manualGrowth && (
           <button data-testid="grow-row" type="button"
@@ -1237,6 +1846,11 @@ function HistoryConversationBrowserFixture() {
 
 export function HistoryBrowserFixture() {
   const params = new URLSearchParams(window.location.search);
+  const planUi = params.get("plan-ui");
+  if (planUi) return <PlanUiFixture mode={planUi} />;
+  if (params.has("goal-ui")) {
+    return <GoalUiFixture status={params.get("goal-status")} />;
+  }
   if (params.has("header-menu")) {
     return <UsageActivityBrowserFixture
       engine={params.get("engine") === "claude" ? "claude" : "codex"}
@@ -1245,4 +1859,349 @@ export function HistoryBrowserFixture() {
   return <HistoryConversationBrowserFixture />;
 }
 
-createRoot(document.getElementById("root")!).render(<HistoryBrowserFixture />);
+function PlanUiFixture({ mode }: { mode: string }) {
+  const [detailRequests, setDetailRequests] = useState(0);
+  const [authoritative, setAuthoritative] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const structuredPlan: Block = {
+    kind: "process",
+    item_id: "plan-ui-structured",
+    processKind: "plan",
+    phase: "end",
+    status: "succeeded",
+    title: "计划",
+    explanation: authoritative ? "权威计划已同步" : "缓存计划",
+    plan: authoritative ? [
+      { step: "权威步骤一", status: "completed" },
+      { step: "权威步骤二", status: "inProgress" },
+      { step: "权威步骤三", status: "pending" },
+    ] : [
+      { step: "缓存步骤一", status: "completed" },
+      { step: "缓存步骤二", status: "inProgress" },
+      { step: "缓存步骤三", status: "pending" },
+    ],
+    done: true,
+  };
+  const unstructuredPlan: Block = {
+    kind: "process",
+    item_id: "plan-ui-unstructured",
+    processKind: "plan",
+    phase: "end",
+    status: "succeeded",
+    title: "旧版计划",
+    detail: "先检查协议，再验证移动端，最后发布。",
+    done: true,
+  };
+  const blocks = mode === "refresh" && refreshing
+    ? []
+    : mode === "unstructured"
+    ? [unstructuredPlan]
+    : mode === "mixed"
+      ? [unstructuredPlan, structuredPlan]
+      : [structuredPlan];
+  const deferred = mode === "refresh" && !authoritative;
+  return (
+    <main style={{ minHeight: "100dvh", padding: 24 }}>
+      <output data-testid="plan-detail-requests">{detailRequests}</output>
+      <output data-testid="plan-refresh-state">{
+        refreshing ? "loading" : authoritative ? "ready" : "cached"
+      }</output>
+      <ProcessTimeline blocks={blocks} done active={false}
+        deferredCount={deferred ? 8 : 0}
+        detailLoading={refreshing}
+        onLoadDetail={deferred ? () => {
+          setDetailRequests((value) => value + 1);
+          setRefreshing(true);
+          window.setTimeout(() => {
+            setAuthoritative(true);
+            setRefreshing(false);
+          }, 150);
+          return true;
+        } : undefined} />
+    </main>
+  );
+}
+
+function GoalUiFixture({ status }: { status: string | null }) {
+  const [open, setOpen] = useState(false);
+  const [revealed, setRevealed] = useState(true);
+  const goalStatus = status === "blocked" ? "blocked" : "active";
+  const goal: ThreadGoal = {
+    threadId: "goal-fixture-thread",
+    objective: "完成 protocol v29 发布并验证所有终端同步升级",
+    status: goalStatus,
+    engine: "codex",
+    tokenBudget: 100_000,
+    tokensUsed: 37_000,
+    timeUsedSeconds: 321,
+  };
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
+      <GoalPanel engine="codex" goal={goal} revealed={revealed} open={open}
+        onOpen={() => setOpen(true)} onClose={() => setOpen(false)}
+        onDismiss={() => setRevealed(false)} onSave={() => setOpen(false)}
+        onClear={() => setRevealed(false)} />
+      <div className="composer"><div className="composer-in" /></div>
+    </main>
+  );
+}
+
+function InlineImageCapacityFixture() {
+  const cacheRef = useRef<InlineImageAssetCache | null>(null);
+  const requestSequenceRef = useRef(0);
+  const occupiedRequestId = "occupied-inline-image";
+  if (cacheRef.current === null) {
+    cacheRef.current = new InlineImageAssetCache(1);
+    if (!cacheRef.current.begin({
+      sid: "other-session",
+      path: "/tmp/occupied.png",
+      previewId: "occupied-preview",
+      requestId: occupiedRequestId,
+    })) {
+      throw new Error("inline image capacity fixture failed to occupy its cache");
+    }
+  }
+  const [assets, setAssets] = useState<Record<string, InlineImageAsset>>({});
+  const [attempts, setAttempts] = useState(0);
+  const [networkLoads, setNetworkLoads] = useState(0);
+  const loadImage = useCallback((path: string): boolean => {
+    setAttempts((value) => value + 1);
+    const sequence = ++requestSequenceRef.current;
+    const accepted = cacheRef.current!.begin({
+      sid: "capacity-session",
+      path,
+      previewId: `capacity-preview-${sequence}`,
+      requestId: `capacity-request-${sequence}`,
+    });
+    if (!accepted) return false;
+    setNetworkLoads((value) => value + 1);
+    setAssets(cacheRef.current!.forSession("capacity-session"));
+    return true;
+  }, []);
+  return (
+    <main>
+      <button type="button" data-testid="release-inline-capacity"
+        onClick={() => cacheRef.current!.cancel(occupiedRequestId)}>
+        release
+      </button>
+      <output data-testid="inline-load-attempts">{attempts}</output>
+      <output data-testid="inline-network-loads">{networkLoads}</output>
+      <MessageBlock text="![capacity image](/tmp/capacity.png)" done
+        imageAssets={assets} onLoadImage={loadImage} />
+    </main>
+  );
+}
+
+function InlineImageEvictionFixture() {
+  const sid = "two-visible-inline-images";
+  const cacheRef = useRef<InlineImageAssetCache | null>(null);
+  const requestSequenceRef = useRef(0);
+  const settleTimersRef = useRef<number[]>([]);
+  if (cacheRef.current === null) {
+    cacheRef.current = new InlineImageAssetCache(1);
+  }
+  const [assets, setAssets] = useState<Record<string, InlineImageAsset>>({});
+  const [attempts, setAttempts] = useState(0);
+  const [networkLoads, setNetworkLoads] = useState(0);
+  const noLoaderAssets = useMemo<Record<string, InlineImageAsset>>(() => ({
+    "/tmp/no-loader-error.png": { status: "error" },
+    "/tmp/no-loader-timeout.png": {
+      status: "loading",
+      startedAt: Date.now() - INLINE_IMAGE_REQUEST_TIMEOUT_MS - 1,
+      requestGeneration: 1,
+    },
+  }), []);
+  useEffect(() => () => {
+    settleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+  }, []);
+  const loadImage = useCallback((path: string): boolean => {
+    setAttempts((value) => value + 1);
+    const cache = cacheRef.current!;
+    if (cache.has(sid, path)) return true;
+    const sequence = ++requestSequenceRef.current;
+    const previewId = `visible-preview-${sequence}`;
+    const requestId = `visible-request-${sequence}`;
+    if (!cache.begin({ sid, path, previewId, requestId })) return false;
+    setNetworkLoads((value) => value + 1);
+    setAssets(cache.forSession(sid));
+    settleTimersRef.current.push(window.setTimeout(() => {
+      if (!cache.accept({
+        v: 26,
+        ts: Date.now() / 1000,
+        type: "preview_asset",
+        sid,
+        path,
+        preview_id: previewId,
+        request_id: requestId,
+        media_type: "image/png",
+        data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlK4h8AAAAASUVORK5CYII=",
+      })) return;
+      setAssets(cache.forSession(sid));
+    }, 20));
+    return true;
+  }, []);
+  return (
+    <main>
+      <output data-testid="visible-inline-attempts">{attempts}</output>
+      <output data-testid="visible-inline-network-loads">{networkLoads}</output>
+      <div data-testid="two-visible-inline-images">
+        <MessageBlock text={[
+          "![A](/tmp/visible-a.png)",
+          "![B](/tmp/visible-b.png)",
+        ].join("\n\n")} done imageAssets={assets} onLoadImage={loadImage} />
+      </div>
+      <div data-testid="inline-no-loader">
+        <MessageBlock text={[
+          "![error](/tmp/no-loader-error.png)",
+          "![timeout](/tmp/no-loader-timeout.png)",
+        ].join("\n\n")} done imageAssets={noLoaderAssets} />
+      </div>
+    </main>
+  );
+}
+
+function HistoryImageFallbackErrorFixture() {
+  const turnId = "history-fallback-error";
+  const imageId = "history-fallback-image";
+  const fallback = useMemo<QueryImg>(() => ({
+    media_type: "image/png",
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlK4h8AAAAASUVORK5CYII=",
+  }), []);
+  const [canonical, setCanonical] = useState(false);
+  const [loads, setLoads] = useState(0);
+  const [lastLoad, setLastLoad] = useState("");
+  useEffect(() => setCanonical(true), []);
+  const turns = useMemo<Turn[]>(() => [{
+    id: turnId,
+    prompt: "fallback 与 canonical 应共用一行图片布局",
+    ...(canonical
+      ? {
+        imageRefs: [{
+          image_id: imageId,
+          media_type: "image/png" as const,
+          width: 1,
+          height: 1,
+          byte_size: 68,
+        }],
+      }
+      : { images: [fallback] }),
+    blocks: [],
+    done: true,
+    ts: 1_000,
+    doneTs: 2_000,
+  }], [canonical, fallback]);
+  const historyImageAssets = useMemo<Record<string, HistoryImageAsset>>(
+    () => ({
+      [historyImageAssetKey(turnId, imageId, "thumbnail")]: {
+        status: "error",
+      },
+    }),
+    [],
+  );
+  const loadHistoryImage = useCallback((
+    requestedTurnId: string,
+    requestedImageId: string,
+    variant: HistoryImageVariant,
+  ): boolean => {
+    setLoads((value) => value + 1);
+    setLastLoad(`${requestedTurnId}|${requestedImageId}|${variant}`);
+    return true;
+  }, []);
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <output data-testid="history-fallback-loads">{loads}</output>
+      <output data-testid="history-fallback-last-load">{lastLoad}</output>
+      <ChatView sid="history-fallback-session" turns={turns}
+        engine="codex" historyRevision="history-fallback-r1"
+        historyImageAssets={historyImageAssets}
+        onLoadHistoryImage={loadHistoryImage}
+        onEdit={() => {}} onGetDiff={() => {}} />
+    </main>
+  );
+}
+
+const UNSAFE_SVG = [
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 40">',
+  "<script>document.documentElement.dataset.bad='yes'</script>",
+  '<foreignObject x="0" y="0" width="20" height="20"><div>bad</div></foreignObject>',
+  '<image href="https://example.com/tracker.png" width="10" height="10"/>',
+  '<rect id="safe-svg-rect" width="120" height="40" fill="#6256b4"/>',
+  "</svg>",
+].join("");
+
+function ArtifactPreviewFixture({ kind }: {
+  kind: "html" | "svg" | "markdown-svg";
+}) {
+  const svgData = window.btoa(UNSAFE_SVG);
+  const artifact = kind === "html"
+    ? {
+      file: "preview.html",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "html" as const,
+      content: `<!doctype html><html><head>
+        <style>#head-style { color: rgb(12, 34, 56); }</style>
+        </head><body><div id="head-style">head css retained</div>
+        <script>
+          document.body.dataset.scriptRan = "yes";
+          try { parent.document.body.dataset.previewEscaped = "yes"; }
+          catch (_) { document.body.dataset.parentBlocked = "yes"; }
+        </script></body></html>`,
+      size: 360,
+      mtimeNs: "1",
+      revision: "a".repeat(64),
+    }
+    : kind === "svg"
+    ? {
+      file: "diagram.svg",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "image" as const,
+      data: svgData,
+      mediaType: "image/svg+xml",
+      size: UNSAFE_SVG.length,
+      mtimeNs: "1",
+    }
+    : {
+      file: "README.md",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "md" as const,
+      content: "![diagram](diagram.svg)",
+      size: 23,
+      mtimeNs: "1",
+      revision: "b".repeat(64),
+      assets: {
+        "diagram.svg": {
+          mediaType: "image/svg+xml",
+          data: svgData,
+        },
+      },
+    };
+  return <main style={{ height: "100dvh" }}>
+    <ArtifactPanel artifact={artifact} active="diff" hasBtw={false}
+      onTab={() => {}} onClose={() => {}} />
+  </main>;
+}
+
+const rootParams = new URLSearchParams(window.location.search);
+createRoot(document.getElementById("root")!).render(
+  rootParams.has("artifact-html")
+    ? <ArtifactPreviewFixture kind="html" />
+    : rootParams.has("artifact-svg")
+    ? <ArtifactPreviewFixture kind="svg" />
+    : rootParams.has("artifact-markdown-svg")
+    ? <ArtifactPreviewFixture kind="markdown-svg" />
+    : rootParams.has("inline-image-capacity")
+    ? <InlineImageCapacityFixture />
+    : rootParams.has("inline-image-eviction")
+    ? <InlineImageEvictionFixture />
+    : rootParams.has("history-image-fallback-error")
+    ? <HistoryImageFallbackErrorFixture />
+    : rootParams.has("reducer-pipeline")
+    ? <ReducerHistoryBrowserFixture />
+    : rootParams.has("codex-live-burst")
+    ? <CodexLiveBurstFixture />
+    : <HistoryBrowserFixture />,
+);

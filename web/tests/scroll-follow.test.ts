@@ -200,6 +200,13 @@ assert.equal(historyAnchor.current()?.phase, "pending");
 historyAnchor.observeUserScroll(true);
 assert.deepEqual(historyAnchor.current()?.anchorTurnId, "turn-10",
   "rubber-banding at the history edge keeps the frozen page boundary");
+assert.equal(historyAnchor.rebasePending(firstAnchorGeneration, {
+  anchorTurnId: "turn-11",
+  oldestTurnId: "turn-10",
+  anchorOffset: 24,
+}), true);
+assert.deepEqual(historyAnchor.current()?.anchorTurnId, "turn-11",
+  "verified movement may rebase a response that is staged before mount");
 assert.equal(historyAnchor.markApplied(firstAnchorGeneration), true);
 assert.equal(historyAnchor.current()?.phase, "applied");
 assert.equal(historyAnchor.rebase(firstAnchorGeneration, {
@@ -519,7 +526,7 @@ assert.match(chatViewSource, /updateTurnKeySnapshot/);
 assert.doesNotMatch(chatViewSource, /turnsRef\.current/,
   "old and new virtualizer options must not share a mutable turn-key source");
 assert.match(chatViewSource, /shouldAdjustScrollPositionOnItemSizeChange/,
-  "late virtual-row measurements must preserve the keyed history boundary");
+  "virtual-core resize correction must be explicitly coordinated");
 assert.doesNotMatch(chatViewSource, /HISTORY_ANCHOR_SETTLE_MS/,
   "history anchoring must not expire on a guessed layout timer");
 assert.doesNotMatch(css, /content-visibility:auto/,
@@ -546,7 +553,14 @@ const threadShellRule = css.match(/\.thread-shell\{[^}]+\}/)?.[0] ?? "";
 assert.match(threadShellRule, /position:relative/);
 const threadRule = css.match(/\.thread\{[^}]+\}/)?.[0] ?? "";
 assert.match(threadRule, /overflow-anchor:none/,
-  "JS owns prepend anchoring; browser anchoring must be disabled");
+  "the keyed layout transaction must be the only history scroll owner");
+assert.match(threadRule, /padding:0/,
+  "the keyed offset coordinate system requires a padding-free scroll container");
+assert.match(chatViewSource, /el\.scrollTop = target/,
+  "WebKit history prepends must restore their keyed row before paint");
+const threadInRule = css.match(/\.thread-in\{[^}]+\}/)?.[0] ?? "";
+assert.match(threadInRule, /padding:0 16px/,
+  "the visual thread gutter must live inside the in-flow content");
 const scrollBottomRule = css.match(/\.scroll-bottom-wrap\{[^}]+\}/)?.[0] ?? "";
 assert.match(scrollBottomRule, /position:absolute/);
 assert.doesNotMatch(scrollBottomRule, /position:sticky/);

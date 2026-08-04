@@ -130,6 +130,41 @@ class ClaudeControlStore:
             self._sessions = updated
         return controls
 
+    def inherit_if_absent(
+        self,
+        session_id: str,
+        *,
+        model: str | None,
+        effort: str | None,
+        permission_mode: str | None,
+    ) -> ClaudeControls:
+        """Seed a new fork once without overwriting later child choices."""
+        session_id = _canonical_session_id(session_id)
+        controls = ClaudeControls(
+            model=valid_claude_model(model),
+            effort=valid_claude_effort(effort),
+            permission_mode=valid_claude_permission(permission_mode),
+        )
+        payload = controls.as_dict()
+        with self._lock:
+            existing = self._sessions.get(session_id)
+            if existing is not None:
+                return ClaudeControls(
+                    model=valid_claude_model(existing.get("model")),
+                    effort=valid_claude_effort(existing.get("effort")),
+                    permission_mode=valid_claude_permission(
+                        existing.get("permission_mode")),
+                )
+            if not payload:
+                return controls
+            updated = dict(self._sessions)
+            updated[session_id] = payload
+            while len(updated) > _MAX_ENTRIES:
+                updated.pop(next(iter(updated)))
+            self._persist(updated)
+            self._sessions = updated
+        return controls
+
     def _load(self) -> dict[str, dict[str, str]]:
         try:
             info = self.path.lstat()

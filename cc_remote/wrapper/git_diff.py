@@ -7,15 +7,137 @@ import signal
 import stat
 from collections.abc import Awaitable, Callable
 
+from cc_remote.wrapper.preview_capabilities import PreviewCapability
+
 CommandRunner = Callable[[tuple[str, ...], int], Awaitable[str]]
 _TRUNCATED_MARKER = "[diff truncated at transport safety limit]"
+
+
+def _read_external_snapshot(
+    path: str,
+    capability: PreviewCapability,
+    source_max_bytes: int,
+) -> tuple[bytes, os.stat_result] | None:
+    """Open and read the exact capability-bound inode without a path re-open."""
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("external diff target must be a regular file")
+        if not capability.matches(file_stat):
+            raise ValueError("external diff capability no longer matches")
+        if file_stat.st_size > source_max_bytes:
+            raise ValueError(
+                "external diff target exceeds the source size limit")
+
+        chunks: list[bytes] = []
+        remaining = source_max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > source_max_bytes:
+            raise ValueError(
+                "external diff target exceeds the source size limit")
+        return data, file_stat
+    finally:
+        os.close(descriptor)
+
+
+def _diff_path_label(path: str) -> str:
+    """Keep generated headers single-line while retaining a useful file label."""
+    return (
+        path.replace(os.sep, "/")
+        .replace("\\", "\\\\")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+    )
+
+
+def _external_snapshot_diff(
+    path: str,
+    data: bytes,
+    file_stat: os.stat_result,
+    max_bytes: int,
+) -> str:
+    """Render a bounded Git-compatible new-file diff from immutable bytes."""
+    if not data:
+        return ""
+    label = _diff_path_label(path)
+    mode = "100755" if file_stat.st_mode & 0o111 else "100644"
+    prefix = (
+        f"diff --git a/{label} b/{label}\n"
+        f"new file mode {mode}\n"
+        "--- /dev/null\n"
+        f"+++ b/{label}\n"
+    )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = ""
+    binary = b"\0" in data or not text
+    if binary:
+        rendered = prefix + f"Binary files /dev/null and b/{label} differ\n"
+        payload = rendered.encode("utf-8")
+        if len(payload) <= max_bytes:
+            return rendered
+        return (
+            payload[:max_bytes].decode("utf-8", errors="replace")
+            + f"\n\n{_TRUNCATED_MARKER}\n"
+        )
+
+    line_count = data.count(b"\n") + (0 if data.endswith(b"\n") else 1)
+    output = bytearray()
+    truncated = False
+
+    def append(value: str) -> bool:
+        nonlocal truncated
+        encoded = value.encode("utf-8")
+        remaining = max_bytes - len(output)
+        if len(encoded) <= remaining:
+            output.extend(encoded)
+            return True
+        if remaining > 0:
+            output.extend(encoded[:remaining])
+        truncated = True
+        return False
+
+    append(prefix)
+    if not truncated:
+        append(f"@@ -0,0 +1,{line_count} @@\n")
+    position = 0
+    while not truncated and position < len(text):
+        newline = text.find("\n", position)
+        if newline < 0:
+            append(f"+{text[position:]}\n")
+            if not truncated:
+                append("\\ No newline at end of file\n")
+            break
+        append(f"+{text[position:newline + 1]}")
+        position = newline + 1
+
+    rendered = bytes(output).decode("utf-8", errors="replace")
+    if truncated:
+        rendered += f"\n\n{_TRUNCATED_MARKER}\n"
+    return rendered
 
 
 async def read_git_diff(
     cwd: str,
     file: str,
     *,
-    allowed_external_paths: frozenset[str],
+    allowed_external_paths: dict[str, PreviewCapability],
     max_bytes: int,
     source_max_bytes: int,
     run_command: CommandRunner,
@@ -103,21 +225,16 @@ async def read_git_diff(
         below_root = False
     if not below_root:
         resolved = os.path.realpath(contained)
-        if resolved not in allowed_external_paths:
+        capability = allowed_external_paths.get(resolved)
+        if capability is None:
             raise ValueError("diff path is outside the session repository")
-        try:
-            file_stat = os.lstat(resolved)
-        except OSError:
+        snapshot = _read_external_snapshot(
+            resolved, capability, source_max_bytes)
+        if snapshot is None:
             return ""
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError("external diff target must be a regular file")
-        if file_stat.st_size > source_max_bytes:
-            raise ValueError(
-                "external diff target exceeds the source size limit")
-        return await run_command(
-            ("git", "-C", root, "diff", "--no-ext-diff", "--no-textconv",
-             "--no-index", "--", "/dev/null", resolved),
-            max_bytes,
+        data, file_stat = snapshot
+        return _external_snapshot_diff(
+            resolved, data, file_stat, max_bytes,
         )
     relative_file = os.path.relpath(contained, root)
 

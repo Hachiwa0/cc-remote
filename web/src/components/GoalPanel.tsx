@@ -46,28 +46,29 @@ export function GoalPanel(p: Props) {
   const used = goal?.tokensUsed ?? 0;
   const total = goal?.tokenBudget ?? null;
   const progress = total ? Math.min(100, used / total * 100) : null;
+  const visualProgress = goal?.status === "complete" ? 100 : progress;
   const engineName = p.engine === "codex" ? "Codex" : "Claude";
 
   return <>
-    {p.revealed && goal && <div className={`goal-card goal-${goal.status}`}>
-      <button className="goal-card-main" onClick={p.onOpen} aria-label="查看 Goal">
-        <span className="goal-symbol"><Icon name="verify" size={16} /></span>
-        <span className="goal-card-copy">
-          <span className="goal-card-kicker">
-            <span>{engineName} Goal</span>
-            <span className={`goal-status goal-status-${goal.status}`}>{statusName[goal.status]}</span>
-          </span>
-          <span className="goal-card-objective">{goal.objective}</span>
-          <span className="goal-card-meta">
-            {duration(goal.timeUsedSeconds)} · {tokens(goal.tokensUsed)} tokens
-            {goal.iterations != null && ` · ${goal.iterations} 轮检查`}
-          </span>
+    {p.revealed && goal && <div className={`goal-chip-wrap goal-${goal.status}`}>
+      <button className="goal-chip" onClick={p.onOpen}
+        aria-label={`查看 Goal，${statusName[goal.status]}`}>
+        {visualProgress != null
+          ? <span className={`goal-chip-ring goal-chip-ring-${goal.status}`}
+              aria-hidden="true"
+              style={{ "--goal-progress": `${visualProgress * 3.6}deg` } as CSSProperties}>
+              <Icon name={goal.status === "complete" ? "verify" : "plan"} size={11} />
+            </span>
+          : <span className={`goal-chip-dot goal-chip-dot-${goal.status}`} aria-hidden="true" />}
+        <span className="goal-chip-label">Goal</span>
+        <span className="goal-chip-objective">{goal.objective}</span>
+        <span className={`goal-chip-status goal-chip-status-${goal.status}`}>
+          {statusName[goal.status]}
         </span>
-        {progress != null && <span className="goal-ring" style={{ "--goal-progress": `${progress * 3.6}deg` } as CSSProperties}>
-          <span>{Math.round(progress)}%</span>
-        </span>}
       </button>
-      <button className="goal-card-dismiss" onClick={p.onDismiss} aria-label="隐藏 Goal"><Icon name="close" size={14} /></button>
+      <button className="goal-chip-dismiss" onClick={p.onDismiss} aria-label="隐藏 Goal">
+        <Icon name="close" size={12} />
+      </button>
     </div>}
 
     {p.open && <>

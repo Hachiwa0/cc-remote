@@ -218,12 +218,42 @@ try {
   const hiddenDiagnostic = "provider crash at /private/token; see wrapper logs";
   assert.equal(presentTurnProblem({ code: "cc_crash", message: hiddenDiagnostic }),
     "本次回复未完成，请重试。");
+  for (const safeMessage of [
+    "网络异常，连接失败，请重新尝试。",
+    "网络连接异常，请检查网络后重试。",
+    "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。",
+    "请求过于频繁或当前额度受限，请稍后重试。",
+    "请求超时，请重新尝试。",
+    "Codex 上游服务暂时不可用，请稍后重试。",
+  ]) {
+    assert.equal(
+      presentTurnProblem({ code: "cc_crash", message: safeMessage }),
+      safeMessage,
+    );
+  }
   assert.equal(presentCommandProblem({ code: "internal", message: hiddenDiagnostic }),
     "操作未完成，请稍后重试。");
   assert.doesNotMatch(
     presentCommandProblem({ code: "protocol", message: hiddenDiagnostic }),
     /crash|wrapper|private|protocol/i);
   assert.equal(presentHistoricalTurnProblem("error"), "该轮未正常结束");
+  assert.equal(
+    presentHistoricalTurnProblem(
+      "provider crash at /private/token; Authorization: Bearer secret",
+    ),
+    "该轮未正常结束",
+  );
+  assert.equal(
+    presentHistoricalTurnProblem("网络连接异常，请检查网络后重试。"),
+    "网络连接异常，请检查网络后重试。",
+  );
+  assert.equal(
+    presentHistoricalTurnProblem(
+      "Codex 登录已失效或当前账号无权限，请重新登录后重试。",
+    ),
+    "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。",
+    "a cached pre-upgrade auth failure is migrated to provider-neutral copy",
+  );
 
   const markup = renderToStaticMarkup(createElement(NoticeStack, {
     notices: state.runtimes[sid].notices,

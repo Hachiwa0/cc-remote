@@ -1109,7 +1109,8 @@ def test_corrupt_private_btw_state_refuses_fail_open_startup():
         machine.__class__(machine.cfg, transport)
 
 
-def test_btw_capture_persistence_failure_terminates_and_deletes_fork(monkeypatch):
+def test_btw_capture_persistence_failure_terminates_and_deletes_fork(
+        tmp_path, monkeypatch):
     class Sdk:
         def __init__(self):
             self.disconnected = False
@@ -1125,6 +1126,17 @@ def test_btw_capture_persistence_failure_terminates_and_deletes_fork(monkeypatch
         fork.owner_client_id = "owner-client"
         fork.sdk = Sdk()
         machine.sessions[fork.key] = fork
+        artifact = tmp_path / "outside.md"
+        artifact.write_text("# private", encoding="utf-8")
+        machine._preview_capability_store.grant_path(
+            "claude",
+            "code",
+            fork.key,
+            str(artifact),
+            mode="read",
+            source="user_approved",
+            persist=False,
+        )
 
         monkeypatch.setattr(
             machine, "_persist_private_btw_sessions",
@@ -1145,6 +1157,9 @@ def test_btw_capture_persistence_failure_terminates_and_deletes_fork(monkeypatch
         assert fork.btw_real_id == real_id
         assert real_id not in machine._private_btw_sessions
         assert deleted == [(real_id, fork.cwd)]
+        assert machine._preview_capability_store.snapshot(
+            "claude", "code", fork.key,
+        ) == {}
 
     asyncio.run(run())
 

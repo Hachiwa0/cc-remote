@@ -7,15 +7,25 @@ marker is still forwarded so the remote timeline does not silently omit the step
 """
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import json
 import os
 import re
 import shlex
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import islice
 
+from cc_remote.attachments import (
+    ALLOWED_IMAGE_TYPES,
+    MAX_IMAGE_DIMENSION,
+    MAX_IMAGE_PIXELS,
+    MAX_SINGLE_ATTACHMENT_BYTES,
+    decode_attachment,
+    image_dimensions,
+)
 from cc_remote.protocol import (
     AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult, AssistantMsgEnd,
     ProcessEvent, TurnPlan, TurnDiff, TurnEnd, TurnResult, UserMsg, Error,
@@ -64,6 +74,7 @@ _EMPTY_COMPLETED_MESSAGE = (
 _MAX_DELTA_STREAMS = 2048
 _MAX_DELTA_EVENTS_PER_STREAM = 1024
 _MAX_FINISHED_DELTA_ITEMS = 4096
+_LIVE_DELTA_FLUSH_SECONDS = 0.05
 _MAX_LIVE_ITEMS = 4096
 _LIVE_ITEMS_OMITTED_ID = "cc-remote-live-items-omitted"
 _DELTA_TRUNCATION_NOTICE = "\n…（后续输出已截断）"
@@ -77,6 +88,24 @@ _MAX_HISTORY_REVERSE_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_FORWARD_BYTES = 64 * 1024 * 1024
 _MAX_PENDING_HISTORY_COMPACTIONS = 32
+_MAX_HISTORY_IMAGE_VIEWS_PER_SEGMENT = 128
+_MAX_HISTORY_IMAGE_BYTES_PER_SEGMENT = 64 * 1024 * 1024
+_HISTORY_TURN_SEARCH_CHUNK_BYTES = 4 * 1024 * 1024
+_MAX_HISTORY_TURN_MATCHES = 16 * 1024
+
+
+@dataclass(frozen=True)
+class CodexHistoryImageView:
+    """One source-bound image-view activity recovered from a rollout turn."""
+
+    call_id: str
+    event: ProcessEvent
+    previous_item_id: str | None = None
+    next_item_id: str | None = None
+    media_type: str | None = None
+    width: int | None = None
+    height: int | None = None
+    data: bytes | None = None
 
 
 def _bounded_jsonl_records(file, *, end_offset: int | None = None):
@@ -435,21 +464,27 @@ def codex_history_boundary_user(
     boundary_offset: int,
     cursor: str,
     *,
+    user_index: int = 0,
     max_scan_bytes: int = _MAX_HISTORY_BOUNDARY_FORWARD_BYTES,
 ) -> UserMsg | None:
-    """Recover the user row omitted from a bounded single-turn tail.
+    """Recover one user row omitted from a bounded single-turn tail.
 
     A single Codex turn can grow far beyond the history byte window, especially
     after one or more ``compacted`` records.  Reading only its recent tail keeps
     memory bounded but otherwise leaves the browser with tool/assistant events
     that have no prompt.  Scan forward from the already-discovered turn boundary
-    only until the first visible user record and reuse the paging cursor as its
-    stable id.  Oversized JSONL records are skipped by ``_bounded_jsonl_records``
-    rather than materialized.
+    only until the requested visible user record and reuse the paging cursor as
+    its stable id.  ``user_index`` also lets the official-history adapter recover
+    images from later steer messages without translating the whole rollout.
+    Oversized JSONL records are skipped by ``_bounded_jsonl_records`` rather than
+    materialized.
     """
     if (not isinstance(boundary_offset, int) or boundary_offset < 0
             or not isinstance(cursor, str)
-            or not _SAFE_WIRE_ID.fullmatch(cursor)):
+            or not _SAFE_WIRE_ID.fullmatch(cursor)
+            or isinstance(user_index, bool)
+            or not isinstance(user_index, int)
+            or user_index < 0):
         return None
     try:
         size = os.path.getsize(path)
@@ -496,7 +531,12 @@ def codex_history_boundary_user(
                 continue
             prompt = visible_codex_user_message(payload.get("message"))
             if not prompt:
-                return None
+                pending_images = []
+                continue
+            if user_index:
+                user_index -= 1
+                pending_images = []
+                continue
             event = UserMsg(msg_id=cursor, prompt=prompt)
             if pending_images:
                 event.images = pending_images
@@ -508,6 +548,39 @@ def codex_history_boundary_user(
                 except (TypeError, ValueError):
                     pass
             return event
+    return None
+
+
+def codex_history_turn_user(
+    path: str,
+    turn_id: str,
+    cursor: str,
+    user_index: int = 0,
+) -> UserMsg | None:
+    """Recover one visible user row for one native Codex turn.
+
+    Official summary items retain expired ``localImage`` paths rather than the
+    inline image bytes persisted in the rollout. Locate only the requested
+    native turn boundary, then reuse the bounded forward reader above so image
+    thumbnails remain available without translating the whole rollout.
+    """
+    if (
+        not isinstance(turn_id, str)
+        or not _SAFE_WIRE_ID.fullmatch(turn_id)
+        or not isinstance(cursor, str)
+        or not _SAFE_WIRE_ID.fullmatch(cursor)
+        or isinstance(user_index, bool)
+        or not isinstance(user_index, int)
+        or user_index < 0
+    ):
+        return None
+    try:
+        for offset, boundary in _history_boundaries(path, use_turns=True):
+            if boundary == turn_id:
+                return codex_history_boundary_user(
+                    path, offset, cursor, user_index=user_index)
+    except OSError:
+        return None
     return None
 
 
@@ -560,6 +633,163 @@ def codex_native_rollback_turns(path: str, logical_turns: int) -> int:
     return native_turns if native_turns > 0 else logical_turns
 
 
+_CODEX_APPEND_NOTIFICATION_FIELDS = {
+    "item/agentMessage/delta": "delta",
+    "item/reasoning/summaryTextDelta": "delta",
+    "item/plan/delta": "delta",
+    "item/commandExecution/outputDelta": "delta",
+    "item/fileChange/outputDelta": "delta",
+    "item/mcpToolCall/progress": "message",
+}
+_NO_CODEX_NOTIFICATION = object()
+
+
+def _codex_append_notification_key(message: object) -> tuple | None:
+    """Return the exact append-only field eligible for live burst merging."""
+    if not isinstance(message, dict):
+        return None
+    method = message.get("method")
+    field = _CODEX_APPEND_NOTIFICATION_FIELDS.get(method)
+    params = message.get("params")
+    if field is None or not isinstance(params, dict):
+        return None
+    item_id = params.get("itemId")
+    value = params.get(field)
+    if not isinstance(item_id, str) or not item_id or not isinstance(value, str):
+        return None
+    # Preserve turn/item/stream/index boundaries even if a future app-server
+    # interleaves two append channels under the same item id.
+    return (
+        method,
+        params.get("threadId"),
+        params.get("turnId"),
+        item_id,
+        params.get("stream"),
+        params.get("summaryIndex"),
+        params.get("contentIndex"),
+    )
+
+
+def _merge_codex_append_notifications(
+    previous: dict, incoming: dict,
+) -> dict | None:
+    key = _codex_append_notification_key(previous)
+    if key is None or key != _codex_append_notification_key(incoming):
+        return None
+    method = previous.get("method")
+    field = _CODEX_APPEND_NOTIFICATION_FIELDS.get(method)
+    previous_params = previous.get("params")
+    incoming_params = incoming.get("params")
+    if (field is None or not isinstance(previous_params, dict)
+            or not isinstance(incoming_params, dict)):
+        return None
+    previous_text = previous_params.get(field)
+    incoming_text = incoming_params.get(field)
+    if not isinstance(previous_text, str) or not isinstance(incoming_text, str):
+        return None
+    merged = dict(previous)
+    merged["params"] = {
+        **previous_params,
+        field: previous_text + incoming_text,
+    }
+    return merged
+
+
+async def coalesce_codex_live_notifications(
+    source, *, flush_seconds: float = _LIVE_DELTA_FLUSH_SECONDS,
+):
+    """Bound live append bursts before translation and replay seq allocation.
+
+    The first append for a field is immediate. A following run for that exact
+    field is merged only until the first append's deadline, so a quiet provider
+    cannot strand the final chunk waiting for another notification. Structural,
+    unknown, turn, item and stream boundaries remain strict ordering barriers.
+    """
+    iterator = source.__aiter__()
+    loop = asyncio.get_running_loop()
+    next_task: asyncio.Task | None = None
+    buffered: object = _NO_CODEX_NOTIFICATION
+    source_done = False
+    pending_error: Exception | None = None
+    last_key: tuple | None = None
+    last_emitted_at = float("-inf")
+
+    async def take_next():
+        nonlocal next_task
+        if next_task is None:
+            next_task = asyncio.create_task(anext(iterator))
+        task = next_task
+        try:
+            return await task
+        finally:
+            if task.done():
+                next_task = None
+
+    try:
+        while not source_done or buffered is not _NO_CODEX_NOTIFICATION:
+            if buffered is not _NO_CODEX_NOTIFICATION:
+                message = buffered
+                buffered = _NO_CODEX_NOTIFICATION
+            else:
+                try:
+                    message = await take_next()
+                except StopAsyncIteration:
+                    break
+
+            key = _codex_append_notification_key(message)
+            now = loop.time()
+            if (flush_seconds <= 0 or key is None or key != last_key
+                    or now - last_emitted_at >= flush_seconds):
+                last_key = key
+                last_emitted_at = now
+                yield message
+                continue
+
+            merged = message
+            deadline = last_emitted_at + flush_seconds
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                if next_task is None:
+                    next_task = asyncio.create_task(anext(iterator))
+                done, _ = await asyncio.wait(
+                    {next_task}, timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+                task = next_task
+                next_task = None
+                try:
+                    incoming = task.result()
+                except StopAsyncIteration:
+                    source_done = True
+                    break
+                except Exception as exc:
+                    # The provider may fail after delivering part of an
+                    # append burst.  Flush those confirmed bytes before the
+                    # original stream error reaches the turn lifecycle.
+                    source_done = True
+                    pending_error = exc
+                    break
+                combined = _merge_codex_append_notifications(merged, incoming)
+                if combined is None:
+                    buffered = incoming
+                    break
+                merged = combined
+
+            last_key = key
+            last_emitted_at = loop.time()
+            yield merged
+            if pending_error is not None:
+                raise pending_error
+    finally:
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+            await asyncio.gather(next_task, return_exceptions=True)
+
+
 class CodexStreamTranslator:
     def __init__(self, tool_result_max: int):
         self.tool_result_max = tool_result_max
@@ -570,6 +800,7 @@ class CodexStreamTranslator:
         self._tool_message_ids: dict[str, str] = {}
         self._reasoning_started: set[str] = set()
         self._file_diffs: dict[str, str] = {}
+        self._file_diff_stream_aligned: set[str] = set()
         self._open_msg: str | None = None
         self._open_channel = "unknown"
         self._visible_output = False
@@ -710,6 +941,7 @@ class CodexStreamTranslator:
                 finished_id = _live_id(item.get("id"), fallback)
                 self._finish_delta_item(finished_id)
                 self._file_diffs.pop(finished_id, None)
+                self._file_diff_stream_aligned.discard(finished_id)
 
         elif method == "item/reasoning/summaryPartAdded":
             iid = _live_id(p.get("itemId"), "reasoning")
@@ -828,12 +1060,20 @@ class CodexStreamTranslator:
                     "changes": p.get("changes"),
                 }))
             latest, _ = bounded_text(_changes_diff(p.get("changes")), 2 * 1024 * 1024)
+            seen_snapshot = iid in self._file_diffs
             previous = self._file_diffs.get(iid, "")
             self._file_diffs[iid] = latest
             # patchUpdated is a snapshot. ToolDelta is append-only, so forward
-            # only the genuinely-new suffix; non-monotonic rewrites are still
-            # delivered authoritatively by item/completed.diff.
-            if latest and latest.startswith(previous):
+            # only a genuinely-new suffix while the snapshots remain aligned.
+            # Once the server rewrites an earlier hunk, no future suffix can be
+            # appended safely to the browser's old projection; completion still
+            # replaces it authoritatively through ToolResult.diff.
+            if not seen_snapshot:
+                self._file_diff_stream_aligned.add(iid)
+            elif not latest.startswith(previous):
+                self._file_diff_stream_aligned.discard(iid)
+            if (latest and iid in self._file_diff_stream_aligned
+                    and latest.startswith(previous)):
                 delta = self._bounded_live_delta(
                     iid, "diff", latest[len(previous):], 512 * 1024)
                 if delta:
@@ -1052,7 +1292,7 @@ class CodexStreamTranslator:
                 self._terminal_error = True
                 out.append(Error(
                     code=ERR_CC_CRASH,
-                    message="Codex 本次回复未完成，请重试。",
+                    message=_provider_failure_message(err),
                 ))
 
         elif method == "turn/completed":
@@ -1064,9 +1304,14 @@ class CodexStreamTranslator:
             # copy (the error notification above may not fire for every mode).
             if st == "failed":
                 if not self._terminal_error:
+                    raw_error = (
+                        turn.get("error")
+                        if isinstance(turn.get("error"), dict)
+                        else {}
+                    )
                     out.append(Error(
                         code=ERR_CC_CRASH,
-                        message="Codex 本次回复未完成，请重试。",
+                        message=_provider_failure_message(raw_error),
                     ))
                     self._terminal_error = True
             if st == "completed" and not self._terminal_error:
@@ -1363,11 +1608,16 @@ class CodexStreamTranslator:
                 turn_id=turn_id, title="压缩上下文")
         if item_type == "imageView":
             path, _ = bounded_text(item.get("path"), 16 * 1024)
+            image_status = _process_status(item.get("status"))
+            if completed and image_status in {"unknown", "running", "pending"}:
+                image_status = "succeeded"
             return ProcessEvent(
-                item_id=iid, kind="server_tool", phase=phase, status=status,
+                item_id=iid, kind="server_tool", phase=phase,
+                status=image_status if completed else status,
                 turn_id=turn_id, title="查看图片",
                 summary=path or None,
                 input={"file_path": path} if path else None,
+                tool="view_image",
             )
         if item_type == "sleep":
             duration = _duration_ms(item.get("durationMs"))
@@ -1483,6 +1733,64 @@ def _retry_detail(error: dict) -> str:
     if attempt:
         text += f"（{attempt.group(1).replace(' ', '')}）"
     return text + "…"
+
+
+_GENERIC_TURN_FAILURE = "Codex 本次回复未完成，请重试。"
+_AUTH_TURN_FAILURE = (
+    "模型服务认证已失效或当前账号无权限，"
+    "请检查当前服务的凭据或账号权限后重试。"
+)
+_RATE_LIMIT_TURN_FAILURE = "请求过于频繁或当前额度受限，请稍后重试。"
+_TIMEOUT_TURN_FAILURE = "请求超时，请重新尝试。"
+_UPSTREAM_TURN_FAILURE = "Codex 上游服务暂时不可用，请稍后重试。"
+_NETWORK_TURN_FAILURE = "网络连接异常，请检查网络后重试。"
+
+
+def _provider_failure_message(error: object) -> str:
+    """Map one provider terminal to bounded, user-actionable product copy."""
+    if not isinstance(error, dict):
+        return _GENERIC_TURN_FAILURE
+    message = error.get("message") if isinstance(error.get("message"), str) else ""
+    details = (
+        error.get("additionalDetails")
+        if isinstance(error.get("additionalDetails"), str)
+        else ""
+    )
+    combined = f"{message} {details}"[:8192].lower()
+    status = _structured_http_status(error)
+    if status is None:
+        status_match = re.search(r"\b([45]\d\d)\b", combined)
+        status = status_match.group(1) if status_match else None
+    if status in {"401", "403"}:
+        return _AUTH_TURN_FAILURE
+    if status == "429":
+        return _RATE_LIMIT_TURN_FAILURE
+    if status == "408":
+        return _TIMEOUT_TURN_FAILURE
+    if status is not None:
+        if status.startswith("5"):
+            return _UPSTREAM_TURN_FAILURE
+        # A concrete provider-side 4xx must not be relabelled as a local
+        # network failure merely because its transport also disconnected.
+        return _GENERIC_TURN_FAILURE
+    if any(marker in combined for marker in (
+        "request timed out",
+        "request timeout",
+        "timed out",
+    )):
+        return _TIMEOUT_TURN_FAILURE
+    if any(marker in combined for marker in (
+        "stream disconnected",
+        "connection reset",
+        "connection closed",
+        "connection refused",
+        "error sending request",
+        "dns error",
+        "tls error",
+        "socket error",
+    )):
+        return _NETWORK_TURN_FAILURE
+    return _GENERIC_TURN_FAILURE
 
 
 def _bounded_model_field(value, max_chars: int) -> str:
@@ -1757,14 +2065,12 @@ def _change_descriptors(changes) -> list[dict]:
             if not isinstance(entry, dict):
                 continue
             kind = entry.get("kind")
-            if isinstance(kind, dict):
-                kind = kind.get("type")
+            kind_name = kind.get("type") if isinstance(kind, dict) else kind
             descriptor = {
                 "path": str(entry.get("path") or "")[:16 * 1024],
-                "kind": str(kind or "update")[:128],
+                "kind": str(kind_name or "update")[:128],
             }
-            move_path = (entry.get("move_path")
-                         or entry.get("destination_path") or entry.get("to"))
+            move_path = _change_move_path(entry)
             if isinstance(move_path, str) and move_path:
                 descriptor["move_path"] = move_path[:16 * 1024]
             descriptors.append(descriptor)
@@ -1819,26 +2125,48 @@ def _changes_diff(changes) -> str:
     return "\n".join(parts)
 
 
-def _change_diff(path: str, entry: dict) -> str:
-    explicit = entry.get("unified_diff") or entry.get("diff")
-    if isinstance(explicit, str) and explicit:
-        return explicit
+def _change_move_path(entry: dict) -> str | None:
+    kind = entry.get("kind")
+    nested = kind.get("move_path") if isinstance(kind, dict) else None
+    move_path = (entry.get("move_path") or entry.get("destination_path")
+                 or entry.get("to") or nested)
+    return move_path if isinstance(move_path, str) and move_path else None
 
+
+def _change_diff(path: str, entry: dict) -> str:
     kind = entry.get("kind") or entry.get("type") or "update"
     if isinstance(kind, dict):
         kind = kind.get("type") or "update"
+    normalized_kind = str(kind).lower()
+    from_file = "/dev/null" if normalized_kind in {
+        "add", "create", "added",
+    } else path
+    move_path = _change_move_path(entry)
+    to_file = "/dev/null" if normalized_kind in {
+        "delete", "remove", "deleted",
+    } else move_path or path
+
+    explicit = entry.get("unified_diff") or entry.get("diff")
+    if isinstance(explicit, str) and explicit:
+        # FileUpdateChange.diff is authoritative but current app-server builds
+        # may omit file headers. Add only those structural headers so the web
+        # parser can render the native hunks; never derive content from the
+        # current worktree.
+        if ("@@" in explicit
+                and not re.search(r"(?m)^(?:diff --git |--- |\+\+\+ )", explicit)):
+            return f"--- {from_file}\n+++ {to_file}\n{explicit}"
+        return explicit
+
     old_content = entry.get("old_content")
     new_content = entry.get("content")
-    if str(kind).lower() in {"add", "create", "added"}:
+    if normalized_kind in {"add", "create", "added"}:
         old_content = ""
-    elif str(kind).lower() in {"delete", "remove", "deleted"}:
+    elif normalized_kind in {"delete", "remove", "deleted"}:
         old_content = (entry.get("content") if old_content is None
                        else old_content)
         new_content = ""
     if not isinstance(old_content, str) or not isinstance(new_content, str):
         return ""
-    from_file = "/dev/null" if not old_content else path
-    to_file = "/dev/null" if not new_content else path
     return "".join(difflib.unified_diff(
         old_content.splitlines(keepends=True),
         new_content.splitlines(keepends=True),
@@ -2606,6 +2934,21 @@ def codex_translate_history(
                         category = tool_meta[1]
                         raw_output = p.get("output")
                         structured_error = False
+                        if _normalized_history_tool(
+                                tool_meta[0]) == "viewimage":
+                            has_image = bool(
+                                isinstance(raw_output, list)
+                                and any(
+                                    isinstance(item, dict)
+                                    and item.get("type") == "input_image"
+                                    for item in raw_output
+                                )
+                            )
+                            raw_output = (
+                                "图片已读取"
+                                if has_image
+                                else "图片读取未返回可预览内容"
+                            )
                         if category in {"mcp", "server_tool"}:
                             raw_output, structured_error = (
                                 _history_structured_tool_output(raw_output))
@@ -2930,6 +3273,10 @@ def _hist_tool_name(name) -> str:
     return name or "tool"
 
 
+def _normalized_history_tool(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
 def _history_plan_event(
     name,
     tool_input: dict,
@@ -3157,3 +3504,382 @@ def _data_uri_to_img(url) -> dict | None:
         return {"media_type": mt, "data": data}
     except Exception:
         return None
+
+
+def _record_containing_offset(
+    source,
+    *,
+    file_size: int,
+    offset: int,
+) -> tuple[int, bytes] | None:
+    """Read one bounded JSONL record around a byte match."""
+    prefix_start = max(0, offset - _MAX_HISTORY_BOUNDARY_RECORD_BYTES)
+    source.seek(prefix_start)
+    prefix = source.read(offset - prefix_start)
+    newline = prefix.rfind(b"\n")
+    record_start = (
+        prefix_start + newline + 1
+        if newline >= 0
+        else 0 if prefix_start == 0
+        else None
+    )
+    if record_start is None:
+        return None
+    source.seek(record_start)
+    line = source.readline(_MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1)
+    if (
+        len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+        or (
+            not line.endswith(b"\n")
+            and record_start + len(line) < file_size
+        )
+    ):
+        return None
+    return record_start, line.rstrip(b"\r\n")
+
+
+def _codex_native_turn_window(
+    path: str,
+    native_turn_id: str,
+) -> tuple[int, int] | None:
+    """Locate a native task by exact id without walking every JSONL record."""
+    needle = native_turn_id.encode("ascii")
+    try:
+        with open(path, "rb") as source:
+            file_size = os.fstat(source.fileno()).st_size
+            left = 0
+            right = file_size
+            checked_records: set[int] = set()
+
+            def inspect(data: bytes, absolute_start: int, *, reverse: bool):
+                cursor = len(data) if reverse else 0
+                while True:
+                    match = (
+                        data.rfind(needle, 0, cursor)
+                        if reverse
+                        else data.find(needle, cursor)
+                    )
+                    if match < 0:
+                        return None
+                    absolute_match = absolute_start + match
+                    record = _record_containing_offset(
+                        source,
+                        file_size=file_size,
+                        offset=absolute_match,
+                    )
+                    if record is not None:
+                        record_start, line = record
+                        if record_start not in checked_records:
+                            checked_records.add(record_start)
+                            if len(checked_records) > _MAX_HISTORY_TURN_MATCHES:
+                                return None
+                            if _history_turn_cursor(line) == native_turn_id:
+                                return record_start, file_size
+                    cursor = match if reverse else match + len(needle)
+
+            overlap = max(0, len(needle) - 1)
+            while left < right:
+                forward_end = min(
+                    right, left + _HISTORY_TURN_SEARCH_CHUNK_BYTES)
+                source.seek(left)
+                forward = source.read(
+                    min(file_size, forward_end + overlap) - left)
+                found = inspect(forward, left, reverse=False)
+                if found is not None:
+                    return found
+                left = forward_end
+                if left >= right:
+                    break
+
+                reverse_start = max(
+                    left, right - _HISTORY_TURN_SEARCH_CHUNK_BYTES)
+                source.seek(reverse_start)
+                reverse = source.read(
+                    min(file_size, right + overlap) - reverse_start)
+                found = inspect(reverse, reverse_start, reverse=True)
+                if found is not None:
+                    return found
+                right = reverse_start
+    except (OSError, UnicodeEncodeError):
+        return None
+    return None
+
+
+def _history_image_payload(
+    url: object,
+) -> tuple[str, int, int, bytes] | None:
+    image = _data_uri_to_img(url)
+    if image is None:
+        return None
+    media_type = image.get("media_type")
+    encoded = image.get("data")
+    if (
+        not isinstance(media_type, str)
+        or media_type not in ALLOWED_IMAGE_TYPES
+        or not isinstance(encoded, str)
+    ):
+        return None
+    try:
+        data = decode_attachment(encoded)
+    except ValueError:
+        return None
+    if len(data) > MAX_SINGLE_ATTACHMENT_BYTES:
+        return None
+    dimensions = image_dimensions(data, media_type)
+    if dimensions is None:
+        return None
+    width, height = dimensions
+    if (
+        width <= 0
+        or height <= 0
+        or width > MAX_IMAGE_DIMENSION
+        or height > MAX_IMAGE_DIMENSION
+        or width * height > MAX_IMAGE_PIXELS
+    ):
+        return None
+    normalized = "image/jpeg" if media_type == "image/jpg" else media_type
+    return normalized, width, height, data
+
+
+def codex_history_image_views(
+    path: str,
+    native_turn_id: str,
+    *,
+    segment_index: int = 0,
+) -> tuple[CodexHistoryImageView, ...]:
+    """Recover only ``view_image`` activities from one native rollout turn.
+
+    Official app-server 0.147 can return a successful full turn while omitting
+    ``imageView`` items. This deliberately narrow supplement never translates
+    ordinary messages/tools and never puts an ``input_image`` base64 body into
+    a history event.
+    """
+    if (
+        not isinstance(native_turn_id, str)
+        or not _SAFE_WIRE_ID.fullmatch(native_turn_id)
+        or isinstance(segment_index, bool)
+        or not isinstance(segment_index, int)
+        or segment_index < 0
+    ):
+        return ()
+    window = _codex_native_turn_window(path, native_turn_id)
+    if window is None:
+        return ()
+    start_offset, end_offset = window
+
+    calls: list[dict[str, object]] = []
+    by_call_id: dict[str, dict[str, object]] = {}
+    current_segment = 0
+    saw_visible_user = False
+    image_bytes = 0
+    last_anchor_id: str | None = None
+    awaiting_next_anchor: list[dict[str, object]] = []
+    try:
+        source = open(path, "rb")
+    except OSError:
+        return ()
+    with source:
+        source.seek(start_offset)
+        for _offset, line in _bounded_jsonl_records(
+            source, end_offset=end_offset,
+        ):
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            row_type = row.get("type")
+            payload_type = payload.get("type")
+
+            if row_type == "event_msg" and payload_type == "task_started":
+                turn_id = payload.get("turn_id")
+                if (
+                    isinstance(turn_id, str)
+                    and turn_id != native_turn_id
+                ):
+                    break
+                continue
+
+            if row_type == "event_msg" and payload_type == "user_message":
+                if not visible_codex_user_message(payload.get("message")):
+                    continue
+                if saw_visible_user:
+                    if current_segment == segment_index:
+                        awaiting_next_anchor.clear()
+                    last_anchor_id = None
+                    current_segment += 1
+                else:
+                    saw_visible_user = True
+                continue
+
+            if (
+                row_type == "response_item"
+                and payload_type == "function_call"
+                and payload.get("name") == "view_image"
+            ):
+                if (
+                    current_segment != segment_index
+                    or len(calls) >= _MAX_HISTORY_IMAGE_VIEWS_PER_SEGMENT
+                ):
+                    continue
+                metadata = payload.get(
+                    "internal_chat_message_metadata_passthrough")
+                metadata_turn = (
+                    metadata.get("turn_id")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if (
+                    isinstance(metadata_turn, str)
+                    and metadata_turn != native_turn_id
+                ):
+                    continue
+                call_id = _live_id(
+                    payload.get("call_id") or payload.get("id"),
+                    "history-image-call",
+                )
+                arguments = payload.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except (json.JSONDecodeError, ValueError):
+                        arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                raw_path = arguments.get("path") or arguments.get("file_path")
+                image_path, _ = bounded_text(raw_path, 16 * 1024)
+                record: dict[str, object] = {
+                    "call_id": call_id,
+                    "item_id": _live_id(
+                        payload.get("id") or call_id,
+                        "history-image-view",
+                    ),
+                    "path": image_path,
+                    "segment_index": current_segment,
+                    "timestamp": row.get("timestamp"),
+                    "output_seen": False,
+                    "image": None,
+                    "previous_item_id": last_anchor_id,
+                    "next_item_id": None,
+                }
+                calls.append(record)
+                by_call_id[call_id] = record
+                awaiting_next_anchor.append(record)
+                continue
+
+            if row_type != "response_item":
+                continue
+
+            if payload_type == "function_call_output":
+                call_id = _live_id(
+                    payload.get("call_id"), "history-image-call")
+                record = by_call_id.get(call_id)
+                if record is not None:
+                    record["output_seen"] = True
+                    if record.get("image") is None:
+                        output = payload.get("output")
+                        if isinstance(output, list):
+                            for item in output:
+                                if (
+                                    not isinstance(item, dict)
+                                    or item.get("type") != "input_image"
+                                ):
+                                    continue
+                                image = _history_image_payload(
+                                    item.get("image_url"))
+                                if (
+                                    image is not None
+                                    and image_bytes + len(image[3])
+                                    <= _MAX_HISTORY_IMAGE_BYTES_PER_SEGMENT
+                                ):
+                                    record["image"] = image
+                                    image_bytes += len(image[3])
+                                    break
+                    continue
+
+            if current_segment != segment_index:
+                continue
+            raw_anchor = payload.get("id") or payload.get("call_id")
+            anchor_id = (
+                raw_anchor
+                if isinstance(raw_anchor, str)
+                and _SAFE_WIRE_ID.fullmatch(raw_anchor)
+                else None
+            )
+            if anchor_id is None:
+                continue
+            for pending in awaiting_next_anchor:
+                pending["next_item_id"] = anchor_id
+            awaiting_next_anchor.clear()
+            last_anchor_id = anchor_id
+
+    views: list[CodexHistoryImageView] = []
+    for record in calls:
+        call_id = str(record["call_id"])
+        image = record.get("image")
+        image_ref: dict[str, object] | None = None
+        media_type: str | None = None
+        width: int | None = None
+        height: int | None = None
+        data: bytes | None = None
+        if isinstance(image, tuple) and len(image) == 4:
+            media_type, width, height, data = image
+            digest = hashlib.sha256(data).hexdigest()
+            image_id = "img-" + hashlib.sha256(
+                (
+                    f"{native_turn_id}\0{call_id}\0{digest}"
+                ).encode("utf-8", "surrogatepass")
+            ).hexdigest()[:24]
+            image_ref = {
+                "image_id": image_id,
+                "media_type": media_type,
+                "width": width,
+                "height": height,
+                "byte_size": len(data),
+            }
+        image_path = str(record.get("path") or "")
+        event_input: dict[str, object] = {}
+        if image_path:
+            event_input["file_path"] = image_path
+        if image_ref is not None:
+            event_input["history_image"] = image_ref
+        succeeded = bool(record.get("output_seen"))
+        event = ProcessEvent(
+            item_id=str(record["item_id"]),
+            kind="server_tool",
+            phase="end",
+            status="succeeded" if succeeded else "interrupted",
+            turn_id=native_turn_id,
+            title="查看图片",
+            summary=image_path or None,
+            input=event_input or None,
+            tool="view_image",
+        )
+        timestamp = record.get("timestamp")
+        if isinstance(timestamp, str):
+            try:
+                event.ts = datetime.fromisoformat(
+                    timestamp.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                pass
+        views.append(CodexHistoryImageView(
+            call_id=call_id,
+            event=event,
+            previous_item_id=(
+                str(record["previous_item_id"])
+                if record.get("previous_item_id")
+                else None
+            ),
+            next_item_id=(
+                str(record["next_item_id"])
+                if record.get("next_item_id")
+                else None
+            ),
+            media_type=media_type,
+            width=width,
+            height=height,
+            data=data,
+        ))
+    return tuple(views)

@@ -5,6 +5,8 @@ import asyncio
 import json
 import re
 
+import pytest
+
 from cc_remote.protocol import (
     AssistantMsgStart,
     Delta,
@@ -21,6 +23,7 @@ from cc_remote.wrapper import codex_stream as codex_stream_module
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator,
     _redact_credentials,
+    coalesce_codex_live_notifications,
     codex_history_window,
     codex_translate_history,
 )
@@ -237,6 +240,101 @@ def test_codex_plan_command_file_diff_and_delta_metadata():
     assert patch_use.input["file_paths"] == ["/repo/a.py"]
 
 
+def test_codex_file_update_schema_keeps_native_hunks_and_never_invents_update():
+    update = {
+        "path": "/repo/old.py",
+        "kind": {"type": "update", "move_path": "/repo/new.py"},
+        "diff": "@@ -1 +1 @@\n-old\n+new",
+    }
+    descriptors = codex_stream_module._change_descriptors([update])
+    assert descriptors == [{
+        "path": "/repo/old.py",
+        "kind": "update",
+        "move_path": "/repo/new.py",
+    }]
+    assert codex_stream_module._descriptor_paths(descriptors) == [
+        "/repo/old.py", "/repo/new.py",
+    ]
+    diff = codex_stream_module._changes_diff([update])
+    assert diff.startswith("--- /repo/old.py\n+++ /repo/new.py\n@@")
+
+    # An update with only the resulting file body has no before-image. Treating
+    # it as an add paints the entire file green and attributes current worktree
+    # state to a historical turn.
+    assert codex_stream_module._changes_diff([{
+        "path": "/repo/existing.py",
+        "kind": {"type": "update"},
+        "content": "whole resulting file\n",
+    }]) == ""
+
+    added = codex_stream_module._changes_diff({
+        "/repo/new.txt": {"type": "add", "content": "one\n"},
+    })
+    assert added.startswith("--- /dev/null\n+++ /repo/new.txt\n@@")
+    deleted = codex_stream_module._changes_diff({
+        "/repo/old.txt": {"type": "delete", "content": "one\n"},
+    })
+    assert deleted.startswith("--- /repo/old.txt\n+++ /dev/null\n@@")
+
+
+def test_codex_file_patch_snapshot_stops_appending_after_rewrite():
+    translator = CodexStreamTranslator(32_000)
+    events = _feed(translator, [{
+        "method": "item/started",
+        "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "item": {
+                "type": "fileChange", "id": "patch-rewrite",
+                "status": "inProgress", "changes": [],
+            },
+        },
+    }])
+    assert not [event for event in events if isinstance(event, ToolDelta)]
+
+    def patch(diff: str) -> list:
+        return _feed(translator, [{
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "patch-rewrite",
+                "changes": [{
+                    "path": "/repo/a.py",
+                    "kind": {"type": "update"},
+                    "diff": diff,
+                }],
+            },
+        }])
+
+    first = patch("@@ -1 +1 @@\n-old\n+first")
+    cleared = patch("")
+    rewritten = patch("@@ -1 +1 @@\n-old\n+second")
+    extended = patch("@@ -1 +1,2 @@\n-old\n+second\n+third")
+    assert len([event for event in first if isinstance(event, ToolDelta)]) == 1
+    assert not [event for event in cleared if isinstance(event, ToolDelta)]
+    assert not [event for event in rewritten if isinstance(event, ToolDelta)]
+    assert not [event for event in extended if isinstance(event, ToolDelta)]
+
+    completed = _feed(translator, [{
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread-1", "turnId": "turn-1",
+            "item": {
+                "type": "fileChange", "id": "patch-rewrite",
+                "status": "completed",
+                "changes": [{
+                    "path": "/repo/a.py",
+                    "kind": {"type": "update"},
+                    "diff": "@@ -1 +1,2 @@\n-old\n+second\n+third",
+                }],
+            },
+        },
+    }])
+    result = next(event for event in completed if isinstance(event, ToolResult))
+    assert result.diff
+    assert "+second\n+third" in result.diff
+    assert "+first" not in result.diff
+
+
 def test_codex_live_append_streams_have_cumulative_and_event_budgets():
     translator = CodexStreamTranslator(10_000)
     output_events = _feed(translator, [
@@ -286,6 +384,128 @@ def test_codex_live_append_streams_have_cumulative_and_event_budgets():
     })
     assert process_translator._delta_chars == {}
     assert process_translator._delta_events == {}
+
+
+@pytest.mark.asyncio
+async def test_codex_delta_bursts_coalesce_before_structural_boundaries():
+    async def source():
+        yield {"method": "item/commandExecution/outputDelta", "params": {
+            "turnId": "turn-1", "itemId": "command-coalesced", "delta": "a",
+        }}
+        await asyncio.sleep(0.001)
+        yield {"method": "item/commandExecution/outputDelta", "params": {
+            "turnId": "turn-1", "itemId": "command-coalesced", "delta": "b",
+        }}
+        yield {"method": "item/commandExecution/outputDelta", "params": {
+            "turnId": "turn-1", "itemId": "command-coalesced", "delta": "c",
+        }}
+        yield {"method": "item/completed", "params": {"item": {
+            "type": "commandExecution", "id": "command-coalesced",
+            "command": "printf abc", "status": "completed",
+            "aggregatedOutput": "abc", "exitCode": 0,
+        }}}
+
+    coalesced = [message async for message in
+                 coalesce_codex_live_notifications(
+                     source(), flush_seconds=0.01)]
+    assert [message["params"].get("delta") for message in coalesced] == [
+        "a", "bc", None,
+    ]
+
+    translator = CodexStreamTranslator(8_000)
+    events = _feed(translator, coalesced)
+    assert [event.delta for event in events if isinstance(event, ToolDelta)] == [
+        "a", "bc",
+    ]
+    result_index = next(
+        index for index, event in enumerate(events) if isinstance(event, ToolResult))
+    last_delta_index = max(
+        index for index, event in enumerate(events) if isinstance(event, ToolDelta))
+    assert last_delta_index < result_index
+
+
+@pytest.mark.asyncio
+async def test_codex_quiet_delta_tail_flushes_without_waiting_for_next_frame():
+    release_tail = asyncio.Event()
+    second_seen = asyncio.Event()
+    collected: list[str] = []
+
+    async def source():
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "a",
+        }}
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "b",
+        }}
+        await release_tail.wait()
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "c",
+        }}
+
+    async def consume() -> None:
+        async for message in coalesce_codex_live_notifications(
+            source(), flush_seconds=0.01,
+        ):
+            collected.append(message["params"]["delta"])
+            if collected == ["a", "b"]:
+                second_seen.set()
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(second_seen.wait(), timeout=0.5)
+    release_tail.set()
+    await task
+    assert collected == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_codex_delta_burst_flushes_confirmed_tail_before_stream_error():
+    async def source():
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "a",
+        }}
+        yield {"method": "item/agentMessage/delta", "params": {
+            "turnId": "turn-1", "itemId": "message-1", "delta": "b",
+        }}
+        raise RuntimeError("app-server stream closed")
+
+    collected: list[str] = []
+    with pytest.raises(RuntimeError, match="app-server stream closed"):
+        async for message in coalesce_codex_live_notifications(
+            source(), flush_seconds=0.01,
+        ):
+            collected.append(message["params"]["delta"])
+
+    assert collected == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_codex_delta_coalescing_keeps_item_and_channel_barriers():
+    messages = [
+        {"method": "item/reasoning/summaryTextDelta", "params": {
+            "turnId": "turn-1", "itemId": "reasoning-a",
+            "summaryIndex": 0, "delta": "a",
+        }},
+        {"method": "item/reasoning/summaryTextDelta", "params": {
+            "turnId": "turn-1", "itemId": "reasoning-b",
+            "summaryIndex": 0, "delta": "b",
+        }},
+        {"method": "item/reasoning/summaryTextDelta", "params": {
+            "turnId": "turn-1", "itemId": "reasoning-a",
+            "summaryIndex": 1, "delta": "c",
+        }},
+        {"method": "turn/completed", "params": {
+            "turn": {"id": "turn-1", "status": "completed"},
+        }},
+    ]
+
+    async def source():
+        for message in messages:
+            yield message
+
+    coalesced = [message async for message in
+                 coalesce_codex_live_notifications(
+                     source(), flush_seconds=0.01)]
+    assert coalesced == messages
 
 
 def test_codex_unique_live_items_are_bounded_and_dropped_results_stay_dropped(
@@ -808,6 +1028,8 @@ def test_codex_new_runtime_items_are_visible_without_forwarding_binary_results()
         ("生成图片", "end"), ("进入 Review", "end"),
         ("退出 Review", "end"),
     ]
+    viewed = [event for event in events if event.title == "查看图片"]
+    assert all(event.tool == "view_image" for event in viewed)
     image = next(event for event in events if event.title == "生成图片")
     assert image.input == {"file_path": "/tmp/generated.png"}
     assert image.summary == "一张架构图"

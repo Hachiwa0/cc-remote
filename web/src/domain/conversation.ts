@@ -16,6 +16,8 @@ export interface TextBlock {
   text: string;
   done: boolean;
   channel?: AssistantChannel;
+  /** Local source order for the bounded live spill archive. Never sent on wire. */
+  liveOrder?: number;
 }
 
 export interface ToolBlock {
@@ -42,6 +44,8 @@ export interface ToolBlock {
     duration_ms?: number | null;
   };
   done: boolean;
+  /** Local source order for the bounded live spill archive. Never sent on wire. */
+  liveOrder?: number;
 }
 
 export interface ProcessBlock {
@@ -69,6 +73,8 @@ export interface ProcessBlock {
   explanation?: string | null;
   plan?: PlanEntry[];
   done: boolean;
+  /** Local source order for the bounded live spill archive. Never sent on wire. */
+  liveOrder?: number;
 }
 
 export type Block = TextBlock | ToolBlock | ProcessBlock;
@@ -123,6 +129,11 @@ export interface Turn {
   detailEventCount?: number;
   detailLoaded?: boolean;
   detailLoading?: boolean;
+  /** Transient source/read failure for the heavyweight process disclosure. */
+  detailError?: string;
+  /** Exact failed page request retained only long enough for an in-place retry. */
+  detailRetryBefore?: string | null;
+  detailRetryDirection?: "initial" | "older" | "newer";
   detailHasMore?: boolean;
   detailOldestCursor?: string | null;
   detailHasNewer?: boolean;
@@ -140,4 +151,16 @@ export interface Turn {
   /** The automatic refresh repair installed only the newest server page; an
    * explicit disclosure may still request the remaining older pages. */
   detailRestoreIncomplete?: boolean;
+  /** The live reducer evicted completed process blocks from its bounded tail.
+   * Source-backed detail pages, rather than a visible omission card, own them. */
+  liveBlocksSpilled?: boolean;
+  /** Monotonic count of blocks evicted from the live in-memory tail. */
+  liveSpilledBlockCount?: number;
+  /** Bounded provisional archive bridging the last authoritative detail
+   * snapshot and the current live tail. It is never a source authority. */
+  liveSpillBlocks?: Block[];
+  /** Spill count captured by the most recent coalesced detail refresh. */
+  liveSpillRefreshCount?: number;
+  /** Next local block ordinal; used only to preserve spill chronology. */
+  nextLiveBlockOrder?: number;
 }

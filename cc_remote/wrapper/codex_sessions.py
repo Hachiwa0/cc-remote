@@ -300,8 +300,18 @@ def codex_session_settings(
                         out.pop("effort", None)
 
                 approval = payload.get("approval_policy")
-                if approval in {"untrusted", "on-request", "never"}:
+                if (isinstance(approval, str)
+                        and approval in {"untrusted", "on-request", "never"}):
                     out["approval_policy"] = approval
+                    out.pop("approval_policy_granular", None)
+                elif (isinstance(approval, dict)
+                        and isinstance(approval.get("granular"), dict)):
+                    # The bounded history reader need not duplicate the complete
+                    # policy object.  It must, however, distinguish native
+                    # granular approval from a missing value so callers do not
+                    # replace it with a stale named/UI projection.
+                    out.pop("approval_policy", None)
+                    out["approval_policy_granular"] = True
                 if "service_tier" in payload:
                     tier = payload.get("service_tier")
                     if tier is None or tier == "default":

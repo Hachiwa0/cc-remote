@@ -16,6 +16,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
@@ -43,8 +44,9 @@ _CLAUDE_MESSAGE_UUID = re.compile(
     re.IGNORECASE,
 )
 _MAX_TRANSCRIPT_MATCHES = 1000
-_MAX_TRANSCRIPT_RECORD_CHARS = 16 * 1024 * 1024
+_MAX_TRANSCRIPT_RECORD_CHARS = 64 * 1024 * 1024
 _MAX_TIMESTAMP_ENTRIES = 200_000
+_MAX_TRANSCRIPT_CHAIN_ENTRIES = 200_000
 _MAX_INTERNAL_USER_EVENTS = 10_000
 _MAX_SUBAGENT_FILES = 128
 _MAX_SUBAGENT_TOTAL_BYTES = 32 * 1024 * 1024
@@ -1064,13 +1066,274 @@ def _bounded_jsonl_lines(file):
             line = file.readline(_MAX_TRANSCRIPT_RECORD_CHARS + 1)
 
 
+@dataclass(frozen=True)
+class CompactTranscriptPage:
+    messages: list[SimpleNamespace]
+    timestamps: dict[str, float]
+    internal_events: dict[str, ProcessEvent]
+    has_more: bool
+    oldest_cursor: str | None
+
+
+class TranscriptTimestamps(dict[str, float]):
+    """Timestamp map with exact SDK query aliases retained from JSONL.
+
+    ``claude_agent_sdk.get_session_messages()`` intentionally projects only the
+    transcript UUID and message body.  Claude Code nevertheless persists the
+    originating remote query id in ``promptId``.  Keeping that metadata on the
+    existing side-read avoids another full transcript scan while allowing a
+    History row to reconcile with the browser's live optimistic row after a
+    session switch.  It remains a normal ``dict`` for existing callers.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.client_message_ids: dict[str, str] = {}
+
+
+def _remember_transcript_client_id(
+    timestamps: TranscriptTimestamps,
+    row: dict[str, Any],
+) -> None:
+    uid = row.get("uuid")
+    prompt_id = row.get("promptId")
+    if (
+        row.get("type") == "user"
+        and isinstance(uid, str)
+        and _SAFE_WIRE_ID.fullmatch(uid)
+        and isinstance(prompt_id, str)
+        and _SAFE_WIRE_ID.fullmatch(prompt_id)
+        and prompt_id != uid
+    ):
+        timestamps.client_message_ids[uid] = prompt_id
+
+
+def _compact_visible_user(row: dict[str, Any]) -> bool:
+    origin = row.get("origin")
+    if (
+        row.get("type") != "user"
+        or origin == "task-notification"
+        or (
+            isinstance(origin, dict)
+            and origin.get("kind") == "task-notification"
+        )
+    ):
+        return False
+    message = row.get("message")
+    if not isinstance(message, dict):
+        return False
+    role = message.get("role") or row.get("type")
+    if role != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip()) and not _is_meta_user_text(content)
+    if not isinstance(content, list) or _is_interrupted_user_content(content):
+        return False
+    return any(
+        isinstance(block, dict) and (
+            block.get("type") == "image"
+            or (
+                block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                and bool(block["text"].strip())
+                and not _is_meta_user_text(block["text"])
+            )
+        )
+        for block in content
+    )
+
+
+def _compact_chain_index(
+    source_path: str,
+    *,
+    index_store=None,
+    snapshot_size: int | None = None,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+):
+    """Return compact main-chain ids plus bounded graph metadata.
+
+    Payloads are parsed only transiently. The retained graph stores small
+    identity fields and byte offsets so the second phase can seek directly to
+    the requested page instead of scanning or retaining every message body.
+    """
+    rows: dict[str, tuple[object, ...]] = {}
+    leaf: str | None = None
+    queued: set[tuple[int, str]] = set()
+    if index_store is not None:
+        try:
+            indexed = index_store.get_claude_compact_index(
+                source_path,
+                snapshot_size=snapshot_size,
+                max_record_bytes=max_record_bytes,
+                max_entries=_MAX_TRANSCRIPT_CHAIN_ENTRIES,
+                visible_user=_compact_visible_user,
+            )
+        except Exception:
+            indexed = None
+        if indexed is None:
+            return None
+        rows = indexed.rows
+        leaf = indexed.leaf
+        queued = set(indexed.queued_notifications)
+    else:
+        try:
+            with open(source_path, "rb") as source:
+                stat = os.fstat(source.fileno())
+                target_size = min(
+                    int(stat.st_size),
+                    int(snapshot_size) if snapshot_size is not None
+                    else int(stat.st_size),
+                )
+                while source.tell() < target_size:
+                    remaining = target_size - source.tell()
+                    if remaining <= 0:
+                        break
+                    record_limit = max(1024, int(max_record_bytes))
+                    offset = source.tell()
+                    line = source.readline(min(remaining, record_limit + 1))
+                    if not line:
+                        break
+                    complete = line.endswith(b"\n") \
+                        or (source.tell() == target_size
+                            and len(line) <= record_limit)
+                    if not complete:
+                        while (line and not line.endswith(b"\n")
+                               and source.tell() < target_size):
+                            line = source.readline(min(
+                                target_size - source.tell(), record_limit + 1))
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if (row.get("type") == "queue-operation"
+                            and row.get("operation") == "enqueue"):
+                        content = row.get("content")
+                        if (isinstance(content, str)
+                                and content.lstrip().startswith(
+                                    "<task-notification>")):
+                            queued.add((len(content), hashlib.sha256(
+                                content.encode("utf-8", "surrogatepass")
+                            ).hexdigest()))
+                    uid = row.get("uuid")
+                    if not (isinstance(uid, str)
+                            and _SAFE_WIRE_ID.fullmatch(uid)):
+                        continue
+                    if len(rows) >= _MAX_TRANSCRIPT_CHAIN_ENTRIES \
+                            and uid not in rows:
+                        return None
+                    rows[uid] = (
+                        row.get("type"),
+                        row.get("subtype"),
+                        row.get("parentUuid"),
+                        row.get("logicalParentUuid"),
+                        row.get("isSidechain"),
+                        offset,
+                        _compact_visible_user(row),
+                        len(line),
+                    )
+                    if row.get("isSidechain") is not True:
+                        leaf = uid
+        except OSError:
+            return None
+    if not leaf:
+        return None
+
+    chain_ids: list[str] = []
+    seen: set[str] = set()
+    cursor: str | None = leaf
+    saw_compact = False
+    while cursor and cursor not in seen:
+        seen.add(cursor)
+        metadata = rows.get(cursor)
+        if metadata is None:
+            return None
+        chain_ids.append(cursor)
+        row_type, subtype, parent_uuid, logical_parent_uuid = metadata[:4]
+        is_compact = row_type == "system" and subtype == "compact_boundary"
+        saw_compact = saw_compact or is_compact
+        parent = logical_parent_uuid if is_compact else parent_uuid
+        if not isinstance(parent, str) or not _SAFE_WIRE_ID.fullmatch(parent):
+            parent = None
+        cursor = parent
+    if cursor is not None or not saw_compact:
+        return None
+    return list(reversed(chain_ids)), rows, queued
+
+
+def _load_compact_chain_messages(
+    session_id: str,
+    source_path: str,
+    chain_ids: list[str],
+    rows: dict[str, tuple[object, ...]],
+    queued: set[tuple[int, str]],
+    *,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+) -> tuple[
+    list[SimpleNamespace], dict[str, float], dict[str, ProcessEvent]
+] | None:
+    messages: list[SimpleNamespace] = []
+    timestamps = TranscriptTimestamps()
+    internal_events: dict[str, ProcessEvent] = {}
+    try:
+        with open(source_path, "rb") as source:
+            for uid in chain_ids:
+                metadata = rows.get(uid)
+                if metadata is None or not isinstance(metadata[5], int):
+                    return None
+                source.seek(metadata[5])
+                record_limit = max(1024, int(max_record_bytes))
+                line = source.readline(record_limit + 1)
+                if (not line or len(line) > record_limit
+                        and not line.endswith(b"\n")):
+                    return None
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    return None
+                if row.get("uuid") != uid:
+                    return None
+                _remember_transcript_client_id(timestamps, row)
+                internal = _internal_user_event_from_row(row, queued)
+                if internal is not None:
+                    internal_events[uid] = internal
+                row_type = row.get("type")
+                message = row.get("message")
+                if row_type in {"user", "assistant"} \
+                        and isinstance(message, dict):
+                    messages.append(SimpleNamespace(
+                        type=row_type,
+                        uuid=uid,
+                        session_id=session_id,
+                        message=message,
+                        parent_tool_use_id=(
+                            row.get("parentToolUseID")
+                            or row.get("parent_tool_use_id")
+                        ),
+                    ))
+                timestamp = row.get("timestamp")
+                if not isinstance(timestamp, str):
+                    continue
+                try:
+                    timestamps[uid] = datetime.fromisoformat(
+                        timestamp.replace("Z", "+00:00")
+                        if timestamp.endswith("Z") else timestamp
+                    ).timestamp()
+                except Exception:
+                    pass
+    except OSError:
+        return None
+    return messages, timestamps, internal_events
+
+
 def transcript_timestamps(session_id: str) -> dict[str, float]:
     """Map each transcript entry's uuid -> epoch seconds, read straight from the
     .jsonl. The SDK's SessionMessage drops the per-message timestamp, so without
     this, history events default their `ts` to now (making every past message show
     the current time — "like a clock"). Best-effort: {} if not found/readable.
     session_id is globally unique, so a glob across all project dirs locates it."""
-    out: dict[str, float] = {}
+    out = TranscriptTimestamps()
     if not _SAFE_SESSION_ID.fullmatch(session_id):
         return out
     try:
@@ -1083,6 +1346,7 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
                     d = json.loads(line)
                 except Exception:
                     continue
+                _remember_transcript_client_id(out, d)
                 uid, ts = d.get("uuid"), d.get("timestamp")
                 if not uid or not isinstance(ts, str):
                     continue
@@ -1098,6 +1362,152 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
     return out
 
 
+def transcript_compact_main_chain(
+    session_id: str,
+    *,
+    path: str | None = None,
+) -> tuple[list[SimpleNamespace], dict[str, float]] | None:
+    """Recover the active Claude message chain across compact boundaries.
+
+    Claude Agent SDK's ``get_session_messages`` deliberately starts at the
+    compact summary. The raw transcript retains the prior active ancestry and
+    links it through ``system/compact_boundary.logicalParentUuid``. Follow that
+    graph instead of replaying JSONL file order (which can contain abandoned
+    branches), and return ``None`` when the active chain has no compact marker
+    so ordinary sessions keep using the SDK's supported projection.
+    """
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return None
+    source_path = path or transcript_path(session_id)
+    if not source_path:
+        return None
+    indexed = _compact_chain_index(source_path)
+    if indexed is None:
+        return None
+    ordered_ids, rows, queued = indexed
+    loaded = _load_compact_chain_messages(
+        session_id, source_path, ordered_ids, rows, queued)
+    if loaded is None or not loaded[0]:
+        return None
+    return loaded[0], loaded[1]
+
+
+def transcript_compact_snapshot(
+    session_id: str,
+    *,
+    path: str | None = None,
+    index_store=None,
+    snapshot_size: int | None = None,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+) -> tuple[
+    list[SimpleNamespace], dict[str, float], dict[str, ProcessEvent]
+] | None:
+    """Load the compact active chain plus indexed internal task events."""
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return None
+    source_path = path or transcript_path(session_id)
+    if not source_path:
+        return None
+    indexed = _compact_chain_index(
+        source_path,
+        index_store=index_store,
+        snapshot_size=snapshot_size,
+        max_record_bytes=max_record_bytes,
+    )
+    if indexed is None:
+        return None
+    ordered_ids, rows, queued = indexed
+    loaded = _load_compact_chain_messages(
+        session_id, source_path, ordered_ids, rows, queued,
+        max_record_bytes=max_record_bytes,
+    )
+    if loaded is None or not loaded[0]:
+        return None
+    return loaded
+
+
+def transcript_compact_history_page(
+    session_id: str,
+    *,
+    path: str | None = None,
+    before: str | None = None,
+    limit: int = 60,
+    max_payload_bytes: int | None = None,
+    index_store=None,
+    snapshot_size: int | None = None,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+) -> CompactTranscriptPage | None:
+    """Load one visible turn page from a compacted Claude transcript.
+
+    The graph pass is payload-light and capped; the payload pass seeks only to
+    main-chain rows belonging to this page. This is the safe oversized-source
+    path used when the general SDK projection would exceed the configured
+    whole-transcript limit.
+    """
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return None
+    source_path = path or transcript_path(session_id)
+    if not source_path:
+        return None
+    indexed = _compact_chain_index(
+        source_path,
+        index_store=index_store,
+        snapshot_size=snapshot_size,
+        max_record_bytes=max_record_bytes,
+    )
+    if indexed is None:
+        return None
+    ordered_ids, rows, queued = indexed
+    visible = [
+        (index, uid)
+        for index, uid in enumerate(ordered_ids)
+        if bool(rows[uid][6])
+    ]
+    if not visible:
+        return None
+    end = len(visible)
+    if before is not None:
+        found = next(
+            (index for index, (_, uid) in enumerate(visible)
+             if uid == before),
+            None,
+        )
+        if found is None:
+            return None
+        end = found
+    bounded_limit = max(1, min(200, int(limit)))
+    start = max(0, end - bounded_limit)
+    chain_end = visible[end][0] if end < len(visible) else len(ordered_ids)
+    payload_prefix = [0]
+    for uid in ordered_ids:
+        metadata = rows[uid]
+        payload_prefix.append(payload_prefix[-1] + (
+            int(metadata[7]) if metadata[0] in {"user", "assistant"} else 0
+        ))
+    while True:
+        chain_start = 0 if start == 0 else visible[start][0]
+        payload_bytes = payload_prefix[chain_end] - payload_prefix[chain_start]
+        if max_payload_bytes is None or payload_bytes <= max_payload_bytes:
+            break
+        if end - start <= 1:
+            return None
+        start += 1
+    selected_ids = ordered_ids[chain_start:chain_end]
+    loaded = _load_compact_chain_messages(
+        session_id, source_path, selected_ids, rows, queued,
+        max_record_bytes=max_record_bytes)
+    if loaded is None:
+        return None
+    messages, timestamps, internal_events = loaded
+    return CompactTranscriptPage(
+        messages=messages,
+        timestamps=timestamps,
+        internal_events=internal_events,
+        has_more=start > 0,
+        oldest_cursor=visible[start][1] if start < end else None,
+    )
+
+
 def _notification_tag(text: str, name: str, limit: int) -> str | None:
     start_token = f"<{name}>"
     end_token = f"</{name}>"
@@ -1109,6 +1519,53 @@ def _notification_tag(text: str, name: str, limit: int) -> str | None:
     if end < 0:
         return None
     return _short_text(text[start:end].strip(), limit)
+
+
+def _internal_user_event_from_row(
+    row: dict[str, Any],
+    queued: set[tuple[int, str]] | frozenset[tuple[int, str]],
+) -> ProcessEvent | None:
+    origin = row.get("origin")
+    message = row.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    uid = row.get("uuid")
+    if not (row.get("type") == "user"
+            and isinstance(origin, dict)
+            and origin.get("kind") == "task-notification"
+            and isinstance(content, str)
+            and isinstance(uid, str)
+            and _SAFE_WIRE_ID.fullmatch(uid)):
+        return None
+    fingerprint = (len(content), hashlib.sha256(
+        content.encode("utf-8", "surrogatepass")
+    ).hexdigest())
+    if fingerprint not in queued:
+        return None
+    task_id = _notification_tag(content, "task-id", 128)
+    tool_id = _notification_tag(content, "tool-use-id", 128)
+    if not task_id or not _SAFE_WIRE_ID.fullmatch(task_id):
+        return None
+    if tool_id and not _SAFE_WIRE_ID.fullmatch(tool_id):
+        tool_id = None
+    raw_status = _notification_tag(content, "status", 64)
+    summary = _notification_tag(content, "summary", 1000)
+    usage: dict[str, int] = {}
+    for tag in ("tool_uses", "total_tokens", "duration_ms"):
+        value = _notification_tag(content, tag, 32)
+        if value and value.isdigit():
+            usage[tag] = int(value)
+    status = _task_status(raw_status)
+    item_id = _agent_process_id(tool_id) if tool_id else task_id
+    return ProcessEvent(
+        item_id=item_id,
+        kind="agent" if tool_id else "task",
+        phase="end",
+        status=status,
+        parent_id=tool_id,
+        title=summary or ("协作代理" if tool_id else "后台任务"),
+        progress=_task_progress(usage),
+        duration_ms=usage.get("duration_ms"),
+    )
 
 
 def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
@@ -1143,47 +1600,11 @@ def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
                             content.encode("utf-8", "surrogatepass")
                         ).hexdigest()))
                     continue
-                origin = row.get("origin")
-                message = row.get("message")
-                content = message.get("content") if isinstance(message, dict) else None
                 uid = row.get("uuid")
-                if not (row.get("type") == "user"
-                        and isinstance(origin, dict)
-                        and origin.get("kind") == "task-notification"
-                        and isinstance(content, str)
-                        and isinstance(uid, str)
-                        and _SAFE_WIRE_ID.fullmatch(uid)):
+                event = _internal_user_event_from_row(row, queued)
+                if event is None or not isinstance(uid, str):
                     continue
-                fingerprint = (len(content), hashlib.sha256(
-                    content.encode("utf-8", "surrogatepass")
-                ).hexdigest())
-                if fingerprint not in queued:
-                    continue
-                task_id = _notification_tag(content, "task-id", 128)
-                tool_id = _notification_tag(content, "tool-use-id", 128)
-                if not task_id or not _SAFE_WIRE_ID.fullmatch(task_id):
-                    continue
-                if tool_id and not _SAFE_WIRE_ID.fullmatch(tool_id):
-                    tool_id = None
-                raw_status = _notification_tag(content, "status", 64)
-                summary = _notification_tag(content, "summary", 1000)
-                usage: dict[str, int] = {}
-                for tag in ("tool_uses", "total_tokens", "duration_ms"):
-                    value = _notification_tag(content, tag, 32)
-                    if value and value.isdigit():
-                        usage[tag] = int(value)
-                status = _task_status(raw_status)
-                item_id = _agent_process_id(tool_id) if tool_id else task_id
-                events[uid] = ProcessEvent(
-                    item_id=item_id,
-                    kind="agent" if tool_id else "task",
-                    phase="end",
-                    status=status,
-                    parent_id=tool_id,
-                    title=summary or ("协作代理" if tool_id else "后台任务"),
-                    progress=_task_progress(usage),
-                    duration_ms=usage.get("duration_ms"),
-                )
+                events[uid] = event
                 if len(events) >= _MAX_INTERNAL_USER_EVENTS:
                     break
     except (OSError, UnicodeError):
@@ -1236,8 +1657,15 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     def _ts(uid):
         return timestamps.get(uid) if timestamps else None
 
+    client_message_ids = getattr(timestamps, "client_message_ids", {})
+
     def _um(uid, prompt):
-        um = UserMsg(msg_id=uid, prompt=prompt)
+        client_msg_id = client_message_ids.get(uid)
+        um = UserMsg(
+            msg_id=uid,
+            client_msg_id=client_msg_id,
+            prompt=prompt,
+        )
         t = _ts(uid)
         if t is not None:
             um.ts = t   # question time, not load time

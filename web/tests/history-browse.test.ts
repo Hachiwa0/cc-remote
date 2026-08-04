@@ -19,7 +19,6 @@ import {
 } from "../src/history-merge.ts";
 import { protectedHistoryTurnIds } from "../src/history-selection-guard.ts";
 import {
-  DETAIL_PROJECTION_CAP_ITEM_ID,
   installTurnDetailProjectionPage,
   nextAutoLoadDetailTurn,
 } from "../src/history-detail-projection.ts";
@@ -683,15 +682,50 @@ capped = installTurnDetailProjectionPage(capped.projection, {
   hasMore: true,
   oldestCursor: "cap-oldest",
   hasNewer: true,
+  newerCursor: "cap-newest",
 }, decodeDetailEvents, { maxItems: 5 });
 assert.equal(capped.projection.capped, true);
-assert.equal(capped.projection.hasMore, false,
-  "the explicit safety cap terminates automatic older-page loading");
-assert.equal(
-  capped.projection.blocks[0].kind === "process"
-    ? capped.projection.blocks[0].item_id : "",
-  DETAIL_PROJECTION_CAP_ITEM_ID,
+assert.equal(capped.projection.hasMore, true,
+  "the memory cap keeps the older source cursor available");
+assert.equal(capped.projection.hasNewer, true);
+assert.equal(capped.projection.newerCursor, "cap-newest");
+assert.deepEqual(capped.projection.blocks.flatMap((block) =>
+  block.kind === "process" ? [block.item_id] : []), [
+  "mid-1", "mid-2", "mid-3",
+], "an older request retains the page the reader explicitly requested");
+const returnedToNewer = installTurnDetailProjectionPage(capped.projection, {
+  before: "cap-newest",
+  events: [
+    processEvent("new-1", 30),
+    processEvent("new-2", 31),
+    processEvent("new-3", 32),
+  ],
+  hasMore: true,
+  oldestCursor: "cap-middle",
+  hasNewer: false,
+}, decodeDetailEvents, { maxItems: 5 });
+assert.equal(returnedToNewer.projection.capped, true);
+assert.equal(returnedToNewer.projection.hasMore, true);
+assert.equal(returnedToNewer.projection.hasNewer, false);
+assert.deepEqual(returnedToNewer.projection.blocks.flatMap((block) =>
+  block.kind === "process" ? [block.item_id] : []), [
+  "new-1", "new-2", "new-3",
+], "the bounded detail window can navigate back to newer process pages");
+const cappedDetailTurn = installAuthoritativeTurnDetailPage(
+  turn("capped-detail", { detailAutoLoad: true }),
+  returnedToNewer.detail!,
+  {
+    hasMore: returnedToNewer.projection.hasMore,
+    oldestCursor: returnedToNewer.projection.oldestCursor,
+    hasNewer: returnedToNewer.projection.hasNewer,
+    newerCursor: returnedToNewer.projection.newerCursor,
+  },
+  returnedToNewer.projection,
 );
+assert.equal(cappedDetailTurn.detailAutoLoad, false,
+  "the memory cap stops automatic full-turn pagination");
+assert.equal(cappedDetailTurn.detailHasMore, true,
+  "stopping automatic pagination must retain the manual older-page cursor");
 
 const loading = markBrowseDetailLoading(
   overlap, "native-2", true, {

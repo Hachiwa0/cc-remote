@@ -85,6 +85,13 @@ class CodexForkJournal:
             if any(entry.get(field) != canonical.get(field)
                    for field in identity_fields):
                 raise ValueError("fork alias identity differs from its canonical root")
+            if entry.get("controls", {}) != canonical.get("controls", {}):
+                raise ValueError("fork alias controls differ from its canonical root")
+            if bool(entry.get("name_finalized")) != bool(
+                canonical.get("name_finalized")
+            ):
+                raise ValueError(
+                    "fork alias name state differs from its canonical root")
             compatible = {
                 "alias": {"intent", "submitted", "uncertain"},
                 "complete": {"complete"},
@@ -120,7 +127,7 @@ class CodexForkJournal:
         source_request_id = canonical_request_id or request_id
         if entry.get("thread_source") != fork_thread_source(source_request_id):
             raise ValueError("invalid fork source")
-        if entry.get("target") != "same_cwd":
+        if entry.get("target") not in {"same_cwd", "worktree"}:
             raise ValueError("invalid fork target")
         cwd = entry.get("cwd")
         if (not isinstance(cwd, str) or not cwd or "\x00" in cwd
@@ -146,6 +153,32 @@ class CodexForkJournal:
         created_at = entry.get("created_at")
         if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
             raise ValueError("invalid fork timestamp")
+        controls = entry.get("controls", {})
+        if not isinstance(controls, dict) or set(controls) - {
+            "model", "approval_policy", "permission_profile", "web_search",
+        }:
+            raise ValueError("invalid fork controls")
+        model = controls.get("model")
+        if model is not None and (
+            not isinstance(model, str) or not model or len(model) > 256
+        ):
+            raise ValueError("invalid fork model")
+        approval = controls.get("approval_policy")
+        if approval is not None and approval not in {
+            "untrusted", "on-request", "never",
+        }:
+            raise ValueError("invalid fork approval policy")
+        profile = controls.get("permission_profile")
+        if profile is not None and (
+            not isinstance(profile, str) or not profile or len(profile) > 256
+        ):
+            raise ValueError("invalid fork permission profile")
+        web_search = controls.get("web_search")
+        if web_search is not None and web_search not in {"cached", "live"}:
+            raise ValueError("invalid fork web search mode")
+        name_finalized = entry.get("name_finalized")
+        if name_finalized is not None and not isinstance(name_finalized, bool):
+            raise ValueError("invalid fork name finalization state")
 
     def begin(
         self,
@@ -153,10 +186,14 @@ class CodexForkJournal:
         parent_session_id: str,
         last_turn_id: str,
         cwd: str,
+        controls: Optional[dict[str, str]] = None,
+        *,
+        target: str = "same_cwd",
     ) -> dict[str, Any]:
         with self._lock:
             return self._begin(
-                request_id, parent_session_id, last_turn_id, cwd)
+                request_id, parent_session_id, last_turn_id, cwd, controls,
+                target)
 
     def _begin(
         self,
@@ -164,12 +201,17 @@ class CodexForkJournal:
         parent_session_id: str,
         last_turn_id: str,
         cwd: str,
+        controls: Optional[dict[str, str]],
+        target: str,
     ) -> dict[str, Any]:
+        if target not in {"same_cwd", "worktree"}:
+            raise ForkJournalError("invalid fork target")
         source = fork_thread_source(request_id)
+        control_snapshot = dict(controls or {})
         identity = {
             "parent_session_id": parent_session_id,
             "last_turn_id": last_turn_id,
-            "target": "same_cwd",
+            "target": target,
             "cwd": cwd,
             "thread_source": source,
         }
@@ -205,6 +247,7 @@ class CodexForkJournal:
         if canonical is None:
             entry = {
                 **identity,
+                "controls": control_snapshot,
                 "status": "intent",
                 "created_at": time.time(),
             }
@@ -215,6 +258,7 @@ class CodexForkJournal:
             entry = {
                 **identity,
                 "thread_source": canonical_entry["thread_source"],
+                "controls": dict(canonical_entry.get("controls") or {}),
                 "canonical_request_id": canonical_request_id,
                 "status": "alias",
                 "created_at": time.time(),
@@ -254,6 +298,30 @@ class CodexForkJournal:
     def complete(self, request_id: str, session_id: str) -> dict[str, Any]:
         with self._lock:
             return self._complete(request_id, session_id)
+
+    def mark_name_finalized(self, request_id: str) -> dict[str, Any]:
+        """Remember that a worktree fork title must never be applied again."""
+        if not isinstance(request_id, str) or not _SAFE_ID.fullmatch(request_id):
+            raise ForkJournalError("invalid fork request id")
+        with self._lock:
+            existing = self.entries.get(request_id)
+            if existing is None:
+                raise ForkJournalError("fork intent is missing")
+            if (existing.get("target") != "worktree"
+                    or existing.get("status") != "complete"):
+                raise ForkJournalError(
+                    "only a completed worktree fork can finalize its name")
+            source = existing.get("thread_source")
+            updated = OrderedDict(self.entries)
+            for key, value in tuple(updated.items()):
+                if value.get("thread_source") != source:
+                    continue
+                finalized = dict(value)
+                finalized["name_finalized"] = True
+                updated[key] = finalized
+            self._persist(updated)
+            self.entries = updated
+            return dict(updated[request_id])
 
     def _complete(self, request_id: str, session_id: str) -> dict[str, Any]:
         existing = self.entries.get(request_id)

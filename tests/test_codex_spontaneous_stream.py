@@ -186,6 +186,149 @@ def test_spontaneous_bridge_completion_snapshot_and_terminal_win_after_gap():
     asyncio.run(run())
 
 
+def test_compaction_interrupted_boundary_keeps_same_turn_stream_open():
+    async def run():
+        lifecycle = []
+
+        async def on_lifecycle(phase, turn_id):
+            lifecycle.append((phase, turn_id))
+
+        handle = CodexHandle(_Cfg(), turn_lifecycle_callback=on_lifecycle)
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "compact-continuation"
+        started = _notification(
+            "turn/started", turn_id, turn={"id": turn_id},
+        )
+        await handle._dispatch(started)
+        compacted = _notification("thread/compacted", turn_id)
+        await handle._dispatch(compacted)
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        ))
+
+        assert handle.turn_active is True
+        assert handle.turn_id == turn_id
+        assert handle._spontaneous_turn_id == turn_id
+        assert lifecycle == [("started", turn_id)]
+
+        continuation = [
+            _notification(
+                "item/started", turn_id,
+                item={"id": "after-compact", "type": "agentMessage"},
+            ),
+            _notification(
+                "item/agentMessage/delta", turn_id,
+                itemId="after-compact", delta="continued",
+            ),
+            _notification(
+                "item/completed", turn_id,
+                item={
+                    "id": "after-compact",
+                    "type": "agentMessage",
+                    "text": "continued",
+                },
+            ),
+        ]
+        for message in continuation:
+            await handle._dispatch(message)
+        final = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        )
+        await handle._dispatch(final)
+
+        frames = [
+            item async for item in
+            handle.receive_spontaneous_response(turn_id)
+        ]
+        assert frames == [started, compacted, *continuation, final]
+        assert lifecycle == [
+            ("started", turn_id),
+            ("completed", turn_id),
+        ]
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+
+    asyncio.run(run())
+
+
+def test_managed_compaction_interrupted_boundary_keeps_response_open():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "managed-compact-continuation"
+        handle.turn_id = turn_id
+        handle.turn_active = True
+        handle._open_managed_stream()
+
+        compacted = _notification("thread/compacted", turn_id)
+        await handle._dispatch(compacted)
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        ))
+        assert handle.turn_active is True
+        assert handle.turn_id == turn_id
+
+        continuation = _notification(
+            "item/completed", turn_id,
+            item={
+                "id": "managed-after-compact",
+                "type": "agentMessage",
+                "text": "continued",
+            },
+        )
+        await handle._dispatch(continuation)
+        final = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        )
+        await handle._dispatch(final)
+
+        frames = [item async for item in handle.receive_response()]
+        assert frames == [compacted, continuation, final]
+        assert frames[-1]["params"]["turn"]["status"] == "interrupted"
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+
+    asyncio.run(run())
+
+
+def test_plain_interrupted_boundary_remains_terminal():
+    async def run():
+        lifecycle = []
+
+        async def on_lifecycle(phase, turn_id):
+            lifecycle.append((phase, turn_id))
+
+        handle = CodexHandle(_Cfg(), turn_lifecycle_callback=on_lifecycle)
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "plain-interrupted"
+        await handle._dispatch(_notification(
+            "turn/started", turn_id, turn={"id": turn_id},
+        ))
+        terminal = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        )
+        await handle._dispatch(terminal)
+
+        frames = [
+            item async for item in
+            handle.receive_spontaneous_response(turn_id)
+        ]
+        assert frames[-1] == terminal
+        assert lifecycle == [
+            ("started", turn_id),
+            ("completed", turn_id),
+        ]
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+
+    asyncio.run(run())
+
+
 def test_stdout_reader_drains_burst_when_spontaneous_consumer_is_stalled():
     async def run():
         turn_id = "auto-burst"

@@ -799,6 +799,23 @@ export class RelayWs {
     return queued ? requestId : null;
   }
 
+  sendAuthorizePreview(
+    authorizationId: string,
+    requestId: string,
+    decision: "allow" | "deny",
+    targetSid?: string | null,
+  ): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "authorize_preview",
+      authorization_id: authorizationId,
+      request_id: requestId,
+      decision,
+      ts: nowTs(),
+      ...this.sidObj(targetSid),
+    });
+  }
+
   /** Fetch a small canonical conversation page. Heavy per-turn detail remains
    *  in the wrapper materialized index until the user expands it. */
   sendGetHistory(

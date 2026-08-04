@@ -53,6 +53,7 @@ import tempfile
 import time
 import unicodedata
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 from typing import Optional
@@ -92,11 +93,12 @@ from cc_remote.protocol import (
     CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
     BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
+    PreviewAuthorizationRequired, PreviewAuthorizationResult,
     ConversationTurn, History, TurnDetail, HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
     GoalState, Snapshot, StateEvent, State, TakeoverState, SessionControl,
     UserMsg, TurnSteered,
-    ToolUse, ToolResult, TurnBinding, TurnEnd, TurnNotificationContext,
+    ToolUse, ToolResult, ProcessEvent, TurnBinding, TurnEnd, TurnNotificationContext,
     TurnResult, is_downstream,
     is_reliable_command,
     SessionInfo, SessionList, SessionActivity, ListSessions, SessionFocus,
@@ -115,6 +117,7 @@ from cc_remote.wrapper.claude_controls import (
     ClaudeControls,
     last_completed_assistant_controls,
     valid_claude_model,
+    valid_claude_permission,
 )
 from cc_remote.wrapper.codex_controls import (
     CODEX_WEB_SEARCH_MODES,
@@ -154,11 +157,14 @@ from cc_remote.wrapper.history_store import (
     HistorySourceFingerprint,
     MaterializedHistoryPage,
     history_image_from_events,
+    history_source_extends,
     materialize_history_turns,
 )
 from cc_remote.wrapper.stream import (
     StreamTranslator, extract_session_id, extract_model,
-    translate_history, last_assistant_model, transcript_internal_user_events,
+    translate_history, last_assistant_model, transcript_compact_snapshot,
+    transcript_compact_history_page,
+    transcript_internal_user_events,
     transcript_timestamps, transcript_path,
     translate_subagent_history, merge_subagent_history,
 )
@@ -171,10 +177,19 @@ from cc_remote.wrapper.codex_handle import (
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
-    CodexStreamTranslator, codex_session_id, is_turn_terminal,
-    codex_history_boundary_user, codex_history_window,
+    CodexHistoryImageView, CodexStreamTranslator,
+    coalesce_codex_live_notifications,
+    codex_history_image_views, codex_session_id, is_turn_terminal,
+    codex_history_boundary_user, codex_history_turn_user,
+    codex_history_window,
     codex_native_rollback_turns,
     codex_translate_history,
+)
+from cc_remote.wrapper.codex_history import (
+    CodexHistoryCursorError,
+    CodexHistoryInvalidResponse,
+    CodexHistoryUnsupported,
+    CodexOfficialHistory,
 )
 from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
@@ -198,7 +213,7 @@ from cc_remote.wrapper.work_context import (
     work_context_metrics,
 )
 from cc_remote.wrapper.codex_worktrees import (
-    WorktreeError, prepare_worktree, rollback_worktree,
+    WorktreeError, WorktreeSpec, prepare_worktree, rollback_worktree,
 )
 from cc_remote.wrapper.codex_checkpoints import (
     CheckpointConflict, CheckpointError, CodexCheckpointJournal,
@@ -227,6 +242,12 @@ from cc_remote.wrapper.process_scan import (
     process_owner_uid,
 )
 from cc_remote.wrapper.command_router import CommandRouter, UNHANDLED_COMMAND
+from cc_remote.wrapper.preview_capabilities import (
+    PREVIEW_PATH_MAX_BYTES,
+    PreviewCapability,
+    PreviewCapabilityError,
+    PreviewCapabilityStore,
+)
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -334,6 +355,45 @@ def _turn_detail_event_group(event: dict) -> str | None:
     # Control/user/terminal frames reconstruct the turn envelope but do not
     # consume one visible process slot.
     return None
+
+
+def _rebind_turn_detail_visible_id(
+    rows: tuple[dict, ...] | list[dict],
+    *,
+    indexed_turn_id: str,
+    visible_turn_id: str,
+) -> list[dict]:
+    """Bind one proven rollout detail segment to its official visible id.
+
+    Codex may expose a persisted user item id in the official summary while the
+    source-bound rollout index stores that same segment under its rollout user
+    id.  The caller has already resolved the exact native turn and segment
+    index.  Rebind only that verified one-turn group; never guess from prompt
+    text or accept an unrelated singleton detail response.
+    """
+    copied = [dict(row) for row in rows]
+    if indexed_turn_id == visible_turn_id:
+        return copied
+    projected = materialize_history_turns(copied)
+    if (
+        len(projected) != 1
+        or projected[0].get("id") != indexed_turn_id
+    ):
+        raise ValueError("rollout detail identity is not the resolved segment")
+    rebound = False
+    for event in copied:
+        if event.get("msg_id") == indexed_turn_id:
+            event["msg_id"] = visible_turn_id
+            rebound = True
+    if not rebound:
+        raise ValueError("rollout detail has no visible user anchor")
+    rebound_projection = materialize_history_turns(copied)
+    if (
+        len(rebound_projection) != 1
+        or rebound_projection[0].get("id") != visible_turn_id
+    ):
+        raise ValueError("rollout detail could not bind the official identity")
+    return copied
 
 
 def _coalesce_turn_detail_group(rows: list[dict]) -> list[dict]:
@@ -672,6 +732,157 @@ def _render_history_image(
         return "image/webp", source.width, source.height, thumb
 
 
+def _normalized_tool_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _merge_codex_history_image_views(
+    rows: tuple[dict, ...] | list[dict],
+    views: tuple[CodexHistoryImageView, ...],
+) -> list[dict]:
+    """Add only missing image-view rows without replacing official detail."""
+    merged = [dict(row) for row in rows]
+    if not views:
+        return merged
+
+    official_indexes: list[int] = []
+    for index, row in enumerate(merged):
+        if (
+            row.get("type") == "process"
+            and _normalized_tool_name(row.get("tool")) == "viewimage"
+        ):
+            official_indexes.append(index)
+
+    used_official: set[int] = set()
+    matched_official_calls: set[str] = set()
+    view_events: dict[str, dict] = {}
+    for view in views:
+        event = view.event.model_dump(mode="json")
+        view_events[view.call_id] = event
+        event_input = event.get("input")
+        image_path = (
+            event_input.get("file_path")
+            if isinstance(event_input, dict)
+            else None
+        )
+        matched_index = next((
+            index for index in official_indexes
+            if index not in used_official
+            and merged[index].get("item_id") == event.get("item_id")
+        ), None)
+        if matched_index is None and isinstance(image_path, str):
+            matched_index = next((
+                index for index in official_indexes
+                if index not in used_official
+                and isinstance(merged[index].get("input"), dict)
+                and (
+                    merged[index]["input"].get("file_path")
+                    or merged[index]["input"].get("path")
+                ) == image_path
+            ), None)
+        if matched_index is not None:
+            used_official.add(matched_index)
+            official = dict(merged[matched_index])
+            official_input = dict(
+                official.get("input")
+                if isinstance(official.get("input"), dict)
+                else {}
+            )
+            if isinstance(event_input, dict):
+                history_ref = event_input.get("history_image")
+                if isinstance(history_ref, dict):
+                    official_input["history_image"] = history_ref
+            if image_path:
+                official_input.setdefault("file_path", image_path)
+            official["input"] = official_input or None
+            official["tool"] = "view_image"
+            merged[matched_index] = official
+            matched_official_calls.add(view.call_id)
+
+    legacy_view_calls = {
+        str(row.get("tool_use_id"))
+        for row in merged
+        if (
+            row.get("type") == "tool_use"
+            and row.get("tool_use_id") in view_events
+            and _normalized_tool_name(row.get("tool")) == "viewimage"
+        )
+    }
+    placed_calls: set[str] = set(matched_official_calls)
+    base: list[dict] = []
+    for row in merged:
+        call_id = row.get("tool_use_id")
+        if (
+            row.get("type") == "tool_use"
+            and call_id in legacy_view_calls
+        ):
+            call_key = str(call_id)
+            if call_key not in placed_calls:
+                base.append(view_events[call_key])
+                placed_calls.add(call_key)
+            continue
+        if (
+            row.get("type") in {"tool_delta", "tool_result"}
+            and call_id in legacy_view_calls
+        ):
+            continue
+        base.append(row)
+
+    additions = [
+        view for view in views
+        if view.call_id not in placed_calls
+    ]
+    if not additions:
+        return base
+
+    first_by_id: dict[str, int] = {}
+    last_by_id: dict[str, int] = {}
+    for index, row in enumerate(base):
+        for key in ("item_id", "tool_use_id", "message_id"):
+            identity = row.get(key)
+            if not isinstance(identity, str):
+                continue
+            first_by_id.setdefault(identity, index)
+            last_by_id[identity] = index
+
+    fallback_index = next((
+        index for index, row in enumerate(base)
+        if (
+            row.get("type") == "assistant_msg_start"
+            and row.get("channel") == "final"
+        )
+    ), None)
+    if fallback_index is None:
+        fallback_index = next((
+            index for index, row in enumerate(base)
+            if row.get("type") == "turn_end"
+        ), len(base))
+
+    insertions: dict[int, list[dict]] = {}
+    for view in additions:
+        if (
+            view.next_item_id is not None
+            and view.next_item_id in first_by_id
+        ):
+            insert_at = first_by_id[view.next_item_id]
+        elif (
+            view.previous_item_id is not None
+            and view.previous_item_id in last_by_id
+        ):
+            insert_at = last_by_id[view.previous_item_id] + 1
+        else:
+            insert_at = fallback_index
+        insertions.setdefault(insert_at, []).append(
+            view.event.model_dump(mode="json"))
+
+    ordered: list[dict] = []
+    for index in range(len(base) + 1):
+        ordered.extend(insertions.get(index, ()))
+        if index < len(base):
+            ordered.append(base[index])
+    return ordered
+
+
 def _session_permission_mode(ctx: SessionContext) -> str:
     """Return the permission mode actually configured on this live engine."""
     if ctx.engine == "codex":
@@ -749,6 +960,34 @@ class _FileRevisionConflict(RuntimeError):
         self.revision = revision
 
 
+class _PreviewAuthorizationNeeded(ValueError):
+    """An otherwise valid preview points outside cwd without a capability."""
+
+    def __init__(self, path: str, resolved_path: str):
+        super().__init__("外部文件需要确认后才能预览")
+        self.path = path
+        self.resolved_path = resolved_path
+
+
+class _PreviewCapabilityChanged(_PreviewAuthorizationNeeded):
+    """The exact file identity previously authorized no longer matches."""
+
+
+@dataclass(frozen=True)
+class _PreviewChallenge:
+    authorization_id: str
+    session_key: str
+    engine: str
+    space: str
+    client_id: str
+    request_id: str
+    operation: str
+    path: str
+    resolved_path: str
+    preview_id: Optional[str]
+    created_at: float
+
+
 class WrapperMachine:
     # Browser/TUI outboxes hold at most 256 commands. Keep a 2x retry window per
     # client and at most the relay's configured maximum of 64 client identities;
@@ -764,8 +1003,15 @@ class WrapperMachine:
     # number of resident sessions allowed by config validation.
     PRIVATE_BTW_CAP = 64
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
-    PREVIEW_EXTERNAL_PATH_CAP = 256
     PREVIEW_WRITE_CANDIDATE_CAP = 64
+    PREVIEW_AUTHORIZATION_CAP = 256
+    PREVIEW_AUTHORIZATION_TTL = 5 * 60
+    PREVIEW_IMAGE_CANDIDATE_CAP = 64
+    PREVIEW_IMAGE_SNAPSHOT_SESSION_BYTES = 16 * 1024 * 1024
+    PREVIEW_IMAGE_SNAPSHOT_GLOBAL_BYTES = 64 * 1024 * 1024
+    PREVIEW_IMAGE_SNAPSHOT_SESSION_ENTRIES = 64
+    PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES = 256
+    CODEX_HISTORY_IMAGE_VIEW_CACHE_ENTRIES = 256
     NOTIFICATION_TITLE_CAP = 512
     NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
@@ -780,7 +1026,7 @@ class WrapperMachine:
     FORK_BACKGROUND_ATTEMPTS = 100
     UNCERTAIN_FORK_CAP = 4096
     MARKDOWN_PREVIEW_SUFFIXES = frozenset({".md", ".markdown"})
-    HTML_PREVIEW_SUFFIXES = frozenset({".htm", ".html", ".svg"})
+    HTML_PREVIEW_SUFFIXES = frozenset({".htm", ".html"})
     OFFICE_PREVIEW_SUFFIXES = frozenset({
         ".doc", ".docx", ".odt", ".rtf", ".xls", ".xlsx", ".ods",
         ".ppt", ".pptx", ".odp",
@@ -796,6 +1042,7 @@ class WrapperMachine:
         ".gif": "image/gif",
         ".webp": "image/webp",
         ".avif": "image/avif",
+        ".svg": "image/svg+xml",
     }
     ARTIFACT_PREVIEW_MEDIA_TYPES = {
         **PREVIEW_ASSET_MEDIA_TYPES,
@@ -819,7 +1066,8 @@ class WrapperMachine:
         "set_perm", "get_permission_profiles", "set_permission_profile",
         "set_web_search",
         "get_context", "get_status", "get_diff", "get_file_preview", "save_markdown",
-        "get_preview_asset", "answer_question", "get_goal", "set_goal", "clear_goal",
+        "get_preview_asset", "authorize_preview",
+        "answer_question", "get_goal", "set_goal", "clear_goal",
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
@@ -861,6 +1109,31 @@ class WrapperMachine:
         # rejected by a browser that still holds the previous control watermark.
         self._control_revision_epochs: dict[str, int] = {}
         self._preview_conversion_limit = asyncio.Semaphore(2)
+        self._preview_capability_store = PreviewCapabilityStore(
+            Path(cfg.state_dir))
+        self._preview_capability_mutation_lock = asyncio.Lock()
+        self._preview_challenges: OrderedDict[
+            str, _PreviewChallenge
+        ] = OrderedDict()
+        # Immutable snapshots created only after a successful built-in image
+        # read.  They are process-local by design: no temporary user image is
+        # copied to the relay or persisted on disk.
+        self._preview_image_snapshots: OrderedDict[
+            tuple[str, str], tuple[str, str, bytes]
+        ] = OrderedDict()
+        self._preview_image_path_aliases: dict[
+            tuple[str, str], str
+        ] = {}
+        self._preview_image_snapshot_bytes = 0
+        # Event-only cache for repeated TurnDetail pages. Exact image bytes live
+        # in the source-bound SQLite asset cache, never in this second LRU.
+        self._codex_history_image_views: OrderedDict[
+            tuple[str, str, str, int],
+            tuple[
+                HistorySourceFingerprint,
+                tuple[CodexHistoryImageView, ...],
+            ],
+        ] = OrderedDict()
         # Pool of resident sessions, keyed by real session_id (or a `tmp-<uuid>`
         # temp key for a brand-new session until its id is captured).
         self.sessions: dict[str, SessionContext] = {}
@@ -932,6 +1205,13 @@ class WrapperMachine:
         except Exception as exc:
             self._history_index = None
             log.warning("history index unavailable", error=str(exc))
+        # Codex's official app-server owns persisted turns and native compact
+        # state. Keep opaque turn/item cursors generation-local; the browser
+        # receives only stable wire ids and IndexedDB remains the instant paint.
+        self._codex_history = CodexOfficialHistory(
+            cfg.tool_result_max,
+            recover_user=self._recover_official_codex_user,
+        )
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
         # resets this window (documented residual risk, not durable exactly-once).
@@ -1091,6 +1371,16 @@ class WrapperMachine:
                     "history index invalidation failed", session_id=sid,
                     error=str(exc),
                 )
+        for key in tuple(self._codex_history_image_views):
+            if key[0] == sid:
+                self._codex_history_image_views.pop(key, None)
+        invalidate_official = getattr(
+            getattr(self, "_codex_history", None),
+            "invalidate_thread",
+            None,
+        )
+        if callable(invalidate_official):
+            invalidate_official(sid)
         return self._history_revision(sid)
 
     def _focused_ctx(self) -> Optional[SessionContext]:
@@ -1327,7 +1617,11 @@ class WrapperMachine:
                 session_id,
                 turn_id,
                 logical_msg_id,
-                daemon_epoch=ctx.codex_daemon_epoch,
+                daemon_epoch=(
+                    None
+                    if ctx.codex_daemon_epoch == _CODEX_DAEMON_UNMARKED_EPOCH
+                    else ctx.codex_daemon_epoch
+                ),
                 automatic=automatic,
             )
         except Exception as exc:
@@ -3117,6 +3411,8 @@ class WrapperMachine:
                 except Exception:
                     pass
                 self.sessions.pop(ctx.key, None)
+                self._purge_preview_image_snapshots(
+                    ctx.preview_snapshot_token)
             if record is not None and record.session_id is None:
                 await asyncio.to_thread(store.abandon, record.work_id)
             await self._broadcast_work_schedule_state(
@@ -3228,6 +3524,7 @@ class WrapperMachine:
             # replacement wrapper connected. It was spawned only for recovery;
             # leave the resident slot available until the user focuses it.
             self.sessions.pop(ctx.key, None)
+            self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
             try:
                 await ctx.sdk.disconnect()
             except Exception as exc:
@@ -3246,27 +3543,49 @@ class WrapperMachine:
         except ValueError:
             return False
 
-    def _observe_preview_path_event(self, ctx: SessionContext, msg) -> None:
-        """Grant an exact, bounded preview capability after a successful write.
+    def _normalize_preview_write_event(self, msg) -> tuple[str, ...]:
+        """Decorate one write ToolUse without granting filesystem access.
 
-        Normal previews remain cwd-confined.  Claude/Codex can, however, be
+        Historical translation also calls this presentation-only helper. It must
+        never populate the live pending map: a transcript records the old path,
+        but not the device/inode observed when that write completed.
+        """
+        if (
+            not isinstance(msg, ToolUse)
+            or (msg.tool or "").lower() not in self.PREVIEW_WRITE_TOOLS
+        ):
+            return ()
+        raw_paths = self._tool_write_paths(msg.input)
+        if not raw_paths:
+            return ()
+        # ``file_paths`` is the engine-neutral presentation field. Keep the
+        # original payload beside it so old clients and detailed tool views
+        # retain the exact SDK/app-server input.
+        if msg.input.get("file_paths") != list(raw_paths):
+            msg.input = dict(msg.input)
+            msg.input["file_paths"] = list(raw_paths)
+        return raw_paths
+
+    async def _run_preview_capability_mutation(
+        self, method, /, *args, **kwargs,
+    ):
+        """Serialize copy-on-write store mutations away from the event loop."""
+        async with self._preview_capability_mutation_lock:
+            return await asyncio.to_thread(method, *args, **kwargs)
+
+    async def _observe_preview_path_event(self, ctx: SessionContext, msg) -> None:
+        """Grant an exact capability only at a live successful-write boundary.
+
+        Normal previews remain cwd-confined. Claude/Codex can, however, be
         explicitly asked to create a deliverable elsewhere (for example
-        ``/tmp/test.md``).  The resulting ToolUse + successful ToolResult is an
-        auditable capability for that exact path; knowing any other absolute
-        path is still insufficient to read it through Remote.
+        ``/tmp/test.md``). The live ToolUse + successful ToolResult pair is an
+        auditable capability for the exact file identity inspected at that
+        moment; replaying the same pair from history is not.
         """
         if isinstance(msg, ToolUse):
-            if (msg.tool or "").lower() not in self.PREVIEW_WRITE_TOOLS:
-                return
-            raw_paths = self._tool_write_paths(msg.input)
+            raw_paths = self._normalize_preview_write_event(msg)
             if not raw_paths:
                 return
-            # ``file_paths`` is the engine-neutral presentation field.  Keep the
-            # original payload beside it so old clients and detailed tool views
-            # retain the exact SDK/app-server input.
-            if msg.input.get("file_paths") != list(raw_paths):
-                msg.input = dict(msg.input)
-                msg.input["file_paths"] = list(raw_paths)
             pending = ctx.preview_write_candidates
             pending[msg.tool_use_id] = raw_paths
             while len(pending) > self.PREVIEW_WRITE_CANDIDATE_CAP:
@@ -3280,17 +3599,276 @@ class WrapperMachine:
                 "failed", "declined", "cancelled", "interrupted"}:
             return
         root = os.path.realpath(ctx.cwd)
-        paths = ctx.preview_external_paths
+        session_key = ctx.session_id or ctx.key
+        if not session_key:
+            return
         for raw_path in raw_paths:
             candidate = os.path.realpath(
                 raw_path if os.path.isabs(raw_path)
                 else os.path.join(root, raw_path))
             if self._path_is_below(root, candidate):
                 continue
-            paths.pop(candidate, None)
-            paths[candidate] = None
-        while len(paths) > self.PREVIEW_EXTERNAL_PATH_CAP:
-            paths.pop(next(iter(paths)))
+            try:
+                await self._run_preview_capability_mutation(
+                    self._preview_capability_store.grant_path,
+                    ctx.engine,
+                    ctx.space,
+                    session_key,
+                    candidate,
+                    mode="read_write",
+                    source="structured_write",
+                    persist=not ctx.btw,
+                )
+            except PreviewCapabilityError as exc:
+                # A tool may report success before a delayed/background file
+                # exists. Do not guess or retain a path-only capability; the
+                # eventual preview can use the explicit confirmation flow.
+                log.debug(
+                    "structured preview capability not granted",
+                    error=str(exc),
+                )
+
+    @staticmethod
+    def _preview_image_read_path(msg: ToolUse) -> Optional[str]:
+        """Return the exact path for a built-in image-reading tool."""
+        tool = re.sub(r"[^a-z0-9]", "", (msg.tool or "").lower())
+        if tool not in {"read", "readfile", "viewimage"}:
+            return None
+        for key in ("file_path", "path"):
+            candidate = msg.input.get(key)
+            if (
+                isinstance(candidate, str)
+                and candidate
+                and not candidate.startswith("~")
+                and len(candidate) <= 4096
+            ):
+                return candidate
+        return None
+
+    async def _observe_preview_image_event(
+        self, ctx: SessionContext, msg,
+    ) -> None:
+        """Capture cwd-external images only after their tool read succeeds."""
+        if isinstance(msg, ProcessEvent):
+            tool = re.sub(r"[^a-z0-9]", "", (msg.tool or "").lower())
+            if msg.kind != "server_tool" or tool != "viewimage":
+                return
+            raw_path = None
+            if isinstance(msg.input, dict):
+                for key in ("file_path", "path"):
+                    candidate = msg.input.get(key)
+                    if (
+                        isinstance(candidate, str)
+                        and candidate
+                        and not candidate.startswith("~")
+                        and len(candidate) <= 4096
+                    ):
+                        raw_path = candidate
+                        break
+            if raw_path is None:
+                return
+            if isinstance(msg.input, dict) and "preview_id" in msg.input:
+                msg.input = dict(msg.input)
+                msg.input.pop("preview_id", None)
+            root = os.path.realpath(ctx.cwd)
+            candidate = os.path.realpath(
+                raw_path if os.path.isabs(raw_path)
+                else os.path.join(root, raw_path))
+            if os.path.splitext(candidate)[1].lower() not in (
+                    self.PREVIEW_ASSET_MEDIA_TYPES):
+                return
+            pending = ctx.preview_image_candidates
+            if msg.phase != "end":
+                pending[msg.item_id] = candidate
+                while len(pending) > self.PREVIEW_IMAGE_CANDIDATE_CAP:
+                    pending.pop(next(iter(pending)))
+                return
+            candidate = pending.pop(msg.item_id, candidate)
+            if msg.status in {
+                    "failed", "declined", "cancelled", "interrupted"}:
+                return
+            try:
+                capability = self._preview_capability_store.inspect_path(
+                    ctx.engine,
+                    ctx.space,
+                    ctx.session_id or ctx.key,
+                    candidate,
+                    mode="read",
+                    source="engine_observed",
+                )
+                _, media_type, data = await asyncio.to_thread(
+                    self._read_preview_asset,
+                    ctx.cwd,
+                    candidate,
+                    {capability.path: capability},
+                )
+            except (OSError, ValueError, PreviewCapabilityError):
+                return
+            self._store_preview_image_snapshot(
+                ctx.preview_snapshot_token,
+                candidate,
+                media_type,
+                data,
+                snapshot_id=msg.item_id,
+            )
+            msg.input = dict(msg.input or {})
+            msg.input["preview_id"] = msg.item_id
+            return
+
+        if isinstance(msg, ToolUse):
+            raw_path = self._preview_image_read_path(msg)
+            if raw_path is None:
+                return
+            root = os.path.realpath(ctx.cwd)
+            candidate = os.path.realpath(
+                raw_path if os.path.isabs(raw_path)
+                else os.path.join(root, raw_path))
+            if self._path_is_below(root, candidate):
+                return
+            if os.path.splitext(candidate)[1].lower() not in (
+                    self.PREVIEW_ASSET_MEDIA_TYPES):
+                return
+            pending = ctx.preview_image_candidates
+            pending[msg.tool_use_id] = candidate
+            while len(pending) > self.PREVIEW_IMAGE_CANDIDATE_CAP:
+                pending.pop(next(iter(pending)))
+            return
+
+        if not isinstance(msg, ToolResult):
+            return
+        candidate = ctx.preview_image_candidates.pop(msg.tool_use_id, None)
+        if candidate is None or msg.is_error or msg.status in {
+                "failed", "declined", "cancelled", "interrupted"}:
+            return
+        try:
+            capability = self._preview_capability_store.inspect_path(
+                ctx.engine,
+                ctx.space,
+                ctx.session_id or ctx.key,
+                candidate,
+                mode="read",
+                source="engine_observed",
+            )
+            _, media_type, data = await asyncio.to_thread(
+                self._read_preview_asset,
+                ctx.cwd,
+                candidate,
+                {capability.path: capability},
+            )
+        except (OSError, ValueError, PreviewCapabilityError):
+            # The engine result remains authoritative. A path that disappeared,
+            # changed type, or exceeded the preview bound simply has no Remote
+            # preview capability.
+            return
+        self._store_preview_image_snapshot(
+            ctx.preview_snapshot_token,
+            candidate,
+            media_type,
+            data,
+            snapshot_id=msg.tool_use_id,
+        )
+
+    def _store_preview_image_snapshot(
+        self,
+        token: str,
+        path: str,
+        media_type: str,
+        data: bytes,
+        *,
+        snapshot_id: str | None = None,
+    ) -> None:
+        cache = self._preview_image_snapshots
+        asset_id = snapshot_id or path
+        key = (token, asset_id)
+        previous = cache.pop(key, None)
+        if previous is not None:
+            self._preview_image_snapshot_bytes -= len(previous[2])
+            previous_alias = (token, previous[0])
+            if self._preview_image_path_aliases.get(previous_alias) == asset_id:
+                self._preview_image_path_aliases.pop(previous_alias, None)
+        cache[key] = (path, media_type, data)
+        self._preview_image_path_aliases[(token, path)] = asset_id
+        self._preview_image_snapshot_bytes += len(data)
+
+        session_bytes = sum(
+            len(payload)
+            for (entry_token, _), (_, _, payload) in cache.items()
+            if entry_token == token
+        )
+        session_entries = sum(
+            1 for entry_token, _ in cache if entry_token == token)
+        while (
+            session_bytes > self.PREVIEW_IMAGE_SNAPSHOT_SESSION_BYTES
+            or session_entries > self.PREVIEW_IMAGE_SNAPSHOT_SESSION_ENTRIES
+        ):
+            oldest = next(
+                (
+                    entry_key for entry_key in cache
+                    if entry_key[0] == token
+                ),
+                None,
+            )
+            if oldest is None:
+                break
+            evicted_path, _, payload = cache.pop(oldest)
+            alias_key = (oldest[0], evicted_path)
+            if self._preview_image_path_aliases.get(alias_key) == oldest[1]:
+                self._preview_image_path_aliases.pop(alias_key, None)
+            size = len(payload)
+            session_bytes -= size
+            session_entries -= 1
+            self._preview_image_snapshot_bytes -= size
+
+        while (
+            self._preview_image_snapshot_bytes
+            > self.PREVIEW_IMAGE_SNAPSHOT_GLOBAL_BYTES
+            or len(cache) > self.PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES
+        ) and cache:
+            evicted_key, (evicted_path, _, payload) = cache.popitem(last=False)
+            alias_key = (evicted_key[0], evicted_path)
+            if self._preview_image_path_aliases.get(alias_key) == evicted_key[1]:
+                self._preview_image_path_aliases.pop(alias_key, None)
+            self._preview_image_snapshot_bytes -= len(payload)
+
+    def _purge_preview_image_snapshots(self, token: str) -> None:
+        cache = self._preview_image_snapshots
+        for key in tuple(cache):
+            if key[0] != token:
+                continue
+            path, _, payload = cache.pop(key)
+            alias_key = (key[0], path)
+            if self._preview_image_path_aliases.get(alias_key) == key[1]:
+                self._preview_image_path_aliases.pop(alias_key, None)
+            self._preview_image_snapshot_bytes -= len(payload)
+        for alias_key in tuple(self._preview_image_path_aliases):
+            if alias_key[0] == token:
+                self._preview_image_path_aliases.pop(alias_key, None)
+
+    def _preview_image_snapshot(
+        self,
+        ctx: SessionContext,
+        path: str,
+        preview_id: str | None = None,
+    ) -> Optional[tuple[str, bytes]]:
+        candidate = os.path.realpath(
+            path if os.path.isabs(path)
+            else os.path.join(os.path.realpath(ctx.cwd), path))
+        token = ctx.preview_snapshot_token
+        key = (
+            (token, preview_id)
+            if preview_id and (token, preview_id) in self._preview_image_snapshots
+            else (
+                token,
+                self._preview_image_path_aliases.get(
+                    (token, candidate), candidate),
+            )
+        )
+        snapshot = self._preview_image_snapshots.pop(key, None)
+        if snapshot is not None:
+            self._preview_image_snapshots[key] = snapshot
+            _stored_path, media_type, data = snapshot
+            return media_type, data
+        return None
 
     @staticmethod
     def _tool_write_paths(tool_input: dict) -> tuple[str, ...]:
@@ -3336,11 +3914,21 @@ class WrapperMachine:
                 break
         return tuple(paths)
 
-    @staticmethod
-    def _preview_external_paths(ctx: SessionContext) -> frozenset[str]:
-        # Copy before handing the set to a worker thread.  Live tool events may
-        # add another path while an Office conversion or file read is running.
-        return frozenset(ctx.preview_external_paths)
+    def _preview_capabilities(
+        self,
+        ctx: SessionContext,
+        *,
+        require_write: bool = False,
+    ) -> dict[str, PreviewCapability]:
+        session_key = ctx.session_id or ctx.key
+        if not session_key:
+            return {}
+        return self._preview_capability_store.snapshot(
+            ctx.engine,
+            ctx.space,
+            session_key,
+            require_write=require_write,
+        )
 
     async def _emit_locked(self, ctx: SessionContext, msg) -> None:
         # Stamp routing before buffering so byte accounting includes the final
@@ -3371,7 +3959,8 @@ class WrapperMachine:
         await self.transport.send(live)
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
-        self._observe_preview_path_event(ctx, msg)
+        await self._observe_preview_image_event(ctx, msg)
+        await self._observe_preview_path_event(ctx, msg)
         async with ctx.emit_lock:
             await self._emit_locked(ctx, msg)
 
@@ -4744,6 +5333,11 @@ class WrapperMachine:
                 "holders": set(),
                 "writers": set(),
                 "active_external_turns": active_turns,
+                # A task_started observed incrementally after watch creation is
+                # authoritative live-tail evidence, not cold-start debris. Keep
+                # it across a later shared-context attach even though it was not
+                # part of ``seeded_external_turns``.
+                "observed_external_turns": set(),
                 # A cold tail cannot distinguish a live turn from a crashed old
                 # task_started record. The first complete /proc scan confirms it.
                 "seeded_external_turns": set(active_turns),
@@ -5062,8 +5656,13 @@ class WrapperMachine:
         # the old full translated page made every external append re-send
         # megabytes to every browser. Keep the same authoritative replacement
         # semantics with the lightweight projection; detail remains on demand.
-        hist = await self._build_history(
-            sid, limit=self.MIRROR_LIMIT, detail="summary", allow_stale=True)
+        hist = await self._build_requested_history(
+            sid,
+            before=None,
+            limit=self.MIRROR_LIMIT,
+            cwd=None,
+            detail="summary",
+        )
         hist.sid = sid
         await self.transport.send(hist)
         return hist
@@ -5178,10 +5777,16 @@ class WrapperMachine:
             # running creates this shared context mid-turn; that passive attach
             # must not erase the App's authoritative task_started marker.
             seeded = set(w.get("seeded_external_turns", ()))
+            observed = set(w.get("observed_external_turns", ()))
             active = w.setdefault("active_external_turns", {})
             for turn_id in list(active):
-                if turn_id not in seeded and not private_holders:
+                if (
+                    turn_id not in seeded
+                    and turn_id not in observed
+                    and not private_holders
+                ):
                     active.pop(turn_id, None)
+            w.setdefault("observed_external_turns", set()).clear()
             w.setdefault("pending_wrapper_turns", {}).clear()
             w["takeover_pending"] = None
             w["shared_activity_initialized"] = True
@@ -5212,6 +5817,7 @@ class WrapperMachine:
             w["size"] = st.st_size
             w["partial"] = b""
             w["active_external_turns"].clear()
+            w.setdefault("observed_external_turns", set()).clear()
             w["pending_wrapper_turns"].clear()
             if w.get("takeover_pending"):
                 takeover_cleared = True
@@ -5226,6 +5832,7 @@ class WrapperMachine:
         sdk = ctx.sdk if ctx is not None else None
         own_turn_ids = set(getattr(sdk, "owned_turn_ids", ())) if sdk else set()
         active: dict[str, float] = w["active_external_turns"]
+        observed: set[str] = w.setdefault("observed_external_turns", set())
         pending: dict[str, dict[str, object]] = w["pending_wrapper_turns"]
         attribution_pending = bool(
             sdk is not None and getattr(
@@ -5248,6 +5855,7 @@ class WrapperMachine:
         # may identify a marker after an earlier implementation already promoted it.
         for turn_id in own_turn_ids:
             active.pop(turn_id, None)
+            observed.discard(turn_id)
         for turn_id, record in list(pending.items()):
             seen_at = float(record.get("seen_at", now))
             if turn_id in own_turn_ids:
@@ -5269,6 +5877,7 @@ class WrapperMachine:
                 self._revoke_codex_takeover(w, holders, writers)
                 if not bool(record.get("finished")):
                     self._remember_watch_turn(active, turn_id, now)
+                    observed.add(turn_id)
                 pending.pop(turn_id, None)
                 external_growth = True
 
@@ -5305,6 +5914,9 @@ class WrapperMachine:
                     # governed by the active marker below.
                     self._revoke_codex_takeover(w, holders, writers)
                     self._remember_watch_turn(active, turn_id, now)
+                    observed.add(turn_id)
+                    while len(observed) > self.CODEX_TURN_TRACK_MAX:
+                        observed.pop()
                     external_growth = True
             for turn_id in markers.finished:
                 if turn_id in pending:
@@ -5312,6 +5924,7 @@ class WrapperMachine:
                 elif turn_id in active:
                     external_growth = True
                     active.pop(turn_id, None)
+                observed.discard(turn_id)
 
             if holders or active:
                 external_growth = True
@@ -5327,6 +5940,7 @@ class WrapperMachine:
             # Fallback for a crashed short-lived writer that never recorded a
             # terminal marker. A live writer's FD keeps the session locked.
             active.clear()
+            observed.clear()
 
         # Clicking takeover during a live terminal response records the user's
         # ownership intent immediately, but waits for that response to reach a
@@ -5702,6 +6316,7 @@ class WrapperMachine:
         source_window_has_more = False
         source_window_oldest_cursor = None
         source_window_boundary_offset = None
+        oversized_compact_page = None
         try:
             source_path = await asyncio.to_thread(
                 codex_rollout_path if is_codex_hist else transcript_path, sid)
@@ -5788,21 +6403,6 @@ class WrapperMachine:
             cached_events = cached_full_events or [
                 dict(row) for row in indexed_page.events
             ]
-            if ctx is not None:
-                # Rebuild exact preview capabilities from the materialized
-                # ToolUse/ToolResult pairs.  A wrapper restart must not make a
-                # previously valid cross-cwd file preview disappear merely
-                # because JSONL translation was skipped.
-                for row in cached_events:
-                    try:
-                        if row.get("type") == "tool_use":
-                            self._observe_preview_path_event(
-                                ctx, ToolUse.model_validate(row))
-                        elif row.get("type") == "tool_result":
-                            self._observe_preview_path_event(
-                                ctx, ToolResult.model_validate(row))
-                    except (TypeError, ValueError):
-                        continue
             if before is None and ctx is not None:
                 live_model = _session_model(ctx)
                 live_effort = _session_effort(ctx)
@@ -5881,7 +6481,6 @@ class WrapperMachine:
                 ]
             if (
                 (stale_indexed_page or not cached_source_stable)
-                and not source_too_large
                 and before is None
             ):
                 self._schedule_history_refresh(
@@ -5893,27 +6492,52 @@ class WrapperMachine:
                 )
             return cached_history
         if source_too_large:
-            notice = Error(
-                code=ERR_INTERNAL,
-                message=("历史文件超过安全读取上限；请调大 "
-                         "HISTORY_SOURCE_MAX_BYTES 或在终端中查看"),
-                sid=sid,
-            )
-            return History(
-                session_id=sid,
-                revision=revision,
-                generation=self.instance_id,
-                build_seq=build_seq,
-                live_seq=live_seq,
-                events=[notice.model_dump(mode="json")],
-                has_more=False,
+            oversized_compact_page = await asyncio.to_thread(
+                transcript_compact_history_page,
+                sid,
+                path=source_path,
                 before=before,
-                external=self._is_external(sid),
-                control=control,
-                takeover_pending=bool(
-                    (self._watch.get(sid) or {}).get("takeover_pending")),
-                in_progress=in_progress,
+                limit=(int(limit) if isinstance(limit, int) and limit > 0
+                       else self.MIRROR_LIMIT),
+                max_payload_bytes=self.cfg.history_source_max_bytes,
+                index_store=self._history_index,
+                snapshot_size=(source_fingerprint.size
+                               if source_fingerprint is not None else None),
+                max_record_bytes=min(
+                    256 * 1024 * 1024,
+                    max(64 * 1024 * 1024,
+                        self.cfg.history_source_max_bytes),
+                ),
             )
+            if oversized_compact_page is None:
+                message = (
+                    "历史页游标已失效，请刷新会话后重试"
+                    if before is not None
+                    else "历史文件超过安全读取上限；请调大 "
+                         "HISTORY_SOURCE_MAX_BYTES 或在终端中查看"
+                )
+                notice = Error(
+                    code=ERR_INTERNAL,
+                    message=message,
+                    sid=sid,
+                )
+                return History(
+                    session_id=sid,
+                    revision=revision,
+                    generation=self.instance_id,
+                    build_seq=build_seq,
+                    live_seq=live_seq,
+                    events=[notice.model_dump(mode="json")],
+                    has_more=False,
+                    before=before,
+                    external=self._is_external(sid),
+                    control=control,
+                    takeover_pending=bool(
+                        (self._watch.get(sid) or {}).get("takeover_pending")),
+                    in_progress=in_progress,
+                )
+            source_window_has_more = oversized_compact_page.has_more
+            source_window_oldest_cursor = oversized_compact_page.oldest_cursor
         history_error = None
         if is_codex_hist:
             # Codex history lives in ~/.codex/sessions rollout files, not the
@@ -5994,13 +6618,38 @@ class WrapperMachine:
                     directory = os.path.realpath(expanded_hint)
             try:
                 def _read():
-                    messages = get_session_messages(sid, directory=directory)
-                    if not messages and directory is not None:
-                        messages = get_session_messages(sid, directory=None)
+                    if oversized_compact_page is not None:
+                        messages = oversized_compact_page.messages
+                        timestamps = oversized_compact_page.timestamps
+                        internal_events = oversized_compact_page.internal_events
+                    else:
+                        compact_snapshot = transcript_compact_snapshot(
+                            sid,
+                            path=source_path,
+                            index_store=self._history_index,
+                            snapshot_size=(source_fingerprint.size
+                                           if source_fingerprint is not None
+                                           else None),
+                            max_record_bytes=min(
+                                256 * 1024 * 1024,
+                                max(64 * 1024 * 1024,
+                                    self.cfg.history_source_max_bytes),
+                            ),
+                        )
+                        if compact_snapshot is not None:
+                            messages, timestamps, internal_events = compact_snapshot
+                        else:
+                            messages = get_session_messages(
+                                sid, directory=directory)
+                            if not messages and directory is not None:
+                                messages = get_session_messages(
+                                    sid, directory=None)
+                            timestamps = transcript_timestamps(sid)
+                            internal_events = transcript_internal_user_events(sid)
                     return (
                         messages,
-                        transcript_timestamps(sid),
-                        transcript_internal_user_events(sid),
+                        timestamps,
+                        internal_events,
                     )
                 msgs, tss, internal_events = await asyncio.to_thread(_read)
                 if internal_events:
@@ -6038,12 +6687,11 @@ class WrapperMachine:
                 in_progress=in_progress,
             )
         for ev in events:
-            if ctx is not None:
-                # Rebuild exact cross-cwd preview capabilities from the durable
-                # transcript after a wrapper restart or resident-session
-                # eviction.  The observer grants only completed Write/Edit
-                # pairs, never a path merely mentioned by the assistant.
-                self._observe_preview_path_event(ctx, ev)
+            # History may normalize file-operation presentation, but it cannot
+            # mint a capability for today's inode from yesterday's write. Normal
+            # sessions restore the identity captured at the live boundary from
+            # PreviewCapabilityStore; legacy rows fail closed and ask once.
+            self._normalize_preview_write_event(ev)
             if isinstance(ev, UserMsg):
                 ev.prompt, restored_files = self._strip_attachment_paths(ev.prompt)
                 if restored_files and not ev.files:
@@ -6284,6 +6932,12 @@ class WrapperMachine:
                     HistorySourceFingerprint.capture, source_fingerprint.path)
                 source_snapshot_stable = (
                     current_fingerprint == source_fingerprint
+                    or (
+                        before is not None
+                        and oversized_compact_page is not None
+                        and history_source_extends(
+                            source_fingerprint, current_fingerprint)
+                    )
                 )
             except OSError:
                 source_snapshot_stable = False
@@ -6460,6 +7114,112 @@ class WrapperMachine:
             self.HISTORY_REFRESH_MAX_INTERVAL_SECONDS,
         )
 
+    async def _recover_official_codex_user(
+        self,
+        sid: str,
+        native_turn_id: str,
+        visible_turn_id: str,
+        user_index: int,
+    ) -> UserMsg | None:
+        """Recover inline image bytes hidden behind expired localImage paths."""
+        path = await asyncio.to_thread(codex_rollout_path, sid)
+        if not path:
+            return None
+        return await asyncio.to_thread(
+            codex_history_turn_user,
+            path,
+            native_turn_id,
+            visible_turn_id,
+            user_index,
+        )
+
+    async def _build_official_codex_history(
+        self,
+        sid: str,
+        *,
+        before: str | None,
+        limit: int | None,
+    ) -> History:
+        """Build one summary page from Codex's persisted app-server turns.
+
+        This control-plane read never resumes the thread. Opaque official
+        cursors stay inside ``CodexOfficialHistory`` and are invalidated with
+        the wrapper generation; the wire keeps the existing safe turn ids.
+        """
+        revision = self._history_revision(sid)
+        if before is None:
+            build_seq = self._history_build_sequences.get(sid, 0) + 1
+            self._history_build_sequences[sid] = build_seq
+        else:
+            build_seq = self._history_build_sequences.get(sid, 0)
+        ctx = self._ctx_by_sid(sid)
+        watch = self._watch.get(sid) or {}
+        active_external_turns = watch.get("active_external_turns")
+        active_turn_ids = (
+            set(active_external_turns)
+            if isinstance(active_external_turns, dict)
+            else set()
+        )
+        if ctx is not None and ctx.state != "idle" and not active_turn_ids:
+            for candidate in (
+                ctx.codex_owned_turn_id,
+                ctx.codex_spontaneous_turn_id,
+                getattr(ctx.sdk, "turn_id", None),
+            ):
+                if isinstance(candidate, str) and candidate:
+                    active_turn_ids.add(candidate)
+                    break
+        in_progress = bool(
+            (ctx is not None and ctx.state != "idle")
+            or (
+                isinstance(active_external_turns, dict)
+                and active_external_turns
+            )
+        )
+        page = await self._codex_history.summary_page(
+            sid,
+            before=before,
+            limit=limit or 4,
+            include_live_detail=in_progress and before is None,
+            active_turn_ids=active_turn_ids if before is None else set(),
+            # The latest row can be the new active turn while the just-finished
+            # previous row is exactly the steered turn being reconciled. Hydrate
+            # both once; later mirrors reuse the generation-local bounded cache.
+            hydrate_recent=2 if before is None else 0,
+        )
+
+        control_rows: list[dict] = []
+        if before is None and ctx is not None:
+            model = _session_model(ctx)
+            effort = _session_effort(ctx)
+            if model:
+                control_rows.append(
+                    Model(model=model, sid=sid).model_dump(mode="json"))
+            if effort:
+                control_rows.append(
+                    Effort(effort=effort, sid=sid).model_dump(mode="json"))
+        return History(
+            session_id=sid,
+            revision=revision,
+            generation=self.instance_id,
+            build_seq=build_seq,
+            live_seq=ctx.seq if ctx is not None else None,
+            events=control_rows,
+            turns=[
+                ConversationTurn.model_validate(turn)
+                for turn in page.turns
+            ],
+            detail="summary",
+            has_more=page.has_more,
+            before=before,
+            control=self._session_control(ctx) if ctx is not None else None,
+            oldest_id=page.oldest_id,
+            newest_id=page.newest_id,
+            external=self._is_external(sid),
+            takeover_pending=bool(watch.get("takeover_pending")),
+            in_progress=in_progress,
+        )
+
     async def _build_requested_history(
         self,
         sid: str,
@@ -6475,6 +7235,68 @@ class WrapperMachine:
         # scan can take seconds on macOS and must not hold the conversation
         # first paint. The watch loop and switch/query safety paths refresh
         # SessionControl separately; history uses the last known control value.
+        watch = self._watch.get(sid) or {}
+        ctx = self._ctx_by_sid(sid)
+        is_codex = bool(
+            (ctx is not None and ctx.engine == "codex")
+            or watch.get("engine") == "codex"
+        )
+        if is_codex and detail == "summary":
+            try:
+                return await self._build_official_codex_history(
+                    sid, before=before, limit=limit)
+            except CodexHistoryUnsupported:
+                # Older app-server builds retain the source-window rollout
+                # parser. This is a capability fallback, never a response/error
+                # fallback: auth, timeout and malformed official data must stay
+                # visible instead of being mistaken for empty history.
+                log.info(
+                    "official Codex history unsupported; using rollout",
+                    session_id=sid,
+                )
+            except (
+                CodexHistoryCursorError,
+                CodexHistoryInvalidResponse,
+                CodexRpcOutcomeUnknown,
+                CodexRpcRejected,
+                OSError,
+                RuntimeError,
+            ) as exc:
+                log.warning(
+                    "official Codex history failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+                revision = self._history_revision(sid)
+                # The attempted official newest-page build already advanced the
+                # sequence before issuing I/O. Preserve that exact watermark
+                # for its correlated error instead of creating a phantom build.
+                build_seq = self._history_build_sequences.get(sid, 0)
+                return History(
+                    session_id=sid,
+                    revision=revision,
+                    generation=self.instance_id,
+                    build_seq=build_seq,
+                    live_seq=ctx.seq if ctx is not None else None,
+                    authoritative=False,
+                    error="历史暂时不可用，请稍后重试",
+                    events=[],
+                    turns=[],
+                    detail="summary",
+                    has_more=False,
+                    before=before,
+                    control=(
+                        self._session_control(ctx)
+                        if ctx is not None else None
+                    ),
+                    external=self._is_external(sid),
+                    takeover_pending=bool(
+                        watch.get("takeover_pending")),
+                    in_progress=bool(
+                        (ctx is not None and ctx.state != "idle")
+                        or watch.get("active_external_turns")
+                    ),
+                )
         return await self._build_history(
             sid, before=before, limit=limit, cwd_hint=cwd, detail=detail,
             allow_stale=True)
@@ -6526,6 +7348,161 @@ class WrapperMachine:
                  elapsed_ms=round((time.perf_counter() - started_at) * 1000))
         return hist
 
+    async def _supplement_codex_history_image_views(
+        self,
+        sid: str,
+        visible_turn_id: str,
+        rows: tuple[dict, ...] | list[dict],
+        *,
+        required_image_id: str | None = None,
+    ) -> list[dict]:
+        """Add rollout-only image views while preserving official detail."""
+        try:
+            locator = self._codex_history.rollout_fallback(
+                sid, visible_turn_id)
+            path = await asyncio.to_thread(codex_rollout_path, sid)
+            if not path:
+                return list(rows)
+            source = await asyncio.to_thread(
+                HistorySourceFingerprint.capture, path)
+            cache_key = (
+                sid,
+                source.path,
+                locator.native_turn_id,
+                locator.segment_index,
+            )
+            cached = self._codex_history_image_views.get(cache_key)
+            views: tuple[CodexHistoryImageView, ...] | None = None
+            parsed = False
+            if cached is not None:
+                cached_source, cached_views = cached
+                if await asyncio.to_thread(
+                    history_source_extends, cached_source, source,
+                ):
+                    views = cached_views
+                    self._codex_history_image_views.move_to_end(cache_key)
+                else:
+                    self._codex_history_image_views.pop(cache_key, None)
+            if views is None:
+                views = await asyncio.to_thread(
+                    codex_history_image_views,
+                    path,
+                    locator.native_turn_id,
+                    segment_index=locator.segment_index,
+                )
+                parsed = True
+
+            required_view = None
+            if required_image_id is not None:
+                required_view = next((
+                    view for view in views
+                    if (
+                        isinstance(view.event.input, dict)
+                        and isinstance(
+                            view.event.input.get("history_image"), dict)
+                        and view.event.input["history_image"].get("image_id")
+                        == required_image_id
+                    )
+                ), None)
+            if (
+                required_view is not None
+                and not parsed
+                and self._history_index is not None
+            ):
+                cached_asset = await asyncio.to_thread(
+                    self._history_index.get_image_asset,
+                    sid,
+                    "codex",
+                    source,
+                    visible_turn_id,
+                    required_image_id,
+                    "full",
+                )
+                if cached_asset is None:
+                    views = await asyncio.to_thread(
+                        codex_history_image_views,
+                        path,
+                        locator.native_turn_id,
+                        segment_index=locator.segment_index,
+                    )
+                    parsed = True
+            merged = _merge_codex_history_image_views(rows, views)
+            if self._history_index is None:
+                return merged
+            views_to_store = list(views)
+            if required_image_id is not None:
+                views_to_store.sort(key=lambda view: bool(
+                    isinstance(view.event.input, dict)
+                    and isinstance(
+                        view.event.input.get("history_image"), dict)
+                    and view.event.input["history_image"].get("image_id")
+                    == required_image_id
+                ))
+            for view in views_to_store:
+                if (
+                    view.data is None
+                    or view.media_type is None
+                    or view.width is None
+                    or view.height is None
+                    or not isinstance(view.event.input, dict)
+                ):
+                    continue
+                image_ref = view.event.input.get("history_image")
+                image_id = (
+                    image_ref.get("image_id")
+                    if isinstance(image_ref, dict)
+                    else None
+                )
+                if not isinstance(image_id, str):
+                    continue
+                await asyncio.to_thread(
+                    self._history_index.put_image_asset,
+                    sid,
+                    "codex",
+                    source,
+                    visible_turn_id,
+                    image_id,
+                    "full",
+                    view.media_type,
+                    view.width,
+                    view.height,
+                    view.data,
+                )
+            if parsed:
+                self._codex_history_image_views[cache_key] = (
+                    source,
+                    tuple(
+                        CodexHistoryImageView(
+                            call_id=view.call_id,
+                            event=view.event,
+                            previous_item_id=view.previous_item_id,
+                            next_item_id=view.next_item_id,
+                        )
+                        for view in views
+                    ),
+                )
+                self._codex_history_image_views.move_to_end(cache_key)
+                while (
+                    len(self._codex_history_image_views)
+                    > self.CODEX_HISTORY_IMAGE_VIEW_CACHE_ENTRIES
+                ):
+                    self._codex_history_image_views.popitem(last=False)
+            return merged
+        except (
+            CodexHistoryCursorError,
+            OSError,
+            ValueError,
+        ):
+            return list(rows)
+        except Exception as exc:
+            log.warning(
+                "Codex history image-view supplement failed",
+                session_id=sid,
+                turn_id=visible_turn_id,
+                error_type=type(exc).__name__,
+            )
+            return list(rows)
+
     async def _handle_get_turn_detail(self, cmd) -> TurnDetail:
         """Return one heavyweight turn projection to its requesting browser."""
         started_at = time.perf_counter()
@@ -6576,8 +7553,6 @@ class WrapperMachine:
         requested_revision = getattr(cmd, "revision", None)
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新展开该轮")
-        if self._history_index is None:
-            return await send(error="详细过程暂时不可用，请稍后重试")
 
         self._watch_session(sid)
         watch = self._watch.get(sid) or {}
@@ -6586,20 +7561,186 @@ class WrapperMachine:
             (ctx is not None and ctx.engine == "codex")
             or watch.get("engine") == "codex"
         )
-        try:
-            source_path = await asyncio.to_thread(
-                codex_rollout_path if is_codex else transcript_path, sid)
-            if not source_path:
-                return await send(error="详细过程尚未生成")
-            source = await asyncio.to_thread(
-                HistorySourceFingerprint.capture, source_path)
-            rows = await asyncio.to_thread(
-                self._history_index.get_turn_detail,
-                sid,
-                "codex" if is_codex else "claude",
-                source,
-                cmd.turn_id,
+        rows = None
+        indexed_turn_id = cmd.turn_id
+        fallback_official_rows = None
+        if is_codex:
+            fallback = None
+            fallback_required = False
+            try:
+                rows = await self._codex_history.turn_events(
+                    sid, cmd.turn_id)
+                detail_source = getattr(
+                    self._codex_history, "turn_detail_source", None)
+                if (
+                    callable(detail_source)
+                    and detail_source(sid, cmd.turn_id) == "full"
+                ):
+                    # Current app-server full-turn projections can omit every
+                    # command/tool while remaining structurally valid. Keep the
+                    # official lifecycle/final as a graceful fallback, but use
+                    # the source-bound rollout segment for complete process.
+                    fallback = self._codex_history.rollout_fallback(
+                        sid, cmd.turn_id)
+            except CodexHistoryUnsupported:
+                # A summary-capable app-server may still lack item pagination
+                # and full turn views. Materialize only the rollout page that
+                # originally contained this turn, then reuse the source-bound
+                # compatibility detail index.
+                try:
+                    fallback = self._codex_history.rollout_fallback(
+                        sid, cmd.turn_id)
+                except Exception as exc:
+                    log.warning(
+                        "Codex rollout detail fallback failed",
+                        session_id=sid,
+                        turn_id=cmd.turn_id,
+                        error_type=type(exc).__name__,
+                    )
+                    return await send(
+                        error="详细过程暂时不可用，请稍后重试")
+                fallback_required = True
+            except CodexHistoryCursorError:
+                # A compatibility rollout page (or a page cached before this
+                # official-reader generation) has no in-memory locator. Its
+                # source-bound SQLite detail remains valid and should still be
+                # served below. Without that index, fail closed as expired.
+                if self._history_index is None:
+                    return await send(
+                        error="详细过程已过期，请刷新会话后重试")
+            except (
+                CodexHistoryInvalidResponse,
+                CodexRpcOutcomeUnknown,
+                CodexRpcRejected,
+                OSError,
+                RuntimeError,
+            ) as exc:
+                log.warning(
+                    "official Codex turn detail failed",
+                    session_id=sid,
+                    turn_id=cmd.turn_id,
+                    error_type=type(exc).__name__,
+                )
+                return await send(
+                    error="详细过程暂时不可用，请稍后重试")
+
+            if fallback is not None:
+                official_rows = rows
+                try:
+                    fallback_history = await self._build_history(
+                        sid,
+                        before=fallback.before,
+                        limit=fallback.limit,
+                        cwd_hint=None,
+                        detail="summary",
+                        allow_stale=False,
+                    )
+                    if self._history_revision(sid) != revision:
+                        return await send(
+                            error="会话历史已更新，请重新展开该轮")
+                    if fallback_history.error:
+                        raise RuntimeError("rollout history page unavailable")
+                    candidates = [
+                        turn for turn in fallback_history.turns
+                        if turn.forkPointId == fallback.native_turn_id
+                    ]
+                    direct = next((
+                        turn for turn in candidates
+                        if turn.id == cmd.turn_id
+                        or turn.clientMsgId == cmd.turn_id
+                    ), None)
+                    if direct is not None:
+                        indexed_turn_id = direct.id
+                    else:
+                        if (
+                            len(candidates) != fallback.segment_count
+                            or fallback.segment_index < 0
+                            or fallback.segment_index >= len(candidates)
+                        ):
+                            raise CodexHistoryCursorError(
+                                "rollout detail segment no longer resolves")
+                        indexed_turn_id = candidates[
+                            fallback.segment_index].id
+                    # Read this exact source-bound segment from SQLite below.
+                    # Do not merge the incomplete full-turn rows into it: their
+                    # missing tools make their array order non-authoritative.
+                    fallback_official_rows = official_rows
+                    rows = None
+                except Exception as exc:
+                    log.warning(
+                        "Codex rollout detail supplement failed",
+                        session_id=sid,
+                        turn_id=cmd.turn_id,
+                        error_type=type(exc).__name__,
+                    )
+                    if fallback_required or official_rows is None:
+                        return await send(
+                            error="详细过程暂时不可用，请稍后重试")
+                    # A valid official full row still carries the final answer
+                    # and lifecycle. Degrade visibly instead of turning a
+                    # temporary local-index miss into an empty detail panel.
+                    rows = official_rows
+
+        if rows is None and self._history_index is None:
+            if fallback_official_rows is None:
+                return await send(error="详细过程暂时不可用，请稍后重试")
+            rows = list(fallback_official_rows)
+            indexed_turn_id = cmd.turn_id
+        active_turn = bool(
+            ctx is not None
+            and (
+                ctx.state != "idle"
+                or (not is_codex and ctx.claude_write_active)
             )
+        )
+        if rows is None and not is_codex and active_turn:
+            # A summary page normally materializes source-complete detail rows,
+            # but the browser can cross its live display window before any
+            # History refresh has indexed this still-growing Claude turn.
+            # Rebuild only the bounded newest page from the current transcript
+            # snapshot. The live tail remains authoritative for bytes appended
+            # after that snapshot, and a terminal refresh replaces it later.
+            try:
+                refreshed = await self._build_history(
+                    sid,
+                    before=None,
+                    limit=4,
+                    cwd_hint=ctx.cwd if ctx is not None else None,
+                    detail="summary",
+                    allow_stale=False,
+                )
+                if refreshed.error:
+                    log.warning(
+                        "running Claude detail materialization failed",
+                        session_id=sid,
+                        turn_id=cmd.turn_id,
+                    )
+            except Exception as exc:
+                log.warning(
+                    "running Claude detail materialization failed",
+                    session_id=sid,
+                    turn_id=cmd.turn_id,
+                    error_type=type(exc).__name__,
+                )
+        try:
+            if rows is None:
+                source_path = await asyncio.to_thread(
+                    codex_rollout_path if is_codex else transcript_path, sid)
+                if not source_path:
+                    if fallback_official_rows is None:
+                        return await send(error="详细过程尚未生成")
+                    rows = list(fallback_official_rows)
+                    indexed_turn_id = cmd.turn_id
+                else:
+                    source = await asyncio.to_thread(
+                        HistorySourceFingerprint.capture, source_path)
+                    rows = await asyncio.to_thread(
+                        self._history_index.get_turn_detail,
+                        sid,
+                        "codex" if is_codex else "claude",
+                        source,
+                        indexed_turn_id,
+                    )
         except OSError:
             rows = None
         except Exception as exc:
@@ -6610,8 +7751,44 @@ class WrapperMachine:
                 error=str(exc),
             )
             rows = None
+        if rows is None and fallback_official_rows is not None:
+            # The official full-turn projection is incomplete on some app-server
+            # generations, but it is still source-authoritative for the rows it
+            # returned.  A pruned, oversized, or temporarily unavailable local
+            # rollout detail index must degrade to those rows instead of making
+            # the same retry fail forever.
+            log.warning(
+                "Codex rollout detail unavailable; using official fallback",
+                session_id=sid,
+                turn_id=cmd.turn_id,
+                indexed_turn_id=indexed_turn_id,
+            )
+            rows = list(fallback_official_rows)
+            indexed_turn_id = cmd.turn_id
         if rows is None:
             return await send(error="详细过程已过期，请刷新会话后重试")
+        if is_codex and indexed_turn_id != cmd.turn_id:
+            try:
+                rows = _rebind_turn_detail_visible_id(
+                    rows,
+                    indexed_turn_id=indexed_turn_id,
+                    visible_turn_id=cmd.turn_id,
+                )
+            except ValueError as exc:
+                log.warning(
+                    "Codex rollout detail identity binding failed",
+                    session_id=sid,
+                    turn_id=cmd.turn_id,
+                    indexed_turn_id=indexed_turn_id,
+                    error_type=type(exc).__name__,
+                )
+                if fallback_official_rows is None:
+                    return await send(
+                        error="详细过程暂时不可用，请稍后重试")
+                rows = list(fallback_official_rows)
+        if is_codex:
+            rows = await self._supplement_codex_history_image_views(
+                sid, cmd.turn_id, rows)
         try:
             page, has_more, oldest, has_newer, newer = _turn_detail_page(
                 rows,
@@ -6680,8 +7857,6 @@ class WrapperMachine:
         requested_revision = getattr(cmd, "revision", None)
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新加载图片")
-        if self._history_index is None:
-            return await send(error="历史图片暂时不可用")
 
         self._watch_session(sid)
         watch = self._watch.get(sid) or {}
@@ -6692,6 +7867,27 @@ class WrapperMachine:
         )
         engine = "codex" if is_codex else "claude"
         try:
+            if is_codex:
+                official_rows = self._codex_history.summary_events(
+                    sid, cmd.turn_id)
+                if official_rows is not None:
+                    official_image = history_image_from_events(
+                        official_rows, cmd.turn_id, cmd.image_id)
+                    if official_image is not None:
+                        media_type, width, height, data = await asyncio.to_thread(
+                            _render_history_image,
+                            official_image,
+                            cmd.variant,
+                        )
+                        return await send(
+                            media_type=media_type,
+                            width=width,
+                            height=height,
+                            data=data,
+                        )
+
+            if self._history_index is None:
+                return await send(error="历史图片暂时不可用")
             source_path = await asyncio.to_thread(
                 codex_rollout_path if is_codex else transcript_path, sid)
             if not source_path:
@@ -6699,7 +7895,40 @@ class WrapperMachine:
             source = await asyncio.to_thread(
                 HistorySourceFingerprint.capture, source_path)
 
-            if cmd.variant == "thumbnail":
+            rows = None
+            if is_codex:
+                try:
+                    official_rows = await self._codex_history.turn_events(
+                        sid, cmd.turn_id)
+                    rows = await self._supplement_codex_history_image_views(
+                        sid,
+                        cmd.turn_id,
+                        official_rows,
+                        required_image_id=cmd.image_id,
+                    )
+                except (
+                    CodexHistoryCursorError,
+                    CodexHistoryInvalidResponse,
+                    CodexHistoryUnsupported,
+                    CodexRpcOutcomeUnknown,
+                    CodexRpcRejected,
+                    OSError,
+                    RuntimeError,
+                ):
+                    rows = None
+            if rows is None:
+                rows = await asyncio.to_thread(
+                    self._history_index.get_turn_detail,
+                    sid, engine, source, cmd.turn_id,
+                )
+            if rows is None:
+                return await send(error="历史图片已过期，请刷新会话")
+            image = history_image_from_events(
+                rows, cmd.turn_id, cmd.image_id)
+            if image is None:
+                return await send(error="未找到这张历史图片")
+
+            if isinstance(image.get("data"), str):
                 cached = await asyncio.to_thread(
                     self._history_index.get_image_asset,
                     sid, engine, source, cmd.turn_id, cmd.image_id,
@@ -6708,29 +7937,68 @@ class WrapperMachine:
                 if cached is not None:
                     media_type, width, height, data = cached
                     return await send(
-                        media_type=media_type, width=width,
-                        height=height, data=data)
-
-            rows = await asyncio.to_thread(
-                self._history_index.get_turn_detail,
-                sid, engine, source, cmd.turn_id,
-            )
-            if rows is None:
-                return await send(error="历史图片已过期，请刷新会话")
-            image = history_image_from_events(
-                rows, cmd.turn_id, cmd.image_id)
-            if image is None:
-                return await send(error="未找到这张历史图片")
-            media_type, width, height, data = await asyncio.to_thread(
-                _render_history_image, image, cmd.variant)
-            if cmd.variant == "thumbnail":
-                await asyncio.to_thread(
-                    self._history_index.put_image_asset,
-                    sid, engine, source, cmd.turn_id, cmd.image_id,
-                    cmd.variant, media_type, width, height, data,
+                        media_type=media_type,
+                        width=width,
+                        height=height,
+                        data=data,
+                    )
+                media_type, width, height, data = await asyncio.to_thread(
+                    _render_history_image, image, cmd.variant)
+                if cmd.variant == "thumbnail":
+                    await asyncio.to_thread(
+                        self._history_index.put_image_asset,
+                        sid, engine, source, cmd.turn_id, cmd.image_id,
+                        cmd.variant, media_type, width, height, data,
+                    )
+                return await send(
+                    media_type=media_type,
+                    width=width,
+                    height=height,
+                    data=data,
                 )
+
+            cached = await asyncio.to_thread(
+                self._history_index.get_image_asset,
+                sid, engine, source, cmd.turn_id, cmd.image_id,
+                cmd.variant,
+            )
+            if cached is not None:
+                media_type, width, height, data = cached
+                return await send(
+                    media_type=media_type,
+                    width=width,
+                    height=height,
+                    data=data,
+                )
+            if cmd.variant != "thumbnail":
+                return await send(error="历史图片已过期，请重新展开该轮")
+            full = await asyncio.to_thread(
+                self._history_index.get_image_asset,
+                sid, engine, source, cmd.turn_id, cmd.image_id,
+                "full",
+            )
+            if full is None:
+                return await send(error="历史图片已过期，请重新展开该轮")
+            full_media_type, _full_width, _full_height, full_data = full
+            media_type, width, height, data = await asyncio.to_thread(
+                _render_history_image,
+                {
+                    "media_type": full_media_type,
+                    "data": base64.b64encode(full_data).decode("ascii"),
+                },
+                "thumbnail",
+            )
+            await asyncio.to_thread(
+                self._history_index.put_image_asset,
+                sid, engine, source, cmd.turn_id, cmd.image_id,
+                "thumbnail", media_type, width, height, data,
+            )
             return await send(
-                media_type=media_type, width=width, height=height, data=data)
+                media_type=media_type,
+                width=width,
+                height=height,
+                data=data,
+            )
         except ValueError as exc:
             return await send(error=str(exc))
         except Exception as exc:
@@ -8449,6 +9717,9 @@ class WrapperMachine:
             return
         await self._discard_query_queue(ctx)
         self.sessions.pop(ctx.key, None)
+        self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
+        if ctx.key:
+            await self._drop_preview_session(ctx.engine, ctx.key)
         disconnected = False
         try:
             tasks = {
@@ -9102,7 +10373,9 @@ class WrapperMachine:
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
         current_turn_id = turn_id
         logical_msg_id = recovered_msg_id or turn_id
-        stream = ctx.sdk.receive_spontaneous_response(turn_id).__aiter__()
+        stream = coalesce_codex_live_notifications(
+            ctx.sdk.receive_spontaneous_response(turn_id),
+        ).__aiter__()
         restart_watch_task: Optional[asyncio.Task] = None
         overflowed = False
         terminal_seen = False
@@ -9316,7 +10589,9 @@ class WrapperMachine:
             ctx.codex_spontaneous_turn_id = current_turn_id
             ctx.codex_spontaneous_task = current_task
             ctx.active_msg_id = logical_msg_id
-            stream = ctx.sdk.receive_response().__aiter__()
+            stream = coalesce_codex_live_notifications(
+                ctx.sdk.receive_response(),
+            ).__aiter__()
             overflowed = False
             terminal_seen = False
             stream_closed = False
@@ -9559,7 +10834,9 @@ class WrapperMachine:
         async def reader() -> None:
             cancelled = False
             try:
-                async for message in ctx.sdk.receive_response():
+                async for message in coalesce_codex_live_notifications(
+                    ctx.sdk.receive_response(),
+                ):
                     await queue.put(message)
             except asyncio.CancelledError:
                 cancelled = True
@@ -10036,7 +11313,14 @@ class WrapperMachine:
             return
         self._clear_codex_checkpoint_tracking(ctx)
         try:
-            await asyncio.to_thread(journal.finish_turn, turn_id)
+            completed = await asyncio.to_thread(journal.finish_turn, turn_id)
+            if completed is not None and not getattr(
+                completed, "files_available", True
+            ):
+                log.info(
+                    "Codex turn committed cleanly; file rollback is conversation-only",
+                    session_id=ctx.session_id,
+                )
         except CheckpointError as exc:
             try:
                 await asyncio.to_thread(journal.abort_turn, turn_id)
@@ -10373,7 +11657,7 @@ class WrapperMachine:
             return error
         try:
             diff = await self._git_diff(
-                ctx.cwd, cmd.file, self._preview_external_paths(ctx))
+                ctx.cwd, cmd.file, self._preview_capabilities(ctx))
             event = DiffReport(
                 file=cmd.file,
                 diff=diff,
@@ -10393,6 +11677,247 @@ class WrapperMachine:
             await self._emit(ctx, error)
             return error
 
+    def _prune_preview_challenges(self) -> None:
+        cutoff = time.monotonic() - self.PREVIEW_AUTHORIZATION_TTL
+        expired = [
+            authorization_id
+            for authorization_id, challenge
+            in self._preview_challenges.items()
+            if challenge.created_at < cutoff
+        ]
+        for authorization_id in expired:
+            self._preview_challenges.pop(authorization_id, None)
+        while len(self._preview_challenges) > self.PREVIEW_AUTHORIZATION_CAP:
+            self._preview_challenges.popitem(last=False)
+
+    async def _drop_preview_session(
+        self, engine: str, session_id: str,
+    ) -> None:
+        await self._run_preview_capability_mutation(
+            self._preview_capability_store.remove_session,
+            engine,
+            session_id,
+        )
+        for authorization_id, challenge in tuple(
+                self._preview_challenges.items()):
+            if (
+                challenge.engine == engine
+                and challenge.session_key == session_id
+            ):
+                self._preview_challenges.pop(authorization_id, None)
+
+    async def _rekey_preview_session(
+        self,
+        ctx: SessionContext,
+        old_key: str,
+        session_id: str,
+    ) -> None:
+        await self._run_preview_capability_mutation(
+            self._preview_capability_store.rekey,
+            ctx.engine,
+            ctx.space,
+            old_key,
+            session_id,
+            persist=not ctx.btw,
+        )
+        for authorization_id, challenge in tuple(
+                self._preview_challenges.items()):
+            if (
+                challenge.engine != ctx.engine
+                or challenge.space != ctx.space
+                or challenge.session_key != old_key
+            ):
+                continue
+            self._preview_challenges[authorization_id] = _PreviewChallenge(
+                authorization_id=challenge.authorization_id,
+                session_key=session_id,
+                engine=challenge.engine,
+                space=challenge.space,
+                client_id=challenge.client_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                resolved_path=challenge.resolved_path,
+                preview_id=challenge.preview_id,
+                created_at=challenge.created_at,
+            )
+
+    async def _require_preview_authorization(
+        self,
+        ctx: SessionContext,
+        cmd,
+        needed: _PreviewAuthorizationNeeded,
+        *,
+        operation: str,
+        preview_id: Optional[str] = None,
+    ):
+        client_id = getattr(cmd, "client_id", None)
+        if not client_id:
+            raise ValueError("外部文件预览需要已认证客户端确认")
+        self._prune_preview_challenges()
+        session_key = ctx.session_id or ctx.key
+        assert session_key
+        for challenge in reversed(self._preview_challenges.values()):
+            if (
+                challenge.session_key == session_key
+                and challenge.engine == ctx.engine
+                and challenge.space == ctx.space
+                and challenge.client_id == client_id
+                and challenge.request_id == cmd.request_id
+                and challenge.operation == operation
+                and challenge.path == needed.path
+                and challenge.resolved_path == needed.resolved_path
+                and challenge.preview_id == preview_id
+            ):
+                event = PreviewAuthorizationRequired(
+                    authorization_id=challenge.authorization_id,
+                    request_id=challenge.request_id,
+                    operation=operation,
+                    path=challenge.path,
+                    resolved_path=challenge.resolved_path,
+                    format=(
+                        "image" if operation == "preview_asset"
+                        else self._preview_format(challenge.resolved_path)
+                    ),
+                    preview_id=preview_id,
+                    to=client_id,
+                )
+                await self._emit(ctx, event)
+                return event
+
+        authorization_id = uuid4().hex
+        challenge = _PreviewChallenge(
+            authorization_id=authorization_id,
+            session_key=session_key,
+            engine=ctx.engine,
+            space=ctx.space,
+            client_id=client_id,
+            request_id=cmd.request_id,
+            operation=operation,
+            path=needed.path,
+            resolved_path=needed.resolved_path,
+            preview_id=preview_id,
+            created_at=time.monotonic(),
+        )
+        self._preview_challenges[authorization_id] = challenge
+        self._prune_preview_challenges()
+        event = PreviewAuthorizationRequired(
+            authorization_id=authorization_id,
+            request_id=cmd.request_id,
+            operation=operation,
+            path=needed.path,
+            resolved_path=needed.resolved_path,
+            format=(
+                "image" if operation == "preview_asset"
+                else self._preview_format(needed.resolved_path)
+            ),
+            preview_id=preview_id,
+            to=client_id,
+        )
+        await self._emit(ctx, event)
+        return event
+
+    async def _handle_authorize_preview(self, cmd):
+        client_id = getattr(cmd, "client_id", None)
+        sid = getattr(cmd, "sid", None)
+        self._prune_preview_challenges()
+        challenge = self._preview_challenges.get(cmd.authorization_id)
+        ctx = self._ctx_for(sid)
+        session_key = (ctx.session_id or ctx.key) if ctx is not None else sid
+
+        if (
+            challenge is None
+            or not client_id
+            or challenge.client_id != client_id
+            or challenge.request_id != cmd.request_id
+            or challenge.session_key != session_key
+            or challenge.engine != getattr(ctx, "engine", None)
+            or challenge.space != getattr(ctx, "space", None)
+            or ctx is None
+        ):
+            result = PreviewAuthorizationResult(
+                authorization_id=cmd.authorization_id,
+                request_id=cmd.request_id,
+                status="expired",
+                error="该预览确认已过期，请重新打开文件",
+                sid=sid,
+                to=client_id,
+            )
+            if ctx is not None:
+                await self._emit(ctx, result)
+            else:
+                await self.transport.send(result)
+            return result
+
+        if cmd.decision == "deny":
+            self._preview_challenges.pop(cmd.authorization_id, None)
+            result = PreviewAuthorizationResult(
+                authorization_id=challenge.authorization_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                preview_id=challenge.preview_id,
+                status="denied",
+                to=client_id,
+            )
+            await self._emit(ctx, result)
+            return result
+
+        current_resolved = os.path.realpath(
+            challenge.path if os.path.isabs(challenge.path)
+            else os.path.join(ctx.cwd, challenge.path))
+        if current_resolved != challenge.resolved_path:
+            self._preview_challenges.pop(cmd.authorization_id, None)
+            result = PreviewAuthorizationResult(
+                authorization_id=challenge.authorization_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                preview_id=challenge.preview_id,
+                status="changed",
+                error="文件路径已经变化，请重新确认",
+                to=client_id,
+            )
+            await self._emit(ctx, result)
+            return result
+
+        try:
+            await self._run_preview_capability_mutation(
+                self._preview_capability_store.grant_path,
+                challenge.engine,
+                challenge.space,
+                challenge.session_key,
+                challenge.resolved_path,
+                mode="read",
+                source="user_approved",
+                persist=not ctx.btw,
+            )
+        except PreviewCapabilityError as exc:
+            status = "changed" if "不存在" in str(exc) else "error"
+            result = PreviewAuthorizationResult(
+                authorization_id=challenge.authorization_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                preview_id=challenge.preview_id,
+                status=status,
+                error=str(exc),
+                to=client_id,
+            )
+        else:
+            result = PreviewAuthorizationResult(
+                authorization_id=challenge.authorization_id,
+                request_id=challenge.request_id,
+                operation=challenge.operation,
+                path=challenge.path,
+                preview_id=challenge.preview_id,
+                status="granted",
+                to=client_id,
+            )
+        self._preview_challenges.pop(cmd.authorization_id, None)
+        await self._emit(ctx, result)
+        return result
+
     async def _handle_get_file_preview(self, cmd):
         sid = getattr(cmd, "sid", None)
         client_id = getattr(cmd, "client_id", None)
@@ -10410,7 +11935,7 @@ class WrapperMachine:
 
         try:
             suffix = os.path.splitext(cmd.path)[1].lower()
-            external_paths = self._preview_external_paths(ctx)
+            external_paths = self._preview_capabilities(ctx)
             if suffix in self.OFFICE_PREVIEW_SUFFIXES:
                 async with self._preview_conversion_limit:
                     preview = await asyncio.to_thread(
@@ -10420,6 +11945,12 @@ class WrapperMachine:
                 preview = await asyncio.to_thread(
                     self._read_file_preview, ctx.cwd, cmd.path,
                     external_paths)
+            resolved_path = os.path.realpath(
+                cmd.path if os.path.isabs(cmd.path)
+                else os.path.join(ctx.cwd, cmd.path))
+            inside_root = self._path_is_below(
+                os.path.realpath(ctx.cwd), resolved_path)
+            external_capability = external_paths.get(resolved_path)
             response = FilePreview(
                 path=preview["path"],
                 request_id=cmd.request_id,
@@ -10433,8 +11964,27 @@ class WrapperMachine:
                 truncated=preview.get("truncated", False),
                 mtime_ns=str(preview["mtime_ns"]),
                 revision=preview.get("revision"),
+                writable=(
+                    inside_root
+                    or (
+                        external_capability is not None
+                        and external_capability.mode == "read_write"
+                    )
+                ),
                 to=client_id,
             )
+        except _PreviewCapabilityChanged as exc:
+            self._preview_capability_store.revoke(
+                ctx.engine,
+                ctx.space,
+                ctx.session_id or ctx.key,
+                exc.resolved_path,
+            )
+            return await self._require_preview_authorization(
+                ctx, cmd, exc, operation="file_preview")
+        except _PreviewAuthorizationNeeded as exc:
+            return await self._require_preview_authorization(
+                ctx, cmd, exc, operation="file_preview")
         except (UnicodeDecodeError, ValueError) as exc:
             response = FilePreview(
                 path=cmd.path,
@@ -10479,8 +12029,30 @@ class WrapperMachine:
                 cmd.expected_size,
                 int(cmd.expected_mtime_ns),
                 cmd.expected_revision,
-                self._preview_external_paths(ctx),
+                self._preview_capabilities(ctx, require_write=True),
             )
+            resolved = os.path.realpath(
+                cmd.path if os.path.isabs(cmd.path)
+                else os.path.join(ctx.cwd, cmd.path))
+            if not self._path_is_below(os.path.realpath(ctx.cwd), resolved):
+                try:
+                    self._preview_capability_store.grant_path(
+                        ctx.engine,
+                        ctx.space,
+                        ctx.session_id or ctx.key,
+                        resolved,
+                        mode="read_write",
+                        source="structured_write",
+                        persist=not ctx.btw,
+                    )
+                except PreviewCapabilityError:
+                    # The atomic save already succeeded. A capability refresh
+                    # failure must not turn that completed mutation into a fake
+                    # save error; the next preview will ask again.
+                    log.warning(
+                        "saved external preview capability could not be refreshed",
+                        session_id=ctx.session_id or ctx.key,
+                    )
             response = FileSaveResult(
                 path=path,
                 request_id=cmd.request_id,
@@ -10537,9 +12109,14 @@ class WrapperMachine:
             return response
 
         try:
-            _, media_type, data = await asyncio.to_thread(
-                self._read_preview_asset, ctx.cwd, cmd.path,
-                self._preview_external_paths(ctx))
+            snapshot = self._preview_image_snapshot(
+                ctx, cmd.path, cmd.preview_id)
+            if snapshot is None:
+                _, media_type, data = await asyncio.to_thread(
+                    self._read_preview_asset, ctx.cwd, cmd.path,
+                    self._preview_capabilities(ctx))
+            else:
+                media_type, data = snapshot
             response = PreviewAsset(
                 path=cmd.path,
                 preview_id=cmd.preview_id,
@@ -10547,6 +12124,28 @@ class WrapperMachine:
                 media_type=media_type,
                 data=base64.b64encode(data).decode("ascii"),
                 to=client_id,
+            )
+        except _PreviewCapabilityChanged as exc:
+            self._preview_capability_store.revoke(
+                ctx.engine,
+                ctx.space,
+                ctx.session_id or ctx.key,
+                exc.resolved_path,
+            )
+            return await self._require_preview_authorization(
+                ctx,
+                cmd,
+                exc,
+                operation="preview_asset",
+                preview_id=cmd.preview_id,
+            )
+        except _PreviewAuthorizationNeeded as exc:
+            return await self._require_preview_authorization(
+                ctx,
+                cmd,
+                exc,
+                operation="preview_asset",
+                preview_id=cmd.preview_id,
             )
         except ValueError as exc:
             response = PreviewAsset(
@@ -10911,6 +12510,7 @@ class WrapperMachine:
                         question.question,
                         list(question.options),
                         header=question.header,
+                        allow_text=True,
                         multi_select=question.multi_select,
                     )
                     answers[question.question] = answer
@@ -11013,7 +12613,9 @@ class WrapperMachine:
         allowed_suffixes: Optional[frozenset[str]],
         max_bytes: int,
         allow_truncate: bool,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, bytes, os.stat_result, bool]:
         """Read a bounded regular file below cwd without following an escape.
 
@@ -11024,18 +12626,36 @@ class WrapperMachine:
         """
         if path.startswith("~"):
             raise ValueError("预览路径必须位于当前工作目录")
+        try:
+            path_bytes = len(path.encode("utf-8", "surrogatepass"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("预览路径无效") from exc
+        if (
+            not path
+            or "\x00" in path
+            or path_bytes > PREVIEW_PATH_MAX_BYTES
+        ):
+            raise ValueError("预览路径过长")
 
         root = os.path.realpath(cwd)
         candidate = os.path.realpath(
             path if os.path.isabs(path) else os.path.join(root, path))
+        if (
+            len(candidate.encode("utf-8", "surrogatepass"))
+            > PREVIEW_PATH_MAX_BYTES
+        ):
+            raise ValueError("预览路径过长")
         inside_root = WrapperMachine._path_is_below(root, candidate)
-        if not inside_root and candidate not in allowed_external_paths:
-            raise ValueError(
-                "预览路径超出当前工作目录，且不是本会话成功创建或编辑的文件")
 
         suffix = os.path.splitext(candidate)[1].lower()
         if allowed_suffixes is not None and suffix not in allowed_suffixes:
             raise ValueError("不支持预览该文件类型")
+        capability = (
+            (allowed_external_paths or {}).get(candidate)
+            if not inside_root else None
+        )
+        if not inside_root and capability is None:
+            raise _PreviewAuthorizationNeeded(path, candidate)
 
         access_root = root if inside_root else os.path.dirname(candidate)
         relative = (os.path.relpath(candidate, root)
@@ -11077,6 +12697,12 @@ class WrapperMachine:
             file_stat = os.fstat(fd)
             if not stat.S_ISREG(file_stat.st_mode):
                 raise ValueError("预览目标必须是普通文件")
+            if (
+                not inside_root
+                and capability is not None
+                and not capability.matches(file_stat)
+            ):
+                raise _PreviewCapabilityChanged(path, candidate)
             if not allow_truncate and file_stat.st_size > max_bytes:
                 raise ValueError(
                     f"预览文件超过 {max_bytes // (1024 * 1024)} MiB 限制")
@@ -11094,7 +12720,9 @@ class WrapperMachine:
     @classmethod
     def _read_text_preview(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, str, int, bool, int, str, Optional[str]]:
         relative, data, file_stat, truncated = cls._read_session_file(
             cwd,
@@ -11124,7 +12752,9 @@ class WrapperMachine:
     @classmethod
     def _read_file_preview(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> dict[str, object]:
         """Read or render one artifact entirely on the wrapper host.
 
@@ -11197,6 +12827,9 @@ class WrapperMachine:
 
     @staticmethod
     def _validate_rendered_preview(media_type: str, data: bytes) -> None:
+        if media_type == "image/svg+xml":
+            WrapperMachine._validate_svg_preview(data)
+            return
         valid = {
             "application/pdf": data.startswith(b"%PDF-"),
             "image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
@@ -11210,10 +12843,29 @@ class WrapperMachine:
         if not valid:
             raise ValueError("文件内容与预览格式不匹配")
 
+    @staticmethod
+    def _validate_svg_preview(data: bytes) -> None:
+        if b"\0" in data:
+            raise ValueError("SVG 文件不是有效的 UTF-8 文本")
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("SVG 文件不是有效的 UTF-8 文本") from exc
+        # This is only a cheap type gate. The browser performs the mandatory
+        # structural sanitizer before creating any SVG blob URL.
+        document = re.sub(r"^\s*<\?xml[^>]*>\s*", "", text, count=1,
+                          flags=re.IGNORECASE)
+        document = re.sub(r"^\s*<!doctype[^>]*>\s*", "", document, count=1,
+                          flags=re.IGNORECASE)
+        if not re.match(r"^\s*<svg(?:\s|>)", document, re.IGNORECASE):
+            raise ValueError("SVG 文件根元素无效")
+
     @classmethod
     def _convert_office_preview(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> dict[str, object]:
         suffix = os.path.splitext(path)[1].lower()
         relative, data, file_stat, _ = cls._read_session_file(
@@ -11237,20 +12889,28 @@ class WrapperMachine:
             source = root / f"input{suffix}"
             output = root / "out"
             home = root / "home"
+            xdg_config = root / "xdg-config"
+            xdg_cache = root / "xdg-cache"
+            xdg_runtime = root / "xdg-runtime"
             output.mkdir(mode=0o700)
             home.mkdir(mode=0o700)
+            xdg_config.mkdir(mode=0o700)
+            xdg_cache.mkdir(mode=0o700)
+            xdg_runtime.mkdir(mode=0o700)
             source.write_bytes(data)
             source.chmod(0o600)
 
             command = [
                 bwrap,
                 "--die-with-parent",
-                "--unshare-net",
+                "--unshare-all",
                 "--new-session",
+                "--hostname", "cc-remote-preview",
+                "--clearenv",
                 "--ro-bind", "/usr", "/usr",
                 "--ro-bind", "/etc", "/etc",
-                "--ro-bind", "/lib", "/lib",
-                "--ro-bind", "/lib64", "/lib64",
+                "--ro-bind-try", "/lib", "/lib",
+                "--ro-bind-try", "/lib64", "/lib64",
                 "--symlink", "usr/bin", "/bin",
                 "--symlink", "usr/sbin", "/sbin",
                 "--proc", "/proc",
@@ -11260,8 +12920,15 @@ class WrapperMachine:
                 "--dir", "/mnt",
                 "--bind", temp, "/mnt",
                 "--chdir", "/mnt",
+                "--cap-drop", "ALL",
+                "--setenv", "PATH", "/usr/bin:/bin",
                 "--setenv", "HOME", "/mnt/home",
                 "--setenv", "TMPDIR", "/mnt/home",
+                "--setenv", "LANG", "C.UTF-8",
+                "--setenv", "LC_ALL", "C.UTF-8",
+                "--setenv", "XDG_CONFIG_HOME", "/mnt/xdg-config",
+                "--setenv", "XDG_CACHE_HOME", "/mnt/xdg-cache",
+                "--setenv", "XDG_RUNTIME_DIR", "/mnt/xdg-runtime",
                 soffice,
                 "-env:UserInstallation=file:///mnt/profile",
                 "--headless",
@@ -11301,6 +12968,11 @@ class WrapperMachine:
             stderr=subprocess.DEVNULL,
             close_fds=True,
             start_new_session=True,
+            env={
+                "PATH": os.defpath,
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            },
         )
         try:
             return_code = process.wait(timeout=cls.OFFICE_PREVIEW_TIMEOUT_SECONDS)
@@ -11322,7 +12994,9 @@ class WrapperMachine:
         expected_size: int,
         expected_mtime_ns: int,
         expected_revision: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, int, int, str]:
         """CAS-style atomic save for one existing Markdown regular file.
 
@@ -11344,14 +13018,16 @@ class WrapperMachine:
         if lexical_inside and not inside_root:
             raise ValueError("保存路径不能包含符号链接")
         if not inside_root:
-            if real_candidate not in allowed_external_paths:
+            capability = (allowed_external_paths or {}).get(real_candidate)
+            if capability is None or capability.mode != "read_write":
                 raise ValueError(
-                    "保存路径超出当前工作目录，且不是本会话成功创建或编辑的文件")
+                    "该外部文件仅获准查看，未获准编辑")
             candidate = real_candidate
             root = os.path.dirname(candidate)
             relative = os.path.basename(candidate)
             display_path = candidate
         else:
+            capability = None
             root = session_root
             relative = os.path.relpath(candidate, root)
             display_path = relative.replace(os.sep, "/")
@@ -11433,6 +13109,12 @@ class WrapperMachine:
                 dir_fd = next_fd
 
             original, original_stat, original_revision = read_current()
+            if (
+                capability is not None
+                and not capability.matches(
+                    original_stat, require_write=True)
+            ):
+                raise ValueError("外部文件已变化，需要重新授权后才能编辑")
             require_expected(original_stat, original_revision)
             if b"\0" in original:
                 raise ValueError("Markdown 文件不是有效的 UTF-8 文本")
@@ -11495,7 +13177,9 @@ class WrapperMachine:
     @classmethod
     def _read_markdown_preview(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, str, int, bool, int]:
         relative, data, file_stat, truncated = cls._read_session_file(
             cwd,
@@ -11534,7 +13218,9 @@ class WrapperMachine:
     @classmethod
     def _read_preview_asset(
         cls, cwd: str, path: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> tuple[str, str, bytes]:
         suffix = os.path.splitext(path)[1].lower()
         media_type = cls.PREVIEW_ASSET_MEDIA_TYPES.get(suffix)
@@ -11548,18 +13234,22 @@ class WrapperMachine:
             allow_truncate=False,
             allowed_external_paths=allowed_external_paths,
         )
+        if media_type == "image/svg+xml":
+            cls._validate_svg_preview(data)
         return relative, media_type, data
 
     async def _git_diff(
         self, cwd: str, file: str,
-        allowed_external_paths: frozenset[str] = frozenset(),
+        allowed_external_paths: Optional[
+            dict[str, PreviewCapability]
+        ] = None,
     ) -> str:
         max_bytes = max(64 * 1024, min(4 * 1024 * 1024,
                                        self.cfg.ws_max_size_bytes // 2))
         return await read_git_diff(
             cwd,
             file,
-            allowed_external_paths=allowed_external_paths,
+            allowed_external_paths=allowed_external_paths or {},
             max_bytes=max_bytes,
             source_max_bytes=getattr(
                 self.cfg, "history_source_max_bytes", 64 * 1024 * 1024),
@@ -12064,6 +13754,9 @@ class WrapperMachine:
                 }
                 await self._discard_query_queue(ctx)
                 self.sessions.pop(ctx.key, None)
+                self._purge_preview_image_snapshots(
+                    ctx.preview_snapshot_token)
+                await self._drop_preview_session(ctx.engine, ctx.key)
                 log.error("private btw persistence failed; terminating fork",
                           error_type=type(persist_error).__name__)
                 disconnected = False
@@ -12124,6 +13817,7 @@ class WrapperMachine:
                 rekey_goal(sid)
             save_session_id(self.cfg.state_dir, ctx.cwd, sid)
         if old_key and old_key != sid:
+            await self._rekey_preview_session(ctx, old_key, sid)
             self._remember_session_alias(old_key, sid, ctx.cwd)
             self.sessions.pop(old_key, None)
             self.sessions[sid] = ctx
@@ -12538,6 +14232,7 @@ class WrapperMachine:
         if ctx is not None:
             await ctx.sdk.disconnect()
             self.sessions.pop(ctx.key or sid, None)
+            self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
         try:
             if engine == "codex":
                 await codex_rpc("thread/delete", {"threadId": sid})
@@ -12556,6 +14251,7 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        await self._drop_preview_session(engine, sid)
         if self._session_pins is not None:
             try:
                 await asyncio.to_thread(
@@ -12668,6 +14364,7 @@ class WrapperMachine:
                 await self.transport.send(error)
                 return error
             self.sessions.pop(ctx.key or sid, None)
+            self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
         try:
             if engine == "codex":
                 try:
@@ -12689,6 +14386,7 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        await self._drop_preview_session(engine, sid)
         if engine == "codex" and checkpoint_cleanup_journal is not None:
             try:
                 await asyncio.to_thread(
@@ -13838,20 +15536,66 @@ class WrapperMachine:
         self._uncertain_codex_forks[request_id] = child_session_id or existing
         self._uncertain_codex_forks.move_to_end(request_id)
 
+    def _release_terminal_codex_fork_lock(
+        self, request_id: str, expected: Optional[asyncio.Lock] = None,
+    ) -> None:
+        """Drop only locks whose durable request can no longer be reconciled."""
+        try:
+            entry = self._codex_forks.get(request_id)
+            effective_status = entry.get("status") if entry is not None else None
+            if effective_status == "alias":
+                canonical_id = entry.get("canonical_request_id")
+                canonical = (
+                    self._codex_forks.get(canonical_id)
+                    if isinstance(canonical_id, str) else None
+                )
+                effective_status = (
+                    canonical.get("status") if canonical is not None else None
+                )
+        except ForkJournalError as exc:
+            log.warning("Codex fork lock cleanup skipped", error=str(exc))
+            return
+        task = self._codex_fork_tasks.get(request_id)
+        lock = self._codex_fork_locks.get(request_id)
+        terminal_or_unrecorded = (
+            entry is None
+            # ``intent`` has not crossed the durable submit boundary, so a
+            # failed local preflight/persist attempt has nothing to reconcile.
+            # Submitted/uncertain requests keep their lock for the background
+            # reconciler and reliable retry path.
+            or effective_status in {"intent", "complete", "rejected"}
+        )
+        if (terminal_or_unrecorded
+                and (task is None or task.done())
+                and lock is not None
+                and (expected is None or lock is expected)):
+            self._codex_fork_locks.pop(request_id, None)
+
     def _ensure_codex_fork_reconciler(
-        self, cmd, sid: str, cwd: str, marker: str,
+        self,
+        cmd,
+        sid: str,
+        cwd: str,
+        marker: str,
+        worktree: Optional[WorktreeSpec] = None,
     ) -> None:
         current = self._codex_fork_tasks.get(cmd.request_id)
         if current is not None and not current.done():
             return
         task = asyncio.create_task(
-            self._reconcile_codex_fork_command(cmd, sid, cwd, marker),
+            self._reconcile_codex_fork_command(
+                cmd, sid, cwd, marker, worktree),
             name=f"codex-fork-reconcile-{cmd.request_id}",
         )
         self._codex_fork_tasks[cmd.request_id] = task
 
     async def _reconcile_codex_fork_command(
-        self, cmd, sid: str, cwd: str, marker: str,
+        self,
+        cmd,
+        sid: str,
+        cwd: str,
+        marker: str,
+        worktree: Optional[WorktreeSpec] = None,
     ) -> None:
         """Resolve an unknown mutation on the current client connection."""
         request_id = cmd.request_id
@@ -13871,17 +15615,35 @@ class WrapperMachine:
                     child = self._uncertain_codex_forks.get(request_id)
                     if not child and entry.get("status") == "complete":
                         child = entry.get("session_id")
-                    if not child:
-                        meta = await asyncio.to_thread(
-                            find_rollout_fork, marker, sid, cwd)
-                        child = (
-                            meta.get("session_id")
-                            if isinstance(meta, dict) else None)
+                    try:
+                        if not child:
+                            meta = await asyncio.to_thread(
+                                find_rollout_fork, marker, sid, cwd)
+                            child = (
+                                meta.get("session_id")
+                                if isinstance(meta, dict) else None)
+                        if not child and worktree is not None:
+                            thread = await self._find_codex_worktree_fork(
+                                sid, cwd)
+                            child = (
+                                thread.get("id")
+                                if isinstance(thread, dict) else None)
+                    except Exception as exc:
+                        log.warning(
+                            "Codex fork reconciliation lookup failed",
+                            request_id=request_id,
+                            error_type=type(exc).__name__,
+                        )
+                        continue
                     if not isinstance(child, str) or not child:
                         continue
                     try:
-                        event = await self._finish_same_cwd_fork(
-                            cmd, sid, cwd, child)
+                        if worktree is None:
+                            event = await self._finish_same_cwd_fork(
+                                cmd, sid, cwd, child)
+                        else:
+                            event = await self._finish_worktree_fork(
+                                cmd, sid, worktree, child, marker)
                     except _ForkOutcomeUncertain:
                         continue
                     if client_id and cmd_id:
@@ -13909,6 +15671,154 @@ class WrapperMachine:
             current = asyncio.current_task()
             if self._codex_fork_tasks.get(request_id) is current:
                 self._codex_fork_tasks.pop(request_id, None)
+            self._release_terminal_codex_fork_lock(request_id)
+
+    async def _claude_fork_control_snapshot(
+        self,
+        sid: str,
+        cwd: str,
+        ctx: Optional[SessionContext],
+    ) -> dict[str, str]:
+        saved = await self._load_claude_session_controls(sid)
+        model = valid_claude_model(
+            _session_model(ctx) if ctx is not None else None
+        ) or saved.model
+        effort = (
+            _session_effort(ctx) if ctx is not None else None
+        ) or saved.effort
+        permission = valid_claude_permission(
+            _session_permission_mode(ctx) if ctx is not None else None
+        ) or saved.permission_mode
+        if (model is None or effort is None) and ctx is None:
+            try:
+                native = await asyncio.to_thread(
+                    last_completed_assistant_controls,
+                    sid,
+                    directory=cwd,
+                    max_bytes=self.cfg.history_source_max_bytes,
+                )
+                model = model or native.model
+                effort = effort or native.effort
+            except Exception as exc:
+                log.warning(
+                    "Claude fork model snapshot unavailable",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+        return {
+            key: value
+            for key, value in (
+                ("model", model),
+                ("effort", effort),
+                ("permission_mode", permission),
+            )
+            if isinstance(value, str) and value
+        }
+
+    async def _codex_fork_control_snapshot(
+        self,
+        sid: str,
+        ctx: Optional[SessionContext],
+    ) -> dict[str, str]:
+        saved = await self._load_codex_session_controls(sid)
+        settings = await asyncio.to_thread(
+            codex_session_settings,
+            sid,
+        )
+        model = (
+            _session_model(ctx) if ctx is not None else None
+        ) or settings.get("model")
+        approval: Optional[str] = None
+        granular_approval = bool(settings.get("approval_policy_granular"))
+        if ctx is not None:
+            raw_approval = getattr(ctx.sdk, "approval_policy", None)
+            if (isinstance(raw_approval, str)
+                    and raw_approval in CODEX_PERMISSION_MODES):
+                approval = raw_approval
+            elif (isinstance(raw_approval, dict)
+                    and isinstance(raw_approval.get("granular"), dict)):
+                # ``ctx.sdk.approval`` is only the Web UI projection for this
+                # official object. Omitting the override lets thread/fork retain
+                # the source thread's native granular semantics.
+                granular_approval = True
+            else:
+                projected = _session_permission_mode(ctx)
+                if projected in CODEX_PERMISSION_MODES:
+                    approval = projected
+        if approval is None and not granular_approval:
+            approval = saved.approval_policy or settings.get("approval_policy")
+        profile = (
+            _session_permission_profile(ctx) if ctx is not None else None
+        ) or saved.permission_profile or settings.get("permission_profile")
+        web_search = (
+            _session_web_search(ctx) if ctx is not None else None
+        ) or saved.web_search
+        return {
+            key: value
+            for key, value in (
+                ("model", model),
+                ("approval_policy", approval),
+                ("permission_profile", profile),
+                ("web_search", web_search),
+            )
+            if isinstance(value, str) and value
+            and len(value) <= 256
+        }
+
+    @staticmethod
+    async def _codex_fork_profile_allowed(
+        controls: dict[str, str],
+        cwd: str,
+    ) -> bool:
+        profile = controls.get("permission_profile")
+        if profile is None:
+            return True
+        profiles = await codex_permission_profiles(cwd)
+        return any(
+            item["id"] == profile and item["allowed"]
+            for item in profiles
+        )
+
+    async def _inherit_claude_fork_controls(
+        self,
+        child_session_id: str,
+        controls: object,
+    ) -> None:
+        values = controls if isinstance(controls, dict) else {}
+        if not values:
+            return
+        if self._claude_controls is None:
+            raise ClaudeControlStoreError(
+                "Claude control store is unavailable")
+        await asyncio.to_thread(
+            self._claude_controls.inherit_if_absent,
+            child_session_id,
+            model=values.get("model"),
+            effort=values.get("effort"),
+            permission_mode=values.get("permission_mode"),
+        )
+
+    async def _inherit_codex_fork_controls(
+        self,
+        child_session_id: str,
+        controls: object,
+    ) -> None:
+        values = controls if isinstance(controls, dict) else {}
+        if not any(
+            values.get(key)
+            for key in ("approval_policy", "permission_profile", "web_search")
+        ):
+            return
+        if self._codex_controls is None:
+            raise CodexControlStoreError(
+                "Codex control store is unavailable")
+        await asyncio.to_thread(
+            self._codex_controls.inherit_if_absent,
+            child_session_id,
+            approval_policy=values.get("approval_policy"),
+            permission_profile=values.get("permission_profile"),
+            web_search=values.get("web_search"),
+        )
 
     async def _finish_same_cwd_fork(
         self, cmd, sid: str, cwd: str, child_session_id: str,
@@ -13933,6 +15843,23 @@ class WrapperMachine:
             raise _ForkOutcomeUncertain(
                 "fork completed but its durable result is not yet recorded"
             ) from exc
+        try:
+            entry = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            await self._inherit_codex_fork_controls(
+                child_session_id, (entry or {}).get("controls"))
+        except Exception as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, cwd, fork_thread_source(cmd.request_id))
+            log.warning(
+                "Codex fork controls are waiting for durable inheritance",
+                session_id=child_session_id,
+                error_type=type(exc).__name__,
+            )
+            raise _ForkOutcomeUncertain(
+                "fork controls are not durably inherited") from exc
         self._uncertain_codex_forks.pop(cmd.request_id, None)
         event = SessionForked(
             parent_session_id=sid,
@@ -14132,6 +16059,24 @@ class WrapperMachine:
                 "Claude fork completed but its durable result is not recorded"
             ) from exc
 
+        try:
+            fork_entry = await asyncio.to_thread(
+                self._claude_forks.get, cmd.request_id)
+            await self._inherit_claude_fork_controls(
+                child_session_id, (fork_entry or {}).get("controls"))
+        except Exception as exc:
+            self._remember_uncertain_claude_fork(
+                cmd.request_id, child_session_id)
+            self._ensure_claude_fork_reconciler(
+                cmd, sid, cwd, title)
+            log.warning(
+                "Claude fork controls are waiting for durable inheritance",
+                session_id=child_session_id,
+                error_type=type(exc).__name__,
+            )
+            raise _ForkOutcomeUncertain(
+                "Claude fork controls are not durably inherited") from exc
+
         self._uncertain_claude_forks.pop(cmd.request_id, None)
         # The marker must remain list-visible until the child id is durable.
         # Replace only that exact marker: after SessionForked is delivered, an
@@ -14244,10 +16189,13 @@ class WrapperMachine:
                     cmd, ERR_INTERNAL, "无法确定源会话的工作目录")
             source_cwd = os.path.realpath(raw_cwd)
             title = self._claude_fork_title(info)
+            controls = await self._claude_fork_control_snapshot(
+                sid, source_cwd, ctx)
             try:
                 entry = await asyncio.to_thread(
                     self._claude_forks.begin,
-                    cmd.request_id, sid, cmd.last_turn_id, source_cwd)
+                    cmd.request_id, sid, cmd.last_turn_id, source_cwd,
+                    controls)
                 canonical = await asyncio.to_thread(
                     self._claude_forks.get_canonical, cmd.request_id)
                 canonical_status = (canonical or entry).get("status")
@@ -14385,20 +16333,23 @@ class WrapperMachine:
                     cmd, ERR_INTERNAL, "派生请求锁容量已满，请稍后重试")
             lock = asyncio.Lock()
             self._codex_fork_locks[request_id] = lock
-        async with lock:
-            # A background reconciler may have resolved this reliable command
-            # after _process_command's initial dedupe check but before this lock.
-            client_id = getattr(cmd, "client_id", None)
-            cmd_id = getattr(cmd, "cmd_id", None)
-            if client_id and cmd_id:
-                seen, cached = self._command_seen(client_id, cmd_id)
-                if seen:
-                    # The background resolver published the correlated event and
-                    # ACK before releasing this same lock. Return its cached
-                    # response so outer _process_command preserves the cache and
-                    # emits only its harmless duplicate ACK, not a second event.
-                    return cached
-            return await self._handle_fork_session_locked(cmd)
+        try:
+            async with lock:
+                # A background reconciler may have resolved this reliable command
+                # after _process_command's initial dedupe check but before this lock.
+                client_id = getattr(cmd, "client_id", None)
+                cmd_id = getattr(cmd, "cmd_id", None)
+                if client_id and cmd_id:
+                    seen, cached = self._command_seen(client_id, cmd_id)
+                    if seen:
+                        # The background resolver published the correlated event and
+                        # ACK before releasing this same lock. Return its cached
+                        # response so outer _process_command preserves the cache and
+                        # emits only its harmless duplicate ACK, not a second event.
+                        return cached
+                return await self._handle_fork_session_locked(cmd)
+        finally:
+            self._release_terminal_codex_fork_lock(request_id, lock)
 
     async def _handle_fork_session_locked(self, cmd):
         """Persistently fork Codex after one selected completed turn."""
@@ -14421,12 +16372,37 @@ class WrapperMachine:
         source_cwd = os.path.realpath(source_cwd)
 
         try:
+            existing_entry = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            controls = (
+                dict(existing_entry.get("controls") or {})
+                if existing_entry is not None
+                else await self._codex_fork_control_snapshot(sid, ctx)
+            )
+            if existing_entry is None:
+                try:
+                    profile_allowed = await self._codex_fork_profile_allowed(
+                        controls, source_cwd)
+                except Exception as exc:
+                    log.warning(
+                        "Codex fork permission profile lookup failed",
+                        parent=sid,
+                        error_type=type(exc).__name__,
+                    )
+                    return await self._send_session_fork_error(
+                        cmd, ERR_INTERNAL,
+                        "当前执行环境状态无法确认，派生未开始")
+                if not profile_allowed:
+                    return await self._send_session_fork_error(
+                        cmd, ERR_AUTH,
+                        "源会话的执行环境不允许用于派生会话")
             entry = await asyncio.to_thread(
                 self._codex_forks.begin,
                 cmd.request_id,
                 sid,
                 cmd.last_turn_id,
                 source_cwd,
+                controls,
             )
         except ForkJournalError as exc:
             log.warning("codex fork intent rejected", error=str(exc))
@@ -14512,6 +16488,20 @@ class WrapperMachine:
             "ephemeral": False,
             "threadSource": marker,
         }
+        parent_model = (entry.get("controls") or {}).get("model")
+        if isinstance(parent_model, str) and parent_model:
+            params["model"] = parent_model
+        parent_approval = (entry.get("controls") or {}).get(
+            "approval_policy")
+        if parent_approval in CODEX_PERMISSION_MODES:
+            params["approvalPolicy"] = parent_approval
+        parent_profile = (entry.get("controls") or {}).get(
+            "permission_profile")
+        if isinstance(parent_profile, str) and parent_profile:
+            params["permissions"] = parent_profile
+        parent_web_search = (entry.get("controls") or {}).get("web_search")
+        if parent_web_search in CODEX_WEB_SEARCH_MODES:
+            params["config"] = {"web_search": parent_web_search}
         try:
             raw_result = await codex_rpc("thread/fork", params)
         except CodexRpcRejected as exc:
@@ -14594,6 +16584,151 @@ class WrapperMachine:
                      last_turn_id=cmd.last_turn_id)
         return event
 
+    async def _finalize_codex_worktree_fork_name(
+        self,
+        cmd,
+        child_session_id: str,
+        cwd: str,
+        *,
+        freshly_confirmed: bool,
+    ) -> None:
+        """Apply a requested title at most once, before publishing the result."""
+        entry = await asyncio.to_thread(
+            self._codex_forks.get, cmd.request_id)
+        if entry and entry.get("name_finalized"):
+            return
+        name = (getattr(cmd, "name", None) or "").strip()
+        if name and freshly_confirmed:
+            try:
+                await codex_rpc("thread/name/set", {
+                    "threadId": child_session_id,
+                    "name": name,
+                }, cwd=cwd)
+            except Exception as exc:
+                # A lost response may still have applied the title. Never replay
+                # this convenience mutation after a user could have renamed it.
+                log.warning(
+                    "forked thread initial name set failed",
+                    thread_id=child_session_id,
+                    error=str(exc),
+                )
+        elif name:
+            try:
+                result = await codex_rpc("thread/read", {
+                    "threadId": child_session_id,
+                    "includeTurns": False,
+                }, cwd=cwd)
+                thread = result.get("thread") if isinstance(result, dict) else None
+                current_name = (
+                    thread.get("name") if isinstance(thread, dict) else None)
+                if current_name != name:
+                    log.info(
+                        "preserving renamed fork title during retry",
+                        thread_id=child_session_id,
+                    )
+            except Exception as exc:
+                # Losing an initial suggestion is safer than writing after the
+                # direct fork response boundary.
+                log.warning(
+                    "forked thread name reconciliation skipped",
+                    thread_id=child_session_id,
+                    error_type=type(exc).__name__,
+                )
+        await asyncio.to_thread(
+            self._codex_forks.mark_name_finalized, cmd.request_id)
+
+    async def _finish_worktree_fork(
+        self,
+        cmd,
+        sid: str,
+        spec: WorktreeSpec,
+        child_session_id: str,
+        marker: str,
+        *,
+        freshly_confirmed: bool = False,
+    ) -> SessionForked:
+        """Durably publish one worktree fork without replaying its mutation."""
+        try:
+            await asyncio.to_thread(
+                self._codex_forks.complete,
+                cmd.request_id,
+                child_session_id,
+            )
+        except ForkJournalError as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError:
+                pass
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            log.exception(
+                "Codex worktree fork result journal failed", error=str(exc))
+            raise _ForkOutcomeUncertain(
+                "worktree fork completed but its result is not durable"
+            ) from exc
+
+        try:
+            entry = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            await self._inherit_codex_fork_controls(
+                child_session_id, (entry or {}).get("controls"))
+        except Exception as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            log.warning(
+                "worktree fork controls are waiting for durable inheritance",
+                session_id=child_session_id,
+                error_type=type(exc).__name__,
+            )
+            raise _ForkOutcomeUncertain(
+                "worktree fork controls are not durably inherited") from exc
+
+        try:
+            await self._finalize_codex_worktree_fork_name(
+                cmd,
+                child_session_id,
+                spec.cwd,
+                freshly_confirmed=freshly_confirmed,
+            )
+        except ForkJournalError as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            raise _ForkOutcomeUncertain(
+                "worktree fork name state is not durable") from exc
+
+        self._uncertain_codex_forks.pop(cmd.request_id, None)
+        event = SessionForked(
+            parent_session_id=sid,
+            session_id=child_session_id,
+            cwd=spec.cwd,
+            git_branch=spec.branch,
+            target="worktree",
+            last_turn_id=getattr(cmd, "last_turn_id", None),
+            request_id=cmd.request_id,
+            to=cmd.client_id,
+        )
+        await self.transport.send(event)
+        try:
+            await self._list_codex_sessions(cmd)
+        except Exception as exc:
+            log.warning(
+                "worktree fork session list refresh failed", error=str(exc))
+        log.info(
+            "codex session forked into worktree",
+            parent=sid,
+            session_id=child_session_id,
+            cwd=spec.cwd,
+            branch=spec.branch,
+        )
+        return event
+
     async def _find_codex_worktree_fork(
         self, parent_session_id: str, cwd: str,
     ) -> Optional[dict]:
@@ -14644,6 +16779,28 @@ class WrapperMachine:
         return None
 
     async def _handle_fork_session_worktree(self, cmd):
+        """Serialize reliable worktree retries with their reconciler."""
+        request_id = cmd.request_id
+        lock = self._codex_fork_locks.get(request_id)
+        if lock is None:
+            if len(self._codex_fork_locks) >= self.UNCERTAIN_FORK_CAP:
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_INTERNAL, "派生请求锁容量已满，请稍后重试")
+            lock = asyncio.Lock()
+            self._codex_fork_locks[request_id] = lock
+        try:
+            async with lock:
+                client_id = getattr(cmd, "client_id", None)
+                cmd_id = getattr(cmd, "cmd_id", None)
+                if client_id and cmd_id:
+                    seen, cached = self._command_seen(client_id, cmd_id)
+                    if seen:
+                        return cached
+                return await self._handle_fork_session_worktree_locked(cmd)
+        finally:
+            self._release_terminal_codex_fork_lock(request_id, lock)
+
+    async def _handle_fork_session_worktree_locked(self, cmd):
         """Create a wrapper-owned Git worktree and persistently fork Codex into it."""
         if not getattr(cmd, "client_id", None):
             return await self._send_worktree_fork_error(
@@ -14686,128 +16843,272 @@ class WrapperMachine:
             return await self._send_worktree_fork_error(
                 cmd, ERR_INTERNAL, "Git 工作树创建未完成，请稍后重试。")
 
-        existing: Optional[dict] = None
+        journal_turn = (
+            getattr(cmd, "last_turn_id", None)
+            or "cc-remote-worktree-head"
+        )
         try:
-            existing = await self._find_codex_worktree_fork(sid, spec.cwd)
-        except Exception as exc:
-            if not spec.created:
-                log.warning("worktree fork recovery lookup failed",
-                            parent=sid, cwd=spec.cwd, error=str(exc))
-                return await self._send_worktree_fork_error(
-                    cmd, ERR_INTERNAL,
-                    "工作树已存在，但暂时无法确认派生会话；请稍后重试",
-                )
-            log.warning("fresh worktree pre-fork lookup failed; continuing",
-                        parent=sid, cwd=spec.cwd, error=str(exc))
-
-        fork_result: Optional[dict] = None
-        if existing is None:
-            params: dict = {
-                "threadId": sid,
-                "cwd": spec.cwd,
-                "ephemeral": False,
-                "threadSource": fork_thread_source(cmd.request_id),
-            }
-            if getattr(cmd, "last_turn_id", None):
-                params["lastTurnId"] = cmd.last_turn_id
-            parent_model = (
-                getattr(ctx.sdk, "model", None) if ctx is not None else None
-            ) or (await asyncio.to_thread(codex_session_settings, sid)).get("model")
-            if parent_model:
-                params["model"] = parent_model
+            prior_entry = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            controls = (
+                dict(prior_entry.get("controls") or {})
+                if prior_entry is not None
+                else await self._codex_fork_control_snapshot(sid, ctx)
+            )
+        except ForkJournalError as exc:
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, f"无法读取派生请求状态: {exc}")
+        if prior_entry is None:
             try:
-                raw_result = await codex_rpc(
-                    "thread/fork", params, cwd=spec.cwd)
-                fork_result = raw_result if isinstance(raw_result, dict) else None
+                profile_allowed = await self._codex_fork_profile_allowed(
+                    controls, spec.cwd)
             except Exception as exc:
+                if spec.created:
+                    await asyncio.to_thread(rollback_worktree, spec)
                 log.warning(
-                    "Codex worktree fork RPC did not complete",
+                    "worktree fork permission profile lookup failed",
                     parent=sid,
-                    cwd=spec.cwd,
                     error_type=type(exc).__name__,
                 )
-                recovered: Optional[dict] = None
-                recovery_failed = False
-                try:
-                    recovered = await self._find_codex_worktree_fork(sid, spec.cwd)
-                except Exception as recovery_exc:
-                    recovery_failed = True
-                    log.warning("worktree fork post-error recovery failed",
-                                parent=sid, cwd=spec.cwd,
-                                error=str(recovery_exc))
-                if recovered is not None:
-                    existing = recovered
-                else:
-                    if spec.created and not recovery_failed:
-                        await asyncio.to_thread(rollback_worktree, spec)
-                    detail = (
-                        "派生结果暂时无法确认，工作树已保留；请稍后重试"
-                        if recovery_failed
-                        else "Codex 会话派生未完成，请稍后重试。"
-                    )
-                    return await self._send_worktree_fork_error(
-                        cmd, ERR_INTERNAL, detail)
-
-        thread = existing
-        if thread is None and fork_result is not None:
-            candidate = fork_result.get("thread")
-            thread = candidate if isinstance(candidate, dict) else None
-        new_session_id = thread.get("id") if isinstance(thread, dict) else None
-        if not isinstance(new_session_id, str) or not new_session_id:
-            # A malformed/lost response can still follow a committed fork. Query
-            # the state DB once before removing its cwd and potentially orphaning
-            # the new thread.
-            recovery_failed = False
-            try:
-                recovered = await self._find_codex_worktree_fork(sid, spec.cwd)
-            except Exception as recovery_exc:
-                recovered = None
-                recovery_failed = True
-                log.warning("worktree fork id recovery failed",
-                            parent=sid, cwd=spec.cwd, error=str(recovery_exc))
-            new_session_id = (
-                recovered.get("id") if isinstance(recovered, dict) else None)
-            if not isinstance(new_session_id, str) or not new_session_id:
-                if spec.created and not recovery_failed:
-                    await asyncio.to_thread(rollback_worktree, spec)
-                detail = (
-                    "派生结果暂时无法确认，工作树已保留；请稍后重试"
-                    if recovery_failed
-                    else "Codex 会话派生成功但未返回新会话 ID"
-                )
                 return await self._send_worktree_fork_error(
-                    cmd, ERR_INTERNAL, detail)
+                    cmd, ERR_INTERNAL,
+                    "新工作树的执行环境状态无法确认，派生未开始")
+            if not profile_allowed:
+                if spec.created:
+                    await asyncio.to_thread(rollback_worktree, spec)
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_AUTH,
+                    "源会话的执行环境不允许用于新工作树")
 
-        if name:
+        try:
+            fork_entry = await asyncio.to_thread(
+                self._codex_forks.begin,
+                cmd.request_id,
+                sid,
+                journal_turn,
+                spec.cwd,
+                controls,
+                target="worktree",
+            )
+        except ForkJournalError as exc:
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, f"无法记录派生请求: {exc}")
+        controls = dict(fork_entry.get("controls") or {})
+        marker = fork_entry["thread_source"]
+        if fork_entry.get("status") == "rejected":
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL,
+                fork_entry.get("error_message") or "Codex 会话派生已被拒绝")
+
+        async def recover(attempts: int = 1) -> Optional[str]:
+            for attempt in range(max(1, attempts)):
+                try:
+                    meta = await asyncio.to_thread(
+                        find_rollout_fork, marker, sid, spec.cwd)
+                    child = (
+                        meta.get("session_id")
+                        if isinstance(meta, dict) else None)
+                    if isinstance(child, str) and child:
+                        return child
+                    thread = await self._find_codex_worktree_fork(
+                        sid, spec.cwd)
+                    child = (
+                        thread.get("id")
+                        if isinstance(thread, dict) else None)
+                    if isinstance(child, str) and child:
+                        return child
+                except Exception as exc:
+                    log.warning(
+                        "worktree fork recovery lookup failed",
+                        parent=sid,
+                        cwd=spec.cwd,
+                        error_type=type(exc).__name__,
+                    )
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(self.FORK_RECONCILE_DELAY)
+            return None
+
+        completed_child = fork_entry.get("session_id")
+        if fork_entry.get("status") == "complete" and isinstance(
+            completed_child, str
+        ):
+            return await self._finish_worktree_fork(
+                cmd, sid, spec, completed_child, marker)
+
+        volatile_child = self._uncertain_codex_forks.get(cmd.request_id)
+        if (fork_entry.get("status") in {"submitted", "uncertain"}
+                or cmd.request_id in self._uncertain_codex_forks):
+            recovered = volatile_child or await recover(
+                self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_worktree_fork(
+                    cmd, sid, spec, recovered, marker)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            raise _ForkOutcomeUncertain(
+                "worktree fork is waiting for durable reconciliation")
+
+        recovered = await recover()
+        if recovered:
+            return await self._finish_worktree_fork(
+                cmd, sid, spec, recovered, marker)
+
+        try:
+            claimed_submission = await asyncio.to_thread(
+                self._codex_forks.claim_submission, cmd.request_id)
+        except ForkJournalError as exc:
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL,
+                f"无法持久记录派生提交状态: {exc}")
+        if not claimed_submission:
+            refreshed = await asyncio.to_thread(
+                self._codex_forks.get, cmd.request_id)
+            if refreshed and refreshed.get("status") == "complete":
+                child = refreshed.get("session_id")
+                if isinstance(child, str) and child:
+                    return await self._finish_worktree_fork(
+                        cmd, sid, spec, child, marker)
+            if refreshed and refreshed.get("status") == "rejected":
+                if spec.created:
+                    await asyncio.to_thread(rollback_worktree, spec)
+                return await self._send_worktree_fork_error(
+                    cmd, ERR_INTERNAL,
+                    refreshed.get("error_message")
+                    or "Codex 会话派生已被拒绝")
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_worktree_fork(
+                    cmd, sid, spec, recovered, marker)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            raise _ForkOutcomeUncertain(
+                "canonical worktree fork is still being reconciled")
+
+        params: dict = {
+            "threadId": sid,
+            "cwd": spec.cwd,
+            "ephemeral": False,
+            "threadSource": marker,
+        }
+        if getattr(cmd, "last_turn_id", None):
+            params["lastTurnId"] = cmd.last_turn_id
+        parent_model = controls.get("model")
+        if parent_model:
+            params["model"] = parent_model
+        parent_approval = controls.get("approval_policy")
+        if parent_approval in CODEX_PERMISSION_MODES:
+            params["approvalPolicy"] = parent_approval
+        parent_profile = controls.get("permission_profile")
+        if parent_profile:
+            params["permissions"] = parent_profile
+        parent_web_search = controls.get("web_search")
+        if parent_web_search in CODEX_WEB_SEARCH_MODES:
+            params["config"] = {"web_search": parent_web_search}
+
+        try:
+            raw_result = await codex_rpc(
+                "thread/fork", params, cwd=spec.cwd)
+        except CodexRpcRejected as exc:
+            log.warning(
+                "Codex worktree fork rejected",
+                parent=sid,
+                cwd=spec.cwd,
+                error=str(exc),
+            )
             try:
-                await codex_rpc("thread/name/set", {
-                    "threadId": new_session_id,
-                    "name": name,
-                }, cwd=spec.cwd)
-            except Exception as exc:
-                # The persistent fork and its worktree are already valid. A title
-                # can be retried through the normal rename action without risking
-                # user work, so never roll the fork back here.
-                log.warning("forked thread name set failed",
-                            thread_id=new_session_id, error=str(exc))
+                await asyncio.to_thread(
+                    self._codex_forks.reject,
+                    cmd.request_id,
+                    "Codex 会话派生未完成，请稍后重试。",
+                )
+            except ForkJournalError as journal_exc:
+                log.warning(
+                    "worktree fork rejection journal failed",
+                    error=str(journal_exc),
+                )
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, "Codex 会话派生未完成，请稍后重试。")
+        except CodexRpcOutcomeUnknown as exc:
+            self._remember_uncertain_codex_fork(cmd.request_id, None)
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError as journal_exc:
+                log.warning(
+                    "worktree fork uncertainty journal failed",
+                    error=str(journal_exc),
+                )
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if recovered:
+                return await self._finish_worktree_fork(
+                    cmd, sid, spec, recovered, marker)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            log.warning(
+                "Codex worktree fork outcome unknown",
+                parent=sid,
+                cwd=spec.cwd,
+                error=str(exc),
+            )
+            raise _ForkOutcomeUncertain(
+                "worktree fork outcome is not yet visible") from exc
+        except Exception as exc:
+            log.warning(
+                "Codex worktree fork could not start",
+                parent=sid,
+                cwd=spec.cwd,
+                error=str(exc),
+            )
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.reject,
+                    cmd.request_id,
+                    f"无法发起 Codex 会话派生: {exc}",
+                )
+            except ForkJournalError as journal_exc:
+                log.warning(
+                    "worktree pre-submit rejection journal failed",
+                    error=str(journal_exc),
+                )
+            if spec.created:
+                await asyncio.to_thread(rollback_worktree, spec)
+            return await self._send_worktree_fork_error(
+                cmd, ERR_INTERNAL, "Codex 会话派生未完成，请稍后重试。")
 
-        event = SessionForked(
-            parent_session_id=sid,
-            session_id=new_session_id,
-            cwd=spec.cwd,
-            git_branch=spec.branch,
-            target="worktree",
-            last_turn_id=getattr(cmd, "last_turn_id", None),
-            request_id=cmd.request_id,
-            to=cmd.client_id,
-        )
-        await self.transport.send(event)
-        await self._list_codex_sessions(cmd)
-        log.info("codex session forked into worktree",
-                 parent=sid, session_id=new_session_id,
-                 cwd=spec.cwd, branch=spec.branch,
-                 recovered=existing is not None)
-        return event
+        thread = raw_result.get("thread") if isinstance(raw_result, dict) else None
+        new_session_id = thread.get("id") if isinstance(thread, dict) else None
+        freshly_confirmed = isinstance(new_session_id, str) and bool(new_session_id)
+        if not isinstance(new_session_id, str) or not new_session_id:
+            self._remember_uncertain_codex_fork(cmd.request_id, None)
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.mark_uncertain, cmd.request_id)
+            except ForkJournalError as journal_exc:
+                log.warning(
+                    "worktree malformed-result journal failed",
+                    error=str(journal_exc),
+                )
+            recovered = await recover(self.FORK_RECONCILE_ATTEMPTS)
+            if not recovered:
+                self._ensure_codex_fork_reconciler(
+                    cmd, sid, spec.cwd, marker, spec)
+                raise _ForkOutcomeUncertain(
+                    "worktree fork response omitted its child id")
+            new_session_id = recovered
+
+        return await self._finish_worktree_fork(
+            cmd, sid, spec, new_session_id, marker,
+            freshly_confirmed=freshly_confirmed)
 
     async def _send_session_migration_error(
         self, cmd, code: str, message: str, *, sid: Optional[str] = None,
@@ -15106,7 +17407,10 @@ class WrapperMachine:
                 # pending reload so the queued/next Remote turn resumes the
                 # latest native state in this newly confirmed cwd first.
                 ctx.preview_write_candidates.clear()
-                ctx.preview_external_paths.clear()
+                ctx.preview_image_candidates.clear()
+                self._purge_preview_image_snapshots(
+                    ctx.preview_snapshot_token)
+                await self._drop_preview_session(ctx.engine, sid)
                 await self._cleanup_codex_steer_attachments(ctx)
                 self._invalidate_codex_session_catalog()
                 await self._emit(ctx, ArtifactInvalidated(
@@ -15340,6 +17644,7 @@ class WrapperMachine:
                     ERR_BUSY, "所有会话都在运行,先中断一个再切换")
                 return None
             vc = self.sessions.pop(victim)
+            self._purge_preview_image_snapshots(vc.preview_snapshot_token)
             try:
                 await vc.sdk.disconnect()
             except Exception:
@@ -15972,6 +18277,7 @@ class WrapperMachine:
             if victim is None:
                 raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
             vc = self.sessions.pop(victim)
+            self._purge_preview_image_snapshots(vc.preview_snapshot_token)
             try:
                 await vc.sdk.disconnect()
             except Exception:
@@ -16044,14 +18350,32 @@ class WrapperMachine:
         except OSError:
             pass
         try:
-            msgs = await asyncio.to_thread(
-                get_session_messages, session_id, directory=ctx.cwd,
+            compact_snapshot = await asyncio.to_thread(
+                transcript_compact_snapshot,
+                session_id,
+                path=path,
+                index_store=self._history_index,
+                snapshot_size=(os.path.getsize(path) if path else None),
+                max_record_bytes=min(
+                    256 * 1024 * 1024,
+                    max(64 * 1024 * 1024,
+                        self.cfg.history_source_max_bytes),
+                ),
             )
+            if compact_snapshot is not None:
+                msgs, timestamps, _internal_events = compact_snapshot
+            else:
+                msgs = await asyncio.to_thread(
+                    get_session_messages, session_id, directory=ctx.cwd,
+                )
+                timestamps = await asyncio.to_thread(
+                    transcript_timestamps, session_id)
         except Exception as e:
             log.warning("get_session_messages failed", session_id=session_id, error=str(e))
             return
         try:
-            events = translate_history(msgs, self.cfg.tool_result_max)
+            events = translate_history(
+                msgs, self.cfg.tool_result_max, timestamps=timestamps)
             subagent_events = await asyncio.to_thread(
                 translate_subagent_history, session_id, self.cfg.tool_result_max)
             events = merge_subagent_history(events, subagent_events)
@@ -16477,7 +18801,10 @@ class WrapperMachine:
         ) -> None:
             cancelled = False
             try:
-                async for msg in ctx.sdk.receive_response():
+                messages = ctx.sdk.receive_response()
+                if is_codex:
+                    messages = coalesce_codex_live_notifications(messages)
+                async for msg in messages:
                     await target_queue.put(msg)
             except asyncio.CancelledError:
                 cancelled = True

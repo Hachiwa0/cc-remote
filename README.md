@@ -4,7 +4,7 @@
 
 自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web
 
-**当前版本：v3.0.0** · Wire protocol v28
+**当前版本：v3.0.0** · Wire protocol v29
 
 [English](README_en.md) ·
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
@@ -57,8 +57,8 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **Codex 大 rollout** | Codex 历史按回合从文件尾部向前读取，保留 app-server 的原生 resume / compact 状态，不把整个 rollout 重新上传给模型。对特定超大 Codex Desktop + OpenAI 恢复场景，才启用严格限定的官方 HTTP 兼容路径。 |
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
 | **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
-| **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
-| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v28。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
+| **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。工作目录外的精确文件会先在请求它的会话中确认，只授权当前文件身份；用户确认的 Markdown 保持只读，只有本会话成功写入的文件才可保存。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
+| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v29。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
 
 > **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在
 > wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
@@ -130,8 +130,11 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
   cc-remote 只向扫描到的精确同用户 Claude 进程发送 SIGTERM，确认释放后再由 SDK 恢复
   同一会话。它不终止终端 Shell、不使用 SIGKILL，也不会静默接管现有进程。
 - **Codex Code：**默认通过 Codex 官方共享 app-server daemon 接入，让原生 Codex
-  客户端与 Remote 共享 thread 和控制状态；如果本机版本不支持，会明确降级到私有
-  app-server。`CC_REMOTE_CODEX_DAEMON=off` 可用于故障排查。
+  客户端与 Remote 共享 thread 和控制状态。app-server 随 Codex CLI 提供，不需要
+  单独安装；但 CLI 必须同时支持 `app-server daemon` 和 `app-server proxy` 才能共享
+  这条控制面。如果本机版本或 daemon 不可用，cc-remote 会降级到私有 stdio
+  app-server：Remote 仍可独立控制会话，但无法再与原生 Codex CLI/App 实时双向协同。
+  `CC_REMOTE_CODEX_DAEMON=off` 会强制使用这个私有路径，仅建议用于故障排查。
 - **切换 Codex 账号：**把
   `scripts/codex-auth-daemon-restart` 配置为 `codex-auth` 的切换后 hook。
   脚本在官方 daemon restart 前后写入本地代际屏障。Remote 检测到切号后会立即
@@ -209,7 +212,14 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### 前置
 
-- 一台已完成 **Claude Code** 或支持 `app-server` 的 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器。Claude wrapper 会显式启动日常使用的 `~/.local/bin/claude`，而不是 SDK 内置副本；Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个都可用即可在网页中切换引擎。
+- 一台已完成 **Claude Code** 或新版 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器。Codex app-server 已包含在 CLI 中，无需单独安装；Codex Code 要与原生 CLI/App 实时双向协同时，以下两个命令必须都能正常退出：
+
+  ```bash
+  codex app-server daemon --help
+  codex app-server proxy --help
+  ```
+
+  只有 `codex app-server --stdio` 可用时，Remote 仍能独立使用 Codex，但无法共享原生客户端的实时控制状态。Claude wrapper 会显式启动日常使用的 `~/.local/bin/claude`，而不是 SDK 内置副本；Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个引擎都可用即可在网页中切换。
 - **Python 3.10+**、**Node 20.19+**（用来构建网页）。
 - 可选：要预览 DOCX/XLSX/PPTX 等 Office 文件，Linux wrapper 主机需安装
   **LibreOffice + bubblewrap**（例如 `sudo apt install libreoffice bubblewrap`）；VPS 不需要。
@@ -401,12 +411,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v28**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v29**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v28 relay 和
-> v28 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v29 relay 和
+> v29 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。
 
 ### 3）上传 staging，由原子 release 安装器发布
 
@@ -460,7 +470,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v28 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v29 wrapper。
 
 验证：
 
@@ -585,7 +595,7 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | 交互配对凭据路径；文件必须仅当前用户可读。显式的 `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` 优先。 |
 | `CLAUDE_BIN` | `~/.local/bin/claude` | wrapper 实际启动的日常 Claude Code；空值仍使用该默认路径。只有 CLI 安装在别处时才设为另一个绝对路径。 |
 | `CC_REMOTE_CODEX_PROXY` | 空 | 仅注入 wrapper 启动的 Codex 子进程的 HTTP(S)/SOCKS5 代理；不改 wrapper 到 relay 的连接，也不影响用户终端里的 `codex`。例如 nono 可填 `http://127.0.0.1:7897`。 |
-| `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server。Work 始终私有，不受此项影响。 |
+| `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server，并失去与原生 Codex CLI/App 的实时双向协同。Work 始终私有，不受此项影响。 |
 | `CC_REMOTE_STATE_DIR` | `~/.cc-remote` | 本机 wrapper 状态目录。账号切换 hook 与 wrapper 必须使用同一个值，daemon 代际屏障保存在其中；不包含 Codex 凭据。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |
 | `CC_RESUME_SESSION_ID` | 空 | 恢复指定会话 UUID；留空开新会话。首次启动后 id 会持久化到 `~/.cc-remote/`。 |
@@ -632,7 +642,7 @@ cc-remote **不碰模型 API**——它只驱动你机器上已经配置好的 C
 
 - 用**官方 Anthropic API**：装好 `claude` 能对话即可，cc-remote 直接用。
 - 用**兼容端点（如 GLM / z.AI）**：照常在 `settings.json` 里设 `ANTHROPIC_BASE_URL`（指向官方兼容端点或你自建的代理），cc-remote 一样只做控制链路。
-- 用 **Codex**：先确保本机 `codex` 可正常对话且 `codex app-server` 可启动；cc-remote 不接触其 API key，也不会改写全局认证配置。
+- 用 **Codex**：先确保本机 `codex` 可正常对话；app-server 已随 CLI 提供。Codex Code 如需原生 CLI/App 与 Remote 实时双向协同，还要确保 `codex app-server daemon --help` 和 `codex app-server proxy --help` 都成功。cc-remote 不接触其 API key，也不会改写全局认证配置。
 
 ## 开发
 

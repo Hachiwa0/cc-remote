@@ -441,6 +441,25 @@ def test_restarted_wrapper_reclaims_only_leased_active_daemon_turn(
     asyncio.run(go())
 
 
+def test_unmarked_daemon_generation_persists_a_recoverable_turn_lease():
+    machine, _transport = _mk_machine()
+    ctx = _mk_ctx("sid", "sid")
+    ctx.engine = "codex"
+    ctx.space = "code"
+    ctx.sdk = _SharedSdk()
+    ctx.codex_daemon_epoch = "unmarked"
+    machine.sessions[ctx.key] = ctx
+
+    machine._claim_codex_turn(ctx, "owned-turn", "logical-message")
+
+    lease = machine._codex_turn_leases.get("sid")
+    assert lease is not None
+    assert lease.turn_id == "owned-turn"
+    assert lease.msg_id == "logical-message"
+    assert lease.daemon_epoch is None
+    assert ctx.codex_owned_turn_id == "owned-turn"
+
+
 def test_restarted_wrapper_continues_leased_turn_aborted_by_account_switch(
     tmp_path, monkeypatch,
 ):
@@ -868,6 +887,41 @@ def test_shared_context_attach_preserves_running_private_app_turn(tmp_path):
         assert ctx.control_mode == "desktop"
         assert ctx.write_state == "read_only"
         assert ctx.terminal_attached is True
+
+    asyncio.run(go())
+
+
+def test_shared_context_attach_preserves_turn_observed_after_sidebar_seed(tmp_path):
+    """A turn starting after watch creation is not stale shared-daemon debris."""
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        path = tmp_path / "rollout.jsonl"
+        path.write_bytes(b"")
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        mirrored = []
+        machine._push_mirrored_history = lambda sid: _record_async(
+            mirrored, sid)
+
+        with path.open("ab") as stream:
+            stream.write(_event("task_started", "app-turn"))
+        await machine._poll_codex_watch(
+            "sid", watch, set(), 1000.0, writers=set())
+        assert watch["active_external_turns"] == {"app-turn": 1000.0}
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _SharedSdk()
+        machine.sessions[ctx.key] = ctx
+        await machine._poll_codex_watch(
+            "sid", watch, set(), 1001.0, writers=set())
+
+        assert watch["active_external_turns"] == {"app-turn": 1000.0}
+        assert watch["desktop_active"] is True
+        assert watch["external"] is True
+        assert ctx.control_mode == "desktop"
+        assert ctx.write_state == "read_only"
 
     asyncio.run(go())
 

@@ -1,6 +1,59 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
+test("mounted message image retries once when cache capacity is released", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?inline-image-capacity=1");
+
+  await expect(page.getByTestId("inline-load-attempts")).toHaveText("1");
+  await expect(page.getByTestId("inline-network-loads")).toHaveText("0");
+  await expect(page.locator(".message-image-error"))
+    .toContainText("图片暂时无法加载");
+
+  await page.getByTestId("release-inline-capacity").click();
+
+  await expect(page.getByTestId("inline-load-attempts")).toHaveText("2");
+  await expect(page.getByTestId("inline-network-loads")).toHaveText("1");
+  await expect(page.locator(".message-image-loading")).toBeVisible();
+  await page.waitForTimeout(150);
+  await expect(page.getByTestId("inline-load-attempts")).toHaveText("2");
+  await expect(page.getByTestId("inline-network-loads")).toHaveText("1");
+});
+
+test("two visible images do not reclaim one cache slot forever", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?inline-image-eviction=1");
+
+  await expect(page.getByTestId("visible-inline-attempts")).toHaveText("3");
+  await expect(page.getByTestId("visible-inline-network-loads")).toHaveText("2");
+  const visibleImages = page.getByTestId("two-visible-inline-images");
+  await expect(visibleImages.getByRole("button", {
+    name: "图片暂时无法加载，点击重试",
+  })).toBeVisible();
+  await expect(visibleImages.getByRole("img", { name: "B" })).toBeAttached();
+
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("visible-inline-attempts")).toHaveText("3");
+  await expect(page.getByTestId("visible-inline-network-loads")).toHaveText("2");
+
+  await visibleImages.getByRole("button", {
+    name: "图片暂时无法加载，点击重试",
+  }).click();
+  await expect(page.getByTestId("visible-inline-attempts")).toHaveText("4");
+  await expect(page.getByTestId("visible-inline-network-loads")).toHaveText("3");
+  await expect(visibleImages.getByRole("img", { name: "A" })).toBeAttached();
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("visible-inline-attempts")).toHaveText("4");
+  await expect(page.getByTestId("visible-inline-network-loads")).toHaveText("3");
+
+  const noLoader = page.getByTestId("inline-no-loader");
+  await expect(noLoader.getByText("图片加载失败", { exact: true })).toBeVisible();
+  await expect(noLoader.getByText("图片加载超时", { exact: true })).toBeVisible();
+  await expect(noLoader.locator("button.message-image-error")).toHaveCount(0);
+});
+
 const productionCsp = (() => {
   const template = readFileSync(
     new URL("../../deploy/Caddyfile", import.meta.url),
@@ -23,6 +76,95 @@ async function applyProductionCsp(
     meta.content = policy;
     document.head.append(meta);
   }, productionCsp);
+}
+
+test("HTML preview retains head CSS and runs scripts only after explicit consent", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?artifact-html=1");
+  await applyProductionCsp(page);
+
+  const previewGeometry = async () => page.locator(
+    ".artifact-html-stage",
+  ).evaluate((stage) => {
+    const body = stage.parentElement;
+    const frame = stage.querySelector("iframe");
+    return {
+      bodyWidth: body?.getBoundingClientRect().width ?? 0,
+      stageWidth: stage.getBoundingClientRect().width,
+      frameWidth: frame?.getBoundingClientRect().width ?? 0,
+    };
+  });
+  const expectPreviewFillsBody = async () => {
+    await expect.poll(async () => {
+      const geometry = await previewGeometry();
+      return geometry.bodyWidth > 0
+        && Math.abs(geometry.stageWidth - geometry.bodyWidth) <= 1
+        && Math.abs(geometry.frameWidth - geometry.bodyWidth) <= 1;
+    }).toBe(true);
+  };
+
+  const staticFrame = page.frameLocator('iframe[title="HTML 静态预览"]');
+  await expectPreviewFillsBody();
+  await expect(staticFrame.locator("#head-style")).toHaveCSS(
+    "color",
+    "rgb(12, 34, 56)",
+  );
+  await expect(staticFrame.locator("body")).not.toHaveAttribute(
+    "data-script-ran",
+    "yes",
+  );
+
+  await page.getByRole("button", { name: "运行交互预览" }).click();
+  const interactiveFrame = page.frameLocator('iframe[title="HTML 交互预览"]');
+  await expectPreviewFillsBody();
+  await expect(interactiveFrame.locator("body")).toHaveAttribute(
+    "data-script-ran",
+    "yes",
+  );
+  await expect(interactiveFrame.locator("body")).toHaveAttribute(
+    "data-parent-blocked",
+    "yes",
+  );
+  await expect(page.locator("body")).not.toHaveAttribute(
+    "data-preview-escaped",
+    "yes",
+  );
+
+  await page.getByRole("button", { name: "停止交互预览" }).click();
+  await page.getByRole("button", { name: "运行交互预览" }).click();
+  const warmInteractiveFrame = page.frameLocator(
+    'iframe[title="HTML 交互预览"]',
+  );
+  await expect(warmInteractiveFrame.locator("body")).toHaveAttribute(
+    "data-script-ran",
+    "yes",
+  );
+});
+
+for (const fixture of ["artifact-svg", "artifact-markdown-svg"] as const) {
+  test(`${fixture} sanitizes SVG before creating a blob URL`, async ({
+    page,
+  }) => {
+    await page.goto(`/tests/history-browser.html?${fixture}=1`);
+    const image = page.getByRole("img", { name: fixture === "artifact-svg"
+      ? "diagram.svg" : "diagram" });
+    await expect(image).toBeVisible();
+    const sanitized = await image.evaluate(async (node) => {
+      const src = (node as HTMLImageElement).src;
+      return {
+        src,
+        text: await (await fetch(src)).text(),
+      };
+    });
+    expect(sanitized.src).toMatch(/^blob:/);
+    expect(sanitized.text).toContain("safe-svg-rect");
+    expect(sanitized.text).not.toMatch(
+      /<script|foreignObject|example\.com|<image/i,
+    );
+    await applyProductionCsp(page);
+    await expect(image).toBeVisible();
+  });
 }
 
 async function pinchThenPanPreview(
@@ -219,6 +361,111 @@ test("Claude settings does not expose Codex usage activity", async ({ page }) =>
   await expect(page.getByRole("button", { name: /通知/ })).toBeVisible();
 });
 
+async function maxPaintedTurnOffsetShiftThroughAction(
+  page: import("@playwright/test").Page,
+  turnId: string,
+  actionTestId: string,
+  frameCount = 36,
+): Promise<{ maxShift: number; missing: boolean }> {
+  return page.evaluate(async ({ id, testId, frames }) => {
+    const viewport = document.querySelector<HTMLElement>(".thread");
+    const row = document.querySelector<HTMLElement>(
+      `[data-turn-id="${CSS.escape(id)}"]`,
+    );
+    const action = document.querySelector<HTMLElement>(
+      `[data-testid="${CSS.escape(testId)}"]`,
+    );
+    if (!viewport || !row || !action) {
+      throw new Error("frame sampling target is missing");
+    }
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const initial = row.getBoundingClientRect().top - viewportTop;
+    let maxShift = 0;
+    let missing = false;
+    action.click();
+    await new Promise<void>((resolve) => {
+      let remaining = frames;
+      const sample = () => {
+        const current = document.querySelector<HTMLElement>(
+          `[data-turn-id="${CSS.escape(id)}"]`,
+        );
+        if (!current) {
+          missing = true;
+        } else {
+          const offset = current.getBoundingClientRect().top
+            - viewport.getBoundingClientRect().top;
+          maxShift = Math.max(maxShift, Math.abs(offset - initial));
+        }
+        remaining -= 1;
+        if (remaining <= 0) resolve();
+        else requestAnimationFrame(() => window.setTimeout(sample, 0));
+      };
+      // rAF runs before ResizeObserver delivery. Sample after the paint
+      // opportunity so the test observes user-visible frames, not the
+      // browser's internal pre-observer layout checkpoint.
+      requestAnimationFrame(() => window.setTimeout(sample, 0));
+    });
+    return { maxShift, missing };
+  }, { id: turnId, testId: actionTestId, frames: frameCount });
+}
+
+async function maxTurnOffsetShiftThroughTouchHistoryLoad(
+  page: import("@playwright/test").Page,
+  turnId: string,
+  frameCount = 60,
+): Promise<{ maxShift: number; missing: boolean }> {
+  return page.evaluate(async ({ id, frames }) => {
+    const viewport = document.querySelector<HTMLElement>(".thread");
+    const row = document.querySelector<HTMLElement>(
+      `[data-turn-id="${CSS.escape(id)}"]`,
+    );
+    if (!viewport || !row) throw new Error("touch frame target is missing");
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const initial = row.getBoundingClientRect().top - viewportTop;
+    let maxShift = 0;
+    let missing = false;
+    const dispatch = (type: "touchstart" | "touchmove" | "touchend",
+      clientY: number) => {
+      const touch = {
+        identifier: 1,
+        target: viewport,
+        clientX: 120,
+        clientY,
+      };
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperties(event, {
+        touches: { value: type === "touchend" ? [] : [touch] },
+        targetTouches: { value: type === "touchend" ? [] : [touch] },
+        changedTouches: { value: [touch] },
+      });
+      viewport.dispatchEvent(event);
+    };
+    dispatch("touchstart", 160);
+    dispatch("touchmove", 220);
+    dispatch("touchend", 220);
+    await new Promise<void>((resolve) => {
+      let remaining = frames;
+      const sample = () => {
+        const current = document.querySelector<HTMLElement>(
+          `[data-turn-id="${CSS.escape(id)}"]`,
+        );
+        if (!current) {
+          missing = true;
+        } else {
+          const offset = current.getBoundingClientRect().top
+            - viewport.getBoundingClientRect().top;
+          maxShift = Math.max(maxShift, Math.abs(offset - initial));
+        }
+        remaining -= 1;
+        if (remaining <= 0) resolve();
+        else requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+    return { maxShift, missing };
+  }, { id: turnId, frames: frameCount });
+}
+
 async function processDetailEdge(
   page: import("@playwright/test").Page,
   edge: "start" | "end",
@@ -271,6 +518,47 @@ async function waitForScrollIdle(
     await page.waitForTimeout(50);
   }
   throw new Error("thread scroll position did not settle");
+}
+
+async function pauseOutputAndScrollToHistoryStart(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  const viewport = page.locator(".thread");
+  // Initial virtual measurements can finish one frame after the first write
+  // and reassert the mounted tail. Retry the neutral test setup until the
+  // physical viewport itself is stable at the history edge; no user-intent
+  // event is emitted here, so the page request still belongs to the action
+  // under test.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await viewport.evaluate((node) => { node.scrollTop = 0; });
+    await waitForScrollIdle(page);
+    if (await viewport.evaluate((node) => node.scrollTop <= 1)) return;
+  }
+  expect(await viewport.evaluate((node) => node.scrollTop)).toBeLessThanOrEqual(1);
+}
+
+async function waitForReadingPositionIdle(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  let previous: { id: string; offset: number } | null = null;
+  let stableSamples = 0;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const current = await readingAnchor(page).catch(() => null);
+    if (!current) {
+      previous = null;
+      stableSamples = 0;
+      await page.waitForTimeout(50);
+      continue;
+    }
+    stableSamples = previous != null
+      && current.id === previous.id
+      && Math.abs(current.offset - previous.offset) < 0.5
+      ? stableSamples + 1 : 0;
+    if (stableSamples >= 4) return;
+    previous = current;
+    await page.waitForTimeout(50);
+  }
+  throw new Error("thread visual reading position did not settle");
 }
 
 async function nativeSelectionSnapshot(
@@ -348,7 +636,7 @@ async function wheelUntilTurn(
   const box = await viewport.boundingBox();
   if (!box) throw new Error("thread viewport has no bounds");
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  for (let attempt = 0; attempt < 12; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     if (await turnIntersectsViewport(page, turnId)) return;
     await page.mouse.wheel(0, deltaY);
     await page.waitForTimeout(40);
@@ -549,6 +837,189 @@ test("prepend preserves the exact reading row through delayed row growth", async
   expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
 });
 
+test("reducer history paging and live refresh keep one stable projection", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?reducer-pipeline=1");
+  await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("20");
+  await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("20");
+
+  await pauseOutputAndScrollToHistoryStart(page);
+  const before = await readingAnchor(page);
+  await page.getByRole("button", { name: "加载更早的历史" }).click();
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.locator('[data-turn-id="reducer-m20"]')).toBeAttached();
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("40");
+  await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("40");
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+
+  // A same-revision newest-page refresh is delivered to the authoritative
+  // runtime while the reducer-owned browse projection remains visible.
+  await page.getByTestId("reducer-live-refresh").click();
+  await expect(page.getByTestId("reducer-refresh-count")).toHaveText("1");
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("40");
+  await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("40");
+  const afterRefresh = await readingAnchor(page);
+  expect(afterRefresh.id).toBe(before.id);
+  expect(Math.abs(afterRefresh.offset - before.offset)).toBeLessThan(2);
+
+  // A -> B -> A discards only the display browse window. The accepted runtime
+  // must still contain one canonical copy of every newest turn.
+  await page.getByTestId("switch-session").click();
+  await expect(page.getByTestId("reducer-focused-sid"))
+    .toHaveText("reducer-history-session-b");
+  await expect(page.locator('[data-turn-id="reducer-b8"]')).toBeVisible();
+  await page.getByTestId("switch-session").click();
+  await expect(page.getByTestId("reducer-focused-sid"))
+    .toHaveText("reducer-history-session-a");
+  await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("20");
+  await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("20");
+});
+
+test("authoritative paging returns after an IndexedDB first paint", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?reducer-pipeline=1&cached-paging=1",
+  );
+  await expect(page.locator('[data-turn-id="reducer-cached-current"]'))
+    .toBeVisible();
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  const loader = page.getByTestId("load-older-history");
+  await expect(loader).toBeVisible();
+  const [loaderBox, viewportBox] = await Promise.all([
+    loader.boundingBox(),
+    viewport.boundingBox(),
+  ]);
+  expect(loaderBox).not.toBeNull();
+  expect(viewportBox).not.toBeNull();
+  expect(loaderBox!.y).toBeGreaterThanOrEqual(viewportBox!.y);
+  expect(loaderBox!.y + loaderBox!.height)
+    .toBeLessThanOrEqual(viewportBox!.y + viewportBox!.height);
+});
+
+test("reducer prepend never paints an intermediate reading-row jump", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?reducer-pipeline=1");
+  await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
+  await pauseOutputAndScrollToHistoryStart(page);
+  const before = await readingAnchor(page);
+  const sampled = await maxPaintedTurnOffsetShiftThroughAction(
+    page,
+    before.id,
+    "load-older-history",
+    60,
+  );
+  await expect(page.locator('[data-turn-id="reducer-m20"]')).toBeAttached();
+  const after = await readingAnchor(page);
+  expect(sampled.missing).toBe(false);
+  expect(sampled.maxShift).toBeLessThan(2);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+});
+
+test("touching the history edge never paints an intermediate reading-row jump", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?reducer-pipeline=1");
+  await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
+  await pauseOutputAndScrollToHistoryStart(page);
+  const before = await readingAnchor(page);
+  const sampled = await maxTurnOffsetShiftThroughTouchHistoryLoad(
+    page,
+    before.id,
+  );
+  await expect(page.locator('[data-turn-id="reducer-m20"]')).toBeAttached();
+  const after = await readingAnchor(page);
+  expect(sampled.missing).toBe(false);
+  expect(sampled.maxShift).toBeLessThan(2);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+});
+
+test("a history page waits for the active touch to release before mounting", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?delay=20&manual-growth=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await dispatchTouchPhase(page, "touchstart", 160);
+  await dispatchTouchPhase(page, "touchmove", 220);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await page.waitForTimeout(100);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  const held = await readingAnchor(page);
+  expect(held.id).toBe(before.id);
+  expect(Math.abs(held.offset - before.offset)).toBeLessThan(2);
+
+  await dispatchTouchPhase(page, "touchend", 220);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+  await page.waitForTimeout(350);
+  const settled = await readingAnchor(page);
+  expect(settled.id).toBe(before.id);
+  expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
+});
+
+test("older history becoming available during a wheel gesture is restored once", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name === "webkit", "desktop wheel path");
+  await page.goto(
+    "/tests/history-browser.html?delayed-history-availability=1&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  const before = await readingAnchor(page);
+  await viewport.dispatchEvent("wheel", { deltaY: -80 });
+  await page.getByTestId("reveal-older-history").click();
+
+  await expect(page.getByText("正在恢复历史…")).toBeVisible();
+  const pending = await readingAnchor(page);
+  expect(pending.id).toBe(before.id);
+  expect(Math.abs(pending.offset - before.offset)).toBeLessThan(2);
+  await expect(page.getByTestId("load-count")).toHaveText("0");
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+});
+
+test("older history becoming available under touch waits for release", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "webkit", "mobile WebKit touch path");
+  await page.goto(
+    "/tests/history-browser.html?delayed-history-availability=1&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await dispatchTouchPhase(page, "touchstart", 160);
+  await dispatchTouchPhase(page, "touchmove", 220);
+  await page.getByTestId("reveal-older-history").click();
+
+  await expect(page.getByText("正在恢复历史…")).toBeVisible();
+  await expect(page.getByTestId("load-count")).toHaveText("0");
+  await dispatchTouchPhase(page, "touchend", 220);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+});
+
 test("one click loads every turn-detail page without collapsing or jumping", async ({
   page,
 }) => {
@@ -556,8 +1027,11 @@ test("one click loads every turn-detail page without collapsing or jumping", asy
     "/tests/history-browser.html?detail-paging=1&delay=80&growth-delay=180",
   );
   const header = page.locator(".turn-process-head");
+  await expect(header).toHaveAttribute("aria-expanded", "false");
   const initialStart = await processDetailEdge(page, "start");
   await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByText("正在加载过程…")).toBeVisible();
   await expect(page.locator(".thread"))
     .toHaveAttribute("data-detail-anchor-active", "true");
   await expect(page.getByText("较新命令 1")).toBeVisible();
@@ -573,6 +1047,69 @@ test("one click loads every turn-detail page without collapsing or jumping", asy
     .toHaveAttribute("data-detail-anchor-active", "false");
 });
 
+test("a loading process can collapse and reopen without issuing a duplicate read", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&delay=500&growth-delay=180",
+  );
+  const header = page.locator(".turn-process-head");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(header).toHaveAttribute("aria-busy", "true");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  expect(await page.evaluate(
+    () => document.documentElement.dataset.detailRequests,
+  )).toBe("1");
+});
+
+test("a failed process detail stays open and retries in place", async ({ page }) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&detail-error-once=1"
+      + "&delay=500&growth-delay=30",
+  );
+  const header = page.locator(".turn-process-head");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByRole("alert")).toContainText(
+    "详细过程暂时不可用，请稍后重试",
+  );
+  await page.getByRole("button", { name: "重试" }).click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(header).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByText("较新命令 1")).toBeVisible();
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+});
+
+test("a failed older process page retries the exact cursor in place", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&detail-older-error-once=1"
+      + "&delay=30&growth-delay=10000",
+  );
+  const header = page.locator(".turn-process-head");
+  await header.click();
+  await expect(page.getByText("较新命令 1")).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText(
+    "详细过程暂时不可用，请稍后重试",
+  );
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.detailLastBefore,
+  )).toBe("detail-older");
+  await page.getByRole("button", { name: "重试" }).click();
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.detailRequests,
+  )).toBe("3");
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.detailLastBefore,
+  )).toBe("detail-older");
+});
+
 test("retained truncated process still fetches its authoritative first detail page", async ({
   page,
 }) => {
@@ -583,7 +1120,7 @@ test("retained truncated process still fetches its authoritative first detail pa
   const header = page.locator(".turn-process-head");
   await header.click();
   await expect(page.getByText("已缓存的较新命令")).toBeVisible();
-  await expect(page.getByText("较早过程已省略")).toBeVisible();
+  await expect(page.getByText("较早过程已省略")).toHaveCount(0);
   await expect(header).toHaveAttribute("aria-busy", "true");
   await expect(page.getByText("较早过程已省略")).toHaveCount(0);
   await expect(page.getByText("较新命令 1")).toBeVisible();
@@ -777,6 +1314,66 @@ test("instant session cache preserves a heavy turn's complete process skeleton",
   ]);
 });
 
+test("session cache rejects v10 Claude rows before replay or hydration", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html");
+  const result = await page.evaluate(async () => {
+    const cache = await import("/src/cache.ts");
+    await cache.clearCache();
+    const legacySid = "legacy-claude-prompt-alias";
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("cc_remote_cache", 1);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const tx = database.transaction("sessions", "readwrite");
+      tx.objectStore("sessions").put({
+        v: 10,
+        turns: [{
+          id: "claude-transcript-uuid",
+          prompt: "legacy prompt",
+          blocks: [],
+          done: false,
+        }],
+        lastSeq: 41,
+        revision: "legacy-r1",
+        generation: "legacy-g1",
+        savedAt: Date.now(),
+      }, legacySid);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+    const legacy = await cache.loadSession(legacySid);
+    const replay = await cache.loadAllReplayState();
+    cache.saveSession("current-claude-prompt-alias", [{
+      id: "browser-prompt-id",
+      clientMsgId: "browser-prompt-id",
+      historyTurnId: "claude-transcript-uuid",
+      prompt: "current prompt",
+      blocks: [],
+      done: false,
+    }], 42, "current-r1", "current-g1");
+    await new Promise((resolve) => window.setTimeout(resolve, 700));
+    const current = await cache.loadSession("current-claude-prompt-alias");
+    database.close();
+    return {
+      legacy,
+      legacyCursor: replay.cursors[legacySid],
+      currentIds: current?.turns.map((turn: {
+        id: string; clientMsgId?: string; historyTurnId?: string;
+      }) => [turn.id, turn.clientMsgId, turn.historyTurnId]),
+    };
+  });
+  expect(result.legacy).toBeNull();
+  expect(result.legacyCursor).toBeUndefined();
+  expect(result.currentIds).toEqual([[
+    "browser-prompt-id", "browser-prompt-id", "claude-transcript-uuid",
+  ]]);
+});
+
 test("a canonical image reference does not reserve a second hidden image row", async ({
   page,
 }) => {
@@ -799,6 +1396,48 @@ test("a canonical image reference does not reserve a second hidden image row", a
   await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
   await page.getByTestId("switch-session").click();
   await assertCanonicalImageLayout();
+});
+
+test("fallback image preview and canonical retry remain independent", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?history-image-fallback-error=1");
+  const turn = page.locator('[data-turn-id="history-fallback-error"]');
+  const imageRow = turn.locator(".ubub-imgs");
+  const preview = turn.getByRole("button", {
+    name: "预览用户发送的图片",
+  });
+  const retry = turn.getByRole("button", { name: "点击重试" });
+
+  await expect(turn).toBeVisible();
+  await expect(imageRow).toHaveCount(1);
+  await expect(imageRow.locator(":scope > .history-image-control"))
+    .toHaveCount(1);
+  await expect(turn.locator(".ubub-image-trigger")).toHaveCount(1);
+  await expect(preview).toBeVisible();
+  await expect(retry).toBeVisible();
+  const gap = await turn.evaluate((node) => {
+    const row = node.querySelector<HTMLElement>(".ubub-imgs");
+    const meta = node.querySelector<HTMLElement>(".ubub-meta");
+    if (!row || !meta) throw new Error("canonical image layout is incomplete");
+    return meta.getBoundingClientRect().top - row.getBoundingClientRect().bottom;
+  });
+  expect(gap).toBeLessThan(20);
+  await expect(page.getByTestId("history-fallback-loads")).toHaveText("0");
+
+  await preview.click();
+  await expect(page.locator(".image-lightbox")).toBeVisible();
+  await expect(page.getByTestId("history-fallback-loads")).toHaveText("0");
+  await page.locator(".image-lightbox-close").click();
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+
+  await retry.click();
+  await expect(page.getByTestId("history-fallback-loads")).toHaveText("1");
+  await expect(page.getByTestId("history-fallback-last-load"))
+    .toHaveText("history-fallback-error|history-fallback-image|thumbnail");
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+  await expect(imageRow).toHaveCount(1);
+  await expect(turn.locator(".ubub-image-trigger")).toHaveCount(1);
 });
 
 test("streaming rerenders cannot cancel an image preview close", async ({
@@ -1238,38 +1877,48 @@ test("a pending composer image previews without triggering removal", async ({
   await expect(page.locator(".image-lightbox")).toHaveCount(0);
 });
 
-test("a page that finishes under an active touch restores its retained boundary", async ({
+test("a page waits through post-touch momentum and restores its final boundary", async ({
   page,
 }, testInfo) => {
   test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
   await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = 0; });
-  const before = await readingAnchor(page);
 
   await dispatchTouchPhase(page, "touchstart", 160);
   await dispatchTouchPhase(page, "touchmove", 220);
   await expect(page.getByTestId("load-count")).toHaveText("1");
-  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
-  // WebKit may deliver the scroll that reached the paging edge only after the
-  // prepended rows have committed. Reproduce that stale metrics sequence
-  // deterministically: without a post-commit touchmove it must not replace o1.
-  await viewport.evaluate((node) => {
-    node.scrollTop = 400;
-    node.dispatchEvent(new Event("scroll"));
-    node.scrollTop = 0;
-    node.dispatchEvent(new Event("scroll"));
-  });
+  await page.waitForTimeout(50);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  // The network page may remain ready for multiple frames, but it cannot
+  // rebase the still-active gesture onto a not-yet-mounted older row.
+  await page.waitForTimeout(100);
   await dispatchTouchPhase(page, "touchend", 220);
+  // touchend does not end iOS scroll ownership: native momentum continues to
+  // emit scroll events without a finger. Keep the page staged, allow those
+  // movements and unrelated row growth, then commit at the final idle point.
+  await page.waitForTimeout(60);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  for (const top of [240, 420, 540]) {
+    await viewport.evaluate((node, scrollTop) => {
+      node.scrollTop = scrollTop;
+      node.dispatchEvent(new Event("scroll"));
+    }, top);
+    await page.waitForTimeout(50);
+  }
+  await page.getByTestId("grow-row").click();
+  const momentumEnd = await readingAnchor(page);
+  const momentumScrollTop = await viewport.evaluate((node) => node.scrollTop);
+  expect(momentumScrollTop).toBeGreaterThan(200);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
 
-  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
-  await expect.poll(async () =>
-    Math.abs((await readingAnchor(page)).offset - before.offset),
-  ).toBeLessThan(2);
-  await page.waitForTimeout(300);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect.poll(async () => (await readingAnchor(page)).id)
+    .toBe(momentumEnd.id);
+  await page.waitForTimeout(350);
   const settled = await readingAnchor(page);
-  expect(settled.id).toBe(before.id);
-  expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
+  expect(settled.id).toBe(momentumEnd.id);
+  expect(Math.abs(settled.offset - momentumEnd.offset)).toBeLessThan(2);
 });
 
 test("a delayed pre-commit touchmove never rebases a retained page", async ({
@@ -1286,7 +1935,8 @@ test("a delayed pre-commit touchmove never rebases a retained page", async ({
   await stageDelayedTouchMove(page, 160, 80);
   await dispatchTouchPhase(page, "touchmove", 220);
   await expect(page.getByTestId("load-count")).toHaveText("1");
-  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await page.waitForTimeout(50);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
   await dispatchDelayedTouchMove(page);
   await viewport.evaluate((node) => {
     node.scrollTop = 400;
@@ -1295,6 +1945,7 @@ test("a delayed pre-commit touchmove never rebases a retained page", async ({
     node.dispatchEvent(new Event("scroll"));
   });
   await dispatchTouchPhase(page, "touchend", 80);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
 
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
   await expect.poll(async () =>
@@ -1322,9 +1973,13 @@ test("a cached-newer page that finishes under touch keeps its retained row", asy
   await expect.poll(async () =>
     Math.abs((await readingAnchor(page)).offset - before.offset),
   ).toBeLessThan(2);
+  await page.waitForTimeout(350);
+  const settled = await readingAnchor(page);
+  expect(settled.id).toBe(before.id);
+  expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
 });
 
-test("movement after an attached page rebases the held touch boundary", async ({
+test("movement while a page is staged becomes the release boundary", async ({
   page,
 }, testInfo) => {
   test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
@@ -1336,10 +1991,12 @@ test("movement after an attached page rebases the held touch boundary", async ({
   await dispatchTouchPhase(page, "touchstart", 160);
   await dispatchTouchPhase(page, "touchmove", 220);
   await expect(page.getByTestId("load-count")).toHaveText("1");
-  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await page.waitForTimeout(50);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
 
-  // The response is already installed, but the same finger deliberately
-  // reverses toward newer content before it is lifted.
+  // The response is staged, while the same finger deliberately reverses
+  // toward newer content before it is lifted. That real position becomes the
+  // keyed anchor used when the page finally mounts.
   await dispatchTouchPhase(page, "touchmove", 80);
   await viewport.evaluate((node) => { node.scrollBy({ top: 720 }); });
   await expect.poll(async () => (await readingAnchor(page)).id)
@@ -1350,6 +2007,42 @@ test("movement after an attached page rebases the held touch boundary", async ({
   await waitForScrollIdle(page);
   const moved = await readingAnchor(page);
   await dispatchTouchPhase(page, "touchend", 80);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(moved.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - moved.offset),
+  ).toBeLessThan(2);
+  await page.waitForTimeout(300);
+  const settled = await readingAnchor(page);
+  expect(settled.id).toBe(moved.id);
+  expect(Math.abs(settled.offset - moved.offset)).toBeLessThan(2);
+});
+
+test("continuing to pull at the top keeps the staged page invisible", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  const original = await readingAnchor(page);
+
+  await dispatchTouchPhase(page, "touchstart", 160);
+  await dispatchTouchPhase(page, "touchmove", 220);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await page.waitForTimeout(50);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+
+  // The same finger keeps pulling into the top edge. The old page cannot move
+  // the DOM out from under that gesture; it mounts once, after release.
+  await dispatchTouchPhase(page, "touchmove", 280);
+  await viewport.evaluate((node) => { node.scrollBy({ top: -720 }); });
+  await waitForScrollIdle(page);
+  const moved = await readingAnchor(page);
+  expect(moved.id).toBe(original.id);
+  await dispatchTouchPhase(page, "touchend", 280);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
 
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(moved.id);
   await expect.poll(async () =>
@@ -1560,12 +2253,17 @@ test("user movement after prepend stays stable through delayed growth", async ({
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(initial.id);
   await wheelUntilTurn(page, "o2", 300, testInfo.project.name);
   await waitForScrollIdle(page);
-  await page.waitForTimeout(300);
   const before = await readingAnchor(page);
-  await page.getByTestId("grow-row").click();
+  const sampled = await maxPaintedTurnOffsetShiftThroughAction(
+    page,
+    before.id,
+    "grow-row",
+  );
   await expect(page.locator('[data-turn-id="n8"] p')).toHaveCount(28);
   await waitForScrollIdle(page);
   const after = await readingAnchor(page);
+  expect(sampled.missing).toBe(false);
+  expect(sampled.maxShift).toBeLessThan(2);
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 });
@@ -1607,12 +2305,12 @@ test("replay recovery replacement preserves the current reading row", async ({
   await page.goto("/tests/history-browser.html?large=40&recovery-replace=1");
   await expect(page.locator('[data-turn-id="m40"]')).toBeVisible();
   await wheelUntilTurn(page, "m10", -400, testInfo.project.name);
-  await waitForScrollIdle(page);
+  await waitForReadingPositionIdle(page);
   const before = await readingAnchor(page);
 
   await page.getByTestId("replace-revision").click();
   await expect(page.locator('[data-turn-id="m10"] p')).toHaveCount(4);
-  await waitForScrollIdle(page);
+  await waitForReadingPositionIdle(page);
   const after = await readingAnchor(page);
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
@@ -1652,6 +2350,111 @@ test("virtualization bounds mounted rows and preserves an expanded timeline", as
   await expect(timeline.locator(".turn-process-head")).toHaveAttribute("aria-expanded", "true");
 });
 
+test("plan progress uses a compact popover that closes outside", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?timeline=1");
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
+  const timeline = page.locator('[data-turn-id="timeline"]');
+  const trigger = timeline.getByRole("button", { name: /查看计划进度/ });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(popover).toBeVisible();
+  await expect(popover).toContainText("1 / 3");
+  await expect(popover).toContainText("验证计划弹层");
+
+  const box = await popover.boundingBox();
+  const viewport = page.viewportSize();
+  if (!box || !viewport) throw new Error("plan popover has no geometry");
+  expect(box.x).toBeGreaterThanOrEqual(8);
+  expect(box.x + box.width).toBeLessThanOrEqual(viewport.width - 8);
+  expect(box.y).toBeGreaterThanOrEqual(8);
+  expect(box.y + box.height).toBeLessThanOrEqual(viewport.height - 8);
+
+  await trigger.click();
+  await expect(popover).toHaveCount(0);
+  await trigger.click();
+  await expect(popover).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(popover).toHaveCount(0);
+  await trigger.click();
+  await expect(popover).toBeVisible();
+
+  await page.getByTestId("load-count").click();
+  await expect(popover).toHaveCount(0);
+});
+
+test("terminal turn does not mark unfinished structured plan complete", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?plan-ui=terminal");
+  await page.getByRole("button", { name: /查看计划进度/ }).click();
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(popover).toContainText("1 / 3");
+  await expect(popover).toContainText("执行已结束");
+  await expect(popover).not.toContainText("全部完成");
+});
+
+test("unstructured plan detail remains visible in the compact popover", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?plan-ui=unstructured");
+  await page.getByRole("button", { name: /查看计划进度/ }).click();
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(popover).toContainText("已记录");
+  await expect(popover).not.toContainText("全部完成");
+  await expect(popover).toContainText("先检查协议，再验证移动端，最后发布。");
+});
+
+test("opening a cached plan refreshes authoritative detail", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?plan-ui=refresh");
+  await page.getByRole("button", { name: /查看计划进度/ }).click();
+  await expect(page.getByTestId("plan-detail-requests")).toHaveText("1");
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(page.getByTestId("plan-refresh-state")).toHaveText("loading");
+  await expect(popover).toBeVisible();
+  await expect(popover).toContainText("缓存步骤二");
+  await expect(page.getByTestId("plan-refresh-state")).toHaveText("ready");
+  await expect(popover).toContainText("权威步骤二");
+  await expect(popover).not.toContainText("缓存步骤二");
+});
+
+test("only the selected plan block moves into the compact popover", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?plan-ui=mixed");
+  await page.locator(".turn-process-head").click();
+  await expect(page.getByText("旧版计划", { exact: true })).toBeVisible();
+});
+
+test("goal entry stays compact and opens its editor", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1");
+  const chip = page.getByRole("button", { name: "查看 Goal" });
+  await expect(chip).toBeVisible();
+  const box = await chip.boundingBox();
+  const viewport = page.viewportSize();
+  if (!box || !viewport) throw new Error("goal chip has no geometry");
+  expect(box.height).toBeLessThanOrEqual(42);
+  expect(box.width).toBeLessThan(viewport.width - 20);
+
+  await chip.click();
+  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toBeVisible();
+  await page.locator(".scrim.show").click({ position: { x: 5, y: 5 } });
+  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
+});
+
+test("budgeted goal keeps its blocked status visible on mobile", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-status=blocked");
+  const chip = page.getByRole("button", { name: /查看 Goal/ });
+  await expect(chip).toHaveAttribute("aria-label", /受阻/);
+  await expect(chip.locator(".goal-chip-ring"))
+    .toHaveClass(/goal-chip-ring-blocked/);
+});
+
 test("desktop text selection keeps its original virtual turn while edge-dragging", async ({
   page,
 }, testInfo) => {
@@ -1659,11 +2462,12 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=120");
   const viewport = page.locator(".thread");
-  await viewport.evaluate((node) => {
-    node.scrollTop = node.scrollHeight * (41 / 120);
-  });
-  const startText = page.locator('[data-turn-id="m42"] p').first();
-  await startText.scrollIntoViewIfNeeded();
+  await wheelUntilTurn(page, "m42", -600, testInfo.project.name);
+  await waitForScrollIdle(page);
+  const startTurnId = (await readingAnchor(page)).id;
+  const startText = page.locator(
+    `[data-turn-id="${startTurnId}"] p`,
+  ).first();
   await expect(startText).toBeInViewport();
   const viewportBox = await viewport.boundingBox();
   const startPoint = await textSelectionPoint(startText);
@@ -1691,10 +2495,12 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   const draggedScrollTop = await viewport.evaluate((node) => node.scrollTop);
   const draggingSelection = await nativeSelectionSnapshot(page);
   expect(draggedScrollTop - startScrollTop).toBeGreaterThan(800);
-  expect(draggingSelection.anchorTurnId).toBe("m42");
+  expect(draggingSelection.anchorTurnId).toBe(startTurnId);
   expect(draggingSelection.anchorConnected).toBe(true);
-  expect(draggingSelection.text).toContain("m42");
-  await expect(page.locator('[data-turn-id="m42"]')).toBeAttached();
+  expect(draggingSelection.text).toContain(startTurnId);
+  await expect(page.locator(
+    `[data-turn-id="${startTurnId}"]`,
+  )).toBeAttached();
   const draggedAnchor = await readingAnchor(page);
   await page.mouse.up();
   await expect(viewport).toHaveAttribute(
@@ -1720,7 +2526,7 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   expect(Math.abs(
     releasedAnchor.offset - immediateReleasedAnchor.offset,
   )).toBeLessThan(2);
-  await page.locator('[data-turn-id="m42"]').evaluate((node) => {
+  await page.locator(`[data-turn-id="${startTurnId}"]`).evaluate((node) => {
     (node as HTMLElement).style.paddingBottom = "320px";
   });
   await page.waitForTimeout(120);
@@ -1758,11 +2564,10 @@ test("desktop wheel scrolling remains available after text selection", async ({
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=120");
   const viewport = page.locator(".thread");
-  await viewport.evaluate((node) => {
-    node.scrollTop = node.scrollHeight * (41 / 120);
-  });
-  const text = page.locator('[data-turn-id="m42"] p').first();
-  await text.scrollIntoViewIfNeeded();
+  await wheelUntilTurn(page, "m42", -600, testInfo.project.name);
+  await waitForScrollIdle(page);
+  const startTurnId = (await readingAnchor(page)).id;
+  const text = page.locator(`[data-turn-id="${startTurnId}"] p`).first();
   const box = await text.boundingBox();
   if (!box) throw new Error("selection fixture has no geometry");
 
@@ -1842,11 +2647,9 @@ test("switching sessions clears retained desktop text selection", async ({
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=80");
   const viewport = page.locator(".thread");
-  await viewport.evaluate((node) => {
-    node.scrollTop = node.scrollHeight * 0.25;
-  });
-  const startText = page.locator('[data-turn-id="m20"] p').first();
-  await startText.scrollIntoViewIfNeeded();
+  await wheelUntilTurn(page, "m42", -600, testInfo.project.name);
+  await waitForScrollIdle(page);
+  const startText = page.locator('[data-turn-id="m42"] p').first();
   const start = await textSelectionPoint(startText);
   const textBox = await startText.boundingBox();
   if (!textBox) throw new Error("selection switch fixture has no geometry");
@@ -1875,8 +2678,7 @@ test("nested process disclosures survive virtual row unmounts", async ({
   page,
 }, testInfo) => {
   await page.goto("/tests/history-browser.html?timeline=1&engine=claude");
-  await wheelUntilTurn(page, "timeline", -4_000, testInfo.project.name);
-  await waitForScrollIdle(page);
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   const timeline = page.locator('[data-turn-id="timeline"]');
   await expect(timeline).toBeVisible();
   await timeline.locator(".turn-process-head").click();
@@ -1887,11 +2689,9 @@ test("nested process disclosures survive virtual row unmounts", async ({
   await expect(activity).toHaveAttribute("open", "");
   await expect(reasoning).toHaveAttribute("open", "");
 
-  await wheelUntilTurn(page, "f80", 4_000, testInfo.project.name);
-  await waitForScrollIdle(page);
+  await scrollThreadToEdge(page, "end", testInfo.project.name);
   await expect(timeline).toHaveCount(0);
-  await wheelUntilTurn(page, "timeline", -4_000, testInfo.project.name);
-  await waitForScrollIdle(page);
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   await expect(timeline).toBeVisible();
   await expect(timeline.locator("details.process-activity"))
     .toHaveAttribute("open", "");
@@ -1985,6 +2785,283 @@ test("live append follows at the bottom but not while reading history", async ({
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
   await expect(page.locator('[data-turn-id="live-42"]')).toHaveCount(0);
   expect(await page.locator(".turn").count()).toBeLessThan(40);
+  await assertCodexBurstNeverPaintsAboveTail(page, testInfo.project.name);
+});
+
+test("returning to a background-grown live turn settles at its current tail", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?interactive-timeline=1&engine=claude",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await expect(page.locator('[data-turn-id="streaming"] .turn-working'))
+    .toBeVisible();
+
+  await page.getByTestId("switch-session").click();
+  await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
+  // Visibility can precede ChatView's next-frame session-entry tail settle on
+  // a loaded WebKit worker. Measure the background update only after that
+  // intentional scope transition has finished.
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+  await page.getByTestId("grow-background-stream").click();
+  await page.waitForTimeout(200);
+  const unchanged = await readingAnchor(page);
+  expect(unchanged.id).toBe(before.id);
+  expect(Math.abs(unchanged.offset - before.offset)).toBeLessThan(2);
+
+  await page.getByTestId("switch-session").click();
+  const working = page.locator(
+    '[data-turn-id="streaming"] .turn-working',
+  );
+  await expect(working).toBeVisible();
+  await expect.poll(async () => working.evaluate((node) => {
+    const thread = document.querySelector<HTMLElement>(".thread");
+    if (!thread) return false;
+    return node.getBoundingClientRect().bottom
+      <= thread.getBoundingClientRect().bottom + 1;
+  })).toBe(true);
+  for (let index = 0; index < 4; index += 1) {
+    await page.getByTestId("grow-stream").click();
+    await expect.poll(async () => working.evaluate((node) => {
+      const thread = document.querySelector<HTMLElement>(".thread");
+      if (!thread) return false;
+      return node.getBoundingClientRect().bottom
+        <= thread.getBoundingClientRect().bottom + 1;
+    })).toBe(true);
+  }
+});
+
+async function assertCodexBurstNeverPaintsAboveTail(
+  page: import("@playwright/test").Page,
+  projectName: string,
+): Promise<void> {
+  await page.goto("/tests/history-browser.html?codex-live-burst=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await waitForScrollIdle(page);
+
+  const resultPromise = page.evaluate(async () => {
+    const thread = document.querySelector<HTMLElement>(".thread");
+    const start = document.querySelector<HTMLButtonElement>(
+      '[data-testid="start-codex-burst"]',
+    );
+    if (!thread || !start) throw new Error("Codex burst fixture is incomplete");
+    const distances: number[] = [];
+    const violations: Array<{
+      frame: number;
+      distance: number;
+      scrollTop: number;
+      scrollHeight: number;
+      burst: string | undefined;
+    }> = [];
+    const reverseJumps: Array<{
+      frame: number;
+      previousScrollTop: number;
+      scrollTop: number;
+      previousScrollHeight: number;
+      scrollHeight: number;
+    }> = [];
+    let frames = 0;
+    let doneFrames = 0;
+    let previousScrollTop = thread.scrollTop;
+    let previousScrollHeight = thread.scrollHeight;
+    let previousBurst = document.documentElement.dataset.codexBurst;
+    start.click();
+    await new Promise<void>((resolve) => {
+      const sample = () => {
+        frames += 1;
+        const distance = Math.max(
+          0,
+          thread.scrollHeight - thread.scrollTop - thread.clientHeight,
+        );
+        distances.push(distance);
+        if (distance > 2) {
+          violations.push({
+            frame: frames,
+            distance,
+            scrollTop: thread.scrollTop,
+            scrollHeight: thread.scrollHeight,
+            burst: document.documentElement.dataset.codexBurst,
+          });
+        }
+        const burst = document.documentElement.dataset.codexBurst;
+        if (burst === "running" && previousBurst === "running"
+            && thread.scrollTop < previousScrollTop - 2) {
+          reverseJumps.push({
+            frame: frames,
+            previousScrollTop,
+            scrollTop: thread.scrollTop,
+            previousScrollHeight,
+            scrollHeight: thread.scrollHeight,
+          });
+        }
+        previousScrollTop = thread.scrollTop;
+        previousScrollHeight = thread.scrollHeight;
+        previousBurst = burst;
+        if (burst === "done") {
+          doneFrames += 1;
+          if (doneFrames >= 6) {
+            resolve();
+            return;
+          }
+        }
+        requestAnimationFrame(() => window.setTimeout(sample, 0));
+      };
+      requestAnimationFrame(() => window.setTimeout(sample, 0));
+    });
+    return {
+      frames,
+      worst: Math.max(0, ...distances),
+      reverseJumps,
+      violations,
+    };
+  });
+
+  const result = await resultPromise;
+  expect(result.frames).toBeGreaterThan(10);
+  expect(result.violations, JSON.stringify(result.violations)).toHaveLength(0);
+  expect(result.reverseJumps, JSON.stringify(result.reverseJumps))
+    .toHaveLength(0);
+  expect(result.worst).toBeLessThanOrEqual(2);
+
+  // The pre-paint observer is active only while the newest turn is open. A
+  // reader who has deliberately left the tail must retain the exact row while
+  // the same long Codex tool burst continues in the background.
+  await page.goto("/tests/history-browser.html?codex-live-burst=1");
+  await wheelUntilTurn(page, "burst-history-1", -2_000, projectName);
+  const before = await readingAnchor(page);
+  await page.getByTestId("start-codex-burst").click();
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.codexBurst,
+  )).toBe("done");
+  await page.waitForTimeout(100);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
+}
+
+test("multi-line IME growth stays pinned during a Codex tool burst", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?codex-live-burst=1&composer-live=1",
+  );
+  const result = await page.evaluate(async () => {
+    const thread = document.querySelector<HTMLElement>(".thread");
+    const input = document.querySelector<HTMLTextAreaElement>(
+      '[data-testid="live-composer-shell"] textarea',
+    );
+    const start = document.querySelector<HTMLButtonElement>(
+      '[data-testid="start-codex-burst"]',
+    );
+    if (!thread || !input || !start) {
+      throw new Error("live composer fixture is incomplete");
+    }
+    const frame = () => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+    thread.scrollTop = thread.scrollHeight;
+    await frame();
+    await frame();
+
+    const distances: number[] = [];
+    let typed = false;
+    let terminalFrames = 0;
+    const monitor = new Promise<void>((resolve) => {
+      const sample = () => {
+        distances.push(Math.max(
+          0,
+          thread.scrollHeight - thread.scrollTop - thread.clientHeight,
+        ));
+        if (typed && document.documentElement.dataset.codexBurst === "done") {
+          terminalFrames += 1;
+          if (terminalFrames >= 6) {
+            resolve();
+            return;
+          }
+        }
+        requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+
+    const setValue = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype, "value",
+    )?.set;
+    if (!setValue) throw new Error("textarea value setter is unavailable");
+    const values = Array.from(
+      { length: 5 },
+      (_, index) => Array.from(
+        { length: index + 1 },
+        (__, line) => `第 ${line + 1} 行拼音输入内容用于验证输入框稳定`,
+      ).join("\n"),
+    );
+    const heights: number[] = [input.getBoundingClientRect().height];
+    input.focus();
+    input.dispatchEvent(new CompositionEvent("compositionstart", {
+      bubbles: true,
+      data: "",
+    }));
+    start.click();
+    for (const value of values) {
+      setValue.call(input, value);
+      input.dispatchEvent(new CompositionEvent("compositionupdate", {
+        bubbles: true,
+        data: value,
+      }));
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        data: value,
+        inputType: "insertCompositionText",
+      }));
+      await frame();
+      await frame();
+      heights.push(input.getBoundingClientRect().height);
+    }
+    input.dispatchEvent(new CompositionEvent("compositionend", {
+      bubbles: true,
+      data: values.at(-1),
+    }));
+    typed = true;
+    await monitor;
+    return {
+      heights,
+      worstDistance: Math.max(0, ...distances),
+    };
+  });
+
+  expect(result.heights.at(-1)).toBeGreaterThan(result.heights[0]);
+  expect(result.heights.at(-1)).toBeLessThanOrEqual(133);
+  expect(result.worstDistance).toBeLessThanOrEqual(2);
+});
+
+test("multi-line composer growth does not move a history reader", async ({
+  page,
+}, testInfo) => {
+  await page.goto(
+    "/tests/history-browser.html?codex-live-burst=1&composer-live=1",
+  );
+  await wheelUntilTurn(
+    page, "burst-history-1", -2_000, testInfo.project.name,
+  );
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+  await page.locator(
+    '[data-testid="live-composer-shell"] textarea',
+  ).fill([
+    "第一行输入",
+    "第二行输入",
+    "第三行输入",
+    "第四行输入",
+    "第五行输入",
+  ].join("\n"));
+  await page.waitForTimeout(120);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 });
 
 test("composer action growth keeps the live tail visible without stealing history", async ({
@@ -2182,6 +3259,8 @@ test("migration picker follows an external session move", async ({ page }) => {
   const confirm = dialog.getByRole(
     "button", { name: "迁移到此目录" },
   );
+  await expect(page.getByTestId("migration-picker-request"))
+    .toHaveText("/repo/current");
   await page.getByTestId("resolve-migration-picker")
     .evaluate((button) => (button as HTMLButtonElement).click());
   await expect(confirm).toBeEnabled();

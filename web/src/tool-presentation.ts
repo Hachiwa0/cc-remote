@@ -1,5 +1,9 @@
 import type { ToolBlock } from "./domain/conversation";
-import { mutatedFilePaths } from "./file-changes";
+import {
+  filePathsFromInput,
+  mutatedFilePaths,
+  presentFileOperation,
+} from "./file-changes";
 
 function value(input: Record<string, unknown>, ...keys: string[]): string {
   for (const key of keys) {
@@ -43,10 +47,32 @@ export function presentTool(block: ToolBlock): ToolPresentation {
   const explicit = block.title?.trim();
   const tool = block.tool || "tool";
   const lower = tool.toLowerCase();
+  const fileSearch = lower === "grep" || lower === "glob" || lower === "search";
+  const fileOperation = (fileSearch ? null : presentFileOperation(tool, input))
+    ?? (block.category === "file"
+      && !fileSearch
+      ? presentFileOperation("filechange", input)
+      : null);
 
   if (explicit) {
+    if (fileSearch) {
+      return {
+        icon: "research",
+        title: explicit,
+        subtitle: file || pattern,
+        group: "搜索",
+      };
+    }
+    if (fileOperation) {
+      return {
+        icon: fileOperation.icon,
+        title: explicit,
+        subtitle: file || filePathsFromInput(input)[0] || "",
+        group: fileOperation.group,
+      };
+    }
     const semantic = {
-      file: { icon: "edit", group: "文件" },
+      file: { icon: "code", group: "文件" },
       command: { icon: "bash", group: "命令" },
       mcp: { icon: "term", group: "MCP" },
       agent: { icon: "spark", group: "协作代理" },
@@ -57,17 +83,17 @@ export function presentTool(block: ToolBlock): ToolPresentation {
     return { ...semantic, title: explicit,
       subtitle: file || commandPreview(command) || pattern || url };
   }
-  if (lower === "read" || lower === "readfile" || lower === "listfiles") {
-    return { icon: "read", title: file ? `读取 ${basename(file)}` : "读取文件",
-      subtitle: file, group: "读取文件" };
+  if (fileOperation) {
+    return {
+      icon: fileOperation.icon,
+      title: file
+        ? `${fileOperation.action} ${basename(file)}`
+        : `${fileOperation.action}文件`,
+      subtitle: file || filePathsFromInput(input)[0] || "",
+      group: fileOperation.group,
+    };
   }
-  if (lower === "edit" || lower === "write" || lower === "apply_patch"
-      || lower === "editfile") {
-    const action = lower === "write" ? "写入" : "编辑";
-    return { icon: "edit", title: file ? `${action} ${basename(file)}` : `${action}文件`,
-      subtitle: file, group: "修改文件" };
-  }
-  if (lower === "grep" || lower === "glob" || lower === "search") {
+  if (fileSearch) {
     return { icon: "research", title: pattern ? `搜索 ${pattern}` : "搜索内容",
       subtitle: file, group: "搜索" };
   }

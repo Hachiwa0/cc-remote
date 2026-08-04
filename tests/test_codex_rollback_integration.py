@@ -13,7 +13,7 @@ from cc_remote.protocol import (
     RollbackSession,
     StateEvent,
 )
-from cc_remote.wrapper.codex_checkpoints import CheckpointError
+from cc_remote.wrapper.codex_checkpoints import CompletedCheckpoint, CheckpointError
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.machine import WrapperMachine
 from tests.test_multisession import _StubTransport, _mk_ctx, _mk_machine
@@ -231,6 +231,33 @@ def test_failed_post_capture_leaves_an_unavailable_turn_marker():
             isinstance(item, Notice) and item.title == "本轮代码回滚不可用"
             for item in transport.sent
         )
+
+    asyncio.run(run())
+
+
+def test_clean_commit_checkpoint_does_not_emit_a_runtime_warning():
+    class ConversationOnlyJournal:
+        def finish_turn(self, turn_id: str):
+            return CompletedCheckpoint(
+                turn_id=turn_id,
+                changed_paths=(),
+                files_available=False,
+            )
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("codex-session", "codex-session")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.codex_checkpoint = ConversationOnlyJournal()
+        ctx.codex_checkpoint_turn_id = "turn-committed"
+        ctx.codex_checkpoint_ready = True
+        ctx.codex_checkpoint_accepted = True
+
+        await machine._finish_codex_checkpoint(ctx)
+
+        assert not any(isinstance(item, Notice) for item in transport.sent)
+        assert ctx.codex_checkpoint_turn_id is None
 
     asyncio.run(run())
 

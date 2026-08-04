@@ -14,6 +14,20 @@
   directory, preserves its deferred-query queue, and rolls back to the original
   cwd if the new resume fails. The selected cwd survives wrapper restarts;
   migration never forks or steals browser focus.
+- Add requester-local confirmation for cwd-external previews under the
+  coordinated protocol v29 gate. Grants are bound to the engine, space,
+  session, canonical path, owner UID, device, and inode; a changed file asks
+  again. User-approved files remain read-only, while successful structured
+  writes can retain exact-file edit access. Relative assets in external
+  Markdown resolve beside that document without becoming browser filesystem
+  URLs.
+- Add isolated artifact and file-activity rendering under the coordinated v29
+  Wrapper/Relay/Web wire gate. HTML
+  artifacts now retain document CSS and offer an explicit isolated interactive
+  preview; standalone, Markdown, and conversation SVG images share one bounded
+  sanitizer. Successful built-in reads can preview exact cwd-external image
+  snapshots without granting directory access, and file activities use
+  read/create/update/delete/move semantics instead of one generic edit icon.
 - Move busy-session follow-up queues from browser memory to the always-on
   wrapper. Protocol v25 lets queued and interrupt-replacement messages continue
   as soon as the active turn ends even when every Web/PWA client is asleep or

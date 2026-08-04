@@ -52,6 +52,7 @@ _ALLOWED_ENTRY_FIELDS = {
     "session_id",
     "error_message",
     "created_at",
+    "controls",
 }
 
 
@@ -175,6 +176,26 @@ class ClaudeForkJournal:
                 or not math.isfinite(created_at)
                 or created_at < 0):
             raise ValueError("invalid Claude fork timestamp")
+        controls = entry.get("controls", {})
+        if not isinstance(controls, dict) or set(controls) - {
+            "model", "effort", "permission_mode",
+        }:
+            raise ValueError("invalid Claude fork controls")
+        model = controls.get("model")
+        if model is not None and (
+            not isinstance(model, str) or not model or len(model) > 256
+        ):
+            raise ValueError("invalid Claude fork model")
+        effort = controls.get("effort")
+        if effort is not None and effort not in {
+            "low", "medium", "high", "xhigh", "max",
+        }:
+            raise ValueError("invalid Claude fork effort")
+        permission = controls.get("permission_mode")
+        if permission is not None and permission not in {
+            "default", "acceptEdits", "plan", "auto", "bypassPermissions",
+        }:
+            raise ValueError("invalid Claude fork permission mode")
 
     @staticmethod
     def _validate_aliases(
@@ -190,6 +211,8 @@ class ClaudeForkJournal:
             if any(entry.get(field) != canonical.get(field)
                    for field in (*_IDENTITY_FIELDS, "marker")):
                 raise ValueError("Claude fork alias identity differs from its root")
+            if entry.get("controls", {}) != canonical.get("controls", {}):
+                raise ValueError("Claude fork alias controls differ from its root")
             compatible = {
                 "alias": {"intent", "submitted", "uncertain"},
                 "complete": {"complete"},
@@ -210,6 +233,7 @@ class ClaudeForkJournal:
         parent_session_id: str,
         cutoff_message_id: str,
         cwd: str,
+        controls: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         request_id = _safe_id(request_id, "fork request id")
         parent_session_id = _safe_id(parent_session_id, "parent session id")
@@ -220,6 +244,7 @@ class ClaudeForkJournal:
             "cutoff_message_id": cutoff_message_id,
             "cwd": cwd,
         }
+        control_snapshot = dict(controls or {})
         with self._lock:
             existing = self.entries.get(request_id)
             if existing is not None:
@@ -255,6 +280,7 @@ class ClaudeForkJournal:
                 entry = {
                     **identity,
                     "marker": claude_fork_marker(request_id),
+                    "controls": control_snapshot,
                     "status": "intent",
                     "created_at": time.time(),
                 }
@@ -267,6 +293,9 @@ class ClaudeForkJournal:
                     "status": "alias",
                     "created_at": time.time(),
                 }
+                if "controls" in canonical_entry:
+                    entry["controls"] = dict(
+                        canonical_entry.get("controls") or {})
             updated[request_id] = entry
             self._persist(updated)
             self.entries = updated

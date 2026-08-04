@@ -216,6 +216,37 @@ assert.deepEqual(detailCoordinator.complete({
   viewId: "view-new",
   windowEpoch: 2,
 });
+
+const sharedDetailCoordinator = new HistoryDetailRequestCoordinator();
+const sharedRuntimeTarget = {
+  target: "runtime" as const,
+  scopeKey: "machine-a:code:codex",
+  sid: "session-shared-detail",
+  revision: "revision-a",
+  turnId: "shared-turn",
+  autoLoad: true,
+};
+const sharedBrowseTarget = {
+  target: "browse" as const,
+  scopeKey: "machine-a:code:codex",
+  sid: "session-shared-detail",
+  revision: "revision-a",
+  turnId: "shared-turn",
+  viewId: "browse-view",
+  windowEpoch: 3,
+};
+assert.deepEqual(sharedDetailCoordinator.register(sharedRuntimeTarget), {
+  accepted: true, send: true,
+});
+assert.deepEqual(sharedDetailCoordinator.register(sharedBrowseTarget), {
+  accepted: true, send: false,
+}, "a user browse target joins an already-running runtime detail read");
+assert.deepEqual(sharedDetailCoordinator.completeAll({
+  session_id: sharedRuntimeTarget.sid,
+  revision: sharedRuntimeTarget.revision,
+  turn_id: sharedRuntimeTarget.turnId,
+}), [sharedRuntimeTarget, sharedBrowseTarget],
+"one wire response is delivered to every frozen projection waiter");
 const newestDetailContext = {
   target: "runtime" as const,
   scopeKey: "machine-a:code:codex",
@@ -385,10 +416,26 @@ scheduled.delete(1);
 scheduledDelays.delete(1);
 firstRepair?.();
 assert.equal(repairs, 1);
-assert.equal(repair.retry("detail:turn-1", () => { repairs += 1; }), false,
-  "the failed repair response must stop instead of looping");
 assert.equal(repair.retry("detail:turn-1", () => { repairs += 1; }), true,
-  "a later explicit request starts a fresh one-shot repair cycle");
+  "a still-growing transcript gets a bounded second repair attempt");
+assert.equal(scheduledDelays.get(2), 1_000,
+  "repair retries back off instead of polling the transcript");
+const secondRepair = scheduled.get(2);
+scheduled.delete(2);
+scheduledDelays.delete(2);
+secondRepair?.();
+assert.equal(repairs, 2);
+assert.equal(repair.retry("detail:turn-1", () => { repairs += 1; }), true);
+assert.equal(scheduledDelays.get(3), 4_000);
+const thirdRepair = scheduled.get(3);
+scheduled.delete(3);
+scheduledDelays.delete(3);
+thirdRepair?.();
+assert.equal(repairs, 3);
+assert.equal(repair.retry("detail:turn-1", () => { repairs += 1; }), false,
+  "the third failed repair response must stop instead of looping");
+assert.equal(repair.retry("detail:turn-1", () => { repairs += 1; }), true,
+  "a later explicit request starts a fresh bounded repair cycle");
 repair.complete("detail:turn-1");
 assert.equal(scheduled.size, 0,
   "an authoritative response cancels a repair that has not fired");

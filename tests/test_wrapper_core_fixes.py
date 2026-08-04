@@ -1078,6 +1078,29 @@ def test_codex_session_settings_restores_applied_update_before_next_turn(
     }
 
 
+def test_codex_session_settings_marks_granular_approval_without_flattening(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout-session-1.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "turn_context",
+        "payload": {
+            "model": "gpt-test",
+            "approval_policy": {"granular": {
+                "mcp_elicitations": True,
+                "rules": False,
+                "sandbox_approval": True,
+            }},
+        },
+    }) + "\n")
+    monkeypatch.setattr(
+        codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
+
+    assert codex_session_settings("session-1") == {
+        "model": "gpt-test",
+        "approval_policy_granular": True,
+    }
+
+
 def test_codex_session_settings_last_ordered_record_wins_after_update(
         monkeypatch, tmp_path):
     rollout = tmp_path / "rollout-session-1.jsonl"

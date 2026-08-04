@@ -3,6 +3,27 @@ import type { ErrorMsg } from "./protocol";
 const OWNERSHIP_GUIDANCE = /(本机终端|原生 .*CLI|Codex App|Claude TUI)/;
 const INCOMPLETE_CLAUDE_SESSION =
   "Claude 会话历史不完整，无法恢复；可从会话菜单删除该条目。";
+const PROVIDER_AUTH_TURN_FAILURE =
+  "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。";
+const LEGACY_CODEX_AUTH_TURN_FAILURE =
+  "Codex 登录已失效或当前账号无权限，请重新登录后重试。";
+const SAFE_TURN_FAILURE_MESSAGES = new Set([
+  // Keep the former network copy safe for replayed rows from an older wrapper.
+  "网络异常，连接失败，请重新尝试。",
+  "网络连接异常，请检查网络后重试。",
+  PROVIDER_AUTH_TURN_FAILURE,
+  "请求过于频繁或当前额度受限，请稍后重试。",
+  "请求超时，请重新尝试。",
+  "Codex 上游服务暂时不可用，请稍后重试。",
+]);
+
+function safeTurnFailureMessage(message: string): string | null {
+  const trimmed = message.trim();
+  if (trimmed === LEGACY_CODEX_AUTH_TURN_FAILURE) {
+    return PROVIDER_AUTH_TURN_FAILURE;
+  }
+  return SAFE_TURN_FAILURE_MESSAGES.has(trimmed) ? trimmed : null;
+}
 
 function ownershipMessage(message: string): string | null {
   if (!OWNERSHIP_GUIDANCE.test(message)) return null;
@@ -27,6 +48,10 @@ export function presentTurnProblem(error: Pick<ErrorMsg, "code" | "message">): s
   }
   if (error.code === "drain_timeout") {
     return "停止操作未及时完成，会话正在恢复。";
+  }
+  if (error.code === "cc_crash") {
+    return safeTurnFailureMessage(error.message)
+      ?? "本次回复未完成，请重试。";
   }
   return "本次回复未完成，请重试。";
 }
@@ -63,5 +88,5 @@ export function presentCommandProblem(
 export function presentHistoricalTurnProblem(message: string): string {
   const normalized = message.trim().toLowerCase();
   if (!normalized || normalized === "error") return "该轮未正常结束";
-  return message;
+  return safeTurnFailureMessage(message) ?? "该轮未正常结束";
 }

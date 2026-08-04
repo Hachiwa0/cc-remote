@@ -48,6 +48,13 @@ class _BackpressuredFakeStdin(_FakeStdin):
             await asyncio.Event().wait()
 
 
+class _OversizedResponseStdout(_FakeStdout):
+    async def readline(self) -> bytes:
+        if self.lines:
+            return self.lines.pop(0)
+        raise ValueError("Separator is found, but chunk is longer than limit")
+
+
 class _FakeProcess:
     def __init__(self, messages):
         self.stdin = _FakeStdin()
@@ -262,18 +269,60 @@ def test_codex_rpc_distinguishes_rejection_from_unknown_post_submit_outcome(
             "thread/fork", {"threadId": "parent"}, cwd=str(tmp_path))
 
     async def run():
-        with pytest.raises(codex_rpc_module.CodexRpcRejected):
+        with pytest.raises(codex_rpc_module.CodexRpcRejected) as rejected:
             await invoke([
                 {"jsonrpc": "2.0", "id": 1, "result": {}},
                 {"jsonrpc": "2.0", "id": 2,
                  "error": {"code": -32602, "message": "invalid params"}},
             ])
+        assert rejected.value.code == -32602
+        assert rejected.value.message == (
+            "codex app-server error -32602: invalid params"
+        )
 
         with pytest.raises(codex_rpc_module.CodexRpcOutcomeUnknown):
             await invoke([
                 {"jsonrpc": "2.0", "id": 1, "result": {}},
                 # EOF after request id=2 was written: commit status is unknown.
             ])
+
+    asyncio.run(run())
+
+
+def test_codex_rpc_preserves_oversized_response_boundary(monkeypatch, tmp_path):
+    async def run():
+        process = _FakeProcess([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+        ])
+        process.stdout = _OversizedResponseStdout([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+        ])
+
+        async def create_subprocess_exec(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(
+            codex_rpc_module, "_resolve_codex_bin", lambda: "/bin/codex")
+        monkeypatch.setattr(
+            codex_rpc_module, "_codex_env", lambda _path: {})
+        monkeypatch.setattr(
+            codex_rpc_module.asyncio,
+            "create_subprocess_exec",
+            create_subprocess_exec,
+        )
+
+        with pytest.raises(
+            codex_rpc_module.CodexRpcResponseTooLarge
+        ) as oversized:
+            await codex_rpc_module.codex_rpc(
+                "thread/turns/list",
+                {"threadId": "thread-1", "itemsView": "full"},
+                cwd=str(tmp_path),
+            )
+        assert isinstance(
+            oversized.value, codex_rpc_module.CodexRpcOutcomeUnknown)
+        assert process.stdin.closed is True
+        assert process.terminated is True
 
     asyncio.run(run())
 

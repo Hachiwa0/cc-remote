@@ -18,8 +18,10 @@ import {
   reduceTargetedRuntime,
 } from "../src/runtime-drain.ts";
 import {
+  mergeDetailWithLiveTail,
   mergeInitialHistory,
   restoreCachedTurnDetails,
+  restoreObservedLiveTurnDetails,
 } from "../src/history-merge.ts";
 import {
   HISTORY_INITIAL_PAGE,
@@ -49,6 +51,18 @@ import {
   historyImageDisplaySource,
   TurnImagePreviewCache,
 } from "../src/turn-image-previews.ts";
+import {
+  HistoryImageAssetCache,
+  historyImageAssetKey,
+  historyImageAssetCacheSnapshot,
+  HISTORY_IMAGE_REQUEST_TIMEOUT_MS,
+  shouldAutoloadHistoryImage,
+} from "../src/history-image-assets.ts";
+import {
+  InlineImageAssetCache,
+  inlineImageAssetCacheSnapshot,
+  INLINE_IMAGE_REQUEST_TIMEOUT_MS,
+} from "../src/inline-image-assets.ts";
 import { boundCachedTurns, controlForCachedSession } from "../src/cache.ts";
 import {
   boundRuntimeTurns,
@@ -88,6 +102,7 @@ import {
 import type {
   EngineCapabilities,
   History,
+  PreviewAsset,
   ServerEvent,
   SessionControl,
 } from "../src/protocol.ts";
@@ -841,7 +856,7 @@ assert.equal(claudeWorkSlashes.includes("permissions"), false,
   "Work permissions are fixed by its private workspace and must not be presented as editable");
 assert.equal(isKnownCodeOnlySlash("permissions", "claude"), true);
 assert.equal(isKnownCodeOnlySlash("permissions", "codex"), true);
-for (const slash of ["plan", "code-review", "security-review", "verify", "simplify", "run", "init"]) {
+for (const slash of ["plan", "code-review", "security-review", "verify", "simplify", "run", "init", "diff"]) {
   assert.equal(claudeWorkSlashes.includes(slash), false, `Work must hide Code /${slash}`);
   assert.equal(isKnownCodeOnlySlash(slash, "claude"), true);
 }
@@ -851,6 +866,17 @@ for (const slash of ["review", "init", "plan", "fast", "status", "compact", "rol
 }
 assert.equal(isKnownCodeOnlySlash("my-personal-skill", "claude"), false,
   "unknown user skills must remain available in Work");
+for (const engine of ["claude", "codex"] as const) {
+  assert.equal(commandsFor(engine).some((command) => (
+    "slash" in command && command.slash === "diff"
+  )), true, `/diff must be discoverable for ${engine} Code`);
+  assert.equal(clientSlashesFor(engine).has("diff"), true,
+    `/diff must remain local for ${engine}`);
+}
+assert.match(rewindComposerSource, /case "diff":[\s\S]{0,160}p\.onDiff\?\.\(\)/,
+  "/diff must open the local diff panel instead of becoming a model prompt");
+assert.match(historyAppSource, /onDiff=\{\(\) => getDiff\(""\)\}/,
+  "the composer /diff callback must reuse the existing latest-diff request path");
 assert.deepEqual(matchCommands("", "claude", "work").map((command) => command.slash),
   claudeWorkSlashes);
 assert.deepEqual(matchCommands("pla", "codex", "work"), []);
@@ -874,8 +900,8 @@ assert.match(historyAppSource, /replay_start[\s\S]*requestHistory/,
 assert.match(historyAppSource, /replay_start[\s\S]*setWorkArtifactsBySid/,
   "a replay gap must discard a possibly stale Work artifact inventory");
 assert.match(historyAppSource,
-  /displayHistoryProjection\(\s*state\.historyRecovery,\s*focusedSid,\s*rt,\s*state\.historyBrowse\s*\)/,
-  "ChatView must select recovery, browse, then live runtime without rebuilding rt.turns");
+  /displayHistoryProjection\(\s*state\.historyRecovery,\s*focusedSid,\s*rt,\s*state\.historyBrowse,\s*state\.retainedHistoryBrowse,\s*\)/,
+  "ChatView must select retained recovery, browse, then live runtime without rebuilding rt.turns");
 assert.match(historyAppSource,
   /new HistoryPageCache\(\)/,
   "deep-history pages must use their independent best-effort IndexedDB");
@@ -923,8 +949,8 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 10/,
-  "open-turn merge repair must invalidate duplicate IndexedDB projections");
+assert.match(cacheSource, /const CACHE_VER = 11/,
+  "Claude prompt aliases must invalidate v10 rows which can paint twice");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
@@ -1223,7 +1249,8 @@ const transcriptTurn = {
   blocks: [{ kind: "text" as const, message_id: "engine-text", text: "answer", done: true }],
 };
 const optimisticTurn = {
-  id: "client-id", prompt: "same prompt", done: false, ts: 1100,
+  id: "client-id", historyTurnId: "engine-id",
+  prompt: "same prompt", done: false, ts: 1100,
   blocks: [{ kind: "text" as const, message_id: "live-text", text: "answer tail", done: false }],
 };
 const laggingDone = {
@@ -1238,6 +1265,395 @@ assert.equal(mergedHistory[0].historyTurnId, "engine-id",
   "an attachment-free optimistic alias retains its native history lookup id");
 assert.equal(mergedHistory[1].prompt, "not flushed");
 
+const nativeAliasMerged = mergeInitialHistory(
+  [{
+    id: "native-alias", prompt: "same prompt", done: true,
+    blocks: [{
+      kind: "text" as const, message_id: "native-alias-final",
+      text: "answer", done: true, channel: "final" as const,
+    }],
+  }],
+  [{
+    id: "client-alias", historyTurnId: "native-alias",
+    prompt: "same prompt", done: false,
+    blocks: [{
+      kind: "text" as const, message_id: "live-alias-final",
+      text: "answer", done: false, channel: "final" as const,
+    }],
+  }],
+);
+assert.deepEqual(
+  nativeAliasMerged.map((turn) => turn.id),
+  ["client-alias"],
+  "historyTurnId is an exact native/client identity even without timestamps",
+);
+
+const compactNativeTurnId = "native-compact-turn";
+const compactBoundaryMerged = mergeInitialHistory(
+  [{
+    id: "history-compact-user",
+    forkPointId: compactNativeTurnId,
+    prompt: "修复问题",
+    done: false,
+    blocks: [],
+  }],
+  [{
+    id: "browser-compact-turn",
+    prompt: "修复问题",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "live-context-compaction",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+);
+assert.deepEqual(
+  compactBoundaryMerged.map((turn) => turn.id),
+  ["browser-compact-turn"],
+  "a native compaction binding must reconcile the live row with History",
+);
+assert.equal(
+  compactBoundaryMerged[0].blocks.some((block) =>
+    block.kind === "process" && block.processKind === "compaction"),
+  true,
+  "reconciling a compact boundary must keep its process marker",
+);
+const rolloutCompactBoundaryMerged = mergeInitialHistory(
+  [{
+    id: "rollout-compact-user",
+    prompt: "修复问题",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "rollout-context-compaction",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+  [{
+    id: "browser-rollout-compact-user",
+    prompt: "修复问题",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "live-rollout-context-compaction",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+);
+assert.equal(rolloutCompactBoundaryMerged.length, 1,
+  "rollout and live compaction markers bind one visible user row");
+assert.equal(
+  rolloutCompactBoundaryMerged[0].blocks.filter((block) =>
+    block.kind === "process" && block.processKind === "compaction").length,
+  1,
+  "one compaction observed through rollout and live sources stays one process",
+);
+const compactDoesNotCrossSteer = mergeInitialHistory(
+  [{
+    id: "history-before-steer",
+    forkPointId: compactNativeTurnId,
+    prompt: "first direction",
+    done: true,
+    blocks: [],
+  }, {
+    id: "history-after-steer",
+    forkPointId: compactNativeTurnId,
+    prompt: "second direction",
+    done: false,
+    blocks: [],
+  }],
+  [{
+    id: "browser-after-steer",
+    prompt: "second direction",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "compact-after-steer",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+);
+assert.deepEqual(
+  compactDoesNotCrossSteer.map((turn) => [turn.id, turn.prompt]),
+  [
+    ["history-before-steer", "first direction"],
+    ["browser-after-steer", "second direction"],
+  ],
+  "a compact task alias must not merge a later steer into an older prompt",
+);
+const repeatedCompactSteer = mergeInitialHistory(
+  [{
+    id: "history-repeated-before-steer",
+    prompt: "继续",
+    done: true,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "history-repeated-old-compact",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }, {
+    id: "history-repeated-after-steer",
+    forkPointId: compactNativeTurnId,
+    prompt: "继续",
+    done: false,
+    blocks: [],
+  }],
+  [{
+    id: "browser-repeated-after-steer",
+    prompt: "继续",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "live-repeated-new-compact",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+  { preserveLiveTailOpen: true },
+);
+assert.deepEqual(
+  repeatedCompactSteer.map((turn) => ({
+    id: turn.id,
+    historyTurnId: turn.historyTurnId,
+    done: turn.done,
+  })),
+  [{
+    id: "history-repeated-before-steer",
+    historyTurnId: undefined,
+    done: true,
+  }, {
+    id: "browser-repeated-after-steer",
+    historyTurnId: "history-repeated-after-steer",
+    done: false,
+  }],
+  "a repeated steer prompt binds the newest compatible compact segment",
+);
+const repeatedCompactionEvents = mergeInitialHistory(
+  [{
+    id: "history-two-compactions",
+    prompt: "long task",
+    done: false,
+    blocks: [
+      {
+        kind: "process" as const,
+        item_id: "history-compact-one",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+      {
+        kind: "process" as const,
+        item_id: "history-compact-two",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+    ],
+  }],
+  [{
+    id: "browser-two-compactions",
+    prompt: "long task",
+    done: false,
+    blocks: [
+      {
+        kind: "process" as const,
+        item_id: "live-compact-one",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+      {
+        kind: "process" as const,
+        item_id: "live-compact-two",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+    ],
+  }],
+);
+assert.equal(
+  repeatedCompactionEvents[0].blocks.filter((block) =>
+    block.kind === "process" && block.processKind === "compaction").length,
+  2,
+  "two real compactions stay visible when both sources observed both events",
+);
+const liveHasNewerCompaction = mergeInitialHistory(
+  [{
+    id: "history-one-compaction",
+    prompt: "long task",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "history-known-compact",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+  [{
+    id: "browser-one-history-two-live-compactions",
+    prompt: "long task",
+    done: false,
+    blocks: [
+      {
+        kind: "process" as const,
+        item_id: "live-known-compact",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+      {
+        kind: "process" as const,
+        item_id: "live-newer-compact",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+    ],
+  }],
+);
+assert.deepEqual(
+  liveHasNewerCompaction[0].blocks.flatMap((block) =>
+    block.kind === "process" && block.processKind === "compaction"
+      ? [block.item_id] : []),
+  ["live-known-compact", "live-newer-compact"],
+  "a live-only newer compaction remains visible after the shared occurrence",
+);
+const historyHasOlderCompaction = mergeInitialHistory(
+  [{
+    id: "history-two-live-one-compactions",
+    prompt: "long task",
+    done: false,
+    blocks: [
+      {
+        kind: "process" as const,
+        item_id: "history-older-compact",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+      {
+        kind: "process" as const,
+        item_id: "history-shared-compact",
+        processKind: "compaction" as const,
+        phase: "end" as const,
+        status: "succeeded" as const,
+        turn_id: compactNativeTurnId,
+        title: "压缩上下文",
+        done: true,
+      },
+    ],
+  }],
+  [{
+    id: "browser-two-history-one-live-compaction",
+    prompt: "long task",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "live-shared-compact",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactNativeTurnId,
+      title: "压缩上下文",
+      done: true,
+    }],
+  }],
+);
+assert.deepEqual(
+  historyHasOlderCompaction[0].blocks.flatMap((block) =>
+    block.kind === "process" && block.processKind === "compaction"
+      ? [block.item_id] : []),
+  ["history-older-compact", "live-shared-compact"],
+  "a live tail pairs with the latest history occurrence without hiding older compaction",
+);
+const sharedTaskSegments = mergeInitialHistory([], [{
+  id: "steer-segment-one",
+  prompt: "first",
+  done: true,
+  blocks: [{
+    kind: "process" as const,
+    item_id: "shared-task-process-one",
+    processKind: "command" as const,
+    phase: "end" as const,
+    status: "succeeded" as const,
+    turn_id: "shared-native-task",
+    title: "运行命令",
+    done: true,
+  }],
+}, {
+  id: "steer-segment-two",
+  prompt: "second",
+  done: false,
+  blocks: [{
+    kind: "process" as const,
+    item_id: "shared-task-process-two",
+    processKind: "command" as const,
+    phase: "start" as const,
+    status: "running" as const,
+    turn_id: "shared-native-task",
+    title: "运行命令",
+    done: false,
+  }],
+}]);
+assert.equal(sharedTaskSegments.length, 2,
+  "ordinary process task ids shared by steer segments are not turn aliases");
+
 const repeatedOld = {
   id: "old-engine", prompt: "继续", done: true, ts: 10_000,
   blocks: [{ kind: "text" as const, message_id: "old-answer", text: "old", done: true }],
@@ -1251,7 +1667,12 @@ assert.equal(repeatedMerged[1].done, false);
 
 const delayedEcho = mergeInitialHistory(
   [{ ...transcriptTurn, id: "engine-delayed", ts: 20_000 }],
-  [{ ...optimisticTurn, id: "client-delayed", ts: 22_500 }],
+  [{
+    ...optimisticTurn,
+    id: "client-delayed",
+    historyTurnId: "engine-delayed",
+    ts: 22_500,
+  }],
 );
 assert.deepEqual(delayedEcho.map((turn) => turn.id), ["client-delayed"]);
 
@@ -1271,7 +1692,8 @@ const multiCommentHistory = {
   ],
 };
 const multiCommentLive = {
-  id: "multi-live", prompt: "inspect", done: true, ts: 30_100,
+  id: "multi-live", historyTurnId: "multi-history",
+  prompt: "inspect", done: true, ts: 30_100,
   blocks: [
     { kind: "text" as const, message_id: "live-a", text: "A", done: true,
       channel: "commentary" as const },
@@ -1286,6 +1708,40 @@ const multiCommentMerged = mergeInitialHistory(
   [multiCommentHistory], [multiCommentLive]);
 assert.deepEqual(multiCommentMerged[0].blocks.filter(
   (block) => block.kind === "text").map((block) => block.text), ["A", "B"]);
+
+const unrelatedSameChannelHistory = {
+  id: "same-turn-unrelated-text",
+  prompt: "inspect",
+  done: true,
+  blocks: [{
+    kind: "text" as const,
+    message_id: "history-unrelated",
+    text: "canonical earlier commentary",
+    done: true,
+    channel: "commentary" as const,
+  }],
+};
+const unrelatedSameChannelLive = {
+  ...unrelatedSameChannelHistory,
+  done: false,
+  blocks: [{
+    kind: "text" as const,
+    message_id: "live-unrelated",
+    text: "a distinct later update",
+    done: false,
+    channel: "commentary" as const,
+  }],
+};
+assert.deepEqual(
+  mergeInitialHistory(
+    [unrelatedSameChannelHistory],
+    [unrelatedSameChannelLive],
+    { preserveLiveTailOpen: true },
+  )[0].blocks.flatMap((block) =>
+    block.kind === "text" ? [block.text] : []),
+  ["canonical earlier commentary", "a distinct later update"],
+  "same-channel text with zero affinity must remain separate blocks",
+);
 
 // Tool-only assistant envelopes have a start/end but no text delta. Summary
 // history omits those invisible shells while loaded detail retains them. A
@@ -1456,7 +1912,8 @@ const imageHistory = {
   blocks: [],
 };
 const imageLive = {
-  id: "image-live", prompt: "看图", done: false, ts: 36_100,
+  id: "image-live", historyTurnId: "image-history",
+  prompt: "看图", done: false, ts: 36_100,
   images: [{ media_type: "image/png" as const, data: "inline-body" }],
   blocks: [],
 };
@@ -1485,6 +1942,447 @@ assert.equal(
 turnImagePreviews.release(imageMerged[0].id);
 assert.equal(turnImagePreviews.get(imageMerged[0].id, 0), undefined);
 
+function imageCapacityWakeHarness() {
+  let nextHandle = 1;
+  const scheduled = new Map<number, {
+    callback: () => void;
+    delayMs: number;
+  }>();
+  return {
+    scheduler: {
+      schedule(callback: () => void, delayMs: number): unknown {
+        const handle = nextHandle++;
+        scheduled.set(handle, { callback, delayMs });
+        return handle;
+      },
+      cancel(handle: unknown): void {
+        if (typeof handle === "number") scheduled.delete(handle);
+      },
+    },
+    scheduledDelays(): number[] {
+      return [...scheduled.values()].map((task) => task.delayMs);
+    },
+    fireNext(): boolean {
+      const next = scheduled.entries().next().value;
+      if (!next) return false;
+      const [handle, task] = next;
+      scheduled.delete(handle);
+      task.callback();
+      return true;
+    },
+  };
+}
+
+const rotatingHistoryImages = new HistoryImageAssetCache(1);
+const rotatingHistoryAKey = historyImageAssetKey(
+  "rotation-turn", "rotation-a", "thumbnail");
+const rotatingHistoryBKey = historyImageAssetKey(
+  "rotation-turn", "rotation-b", "thumbnail");
+assert.equal(rotatingHistoryImages.begin({
+  sid: "rotation-session",
+  turnId: "rotation-turn",
+  imageId: "rotation-a",
+  variant: "thumbnail",
+  requestId: "rotation-a-first",
+  revision: "rotation-r1",
+}), true);
+assert.equal(rotatingHistoryImages.accept({
+  v: 26,
+  ts: 10,
+  type: "history_image",
+  session_id: "rotation-session",
+  turn_id: "rotation-turn",
+  image_id: "rotation-a",
+  variant: "thumbnail",
+  request_id: "rotation-a-first",
+  revision: "rotation-r1",
+  media_type: "image/png",
+  data: "AA==",
+}), true);
+let rotatingHistoryAObserved = false;
+const rotatingHistoryA = rotatingHistoryImages.forSession(
+  "rotation-session")[rotatingHistoryAKey];
+rotatingHistoryAObserved ||= !!rotatingHistoryA;
+assert.equal(rotatingHistoryA?.status, "ready");
+assert.equal(rotatingHistoryImages.begin({
+  sid: "rotation-session",
+  turnId: "rotation-turn",
+  imageId: "rotation-b",
+  variant: "thumbnail",
+  requestId: "rotation-b-first",
+  revision: "rotation-r1",
+}), true);
+assert.equal(
+  shouldAutoloadHistoryImage(
+    rotatingHistoryImages.forSession("rotation-session")[
+      rotatingHistoryAKey
+    ],
+    rotatingHistoryAObserved,
+  ),
+  false,
+  "an image which already held an asset must not auto-compete after LRU eviction",
+);
+assert.equal(rotatingHistoryImages.accept({
+  v: 26,
+  ts: 11,
+  type: "history_image",
+  session_id: "rotation-session",
+  turn_id: "rotation-turn",
+  image_id: "rotation-b",
+  variant: "thumbnail",
+  request_id: "rotation-b-first",
+  revision: "rotation-r1",
+  media_type: "image/png",
+  data: "AQ==",
+}), true);
+assert.deepEqual(
+  Object.keys(rotatingHistoryImages.forSession("rotation-session")),
+  [rotatingHistoryBKey],
+  "limit-one A/B demand must settle on B instead of automatically rotating to A",
+);
+assert.equal(rotatingHistoryImages.begin({
+  sid: "rotation-session",
+  turnId: "rotation-turn",
+  imageId: "rotation-a",
+  variant: "thumbnail",
+  requestId: "rotation-a-explicit",
+  revision: "rotation-r1",
+}), true, "the evicted image remains available to an explicit retry");
+rotatingHistoryImages.clear();
+
+let historyCapacityNow = 20_000;
+const historyCapacityWake = imageCapacityWakeHarness();
+const silentHistoryCapacity = new HistoryImageAssetCache(
+  1,
+  () => historyCapacityNow,
+  historyCapacityWake.scheduler,
+);
+assert.equal(silentHistoryCapacity.begin({
+  sid: "history-capacity-session",
+  turnId: "history-capacity-turn",
+  imageId: "occupied",
+  variant: "thumbnail",
+  requestId: "history-capacity-occupied",
+  revision: "history-capacity-r1",
+}), true);
+assert.equal(silentHistoryCapacity.begin({
+  sid: "history-capacity-session",
+  turnId: "history-capacity-turn",
+  imageId: "waiting",
+  variant: "thumbnail",
+  requestId: "history-capacity-waiting",
+  revision: "history-capacity-r1",
+}), false);
+assert.deepEqual(
+  historyCapacityWake.scheduledDelays(),
+  [HISTORY_IMAGE_REQUEST_TIMEOUT_MS],
+  "a blocked history image schedules the earliest loading-slot expiry",
+);
+const historyCapacitySnapshot = historyImageAssetCacheSnapshot();
+historyCapacityNow += HISTORY_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(historyCapacityWake.fireNext(), true);
+assert.ok(historyImageAssetCacheSnapshot() > historyCapacitySnapshot,
+  "time alone publishes a history-image capacity wake");
+assert.equal(silentHistoryCapacity.begin({
+  sid: "history-capacity-session",
+  turnId: "history-capacity-turn",
+  imageId: "waiting",
+  variant: "thumbnail",
+  requestId: "history-capacity-retry",
+  revision: "history-capacity-r1",
+}), true, "the mounted history-image waiter can claim the expired slot");
+silentHistoryCapacity.clear();
+
+let inlineCapacityNow = 30_000;
+const inlineCapacityWake = imageCapacityWakeHarness();
+const silentInlineCapacity = new InlineImageAssetCache(
+  1,
+  () => inlineCapacityNow,
+  inlineCapacityWake.scheduler,
+);
+assert.equal(silentInlineCapacity.begin({
+  sid: "inline-capacity-session",
+  path: "/tmp/occupied.png",
+  previewId: "inline-capacity-occupied-preview",
+  requestId: "inline-capacity-occupied",
+}), true);
+assert.equal(silentInlineCapacity.begin({
+  sid: "inline-capacity-session",
+  path: "/tmp/waiting.png",
+  previewId: "inline-capacity-waiting-preview",
+  requestId: "inline-capacity-waiting",
+}), false);
+assert.deepEqual(
+  inlineCapacityWake.scheduledDelays(),
+  [INLINE_IMAGE_REQUEST_TIMEOUT_MS],
+  "a blocked inline image schedules the earliest loading-slot expiry",
+);
+const inlineCapacitySnapshot = inlineImageAssetCacheSnapshot();
+inlineCapacityNow += INLINE_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(inlineCapacityWake.fireNext(), true);
+assert.ok(inlineImageAssetCacheSnapshot() > inlineCapacitySnapshot,
+  "time alone publishes an inline-image capacity wake");
+assert.equal(silentInlineCapacity.begin({
+  sid: "inline-capacity-session",
+  path: "/tmp/waiting.png",
+  previewId: "inline-capacity-retry-preview",
+  requestId: "inline-capacity-retry",
+}), true, "the mounted inline-image waiter can claim the expired slot");
+silentInlineCapacity.clear();
+
+const stableInlineImages = new InlineImageAssetCache(2);
+for (const id of ["view-a", "view-b"]) {
+  assert.equal(stableInlineImages.begin({
+    sid: "inline-stable-session",
+    path: "/tmp/reused.png",
+    assetKey: id,
+    previewId: id,
+    requestId: `request-${id}`,
+  }), true);
+  assert.equal(stableInlineImages.accept({
+    v: 28,
+    ts: 10,
+    type: "preview_asset",
+    sid: "inline-stable-session",
+    path: "/tmp/reused.png",
+    preview_id: id,
+    request_id: `request-${id}`,
+    media_type: "image/png",
+    data: id === "view-a" ? "aW1hZ2UtYQ==" : "aW1hZ2UtYg==",
+  } as PreviewAsset), true);
+}
+assert.deepEqual(
+  Object.keys(stableInlineImages.forSession(
+    "inline-stable-session")).sort(),
+  ["view-a", "view-b"],
+  "two imageView items that reuse one path retain independent snapshots",
+);
+stableInlineImages.clear();
+
+const reconnectingAuthorizedImage = new InlineImageAssetCache(1);
+assert.equal(reconnectingAuthorizedImage.begin({
+  sid: "authorization-session",
+  path: "/tmp/authorized.png",
+  previewId: "authorization-preview",
+  requestId: "authorization-request",
+}), true);
+assert.equal(reconnectingAuthorizedImage.requireAuthorization({
+  v: 28,
+  ts: 11,
+  type: "preview_authorization_required",
+  sid: "authorization-session",
+  authorization_id: "authorization-id",
+  request_id: "authorization-request",
+  operation: "preview_asset",
+  path: "/tmp/authorized.png",
+  resolved_path: "/private/tmp/authorized.png",
+  format: "image",
+  preview_id: "authorization-preview",
+}), true);
+const reconnectingAuthorization = reconnectingAuthorizedImage.forSession(
+  "authorization-session")["/tmp/authorized.png"].authorization!;
+assert.equal(reconnectingAuthorizedImage.markAuthorizationSubmitting(
+  reconnectingAuthorization), true);
+assert.equal(reconnectingAuthorizedImage.acceptAuthorizationResult({
+  v: 28,
+  ts: 12,
+  type: "preview_authorization_result",
+  sid: "stale-socket-session",
+  authorization_id: "authorization-id",
+  request_id: "authorization-request",
+  operation: "preview_asset",
+  path: "/tmp/authorized.png",
+  preview_id: "authorization-preview",
+  status: "granted",
+}), false, "a stale socket result cannot complete another session's challenge");
+assert.notEqual(reconnectingAuthorizedImage.acceptAuthorizationResult({
+  v: 28,
+  ts: 13,
+  type: "preview_authorization_result",
+  sid: "authorization-session",
+  authorization_id: "authorization-id",
+  request_id: "authorization-request",
+  operation: "preview_asset",
+  path: "/tmp/authorized.png",
+  preview_id: "authorization-preview",
+  status: "granted",
+}), false, "the same cache survives a RelayWs reconnect and accepts its result");
+assert.equal(reconnectingAuthorizedImage.acceptAuthorizationResult({
+  v: 28,
+  ts: 14,
+  type: "preview_authorization_result",
+  sid: "authorization-session",
+  authorization_id: "authorization-id",
+  request_id: "authorization-request",
+  operation: "preview_asset",
+  path: "/tmp/authorized.png",
+  preview_id: "authorization-preview",
+  status: "granted",
+}), false, "a duplicate result cannot issue the authorized read twice");
+reconnectingAuthorizedImage.clear();
+
+let historyImageNow = 1_000;
+const retryableHistoryImages = new HistoryImageAssetCache(
+  1, () => historyImageNow);
+assert.equal(retryableHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "image-id",
+  variant: "thumbnail",
+  requestId: "history-image-first",
+  revision: "image-r1",
+}), true);
+assert.equal(retryableHistoryImages.has(
+  "image-session", "image-turn", "image-id", "thumbnail"), true);
+historyImageNow += HISTORY_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(retryableHistoryImages.has(
+  "image-session", "image-turn", "image-id", "thumbnail"), false,
+"a silent history-image request becomes retryable after its timeout");
+assert.equal(retryableHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "image-id",
+  variant: "thumbnail",
+  requestId: "history-image-second",
+  revision: "image-r1",
+}), true);
+assert.equal(retryableHistoryImages.accept({
+  v: 26,
+  ts: 10,
+  type: "history_image",
+  session_id: "image-session",
+  turn_id: "image-turn",
+  image_id: "image-id",
+  variant: "thumbnail",
+  request_id: "history-image-second",
+  revision: "image-r1",
+  error: "temporary read failure",
+}), true);
+assert.equal(retryableHistoryImages.has(
+  "image-session", "image-turn", "image-id", "thumbnail"), false,
+"an explicit history-image failure must not poison future retries");
+assert.equal(retryableHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "image-id",
+  variant: "thumbnail",
+  requestId: "history-image-third",
+  revision: "image-r1",
+}), true);
+
+let lateHistoryNow = 3_000;
+const lateHistoryImages = new HistoryImageAssetCache(
+  1, () => lateHistoryNow);
+assert.equal(lateHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "evicted-a",
+  variant: "thumbnail",
+  requestId: "history-evicted-a",
+  revision: "image-r1",
+}), true);
+lateHistoryNow += HISTORY_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(lateHistoryImages.begin({
+  sid: "image-session",
+  turnId: "image-turn",
+  imageId: "active-b",
+  variant: "thumbnail",
+  requestId: "history-active-b",
+  revision: "image-r1",
+}), true);
+assert.equal(lateHistoryImages.accept({
+  v: 26,
+  ts: 10,
+  type: "history_image",
+  session_id: "image-session",
+  turn_id: "image-turn",
+  image_id: "evicted-a",
+  variant: "thumbnail",
+  request_id: "history-evicted-a",
+  revision: "image-r1",
+  media_type: "image/png",
+  data: "AA==",
+}), false,
+"a late response for a timeout-evicted history image must be rejected");
+assert.deepEqual(
+  Object.keys(lateHistoryImages.forSession("image-session")),
+  ["image-turn\u0000active-b\u0000thumbnail"],
+  "late responses cannot grow the history-image cache beyond its hard limit",
+);
+
+let inlineImageNow = 2_000;
+const retryableInlineImages = new InlineImageAssetCache(
+  1, () => inlineImageNow);
+assert.equal(retryableInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/diagram.png",
+  previewId: "inline-preview-one",
+  requestId: "inline-request-one",
+}), true);
+inlineImageNow += INLINE_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(retryableInlineImages.has(
+  "inline-session", "/tmp/diagram.png"), false,
+"a silent inline-image request becomes retryable after its timeout");
+assert.equal(retryableInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/diagram.png",
+  previewId: "inline-preview-two",
+  requestId: "inline-request-two",
+}), true);
+assert.equal(retryableInlineImages.accept({
+  v: 26,
+  ts: 10,
+  type: "preview_asset",
+  sid: "inline-session",
+  path: "/tmp/diagram.png",
+  preview_id: "inline-preview-two",
+  request_id: "inline-request-two",
+  error: "temporary read failure",
+}), true);
+assert.equal(retryableInlineImages.has(
+  "inline-session", "/tmp/diagram.png"), false,
+"an explicit inline-image failure must not poison future retries");
+assert.equal(retryableInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/diagram.png",
+  previewId: "inline-preview-three",
+  requestId: "inline-request-three",
+}), true);
+
+let lateInlineNow = 4_000;
+const lateInlineImages = new InlineImageAssetCache(
+  1, () => lateInlineNow);
+assert.equal(lateInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/evicted-a.png",
+  previewId: "inline-evicted-preview",
+  requestId: "inline-evicted-request",
+}), true);
+lateInlineNow += INLINE_IMAGE_REQUEST_TIMEOUT_MS;
+assert.equal(lateInlineImages.begin({
+  sid: "inline-session",
+  path: "/tmp/active-b.png",
+  previewId: "inline-active-preview",
+  requestId: "inline-active-request",
+}), true);
+assert.equal(lateInlineImages.accept({
+  v: 26,
+  ts: 10,
+  type: "preview_asset",
+  sid: "inline-session",
+  path: "/tmp/evicted-a.png",
+  preview_id: "inline-evicted-preview",
+  request_id: "inline-evicted-request",
+  media_type: "image/png",
+  data: "AA==",
+}), false,
+"a late response for a timeout-evicted inline image must be rejected");
+assert.deepEqual(
+  Object.keys(lateInlineImages.forSession("inline-session")),
+  ["/tmp/active-b.png"],
+  "late responses cannot grow the inline-image cache beyond its hard limit",
+);
+
 // A complete transcript must not be reopened forever by stale cache state.
 const terminalHistory = {
   id: "terminal-history", prompt: "run", done: true, ts: 40_000,
@@ -1497,7 +2395,8 @@ const terminalHistory = {
   ],
 };
 const staleLive = {
-  id: "terminal-live", prompt: "run", done: false, ts: 40_100,
+  id: "terminal-live", historyTurnId: "terminal-history",
+  prompt: "run", done: false, ts: 40_100,
   blocks: [
     { kind: "tool" as const, message_id: "tool-msg-live", tool_use_id: "tool-terminal",
       tool: "shell", input: {}, done: false },
@@ -1535,6 +2434,14 @@ assert.deepEqual(
   mergeInitialHistory(repeatedAnswerTurns, []).map((turn) => turn.id),
   ["repeat-1", "repeat-2"],
 );
+assert.deepEqual(
+  mergeInitialHistory(
+    [repeatedAnswerTurns[0]],
+    [{ ...repeatedAnswerTurns[1], done: false }],
+  ).map((turn) => turn.id),
+  ["repeat-1", "repeat-2"],
+  "same prompt and nearby timestamps cannot replace an authoritative alias",
+);
 
 // Exact production race at the pure merge boundary: a focus-triggered History
 // synthesizes TurnEnd while the matching live tail is still running. Preserve
@@ -1546,7 +2453,8 @@ const partialHistory = {
   blocks: [] as Array<{ kind: "text"; message_id: string; text: string; done: boolean }>,
 };
 const liveActive = {
-  id: "client-active", prompt: "在？", done: false, ts: 10_100,
+  id: "client-active", historyTurnId: "engine-active",
+  prompt: "在？", done: false, ts: 10_100,
   blocks: [{ kind: "text" as const, message_id: "live-active-answer",
     text: "", done: false }],
 };
@@ -1584,6 +2492,146 @@ const assistantOnlyMerged = mergeInitialHistory(
 assert.equal(assistantOnlyMerged.length, 1);
 assert.equal(assistantOnlyMerged[0].id, "goal-turn-1");
 assert.equal(assistantOnlyMerged[0].blocks.filter((block) => block.kind === "text").length, 1);
+
+// A reconnect can begin replay at an assistant item after the user/native turn
+// binding has fallen out of the relay ring. The provisional row then uses the
+// assistant message id as its display id. An authoritative newest History page
+// owns that same message inside the native turn and must absorb the orphan
+// without comparing prompt text or timestamps.
+const replayAssistantMessageId = "msg-replayed-assistant";
+const replayOrphanMerged = mergeInitialHistory(
+  [{
+    id: "native-history-turn",
+    prompt: "inspect the repository",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "one authoritative answer",
+      done: true,
+    }],
+    detailEventCount: 3,
+    detailLoaded: false,
+  }],
+  [{
+    id: replayAssistantMessageId,
+    prompt: "",
+    done: false,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "one authoritative answer",
+      done: false,
+    }],
+    detailError: "stale orphan detail",
+  }],
+  { reconcileAuthoritativeReplayOrphans: true },
+);
+assert.equal(replayOrphanMerged.length, 1);
+assert.equal(replayOrphanMerged[0].id, "native-history-turn");
+assert.equal(replayOrphanMerged[0].detailError, undefined,
+  "an invalid orphan detail request cannot replace canonical detail authority");
+assert.deepEqual(
+  replayOrphanMerged[0].blocks.filter((block) => block.kind === "text")
+    .map((block) => block.text),
+  ["one authoritative answer"],
+);
+assert.equal(mergeInitialHistory(
+  replayOrphanMerged,
+  [{
+    id: replayAssistantMessageId,
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "one authoritative answer",
+      done: true,
+    }],
+  }],
+).length, 2, "non-authoritative merge paths never absorb replay orphans");
+
+const ambiguousReplayOrphans = mergeInitialHistory(
+  replayOrphanMerged,
+  [0, 1].map((index) => ({
+    id: replayAssistantMessageId,
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: `replay candidate ${index}`,
+      done: true,
+    }],
+  })),
+  { reconcileAuthoritativeReplayOrphans: true },
+);
+assert.equal(ambiguousReplayOrphans.length, 2,
+  "multiple provisional rows claiming one item cannot replace canonical history");
+
+const ambiguousCanonicalReplay = mergeInitialHistory(
+  ["canonical-a", "canonical-b"].map((id) => ({
+    id,
+    prompt: `prompt ${id}`,
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: `answer ${id}`,
+      done: true,
+    }],
+  })),
+  [{
+    id: replayAssistantMessageId,
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "ambiguous replay",
+      done: true,
+    }],
+  }],
+  { reconcileAuthoritativeReplayOrphans: true },
+);
+assert.equal(ambiguousCanonicalReplay.length, 3,
+  "a message identity shared by canonical rows is not safe merge evidence");
+
+const unrelatedAssistantOnly = mergeInitialHistory(
+  [{
+    id: "native-history-turn",
+    prompt: "inspect the repository",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: replayAssistantMessageId,
+      channel: "final" as const,
+      text: "same visible text",
+      done: true,
+    }],
+  }],
+  [{
+    id: "different-assistant-message",
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: "different-assistant-message",
+      channel: "final" as const,
+      text: "same visible text",
+      done: true,
+    }],
+  }],
+  { reconcileAuthoritativeReplayOrphans: true },
+);
+assert.equal(unrelatedAssistantOnly.length, 2,
+  "equal assistant text without an exact message identity remains separate");
 
 // A bounded head refresh merges against rows retained from earlier pages.
 // Replayed assistant-only continuations can come from legacy/cache projections
@@ -1807,6 +2855,23 @@ try {
     "本次回复未完成，请重试。");
   assert.doesNotMatch(problemState.runtimes[problemSid].turns[0].error ?? "",
     /cc_crash|provider|private|wrapper/i);
+  const networkProblemSid = "safe-network-problem-presentation";
+  let networkProblemState = reduce({
+    ...initialState, focusedSid: networkProblemSid,
+    runtimes: { [networkProblemSid]: createRuntime() },
+  }, {
+    type: "query_sent", sid: networkProblemSid,
+    msg_id: "network-problem-turn", prompt: "continue", ts: 2,
+  });
+  networkProblemState = reduce(networkProblemState, {
+    type: "event", event: event({
+      type: "error", sid: networkProblemSid,
+      msg_id: "network-problem-turn", code: "cc_crash",
+      message: "网络连接异常，请检查网络后重试。",
+    }),
+  });
+  assert.equal(networkProblemState.runtimes[networkProblemSid].turns[0].error,
+    "网络连接异常，请检查网络后重试。");
   const commandProblem = reduce(problemState, { type: "event", event: event({
     type: "error", sid: problemSid, code: "internal",
     message: "Traceback: secret path /private/token",
@@ -1908,8 +2973,118 @@ try {
     }),
   });
   assert.deepEqual(rekeyedPlaceholder.sessions.map((session: { session_id: string }) =>
-    session.session_id), ["real-created"],
+  session.session_id), ["real-created"],
   "rekey must atomically migrate the temporary sidebar row");
+  const lifecycleRekey = reduce({
+    ...initialState,
+    focusedSid: "tmp-running",
+    runtimes: {
+      "tmp-running": {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        lastLifecycleSeq: 12,
+      },
+      "real-running": {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+        lastLifecycleSeq: 4,
+      },
+    },
+  }, {
+    type: "event",
+    ownership: ownerB,
+    event: event({
+      type: "session_rekey",
+      old_key: "tmp-running",
+      session_id: "real-running",
+      cwd: "/work/new",
+    }),
+  });
+  assert.equal(
+    lifecycleRekey.runtimes["real-running"].state,
+    "running",
+    "rekey keeps the lifecycle from the runtime with the newer lifecycle sequence",
+  );
+  assert.equal(lifecycleRekey.focusedSid, "real-running");
+  const aliasRekey = reduce({
+    ...initialState,
+    focusedSid: "tmp-alias-running",
+    runtimes: {
+      "tmp-alias-running": {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "rekey-client-turn",
+          historyTurnId: "rekey-native-turn",
+          prompt: "same rekeyed turn",
+          blocks: [{
+            kind: "text",
+            message_id: "rekey-live-answer",
+            channel: "final",
+            text: "live tail",
+            done: false,
+          }],
+          done: false,
+        }],
+      },
+      "real-alias-running": {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+        turns: [{
+          id: "rekey-native-turn",
+          clientMsgId: "rekey-client-turn",
+          prompt: "same rekeyed turn",
+          blocks: [{
+            kind: "text",
+            message_id: "rekey-history-answer",
+            channel: "final",
+            text: "history",
+            done: true,
+          }],
+          done: true,
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    ownership: ownerB,
+    event: event({
+      type: "session_rekey",
+      old_key: "tmp-alias-running",
+      session_id: "real-alias-running",
+      cwd: "/work/new",
+    }),
+  });
+  const aliasRekeyTurns =
+    aliasRekey.runtimes["real-alias-running"].turns;
+  assert.equal(
+    aliasRekeyTurns.length,
+    1,
+    "rekey merges a temp client id with its already-replayed native alias",
+  );
+  assert.deepEqual(
+    {
+      id: aliasRekeyTurns[0].id,
+      historyTurnId: aliasRekeyTurns[0].historyTurnId,
+      done: aliasRekeyTurns[0].done,
+    },
+    {
+      id: "rekey-client-turn",
+      historyTurnId: "rekey-native-turn",
+      done: false,
+    },
+    "rekey preserves the live temp identity while retaining native history authority",
+  );
+  assert.equal(
+    aliasRekeyTurns[0].blocks.some((block: Block) =>
+      block.kind === "text" && block.text.includes("live tail")),
+    true,
+    "rekey cannot discard the live tail when its native alias already exists",
+  );
   const authoritativeCreated = reduce(rekeyedPlaceholder, {
     type: "event", ownership: ownerB,
     event: event({
@@ -2128,7 +3303,16 @@ try {
           id: "older-browser", forkPointId: "older-native",
           prompt: "older", blocks: [], done: false,
         }, {
-          id: "promptless-tail", prompt: "", blocks: [], done: false,
+          id: "promptless-tail", prompt: "", blocks: [{
+            kind: "process",
+            item_id: "promptless-claude-process",
+            processKind: "agent",
+            phase: "start",
+            status: "running",
+            turn_id: "promptless-tail",
+            title: "Claude child process",
+            done: false,
+          }], done: false,
         }],
       },
     },
@@ -2154,6 +3338,11 @@ try {
   assert.equal(
     exactEndState.runtimes[exactEndSid].turns[1].forkPointId,
     "new-native",
+  );
+  assert.equal(
+    exactEndState.runtimes[exactEndSid].turns[1].blocks[0]?.done,
+    true,
+    "Claude child process ids cannot disable the unbound TurnEnd fallback",
   );
   assert.equal(exactEndState.runtimes[exactEndSid].acceptancePending, null);
 
@@ -2195,6 +3384,118 @@ try {
     },
   };
   steeredTurnState = reduce(steeredTurnState, {
+    type: "steer_sent",
+    sid: steeredTurnSid,
+    prompt: "change direction",
+    msg_id: "steered-follow-up",
+    images: [{ media_type: "image/png", data: "steered-image" }],
+    files: [{ filename: "steered.txt", data: "steered-file" }],
+    ts: 10_500,
+  });
+  assert.deepEqual(
+    steeredTurnState.runtimes[steeredTurnSid].turns.map((turn: Turn) => ({
+      id: turn.id,
+      prompt: turn.prompt,
+      done: turn.done,
+    })),
+    [{
+      id: "steered-original",
+      prompt: "start the task",
+      done: false,
+    }, {
+      id: "steered-follow-up",
+      prompt: "change direction",
+      done: false,
+    }],
+    "a sent steer paints immediately without waiting for the wrapper echo",
+  );
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].acceptancePending,
+    "steered-follow-up",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "assistant_msg_start",
+      sid: steeredTurnSid,
+      message_id: "new-pre-fence-message",
+      channel: "commentary",
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "delta",
+      sid: steeredTurnSid,
+      message_id: "new-pre-fence-message",
+      channel: "commentary",
+      text: "new item admitted before the steer fence",
+    }),
+  });
+  assert.ok(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks.some(
+      (block: Block) => block.kind === "text"
+        && block.message_id === "new-pre-fence-message"),
+    "a new pre-fence assistant item still belongs to the pre-steer segment",
+  );
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[1].blocks.length,
+    0,
+    "an unseen pre-fence item cannot leak into the optimistic steer segment",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "delta",
+      sid: steeredTurnSid,
+      message_id: "steered-original-commentary",
+      channel: "commentary",
+      text: " before the steer fence",
+    }),
+  });
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks[0].kind
+      === "text"
+      ? steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks[0].text
+      : "",
+    "working before the steer fence",
+    "a delayed assistant delta must return to the turn which owns its message id",
+  );
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[1].blocks.length,
+    0,
+    "the delayed pre-steer delta cannot leak into the optimistic steer segment",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "tool_use",
+      sid: steeredTurnSid,
+      message_id: "steered-original-commentary",
+      tool_use_id: "steered-original-tool",
+      tool: "Read",
+      input: { file_path: "/tmp/old" },
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "tool_use",
+      sid: steeredTurnSid,
+      message_id: "steered-original-commentary",
+      tool_use_id: "steered-original-tool",
+      tool: "Read",
+      input: { file_path: "/tmp/old-updated" },
+    }),
+  });
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[0].blocks.filter(
+      (block: Block) => block.kind === "tool"
+        && block.tool_use_id === "steered-original-tool").length,
+    1,
+    "a replayed delayed tool start updates its original owner exactly once",
+  );
+  assert.equal(
+    steeredTurnState.runtimes[steeredTurnSid].turns[1].blocks.length,
+    0,
+    "a delayed tool start cannot attach to the optimistic steer segment",
+  );
+  steeredTurnState = reduce(steeredTurnState, {
     type: "event", event: event({
       type: "turn_steered",
       sid: steeredTurnSid,
@@ -2231,7 +3532,8 @@ try {
     forkPointId: undefined,
     liveTaskId: steeredNativeTurnId,
   }], "TurnSteered atomically closes the prior segment and opens the steered one");
-  assert.equal(firstSteeredTurns[0].durationMs, 0);
+  assert.equal(firstSteeredTurns[0].durationMs, undefined,
+    "a steer fence without one authoritative clock domain has unknown duration");
   assert.equal(firstSteeredTurns[0].doneTs, 11_000);
   assert.ok(firstSteeredTurns[0].blocks.every((block: Block) => block.done),
     "closing the old segment also settles every open block it owned");
@@ -2239,6 +3541,967 @@ try {
   assert.deepEqual(firstSteeredTurns[1].files, [{
     filename: "steered.txt", data: "",
   }]);
+
+  const idleSnapshotRepairSid = "idle-history-repairs-dangling";
+  let idleRepairState = {
+    ...initialState,
+    focusedSid: idleSnapshotRepairSid,
+    runtimes: {
+      [idleSnapshotRepairSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+        turns: [{
+          id: "dangling-history-turn",
+          prompt: "finished while disconnected",
+          done: false,
+          blocks: [{
+            kind: "text" as const,
+            message_id: "dangling-history-answer",
+            text: "partial answer",
+            done: false,
+            channel: "final" as const,
+          }],
+        }],
+      },
+    },
+  };
+  idleRepairState = reduce(idleRepairState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: idleSnapshotRepairSid,
+      revision: "idle-r1",
+      generation: "idle-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "dangling-history-turn",
+        prompt: "finished while disconnected",
+        done: false,
+        blocks: [{
+          kind: "text",
+          message_id: "dangling-history-answer",
+          text: "partial answer",
+          done: true,
+          channel: "final",
+        }],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    idleRepairState.runtimes[idleSnapshotRepairSid].turns[0].done,
+    true,
+    "an authoritative idle History closes a dangling row even after an idle snapshot",
+  );
+  assert.equal(
+    idleRepairState.runtimes[idleSnapshotRepairSid].turns[0].interrupted,
+    false,
+    "an idle authoritative transcript must not invent a user interruption",
+  );
+  assert.equal(
+    idleRepairState.runtimes[idleSnapshotRepairSid].turns[0].error,
+    undefined,
+    "normal idle reconciliation must not show an unknown-terminal warning",
+  );
+
+  const ambiguousIdleSid = "idle-history-keeps-ambiguous-terminal";
+  let ambiguousIdleState = {
+    ...initialState,
+    focusedSid: ambiguousIdleSid,
+    runtimes: {
+      [ambiguousIdleSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "ambiguous-idle-turn",
+          prompt: "crashed before a terminal",
+          done: false,
+          blocks: [{
+            kind: "text" as const,
+            message_id: "ambiguous-partial-answer",
+            text: "partial answer",
+            done: false,
+            channel: "final" as const,
+          }],
+        }],
+      },
+    },
+  };
+  ambiguousIdleState = reduce(ambiguousIdleState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: ambiguousIdleSid,
+      revision: "ambiguous-r1",
+      generation: "ambiguous-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "ambiguous-idle-turn",
+        prompt: "crashed before a terminal",
+        done: false,
+        blocks: [{
+          kind: "text",
+          message_id: "ambiguous-partial-answer",
+          text: "partial answer",
+          done: false,
+          channel: "final",
+        }],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    ambiguousIdleState.runtimes[ambiguousIdleSid].turns[0].interrupted,
+    true,
+    "idle alone cannot turn a partial dangling answer into success",
+  );
+  assert.match(
+    ambiguousIdleState.runtimes[ambiguousIdleSid].turns[0].error ?? "",
+    /终止状态/,
+    "an ambiguous terminal remains visibly distinguishable from success",
+  );
+
+  const optimisticIdleSid = "idle-history-protects-optimistic";
+  let optimisticIdleState = reduce({
+    ...initialState,
+    focusedSid: optimisticIdleSid,
+    runtimes: {
+      [optimisticIdleSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "query_sent",
+    sid: optimisticIdleSid,
+    prompt: "not accepted yet",
+    msg_id: "optimistic-idle-query",
+    ts: 20_000,
+  });
+  optimisticIdleState = reduce(optimisticIdleState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: optimisticIdleSid,
+      revision: "optimistic-idle-r1",
+      generation: "optimistic-idle-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [],
+    }),
+  });
+  assert.equal(
+    optimisticIdleState.runtimes[optimisticIdleSid].turns[0].done,
+    false,
+    "idle History cannot close a query which is still awaiting acceptance",
+  );
+
+  const acceptedIdleSid = "idle-history-confirms-and-closes";
+  let acceptedIdleState = reduce({
+    ...initialState,
+    focusedSid: acceptedIdleSid,
+    runtimes: {
+      [acceptedIdleSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "query_sent",
+    sid: acceptedIdleSid,
+    prompt: "accepted but terminal was lost",
+    msg_id: "accepted-idle-query",
+    ts: 21_000,
+  });
+  acceptedIdleState = reduce(acceptedIdleState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: acceptedIdleSid,
+      revision: "accepted-idle-r1",
+      generation: "accepted-idle-g1",
+      build_seq: 1,
+      live_seq: 1,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "accepted-idle-query",
+        prompt: "accepted but terminal was lost",
+        done: false,
+        blocks: [{
+          kind: "text",
+          message_id: "accepted-idle-answer",
+          text: "completed answer",
+          done: true,
+          channel: "final",
+        }],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    acceptedIdleState.runtimes[acceptedIdleSid].acceptancePending,
+    null,
+    "the authoritative row confirms the optimistic query",
+  );
+  assert.equal(
+    acceptedIdleState.runtimes[acceptedIdleSid].turns[0].done,
+    true,
+    "the same idle History must close the just-confirmed dangling row",
+  );
+  assert.equal(
+    acceptedIdleState.runtimes[acceptedIdleSid].turns[0].interrupted,
+    false,
+    "a confirmed idle row without an explicit abort must settle normally",
+  );
+
+  const interruptedClaudeSid = "claude-interrupted-live-detail";
+  let interruptedClaudeState = {
+    ...initialState,
+    focusedSid: interruptedClaudeSid,
+    runtimes: {
+      [interruptedClaudeSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        historyRevision: "claude-live-r1",
+        historyGeneration: "claude-live-g1",
+        historyBuildSeq: 1,
+        historyLiveSeq: 10,
+      },
+    },
+  };
+  for (const liveEvent of [
+    {
+      type: "user_msg", sid: interruptedClaudeSid, seq: 11,
+      msg_id: "claude-live-turn", prompt: "inspect",
+    },
+    {
+      type: "assistant_msg_start", sid: interruptedClaudeSid, seq: 12,
+      message_id: "claude-thinking", channel: "thinking",
+    },
+    {
+      type: "delta", sid: interruptedClaudeSid, seq: 13,
+      message_id: "claude-thinking", channel: "thinking",
+      text: "visible reasoning",
+    },
+    {
+      type: "assistant_msg_end", sid: interruptedClaudeSid, seq: 14,
+      message_id: "claude-thinking", channel: "thinking",
+    },
+    {
+      type: "tool_use", sid: interruptedClaudeSid, seq: 15,
+      message_id: "claude-tools", tool_use_id: "claude-tool",
+      tool: "Read", input: { file_path: "README.md" },
+    },
+    {
+      type: "tool_result", sid: interruptedClaudeSid, seq: 16,
+      tool_use_id: "claude-tool", content: "ok", is_error: false,
+    },
+    {
+      type: "assistant_msg_start", sid: interruptedClaudeSid, seq: 17,
+      message_id: "claude-final", channel: "final",
+    },
+    {
+      type: "delta", sid: interruptedClaudeSid, seq: 18,
+      message_id: "claude-final", channel: "final", text: "partial final",
+    },
+    {
+      type: "assistant_msg_end", sid: interruptedClaudeSid, seq: 19,
+      message_id: "claude-final", channel: "final",
+    },
+    {
+      type: "turn_end", sid: interruptedClaudeSid, seq: 20,
+      turn_id: "claude-native-turn",
+      result: {
+        subtype: "error_during_execution",
+        duration_ms: 750,
+        is_error: true,
+      },
+    },
+  ]) {
+    interruptedClaudeState = reduce(interruptedClaudeState, {
+      type: "event", event: event(liveEvent),
+    });
+  }
+  const interruptedSummary = (buildSeq: number) => event({
+    type: "history",
+    session_id: interruptedClaudeSid,
+    revision: "claude-live-r1",
+    generation: "claude-live-g1",
+    build_seq: buildSeq,
+    live_seq: 20,
+    detail: "summary",
+    authoritative: true,
+    in_progress: false,
+    has_more: false,
+    events: [],
+    turns: [{
+      id: "claude-live-turn",
+      forkPointId: "claude-native-turn",
+      prompt: "inspect",
+      done: true,
+      interrupted: true,
+      blocks: [{
+        kind: "text",
+        message_id: "history-final",
+        text: "partial final",
+        channel: "final",
+        done: true,
+      }],
+      detailEventCount: 4,
+      detailLoaded: false,
+    }],
+  });
+  interruptedClaudeState = reduce(interruptedClaudeState, {
+    type: "event", event: interruptedSummary(2),
+  });
+  const interruptedClaudeTurn =
+    interruptedClaudeState.runtimes[interruptedClaudeSid].turns[0];
+  const describeInterruptedBlock = (
+    block: { kind: string; channel?: string; text?: string },
+  ) => block.kind === "text" ? `${block.channel}:${block.text}` : block.kind;
+  assert.deepEqual(
+    interruptedClaudeTurn.blocks.map(describeInterruptedBlock),
+    ["final:partial final"],
+    "authoritative summary keeps ownership of the final answer",
+  );
+  assert.deepEqual(
+    interruptedClaudeTurn.detailProjection?.blocks.map(describeInterruptedBlock),
+    ["thinking:visible reasoning", "tool"],
+    "the process already painted before an interrupt survives summary install",
+  );
+  interruptedClaudeState = reduce(interruptedClaudeState, {
+    type: "event", event: interruptedSummary(3),
+  });
+  assert.deepEqual(
+    interruptedClaudeState.runtimes[interruptedClaudeSid].turns[0]
+      .detailProjection?.blocks.map(describeInterruptedBlock),
+    ["thinking:visible reasoning", "tool"],
+    "repeated summary refreshes do not duplicate restored live detail",
+  );
+  interruptedClaudeState = reduce(interruptedClaudeState, {
+    type: "event", event: event({
+      type: "history_invalidated",
+      session_id: interruptedClaudeSid,
+      revision: "claude-live-r2",
+    }),
+  });
+  assert.deepEqual(
+    interruptedClaudeState.runtimes[interruptedClaudeSid].turns,
+    [],
+    "rollback invalidation removes the completed local projection",
+  );
+  interruptedClaudeState = reduce(interruptedClaudeState, {
+    type: "event", event: event({
+      ...interruptedSummary(1),
+      revision: "claude-live-r2",
+      build_seq: 1,
+    }),
+  });
+  assert.equal(
+    interruptedClaudeState.runtimes[interruptedClaudeSid].turns[0]
+      .detailProjection,
+    undefined,
+    "a replacement revision cannot resurrect pre-rollback live process",
+  );
+
+  const historyAliasSid = "history-client-message-alias";
+  let historyAliasState = reduce({
+    ...initialState,
+    focusedSid: historyAliasSid,
+    runtimes: {
+      [historyAliasSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: historyAliasSid,
+    prompt: "alias steer",
+    msg_id: "browser-alias-steer",
+    ts: 22_000,
+  });
+  historyAliasState = reduce(historyAliasState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: historyAliasSid,
+      revision: "alias-r1",
+      generation: "alias-g1",
+      build_seq: 1,
+      live_seq: 2,
+      detail: "summary",
+      has_more: false,
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "native-alias-steer",
+        clientMsgId: "browser-alias-steer",
+        prompt: "alias steer",
+        done: true,
+        blocks: [],
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    historyAliasState.runtimes[historyAliasSid].acceptancePending,
+    null,
+    "History clientMsgId must release the same reducer latch as RelayWs",
+  );
+  assert.deepEqual(
+    historyAliasState.runtimes[historyAliasSid].turns.map(
+      (turn: Turn) => turn.id),
+    ["browser-alias-steer"],
+    "a native History alias reconciles into the optimistic steer exactly once",
+  );
+
+  const claudeSwitchAliasSid = "claude-switch-history-alias";
+  const claudeOtherSid = "codex-viewed-between-claude-history";
+  let claudeSwitchAliasState = reduce({
+    ...initialState,
+    focusedSid: claudeSwitchAliasSid,
+    runtimes: {
+      [claudeSwitchAliasSid]: {
+        ...createRuntime(), state: "running" as const, syncReady: true,
+      },
+      [claudeOtherSid]: createRuntime(),
+    },
+  }, {
+    type: "query_sent",
+    sid: claudeSwitchAliasSid,
+    prompt: "我又改完了一版，你看看还有没得问题？",
+    msg_id: "6b09ee37-f861-4422-b98a-21f509c951b0",
+    ts: 22_100,
+  });
+  claudeSwitchAliasState = reduce(claudeSwitchAliasState, {
+    type: "event", event: event({
+      type: "session_focus", session_id: claudeOtherSid,
+    }),
+  });
+  claudeSwitchAliasState = reduce(claudeSwitchAliasState, {
+    type: "event", event: event({
+      type: "session_focus", session_id: claudeSwitchAliasSid,
+    }),
+  });
+  claudeSwitchAliasState = reduce(claudeSwitchAliasState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: claudeSwitchAliasSid,
+      revision: "claude-switch-r1",
+      generation: "claude-switch-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "2259073b-7676-455f-b7b0-b9b3892dbe93",
+        clientMsgId: "6b09ee37-f861-4422-b98a-21f509c951b0",
+        prompt: "我又改完了一版，你看看还有没得问题？",
+        done: false,
+        blocks: [],
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    claudeSwitchAliasState.runtimes[claudeSwitchAliasSid].turns.map(
+      (turn: Turn) => ({
+        id: turn.id,
+        historyTurnId: turn.historyTurnId,
+        prompt: turn.prompt,
+      })),
+    [{
+      id: "6b09ee37-f861-4422-b98a-21f509c951b0",
+      historyTurnId: "2259073b-7676-455f-b7b0-b9b3892dbe93",
+      prompt: "我又改完了一版，你看看还有没得问题？",
+    }],
+    "switching to Codex and back reconciles Claude History with the one live prompt",
+  );
+  const legacyClaudeNativeId = "b1934482-d098-4e11-990d-3e91f2586358";
+  const legacyClaudeClientId = "d37608f7-713d-42e2-b10f-4a93f60b03e1";
+  const legacyClaudePrompt =
+    "int32累加器和fp32累加器有什么区别？和寄存器的关系是什么？";
+  let legacyClaudeCacheState = reduce({
+    ...initialState,
+    focusedSid: claudeSwitchAliasSid,
+    runtimes: {
+      [claudeSwitchAliasSid]: createRuntime(),
+      [claudeOtherSid]: createRuntime(),
+    },
+  }, {
+    type: "hydrate_cache",
+    sid: claudeSwitchAliasSid,
+    revision: "claude-legacy-r1",
+    generation: "claude-legacy-g1",
+    // v10 could persist the transcript UUID before promptId became an exact
+    // client alias. CACHE_VER=11 prevents this row from reaching the reducer;
+    // keep the downstream convergence check as a second safety boundary.
+    turns: [{
+      id: legacyClaudeNativeId,
+      prompt: legacyClaudePrompt,
+      blocks: [],
+      done: false,
+    }],
+  });
+  legacyClaudeCacheState = reduce(legacyClaudeCacheState, {
+    type: "event", event: event({
+      type: "session_focus", session_id: claudeOtherSid,
+    }),
+  });
+  legacyClaudeCacheState = reduce(legacyClaudeCacheState, {
+    type: "event", event: event({
+      type: "session_focus", session_id: claudeSwitchAliasSid,
+    }),
+  });
+  legacyClaudeCacheState = reduce(legacyClaudeCacheState, {
+    type: "event", event: event({
+      type: "user_msg",
+      sid: claudeSwitchAliasSid,
+      msg_id: legacyClaudeClientId,
+      prompt: legacyClaudePrompt,
+    }),
+  });
+  assert.equal(
+    legacyClaudeCacheState.runtimes[claudeSwitchAliasSid].turns.length,
+    2,
+    "the v10 shape explains the transient duplicate before canonical History",
+  );
+  legacyClaudeCacheState = reduce(legacyClaudeCacheState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: claudeSwitchAliasSid,
+      revision: "claude-legacy-r1",
+      generation: "claude-legacy-g1",
+      build_seq: 2,
+      live_seq: 1,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: legacyClaudeNativeId,
+        clientMsgId: legacyClaudeClientId,
+        prompt: legacyClaudePrompt,
+        done: false,
+        blocks: [],
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    legacyClaudeCacheState.runtimes[claudeSwitchAliasSid].turns.map(
+      (turn: Turn) => [turn.id, turn.clientMsgId, turn.historyTurnId]),
+    [[legacyClaudeClientId, legacyClaudeClientId, legacyClaudeNativeId]],
+    "authoritative Claude aliases collapse a legacy projection if one survives",
+  );
+  const repeatedClaudePrompt = mergeInitialHistory(
+    [{
+      id: "claude-native-first", clientMsgId: "claude-client-first",
+      prompt: "继续", blocks: [], done: true,
+    }],
+    [{
+      id: "claude-client-second", clientMsgId: "claude-client-second",
+      prompt: "继续", blocks: [], done: false,
+    }],
+  );
+  assert.equal(repeatedClaudePrompt.length, 2,
+    "two real Claude prompts with equal text and distinct ids must both remain");
+
+  const runningAliasSid = "history-running-steer-alias";
+  const runningAliasNativeTurn = "history-running-native-task";
+  let runningAliasState = reduce({
+    ...initialState,
+    focusedSid: runningAliasSid,
+    runtimes: {
+      [runningAliasSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "history-running-original",
+          forkPointId: runningAliasNativeTurn,
+          liveTaskId: runningAliasNativeTurn,
+          prompt: "start",
+          blocks: [],
+          done: false,
+          ts: 10_000,
+        }],
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: runningAliasSid,
+    prompt: "history confirms this steer",
+    msg_id: "history-running-client-steer",
+    ts: 20_000,
+  });
+  runningAliasState = reduce(runningAliasState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: runningAliasSid,
+      revision: "history-running-r1",
+      generation: "history-running-g1",
+      build_seq: 1,
+      live_seq: 2,
+      detail: "summary",
+      has_more: true,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "history-running-native-steer",
+        clientMsgId: "history-running-client-steer",
+        prompt: "history confirms this steer",
+        done: false,
+        blocks: [],
+        ts: 20_000,
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    runningAliasState.runtimes[runningAliasSid].turns.map((turn: Turn) => ({
+      id: turn.id,
+      done: turn.done,
+      liveTaskId: turn.liveTaskId,
+    })),
+    [{
+      id: "history-running-original",
+      done: true,
+      liveTaskId: undefined,
+    }, {
+      id: "history-running-client-steer",
+      done: false,
+      liveTaskId: runningAliasNativeTurn,
+    }],
+    "a running History alias moves native ownership across the steer fence",
+  );
+  runningAliasState = reduce(runningAliasState, {
+    type: "event", event: event({
+      type: "process",
+      sid: runningAliasSid,
+      item_id: "history-running-process",
+      turn_id: runningAliasNativeTurn,
+      kind: "command",
+      phase: "start",
+      status: "running",
+      title: "new segment work",
+    }),
+  });
+  assert.equal(
+    runningAliasState.runtimes[runningAliasSid].turns[1].blocks[0]?.kind,
+    "process",
+    "native process events follow the History-confirmed steer segment",
+  );
+  runningAliasState = reduce(runningAliasState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: runningAliasSid,
+      turn_id: runningAliasNativeTurn,
+      result: { subtype: "success", duration_ms: 3, is_error: false },
+    }),
+  });
+  assert.equal(
+    runningAliasState.runtimes[runningAliasSid].turns[1].done,
+    true,
+    "the native terminal closes the History-confirmed steer segment",
+  );
+
+  const exactSteerSid = "history-running-exact-steer";
+  const exactSteerNativeTurn = "history-running-exact-native-task";
+  let exactSteerState = reduce({
+    ...initialState,
+    focusedSid: exactSteerSid,
+    runtimes: {
+      [exactSteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "history-running-exact-original",
+          forkPointId: exactSteerNativeTurn,
+          liveTaskId: exactSteerNativeTurn,
+          prompt: "start",
+          blocks: [],
+          done: false,
+          ts: 10_000,
+        }],
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: exactSteerSid,
+    prompt: "history confirms the exact steer id",
+    msg_id: "history-running-exact-client-steer",
+    ts: 20_000,
+  });
+  exactSteerState = reduce(exactSteerState, {
+    type: "event", event: event({
+      type: "history",
+      session_id: exactSteerSid,
+      revision: "history-running-exact-r1",
+      generation: "history-running-exact-g1",
+      build_seq: 1,
+      live_seq: 2,
+      detail: "summary",
+      has_more: true,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "history-running-exact-client-steer",
+        prompt: "history confirms the exact steer id",
+        done: false,
+        blocks: [],
+        ts: 20_000,
+        detailEventCount: 0,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    exactSteerState.runtimes[exactSteerSid].turns.map((turn: Turn) => ({
+      id: turn.id,
+      done: turn.done,
+      liveTaskId: turn.liveTaskId,
+    })),
+    [{
+      id: "history-running-exact-original",
+      done: true,
+      liveTaskId: undefined,
+    }, {
+      id: "history-running-exact-client-steer",
+      done: false,
+      liveTaskId: exactSteerNativeTurn,
+    }],
+    "an exact History steer id moves ownership without clientMsgId metadata",
+  );
+  exactSteerState = reduce(exactSteerState, {
+    type: "event", event: event({
+      type: "process",
+      sid: exactSteerSid,
+      item_id: "history-running-exact-process",
+      turn_id: exactSteerNativeTurn,
+      kind: "command",
+      phase: "start",
+      status: "running",
+      title: "new exact segment work",
+    }),
+  });
+  assert.equal(
+    exactSteerState.runtimes[exactSteerSid].turns[1].blocks[0]?.kind,
+    "process",
+    "native process follows an exact-id History-confirmed steer",
+  );
+
+  const unknownSteerSid = "unknown-steer-terminal-owner";
+  const unknownCurrentNative = "unknown-current-native";
+  let unknownSteerState = reduce({
+    ...initialState,
+    focusedSid: unknownSteerSid,
+    runtimes: {
+      [unknownSteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "unknown-old",
+          forkPointId: "unknown-old-native",
+          prompt: "old",
+          blocks: [],
+          done: true,
+        }, {
+          id: "unknown-current",
+          forkPointId: unknownCurrentNative,
+          liveTaskId: unknownCurrentNative,
+          prompt: "current",
+          blocks: [],
+          done: false,
+        }],
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: unknownSteerSid,
+    prompt: "uncertain steer",
+    msg_id: "unknown-client-steer",
+    ts: 30_000,
+  });
+  unknownSteerState = reduce(unknownSteerState, {
+    type: "event", event: event({
+      type: "error",
+      sid: unknownSteerSid,
+      msg_id: "unknown-client-steer",
+      code: "steer_outcome_unknown",
+      message: "connection closed before acceptance was observed",
+    }),
+  });
+  const secondUnknownDispatch = reduce(unknownSteerState, {
+    type: "steer_sent",
+    sid: unknownSteerSid,
+    prompt: "must not be sent",
+    msg_id: "unknown-second-steer",
+    ts: 31_000,
+  });
+  assert.equal(
+    secondUnknownDispatch.runtimes[unknownSteerSid].turns.some(
+      (turn: Turn) => turn.id === "unknown-second-steer"),
+    false,
+    "the reducer keeps one steer acceptance lane while its outcome is unknown",
+  );
+  unknownSteerState = reduce(unknownSteerState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: unknownSteerSid,
+      turn_id: "unknown-old-native",
+      result: { subtype: "success", duration_ms: 1, is_error: false },
+    }),
+  });
+  assert.equal(
+    unknownSteerState.runtimes[unknownSteerSid].acceptancePending,
+    "unknown-client-steer",
+    "a stale older TurnEnd cannot resolve the current unknown steer",
+  );
+  assert.equal(
+    unknownSteerState.runtimes[unknownSteerSid].turns[1].done,
+    false,
+  );
+  unknownSteerState = reduce(unknownSteerState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: unknownSteerSid,
+      turn_id: unknownCurrentNative,
+      result: { subtype: "success", duration_ms: 2, is_error: false },
+    }),
+  });
+  assert.equal(
+    unknownSteerState.runtimes[unknownSteerSid].acceptancePending,
+    null,
+    "the active native owner's terminal resolves the unknown steer",
+  );
+  assert.equal(
+    unknownSteerState.runtimes[unknownSteerSid].turns.at(-1)?.interrupted,
+    true,
+  );
+
+  const prunedStaleSid = "unknown-steer-pruned-stale-terminal";
+  const prunedCurrentNative = "unknown-pruned-current-native";
+  let prunedStaleState = reduce({
+    ...initialState,
+    focusedSid: prunedStaleSid,
+    runtimes: {
+      [prunedStaleSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "unknown-pruned-current",
+          prompt: "current after old rows were pruned",
+          blocks: [{
+            kind: "process",
+            item_id: "unknown-pruned-process",
+            processKind: "command",
+            phase: "start",
+            status: "running",
+            turn_id: prunedCurrentNative,
+            title: "current work",
+            done: false,
+          }],
+          done: false,
+        }],
+      },
+    },
+  }, {
+    type: "steer_sent",
+    sid: prunedStaleSid,
+    prompt: "uncertain steer after pruning",
+    msg_id: "unknown-pruned-client-steer",
+    ts: 35_000,
+  });
+  prunedStaleState = reduce(prunedStaleState, {
+    type: "event", event: event({
+      type: "error",
+      sid: prunedStaleSid,
+      msg_id: "unknown-pruned-client-steer",
+      code: "steer_outcome_unknown",
+      message: "connection closed before acceptance was observed",
+    }),
+  });
+  prunedStaleState = reduce(prunedStaleState, {
+    type: "event", event: event({
+      type: "turn_end",
+      sid: prunedStaleSid,
+      turn_id: "unknown-pruned-unrelated-old-native",
+      result: { subtype: "success", duration_ms: 1, is_error: false },
+    }),
+  });
+  assert.equal(
+    prunedStaleState.runtimes[prunedStaleSid].acceptancePending,
+    "unknown-pruned-client-steer",
+    "a pruned stale TurnEnd cannot consume the sole explicitly-bound owner",
+  );
+  assert.equal(
+    prunedStaleState.runtimes[prunedStaleSid].turns[0].done,
+    false,
+  );
+  prunedStaleState = reduce(prunedStaleState, {
+    type: "event", event: event({
+      type: "state",
+      sid: prunedStaleSid,
+      state: "idle",
+      ts: 36,
+    }),
+  });
+  const prunedIdleTurns =
+    prunedStaleState.runtimes[prunedStaleSid].turns;
+  assert.equal(
+    prunedStaleState.runtimes[prunedStaleSid].acceptancePending,
+    null,
+    "authoritative idle resolves an unknown steer without a TurnEnd",
+  );
+  assert.deepEqual(
+    prunedIdleTurns.map((turn: Turn) => ({
+      done: turn.done,
+      interrupted: turn.interrupted,
+    })),
+    [
+      { done: true, interrupted: true },
+      { done: true, interrupted: true },
+    ],
+    "authoritative idle closes both the predecessor and unknown steer segment",
+  );
+  assert.equal(
+    prunedIdleTurns[0].blocks[0]?.done,
+    true,
+    "authoritative idle cannot leave the predecessor process spinning",
+  );
 
   steeredTurnState = reduce(steeredTurnState, {
     type: "event", event: event({
@@ -2338,6 +4601,71 @@ try {
     "the native TurnEnd closes and binds only the latest steered segment",
   );
 
+  const concurrentSteerSid = "codex-concurrent-steer";
+  const concurrentTurnId = "native-concurrent-turn";
+  let concurrentSteerState = {
+    ...initialState,
+    focusedSid: concurrentSteerSid,
+    runtimes: {
+      [concurrentSteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "concurrent-original",
+          forkPointId: concurrentTurnId,
+          liveTaskId: concurrentTurnId,
+          prompt: "original",
+          blocks: [],
+          done: false,
+        }],
+      },
+    },
+  };
+  concurrentSteerState = reduce(concurrentSteerState, {
+    type: "steer_sent",
+    sid: concurrentSteerSid,
+    prompt: "mine",
+    msg_id: "mine-steer",
+    ts: 40_000,
+  });
+  concurrentSteerState = reduce(concurrentSteerState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      sid: concurrentSteerSid,
+      msg_id: "external-steer",
+      turn_id: concurrentTurnId,
+      prompt: "external",
+      ts: 41,
+    }),
+  });
+  concurrentSteerState = reduce(concurrentSteerState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      sid: concurrentSteerSid,
+      msg_id: "mine-steer",
+      turn_id: concurrentTurnId,
+      prompt: "mine",
+      ts: 42,
+    }),
+  });
+  assert.deepEqual(
+    concurrentSteerState.runtimes[concurrentSteerSid].turns.map(
+      (turn: Turn) => ({
+        id: turn.id,
+        done: turn.done,
+        liveTaskId: turn.liveTaskId,
+      })),
+    [{
+      id: "concurrent-original", done: true, liveTaskId: undefined,
+    }, {
+      id: "external-steer", done: true, liveTaskId: undefined,
+    }, {
+      id: "mine-steer", done: false, liveTaskId: concurrentTurnId,
+    }],
+    "an external steer accepted first must stay before the later local optimistic steer",
+  );
+
   const rejectedSteerSid = "codex-steer-rejected";
   const rejectedSteerBefore: Turn = {
     id: "still-running-after-rejection",
@@ -2364,6 +4692,13 @@ try {
     },
   };
   rejectedSteerState = reduce(rejectedSteerState, {
+    type: "steer_sent",
+    sid: rejectedSteerSid,
+    prompt: "rejected steer",
+    msg_id: "rejected-steer-message",
+    ts: 30_000,
+  });
+  rejectedSteerState = reduce(rejectedSteerState, {
     type: "event", event: event({
       type: "error",
       sid: rejectedSteerSid,
@@ -2376,6 +4711,11 @@ try {
     rejectedSteerState.runtimes[rejectedSteerSid].turns,
     [rejectedSteerBefore],
     "a rejected steer is a command problem and cannot close the active turn",
+  );
+  assert.equal(
+    rejectedSteerState.runtimes[rejectedSteerSid].acceptancePending,
+    null,
+    "a definitive steer rejection releases the optimistic acceptance latch",
   );
   assert.equal(
     rejectedSteerState.runtimes[rejectedSteerSid].state,
@@ -2479,6 +4819,24 @@ try {
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, true);
   detailState = reduce(detailState, { type: "event", event: event({
     type: "turn_detail", session_id: summarySid, turn_id: "summary-message",
+    revision: "summary-r1", authoritative: false,
+    error: "详细过程暂时不可用，请稍后重试", events: [],
+  }) });
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, false);
+  assert.equal(
+    detailState.runtimes[summarySid].turns[0].detailError,
+    "详细过程暂时不可用，请稍后重试",
+    "a failed detail read remains visible and retryable inside the open disclosure",
+  );
+  detailState = reduce(detailState, {
+    type: "turn_detail_requested", sid: summarySid,
+    turnId: "summary-message",
+  });
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, true);
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailError, undefined,
+    "retry clears the prior detail error without collapsing the process shell");
+  detailState = reduce(detailState, { type: "event", event: event({
+    type: "turn_detail", session_id: summarySid, turn_id: "summary-message",
     revision: "summary-r1", events: [
       event({ type: "user_msg", sid: summarySid, msg_id: "summary-message",
         prompt: "inspect" }),
@@ -2505,6 +4863,12 @@ try {
   assert.equal(detailState.runtimes[summarySid].turns.length, 1);
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoaded, true);
   assert.equal(detailState.runtimes[summarySid].turns[0].detailLoading, false);
+  assert.equal(detailState.runtimes[summarySid].turns[0].detailError, undefined);
+  assert.equal(
+    detailState.runtimes[summarySid].turns[0].detailRetryDirection,
+    undefined,
+    "a successful detail response clears its transient retry target",
+  );
   assert.ok(detailState.runtimes[summarySid].turns[0].detailProjection?.blocks.some(
     (block: Block) => block.kind === "tool"));
   assert.deepEqual(detailState.runtimes[summarySid].turns[0].blocks.map(
@@ -2520,6 +4884,33 @@ try {
   }) });
   assert.equal(staleDetail, detailState,
     "a detail response from another history revision cannot rewrite the turn");
+
+  const runtimeOlderRequested = reduce(detailState, {
+    type: "turn_detail_requested", sid: summarySid,
+    turnId: "summary-message", before: "summary-older-cursor",
+  });
+  const runtimeOlderFailed = reduce(runtimeOlderRequested, {
+    type: "event",
+    event: event({
+      type: "turn_detail", session_id: summarySid,
+      turn_id: "summary-message", revision: "summary-r1",
+      authoritative: false, before: "summary-older-cursor",
+      error: "详细过程暂时不可用，请稍后重试", events: [],
+    }),
+  });
+  assert.equal(
+    runtimeOlderFailed.runtimes[summarySid].turns[0].detailLoaded,
+    true,
+    "an older-page failure keeps the already-loaded newest detail page",
+  );
+  assert.equal(
+    runtimeOlderFailed.runtimes[summarySid].turns[0].detailRetryBefore,
+    "summary-older-cursor",
+  );
+  assert.equal(
+    runtimeOlderFailed.runtimes[summarySid].turns[0].detailRetryDirection,
+    "older",
+  );
 
   const refreshedSummary = reduce(detailState, { type: "event", event: event({
     type: "history", session_id: summarySid, revision: "summary-r1",
@@ -2612,8 +5003,8 @@ try {
   );
   assert.deepEqual(
     twoCachedRestores.map((turn) => !!turn.detailRestorePending),
-    [false, true],
-    "refresh automatically validates only the newest affected turn instead of downloading every cached process",
+    [false, false],
+    "completed cached process stays lazy until the user requests its detail",
   );
   const repeatedPromptSummaries: Turn[] = ["a", "b"].map((suffix, index) => ({
     id: `repeated-${suffix}`,
@@ -2648,6 +5039,32 @@ try {
     [["process-0"], ["process-1"]],
     "nearby repeated prompts must restore each turn's own cached process exactly once",
   );
+  const aliasSummaries: Turn[] = ["a", "b"].map((suffix, index) => ({
+    ...repeatedPromptSummaries[index],
+    id: `client-${suffix}`,
+    historyTurnId: `native-${suffix}`,
+  }));
+  const aliasCaches: Turn[] = ["a", "b"].map((suffix, index) => ({
+    ...repeatedPromptCaches[index],
+    id: `native-${suffix}`,
+    // Deliberately make timestamp affinity prefer the wrong repeated prompt.
+    ts: index === 0 ? aliasSummaries[1].ts : aliasSummaries[0].ts,
+    blocks: [{
+      kind: "process",
+      item_id: `native-${suffix}-process`,
+      processKind: "command",
+      phase: "snapshot",
+      status: "succeeded",
+      title: `native-process-${suffix}`,
+      done: true,
+    }, ...repeatedPromptSummaries[index].blocks],
+  }));
+  const aliasRestores = restoreCachedTurnDetails(aliasSummaries, aliasCaches);
+  assert.deepEqual(
+    aliasRestores.map(processFingerprint),
+    [["native-process-a"], ["native-process-b"]],
+    "historyTurnId must beat repeated-prompt timestamp affinity during cache restore",
+  );
 
   let cacheFirstRefresh = reduce({
     ...initialState, focusedSid: refreshSid,
@@ -2668,15 +5085,15 @@ try {
     (cacheFirstRefresh.runtimes[refreshSid].turns[0] as Turn & {
       detailRestorePending?: boolean;
     }).detailRestorePending,
-    true,
-    "a same-revision cached process should schedule one authoritative detail restore",
+    false,
+    "entering a completed session must not schedule an unsolicited detail read",
   );
   assert.equal(
     (cacheFirstRefresh.runtimes[refreshSid].turns[0] as Turn & {
       detailRestoreOpen?: boolean;
     }).detailRestoreOpen,
-    true,
-    "the newest compact process should stay open across a page refresh",
+    false,
+    "completed cached process stays collapsed until the user opens it",
   );
 
   let historyFirstRefresh = reduce({
@@ -3478,7 +5895,7 @@ try {
       has_more: true, events: [], turns: [
         {
           id: "first-prompt", prompt: "first", done: true,
-          doneTs: 2_000, durationMs: 0,
+          doneTs: 2_000,
           detailEventCount: 2, detailLoaded: false, blocks: [{
             kind: "text", message_id: "commentary-first",
             text: "first progress", done: true, channel: "commentary",
@@ -3508,12 +5925,82 @@ try {
     (turn: { prompt: string; done: boolean }) => [turn.prompt, turn.done]), [
       ["first", true], ["second", false],
     ]);
+  assert.equal(detailedSteerTurns[0].durationMs, undefined,
+    "a synthetic steered TurnEnd must not render a fake zero-second duration");
   assert.equal(detailedSteerTurns[0].blocks.some(
     (block: { done: boolean }) => !block.done), false);
   assert.equal(detailedSteerTurns[1].blocks.some(
     (block: { kind: string; text?: string }) =>
       block.kind === "text" && block.text === "second progress"), true);
   assert.equal(detailedSteerTurns[1].blocks.some(
+    (block: { kind: string; processKind?: string }) =>
+      block.kind === "process" && block.processKind === "compaction"), true);
+
+  // A compact marker can reach the live optimistic row before the next
+  // authoritative History head binds that row's native user-message id. The
+  // reducer must reconcile those two identities instead of painting the same
+  // question twice after automatic context compression.
+  const compactDuplicateSid = "compact-does-not-duplicate-question";
+  const compactDuplicateNativeTurn = "compact-native-turn";
+  const compactDuplicateLiveTurn = {
+    id: "compact-browser-message",
+    clientMsgId: "compact-browser-message",
+    prompt: "继续修复问题",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "compact-live-marker",
+      processKind: "compaction" as const,
+      phase: "end" as const,
+      status: "succeeded" as const,
+      turn_id: compactDuplicateNativeTurn,
+      title: "压缩上下文",
+      done: true,
+    }],
+  };
+  let compactDuplicateState = {
+    ...initialState,
+    focusedSid: compactDuplicateSid,
+    runtimes: {
+      [compactDuplicateSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        turns: [compactDuplicateLiveTurn],
+      },
+    },
+  };
+  compactDuplicateState = reduce(compactDuplicateState, {
+    type: "event", event: event({
+      type: "history",
+      sid: compactDuplicateSid,
+      session_id: compactDuplicateSid,
+      revision: "compact-duplicate-revision",
+      generation: "compact-duplicate-generation",
+      build_seq: 1,
+      detail: "summary",
+      in_progress: true,
+      has_more: false,
+      events: [],
+      turns: [{
+        id: "compact-history-message",
+        forkPointId: compactDuplicateNativeTurn,
+        prompt: "继续修复问题",
+        done: false,
+        detailEventCount: 1,
+        detailLoaded: false,
+        blocks: [],
+      }],
+    }),
+  });
+  const compactDuplicateTurns =
+    compactDuplicateState.runtimes[compactDuplicateSid].turns;
+  assert.equal(compactDuplicateTurns.length, 1,
+    "automatic context compression must not add a duplicate user question");
+  assert.equal(compactDuplicateTurns[0].prompt, "继续修复问题");
+  assert.equal(compactDuplicateTurns[0].historyTurnId,
+    "compact-history-message",
+    "the merged row keeps the authoritative History lookup identity");
+  assert.equal(compactDuplicateTurns[0].blocks.some(
     (block: { kind: string; processKind?: string }) =>
       block.kind === "process" && block.processKind === "compaction"), true);
 
@@ -3746,6 +6233,116 @@ try {
     browseAfterLive.historyBrowse?.turns,
     "live narrative marks the browse stale without appending into its window");
 
+  const reconnectingBrowseSource = {
+    ...orderedHistory,
+    historyBrowse: {
+      ...orderedHistory.historyBrowse!,
+      hasOlder: true,
+      olderCursor: "still-has-older",
+    },
+  };
+  let reconnectingBrowse = reduce(reconnectingBrowseSource, {
+    type: "conn", connState: "reconnecting",
+  });
+  assert.equal(reconnectingBrowse.historyBrowse, null,
+    "disconnect revokes the active browse cursor immediately");
+  assert.deepEqual(
+    reconnectingBrowse.retainedHistoryBrowse?.turns.map(
+      (turn: Turn) => turn.id),
+    ["older-page", "new"],
+    "disconnect keeps the already-painted browse window read-only");
+  const reconnectingView = displayHistoryProjection(
+    reconnectingBrowse.historyRecovery,
+    orderedHistorySid,
+    reconnectingBrowse.runtimes[orderedHistorySid],
+    reconnectingBrowse.historyBrowse,
+    reconnectingBrowse.retainedHistoryBrowse,
+  );
+  assert.equal(reconnectingView.hasMore, true);
+  assert.equal(reconnectingView.pagingReady, false);
+  assert.equal(reconnectingView.recovering, true);
+  assert.equal(
+    reconnectingView.scopeKey,
+    orderedHistory.historyBrowse!.scopeKey,
+    "read-only reconnect paint must preserve the exact virtualizer scope",
+  );
+  const retainedBeforeDelayedPage =
+    reconnectingBrowse.retainedHistoryBrowse;
+  reconnectingBrowse = reduce(reconnectingBrowse, {
+    type: "install_history_browse_page",
+    sid: orderedHistorySid,
+    scopeKey: orderedHistory.historyBrowse!.scopeKey,
+    revision: orderedHistory.historyBrowse!.revision,
+    generation: orderedHistory.historyBrowse!.generation,
+    viewId: orderedHistory.historyBrowse!.viewId,
+    windowEpoch: orderedHistory.historyBrowse!.windowEpoch,
+    before: "still-has-older",
+    page: {
+      pageKey: "old-socket-page",
+      turns: [{
+        id: "must-not-install", prompt: "stale", blocks: [], done: true,
+      }],
+      hasOlder: false,
+      olderCursor: "must-not-install",
+    },
+  });
+  assert.equal(
+    reconnectingBrowse.retainedHistoryBrowse,
+    retainedBeforeDelayedPage,
+    "a delayed old-socket page cannot mutate the retained display snapshot");
+
+  reconnectingBrowse = reduce(reconnectingBrowse, {
+    type: "conn", connState: "connected",
+  });
+  reconnectingBrowse = reduce(reconnectingBrowse, {
+    type: "event",
+    event: event({
+      type: "history", sid: orderedHistorySid,
+      session_id: orderedHistorySid,
+      revision: "ordered-rev-new", generation: "wrapper-one",
+      build_seq: 3, has_more: true, oldest_id: "new",
+      events: [event({
+        type: "user_msg", sid: orderedHistorySid,
+        msg_id: "new", prompt: "new",
+      })],
+    }),
+  });
+  assert.equal(reconnectingBrowse.retainedHistoryBrowse, null);
+  assert.deepEqual(
+    reconnectingBrowse.historyBrowse?.turns.map((turn: Turn) => turn.id),
+    ["older-page", "new"],
+    "same revision and wrapper generation reactivate the retained browse");
+  assert.equal(reconnectingBrowse.historyBrowse?.latestDirty, true,
+    "a newer head build marks the reactivated deep window stale");
+
+  let restartedBrowse = reduce(reconnectingBrowseSource, {
+    type: "conn", connState: "reconnecting",
+  });
+  restartedBrowse = reduce(restartedBrowse, {
+    type: "conn", connState: "connected",
+  });
+  restartedBrowse = reduce(restartedBrowse, {
+    type: "event",
+    event: event({
+      type: "history", sid: orderedHistorySid,
+      session_id: orderedHistorySid,
+      revision: "ordered-rev-after-restart", generation: "wrapper-two",
+      build_seq: 1, has_more: true, oldest_id: "restart-head",
+      events: [event({
+        type: "user_msg", sid: orderedHistorySid,
+        msg_id: "restart-head", prompt: "new generation",
+      })],
+    }),
+  });
+  assert.equal(restartedBrowse.retainedHistoryBrowse, null);
+  assert.equal(restartedBrowse.historyBrowse, null,
+    "a different generation atomically replaces rather than reuses old pages");
+  assert.deepEqual(
+    restartedBrowse.runtimes[orderedHistorySid].turns.map(
+      (turn: Turn) => turn.id),
+    ["restart-head"],
+  );
+
   const cacheRaceBrowse = {
     ...browseBeforeLive,
     hasNewer: true,
@@ -3976,6 +6573,35 @@ try {
   assert.equal(hydratedOlderTurn?.detailLoaded, true);
   assert.equal(hydratedOlderTurn?.detailLoading, false);
   assert.equal(hydratedOlderTurn?.blocks[0]?.kind, "text");
+
+  const browseOlderRequested = reduce(detailedBrowse, {
+    type: "history_browse_detail_requested",
+    sid: orderedHistorySid,
+    scopeKey: detailedBrowse.historyBrowse!.scopeKey,
+    revision: detailedBrowse.historyBrowse!.revision,
+    viewId: detailedBrowse.historyBrowse!.viewId,
+    windowEpoch: detailedBrowse.historyBrowse!.windowEpoch,
+    turnId: "older-page",
+    before: "browse-older-detail-cursor",
+  });
+  const browseOlderFailed = reduce(browseOlderRequested, {
+    type: "history_browse_detail",
+    sid: orderedHistorySid,
+    scopeKey: detailedBrowse.historyBrowse!.scopeKey,
+    revision: detailedBrowse.historyBrowse!.revision,
+    viewId: detailedBrowse.historyBrowse!.viewId,
+    windowEpoch: detailedBrowse.historyBrowse!.windowEpoch,
+    turnId: "older-page",
+    before: "browse-older-detail-cursor",
+    events: [],
+    error: "详细过程暂时不可用，请稍后重试",
+  });
+  const failedBrowseTurn = browseOlderFailed.historyBrowse?.turns.find(
+    (turn: Turn) => turn.id === "older-page");
+  assert.equal(failedBrowseTurn?.detailLoaded, true);
+  assert.equal(failedBrowseTurn?.detailRetryBefore,
+    "browse-older-detail-cursor");
+  assert.equal(failedBrowseTurn?.detailRetryDirection, "older");
 
   const runtimeDetailRequested = reduce(orderedHistory, {
     type: "turn_detail_requested",
@@ -4490,6 +7116,55 @@ try {
   assert.deepEqual(sameRevisionState.runtimes[sameRevisionSid].turns.map(
     (turn: { id: string }) => turn.id), ["kept-before-rewind"]);
 
+  // IndexedDB intentionally stores only the bounded visible projection, not
+  // its pagination cursor.  When that instant paint races a same-authority
+  // newest page, keeping the cached rows must not also keep the cache's
+  // default `hasMore=false` / null cursor and hide older server history.
+  const cachedPagingSid = "same-revision-cache-restores-pagination";
+  let cachedPagingState = reduce({
+    ...initialState, focusedSid: cachedPagingSid,
+  }, {
+    type: "hydrate_cache",
+    sid: cachedPagingSid,
+    revision: "cached-paging-rev",
+    generation: "cached-paging-generation",
+    turns: [{
+      id: "cached-current", prompt: "cached current",
+      blocks: [], done: true,
+    }],
+  });
+  assert.equal(!!cachedPagingState.runtimes[cachedPagingSid].hasMore, false);
+  assert.equal(cachedPagingState.runtimes[cachedPagingSid].oldestId ?? null, null);
+  cachedPagingState = reduce(cachedPagingState, {
+    type: "event", event: event({
+      type: "history", sid: cachedPagingSid, session_id: cachedPagingSid,
+      revision: "cached-paging-rev",
+      generation: "cached-paging-generation",
+      build_seq: 1,
+      detail: "summary",
+      has_more: true,
+      oldest_id: "server-older-cursor",
+      events: [],
+      turns: [{
+        id: "cached-current", prompt: "cached current",
+        blocks: [], done: true,
+      }],
+    }),
+  });
+  assert.equal(cachedPagingState.runtimes[cachedPagingSid].hasMore, true,
+    "an authoritative newest page must restore pagination after cache paint");
+  assert.equal(cachedPagingState.runtimes[cachedPagingSid].oldestId,
+    "server-older-cursor",
+    "the load-older affordance must use the authoritative server cursor");
+  const cachedPagingProjection = displayHistoryProjection(
+    cachedPagingState.historyRecovery,
+    cachedPagingSid,
+    cachedPagingState.runtimes[cachedPagingSid],
+  );
+  assert.equal(cachedPagingProjection.hasMore, true);
+  assert.equal(cachedPagingProjection.pagingReady, true);
+  assert.equal(cachedPagingProjection.oldestId, "server-older-cursor");
+
   // When the tiny invalidation marker itself fell out of the ring, the replay
   // gap is still a conservative invalidation boundary. Never leave a stale
   // preview open or finish loading before authoritative History arrives.
@@ -4504,6 +7179,8 @@ try {
         historyRevision: "boot-old:9",
         historyGeneration: "gap-generation-new",
         historyBuildSeq: 4,
+        hasMore: true,
+        oldestId: staleTurns[0].id,
         syncReady: true,
       },
     },
@@ -4530,7 +7207,15 @@ try {
   assert.equal(
     displayHistoryProjection(
       gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+      gapState.historyBrowse, gapState.retainedHistoryBrowse,
     ).hasMore,
+    true,
+    "known older history stays visible while its old cursor is read-only");
+  assert.equal(
+    displayHistoryProjection(
+      gapState.historyRecovery, gapSid, gapState.runtimes[gapSid],
+      gapState.historyBrowse, gapState.retainedHistoryBrowse,
+    ).pagingReady,
     false,
     "a retained projection must never paginate with its old generation cursor");
   const queryDuringGapState = reduce(gapState, {
@@ -5335,7 +8020,8 @@ try {
     type: "history", sid, session_id: sid, revision: "main-rev",
     in_progress: true, has_more: false,
     events: [
-      event({ type: "user_msg", sid, msg_id: "engine-a", prompt: "在？", ts: 10 }),
+      event({ type: "user_msg", sid, msg_id: "engine-a",
+        client_msg_id: "client-a", prompt: "在？", ts: 10 }),
       event({ type: "turn_end", sid, ts: 11, turn_id: "codex-turn-a",
         result: { subtype: "success", duration_ms: 0, is_error: false } }),
     ],
@@ -5355,7 +8041,8 @@ try {
     type: "history", sid, session_id: sid, revision: "main-rev",
     in_progress: false, has_more: false,
     events: [
-      event({ type: "user_msg", sid, msg_id: "engine-a", prompt: "在？", ts: 10 }),
+      event({ type: "user_msg", sid, msg_id: "engine-a",
+        client_msg_id: "client-a", prompt: "在？", ts: 10 }),
       event({ type: "assistant_msg_start", sid, message_id: "engine-answer" }),
       event({ type: "delta", sid, message_id: "engine-answer", text: "only once" }),
       event({ type: "assistant_msg_end", sid, message_id: "engine-answer" }),
@@ -5369,6 +8056,166 @@ try {
     (block: { kind: string; text?: string }) => block.kind === "text" ? block.text : "tool"),
   ["only once"]);
   assert.deepEqual(state.runtimes[otherSid].turns, [untouched]);
+
+  // App-server 0.147 can report an interrupted summary for the exact native
+  // turn which is still appending after context compaction. A newest
+  // authoritative History page says which visible row owns that active head;
+  // the next assistant item has no turn id and must reopen/append there instead
+  // of creating a prompt-less tail after refresh.
+  const compactRefreshSid = "compact-refresh-active-head";
+  const compactRefreshVisibleId = "compact-refresh-user";
+  const compactRefreshNativeId = "compact-refresh-native";
+  let compactRefreshState = reduce({
+    ...initialState,
+    focusedSid: compactRefreshSid,
+    runtimes: {
+      [compactRefreshSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: compactRefreshSid,
+      session_id: compactRefreshSid,
+      revision: "compact-refresh-r1",
+      generation: "compact-refresh-g1",
+      build_seq: 1,
+      live_seq: 10,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      newest_id: compactRefreshVisibleId,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: compactRefreshVisibleId,
+        prompt: "continue the long task",
+        forkPointId: compactRefreshNativeId,
+        done: true,
+        interrupted: true,
+        blocks: [{
+          kind: "text",
+          message_id: "before-compact",
+          channel: "commentary",
+          text: "before compact",
+          done: true,
+        }],
+        detailEventCount: 4,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    compactRefreshState.runtimes[compactRefreshSid].turns[0].done,
+    false,
+    "current authoritative History reopens its exact compacted active row",
+  );
+  assert.equal(
+    compactRefreshState.runtimes[compactRefreshSid].turns[0].interrupted,
+    undefined,
+  );
+  for (const liveEvent of [
+    event({
+      type: "assistant_msg_start",
+      sid: compactRefreshSid,
+      seq: 11,
+      message_id: "after-compact",
+      channel: "commentary",
+    }),
+    event({
+      type: "delta",
+      sid: compactRefreshSid,
+      seq: 12,
+      message_id: "after-compact",
+      channel: "commentary",
+      text: "after compact",
+    }),
+  ]) {
+    compactRefreshState = reduce(compactRefreshState, {
+      type: "event", event: liveEvent,
+    });
+  }
+  assert.equal(
+    compactRefreshState.runtimes[compactRefreshSid].turns.length,
+    1,
+    "post-compact assistant items cannot create a second prompt-less turn",
+  );
+  assert.deepEqual(
+    compactRefreshState.runtimes[compactRefreshSid].turns[0].blocks
+      .filter((block: Block) => block.kind === "text")
+      .map((block: Block) => block.kind === "text" ? block.text : ""),
+    ["before compact", "after compact"],
+  );
+
+  const ambiguousActiveHeadSid = "ambiguous-active-history-head";
+  let ambiguousActiveHeadState = reduce({
+    ...initialState,
+    focusedSid: ambiguousActiveHeadSid,
+    runtimes: {
+      [ambiguousActiveHeadSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: ambiguousActiveHeadSid,
+      session_id: ambiguousActiveHeadSid,
+      revision: "ambiguous-active-r1",
+      generation: "ambiguous-active-g1",
+      build_seq: 1,
+      live_seq: 20,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "missing-active-visible-id",
+      in_progress: true,
+      events: [],
+      turns: [
+        {
+          id: "candidate-a",
+          prompt: "first",
+          forkPointId: "shared-active-native",
+          done: true,
+          blocks: [],
+        },
+        {
+          id: "candidate-b",
+          prompt: "second",
+          forkPointId: "shared-active-native",
+          done: true,
+          blocks: [],
+        },
+      ],
+    }),
+  });
+  assert.ok(
+    ambiguousActiveHeadState.runtimes[ambiguousActiveHeadSid].turns.every(
+      (turn: Turn) => turn.done),
+    "an unmatched active cursor cannot guess between visible steer segments",
+  );
+  ambiguousActiveHeadState = reduce(ambiguousActiveHeadState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: ambiguousActiveHeadSid,
+      seq: 21,
+      message_id: "unbound-after-refresh",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    ambiguousActiveHeadState.runtimes[ambiguousActiveHeadSid].turns.length,
+    3,
+    "missing authoritative ownership fails closed instead of merging by recency",
+  );
 
   const richSid = "rich-process";
   state = {
@@ -5417,6 +8264,41 @@ try {
   assert.equal(commandBlock.result?.duration_ms, 1250);
   assert.equal(richTurn.blocks.filter((block: { kind: string }) => block.kind === "process").length, 3);
 
+  const clearedDiffSid = "cleared-file-diff";
+  let clearedDiffState = reduce({
+    ...initialState,
+    focusedSid: clearedDiffSid,
+    runtimes: { [clearedDiffSid]: createRuntime() },
+  }, {
+    type: "query_sent", sid: clearedDiffSid,
+    prompt: "edit", msg_id: "diff-turn", ts: 31_000,
+  });
+  for (const diffEvent of [
+    event({
+      type: "tool_use", sid: clearedDiffSid, message_id: "diff-message",
+      tool_use_id: "diff-tool", tool: "apply_patch", category: "file",
+      input: { file_paths: ["/repo/a.py"] },
+    }),
+    event({
+      type: "tool_delta", sid: clearedDiffSid, tool_use_id: "diff-tool",
+      stream: "diff", delta: "@@ -1 +1 @@\n-old\n+first",
+    }),
+    event({
+      type: "tool_result", sid: clearedDiffSid, tool_use_id: "diff-tool",
+      content: "", is_error: false, status: "succeeded", diff: null,
+    }),
+  ]) {
+    clearedDiffState = reduce(clearedDiffState, {
+      type: "event", event: diffEvent,
+    });
+  }
+  const clearedDiffBlock = clearedDiffState.runtimes[clearedDiffSid]
+    .turns[0].blocks.find((block: Block) => block.kind === "tool") as {
+      diff?: string;
+    };
+  assert.equal(clearedDiffBlock.diff, undefined,
+    "an authoritative empty terminal snapshot clears the stale live diff");
+
   // Claude can reveal only at Result that a stop_reason=null text block was the
   // final answer. A repeated End for the same id must reclassify in place, while
   // an End for an unknown id must never manufacture an empty text block/turn.
@@ -5445,7 +8327,10 @@ try {
   const correctedTurns = state.runtimes[correctedSid].turns;
   assert.equal(correctedTurns.length, 1);
   assert.equal(correctedTurns[0].blocks.length, 1);
-  assert.deepEqual(correctedTurns[0].blocks[0], {
+  const { liveOrder: correctedLiveOrder, ...correctedBlock } =
+    correctedTurns[0].blocks[0];
+  assert.equal(correctedLiveOrder, 0);
+  assert.deepEqual(correctedBlock, {
     kind: "text", message_id: "ambiguous-answer", text: "真实正文",
     done: true, channel: "final",
   });
@@ -5557,7 +8442,11 @@ try {
   let boundedBlockTurn = state.runtimes[boundedBlocksSid].turns[0];
   assert.equal(boundedBlockTurn.blocks.length, MAX_TURN_BLOCKS);
   assert.equal(boundedBlockTurn.blocks.filter((block: { kind: string; item_id?: string }) =>
-    block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 1);
+    block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 0,
+  "the routine live memory window must not paint an omission card");
+  assert.ok((boundedBlockTurn.detailEventCount ?? 0) >= generatedBlocks);
+  assert.equal(boundedBlockTurn.detailRestorePending, true,
+    "the first live spill must request an authoritative bounded detail page");
   assert.ok(boundedBlockTurn.blocks.some(
     (block: { kind: string; message_id?: string; channel?: string }) =>
       block.kind === "text" && block.message_id === "early-final"
@@ -5599,6 +8488,438 @@ try {
     kind: string; message_id?: string; channel?: string;
   }) => block.kind === "text" && block.message_id === "late-final"
     && block.channel === "final"));
+  state = reduce(state, {
+    type: "turn_detail_requested",
+    sid: boundedBlocksSid,
+    turnId: "bounded-block-turn",
+    autoLoad: false,
+  });
+  state = reduce(state, { type: "event", event: event({
+    type: "turn_end", sid: boundedBlocksSid, turn_id: "bounded-block-turn",
+    result: { subtype: "success", duration_ms: 1, is_error: false },
+  }) });
+  boundedBlockTurn = state.runtimes[boundedBlocksSid].turns[0];
+  assert.equal(boundedBlockTurn.detailRestorePending, true,
+    "terminal reconciliation survives an already in-flight running snapshot");
+  assert.equal(boundedBlockTurn.detailLoading, true);
+  const mergedLiveDetail = mergeDetailWithLiveTail(
+    [{
+      kind: "process", item_id: "source-old", processKind: "command",
+      phase: "end", status: "succeeded", title: "较早命令", done: true,
+    }],
+    [
+      {
+        kind: "process", item_id: OMITTED_PROCESS_ITEM_ID,
+        processKind: "compaction", phase: "snapshot", status: "succeeded",
+        title: "较早过程已省略", done: true,
+      },
+      {
+        kind: "process", item_id: "live-new", processKind: "agent",
+        phase: "start", status: "running", title: "最新活动", done: false,
+      },
+    ],
+  );
+  assert.deepEqual(mergedLiveDetail.map((block: {
+    kind: string; item_id?: string;
+  }) => block.kind === "process" ? block.item_id : ""), [
+    "source-old", "live-new",
+  ], "a loaded detail page and later live tail must render once in source order");
+  const repeatedDistinctCommentary = mergeDetailWithLiveTail(
+    [{
+      kind: "text", message_id: "history-repeat", text: "same update",
+      done: true, channel: "commentary",
+    }],
+    [{
+      kind: "text", message_id: "live-repeat", text: "same update",
+      done: true, channel: "commentary",
+    }],
+  );
+  assert.deepEqual(
+    repeatedDistinctCommentary.flatMap((block) =>
+      block.kind === "text" ? [block.message_id] : []),
+    ["history-repeat", "live-repeat"],
+    "equal detail/live text with distinct native ids is two real occurrences",
+  );
+  const interleavedObservedProcess = mergeDetailWithLiveTail(
+    [
+      {
+        kind: "text", message_id: "commentary-before", text: "before",
+        done: true, channel: "commentary", liveOrder: 0,
+      },
+      {
+        kind: "text", message_id: "commentary-after", text: "after",
+        done: true, channel: "commentary", liveOrder: 1,
+      },
+    ],
+    [
+      {
+        kind: "text", message_id: "commentary-before", text: "before",
+        done: true, channel: "commentary", liveOrder: 0,
+      },
+      {
+        kind: "tool", message_id: "tool-message-1", tool_use_id: "tool-1",
+        tool: "exec", input: {}, done: true, liveOrder: 1,
+      },
+      {
+        kind: "text", message_id: "commentary-after", text: "after",
+        done: true, channel: "commentary", liveOrder: 2,
+      },
+      {
+        kind: "tool", message_id: "tool-message-2", tool_use_id: "tool-2",
+        tool: "exec", input: {}, done: true, liveOrder: 3,
+      },
+    ],
+  );
+  assert.deepEqual(
+    interleavedObservedProcess.map((block) => block.kind === "text"
+      ? block.message_id : block.kind === "tool"
+        ? block.tool_use_id : block.item_id),
+    ["commentary-before", "tool-1", "commentary-after", "tool-2"],
+    "an official detail subset must not move observed tools below later commentary",
+  );
+  const unorderedLiveSubset = mergeDetailWithLiveTail(
+    [
+      {
+        kind: "text", message_id: "source-first", text: "first",
+        done: true, channel: "commentary",
+      },
+      {
+        kind: "text", message_id: "source-second", text: "second",
+        done: true, channel: "commentary",
+      },
+    ],
+    [
+      {
+        kind: "text", message_id: "source-second", text: "second",
+        done: true, channel: "commentary",
+      },
+      {
+        kind: "tool", message_id: "unknown-order-tool", tool_use_id: "unknown-order-tool",
+        tool: "exec", input: {}, done: true,
+      },
+      {
+        kind: "text", message_id: "source-first", text: "first",
+        done: true, channel: "commentary",
+      },
+    ],
+  );
+  assert.deepEqual(
+    unorderedLiveSubset.map((block) => block.kind === "text"
+      ? block.message_id : block.kind === "tool"
+        ? block.tool_use_id : block.item_id),
+    ["source-first", "source-second", "unknown-order-tool"],
+    "Set containment without reducer liveOrder is not chronology evidence",
+  );
+  const authoritativePayload = mergeDetailWithLiveTail(
+    [{
+      kind: "process", item_id: "source-complete", processKind: "command",
+      phase: "end", status: "succeeded", title: "完整命令",
+      output: "FULL-AUTHORITATIVE-OUTPUT", done: true,
+    }],
+    [{
+      kind: "process", item_id: "source-complete", processKind: "command",
+      phase: "end", status: "succeeded", title: "完整命令",
+      output: "TRUNCATED-SPILL", done: true,
+    }],
+    true,
+  );
+  assert.equal(
+    authoritativePayload[0]?.kind === "process"
+      ? authoritativePayload[0].output : undefined,
+    "FULL-AUTHORITATIVE-OUTPUT",
+    "a bounded spill cannot overwrite a completed authoritative detail payload",
+  );
+  const authoritativeThroughLiveTail = mergeDetailWithLiveTail(
+    authoritativePayload,
+    [{
+      kind: "process", item_id: "source-complete", processKind: "command",
+      phase: "end", status: "succeeded", title: "完整命令",
+      output: "TRUNCATED-LIVE-TAIL", done: true,
+    }],
+    true,
+  );
+  assert.equal(
+    authoritativeThroughLiveTail[0]?.kind === "process"
+      ? authoritativeThroughLiveTail[0].output : undefined,
+    "FULL-AUTHORITATIVE-OUTPUT",
+    "the live Turn.blocks merge cannot overwrite detail after the spill merge",
+  );
+  const restoredObservedPayload = restoreObservedLiveTurnDetails(
+    [{
+      id: "observed-authoritative", prompt: "inspect", done: true,
+      blocks: [{
+        kind: "text", message_id: "observed-final",
+        text: "done", channel: "final", done: true,
+      }],
+    }],
+    [{
+      id: "observed-authoritative", prompt: "inspect", done: true,
+      blocks: [{
+        kind: "process", item_id: "observed-process",
+        processKind: "command", phase: "end", status: "succeeded",
+        title: "完整命令", output: "TRUNCATED-LIVE-TAIL", done: true,
+      }],
+      liveSpillBlocks: [{
+        kind: "process", item_id: "observed-process",
+        processKind: "command", phase: "end", status: "succeeded",
+        title: "完整命令", output: "TRUNCATED-SPILL", done: true,
+      }],
+      detailProjection: {
+        segments: [],
+        blocks: [{
+          kind: "process", item_id: "observed-process",
+          processKind: "command", phase: "end", status: "succeeded",
+          title: "完整命令", output: "FULL-AUTHORITATIVE-OUTPUT", done: true,
+        }],
+        capped: false,
+        hasMore: false,
+        oldestCursor: null,
+        hasNewer: false,
+        newerCursor: null,
+      },
+    }],
+  );
+  assert.equal(
+    restoredObservedPayload[0].detailProjection?.blocks[0]?.kind === "process"
+      ? restoredObservedPayload[0].detailProjection.blocks[0].output
+      : undefined,
+    "FULL-AUTHORITATIVE-OUTPUT",
+    "summary restoration keeps detail authoritative through spill and live",
+  );
+
+  const sharedNativeSteerId = "native-task-with-steers";
+  const preSteerTools = Array.from({ length: 12 }, (_, index) => ({
+    kind: "process" as const,
+    item_id: `pre-steer-tool-${index}`,
+    processKind: "command" as const,
+    phase: "end" as const,
+    status: "succeeded" as const,
+    title: `tool ${index}`,
+    done: true,
+  }));
+  const restoredSteerSegments = restoreObservedLiveTurnDetails(
+    [
+      {
+        id: "native-user-before-steer", prompt: "initial request",
+        forkPointId: sharedNativeSteerId, blocks: [], done: true,
+      },
+      {
+        id: "native-user-first-steer", prompt: "first steer",
+        forkPointId: sharedNativeSteerId, blocks: [], done: true,
+      },
+      {
+        id: "native-user-second-steer", prompt: "second steer",
+        forkPointId: sharedNativeSteerId, blocks: [], done: false,
+      },
+    ],
+    [
+      {
+        id: "native-user-before-steer", prompt: "initial request",
+        forkPointId: sharedNativeSteerId, blocks: preSteerTools, done: true,
+      },
+      {
+        id: "native-user-first-steer", prompt: "first steer",
+        forkPointId: sharedNativeSteerId,
+        blocks: [{
+          kind: "process", item_id: "first-steer-tool",
+          processKind: "command", phase: "end", status: "succeeded",
+          title: "first steer tool", done: true,
+        }],
+        done: true,
+      },
+      {
+        id: "native-user-second-steer", prompt: "second steer",
+        forkPointId: sharedNativeSteerId,
+        blocks: [{
+          kind: "process", item_id: "second-steer-tool",
+          processKind: "command", phase: "start", status: "running",
+          title: "second steer tool", done: false,
+        }],
+        done: false,
+      },
+    ],
+  );
+  assert.deepEqual(
+    restoredSteerSegments[0].detailProjection?.blocks.flatMap((block) =>
+      block.kind === "process" ? [block.item_id] : []),
+    preSteerTools.map((block) => block.item_id),
+    "a History refresh must not move or erase pre-steer tools when every "
+      + "visible segment shares one native task id",
+  );
+  assert.deepEqual(
+    restoredSteerSegments[1].detailProjection?.blocks.flatMap((block) =>
+      block.kind === "process" ? [block.item_id] : []),
+    ["first-steer-tool"],
+    "each completed steer segment restores only its own observed process",
+  );
+  const restoredCachedSteerSegments = restoreCachedTurnDetails(
+    [
+      {
+        id: "native-user-before-steer", prompt: "initial request",
+        forkPointId: sharedNativeSteerId, blocks: [], done: true,
+        detailEventCount: 12,
+      },
+      {
+        id: "native-user-first-steer", prompt: "first steer",
+        forkPointId: sharedNativeSteerId, blocks: [], done: true,
+        detailEventCount: 1,
+      },
+    ],
+    restoredSteerSegments.slice(0, 2),
+  );
+  assert.deepEqual(
+    restoredCachedSteerSegments[0].detailProjection?.blocks.flatMap((block) =>
+      block.kind === "process" ? [block.item_id] : []),
+    preSteerTools.map((block) => block.item_id),
+    "switching away and back must not let a shared native task id move the "
+      + "pre-steer tools into a later cached segment",
+  );
+  assert.deepEqual(
+    restoredCachedSteerSegments[1].detailProjection?.blocks.flatMap((block) =>
+      block.kind === "process" ? [block.item_id] : []),
+    ["first-steer-tool"],
+    "cached steer segments remain one-to-one after a session switch",
+  );
+
+  const rollingSpillSid = "rolling-live-spill";
+  state = {
+    ...state,
+    runtimes: {
+      ...state.runtimes,
+      [rollingSpillSid]: {
+        ...createRuntime(), state: "running", syncReady: true,
+      },
+    },
+  };
+  state = reduce(state, { type: "query_sent", sid: rollingSpillSid,
+    prompt: "keep the whole running process", msg_id: "rolling-turn", ts: 31_600 });
+  const spillBatch = MAX_TURN_BLOCKS + 20;
+  const emitSpillBatch = (prefix: string) => {
+    for (let index = 0; index < spillBatch; index += 1) {
+      state = reduce(state, { type: "event", event: event({
+        type: "process", sid: rollingSpillSid,
+        item_id: `${prefix}-${index}`, kind: "command", phase: "end",
+        status: "succeeded", title: `${prefix} ${index}`,
+      }) });
+    }
+  };
+  emitSpillBatch("first");
+  let rollingTurn = state.runtimes[rollingSpillSid].turns[0];
+  const firstSpillCount = rollingTurn.liveSpilledBlockCount ?? 0;
+  const firstSnapshotBlocks = Array.from({ length: spillBatch }, (_, index) => ({
+    kind: "process" as const,
+    item_id: `first-${index}`,
+    processKind: "command" as const,
+    phase: "end" as const,
+    status: "succeeded" as const,
+    title: `first ${index}`,
+    done: true,
+  }));
+  state = {
+    ...state,
+    runtimes: {
+      ...state.runtimes,
+      [rollingSpillSid]: {
+        ...state.runtimes[rollingSpillSid],
+        turns: [{
+          ...rollingTurn,
+          detailRestorePending: false,
+          detailLoading: false,
+          detailLoaded: true,
+          liveSpillRefreshCount: firstSpillCount,
+          detailProjection: {
+            segments: [],
+            blocks: firstSnapshotBlocks,
+            capped: false,
+            hasMore: false,
+            oldestCursor: null,
+            hasNewer: false,
+            newerCursor: null,
+          },
+        }],
+      },
+    },
+  };
+  emitSpillBatch("second");
+  rollingTurn = state.runtimes[rollingSpillSid].turns[0];
+  const spillArchive = (rollingTurn as typeof rollingTurn & {
+    liveSpillBlocks?: typeof firstSnapshotBlocks;
+  }).liveSpillBlocks ?? [];
+  const completeRollingProcess = mergeDetailWithLiveTail(
+    rollingTurn.detailProjection?.blocks ?? [],
+    [...spillArchive, ...rollingTurn.blocks],
+  );
+  assert.equal(new Set(completeRollingProcess.flatMap((block) =>
+    block.kind === "process" ? [block.item_id] : [])).size, spillBatch * 2,
+  "a second live spill must remain continuous with the earlier detail snapshot");
+  assert.equal(rollingTurn.detailRestorePending, true,
+    "continued spill growth must schedule a coalesced authoritative refresh");
+  const reconciledRollingTurn = mergeInitialHistory(
+    [{
+      id: rollingTurn.id,
+      prompt: rollingTurn.prompt,
+      blocks: [],
+      done: false,
+    }],
+    [rollingTurn],
+    { preserveLiveTailOpen: true },
+  )[0];
+  assert.equal(
+    reconciledRollingTurn.liveSpillBlocks?.length,
+    rollingTurn.liveSpillBlocks?.length,
+    "an in-progress summary refresh cannot discard the provisional spill archive",
+  );
+
+  const interleavedSpillSid = "interleaved-live-spill";
+  state = {
+    ...state,
+    runtimes: {
+      ...state.runtimes,
+      [interleavedSpillSid]: {
+        ...createRuntime(), state: "running", syncReady: true,
+      },
+    },
+  };
+  state = reduce(state, { type: "query_sent", sid: interleavedSpillSid,
+    prompt: "preserve interleaved process order", msg_id: "interleaved-turn",
+    ts: 31_700 });
+  state = reduce(state, { type: "event", event: event({
+    type: "process", sid: interleavedSpillSid, item_id: "process-a",
+    kind: "command", phase: "start", status: "running", title: "A",
+  }) });
+  for (let index = 0; index < MAX_TURN_BLOCKS + 8; index += 1) {
+    state = reduce(state, { type: "event", event: event({
+      type: "process", sid: interleavedSpillSid,
+      item_id: `process-b-${index}`, kind: "command", phase: "start",
+      status: "running", title: `B ${index}`,
+    }) });
+  }
+  let interleavedTurn = state.runtimes[interleavedSpillSid].turns[0];
+  assert.ok(interleavedTurn.liveSpillBlocks?.some((block: Block) =>
+    block.kind === "process" && block.item_id === "process-a"),
+  "the oldest still-open process is represented in the spill archive");
+  state = reduce(state, { type: "event", event: event({
+    type: "process", sid: interleavedSpillSid, item_id: "process-a",
+    kind: "command", phase: "end", status: "succeeded", title: "A",
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "process", sid: interleavedSpillSid, item_id: "process-c",
+    kind: "command", phase: "start", status: "running", title: "C",
+  }) });
+  interleavedTurn = state.runtimes[interleavedSpillSid].turns[0];
+  const interleavedBlocks = [
+    ...(interleavedTurn.liveSpillBlocks ?? []),
+    ...interleavedTurn.blocks,
+  ].sort((left, right) => (left.liveOrder ?? 0) - (right.liveOrder ?? 0));
+  const interleavedIds = interleavedBlocks.flatMap((block) =>
+    block.kind === "process" ? [block.item_id] : []);
+  assert.equal(interleavedIds[0], "process-a");
+  assert.equal(interleavedIds.at(-1), "process-c");
+  assert.equal(interleavedIds.filter((id) => id === "process-a").length, 1,
+    "closing a spilled process updates its original block instead of appending a duplicate");
+  const processA = interleavedBlocks.find((block) =>
+    block.kind === "process" && block.item_id === "process-a");
+  assert.equal(processA?.done, true);
 
   const boundedPayloadSid = "bounded-turn-payload";
   state = {
@@ -5625,7 +8946,7 @@ try {
   assert.ok(payloadBlocks.some((block: { kind: string; item_id?: string }) =>
     block.kind === "process" && block.item_id === "large-diff-9"));
   assert.equal(payloadBlocks.filter((block: { kind: string; item_id?: string }) =>
-    block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 1);
+    block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 0);
 
   // Authoritative History is reduced through the same bounded window and must
   // not recreate an oversized turn after a refresh.
@@ -5659,7 +8980,8 @@ try {
   assert.equal(boundedHistoryTurn.blocks.length, MAX_TURN_BLOCKS);
   assert.equal(boundedHistoryTurn.blocks.filter((block: {
     kind: string; item_id?: string;
-  }) => block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 1);
+  }) => block.kind === "process" && block.item_id === OMITTED_PROCESS_ITEM_ID).length, 0);
+  assert.ok((boundedHistoryTurn.detailEventCount ?? 0) > MAX_TURN_BLOCKS);
   assert.ok(boundedHistoryTurn.blocks.some((block: {
     kind: string; message_id?: string;
   }) => block.kind === "text" && block.message_id === "history-final"));
@@ -5676,6 +8998,50 @@ try {
     kind: "tool", message_id: "w", tool_use_id: "web", tool: "webSearch",
     input: { query: "sdk" }, category: "web_search", title: "搜索 sdk", done: false,
   }).icon, "research");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "r", tool_use_id: "read", tool: "Read",
+    input: { file_path: "/tmp/report.md" }, category: "file",
+    title: "读取 report.md", done: true,
+  }).icon, "read",
+  "an engine title must not turn a read-only file tool into a pen icon");
+  for (const tool of ["Glob", "Grep"]) {
+    const presentation = presentTool({
+      kind: "tool", message_id: tool, tool_use_id: tool, tool,
+      input: { pattern: "*.tsx", path: "web/src" }, category: "file",
+      title: tool === "Glob" ? "查找文件 · *.tsx" : "搜索 · *.tsx", done: true,
+    });
+    assert.equal(presentation.icon, "research",
+      `${tool} must remain a read-only search activity`);
+    assert.equal(presentation.group, "搜索");
+  }
+  assert.equal(presentTool({
+    kind: "tool", message_id: "image", tool_use_id: "image", tool: "view_image",
+    input: { path: "/tmp/chart.png" }, category: "file",
+    title: "查看图片", done: true,
+  }).icon, "read",
+  "view_image must remain a read-only file activity");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "a", tool_use_id: "add", tool: "fileChange",
+    input: { changes: [{ path: "new.ts", kind: "add" }] },
+    category: "file", title: "修改", done: true,
+  }).icon, "file-plus");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "x", tool_use_id: "delete", tool: "fileChange",
+    input: { changes: [{ path: "old.ts", kind: "delete" }] },
+    category: "file", title: "修改", done: true,
+  }).icon, "trash");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "m", tool_use_id: "move", tool: "fileChange",
+    input: { changes: [{
+      path: "old.ts", move_path: "new.ts", kind: "move",
+    }] },
+    category: "file", title: "修改", done: true,
+  }).icon, "branch");
+  assert.equal(presentTool({
+    kind: "tool", message_id: "u", tool_use_id: "update", tool: "apply_patch",
+    input: { changes: [{ path: "app.ts", kind: "update" }] },
+    category: "file", title: "修改", done: true,
+  }).icon, "code");
   assert.equal(isToolFailure({
     kind: "tool", message_id: "d", tool_use_id: "declined", tool: "shell",
     input: {}, done: true,
@@ -5696,6 +9062,21 @@ try {
   assert.match(boundedInitialMarkup, /prompt-29</);
   assert.match(boundedInitialMarkup, /virtual-thread-in/,
     "the first paint keeps only a small latest fallback before DOM measurement");
+  const recoveringHistoryMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "recovering-history",
+    turns: [{
+      id: "recovering-turn", prompt: "keep visible", done: true, blocks: [],
+    }],
+    hasMore: true,
+    historyPagingReady: false,
+    engine: "codex",
+    onEdit: () => {},
+    onGetDiff: () => {},
+  }));
+  assert.match(recoveringHistoryMarkup, /正在恢复历史…/,
+    "known older history keeps a truthful disabled affordance during reconnect");
+  assert.doesNotMatch(recoveringHistoryMarkup, /class="load-more-btn"/,
+    "a retained old-generation cursor must never stay clickable");
   const summaryMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "summary-session",
     turns: [{
@@ -5764,10 +9145,26 @@ try {
   }));
   assert.match(cachedCodexDurationMarkup, /已处理 0s/,
     "Claude cache compatibility must not reinterpret a valid Codex duration");
+  const unknownCodexDurationMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "unknown-codex-duration", engine: "codex",
+    turns: [{
+      id: "unknown-codex-turn", prompt: "继续", done: true,
+      ts: 1000, doneTs: 1000,
+      blocks: [{
+        kind: "tool", message_id: "unknown-codex-message",
+        tool_use_id: "unknown-codex-tool", tool: "shell",
+        input: {}, done: true, result: { content: "ok", is_error: false },
+      }],
+    }],
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(unknownCodexDurationMarkup, />已处理</);
+  assert.doesNotMatch(unknownCodexDurationMarkup, /已处理 0s/,
+    "a synthetic steer boundary without duration evidence must not invent 0s");
 
-  // The animated turn marker is driven by the turn lifecycle, not by an empty
-  // placeholder. It must survive reasoning expansion, process activity, final
-  // answer streaming, and terminal-mirrored history alike.
+  // The active marker always stays at the physical tail of the turn so a long
+  // process timeline cannot scroll the only running feedback out of view. The
+  // process shell still reports phase/timing, but its live icon stays static.
   const thinkingMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [{
       id: "thinking-live", prompt: "继续", done: false,
@@ -5775,9 +9172,13 @@ try {
         text: "正在检查实现", done: false }],
     }], engine: "claude", onEdit: () => {}, onGetDiff: () => {},
   }));
-  assert.match(thinkingMarkup, /class="turn-working"/);
-  assert.match(thinkingMarkup, /思考中/);
+  assert.match(thinkingMarkup, /class="turn-process open"/);
+  assert.match(thinkingMarkup, /正在处理/);
   assert.match(thinkingMarkup, /正在检查实现/);
+  assert.match(thinkingMarkup, /class="turn-working"[\s\S]*处理中/,
+    "visible reasoning keeps the animated marker at the turn tail");
+  assert.doesNotMatch(thinkingMarkup, /process-spin/,
+    "the active process header stays static beside the tail animation");
 
   const answerMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [{
@@ -5788,8 +9189,132 @@ try {
   }));
   assert.match(answerMarkup, /class="turn-working"/);
   assert.match(answerMarkup, /回答中/);
+  assert.doesNotMatch(answerMarkup, /class="turn-process/,
+    "final-only streaming does not invent an empty process shell");
+  const answeringAfterProcessMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: richSid, turns: [{
+      id: "answering-after-process", prompt: "继续", done: false,
+      blocks: [{
+        kind: "process", item_id: "completed-command",
+        processKind: "command", phase: "end", status: "succeeded",
+        title: "命令完成", done: true,
+      }, {
+        kind: "text", message_id: "answer-after-process",
+        channel: "final", text: "正在总结", done: false,
+      }],
+    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(answeringAfterProcessMarkup, /class="turn-process open"/,
+    "the process disclosure stays open until the turn terminal boundary");
+  assert.match(answeringAfterProcessMarkup, /turn-process-state done/,
+    "a settled process shell cannot keep spinning while the answer streams");
+  assert.match(answeringAfterProcessMarkup, /class="turn-working"[\s\S]*回答中/);
+  assert.equal(
+    (answeringAfterProcessMarkup.match(/process-spin/g) ?? []).length,
+    0,
+    "the settled process shell cannot add a second live spinner",
+  );
+  const commentaryWhileAnsweringMarkup = renderToStaticMarkup(createElement(
+    ChatView,
+    {
+      sid: richSid,
+      turns: [{
+        id: "commentary-while-answering", prompt: "继续", done: false,
+        blocks: [{
+          kind: "text", message_id: "live-commentary",
+          channel: "commentary", text: "仍在检查", done: false,
+        }, {
+          kind: "text", message_id: "early-final",
+          channel: "final", text: "阶段结论", done: false,
+        }],
+      }],
+      engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    },
+  ));
+  assert.match(commentaryWhileAnsweringMarkup, /turn-process-state running/);
+  assert.match(
+    commentaryWhileAnsweringMarkup,
+    /class="turn-working"[\s\S]*处理中/,
+    "unfinished commentary keeps the live marker at the turn tail",
+  );
+  assert.doesNotMatch(commentaryWhileAnsweringMarkup, /process-spin/,
+    "the process header cannot compete with the tail animation");
+  const zeroTokenRunningMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: richSid, turns: [{
+      id: "zero-token-live", clientMsgId: "zero-token-prompt",
+      prompt: "开始检查", done: false, blocks: [],
+  }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(zeroTokenRunningMarkup, /class="turn-working"/);
+  assert.match(zeroTokenRunningMarkup, /思考中/);
+  assert.doesNotMatch(zeroTokenRunningMarkup, /正在处理|等待响应/,
+    "a pre-token turn cannot render a fake empty process timeline");
+  assert.doesNotMatch(zeroTokenRunningMarkup, /class="turn-process/);
   const { ProcessTimeline } = await reducerHarness.ssrLoadModule(
     "/src/components/ProcessTimeline.tsx");
+  const pagedProcessMarkup = renderToStaticMarkup(createElement(
+    ProcessTimeline, {
+      blocks: [{
+        kind: "process", item_id: "paged-process",
+        processKind: "command", phase: "end", status: "succeeded",
+        title: "当前过程页", done: true,
+      }],
+      done: true,
+      openOverride: true,
+      canLoadEarlier: true,
+      canLoadNewer: true,
+    },
+  ));
+  assert.match(pagedProcessMarkup, /加载更早过程/);
+  assert.match(pagedProcessMarkup, /返回较新过程/,
+    "a bounded process window keeps both source navigation controls");
+  const failedProcessMarkup = renderToStaticMarkup(createElement(
+    ProcessTimeline, {
+      blocks: [],
+      done: true,
+      deferredCount: 12,
+      detailError: "详细过程暂时不可用，请稍后重试",
+      openOverride: true,
+      onLoadDetail: () => true,
+    },
+  ));
+  assert.match(failedProcessMarkup, /role="alert"/);
+  assert.match(failedProcessMarkup, /详细过程暂时不可用，请稍后重试/);
+  assert.match(failedProcessMarkup, />重试</,
+    "detail failure stays in the opened shell instead of requiring a second header click");
+  assert.doesNotMatch(failedProcessMarkup, /正在加载过程/);
+  const failedLoadedPageMarkup = renderToStaticMarkup(createElement(
+    ProcessTimeline, {
+      blocks: [],
+      done: true,
+      deferredCount: 0,
+      detailError: "详细过程暂时不可用，请稍后重试",
+      openOverride: true,
+      onRetryDetail: () => true,
+    },
+  ));
+  assert.match(failedLoadedPageMarkup, /role="alert"/,
+    "a later detail-page failure remains visible after the first page loaded");
+  const planOnlyMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: true,
+    openOverride: true,
+    blocks: [{
+      kind: "process",
+      item_id: "plan-only",
+      processKind: "plan",
+      phase: "end",
+      status: "succeeded",
+      title: "执行计划",
+      plan: [{ step: "检查实现", status: "completed" }],
+      done: true,
+    }],
+  }));
+  assert.match(planOnlyMarkup, /plan-progress-trigger/,
+    "a plan-only timeline keeps the compact plan control");
+  assert.doesNotMatch(planOnlyMarkup, /turn-process-head/,
+    "a plan-only timeline does not advertise an empty outer disclosure");
+  assert.doesNotMatch(planOnlyMarkup, />1 项</);
   const declinedMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     blocks: [{ kind: "process", item_id: "approval-denied", processKind: "hook",
       phase: "end", status: "declined", title: "Hook 已拒绝", done: false }],
@@ -5817,8 +9342,182 @@ try {
   assert.doesNotMatch(codexProcessMarkup, /private reasoning must stay hidden/);
   assert.doesNotMatch(codexProcessMarkup, /synthetic reasoning row/);
   assert.match(codexProcessMarkup, /2 个工具调用/);
+  assert.match(codexProcessMarkup, /aria-expanded="false"/,
+    "entering a completed Codex turn keeps process collapsed");
   assert.doesNotMatch(codexProcessMarkup, /class="tool-group"/,
     "a completed Codex process must not render tool details until the user opens it");
+
+  const imageViewMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: true,
+    openOverride: true,
+    blocks: [{
+      kind: "process",
+      item_id: "view-1",
+      processKind: "server_tool",
+      phase: "end",
+      status: "succeeded",
+      title: "查看图片",
+      tool: "view_image",
+      input: {
+        file_path: "/tmp/chart.png",
+        preview_id: "view-1",
+      },
+      done: true,
+    }],
+    imageAssets: {
+      "view-1": {
+        status: "ready",
+        mediaType: "image/png",
+        data: "iVBORw0KGgo=",
+      },
+    },
+  }));
+  assert.match(imageViewMarkup, /class="process-image-preview"/);
+  assert.match(imageViewMarkup, /\/tmp\/chart\.png/);
+  assert.match(imageViewMarkup, /data:image\/png;base64,iVBORw0KGgo=/);
+  assert.doesNotMatch(imageViewMarkup, /&quot;preview_id&quot;/,
+    "image-view metadata must not render as a raw JSON tool payload");
+
+  const pendingImageViewMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: false,
+    openOverride: true,
+    blocks: [{
+      kind: "process",
+      item_id: "view-pending",
+      processKind: "server_tool",
+      phase: "start",
+      status: "running",
+      title: "查看图片",
+      tool: "view_image",
+      input: { file_path: "/tmp/pending.png" },
+      done: false,
+    }],
+  }));
+  assert.match(pendingImageViewMarkup, /process-image-preview[^>]*disabled/,
+    "a live image view stays inert until its immutable snapshot is ready");
+
+  const historyImageViewMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: true,
+    openOverride: true,
+    historyTurnId: "turn-1",
+    blocks: [{
+      kind: "process",
+      item_id: "history-view-1",
+      processKind: "server_tool",
+      phase: "end",
+      status: "succeeded",
+      title: "查看图片",
+      tool: "view_image",
+      input: {
+        file_path: "/tmp/history.png",
+        history_image: {
+          image_id: "img-history-1",
+          media_type: "image/png",
+          width: 1,
+          height: 1,
+          byte_size: 68,
+        },
+      },
+      done: true,
+    }],
+    historyImageAssets: {
+      [historyImageAssetKey(
+        "turn-1", "img-history-1", "thumbnail")]: {
+        status: "ready",
+        mediaType: "image/webp",
+        data: "UklGRg==",
+      },
+    },
+  }));
+  assert.match(historyImageViewMarkup, /\/tmp\/history\.png/);
+  assert.match(historyImageViewMarkup, /data:image\/webp;base64,UklGRg==/);
+  assert.doesNotMatch(historyImageViewMarkup, /&quot;history_image&quot;/);
+
+  const noNativeDiffMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "historical-file-without-diff",
+    engine: "codex",
+    turns: [{
+      id: "historical-file-without-diff-turn",
+      prompt: "update the file",
+      done: true,
+      blocks: [{
+        kind: "tool",
+        message_id: "historical-file-message",
+        tool_use_id: "historical-file-tool",
+        tool: "fileChange",
+        input: {
+          changes: [{ path: "/repo/existing.ts", kind: "update" }],
+        },
+        done: true,
+        result: { content: "updated", is_error: false },
+      }],
+    }],
+    // Legacy callers may still pass this callback. Historical cards must not
+    // use it to read today's worktree when this turn persisted no native diff.
+    onGetDiff: () => {},
+    onOpenTurnDiff: () => {},
+  }));
+  assert.match(noNativeDiffMarkup,
+    /class="turn-files-summary"[^>]*disabled/);
+  assert.match(noNativeDiffMarkup,
+    /class="turn-file-chip"[^>]*disabled[^>]*title="本轮没有可用的原生 diff"/);
+
+  const nativeDiffMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "historical-file-with-native-diff",
+    engine: "codex",
+    turns: [{
+      id: "historical-file-with-native-diff-turn",
+      prompt: "update the file",
+      done: true,
+      blocks: [{
+        kind: "tool",
+        message_id: "native-diff-message",
+        tool_use_id: "native-diff-tool",
+        tool: "fileChange",
+        input: {
+          changes: [{ path: "/repo/existing.ts", kind: "update" }],
+        },
+        done: true,
+        result: {
+          content: "updated",
+          is_error: false,
+          diff: "--- /repo/existing.ts\n+++ /repo/existing.ts\n@@ -1 +1 @@\n-old\n+new",
+        },
+      }],
+    }],
+    onOpenTurnDiff: () => {},
+  }));
+  assert.doesNotMatch(nativeDiffMarkup,
+    /class="turn-files-summary"[^>]*disabled/);
+  assert.match(nativeDiffMarkup, /title="查看本轮原生 diff"/);
+
+  const markdownWithoutDiffMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "historical-markdown-without-diff",
+    engine: "codex",
+    turns: [{
+      id: "historical-markdown-without-diff-turn",
+      prompt: "update docs",
+      done: true,
+      blocks: [{
+        kind: "tool",
+        message_id: "historical-markdown-message",
+        tool_use_id: "historical-markdown-tool",
+        tool: "fileChange",
+        input: { changes: [{ path: "/repo/README.md", kind: "update" }] },
+        done: true,
+        result: { content: "updated", is_error: false },
+      }],
+    }],
+    onPreviewMarkdown: () => {},
+  }));
+  assert.match(markdownWithoutDiffMarkup,
+    /class="turn-file-chip markdown"[^>]*title="预览 \/repo\/README.md"/,
+    "Markdown remains previewable even when an old turn has no native diff");
+  assert.doesNotMatch(markdownWithoutDiffMarkup,
+    /class="turn-file-chip markdown"[^>]*disabled/);
 
   const codexHookWrappedBatchMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     engine: "codex", done: false,
@@ -5841,6 +9540,78 @@ try {
   assert.equal((codexHookWrappedBatchMarkup.match(/class="tool-group"/g) || []).length, 1,
     "successful Codex hooks must not split one tool batch into many rows");
   assert.doesNotMatch(codexHookWrappedBatchMarkup, /Hook · preToolUse/);
+  const deferredToolMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: false,
+    deferredCount: 20,
+    onLoadDetail: () => {},
+    blocks: [{
+      kind: "tool",
+      message_id: "summary-placeholder-message",
+      tool_use_id: "summary-placeholder-tool",
+      tool: "shell",
+      category: "command",
+      title: "运行命令",
+      input: {},
+      done: false,
+    }],
+  }));
+  assert.match(deferredToolMarkup, /20 项/);
+  assert.doesNotMatch(deferredToolMarkup, /class="tool-group"/,
+    "payload-free summary tools stay hidden until authoritative detail arrives");
+  assert.doesNotMatch(deferredToolMarkup, /运行命令/,
+    "summary placeholders cannot render an empty command card");
+  const retainedZeroArgToolMarkup = renderToStaticMarkup(
+    createElement(ProcessTimeline, {
+      engine: "codex",
+      done: true,
+      deferredCount: 20,
+      openOverride: true,
+      onLoadDetail: () => {},
+      blocks: [{
+        kind: "tool",
+        message_id: "retained-zero-arg-message",
+        tool_use_id: "retained-zero-arg-tool",
+        tool: "list_resources",
+        title: "List resources",
+        input: {},
+        done: true,
+        result: { content: "", is_error: false, status: "succeeded" },
+      }],
+    }),
+  );
+  assert.match(
+    retainedZeroArgToolMarkup,
+    /class="tool-group"/,
+    "a completed zero-argument cached tool is real retained detail, not a summary shell",
+  );
+  const retainedCommandMetadataMarkup = renderToStaticMarkup(
+    createElement(ProcessTimeline, {
+      engine: "codex",
+      done: true,
+      deferredCount: 20,
+      openOverride: true,
+      onLoadDetail: () => {},
+      blocks: [{
+        kind: "process",
+        item_id: "retained-command-metadata",
+        processKind: "command",
+        phase: "end",
+        status: "succeeded",
+        title: "Command finished",
+        exit_code: 0,
+        duration_ms: 1250,
+        done: true,
+      }],
+    }),
+  );
+  assert.match(
+    retainedCommandMetadataMarkup,
+    /Command finished/,
+    "completed command metadata remains visible while authoritative detail is deferred",
+  );
+  assert.match(retainedCommandMetadataMarkup, /exit 0/);
+  assert.match(retainedCommandMetadataMarkup, /1s/);
 
   const codexFailedHookMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     engine: "codex", done: false,
@@ -5899,8 +9670,13 @@ try {
   }));
   assert.match(backgroundMarkup, /正在处理/);
   assert.match(backgroundMarkup, /继续检查/);
-  assert.match(backgroundMarkup, /class="turn-working"/);
-  assert.match(backgroundMarkup, /处理中/);
+  assert.match(backgroundMarkup, /class="turn-working"[\s\S]*处理中/,
+    "a live background process keeps its animated marker at the turn tail");
+  assert.match(
+    backgroundMarkup,
+    /turn-process-state running"><svg/,
+    "the background process header stays static beside the tail animation",
+  );
   assert.doesNotMatch(backgroundMarkup, /class="turn-done-mark"/);
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
@@ -7370,6 +11146,8 @@ assert.equal(
 );
 
 const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
+const btwPanelSource = readFileSync(
+  resolve(process.cwd(), "src/components/BtwPanel.tsx"), "utf8");
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
   assert.doesNotMatch(appSource, new RegExp(`dispatch\\(\\{ type: ["']${optimisticAction}["']`));
 }
@@ -7423,6 +11201,18 @@ assert.match(appSource,
 assert.match(appSource,
   /const previewBtwFile = [\s\S]{0,120}previewFileForSid\(activeBtwSid/,
   "BTW file actions must stay bound to the visible session's fork");
+assert.match(appSource,
+  /activeBtwSid\s*\?\s*inlineImageAssetsRef\.current\.forSession\(activeBtwSid\)/,
+  "the visible BTW must read only its own inline-image cache projection");
+assert.match(appSource,
+  /sendGetPreviewAsset\(path,\s*previewId,\s*requestId,\s*sid\)/,
+  "message image reads must carry their explicit main or BTW session id");
+assert.match(appSource,
+  /focusedSid !== sid[\s\S]{0,180}activeBtwSid !== sid/,
+  "background sessions outside the focused main and visible BTW stay unable to read files");
+assert.match(btwPanelSource,
+  /<ChatView[\s\S]{0,220}imageAssets=\{p\.imageAssets\}[\s\S]{0,120}onLoadImage=\{p\.onLoadImage\}[\s\S]{0,120}onAuthorizeImage=\{p\.onAuthorizeImage\}/,
+  "BTW chat rendering must receive the same bounded image authorization channel");
 assert.match(appSource, /sendInterruptTo\(sid\)/,
   "BTW stop must target the captured fork sid");
 assert.match(appSource, /sendSetModelTo\(sid, model\)/,
@@ -7671,6 +11461,9 @@ assert.match(serviceWorkerSource, /existing\.postMessage\(\{[\s\S]*cc-remote-not
   "an already-open page must receive the exact notification target");
 assert.match(serviceWorkerSource, /self\.clients\.openWindow\(target\)/,
   "cold notification clicks must retain the fragment route");
+assert.match(serviceWorkerSource,
+  /url\.pathname === "\/html-preview-runner\.html"[\s\S]*url\.pathname === "\/html-preview-runner\.js"[\s\S]*return/,
+  "the isolated HTML runner must bypass shell and asset caching");
 assert.match(layoutCss, /var\(--app-height,100dvh\) - var\(--keyboard-inset,0px\)/,
   "keyboard-aware mobile sheets must account for the virtual keyboard inset");
 

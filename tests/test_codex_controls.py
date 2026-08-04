@@ -1501,6 +1501,47 @@ def test_codex_review_overflow_preserves_authoritative_success_terminal():
     asyncio.run(run())
 
 
+def test_codex_review_coalesces_append_burst_before_terminal():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("review-burst", "review-burst")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "review-burst-turn"
+        ctx.turn_task = asyncio.current_task()
+
+        class BurstSdk:
+            async def receive_response(self):
+                for delta in ("a", "b", "c"):
+                    yield {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "turnId": "review-burst-turn",
+                            "itemId": "review-burst-message",
+                            "delta": delta,
+                        },
+                    }
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "review-burst-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = BurstSdk()
+        await machine._run_codex_review_turn(ctx, "review-burst-turn")
+
+        deltas = [event.text for event in transport.sent
+                  if isinstance(event, Delta)]
+        assert deltas == ["a", "bc"]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.subtype == "success"
+
+    asyncio.run(run())
+
+
 def test_managed_codex_overflow_preserves_authoritative_success_terminal():
     async def run():
         machine, transport = _mk_machine()
@@ -3446,8 +3487,9 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
             if message.type == "ask_user" and message.ask_id == first_id)
         assert first_event.header == "Target"
         assert first_event.multi_select is False
+        assert first_event.allow_text is True
         assert [option["label"] for option in first_event.options] == ["Mac", "Linux"]
-        ctx.pending_asks[first_id].set_result("Mac")
+        ctx.pending_asks[first_id].set_result("Windows")
 
         while not ctx.pending_asks or first_id in ctx.pending_asks:
             await asyncio.sleep(0)
@@ -3457,15 +3499,16 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
             if message.type == "ask_user" and message.ask_id == second_id)
         assert second_event.header == "Checks"
         assert second_event.multi_select is True
-        ctx.pending_asks[second_id].set_result(["Tests", "Lint"])
+        assert second_event.allow_text is True
+        ctx.pending_asks[second_id].set_result(["Tests", "Custom audit"])
 
         result = await task
         assert isinstance(result, PermissionResultAllow)
         assert result.updated_input == {
             **tool_input,
             "answers": {
-                "Which target?": "Mac",
-                "Which checks?": ["Tests", "Lint"],
+                "Which target?": "Windows",
+                "Which checks?": ["Tests", "Custom audit"],
             },
         }
         assert not any(

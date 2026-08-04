@@ -546,7 +546,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v28_layout():
+def test_release_docs_and_examples_describe_one_atomic_v29_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -559,10 +559,10 @@ def test_release_docs_and_examples_describe_one_atomic_v28_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v28" in deploy_readme
+    assert "Protocol v29" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v28" in document
+        assert "v29" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -577,7 +577,7 @@ def test_release_docs_and_examples_describe_one_atomic_v28_layout():
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.128" in claude
-    assert "protocol v28" in claude
+    assert "protocol v29" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 
@@ -750,6 +750,38 @@ def test_caddy_site_sets_browser_security_headers():
     assert "request_body @login" in source
     assert "max_size 4KB" in source
     assert " ws:" not in source
+
+
+@pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
+def test_html_preview_runner_has_a_narrow_isolated_policy(template):
+    source = (ROOT / "deploy" / template).read_text()
+    assert (
+        "not path /html-preview-runner.html /html-preview-runner.js"
+        in source
+    )
+    assert (
+        "@html_preview path /html-preview-runner.html /html-preview-runner.js"
+        in source
+    )
+    application, preview = source.split("header @html_preview", 1)
+    assert "script-src 'self' 'unsafe-inline'" not in application
+    assert "frame-src 'self'" in application
+    assert "script-src 'self' 'unsafe-inline'" in preview
+    assert "connect-src 'none'" in preview
+    assert "form-action 'none'" in preview
+    assert "frame-ancestors 'self'" in preview
+    assert 'X-Frame-Options "SAMEORIGIN"' in preview
+
+    runner = (ROOT / "web" / "public" / "html-preview-runner.html").read_text()
+    bootstrap = (
+        ROOT / "web" / "public" / "html-preview-runner.js"
+    ).read_text()
+    assert '<script src="/html-preview-runner.js" defer></script>' in runner
+    assert "<script>" not in runner
+    assert "void parent.document" in bootstrap
+    assert 'event.source !== parent' in bootstrap
+    assert "document.write(event.data.document)" in bootstrap
+    assert "cc-remote-html-preview-ready" not in bootstrap
 
 
 @pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])

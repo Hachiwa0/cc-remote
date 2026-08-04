@@ -6,6 +6,7 @@ import {
   initialState,
   reduce,
   type PendingQuery,
+  type PreviewAuthorizationState,
 } from "./reducer";
 import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
@@ -543,7 +544,12 @@ export default function App() {
   );
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const historyView = displayHistoryProjection(
-    state.historyRecovery, focusedSid, rt, state.historyBrowse);
+    state.historyRecovery,
+    focusedSid,
+    rt,
+    state.historyBrowse,
+    state.retainedHistoryBrowse,
+  );
   const focusedSession = state.sessions.find(
     (session) => session.session_id === focusedSid);
   const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
@@ -567,6 +573,8 @@ export default function App() {
   );
   const inlineImageAssets = focusedSid
     ? inlineImageAssetsRef.current.forSession(focusedSid) : {};
+  const btwInlineImageAssets = activeBtwSid
+    ? inlineImageAssetsRef.current.forSession(activeBtwSid) : {};
   const historyImageAssets = focusedSid
     ? historyImageAssetsRef.current.forSession(focusedSid) : {};
   const currentWorkArtifacts = focusedSid ? (workArtifactsBySid[focusedSid] ?? []) : [];
@@ -665,24 +673,65 @@ export default function App() {
       setCapabilitiesLoading(false);
     }
   }, []);
-  const loadMessageImage = useCallback((sid: string, path: string): boolean => {
+  const loadMessageImage = useCallback((
+    sid: string,
+    path: string,
+    stablePreviewId?: string,
+  ): boolean => {
     const ws = wsRef.current;
-    if (!ws || stateRef.current.focusedSid !== sid) return false;
+    const current = stateRef.current;
+    const focusedSid = current.newChat ? null : current.focusedSid;
+    const activeBtwSid = focusedSid
+      ? current.btwByParentSid[focusedSid]?.sid ?? null : null;
+    if (!ws || (focusedSid !== sid && activeBtwSid !== sid)) return false;
     const cache = inlineImageAssetsRef.current;
-    if (cache.has(sid, path)) return true;
-    const previewId = uuid();
+    const assetKey = stablePreviewId ?? path;
+    if (cache.has(sid, path, assetKey)) return true;
+    const previewId = stablePreviewId ?? uuid();
     const requestId = uuid();
-    if (!cache.begin({ sid, path, previewId, requestId })) return false;
-    if (!ws.sendGetPreviewAsset(path, previewId, requestId)) {
+    if (!cache.begin({
+      sid, path, assetKey, previewId, requestId,
+    })) return false;
+    if (!ws.sendGetPreviewAsset(path, previewId, requestId, sid)) {
       cache.cancel(requestId);
       return false;
     }
     bumpInlineImageRevision();
     return true;
   }, []);
-  const loadFocusedMessageImage = useCallback((path: string) => (
-    focusedSid ? loadMessageImage(focusedSid, path) : false
+  const loadFocusedMessageImage = useCallback((
+    path: string,
+    stablePreviewId?: string,
+  ) => (
+    focusedSid
+      ? loadMessageImage(focusedSid, path, stablePreviewId)
+      : false
   ), [focusedSid, loadMessageImage]);
+  const loadBtwMessageImage = useCallback((
+    path: string,
+    stablePreviewId?: string,
+  ) => (
+    activeBtwSid
+      ? loadMessageImage(activeBtwSid, path, stablePreviewId)
+      : false
+  ), [activeBtwSid, loadMessageImage]);
+  const authorizeMessageImage = useCallback((
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ): boolean => {
+    const cache = inlineImageAssetsRef.current;
+    const request = cache.authorizationRequest(authorization);
+    if (!request) return false;
+    if (!wsRef.current?.sendAuthorizePreview(
+      authorization.authorizationId,
+      authorization.requestId,
+      decision,
+      request.sid,
+    )) return false;
+    if (!cache.markAuthorizationSubmitting(authorization)) return false;
+    bumpInlineImageRevision();
+    return true;
+  }, []);
   const loadHistoryImage = useCallback((
     turnId: string,
     imageId: string,
@@ -1256,6 +1305,33 @@ export default function App() {
       if (cancelled) return;
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
+          if (msg.type === "session_rekey"
+              && inlineImageAssetsRef.current.rekeySession(
+                msg.old_key,
+                msg.session_id,
+              )) {
+            bumpInlineImageRevision();
+          }
+          if (msg.type === "preview_authorization_required"
+              && inlineImageAssetsRef.current.requireAuthorization(msg)) {
+            bumpInlineImageRevision();
+          }
+          if (msg.type === "preview_authorization_result") {
+            const retry =
+              inlineImageAssetsRef.current.acceptAuthorizationResult(msg);
+            if (retry !== false) {
+              bumpInlineImageRevision();
+              if (retry && !ws.sendGetPreviewAsset(
+                retry.path,
+                retry.previewId,
+                retry.requestId,
+                retry.sid,
+              )) {
+                inlineImageAssetsRef.current.cancel(retry.requestId);
+                bumpInlineImageRevision();
+              }
+            }
+          }
           if (msg.type === "preview_asset"
               && inlineImageAssetsRef.current.accept(msg)) {
             bumpInlineImageRevision();
@@ -1540,83 +1616,106 @@ export default function App() {
             }
           }
           if (msg.type === "turn_detail") {
-            const detailTarget =
-              historyDetailRequestsRef.current.complete(msg);
-            if (!detailTarget) return;
+            const detailTargets =
+              historyDetailRequestsRef.current.completeAll(msg);
+            if (detailTargets.length === 0) return;
             const retryKey = [
               "detail", msg.session_id, msg.revision, msg.turn_id,
               msg.before ?? "",
             ].join("\u0000");
             if (msg.authoritative === false) {
-              if (detailTarget.target === "browse") {
-                dispatch({
-                  type: "history_browse_detail",
-                  sid: detailTarget.sid,
-                  scopeKey: detailTarget.scopeKey,
-                  revision: detailTarget.revision,
-                  viewId: detailTarget.viewId,
-                  windowEpoch: detailTarget.windowEpoch,
-                  turnId: detailTarget.turnId,
-                  events: [],
-                  before: detailTarget.before,
-                });
-              } else {
-                dispatch({ type: "event", event: msg, ownership });
-              }
-              recoverableReads.retry(retryKey, () => {
-                if (cancelled) return;
-                if (stateRef.current.focusedSid !== msg.session_id) return;
-                const current = stateRef.current;
-                if (detailTarget.target === "browse") {
-                  const browse = current.historyBrowse;
-                  if (!browse
-                      || browse.scopeKey !== detailTarget.scopeKey
-                      || browse.viewId !== detailTarget.viewId
-                      || browse.revision !== detailTarget.revision
-                      || !browse.turns.some((turn) =>
-                        canonicalTurnId(turn) === detailTarget.turnId
-                        || turn.id === detailTarget.turnId)) return;
-                } else {
-                  const runtime = current.runtimes[msg.session_id];
-                  const turn = runtime?.turns.find(
-                    (item) => canonicalTurnId(item) === msg.turn_id
-                      || item.id === msg.turn_id);
-                  if (!turn || (!detailTarget.before && turn.detailLoaded)
-                      || runtime.historyRevision !== detailTarget.revision) return;
-                }
-                if (!historyDetailRequestsRef.current.begin(detailTarget)) return;
-                const sent = ws.sendGetTurnDetail(
-                  msg.session_id, msg.turn_id, detailTarget.revision,
-                  detailTarget.before);
-                if (!sent) {
-                  historyDetailRequestsRef.current.cancel(detailTarget);
-                  return;
-                }
+              let runtimeReleased = false;
+              for (const detailTarget of detailTargets) {
                 if (detailTarget.target === "browse") {
                   dispatch({
-                    type: "history_browse_detail_requested",
+                    type: "history_browse_detail",
                     sid: detailTarget.sid,
                     scopeKey: detailTarget.scopeKey,
                     revision: detailTarget.revision,
                     viewId: detailTarget.viewId,
                     windowEpoch: detailTarget.windowEpoch,
                     turnId: detailTarget.turnId,
+                    events: [],
+                    error: msg.error,
                     before: detailTarget.before,
                   });
-                } else {
-                  dispatch({
-                    type: "turn_detail_requested", sid: detailTarget.sid,
-                    turnId: detailTarget.turnId,
-                    before: detailTarget.before,
-                    autoLoad: detailTarget.autoLoad,
-                  });
+                } else if (!runtimeReleased) {
+                  dispatch({ type: "event", event: msg, ownership });
+                  runtimeReleased = true;
+                }
+              }
+              recoverableReads.retry(retryKey, () => {
+                if (cancelled) return;
+                if (stateRef.current.focusedSid !== msg.session_id) return;
+                const current = stateRef.current;
+                const activeTargets = detailTargets.filter((detailTarget) => {
+                  if (detailTarget.target === "browse") {
+                    const browse = current.historyBrowse;
+                    return !!browse
+                      && browse.scopeKey === detailTarget.scopeKey
+                      && browse.viewId === detailTarget.viewId
+                      && browse.revision === detailTarget.revision
+                      && browse.turns.some((turn) =>
+                        canonicalTurnId(turn) === detailTarget.turnId
+                        || turn.id === detailTarget.turnId);
+                  }
+                  const runtime = current.runtimes[msg.session_id];
+                  const turn = runtime?.turns.find(
+                    (item) => canonicalTurnId(item) === msg.turn_id
+                      || item.id === msg.turn_id);
+                  return !!turn && (!!detailTarget.before || !turn.detailLoaded)
+                    && runtime?.historyRevision === detailTarget.revision;
+                });
+                if (activeTargets.length === 0) return;
+                const registrations = activeTargets.map((detailTarget) => ({
+                  detailTarget,
+                  registration:
+                    historyDetailRequestsRef.current.register(detailTarget),
+                })).filter(({ registration }) => registration.accepted);
+                if (registrations.length === 0) return;
+                if (registrations.some(({ registration }) => registration.send)) {
+                  const target = registrations[0].detailTarget;
+                  const sent = ws.sendGetTurnDetail(
+                    msg.session_id, msg.turn_id, target.revision, target.before);
+                  if (!sent) {
+                    for (const { detailTarget } of registrations) {
+                      historyDetailRequestsRef.current.cancel(detailTarget);
+                    }
+                    return;
+                  }
+                }
+                for (const { detailTarget } of registrations) {
+                  if (detailTarget.target === "browse") {
+                    dispatch({
+                      type: "history_browse_detail_requested",
+                      sid: detailTarget.sid,
+                      scopeKey: detailTarget.scopeKey,
+                      revision: detailTarget.revision,
+                      viewId: detailTarget.viewId,
+                      windowEpoch: detailTarget.windowEpoch,
+                      turnId: detailTarget.turnId,
+                      before: detailTarget.before,
+                    });
+                  } else {
+                    dispatch({
+                      type: "turn_detail_requested", sid: detailTarget.sid,
+                      turnId: detailTarget.turnId,
+                      before: detailTarget.before,
+                      autoLoad: detailTarget.autoLoad,
+                    });
+                  }
                 }
               });
               return;
             } else {
               recoverableReads.complete(retryKey);
             }
-            if (detailTarget.target === "browse") {
+            let runtimeTarget = false;
+            for (const detailTarget of detailTargets) {
+              if (detailTarget.target === "runtime") {
+                runtimeTarget = true;
+                continue;
+              }
               dispatch({
                 type: "history_browse_detail",
                 sid: detailTarget.sid,
@@ -1632,8 +1731,8 @@ export default function App() {
                 hasNewer: msg.has_newer,
                 newerCursor: msg.newer_cursor,
               });
-              return;
             }
+            if (!runtimeTarget) return;
           }
           if (msg.type === "rollback_result" && msg.files === "succeeded"
               && stateRef.current.artifact?.sid === msg.session_id) {
@@ -2486,9 +2585,12 @@ export default function App() {
           before,
           autoLoad,
         };
-    if (!historyDetailRequestsRef.current.begin(context)) return false;
-    const sent = wsRef.current?.sendGetTurnDetail(
-      sid, turnId, context.revision, before) ?? false;
+    const registration = historyDetailRequestsRef.current.register(context);
+    if (!registration.accepted) return false;
+    const sent = !registration.send || (
+      wsRef.current?.sendGetTurnDetail(
+        sid, turnId, context.revision, before) ?? false
+    );
     if (!sent) {
       historyDetailRequestsRef.current.cancel(context);
       return false;
@@ -2583,6 +2685,39 @@ export default function App() {
     state.newChat,
     state.wrapperOnline,
   ]);
+
+  useEffect(() => {
+    const artifact = state.artifact;
+    const targetSid = artifact?.sid;
+    if (!artifact || !targetSid) return;
+    const authorization = artifact.authorization?.status === "granted"
+      ? artifact.authorization
+      : Object.values(artifact.assets ?? {}).find(
+        (asset) => asset.authorization?.status === "granted",
+      )?.authorization;
+    if (!authorization) return;
+    const ws = wsRef.current;
+    const sent = authorization.operation === "file_preview"
+      ? !!ws?.sendGetFilePreview(
+        authorization.path,
+        authorization.requestId,
+        targetSid,
+      )
+      : !!authorization.previewId && !!ws?.sendGetPreviewAsset(
+        authorization.path,
+        authorization.previewId,
+        authorization.requestId,
+        targetSid,
+      );
+    dispatch({
+      type: sent
+        ? "preview_authorization_retry_started"
+        : "preview_authorization_retry_failed",
+      sid: targetSid,
+      authorizationId: authorization.authorizationId,
+      requestId: authorization.requestId,
+    });
+  }, [state.artifact]);
 
   if (!authReady) {
     return <div className="login" aria-busy="true">正在连接中继…</div>;
@@ -2808,8 +2943,21 @@ export default function App() {
   ): boolean => {
     const ws = wsRef.current;
     if (!ws || !focusedSid || focusedEngine !== "codex") return false;
+    const runtime = stateRef.current.runtimes[focusedSid];
+    if (ws.pendingQueryFor(focusedSid) || runtime?.acceptancePending) {
+      return false;
+    }
     const msg_id = uuid();
     if (!ws.sendSteerTo(focusedSid, prompt, msg_id, images, files)) return false;
+    dispatch({
+      type: "steer_sent",
+      sid: focusedSid,
+      prompt,
+      msg_id,
+      images,
+      files,
+      ts: Date.now(),
+    });
     if (stateRef.current.historyBrowse?.sid === focusedSid) {
       dispatch({ type: "return_to_latest", sid: focusedSid });
     }
@@ -3224,8 +3372,52 @@ export default function App() {
   const previewMarkdown = (file: string) => previewFile(file);
   const loadPreviewAsset = (file: string, previewId: string): boolean => {
     const targetSid = state.artifact?.sid ?? focusedSid;
-    return !!targetSid && !!wsRef.current?.sendGetPreviewAsset(
-      file, previewId, uuid(), targetSid);
+    if (!targetSid) return false;
+    const requestId = uuid();
+    if (!wsRef.current?.sendGetPreviewAsset(
+      file, previewId, requestId, targetSid)) return false;
+    dispatch({
+      type: "begin_preview_asset",
+      sid: targetSid,
+      path: file,
+      previewId,
+      requestId,
+    });
+    return true;
+  };
+  const authorizePreview = (
+    authorization: PreviewAuthorizationState,
+    decision: "allow" | "deny",
+  ): boolean => {
+    const artifact = stateRef.current.artifact;
+    const targetSid = artifact?.sid;
+    if (!artifact || !targetSid) return false;
+    const activeAuthorization = artifact.authorization
+      ?? Object.values(artifact.assets ?? {}).find(
+        (asset) => (
+          asset.authorization?.authorizationId
+            === authorization.authorizationId
+          && asset.authorization.requestId === authorization.requestId
+        ),
+      )?.authorization;
+    if (!activeAuthorization
+        || activeAuthorization.authorizationId
+          !== authorization.authorizationId
+        || activeAuthorization.requestId !== authorization.requestId
+        || activeAuthorization.status !== "required") return false;
+    if (!wsRef.current?.sendAuthorizePreview(
+      authorization.authorizationId,
+      authorization.requestId,
+      decision,
+      targetSid,
+    )) return false;
+    dispatch({
+      type: "submit_preview_authorization",
+      sid: targetSid,
+      authorizationId: authorization.authorizationId,
+      requestId: authorization.requestId,
+    });
+    return true;
   };
   const saveMarkdown = (file: string, content: string, expectedSize: number,
                         expectedMtimeNs: string, expectedRevision: string): string | null => {
@@ -3298,7 +3490,14 @@ export default function App() {
     const sid = activeBtwSid;
     const ws = wsRef.current;
     if (!sid || !ws || activeBtw?.engine !== "codex") return false;
-    return ws.sendSteerTo(sid, prompt, uuid());
+    const runtime = stateRef.current.runtimes[sid];
+    if (ws.pendingQueryFor(sid) || runtime?.acceptancePending) return false;
+    const msg_id = uuid();
+    if (!ws.sendSteerTo(sid, prompt, msg_id)) return false;
+    dispatch({
+      type: "steer_sent", sid, prompt, msg_id, ts: Date.now(),
+    });
+    return true;
   };
   const interruptBtw = (sid: string) => {
     wsRef.current?.sendInterruptTo(sid);
@@ -3605,15 +3804,12 @@ export default function App() {
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={historyView.hasMore}
+              historyPagingReady={historyView.pagingReady}
               historyRevision={rt.historyRevision}
               historyViewRevision={historyView.viewRevision}
+              historyGeneration={historyView.generation}
               historyViewId={historyView.viewId}
-              historyScopeKey={
-                historyView.browsing
-                  && state.historyBrowse?.sid === focusedSid
-                  ? state.historyBrowse.scopeKey
-                  : activeScopeKey
-              }
+              historyScopeKey={historyView.scopeKey ?? activeScopeKey}
               historyWindowEpoch={historyView.windowEpoch}
               historyCursor={historyView.oldestId}
               browseMode={historyView.browsing}
@@ -3640,6 +3836,8 @@ export default function App() {
               imageAssets={inlineImageAssets}
               onLoadImage={historyView.recovering
                 ? undefined : loadFocusedMessageImage}
+              onAuthorizeImage={historyView.recovering
+                ? undefined : authorizeMessageImage}
               historyImageAssets={historyImageAssets}
               onLoadHistoryImage={historyView.recovering
                 ? undefined : loadHistoryImage}
@@ -3725,6 +3923,7 @@ export default function App() {
           })}
           onContext={requestContext}
           onOpenBtw={openBtw}
+          onDiff={() => getDiff("")}
           onPreview={previewMarkdown}
           onGoal={runGoal}
           onStatus={openStatus}
@@ -3819,6 +4018,9 @@ export default function App() {
               if (activeBtwSid) setBtwEffort(activeBtwSid, effort);
             }}
             onOpenFile={previewBtwFile} onClose={closeBtw}
+            imageAssets={btwInlineImageAssets}
+            onLoadImage={loadBtwMessageImage}
+            onAuthorizeImage={authorizeMessageImage}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
             }} />;
@@ -3826,6 +4028,7 @@ export default function App() {
           return <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
             onTab={switchRight} onRefresh={previewArtifactFile}
             onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
+            onAuthorizePreview={authorizePreview}
             onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
             onClose={() => dispatch({ type: "clear_artifact" })} />;
         return null;
