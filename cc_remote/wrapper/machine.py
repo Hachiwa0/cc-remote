@@ -1111,6 +1111,7 @@ class WrapperMachine:
         self._preview_conversion_limit = asyncio.Semaphore(2)
         self._preview_capability_store = PreviewCapabilityStore(
             Path(cfg.state_dir))
+        self._preview_capability_mutation_lock = asyncio.Lock()
         self._preview_challenges: OrderedDict[
             str, _PreviewChallenge
         ] = OrderedDict()
@@ -3565,7 +3566,14 @@ class WrapperMachine:
             msg.input["file_paths"] = list(raw_paths)
         return raw_paths
 
-    def _observe_preview_path_event(self, ctx: SessionContext, msg) -> None:
+    async def _run_preview_capability_mutation(
+        self, method, /, *args, **kwargs,
+    ):
+        """Serialize copy-on-write store mutations away from the event loop."""
+        async with self._preview_capability_mutation_lock:
+            return await asyncio.to_thread(method, *args, **kwargs)
+
+    async def _observe_preview_path_event(self, ctx: SessionContext, msg) -> None:
         """Grant an exact capability only at a live successful-write boundary.
 
         Normal previews remain cwd-confined. Claude/Codex can, however, be
@@ -3601,7 +3609,8 @@ class WrapperMachine:
             if self._path_is_below(root, candidate):
                 continue
             try:
-                self._preview_capability_store.grant_path(
+                await self._run_preview_capability_mutation(
+                    self._preview_capability_store.grant_path,
                     ctx.engine,
                     ctx.space,
                     session_key,
@@ -3951,7 +3960,7 @@ class WrapperMachine:
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
         await self._observe_preview_image_event(ctx, msg)
-        self._observe_preview_path_event(ctx, msg)
+        await self._observe_preview_path_event(ctx, msg)
         async with ctx.emit_lock:
             await self._emit_locked(ctx, msg)
 
@@ -9710,7 +9719,7 @@ class WrapperMachine:
         self.sessions.pop(ctx.key, None)
         self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
         if ctx.key:
-            self._drop_preview_session(ctx.engine, ctx.key)
+            await self._drop_preview_session(ctx.engine, ctx.key)
         disconnected = False
         try:
             tasks = {
@@ -11681,8 +11690,14 @@ class WrapperMachine:
         while len(self._preview_challenges) > self.PREVIEW_AUTHORIZATION_CAP:
             self._preview_challenges.popitem(last=False)
 
-    def _drop_preview_session(self, engine: str, session_id: str) -> None:
-        self._preview_capability_store.remove_session(engine, session_id)
+    async def _drop_preview_session(
+        self, engine: str, session_id: str,
+    ) -> None:
+        await self._run_preview_capability_mutation(
+            self._preview_capability_store.remove_session,
+            engine,
+            session_id,
+        )
         for authorization_id, challenge in tuple(
                 self._preview_challenges.items()):
             if (
@@ -11691,13 +11706,14 @@ class WrapperMachine:
             ):
                 self._preview_challenges.pop(authorization_id, None)
 
-    def _rekey_preview_session(
+    async def _rekey_preview_session(
         self,
         ctx: SessionContext,
         old_key: str,
         session_id: str,
     ) -> None:
-        self._preview_capability_store.rekey(
+        await self._run_preview_capability_mutation(
+            self._preview_capability_store.rekey,
             ctx.engine,
             ctx.space,
             old_key,
@@ -11866,7 +11882,8 @@ class WrapperMachine:
             return result
 
         try:
-            self._preview_capability_store.grant_path(
+            await self._run_preview_capability_mutation(
+                self._preview_capability_store.grant_path,
                 challenge.engine,
                 challenge.space,
                 challenge.session_key,
@@ -13739,7 +13756,7 @@ class WrapperMachine:
                 self.sessions.pop(ctx.key, None)
                 self._purge_preview_image_snapshots(
                     ctx.preview_snapshot_token)
-                self._drop_preview_session(ctx.engine, ctx.key)
+                await self._drop_preview_session(ctx.engine, ctx.key)
                 log.error("private btw persistence failed; terminating fork",
                           error_type=type(persist_error).__name__)
                 disconnected = False
@@ -13800,7 +13817,7 @@ class WrapperMachine:
                 rekey_goal(sid)
             save_session_id(self.cfg.state_dir, ctx.cwd, sid)
         if old_key and old_key != sid:
-            self._rekey_preview_session(ctx, old_key, sid)
+            await self._rekey_preview_session(ctx, old_key, sid)
             self._remember_session_alias(old_key, sid, ctx.cwd)
             self.sessions.pop(old_key, None)
             self.sessions[sid] = ctx
@@ -14234,7 +14251,7 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
-        self._drop_preview_session(engine, sid)
+        await self._drop_preview_session(engine, sid)
         if self._session_pins is not None:
             try:
                 await asyncio.to_thread(
@@ -14369,7 +14386,7 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
-        self._drop_preview_session(engine, sid)
+        await self._drop_preview_session(engine, sid)
         if engine == "codex" and checkpoint_cleanup_journal is not None:
             try:
                 await asyncio.to_thread(
@@ -15519,6 +15536,41 @@ class WrapperMachine:
         self._uncertain_codex_forks[request_id] = child_session_id or existing
         self._uncertain_codex_forks.move_to_end(request_id)
 
+    def _release_terminal_codex_fork_lock(
+        self, request_id: str, expected: Optional[asyncio.Lock] = None,
+    ) -> None:
+        """Drop only locks whose durable request can no longer be reconciled."""
+        try:
+            entry = self._codex_forks.get(request_id)
+            effective_status = entry.get("status") if entry is not None else None
+            if effective_status == "alias":
+                canonical_id = entry.get("canonical_request_id")
+                canonical = (
+                    self._codex_forks.get(canonical_id)
+                    if isinstance(canonical_id, str) else None
+                )
+                effective_status = (
+                    canonical.get("status") if canonical is not None else None
+                )
+        except ForkJournalError as exc:
+            log.warning("Codex fork lock cleanup skipped", error=str(exc))
+            return
+        task = self._codex_fork_tasks.get(request_id)
+        lock = self._codex_fork_locks.get(request_id)
+        terminal_or_unrecorded = (
+            entry is None
+            # ``intent`` has not crossed the durable submit boundary, so a
+            # failed local preflight/persist attempt has nothing to reconcile.
+            # Submitted/uncertain requests keep their lock for the background
+            # reconciler and reliable retry path.
+            or effective_status in {"intent", "complete", "rejected"}
+        )
+        if (terminal_or_unrecorded
+                and (task is None or task.done())
+                and lock is not None
+                and (expected is None or lock is expected)):
+            self._codex_fork_locks.pop(request_id, None)
+
     def _ensure_codex_fork_reconciler(
         self,
         cmd,
@@ -15619,6 +15671,7 @@ class WrapperMachine:
             current = asyncio.current_task()
             if self._codex_fork_tasks.get(request_id) is current:
                 self._codex_fork_tasks.pop(request_id, None)
+            self._release_terminal_codex_fork_lock(request_id)
 
     async def _claude_fork_control_snapshot(
         self,
@@ -15630,10 +15683,13 @@ class WrapperMachine:
         model = valid_claude_model(
             _session_model(ctx) if ctx is not None else None
         ) or saved.model
+        effort = (
+            _session_effort(ctx) if ctx is not None else None
+        ) or saved.effort
         permission = valid_claude_permission(
             _session_permission_mode(ctx) if ctx is not None else None
         ) or saved.permission_mode
-        if model is None and ctx is None:
+        if (model is None or effort is None) and ctx is None:
             try:
                 native = await asyncio.to_thread(
                     last_completed_assistant_controls,
@@ -15641,7 +15697,8 @@ class WrapperMachine:
                     directory=cwd,
                     max_bytes=self.cfg.history_source_max_bytes,
                 )
-                model = native.model
+                model = model or native.model
+                effort = effort or native.effort
             except Exception as exc:
                 log.warning(
                     "Claude fork model snapshot unavailable",
@@ -15652,6 +15709,7 @@ class WrapperMachine:
             key: value
             for key, value in (
                 ("model", model),
+                ("effort", effort),
                 ("permission_mode", permission),
             )
             if isinstance(value, str) and value
@@ -15692,12 +15750,16 @@ class WrapperMachine:
         profile = (
             _session_permission_profile(ctx) if ctx is not None else None
         ) or saved.permission_profile or settings.get("permission_profile")
+        web_search = (
+            _session_web_search(ctx) if ctx is not None else None
+        ) or saved.web_search
         return {
             key: value
             for key, value in (
                 ("model", model),
                 ("approval_policy", approval),
                 ("permission_profile", profile),
+                ("web_search", web_search),
             )
             if isinstance(value, str) and value
             and len(value) <= 256
@@ -15732,6 +15794,7 @@ class WrapperMachine:
             self._claude_controls.inherit_if_absent,
             child_session_id,
             model=values.get("model"),
+            effort=values.get("effort"),
             permission_mode=values.get("permission_mode"),
         )
 
@@ -15743,7 +15806,7 @@ class WrapperMachine:
         values = controls if isinstance(controls, dict) else {}
         if not any(
             values.get(key)
-            for key in ("approval_policy", "permission_profile")
+            for key in ("approval_policy", "permission_profile", "web_search")
         ):
             return
         if self._codex_controls is None:
@@ -15754,6 +15817,7 @@ class WrapperMachine:
             child_session_id,
             approval_policy=values.get("approval_policy"),
             permission_profile=values.get("permission_profile"),
+            web_search=values.get("web_search"),
         )
 
     async def _finish_same_cwd_fork(
@@ -16269,20 +16333,23 @@ class WrapperMachine:
                     cmd, ERR_INTERNAL, "派生请求锁容量已满，请稍后重试")
             lock = asyncio.Lock()
             self._codex_fork_locks[request_id] = lock
-        async with lock:
-            # A background reconciler may have resolved this reliable command
-            # after _process_command's initial dedupe check but before this lock.
-            client_id = getattr(cmd, "client_id", None)
-            cmd_id = getattr(cmd, "cmd_id", None)
-            if client_id and cmd_id:
-                seen, cached = self._command_seen(client_id, cmd_id)
-                if seen:
-                    # The background resolver published the correlated event and
-                    # ACK before releasing this same lock. Return its cached
-                    # response so outer _process_command preserves the cache and
-                    # emits only its harmless duplicate ACK, not a second event.
-                    return cached
-            return await self._handle_fork_session_locked(cmd)
+        try:
+            async with lock:
+                # A background reconciler may have resolved this reliable command
+                # after _process_command's initial dedupe check but before this lock.
+                client_id = getattr(cmd, "client_id", None)
+                cmd_id = getattr(cmd, "cmd_id", None)
+                if client_id and cmd_id:
+                    seen, cached = self._command_seen(client_id, cmd_id)
+                    if seen:
+                        # The background resolver published the correlated event and
+                        # ACK before releasing this same lock. Return its cached
+                        # response so outer _process_command preserves the cache and
+                        # emits only its harmless duplicate ACK, not a second event.
+                        return cached
+                return await self._handle_fork_session_locked(cmd)
+        finally:
+            self._release_terminal_codex_fork_lock(request_id, lock)
 
     async def _handle_fork_session_locked(self, cmd):
         """Persistently fork Codex after one selected completed turn."""
@@ -16432,6 +16499,9 @@ class WrapperMachine:
             "permission_profile")
         if isinstance(parent_profile, str) and parent_profile:
             params["permissions"] = parent_profile
+        parent_web_search = (entry.get("controls") or {}).get("web_search")
+        if parent_web_search in CODEX_WEB_SEARCH_MODES:
+            params["config"] = {"web_search": parent_web_search}
         try:
             raw_result = await codex_rpc("thread/fork", params)
         except CodexRpcRejected as exc:
@@ -16514,6 +16584,59 @@ class WrapperMachine:
                      last_turn_id=cmd.last_turn_id)
         return event
 
+    async def _finalize_codex_worktree_fork_name(
+        self,
+        cmd,
+        child_session_id: str,
+        cwd: str,
+        *,
+        freshly_confirmed: bool,
+    ) -> None:
+        """Apply a requested title at most once, before publishing the result."""
+        entry = await asyncio.to_thread(
+            self._codex_forks.get, cmd.request_id)
+        if entry and entry.get("name_finalized"):
+            return
+        name = (getattr(cmd, "name", None) or "").strip()
+        if name and freshly_confirmed:
+            try:
+                await codex_rpc("thread/name/set", {
+                    "threadId": child_session_id,
+                    "name": name,
+                }, cwd=cwd)
+            except Exception as exc:
+                # A lost response may still have applied the title. Never replay
+                # this convenience mutation after a user could have renamed it.
+                log.warning(
+                    "forked thread initial name set failed",
+                    thread_id=child_session_id,
+                    error=str(exc),
+                )
+        elif name:
+            try:
+                result = await codex_rpc("thread/read", {
+                    "threadId": child_session_id,
+                    "includeTurns": False,
+                }, cwd=cwd)
+                thread = result.get("thread") if isinstance(result, dict) else None
+                current_name = (
+                    thread.get("name") if isinstance(thread, dict) else None)
+                if current_name != name:
+                    log.info(
+                        "preserving renamed fork title during retry",
+                        thread_id=child_session_id,
+                    )
+            except Exception as exc:
+                # Losing an initial suggestion is safer than writing after the
+                # direct fork response boundary.
+                log.warning(
+                    "forked thread name reconciliation skipped",
+                    thread_id=child_session_id,
+                    error_type=type(exc).__name__,
+                )
+        await asyncio.to_thread(
+            self._codex_forks.mark_name_finalized, cmd.request_id)
+
     async def _finish_worktree_fork(
         self,
         cmd,
@@ -16521,6 +16644,8 @@ class WrapperMachine:
         spec: WorktreeSpec,
         child_session_id: str,
         marker: str,
+        *,
+        freshly_confirmed: bool = False,
     ) -> SessionForked:
         """Durably publish one worktree fork without replaying its mutation."""
         try:
@@ -16563,21 +16688,20 @@ class WrapperMachine:
             raise _ForkOutcomeUncertain(
                 "worktree fork controls are not durably inherited") from exc
 
-        name = (getattr(cmd, "name", None) or "").strip()
-        if name:
-            try:
-                await codex_rpc("thread/name/set", {
-                    "threadId": child_session_id,
-                    "name": name,
-                }, cwd=spec.cwd)
-            except Exception as exc:
-                # Naming is an independent, retryable convenience after the
-                # persistent fork and its cwd are already authoritative.
-                log.warning(
-                    "forked thread name set failed",
-                    thread_id=child_session_id,
-                    error=str(exc),
-                )
+        try:
+            await self._finalize_codex_worktree_fork_name(
+                cmd,
+                child_session_id,
+                spec.cwd,
+                freshly_confirmed=freshly_confirmed,
+            )
+        except ForkJournalError as exc:
+            self._remember_uncertain_codex_fork(
+                cmd.request_id, child_session_id)
+            self._ensure_codex_fork_reconciler(
+                cmd, sid, spec.cwd, marker, spec)
+            raise _ForkOutcomeUncertain(
+                "worktree fork name state is not durable") from exc
 
         self._uncertain_codex_forks.pop(cmd.request_id, None)
         event = SessionForked(
@@ -16664,14 +16788,17 @@ class WrapperMachine:
                     cmd, ERR_INTERNAL, "派生请求锁容量已满，请稍后重试")
             lock = asyncio.Lock()
             self._codex_fork_locks[request_id] = lock
-        async with lock:
-            client_id = getattr(cmd, "client_id", None)
-            cmd_id = getattr(cmd, "cmd_id", None)
-            if client_id and cmd_id:
-                seen, cached = self._command_seen(client_id, cmd_id)
-                if seen:
-                    return cached
-            return await self._handle_fork_session_worktree_locked(cmd)
+        try:
+            async with lock:
+                client_id = getattr(cmd, "client_id", None)
+                cmd_id = getattr(cmd, "cmd_id", None)
+                if client_id and cmd_id:
+                    seen, cached = self._command_seen(client_id, cmd_id)
+                    if seen:
+                        return cached
+                return await self._handle_fork_session_worktree_locked(cmd)
+        finally:
+            self._release_terminal_codex_fork_lock(request_id, lock)
 
     async def _handle_fork_session_worktree_locked(self, cmd):
         """Create a wrapper-owned Git worktree and persistently fork Codex into it."""
@@ -16882,6 +17009,9 @@ class WrapperMachine:
         parent_profile = controls.get("permission_profile")
         if parent_profile:
             params["permissions"] = parent_profile
+        parent_web_search = controls.get("web_search")
+        if parent_web_search in CODEX_WEB_SEARCH_MODES:
+            params["config"] = {"web_search": parent_web_search}
 
         try:
             raw_result = await codex_rpc(
@@ -16957,6 +17087,7 @@ class WrapperMachine:
 
         thread = raw_result.get("thread") if isinstance(raw_result, dict) else None
         new_session_id = thread.get("id") if isinstance(thread, dict) else None
+        freshly_confirmed = isinstance(new_session_id, str) and bool(new_session_id)
         if not isinstance(new_session_id, str) or not new_session_id:
             self._remember_uncertain_codex_fork(cmd.request_id, None)
             try:
@@ -16976,7 +17107,8 @@ class WrapperMachine:
             new_session_id = recovered
 
         return await self._finish_worktree_fork(
-            cmd, sid, spec, new_session_id, marker)
+            cmd, sid, spec, new_session_id, marker,
+            freshly_confirmed=freshly_confirmed)
 
     async def _send_session_migration_error(
         self, cmd, code: str, message: str, *, sid: Optional[str] = None,
@@ -17278,7 +17410,7 @@ class WrapperMachine:
                 ctx.preview_image_candidates.clear()
                 self._purge_preview_image_snapshots(
                     ctx.preview_snapshot_token)
-                self._drop_preview_session(ctx.engine, sid)
+                await self._drop_preview_session(ctx.engine, sid)
                 await self._cleanup_codex_steer_attachments(ctx)
                 self._invalidate_codex_session_catalog()
                 await self._emit(ctx, ArtifactInvalidated(

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import stat
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -326,13 +328,13 @@ def test_successful_write_grants_exact_cross_cwd_preview_and_edit(tmp_path):
         machine.sessions[ctx.key] = ctx
         machine.focused_sid = ctx.key
 
-        machine._observe_preview_path_event(ctx, ToolUse(
+        await machine._observe_preview_path_event(ctx, ToolUse(
             message_id="message-1",
             tool_use_id="write-1",
             tool="Write",
             input={"file_path": str(outside), "content": "# created"},
         ))
-        machine._observe_preview_path_event(ctx, ToolResult(
+        await machine._observe_preview_path_event(ctx, ToolResult(
             tool_use_id="write-1",
             content=f"File created successfully at: {outside}",
             is_error=False,
@@ -386,18 +388,18 @@ def test_failed_write_never_grants_cross_cwd_preview(tmp_path):
     ctx = _mk_ctx("session-1", session_id="session-1")
     ctx.cwd = str(root)
 
-    machine._observe_preview_path_event(ctx, ToolUse(
+    asyncio.run(machine._observe_preview_path_event(ctx, ToolUse(
         message_id="message-1",
         tool_use_id="write-1",
         tool="Write",
         input={"file_path": str(outside), "content": "not written"},
-    ))
-    machine._observe_preview_path_event(ctx, ToolResult(
+    )))
+    asyncio.run(machine._observe_preview_path_event(ctx, ToolResult(
         tool_use_id="write-1",
         content="permission denied",
         is_error=True,
         status="failed",
-    ))
+    )))
 
     with pytest.raises(ValueError, match="确认"):
         machine._read_markdown_preview(
@@ -416,18 +418,18 @@ def test_history_write_replay_never_rebinds_a_replaced_external_file(tmp_path):
     ctx.cwd = str(root)
     machine.sessions[ctx.key] = ctx
 
-    machine._observe_preview_path_event(ctx, ToolUse(
+    asyncio.run(machine._observe_preview_path_event(ctx, ToolUse(
         message_id="message-live",
         tool_use_id="write-live",
         tool="Write",
         input={"file_path": str(outside), "content": "# original"},
-    ))
-    machine._observe_preview_path_event(ctx, ToolResult(
+    )))
+    asyncio.run(machine._observe_preview_path_event(ctx, ToolResult(
         tool_use_id="write-live",
         content="written",
         is_error=False,
         status="succeeded",
-    ))
+    )))
     original_capability = machine._preview_capabilities(ctx)[
         str(outside.resolve())
     ]
@@ -863,7 +865,9 @@ def test_preview_marker_cleanup_failure_keeps_restart_fail_closed(
     monkeypatch.setattr(
         store,
         "_clear_invalidation_locked",
-        lambda: (_ for _ in ()).throw(OSError("directory fsync failed")),
+        lambda *_args, **_kwargs: (
+            _ for _ in ()
+        ).throw(OSError("directory fsync failed")),
     )
     store.remove_session("claude", "session-1")
 
@@ -871,6 +875,24 @@ def test_preview_marker_cleanup_failure_keeps_restart_fail_closed(
     recovered = PreviewCapabilityStore(state)
     assert recovered.snapshot("claude", "code", "session-1") == {}
     assert not (state / ".preview-capabilities.invalidated").exists()
+
+
+def test_legacy_preview_invalidation_marker_recovers_fail_closed(tmp_path):
+    state = tmp_path / "state"
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("artifact", encoding="utf-8")
+    store = PreviewCapabilityStore(state)
+    store.grant_path(
+        "claude", "code", "session-1", str(artifact),
+        mode="read", source="user_approved")
+    marker = state / ".preview-capabilities.invalidated"
+    marker.write_text("preview capabilities invalidated\n", encoding="ascii")
+    marker.chmod(0o600)
+
+    recovered = PreviewCapabilityStore(state)
+
+    assert recovered.snapshot("claude", "code", "session-1") == {}
+    assert not marker.exists()
 
 
 def test_destructive_retry_recovers_an_existing_invalidation_marker(
@@ -925,6 +947,36 @@ def test_preview_epoch_invalidates_an_overlapping_store_process(tmp_path):
     assert overlapping.snapshot("claude", "code", "session-1") == {}
 
 
+def test_concurrent_preview_revokes_preserve_unrelated_grants(tmp_path):
+    state = tmp_path / "state"
+    artifacts = [tmp_path / f"artifact-{index}.md" for index in range(3)]
+    for index, artifact in enumerate(artifacts):
+        artifact.write_text(str(index), encoding="utf-8")
+    first = PreviewCapabilityStore(state)
+    for index, artifact in enumerate(artifacts):
+        first.grant_path(
+            "claude", "code", f"session-{index}", str(artifact),
+            mode="read", source="user_approved")
+    second = PreviewCapabilityStore(state)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                store.revoke,
+                "claude", "code", f"session-{index}", str(artifacts[index]),
+            )
+            for index, store in enumerate((first, second))
+        ]
+        for future in futures:
+            future.result(timeout=3)
+
+    restored = PreviewCapabilityStore(state)
+    assert restored.snapshot("claude", "code", "session-0") == {}
+    assert restored.snapshot("claude", "code", "session-1") == {}
+    assert str(artifacts[2].resolve()) in restored.snapshot(
+        "claude", "code", "session-2")
+
+
 def test_preview_lock_refuses_symlink_without_chmodding_target(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -957,6 +1009,80 @@ def test_preview_lock_wait_is_bounded(tmp_path, monkeypatch):
     with pytest.raises(TimeoutError, match="acquisition timed out"):
         with store._exclusive_lock():
             raise AssertionError("busy lock must not be entered")
+
+
+def test_preview_revoke_lock_timeout_leaves_restart_deny_marker(
+    tmp_path, monkeypatch,
+):
+    state = tmp_path / "state"
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("artifact", encoding="utf-8")
+    store = PreviewCapabilityStore(state)
+    store.grant_path(
+        "claude", "code", "session-1", str(artifact),
+        mode="read", source="user_approved")
+    original_lock = store._exclusive_lock
+
+    def lock_timeout():
+        raise TimeoutError("preview capability lock acquisition timed out")
+
+    monkeypatch.setattr(store, "_exclusive_lock", lock_timeout)
+    store.revoke("claude", "code", "session-1", str(artifact))
+
+    marker = state / ".preview-capabilities.invalidated"
+    assert marker.exists()
+    assert store.snapshot("claude", "code", "session-1") == {}
+
+    monkeypatch.setattr(store, "_exclusive_lock", original_lock)
+    recovered = PreviewCapabilityStore(state)
+    assert recovered.snapshot("claude", "code", "session-1") == {}
+    assert not marker.exists()
+
+
+def test_preview_grant_storage_wait_does_not_block_event_loop(
+    tmp_path, monkeypatch,
+):
+    async def run():
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = tmp_path / "outside.md"
+        outside.write_text("outside", encoding="utf-8")
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        started = threading.Event()
+        release = threading.Event()
+        original = machine._preview_capability_store.grant_path
+
+        def blocked_grant(*args, **kwargs):
+            started.set()
+            assert release.wait(timeout=2)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            machine._preview_capability_store, "grant_path", blocked_grant)
+        await machine._observe_preview_path_event(ctx, ToolUse(
+            message_id="message-1",
+            tool_use_id="write-1",
+            tool="Write",
+            input={"file_path": str(outside), "content": "outside"},
+        ))
+        task = asyncio.create_task(machine._observe_preview_path_event(
+            ctx,
+            ToolResult(
+                tool_use_id="write-1",
+                content="written",
+                is_error=False,
+                status="succeeded",
+            ),
+        ))
+        assert await asyncio.to_thread(started.wait, 1)
+        await asyncio.wait_for(asyncio.sleep(0), timeout=0.1)
+        assert not task.done()
+        release.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(run())
 
 
 def test_preview_epoch_rejects_oversized_state_file(tmp_path):
@@ -1129,7 +1255,7 @@ def test_machine_preview_rekey_and_delete_migrate_then_clear_state(tmp_path):
         ))
         assert isinstance(required, PreviewAuthorizationRequired)
 
-        machine._rekey_preview_session(ctx, ctx.key, "real-session")
+        await machine._rekey_preview_session(ctx, ctx.key, "real-session")
         assert machine._preview_capabilities(ctx) == {}
         ctx.session_id = "real-session"
         assert str(outside.resolve()) in machine._preview_capabilities(ctx)
@@ -1145,7 +1271,7 @@ def test_machine_preview_rekey_and_delete_migrate_then_clear_state(tmp_path):
         machine.sessions[resumed.key] = resumed
         assert str(outside.resolve()) in machine._preview_capabilities(resumed)
 
-        machine._drop_preview_session("claude", "real-session")
+        await machine._drop_preview_session("claude", "real-session")
         assert machine._preview_capabilities(resumed) == {}
         assert required.authorization_id not in machine._preview_challenges
 
@@ -1173,16 +1299,16 @@ def test_successful_codex_patch_grants_multiple_exact_cross_cwd_paths(tmp_path):
         ]},
     )
 
-    machine._observe_preview_path_event(ctx, use)
+    asyncio.run(machine._observe_preview_path_event(ctx, use))
     assert use.input["file_paths"] == [str(first), str(second)]
     assert ctx.preview_write_candidates["patch-1"] == (
         str(first), str(second))
-    machine._observe_preview_path_event(ctx, ToolResult(
+    asyncio.run(machine._observe_preview_path_event(ctx, ToolResult(
         tool_use_id="patch-1",
         content="ok",
         is_error=False,
         status="succeeded",
-    ))
+    )))
 
     allowed = machine._preview_capabilities(ctx)
     assert set(allowed) == {str(first.resolve()), str(second.resolve())}

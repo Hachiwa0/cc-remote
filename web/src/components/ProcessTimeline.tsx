@@ -675,22 +675,29 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
     interactionTokens.current.clear();
   }, [onInteractionEnd]);
 
-  const hasDeferredOnly = items.length === 0 && needsAuthoritativeDetail;
-  const waitingForContent = items.length === 0 && processActive;
+  const hasDeferredOnly = timelineItems.length === 0 && needsAuthoritativeDetail;
+  const waitingForContent = timelineItems.length === 0
+    && !visiblePlanBlock && processActive;
   const visibleDetailError = detailError ?? localDetailError;
-  if (!items.length && !hasDeferredOnly && !waitingForContent
+  const showOuterDisclosure = timelineItems.length > 0
+    || hasDeferredOnly || waitingForContent || !!visibleDetailError
+    || canLoadEarlier || canLoadNewer;
+  if (!visiblePlanBlock && !showOuterDisclosure
       && !visibleDetailError) return null;
   // A completed timeline is collapsed. Do not allocate/group hundreds of
   // historical rows until the user actually opens it.
   const rows = open ? groupTimelineRows(timelineItems) : [];
-  const toolCount = items.reduce((count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
+  const toolCount = timelineItems.reduce(
+    (count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
   const countLabel = needsAuthoritativeDetail
     ? `${deferredCount} 项`
     : waitingForContent
       ? "等待响应"
-    : engine === "codex" && toolCount === items.length
+    : timelineItems.length === 0 && (canLoadEarlier || canLoadNewer)
+      ? "更多过程"
+    : engine === "codex" && toolCount === timelineItems.length
       ? `${toolCount} 个工具调用`
-      : `${items.length} 项`;
+      : `${timelineItems.length} 项`;
   const elapsed: number | null = terminalComplete
     ? durationMs != null && durationMs > 0
       ? durationMs
@@ -764,7 +771,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
     <section data-process-detail-root
       className={`turn-process${open ? " open" : ""}`}>
       <div className="turn-process-controls">
-        <button type="button" className="turn-process-head"
+        {showOuterDisclosure && <button type="button" className="turn-process-head"
           aria-expanded={open} aria-busy={detailLoading}
           onPointerDown={pointerDown} onPointerMove={pointerMove}
           onPointerUp={pointerUp} onPointerCancel={pointerCancel}
@@ -784,7 +791,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
             {elapsed == null ? null : ` ${durationLabel(elapsed)}`}</span>
           <span className="turn-process-count">{countLabel}</span>
           <Icon name="chev" size={15} />
-        </button>
+        </button>}
         {visiblePlanBlock && <PlanProgressPopover block={visiblePlanBlock}
           openOverride={itemOpen?.(`plan:${visiblePlanBlock.item_id}`)}
           onOpenChange={(next) => onItemOpenChange?.(
@@ -793,7 +800,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
           onNeedDetail={needsAuthoritativeDetail && !detailLoading
             ? requestDetail : undefined} />}
       </div>
-      {open && <div className="process-timeline">
+      {showOuterDisclosure && open && <div className="process-timeline">
         {visibleDetailError && (
           <div className="process-detail-error" role="alert">
             <span>{visibleDetailError}</span>

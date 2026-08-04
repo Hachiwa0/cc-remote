@@ -178,7 +178,7 @@ class ClaudeForkJournal:
             raise ValueError("invalid Claude fork timestamp")
         controls = entry.get("controls", {})
         if not isinstance(controls, dict) or set(controls) - {
-            "model", "permission_mode",
+            "model", "effort", "permission_mode",
         }:
             raise ValueError("invalid Claude fork controls")
         model = controls.get("model")
@@ -186,6 +186,11 @@ class ClaudeForkJournal:
             not isinstance(model, str) or not model or len(model) > 256
         ):
             raise ValueError("invalid Claude fork model")
+        effort = controls.get("effort")
+        if effort is not None and effort not in {
+            "low", "medium", "high", "xhigh", "max",
+        }:
+            raise ValueError("invalid Claude fork effort")
         permission = controls.get("permission_mode")
         if permission is not None and permission not in {
             "default", "acceptEdits", "plan", "auto", "bypassPermissions",

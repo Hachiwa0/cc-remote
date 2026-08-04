@@ -48,6 +48,7 @@ def test_worktree_fork_control_snapshot_survives_journal_reload(tmp_path):
         "model": "gpt-test",
         "approval_policy": "on-request",
         "permission_profile": ":workspace",
+        "web_search": "live",
     }
 
     journal.begin(
@@ -62,6 +63,11 @@ def test_worktree_fork_control_snapshot_survives_journal_reload(tmp_path):
     reloaded = CodexForkJournal(tmp_path)
     assert reloaded.entries["request-1"]["target"] == "worktree"
     assert reloaded.entries["request-1"]["controls"] == controls
+
+    journal.complete("request-1", "child")
+    journal.mark_name_finalized("request-1")
+    finalized = CodexForkJournal(tmp_path).entries["request-1"]
+    assert finalized["name_finalized"] is True
 
 
 def test_rollout_marker_recovery_scans_active_and_archived_with_bounds(tmp_path):

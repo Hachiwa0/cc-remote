@@ -143,6 +143,7 @@ class CodexControlStore:
         *,
         approval_policy: str | None,
         permission_profile: str | None,
+        web_search: str | None,
     ) -> CodexControls:
         """Seed a new fork once without overwriting later child choices."""
         session_id = _session_id(session_id)
@@ -152,6 +153,9 @@ class CodexControlStore:
                 if approval_policy in CODEX_APPROVAL_POLICIES else None
             ),
             permission_profile=_permission_profile(permission_profile),
+            web_search=(
+                web_search if web_search in CODEX_WEB_SEARCH_MODES else None
+            ),
         )
         payload = controls.as_dict()
         with self._lock:

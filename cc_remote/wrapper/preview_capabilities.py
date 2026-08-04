@@ -5,6 +5,7 @@ import math
 import os
 import sqlite3
 import stat
+import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -29,6 +30,7 @@ PREVIEW_PATH_MAX_BYTES = 4096
 _LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_RETRY_SECONDS = 0.01
 _EPOCH_FILE_MAX_BYTES = 64
+_INVALIDATION_FILE_MAX_BYTES = 128
 
 
 class PreviewCapabilityError(ValueError):
@@ -84,14 +86,17 @@ class PreviewCapabilityStore:
         )
         self._epoch_path = state_dir / ".preview-capabilities.epoch"
         self._epoch: str | None = None
+        self._mutation_lock = threading.RLock()
         self._entries: OrderedDict[
             CapabilityKey, PreviewCapability
         ] = OrderedDict()
         self._persistent = True
         try:
+            self._recover_existing_invalidation()
             with self._exclusive_lock():
                 if self._invalidation_path.exists():
-                    self._recover_invalidation_locked()
+                    raise RuntimeError(
+                        "preview capability invalidation is still active")
                 self._ensure_epoch_locked()
                 self._initialize()
                 self._load()
@@ -150,35 +155,137 @@ class PreviewCapabilityStore:
         finally:
             os.close(descriptor)
 
-    def _mark_invalid_locked(self) -> None:
-        if self._invalidation_path.exists():
-            return
-        temporary = self._invalidation_path.with_name(
-            f".{self._invalidation_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
-        )
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-        try:
-            with os.fdopen(descriptor, "wb", closefd=True) as stream:
-                descriptor = -1
-                stream.write(b"preview capabilities invalidated\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self._invalidation_path)
-            os.chmod(self._invalidation_path, 0o600)
-            self._fsync_parent()
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+    @staticmethod
+    def _lock_descriptor(descriptor: int) -> None:
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        while True:
             try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "preview invalidation ownership timed out")
+                time.sleep(_LOCK_RETRY_SECONDS)
 
-    def _clear_invalidation_locked(self) -> None:
+    def _marker_matches(
+        self, descriptor: int, token: str | None = None,
+    ) -> bool:
+        try:
+            path_info = self._invalidation_path.lstat()
+            descriptor_info = os.fstat(descriptor)
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISREG(path_info.st_mode)
+            or stat.S_ISLNK(path_info.st_mode)
+            or path_info.st_uid != os.geteuid()
+            or stat.S_IMODE(path_info.st_mode) & 0o077
+            or path_info.st_size > _INVALIDATION_FILE_MAX_BYTES
+            or path_info.st_dev != descriptor_info.st_dev
+            or path_info.st_ino != descriptor_info.st_ino
+        ):
+            raise OSError("preview invalidation marker is unsafe")
+        raw = os.pread(descriptor, _INVALIDATION_FILE_MAX_BYTES + 1, 0)
+        if len(raw) > _INVALIDATION_FILE_MAX_BYTES:
+            raise OSError("preview invalidation marker is oversized")
+        try:
+            value = raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise OSError("preview invalidation marker is invalid") from exc
+        if token is None and value == "preview capabilities invalidated":
+            return True
+        if len(value) != 32 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise OSError("preview invalidation marker is invalid")
+        return token is None or value == token
+
+    def _recover_existing_invalidation(self) -> None:
+        """Recover one abandoned marker without racing its live owner."""
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(self._invalidation_path, flags)
+        except FileNotFoundError:
+            return
+        try:
+            self._lock_descriptor(descriptor)
+            with self._exclusive_lock():
+                if not self._marker_matches(descriptor):
+                    return
+                self._recover_invalidation_locked(descriptor)
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def _create_invalidation_intent(self) -> tuple[int, str]:
+        """Publish an already-locked token before the durable store lock."""
+        parent = self._path.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(parent, 0o700)
+        while True:
+            token = uuid4().hex
+            temporary = self._invalidation_path.with_name(
+                f".{self._invalidation_path.name}.{os.getpid()}.{token}.tmp"
+            )
+            descriptor = os.open(
+                temporary,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            linked = False
+            returned = False
+            try:
+                payload = (token + "\n").encode("ascii")
+                if os.write(descriptor, payload) != len(payload):
+                    raise OSError("preview invalidation marker write was short")
+                os.fsync(descriptor)
+                # The inode is locked before the public link exists, so another
+                # process can never mistake this live intent for crash residue.
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                try:
+                    os.link(temporary, self._invalidation_path)
+                    linked = True
+                except FileExistsError:
+                    pass
+                if linked:
+                    temporary.unlink()
+                    self._fsync_parent()
+                    returned = True
+                    return descriptor, token
+            finally:
+                if not returned:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(descriptor)
+                    try:
+                        temporary.unlink()
+                    except FileNotFoundError:
+                        pass
+            self._recover_existing_invalidation()
+
+    @contextmanager
+    def _invalidation_intent(self):
+        descriptor, token = self._create_invalidation_intent()
+        try:
+            yield descriptor, token
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def _clear_invalidation_locked(
+        self, descriptor: int | None = None, token: str | None = None,
+    ) -> None:
+        if descriptor is not None and not self._marker_matches(descriptor, token):
+            raise OSError("preview invalidation ownership changed")
         self._invalidation_path.unlink()
         self._fsync_parent()
 
@@ -249,10 +356,10 @@ class PreviewCapabilityStore:
         try:
             value = self._read_epoch()
             if self._invalidation_path.exists() or value != self._epoch:
-                self._entries.clear()
+                self._entries = OrderedDict()
                 self._epoch = value
         except Exception as exc:
-            self._entries.clear()
+            self._entries = OrderedDict()
             self._persistent = False
             log.warning(
                 "preview capability epoch unavailable; clearing memory",
@@ -263,25 +370,18 @@ class PreviewCapabilityStore:
         value = self._read_epoch()
         unchanged = value == self._epoch
         if not unchanged:
-            self._entries.clear()
+            self._entries = OrderedDict()
             self._epoch = value
         return unchanged
 
-    def _recover_invalidation_locked(self) -> None:
+    def _recover_invalidation_locked(self, descriptor: int) -> None:
         """Discard every old grant before clearing a crash marker."""
         self._initialize()
         with self._connect() as connection:
             connection.execute("DELETE FROM preview_capabilities")
         self._write_epoch_locked()
-        self._clear_invalidation_locked()
-        self._entries.clear()
-
-    def _prepare_destructive_write_locked(self) -> None:
-        """Resolve an older failed mutation before starting a new one."""
-        if self._invalidation_path.exists():
-            self._recover_invalidation_locked()
-        else:
-            self._sync_epoch_locked()
+        self._clear_invalidation_locked(descriptor)
+        self._entries = OrderedDict()
 
     @staticmethod
     def _key(
@@ -373,7 +473,7 @@ class PreviewCapabilityStore:
             granted_at=float(granted_at),
         )
 
-    def _load(self) -> None:
+    def _read_entries(self) -> OrderedDict[CapabilityKey, PreviewCapability]:
         with self._connect() as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM preview_capabilities"
@@ -399,6 +499,7 @@ class PreviewCapabilityStore:
                 ORDER BY granted_at ASC
                 """,
             ).fetchall()
+        entries: OrderedDict[CapabilityKey, PreviewCapability] = OrderedDict()
         for row in rows:
             capability = self._from_row(row)
             if capability is None:
@@ -409,8 +510,8 @@ class PreviewCapabilityStore:
                 capability.session_id,
                 capability.path,
             )
-            self._entries[key] = capability
-        removed = self._trim_entries()
+            entries[key] = capability
+        removed = self._trim_entries(entries)
         if removed:
             with self._connect() as connection:
                 for key in removed:
@@ -421,22 +522,30 @@ class PreviewCapabilityStore:
                         """,
                         key,
                     )
+        return entries
 
-    def _trim_entries(self) -> list[CapabilityKey]:
+    def _load(self) -> None:
+        self._entries = self._read_entries()
+
+    def _trim_entries(
+        self,
+        entries: OrderedDict[CapabilityKey, PreviewCapability] | None = None,
+    ) -> list[CapabilityKey]:
+        target = self._entries if entries is None else entries
         removed: list[CapabilityKey] = []
         counts: dict[tuple[str, str, str], int] = {}
-        for key in self._entries:
+        for key in target:
             scope = key[:3]
             counts[scope] = counts.get(scope, 0) + 1
-        for key in tuple(self._entries):
+        for key in tuple(target):
             scope = key[:3]
             if counts[scope] <= _SESSION_CAP:
                 continue
-            self._entries.pop(key, None)
+            target.pop(key, None)
             counts[scope] -= 1
             removed.append(key)
-        while len(self._entries) > _GLOBAL_CAP:
-            dropped, _ = self._entries.popitem(last=False)
+        while len(target) > _GLOBAL_CAP:
+            dropped, _ = target.popitem(last=False)
             removed.append(dropped)
         return removed
 
@@ -488,19 +597,12 @@ class PreviewCapabilityStore:
         self,
         capability: PreviewCapability,
         removed: list[CapabilityKey],
-    ) -> None:
+    ) -> OrderedDict[CapabilityKey, PreviewCapability] | None:
         if not self._persistent:
-            return
+            return None
         try:
             with self._exclusive_lock():
                 if not self._sync_epoch_locked():
-                    key = self._key(
-                        capability.engine,
-                        capability.space,
-                        capability.session_id,
-                        capability.path,
-                    )
-                    self._entries[key] = capability
                     removed = []
                 if self._invalidation_path.exists():
                     raise RuntimeError(
@@ -541,11 +643,14 @@ class PreviewCapabilityStore:
                             capability.granted_at,
                         ),
                     )
+                entries = self._read_entries()
+                self._persistent = True
+                return entries
         except Exception as exc:
             invalidated = self._invalidation_path.exists()
             self._persistent = False
             if invalidated:
-                self._entries.clear()
+                self._entries = OrderedDict()
             log.warning(
                 "preview capability grant not persisted",
                 error_type=type(exc).__name__,
@@ -553,6 +658,7 @@ class PreviewCapabilityStore:
             if invalidated:
                 raise PreviewCapabilityError(
                     "预览授权存储正在安全恢复，请稍后重试") from exc
+            return None
 
     def grant_path(
         self,
@@ -565,47 +671,50 @@ class PreviewCapabilityStore:
         source: PreviewCapabilitySource,
         persist: bool = True,
     ) -> PreviewCapability:
-        self._observe_epoch()
-        if persist and self._invalidation_path.exists():
-            raise PreviewCapabilityError(
-                "预览授权存储正在安全恢复，请稍后重试")
-        capability = self.inspect_path(
-            engine,
-            space,
-            session_id,
-            path,
-            mode=mode,
-            source=source,
-        )
-        canonical = capability.path
-        key = self._key(engine, space, session_id, canonical)
-        previous = self._entries.get(key)
-        same_identity = (
-            previous is not None
-            and previous.device == capability.device
-            and previous.inode == capability.inode
-            and previous.uid == capability.uid
-        )
-        if same_identity and previous.mode == "read_write":
-            capability = PreviewCapability(
-                engine=capability.engine,
-                space=capability.space,
-                session_id=capability.session_id,
-                path=capability.path,
-                device=capability.device,
-                inode=capability.inode,
-                uid=capability.uid,
-                mode="read_write",
-                source=previous.source,
-                granted_at=capability.granted_at,
+        with self._mutation_lock:
+            self._observe_epoch()
+            if persist and self._invalidation_path.exists():
+                raise PreviewCapabilityError(
+                    "预览授权存储正在安全恢复，请稍后重试")
+            capability = self.inspect_path(
+                engine,
+                space,
+                session_id,
+                path,
+                mode=mode,
+                source=source,
             )
-        self._entries.pop(key, None)
-        self._entries[key] = capability
+            canonical = capability.path
+            key = self._key(engine, space, session_id, canonical)
+            entries = OrderedDict(self._entries)
+            previous = entries.get(key)
+            same_identity = (
+                previous is not None
+                and previous.device == capability.device
+                and previous.inode == capability.inode
+                and previous.uid == capability.uid
+            )
+            if same_identity and previous.mode == "read_write":
+                capability = PreviewCapability(
+                    engine=capability.engine,
+                    space=capability.space,
+                    session_id=capability.session_id,
+                    path=capability.path,
+                    device=capability.device,
+                    inode=capability.inode,
+                    uid=capability.uid,
+                    mode="read_write",
+                    source=previous.source,
+                    granted_at=capability.granted_at,
+                )
+            entries.pop(key, None)
+            entries[key] = capability
 
-        removed = self._trim_entries()
-        if persist:
-            self._persist_grant(capability, removed)
-        return capability
+            removed = self._trim_entries(entries)
+            persisted = (
+                self._persist_grant(capability, removed) if persist else None)
+            self._entries = persisted if persisted is not None else entries
+            return capability
 
     def inspect_path(
         self,
@@ -676,59 +785,59 @@ class PreviewCapabilityStore:
         session_id: str,
         path: str,
     ) -> None:
-        self._observe_epoch()
-        canonical = self._canonical_path(path)
-        key = self._key(engine, space, session_id, canonical)
-        self._entries.pop(key, None)
-        marker_created = False
-        try:
-            with self._exclusive_lock():
-                self._prepare_destructive_write_locked()
-                self._mark_invalid_locked()
-                marker_created = True
-                with self._connect() as connection:
-                    connection.execute(
-                        """
-                        DELETE FROM preview_capabilities
-                        WHERE engine=? AND space=? AND session_id=? AND path=?
-                        """,
-                        key,
-                    )
-                self._write_epoch_locked()
-                self._clear_invalidation_locked()
-                self._persistent = True
-        except Exception as exc:
-            self._persistent = False
-            self._entries.clear()
-            log.warning(
-                "preview capability revoke not persisted",
-                error_type=type(exc).__name__, marker_created=marker_created,
-            )
+        with self._mutation_lock:
+            self._observe_epoch()
+            canonical = self._canonical_path(path)
+            key = self._key(engine, space, session_id, canonical)
+            marker_created = False
+            try:
+                with self._invalidation_intent() as (descriptor, token):
+                    marker_created = True
+                    with self._exclusive_lock():
+                        if not self._marker_matches(descriptor, token):
+                            raise OSError(
+                                "preview invalidation ownership changed")
+                        self._sync_epoch_locked()
+                        self._initialize()
+                        with self._connect() as connection:
+                            connection.execute(
+                                """
+                                DELETE FROM preview_capabilities
+                                WHERE engine=? AND space=? AND session_id=? AND path=?
+                                """,
+                                key,
+                            )
+                        entries = self._read_entries()
+                        self._write_epoch_locked()
+                        self._clear_invalidation_locked(descriptor, token)
+                    self._entries = entries
+                    self._persistent = True
+            except Exception as exc:
+                self._persistent = False
+                self._entries = OrderedDict()
+                log.warning(
+                    "preview capability revoke not persisted",
+                    error_type=type(exc).__name__, marker_created=marker_created,
+                )
 
-    def rekey(
+    def _rekey_entries(
         self,
+        entries: OrderedDict[CapabilityKey, PreviewCapability],
         engine: str,
         space: str,
         old_session_id: str,
         new_session_id: str,
-        *,
-        persist: bool = True,
-    ) -> None:
-        self._observe_epoch()
+    ) -> list[CapabilityKey]:
         moving = [
             (key, capability)
-            for key, capability in self._entries.items()
+            for key, capability in entries.items()
             if key[:3] == (engine, space, old_session_id)
         ]
-        if old_session_id == new_session_id:
-            return
-        if not moving and not persist:
-            return
         for old_key, capability in moving:
-            self._entries.pop(old_key, None)
+            entries.pop(old_key, None)
             new_key = self._key(
                 engine, space, new_session_id, capability.path)
-            existing = self._entries.get(new_key)
+            existing = entries.get(new_key)
             same_identity = (
                 existing is not None
                 and existing.device == capability.device
@@ -755,7 +864,7 @@ class PreviewCapabilityStore:
                     capability.source if mode == capability.mode
                     else existing.source
                 )
-            self._entries[new_key] = PreviewCapability(
+            entries[new_key] = PreviewCapability(
                 engine=engine,
                 space=space,
                 session_id=new_session_id,
@@ -771,105 +880,144 @@ class PreviewCapabilityStore:
                     else selected.granted_at
                 ),
             )
-        self._entries = OrderedDict(sorted(
-            self._entries.items(),
-            key=lambda item: item[1].granted_at,
-        ))
-        removed = self._trim_entries()
-        if not persist:
+        ordered = OrderedDict(sorted(
+            entries.items(), key=lambda item: item[1].granted_at))
+        entries.clear()
+        entries.update(ordered)
+        return self._trim_entries(entries)
+
+    def rekey(
+        self,
+        engine: str,
+        space: str,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        persist: bool = True,
+    ) -> None:
+        if old_session_id == new_session_id:
             return
-        marker_created = False
-        try:
-            with self._exclusive_lock():
-                self._prepare_destructive_write_locked()
-                self._mark_invalid_locked()
-                marker_created = True
-                with self._connect() as connection:
-                    connection.execute(
-                        """
-                        DELETE FROM preview_capabilities
-                        WHERE engine=? AND space=? AND session_id=?
-                        """,
-                        (engine, space, old_session_id),
-                    )
-                    for key in removed:
-                        connection.execute(
-                            """
-                            DELETE FROM preview_capabilities
-                            WHERE engine=? AND space=? AND session_id=? AND path=?
-                            """,
-                            key,
-                        )
-                    for key, capability in self._entries.items():
-                        if key[:3] != (engine, space, new_session_id):
-                            continue
-                        connection.execute(
-                            """
-                            INSERT INTO preview_capabilities (
-                                engine, space, session_id, path, device, inode, uid,
-                                mode, source, granted_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(engine, space, session_id, path) DO UPDATE SET
-                                device=excluded.device,
-                                inode=excluded.inode,
-                                uid=excluded.uid,
-                                mode=excluded.mode,
-                                source=excluded.source,
-                                granted_at=excluded.granted_at
-                            """,
-                            (
-                                capability.engine,
-                                capability.space,
-                                capability.session_id,
-                                capability.path,
-                                str(capability.device),
-                                str(capability.inode),
-                                str(capability.uid),
-                                capability.mode,
-                                capability.source,
-                                capability.granted_at,
-                            ),
-                        )
-                self._write_epoch_locked()
-                self._clear_invalidation_locked()
-                self._persistent = True
-        except Exception as exc:
-            self._persistent = False
-            self._entries.clear()
-            log.warning(
-                "preview capability rekey not persisted",
-                error_type=type(exc).__name__, marker_created=marker_created,
-            )
+        with self._mutation_lock:
+            self._observe_epoch()
+            if not persist:
+                entries = OrderedDict(self._entries)
+                moving = any(
+                    key[:3] == (engine, space, old_session_id)
+                    for key in entries)
+                if not moving:
+                    return
+                self._rekey_entries(
+                    entries, engine, space, old_session_id, new_session_id)
+                self._entries = entries
+                return
+            marker_created = False
+            try:
+                with self._invalidation_intent() as (descriptor, token):
+                    marker_created = True
+                    with self._exclusive_lock():
+                        if not self._marker_matches(descriptor, token):
+                            raise OSError(
+                                "preview invalidation ownership changed")
+                        self._sync_epoch_locked()
+                        self._initialize()
+                        entries = self._read_entries()
+                        removed = self._rekey_entries(
+                            entries, engine, space,
+                            old_session_id, new_session_id)
+                        with self._connect() as connection:
+                            connection.execute(
+                                """
+                                DELETE FROM preview_capabilities
+                                WHERE engine=? AND space=? AND session_id=?
+                                """,
+                                (engine, space, old_session_id),
+                            )
+                            for key in removed:
+                                connection.execute(
+                                    """
+                                    DELETE FROM preview_capabilities
+                                    WHERE engine=? AND space=?
+                                      AND session_id=? AND path=?
+                                    """,
+                                    key,
+                                )
+                            for key, capability in entries.items():
+                                if key[:3] != (
+                                    engine, space, new_session_id
+                                ):
+                                    continue
+                                connection.execute(
+                                    """
+                                    INSERT INTO preview_capabilities (
+                                        engine, space, session_id, path,
+                                        device, inode, uid, mode, source,
+                                        granted_at
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    ON CONFLICT(
+                                        engine, space, session_id, path
+                                    ) DO UPDATE SET
+                                        device=excluded.device,
+                                        inode=excluded.inode,
+                                        uid=excluded.uid,
+                                        mode=excluded.mode,
+                                        source=excluded.source,
+                                        granted_at=excluded.granted_at
+                                    """,
+                                    (
+                                        capability.engine,
+                                        capability.space,
+                                        capability.session_id,
+                                        capability.path,
+                                        str(capability.device),
+                                        str(capability.inode),
+                                        str(capability.uid),
+                                        capability.mode,
+                                        capability.source,
+                                        capability.granted_at,
+                                    ),
+                                )
+                        self._write_epoch_locked()
+                        self._clear_invalidation_locked(descriptor, token)
+                    self._entries = entries
+                    self._persistent = True
+            except Exception as exc:
+                self._persistent = False
+                self._entries = OrderedDict()
+                log.warning(
+                    "preview capability rekey not persisted",
+                    error_type=type(exc).__name__, marker_created=marker_created,
+                )
 
     def remove_session(self, engine: str, session_id: str) -> None:
-        self._observe_epoch()
-        removed = [
-            key for key in self._entries
-            if key[0] == engine and key[2] == session_id
-        ]
-        for key in removed:
-            self._entries.pop(key, None)
-        marker_created = False
-        try:
-            with self._exclusive_lock():
-                self._prepare_destructive_write_locked()
-                self._mark_invalid_locked()
-                marker_created = True
-                with self._connect() as connection:
-                    connection.execute(
-                        """
-                        DELETE FROM preview_capabilities
-                        WHERE engine=? AND session_id=?
-                        """,
-                        (engine, session_id),
-                    )
-                self._write_epoch_locked()
-                self._clear_invalidation_locked()
-                self._persistent = True
-        except Exception as exc:
-            self._persistent = False
-            self._entries.clear()
-            log.warning(
-                "preview capability session cleanup not persisted",
-                error_type=type(exc).__name__, marker_created=marker_created,
-            )
+        with self._mutation_lock:
+            self._observe_epoch()
+            marker_created = False
+            try:
+                with self._invalidation_intent() as (descriptor, token):
+                    marker_created = True
+                    with self._exclusive_lock():
+                        if not self._marker_matches(descriptor, token):
+                            raise OSError(
+                                "preview invalidation ownership changed")
+                        self._sync_epoch_locked()
+                        self._initialize()
+                        with self._connect() as connection:
+                            connection.execute(
+                                """
+                                DELETE FROM preview_capabilities
+                                WHERE engine=? AND session_id=?
+                                """,
+                                (engine, session_id),
+                            )
+                        entries = self._read_entries()
+                        self._write_epoch_locked()
+                        self._clear_invalidation_locked(descriptor, token)
+                    self._entries = entries
+                    self._persistent = True
+            except Exception as exc:
+                self._persistent = False
+                self._entries = OrderedDict()
+                log.warning(
+                    "preview capability session cleanup not persisted",
+                    error_type=type(exc).__name__, marker_created=marker_created,
+                )

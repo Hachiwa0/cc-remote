@@ -87,6 +87,11 @@ class CodexForkJournal:
                 raise ValueError("fork alias identity differs from its canonical root")
             if entry.get("controls", {}) != canonical.get("controls", {}):
                 raise ValueError("fork alias controls differ from its canonical root")
+            if bool(entry.get("name_finalized")) != bool(
+                canonical.get("name_finalized")
+            ):
+                raise ValueError(
+                    "fork alias name state differs from its canonical root")
             compatible = {
                 "alias": {"intent", "submitted", "uncertain"},
                 "complete": {"complete"},
@@ -150,7 +155,7 @@ class CodexForkJournal:
             raise ValueError("invalid fork timestamp")
         controls = entry.get("controls", {})
         if not isinstance(controls, dict) or set(controls) - {
-            "model", "approval_policy", "permission_profile",
+            "model", "approval_policy", "permission_profile", "web_search",
         }:
             raise ValueError("invalid fork controls")
         model = controls.get("model")
@@ -168,6 +173,12 @@ class CodexForkJournal:
             not isinstance(profile, str) or not profile or len(profile) > 256
         ):
             raise ValueError("invalid fork permission profile")
+        web_search = controls.get("web_search")
+        if web_search is not None and web_search not in {"cached", "live"}:
+            raise ValueError("invalid fork web search mode")
+        name_finalized = entry.get("name_finalized")
+        if name_finalized is not None and not isinstance(name_finalized, bool):
+            raise ValueError("invalid fork name finalization state")
 
     def begin(
         self,
@@ -287,6 +298,30 @@ class CodexForkJournal:
     def complete(self, request_id: str, session_id: str) -> dict[str, Any]:
         with self._lock:
             return self._complete(request_id, session_id)
+
+    def mark_name_finalized(self, request_id: str) -> dict[str, Any]:
+        """Remember that a worktree fork title must never be applied again."""
+        if not isinstance(request_id, str) or not _SAFE_ID.fullmatch(request_id):
+            raise ForkJournalError("invalid fork request id")
+        with self._lock:
+            existing = self.entries.get(request_id)
+            if existing is None:
+                raise ForkJournalError("fork intent is missing")
+            if (existing.get("target") != "worktree"
+                    or existing.get("status") != "complete"):
+                raise ForkJournalError(
+                    "only a completed worktree fork can finalize its name")
+            source = existing.get("thread_source")
+            updated = OrderedDict(self.entries)
+            for key, value in tuple(updated.items()):
+                if value.get("thread_source") != source:
+                    continue
+                finalized = dict(value)
+                finalized["name_finalized"] = True
+                updated[key] = finalized
+            self._persist(updated)
+            self.entries = updated
+            return dict(updated[request_id])
 
     def _complete(self, request_id: str, session_id: str) -> dict[str, Any]:
         existing = self.entries.get(request_id)

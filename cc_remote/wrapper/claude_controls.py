@@ -135,12 +135,14 @@ class ClaudeControlStore:
         session_id: str,
         *,
         model: str | None,
+        effort: str | None,
         permission_mode: str | None,
     ) -> ClaudeControls:
         """Seed a new fork once without overwriting later child choices."""
         session_id = _canonical_session_id(session_id)
         controls = ClaudeControls(
             model=valid_claude_model(model),
+            effort=valid_claude_effort(effort),
             permission_mode=valid_claude_permission(permission_mode),
         )
         payload = controls.as_dict()

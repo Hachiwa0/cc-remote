@@ -9295,6 +9295,26 @@ try {
   ));
   assert.match(failedLoadedPageMarkup, /role="alert"/,
     "a later detail-page failure remains visible after the first page loaded");
+  const planOnlyMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
+    engine: "codex",
+    done: true,
+    openOverride: true,
+    blocks: [{
+      kind: "process",
+      item_id: "plan-only",
+      processKind: "plan",
+      phase: "end",
+      status: "succeeded",
+      title: "执行计划",
+      plan: [{ step: "检查实现", status: "completed" }],
+      done: true,
+    }],
+  }));
+  assert.match(planOnlyMarkup, /plan-progress-trigger/,
+    "a plan-only timeline keeps the compact plan control");
+  assert.doesNotMatch(planOnlyMarkup, /turn-process-head/,
+    "a plan-only timeline does not advertise an empty outer disclosure");
+  assert.doesNotMatch(planOnlyMarkup, />1 项</);
   const declinedMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     blocks: [{ kind: "process", item_id: "approval-denied", processKind: "hook",
       phase: "end", status: "declined", title: "Hook 已拒绝", done: false }],

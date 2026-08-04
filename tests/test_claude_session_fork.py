@@ -139,6 +139,7 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
         machine, _ = _resident_machine(monkeypatch)
         machine.sessions[PARENT].sdk = SimpleNamespace(
             model="claude-opus-5",
+            effort="max",
             permission_mode="acceptEdits",
         )
         visible_title = {"value": claude_fork_marker("request-1")}
@@ -164,10 +165,12 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
         await machine._handle_fork_session(command)
         inherited = machine._claude_controls.get(CHILD)
         assert inherited.model == "claude-opus-5"
+        assert inherited.effort == "max"
         assert inherited.permission_mode == "acceptEdits"
         assert machine._claude_forks.entries[
             "request-1"]["controls"] == {
                 "model": "claude-opus-5",
+                "effort": "max",
                 "permission_mode": "acceptEdits",
             }
 

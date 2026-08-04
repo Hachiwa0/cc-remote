@@ -114,6 +114,7 @@ def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):
         assert result.git_branch is None
         assert result.last_turn_id == "turn-2"
         assert duplicate.session_id == "forked-thread"
+        assert "request-1" not in machine._codex_fork_locks
 
         # A new wrapper process sees the completed result rather than relying on
         # the in-memory command ACK cache.
@@ -132,6 +133,7 @@ def test_codex_same_cwd_fork_inherits_model_and_permissions_once(monkeypatch):
         parent = _ctx()
         parent.sdk.approval = "on-request"
         parent.sdk.permission_profile = ":workspace"
+        parent.sdk.web_search = "live"
         machine.sessions = {"parent": parent}
         calls = []
 
@@ -158,14 +160,17 @@ def test_codex_same_cwd_fork_inherits_model_and_permissions_once(monkeypatch):
         assert calls[0][1]["model"] == "gpt-test"
         assert calls[0][1]["approvalPolicy"] == "on-request"
         assert calls[0][1]["permissions"] == ":workspace"
+        assert calls[0][1]["config"] == {"web_search": "live"}
         inherited = machine._codex_controls.get("forked-thread")
         assert inherited.approval_policy == "on-request"
         assert inherited.permission_profile == ":workspace"
+        assert inherited.web_search == "live"
         assert machine._codex_forks.entries[
             "request-1"]["controls"] == {
                 "model": "gpt-test",
                 "approval_policy": "on-request",
                 "permission_profile": ":workspace",
+                "web_search": "live",
             }
 
         machine._codex_controls.update(
@@ -265,7 +270,9 @@ def test_codex_same_cwd_fork_recovers_committed_rollout_intent(monkeypatch):
 def test_codex_same_cwd_fork_does_not_ack_when_result_journal_fails(monkeypatch):
     async def run():
         machine, transport = _mk_machine()
-        machine.sessions = {"parent": _ctx()}
+        parent = _ctx()
+        parent.sdk.web_search = "cached"
+        machine.sessions = {"parent": parent}
         calls = []
 
         async def rpc(method, params, cwd=None):
@@ -557,6 +564,37 @@ def test_codex_same_cwd_fork_pre_submit_failure_is_terminal(monkeypatch):
         assert [message.type for message in transport.sent][-2:] == [
             "error", "command_ack"]
         assert machine._codex_forks.entries["request-1"]["status"] == "rejected"
+        assert "request-1" not in machine._codex_fork_locks
+
+    asyncio.run(run())
+
+
+def test_codex_fork_submit_journal_failure_releases_intent_lock(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        machine.sessions = {"parent": _ctx()}
+
+        async def is_codex(_sid):
+            return True
+
+        def fail_submission(_request_id):
+            raise ForkJournalError("disk full")
+
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(
+            machine_module, "find_rollout_fork", lambda *_args: None)
+        monkeypatch.setattr(
+            machine._codex_forks, "claim_submission", fail_submission)
+        cmd = ForkSession(
+            session_id="parent", request_id="request-1",
+            last_turn_id="turn-2", client_id="client-1", cmd_id="cmd-1")
+
+        await machine._process_command(cmd)
+
+        assert [message.type for message in transport.sent][-2:] == [
+            "error", "command_ack"]
+        assert machine._codex_forks.entries["request-1"]["status"] == "intent"
+        assert "request-1" not in machine._codex_fork_locks
 
     asyncio.run(run())
 
@@ -564,7 +602,9 @@ def test_codex_same_cwd_fork_pre_submit_failure_is_terminal(monkeypatch):
 def test_codex_worktree_fork_uses_persistent_rpc_and_returns_correlated_result(monkeypatch):
     async def run():
         machine, transport = _mk_machine()
-        machine.sessions = {"parent": _ctx()}
+        parent = _ctx()
+        parent.sdk.web_search = "cached"
+        machine.sessions = {"parent": parent}
         calls = []
 
         async def rpc(method, params, cwd=None):
@@ -597,6 +637,7 @@ def test_codex_worktree_fork_uses_persistent_rpc_and_returns_correlated_result(m
             "threadSource": "cc-remote-fork:request-1",
             "model": "gpt-test",
             "approvalPolicy": "never",
+            "config": {"web_search": "cached"},
         }
         assert ("thread/name/set", {
             "threadId": "forked-thread", "name": "Feature fork",
@@ -607,8 +648,14 @@ def test_codex_worktree_fork_uses_persistent_rpc_and_returns_correlated_result(m
         assert result.request_id == "request-1"
         assert result.to == "client-1"
         assert transport.sent[-1] is result
+        duplicate = await machine._handle_fork_session_worktree(_command())
+        assert duplicate.session_id == "forked-thread"
+        assert sum(method == "thread/name/set" for method, *_ in calls) == 1
+        assert "request-1" not in machine._codex_fork_locks
         assert machine._codex_controls.get(
             "forked-thread").approval_policy == "never"
+        assert machine._codex_controls.get(
+            "forked-thread").web_search == "cached"
 
     asyncio.run(run())
 
@@ -639,6 +686,68 @@ def test_codex_cold_fork_does_not_restore_stale_named_over_granular(
             "model": "gpt-test",
             "permission_profile": ":workspace",
         }
+
+    asyncio.run(run())
+
+
+def test_worktree_retry_never_overwrites_name_after_journal_failure(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        machine.sessions = {"parent": _ctx()}
+        visible_name = {"value": None}
+        name_sets = []
+
+        async def rpc(method, params, cwd=None):
+            if method == "thread/list":
+                return {"data": []}
+            if method == "thread/fork":
+                return {"thread": {"id": "forked-thread"}}
+            if method == "thread/name/set":
+                visible_name["value"] = params["name"]
+                name_sets.append(params["name"])
+                return {}
+            if method == "thread/read":
+                return {"thread": {
+                    "id": "forked-thread",
+                    "forkedFromId": "parent",
+                    "cwd": cwd,
+                    "name": visible_name["value"],
+                }}
+            raise AssertionError(method)
+
+        async def is_codex(_sid): return True
+        async def list_sessions(_cmd): return None
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        monkeypatch.setattr(
+            machine_module, "prepare_worktree", lambda *_args: _spec())
+        monkeypatch.setattr(machine, "_ensure_codex_fork_reconciler",
+                            lambda *_args, **_kwargs: None)
+        original_finalize = machine._codex_forks.mark_name_finalized
+        attempts = 0
+
+        def fail_once(request_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ForkJournalError("disk full")
+            return original_finalize(request_id)
+
+        monkeypatch.setattr(
+            machine._codex_forks, "mark_name_finalized", fail_once)
+
+        with pytest.raises(machine_module._ForkOutcomeUncertain):
+            await machine._handle_fork_session_worktree(_command())
+        visible_name["value"] = "User renamed this thread"
+
+        result = await machine._handle_fork_session_worktree(_command())
+
+        assert result.session_id == "forked-thread"
+        assert visible_name["value"] == "User renamed this thread"
+        assert name_sets == ["Feature fork"]
+        assert machine._codex_forks.entries[
+            "request-1"]["name_finalized"] is True
 
     asyncio.run(run())
 
@@ -873,6 +982,7 @@ def test_codex_worktree_fork_restart_submitted_state_never_reforks(monkeypatch):
         assert not any(method == "thread/fork" for method, *_rest in calls)
         assert machine._codex_forks.entries[
             "request-1"]["status"] == "submitted"
+        assert "request-1" in machine._codex_fork_locks
         assert any(
             message.type == "error" and message.code == "fork_reconciling"
             for message in transport.sent
@@ -985,6 +1095,7 @@ def test_codex_worktree_background_reconcile_publishes_worktree_result(
         assert event.target == "worktree"
         assert event.cwd == "/state/worktrees/repo/fork-1/component"
         assert any(message.type == "command_ack" for message in transport.sent)
+        assert "request-1" not in machine._codex_fork_locks
 
     asyncio.run(run())
 
