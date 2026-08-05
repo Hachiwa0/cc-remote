@@ -666,8 +666,7 @@ export default function App() {
 
   useEffect(() => {
     if (!authed || !focusedSid || !focusedGoalScopeKey || state.newChat
-        || state.connState !== "connected" || !state.wrapperOnline
-        || !goalUiPreferencesRef.current[focusedGoalScopeKey]?.known) {
+        || state.connState !== "connected" || !state.wrapperOnline) {
       return;
     }
     const requestKey = `${wsLifecycleEpochRef.current}\0${focusedGoalScopeKey}`;
@@ -685,7 +684,10 @@ export default function App() {
       return {
         ...current,
         [focusedGoalScopeKey]: {
-          revealed: !preference?.hiddenGoal,
+          // Discover an existing Goal silently on a new browser/device. The
+          // authoritative non-null response reveals it; an exact local
+          // dismissal remains hidden across refreshes on this device.
+          revealed: !!preference?.known && !preference.hiddenGoal,
           open: false,
           loading: true,
         },
