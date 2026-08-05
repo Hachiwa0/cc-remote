@@ -505,6 +505,93 @@ def _history_goal_prompt_before_boundary(
     )
 
 
+def _history_goal_prompt_after_boundary(
+    path: str,
+    boundary_offset: int,
+    *,
+    max_scan_bytes: int = 4 * 1024 * 1024,
+) -> tuple[tuple[str, float | None] | None, bool]:
+    """Find a new Goal written just after one native task boundary.
+
+    The app-server may persist ``task_started`` before the correlated
+    ``thread_goal_updated`` record.  Scan only this task's bounded forward
+    segment and report whether a terminal/next boundary proves an empty result
+    is stable.  Reaching a growing rollout's EOF is deliberately not proof: a
+    later append must be allowed to repair the missing prompt.
+    """
+    if boundary_offset < 0:
+        return (None, False)
+    baseline_known, baseline_objective = (
+        _history_goal_objective_before_offset(path, boundary_offset)
+    )
+    try:
+        size = os.path.getsize(path)
+        source = open(path, "rb")
+    except (OSError, TypeError, ValueError):
+        return (None, False)
+    end_offset = min(size, boundary_offset + max_scan_bytes)
+    with source:
+        source.seek(boundary_offset)
+        boundary_line = source.readline(
+            _MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1,
+        )
+        boundary_raw = boundary_line.rstrip(b"\r\n")
+        if _history_turn_cursor(boundary_raw) is None:
+            return (None, False)
+        boundary_timestamp = _history_record_timestamp(boundary_raw)
+        for offset, line in _bounded_jsonl_records(
+            source, end_offset=end_offset,
+        ):
+            raw = line.encode("utf-8", "replace").rstrip(b"\r\n")
+            if _history_turn_cursor(raw) is not None:
+                return (None, True)
+            if _history_user_cursor(path, offset, raw) is not None:
+                return (None, True)
+            record = _history_goal_record(raw)
+            if record is not None:
+                kind, objective, created_at, updated_at, status = record
+                if kind == "cleared" or objective is None:
+                    baseline_known = True
+                    baseline_objective = None
+                    continue
+                changed = bool(
+                    objective != baseline_objective
+                    and (
+                        baseline_known
+                        or (
+                            created_at is not None
+                            and created_at == updated_at
+                        )
+                    )
+                )
+                baseline_known = True
+                baseline_objective = objective
+                goal_timestamp = _history_record_timestamp(raw)
+                if (
+                    changed
+                    and status == "active"
+                    and goal_timestamp is not None
+                    and boundary_timestamp is not None
+                    and 0 <= goal_timestamp - boundary_timestamp
+                    <= _GOAL_TURN_CORRELATION_SECONDS
+                ):
+                    return ((objective, goal_timestamp), True)
+                continue
+            if _history_terminal_marker(raw):
+                return (None, True)
+    return (None, False)
+
+
+def _history_goal_prompt_for_boundary(
+    path: str,
+    boundary_offset: int,
+) -> tuple[tuple[str, float | None] | None, bool]:
+    prompt = _history_goal_prompt_before_boundary(path, boundary_offset)
+    if prompt is not None:
+        return (prompt, True)
+    return _history_goal_prompt_after_boundary(path, boundary_offset)
+
+
 def _history_goal_objective_before_offset(
     path: str,
     offset: int,
@@ -601,9 +688,9 @@ def _history_boundaries(
             pending_assistant_only = None
     if (
         pending_assistant_only is not None
-        and _history_goal_prompt_before_boundary(
+        and _history_goal_prompt_for_boundary(
             path, pending_assistant_only[0],
-        ) is not None
+        )[0] is not None
     ):
         yield pending_assistant_only
 
@@ -756,9 +843,8 @@ def codex_history_boundary_user(
                 except (TypeError, ValueError):
                     pass
             return event
-    goal_prompt = _history_goal_prompt_before_boundary(
-        path, boundary_offset,
-    )
+    goal_prompt, _stable = _history_goal_prompt_for_boundary(
+        path, boundary_offset)
     if goal_prompt is None or user_index != 0:
         return None
     prompt, timestamp = goal_prompt
@@ -829,8 +915,10 @@ def codex_history_turn_users(
             boundary = _history_turn_cursor(line)
             if boundary not in targets:
                 continue
-            seen.add(boundary)
-            goal_prompt = _history_goal_prompt_before_boundary(path, offset)
+            goal_prompt, stable = _history_goal_prompt_for_boundary(
+                path, offset)
+            if stable:
+                seen.add(boundary)
             if goal_prompt is not None:
                 prompt, timestamp = goal_prompt
                 user = UserMsg(msg_id=boundary, prompt=prompt)
