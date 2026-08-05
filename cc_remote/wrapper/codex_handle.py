@@ -328,6 +328,31 @@ class _GoalPromptCandidate:
         self.deadline = deadline
 
 
+class _GoalReplacementFence:
+    """Track Goal objectives still draining behind newer replacements."""
+
+    __slots__ = (
+        "objective",
+        "current_turn_ids",
+        "retired_turn_ids",
+        "generation",
+        "authoritative",
+    )
+
+    def __init__(
+        self,
+        objective: str,
+        current_turn_ids: set[str],
+        retired_turn_ids: dict[str, set[str]],
+        generation: int,
+    ):
+        self.objective = objective
+        self.current_turn_ids = current_turn_ids
+        self.retired_turn_ids = retired_turn_ids
+        self.generation = generation
+        self.authoritative = False
+
+
 class _CodexCompactionContinuation:
     """One managed browser turn spanning native compact turn ids.
 
@@ -1137,6 +1162,11 @@ class CodexHandle:
         self._goal_baseline_loaded = False
         self._goal_prompt_pending: OrderedDict[str, str] = OrderedDict()
         self._goal_prompt_candidate: Optional[_GoalPromptCandidate] = None
+        # Prompt correlation ends as soon as turn/started claims its candidate.
+        # Keep retired objectives independently across response -> notification
+        # gaps. Authoritative external replacements extend the same fence so
+        # delayed old-turn updates cannot regress state after rapid edits either.
+        self._goal_replacement_fence: Optional[_GoalReplacementFence] = None
         # A goal/automatic continuation can start without query(), hence without
         # a response queue owned by Machine._run_turn.  Track that one turn
         # separately so the machine can lock the session, expose interrupt, and
@@ -1386,6 +1416,7 @@ class CodexHandle:
         self._goal_baseline_loaded = False
         self._goal_prompt_pending.clear()
         self._goal_prompt_candidate = None
+        self._goal_replacement_fence = None
         self._spontaneous_turn_id = None
         self._compaction_continuation_turn_id = None
         self._discard_managed_compaction_continuation()
@@ -2689,6 +2720,7 @@ class CodexHandle:
         self._spontaneous_turn_id = None
         self._compaction_continuation_turn_id = None
         self._goal_prompt_candidate = None
+        self._goal_replacement_fence = None
         self._discard_managed_compaction_continuation()
         self._clear_review_tracking()
         tasks = [t for t in (self._reader, self._stderr_task)
@@ -3096,12 +3128,198 @@ class CodexHandle:
             self._goal_objective_baseline = None
             self._goal_status_baseline = None
             self._goal_baseline_loaded = True
+            self._goal_replacement_fence = None
             return None
-        self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
+        candidate = _sanitize_thread_goal(goal, self.thread_id)
+        previous_objective = self._goal_objective_baseline
+        previous_goal_turn_id = self.last_goal_turn_id
+        self.last_goal = candidate
         self._goal_objective_baseline = self.last_goal.get("objective")
         self._goal_status_baseline = self.last_goal.get("status")
         self._goal_baseline_loaded = True
+        # Unlike a streamed snapshot, thread/goal/get reads the app-server's
+        # current persisted Goal. It is the escape hatch for an external client
+        # intentionally restoring the objective fenced below.
+        self._observe_goal_objective(
+            self.last_goal.get("objective"),
+            previous_objective=previous_objective,
+            previous_turn_ids=(
+                {previous_goal_turn_id}
+                if previous_goal_turn_id is not None else set()
+            ),
+            authoritative=True,
+        )
+        if self._goal_objective_baseline != previous_objective:
+            # A persisted snapshot has no turn attribution. Do not let the last
+            # extension turn from the replaced objective become the new
+            # objective's owner.
+            self.last_goal_turn_id = None
         return self.last_goal
+
+    def _current_goal_replacement_fence(
+        self,
+    ) -> Optional[_GoalReplacementFence]:
+        fence = self._goal_replacement_fence
+        if fence is None:
+            return None
+        if fence.generation != self._generation:
+            self._goal_replacement_fence = None
+            return None
+        return fence
+
+    def _observe_goal_objective(
+        self,
+        objective: Any,
+        *,
+        previous_objective: Any = None,
+        turn_id: Optional[str] = None,
+        previous_turn_ids: Optional[set[str]] = None,
+        authoritative: bool = False,
+    ) -> None:
+        """Advance one authoritative response/notification fence."""
+        fence = self._current_goal_replacement_fence()
+        if not isinstance(objective, str):
+            return
+        if fence is None and (authoritative or turn_id is not None):
+            observed_turn_ids = {turn_id} if turn_id is not None else set()
+            if objective == previous_objective:
+                observed_turn_ids.update(previous_turn_ids or set())
+            self._rotate_goal_replacement_fence(
+                objective,
+                previous_objective=previous_objective,
+                current_turn_ids=observed_turn_ids,
+                previous_turn_ids=previous_turn_ids,
+                authoritative=True,
+            )
+            return
+        if fence is not None and objective == fence.objective:
+            if (
+                isinstance(previous_objective, str)
+                and previous_objective
+                and previous_objective != objective
+            ):
+                known_previous_turn_ids = {
+                    item for item in (previous_turn_ids or set())
+                    if isinstance(item, str) and item
+                }
+                if known_previous_turn_ids:
+                    fence.retired_turn_ids.setdefault(
+                        previous_objective, set()
+                    ).update(known_previous_turn_ids)
+            fence.authoritative = True
+            if isinstance(turn_id, str) and turn_id:
+                fence.current_turn_ids.add(turn_id)
+            return
+        if not authoritative:
+            return
+        self._rotate_goal_replacement_fence(
+            objective,
+            previous_objective=previous_objective,
+            current_turn_ids={turn_id} if turn_id else set(),
+            previous_turn_ids=previous_turn_ids,
+            authoritative=True,
+        )
+
+    def _rotate_goal_replacement_fence(
+        self,
+        objective: str,
+        *,
+        previous_objective: Any,
+        current_turn_ids: Optional[set[str]] = None,
+        previous_turn_ids: Optional[set[str]] = None,
+        authoritative: bool,
+    ) -> None:
+        current = self._current_goal_replacement_fence()
+        retired_turn_ids = {
+            retired_objective: set(turn_ids)
+            for retired_objective, turn_ids in (
+                current.retired_turn_ids.items() if current is not None else ()
+            )
+        }
+        if (
+            current is not None
+            and current.authoritative
+            and current.objective != objective
+        ):
+            if current.current_turn_ids:
+                retired_turn_ids.setdefault(
+                    current.objective, set()
+                ).update(current.current_turn_ids)
+        if (
+            isinstance(previous_objective, str)
+            and previous_objective
+            and previous_objective != objective
+        ):
+            known_previous_turn_ids = {
+                item for item in (previous_turn_ids or set())
+                if isinstance(item, str) and item
+            }
+            if known_previous_turn_ids:
+                retired_turn_ids.setdefault(
+                    previous_objective, set()
+                ).update(known_previous_turn_ids)
+        replacement = _GoalReplacementFence(
+            objective,
+            {
+                item for item in (current_turn_ids or set())
+                if isinstance(item, str) and item
+            },
+            retired_turn_ids,
+            self._generation,
+        )
+        replacement.authoritative = authoritative
+        self._goal_replacement_fence = replacement
+
+    def _is_superseded_goal_update(
+        self,
+        candidate: dict[str, Any],
+        turn_id: Optional[str],
+    ) -> bool:
+        """Reject only old turns fenced by a Goal replacement.
+
+        The public Goal contract has no generation id. A permanent
+        different-objective filter would therefore drop legitimate replacements
+        made by another shared-daemon client. Retain objectives retired by
+        authoritative set responses, persisted reads, or accepted replacement
+        notifications. Quarantine observed old turn ids until their individual
+        drain boundary, clear, or reconnect. Without an old turn id, public
+        objective text cannot distinguish a delayed update from a legitimate
+        same-objective restore, so turn-owned updates remain authoritative.
+        Explicit set notifications use turnId=null and remain authoritative
+        even when another client restores that exact objective.
+        """
+        fence = self._current_goal_replacement_fence()
+        if (
+            fence is None
+            or not fence.authoritative
+            or not isinstance(turn_id, str)
+            or not turn_id
+        ):
+            return False
+        incoming_objective = candidate.get("objective")
+        if not isinstance(incoming_objective, str):
+            return False
+        retired_turn_ids = fence.retired_turn_ids.get(
+            incoming_objective, set()
+        )
+        if (
+            incoming_objective == fence.objective
+            and turn_id in fence.current_turn_ids
+        ):
+            return False
+        # A restored objective can have the same public text but a new automatic
+        # turn. The app-server does not expose its internal Goal generation id,
+        # so reject only turn ids observed on a retired generation.
+        superseded = turn_id in retired_turn_ids
+        if superseded and candidate.get("status") == "complete":
+            # Listener FIFO makes this the retired turn's drain boundary. Drop
+            # only that turn because multiple generations may reuse one public
+            # objective string.
+            if turn_id in retired_turn_ids:
+                retired_turn_ids.discard(turn_id)
+                if not retired_turn_ids:
+                    fence.retired_turn_ids.pop(incoming_objective, None)
+        return superseded
 
     def take_goal_prompt(self, turn_id: str) -> Optional[str]:
         """Consume the one visible objective owned by ``turn_id``."""
@@ -3184,8 +3402,27 @@ class CodexHandle:
             candidate_objective = objective or self._goal_objective_baseline
         if candidate_objective is not None:
             # thread/goal/set may synchronously emit turn/started before its RPC
-            # response. Seed the candidate first so that exact spontaneous turn
-            # can claim it even if the goal notification is delayed or omitted.
+            # response. Record the replacement and seed the prompt candidate
+            # before sending so both early notification orders stay correlated.
+            previous_objective = self._goal_objective_baseline
+            previous_turn_ids = {
+                turn_id for turn_id in (
+                    self.last_goal_turn_id,
+                    self.turn_id if self.turn_active else None,
+                )
+                if isinstance(turn_id, str) and turn_id
+            }
+            current_fence = self._current_goal_replacement_fence()
+            if (
+                current_fence is None
+                or current_fence.objective != candidate_objective
+            ):
+                self._rotate_goal_replacement_fence(
+                    candidate_objective,
+                    previous_objective=previous_objective,
+                    previous_turn_ids=previous_turn_ids,
+                    authoritative=False,
+                )
             self._seed_goal_prompt_candidate(candidate_objective)
         try:
             result = await self._request("thread/goal/set", params)
@@ -3196,10 +3433,27 @@ class CodexHandle:
         if not isinstance(goal, dict):
             self._goal_prompt_candidate = None
             raise RuntimeError("codex app-server did not return a goal")
+        response_previous_objective = self._goal_objective_baseline
+        response_previous_turn_id = self.last_goal_turn_id
         self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
         self._goal_objective_baseline = self.last_goal.get("objective")
         self._goal_status_baseline = self.last_goal.get("status")
         self._goal_baseline_loaded = True
+        self._observe_goal_objective(
+            self.last_goal.get("objective"),
+            previous_objective=response_previous_objective,
+            previous_turn_ids=(
+                {response_previous_turn_id}
+                if response_previous_turn_id is not None else set()
+            ),
+            authoritative=True,
+        )
+        if self._goal_objective_baseline != response_previous_objective:
+            # The RPC response itself is not tied to an automatic turn. An
+            # earlier matching notification already changed the baseline and
+            # therefore keeps its turn id; response-first ordering clears the
+            # previous objective's attribution until a notification arrives.
+            self.last_goal_turn_id = None
         if (
             self.last_goal.get("status") != "active"
         ):
@@ -3221,6 +3475,7 @@ class CodexHandle:
             self._goal_baseline_loaded = True
             self._goal_prompt_pending.clear()
             self._goal_prompt_candidate = None
+            self._goal_replacement_fence = None
         return cleared
 
     async def start_review(self, target: dict[str, Any]) -> dict[str, str]:
@@ -4087,6 +4342,7 @@ class CodexHandle:
                     self._proxy_read_buffer.clear()
                 self._compaction_continuation_turn_id = None
                 self._goal_prompt_candidate = None
+                self._goal_replacement_fence = None
                 self._discard_managed_compaction_continuation()
                 self._clear_review_tracking()
                 spontaneous_turn_id = self._spontaneous_turn_id
@@ -4518,6 +4774,10 @@ class CodexHandle:
                         self._goal_prompt_pending.move_to_end(turn_id)
                         while len(self._goal_prompt_pending) > 8:
                             self._goal_prompt_pending.popitem(last=False)
+                        self._observe_goal_objective(
+                            objective,
+                            turn_id=turn_id,
+                        )
                 # Managed query/review turns have their own authoritative user
                 # boundary. Never let a stale Goal candidate steal one.
                 self._goal_prompt_candidate = None
@@ -4592,7 +4852,24 @@ class CodexHandle:
                         error_type=type(exc).__name__,
                     )
                 else:
+                    raw_turn_id = params.get("turnId")
+                    explicit_goal_update = (
+                        "turnId" in params and raw_turn_id is None
+                    )
+                    turn_id = (
+                        raw_turn_id
+                        if isinstance(raw_turn_id, str) and raw_turn_id
+                        else None
+                    )
+                    if self._is_superseded_goal_update(goal, turn_id):
+                        log.warning(
+                            "superseded codex goal notification ignored",
+                            thread_id=self.thread_id,
+                            incoming_status=goal.get("status"),
+                        )
+                        return
                     previous_objective = self._goal_objective_baseline
+                    previous_goal_turn_id = self.last_goal_turn_id
                     objective = goal.get("objective")
                     created_at = goal.get("createdAt")
                     updated_at = goal.get("updatedAt")
@@ -4615,9 +4892,23 @@ class CodexHandle:
                         self._goal_baseline_loaded = True
                     self.goal_revision += 1
                     self._goal_status_baseline = goal.get("status")
-                    turn_id = params.get("turnId")
-                    self.last_goal_turn_id = (
-                        turn_id if isinstance(turn_id, str) and turn_id else None
+                    self.last_goal_turn_id = turn_id
+                    self._observe_goal_objective(
+                        objective,
+                        previous_objective=previous_objective,
+                        turn_id=turn_id,
+                        previous_turn_ids=(
+                            {previous_goal_turn_id}
+                            if previous_goal_turn_id is not None else set()
+                        ),
+                        authoritative=(
+                            explicit_goal_update
+                            or (
+                                isinstance(previous_objective, str)
+                                and isinstance(objective, str)
+                                and previous_objective != objective
+                            )
+                        ),
                     )
                     if goal.get("status") != "active":
                         self._goal_prompt_candidate = None
@@ -4651,6 +4942,7 @@ class CodexHandle:
                 self._goal_baseline_loaded = True
                 self._goal_prompt_pending.clear()
                 self._goal_prompt_candidate = None
+                self._goal_replacement_fence = None
                 self.goal_revision += 1
                 self.last_goal_turn_id = None
                 await self._publish_goal(None)
