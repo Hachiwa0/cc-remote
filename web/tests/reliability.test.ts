@@ -14116,6 +14116,157 @@ for (const sessionId of ["cached-list-session", "fresh-list-session"]) {
     "cached and refreshed responses share one exact request ownership",
   );
 }
+
+// Sidebar mutations and derived-session commands return SessionList using
+// their own transport cmd_id, not an id created by sendListSessions(). Each
+// path must therefore register the same frozen ownership before it is sent.
+listOwnershipRelay.setSessionEngines([
+  { session_id: "mutation-claude", engine: "claude", space: "code" },
+  { session_id: "mutation-codex", engine: "codex", space: "code" },
+]);
+const assertCommandListOwnership = (
+  sendCommand: () => unknown,
+  expectedType: string,
+  engine: "claude" | "codex",
+  space: "code" | "work" = "code",
+) => {
+  listOwnershipRelay.setSurface(engine, space);
+  sendCommand();
+  const frame = JSON.parse(
+    listOwnershipSocket.sent.at(-1) ?? "{}") as {
+      type?: string; cmd_id?: string;
+    };
+  assert.equal(frame.type, expectedType);
+  assert.equal(typeof frame.cmd_id, "string");
+  listOwnershipSocket.receive({
+    type: "session_list", engine, space,
+    request_id: frame.cmd_id,
+    sessions: [{ session_id: `${expectedType}-result`, engine, space }],
+  });
+  assert.equal(
+    listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+    `machine-list-order:${space}:${engine}`,
+    `${expectedType} refresh keeps its exact command-time ownership`,
+  );
+  return frame.cmd_id!;
+};
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendRenameSession(
+    "mutation-claude", "renamed", "claude", "code"),
+  "rename_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendArchiveSession(
+    "mutation-claude", true, "claude", "code"),
+  "archive_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendPinSession(
+    "mutation-claude", true, "claude", "code"),
+  "pin_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendDeleteSession(
+    "mutation-claude", "claude", "code"),
+  "delete_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendDeleteWorkSession(
+    "mutation-work", "claude"),
+  "delete_work_session", "claude", "work",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendForkSession(
+    "mutation-claude", "fork-point"),
+  "fork_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendForkSessionWorktree(
+    "mutation-codex", "review-fix"),
+  "fork_session_worktree", "codex",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendMigrateSession(
+    "mutation-codex", "/repo/new"),
+  "migrate_session", "codex",
+);
+
+// Mutation failures may be followed by an authoritative list that reconciles
+// an outcome the wrapper could not report atomically.
+listOwnershipRelay.setSurface("claude", "code");
+listOwnershipRelay.sendArchiveSession(
+  "mutation-claude", false, "claude", "code");
+const failedMutation = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.equal(typeof failedMutation.cmd_id, "string");
+listOwnershipSocket.receive({
+  type: "error", code: "internal", message: "outcome uncertain",
+  request_id: failedMutation.cmd_id,
+});
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: failedMutation.cmd_id,
+  sessions: [{ session_id: "archive-reconciled" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+  "an Error followed by its mutation list keeps exact request ownership",
+);
+
+// A newer mutation that terminates with Error only must not suppress an older
+// list that is still the newest authoritative response to actually arrive.
+// Claude rename/archive and several delete failures have exactly this shape.
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const listBeforeErrorOnlyMutation = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+listOwnershipRelay.sendRenameSession(
+  "mutation-claude", "rename-that-fails", "claude", "code");
+const errorOnlyMutation = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.equal(typeof errorOnlyMutation.cmd_id, "string");
+listOwnershipSocket.receive({
+  type: "error", code: "internal", message: "rename failed",
+  request_id: errorOnlyMutation.cmd_id,
+});
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: listBeforeErrorOnlyMutation.cmd_id,
+  sessions: [{ session_id: "list-survived-error-only-mutation" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+  "an Error-only mutation cannot suppress an older unconsumed list",
+);
+
+// Fork/migrate errors carry their stable product request_id rather than the
+// transport cmd_id used by SessionList. Correct ordering cannot depend on an
+// Error being able to identify and roll back the list ownership entry.
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const listBeforeFailedFork = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+const failedForkRequestId = "failed-fork-product-request";
+listOwnershipRelay.sendForkSession(
+  "mutation-claude", "fork-point", failedForkRequestId);
+const failedForkCommand = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.notEqual(failedForkCommand.cmd_id, failedForkRequestId);
+listOwnershipSocket.receive({
+  type: "error", code: "busy", message: "fork rejected",
+  request_id: failedForkRequestId,
+});
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: listBeforeFailedFork.cmd_id,
+  sessions: [{ session_id: "list-survived-failed-fork" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+  "a product-request fork error cannot strand an older list",
+);
+
 assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
 const supersededSameScopeRequest = JSON.parse(
   listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };

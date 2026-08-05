@@ -2126,19 +2126,21 @@ test("a page waits through post-touch momentum and restores its final boundary",
   // movements and unrelated row growth, then commit at the final idle point.
   await page.waitForTimeout(60);
   await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  let momentumScrollTop = 0;
   for (const top of [240, 420, 540]) {
-    await viewport.evaluate((node, scrollTop) => {
+    momentumScrollTop = await viewport.evaluate((node, scrollTop) => {
       node.scrollTop = scrollTop;
       node.dispatchEvent(new Event("scroll"));
+      return node.scrollTop;
     }, top);
     await page.waitForTimeout(50);
   }
-  await page.getByTestId("grow-row").click();
+  // Capture the final momentum boundary before any slow-runner command can
+  // legitimately cross the 260 ms idle lease and mount the staged page.
   const momentumEnd = await readingAnchor(page);
-  const momentumScrollTop = await viewport.evaluate((node) => node.scrollTop);
   expect(momentumScrollTop).toBeGreaterThan(200);
-  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
 
+  await page.getByTestId("grow-row").click();
   await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
   await expect.poll(async () => (await readingAnchor(page)).id)
     .toBe(momentumEnd.id);
@@ -2853,7 +2855,6 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   await expect(page.locator(
     `[data-turn-id="${startTurnId}"]`,
   )).toBeAttached();
-  const draggedAnchor = await readingAnchor(page);
   await page.mouse.up();
   await expect(viewport).toHaveAttribute(
     "data-text-selection-dragging", "false",
@@ -2867,11 +2868,13 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   const immediateReleasedScrollTop =
     await viewport.evaluate((node) => node.scrollTop);
   expect(immediateReleasedScrollTop - startScrollTop).toBeGreaterThan(800);
+  const nativeReleaseAdvance = immediateReleasedScrollTop - draggedScrollTop;
+  expect(nativeReleaseAdvance).toBeGreaterThanOrEqual(-2);
+  expect(nativeReleaseAdvance).toBeLessThan(viewportBox.height / 2);
   const immediateReleasedAnchor = await readingAnchor(page);
-  // Chromium may finish one native selection auto-scroll step on mouseup.
-  // Retain that released visual position; the app must not replay an older
-  // scroll command after the browser has handed control back.
-  expect(immediateReleasedAnchor.id).toBe(draggedAnchor.id);
+  // Chromium may finish one native selection auto-scroll step on mouseup and
+  // cross a virtual-row boundary. The post-release position is authoritative;
+  // the app must not replay an older scroll command after control returns.
   await page.waitForTimeout(120);
   const releasedAnchor = await readingAnchor(page);
   expect(releasedAnchor.id).toBe(immediateReleasedAnchor.id);

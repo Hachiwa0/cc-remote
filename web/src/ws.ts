@@ -41,6 +41,11 @@ export interface EventOwnership {
   connectionGeneration: number;
 }
 
+interface ListRequestOwnership {
+  ownership: EventOwnership;
+  order: number;
+}
+
 export function sessionScopeKey(
   machineId: string, engine: "claude" | "codex", space: Space,
 ): string {
@@ -159,8 +164,9 @@ export class RelayWs {
   private readonly ownershipBySession: Record<string, EventOwnership> = {};
   private readonly pendingOwnershipByRequest: Record<string, EventOwnership> = {};
   private readonly pendingListOwnershipByRequest =
-    new Map<string, EventOwnership>();
-  private readonly latestListRequestByScope = new Map<string, string>();
+    new Map<string, ListRequestOwnership>();
+  private readonly latestAcceptedListOrderByScope = new Map<string, number>();
+  private listRequestOrder = 0;
   private readonly pendingGoalOwnershipByRequest =
     new Map<string, EventOwnership>();
   private readonly pendingSwitchOwnership: Record<string, EventOwnership[]> = {};
@@ -549,26 +555,27 @@ export class RelayWs {
 
   sendForkSessionWorktree(parentSessionId: string, name: string,
                           requestId = uuid(), lastTurnId?: string): string | null {
-    const queued = this.send({
+    const queued = this.sendListRefreshingCommand({
       ...makeForkSessionWorktreeCommand(
         parentSessionId, name, requestId, nowTs(), lastTurnId),
-    });
+    }, "codex", "code") !== null;
     return queued ? requestId : null;
   }
 
   sendForkSession(parentSessionId: string, forkPointId: string,
                   requestId = uuid()): string | null {
-    const queued = this.send({
+    const engine = this.engineBySession[parentSessionId] ?? this.activeEngine;
+    const queued = this.sendListRefreshingCommand({
       ...makeForkSessionCommand(parentSessionId, forkPointId, requestId, nowTs()),
-    });
+    }, engine, "code") !== null;
     return queued ? requestId : null;
   }
 
   sendMigrateSession(sessionId: string, cwd: string,
                      requestId = uuid()): string | null {
-    const queued = this.send({
+    const queued = this.sendListRefreshingCommand({
       ...makeMigrateSessionCommand(sessionId, cwd, requestId, nowTs()),
-    });
+    }, "codex", "code") !== null;
     return queued ? requestId : null;
   }
 
@@ -1019,21 +1026,33 @@ export class RelayWs {
 
   sendListSessions(engine?: "claude" | "codex", space: Space = "code"): boolean {
     const targetEngine = engine ?? "claude";
-    const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    const commandId = uuid();
-    this.pendingListOwnershipByRequest.set(commandId, ownership);
+    return this.sendListRefreshingCommand(obj, targetEngine, space) !== null;
+  }
+
+  /** Session mutations return a SessionList correlated to the mutation's own
+   * cmd_id. Freeze the same request-time ownership used by an explicit list so
+   * those authoritative refreshes cannot borrow the surface active at receive
+   * time or be dropped as unowned. */
+  private sendListRefreshingCommand(
+    obj: Record<string, unknown>, engine: "claude" | "codex", space: Space,
+    commandId = uuid(),
+  ): string | null {
+    const ownership = this.ownershipSnapshot(engine, space);
+    this.pendingListOwnershipByRequest.set(commandId, {
+      ownership,
+      order: ++this.listRequestOrder,
+    });
     while (this.pendingListOwnershipByRequest.size > OUTBOX_MAX_COMMANDS) {
       const oldest = this.pendingListOwnershipByRequest.keys().next().value;
       if (typeof oldest !== "string") break;
       this.pendingListOwnershipByRequest.delete(oldest);
     }
     const queued = this.sendTracked(obj, commandId) !== null;
-    if (queued) this.latestListRequestByScope.set(ownership.scopeKey, commandId);
-    else this.pendingListOwnershipByRequest.delete(commandId);
-    return queued;
+    if (!queued) this.pendingListOwnershipByRequest.delete(commandId);
+    return queued ? commandId : null;
   }
 
   sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
@@ -1105,44 +1124,50 @@ export class RelayWs {
 
   sendRenameSession(sessionId: string, title: string,
                     engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
   sendArchiveSession(sessionId: string, archived: boolean,
                      engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
   sendPinSession(sessionId: string, pinned: boolean,
                  engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "pin_session", session_id: sessionId,
       pinned, ts: nowTs(),
     };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
   sendDeleteWorkSession(sessionId: string, engine: "claude" | "codex"): boolean {
-    return this.send({
+    return this.sendListRefreshingCommand({
       v: PROTOCOL_VERSION, type: "delete_work_session", session_id: sessionId,
       engine, space: "work", ts: nowTs(),
-    });
+    }, engine, "work") !== null;
   }
 
   sendDeleteSession(sessionId: string, engine: "claude" | "codex",
                     space: Space = "code"): boolean {
-    return this.send({
+    return this.sendListRefreshingCommand({
       v: PROTOCOL_VERSION, type: "delete_session", session_id: sessionId,
       engine, space, ts: nowTs(),
-    });
+    }, engine, space) !== null;
   }
 
   sendRollbackSession(sessionId: string, engine: "claude" | "codex",
@@ -1420,13 +1445,24 @@ export class RelayWs {
           const listedSpace = msg.space ?? "code";
           const scopeKey = sessionScopeKey(
             this.machineId, msg.engine, listedSpace);
-          const listedOwnership = msg.request_id
+          const listedRequest = msg.request_id
             ? this.pendingListOwnershipByRequest.get(msg.request_id)
             : undefined;
-          if (listedOwnership?.scopeKey === scopeKey
-              && this.latestListRequestByScope.get(scopeKey) === msg.request_id
-              && this.acceptsOwnership(listedOwnership, socketGeneration)) {
+          const acceptedOrder =
+            this.latestAcceptedListOrderByScope.get(scopeKey) ?? 0;
+          if (listedRequest
+              && listedRequest.ownership.scopeKey === scopeKey
+              && listedRequest.order >= acceptedOrder
+              && this.acceptsOwnership(
+                listedRequest.ownership, socketGeneration)) {
+            const listedOwnership = listedRequest.ownership;
             eventOwnership = listedOwnership;
+            // Advance only when a response is accepted, not when its command is
+            // sent. A newer Error-only mutation then cannot strand an older
+            // valid list, while cached + refreshed frames from one request keep
+            // sharing the same order and a truly newer accepted list wins.
+            this.latestAcceptedListOrderByScope.set(
+              scopeKey, listedRequest.order);
             for (const session of msg.sessions) {
               this.engineBySession[session.session_id] = msg.engine;
               this.spaceBySession[session.session_id] = listedSpace;
@@ -1435,7 +1471,10 @@ export class RelayWs {
           }
         }
         if (msg.type === "error" && msg.request_id) {
-          this.pendingListOwnershipByRequest.delete(msg.request_id);
+          // A failed mutation can deliberately send Error followed by its
+          // authoritative SessionList so the sidebar reconciles an uncertain
+          // outcome. Keep bounded list ownership for that possible second
+          // frame; Error alone never advances the accepted-response order.
           this.pendingGoalOwnershipByRequest.delete(msg.request_id);
         }
         if (msg.type === "session_focus") {
