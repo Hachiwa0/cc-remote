@@ -307,6 +307,10 @@ function sharesExactTurnAlias(first: TurnIdentity, second: TurnIdentity): boolea
   return [...exactTurnAliases(second)].some((alias) => firstAliases.has(alias));
 }
 
+function nativeTaskIdentity(turn: Turn): string | undefined {
+  return turn.liveTaskId ?? turn.forkPointId ?? turn.codexTurnId;
+}
+
 function compactionTurnAliases(turn: Turn): Set<string> {
   return new Set(turn.blocks.flatMap((block) =>
     block.kind === "process"
@@ -684,6 +688,18 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
   };
 }
 
+function restoreAuthoritativeLifecycle(merged: Turn, history: Turn): Turn {
+  return {
+    ...merged,
+    done: history.done,
+    interrupted: history.interrupted,
+    error: history.error,
+    progress: history.progress,
+    doneTs: history.doneTs,
+    durationMs: history.durationMs,
+  };
+}
+
 /** Merge previously-loaded heavyweight detail into a newer summary without
  * allowing stale detail lifecycle fields to reopen a steered/completed turn. */
 export function mergeAuthoritativeTurnDetail(
@@ -861,10 +877,15 @@ export function mergeInitialHistory(
   live: Turn[],
   options: {
     preserveLiveTailOpen?: boolean;
+    /** Exact visible row named as the newest authoritative History row.
+     * This binds a uniquely proven live block overlap while a steered row's
+     * client/native user alias is still materializing. It also lets a terminal
+     * page collapse the stale empty active shell left by an earlier snapshot. */
+    newestHistoryId?: string | null;
     /** A newest authoritative page may absorb a replay-created assistant row
      * only when native block identities prove that row belongs to one
      * canonical turn. Disabled for cache, pagination, re-key and detail merges. */
-    reconcileAuthoritativeReplayOrphans?: boolean;
+    reconcileReplayOrphans?: boolean;
   } = {},
 ): Turn[] {
   const merged = history.map((turn) => ({ ...turn, blocks: turn.blocks.map((b) => ({ ...b })) }));
@@ -897,7 +918,9 @@ export function mergeInitialHistory(
   reserveMatches(sameTurn);
 
   const replayOrphanMatches = new Set<number>();
-  if (options.reconcileAuthoritativeReplayOrphans) {
+  const activeReplayMatches = new Set<number>();
+  const authoritativeHeadDuplicateMatches = new Set<number>();
+  if (options.reconcileReplayOrphans) {
     const owners = new Map<string, Set<number>>();
     const addOwner = (key: string, historyIndex: number) => {
       const indexes = owners.get(key) ?? new Set<number>();
@@ -919,12 +942,27 @@ export function mergeInitialHistory(
         for (const key of blockKeys(block)) addOwner(key, historyIndex);
       }
     });
+    const authoritativeHistoryIndexes = options.newestHistoryId
+      ? merged.flatMap((turn, index) =>
+          exactTurnAliases(turn).has(options.newestHistoryId!)
+            ? [index] : [])
+      : [];
+    const authoritativeHistoryIndex = authoritativeHistoryIndexes.length === 1
+      ? authoritativeHistoryIndexes[0] : -1;
+    const primaryBlockKey = (block: Block): string => block.kind === "text"
+      ? `message:${block.message_id}`
+      : block.kind === "tool"
+        ? `tool:${block.tool_use_id}`
+        : `process:${block.item_id}`;
 
     const claims = new Map<number, number[]>();
     for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
       if (matches[liveIndex] >= 0) continue;
       const candidate = live[liveIndex];
-      if (candidate.prompt
+      const activeCandidate = authoritativeHistoryIndex >= 0
+        && liveIndex === live.length - 1
+        && !candidate.done;
+      if (!activeCandidate && (candidate.prompt
           || candidate.images?.length || candidate.imageRefs?.length
           || candidate.files?.length
           || candidate.clientMsgId || candidate.historyTurnId
@@ -932,20 +970,42 @@ export function mergeInitialHistory(
           || candidate.codexTurnId || candidate.liveTaskId
           || candidate.detailProjection
           || candidate.liveSpillBlocks?.length
-          || candidate.blocks.length === 0) continue;
-      const messageOwners = owners.get(`message:${candidate.id}`);
-      if (!messageOwners || messageOwners.size !== 1) continue;
-      const historyIndex = [...messageOwners][0];
+          || candidate.blocks.length === 0)) continue;
+      let historyIndex: number;
+      if (activeCandidate) {
+        historyIndex = authoritativeHistoryIndex;
+        const historyTurn = merged[historyIndex];
+        const historyNativeId = nativeTaskIdentity(historyTurn);
+        const candidateNativeId = nativeTaskIdentity(candidate);
+        if (candidateNativeId && historyNativeId
+            && candidateNativeId !== historyNativeId) continue;
+        const keys = [...new Set(candidate.blocks.map(primaryBlockKey))];
+        const shared = keys.some((key) => owners.get(key)?.has(historyIndex));
+        const conflicts = keys.some((key) => {
+          const keyOwners = owners.get(key);
+          return keyOwners != null && (
+            keyOwners.size !== 1 || !keyOwners.has(historyIndex)
+          );
+        });
+        if (!shared || conflicts) continue;
+      } else {
+        const messageOwners = owners.get(`message:${candidate.id}`);
+        if (!messageOwners || messageOwners.size !== 1) continue;
+        historyIndex = [...messageOwners][0];
+      }
       if (used.has(historyIndex)) continue;
-      const keys = candidate.blocks.flatMap(blockKeys);
-      if (keys.length === 0 || new Set(keys).size !== keys.length
-          || !keys.every((key) => {
-        const keyOwners = owners.get(key);
-        return keyOwners?.size === 1 && keyOwners.has(historyIndex);
-      })) continue;
+      if (!activeCandidate) {
+        const keys = candidate.blocks.flatMap(blockKeys);
+        if (keys.length === 0 || new Set(keys).size !== keys.length
+            || !keys.every((key) => {
+          const keyOwners = owners.get(key);
+          return keyOwners?.size === 1 && keyOwners.has(historyIndex);
+        })) continue;
+      }
       const candidates = claims.get(historyIndex) ?? [];
       candidates.push(liveIndex);
       claims.set(historyIndex, candidates);
+      if (activeCandidate) activeReplayMatches.add(liveIndex);
     }
     for (const [historyIndex, liveIndexes] of claims) {
       // Two provisional rows claiming one native assistant item are ambiguous;
@@ -956,6 +1016,44 @@ export function mergeInitialHistory(
       used.add(historyIndex);
       replayOrphanMatches.add(liveIndex);
     }
+
+    // An item-free active snapshot cannot safely bind a local steer: several
+    // visible steer segments may share one native task id. It therefore leaves
+    // an exact authoritative shell plus the accepted local row until native
+    // blocks arrive. At the terminal snapshot those exact block ids finally
+    // prove that the two local rows describe one newest history row. Allow only
+    // that unique tail candidate to join the already-reserved head; a shared
+    // task id, prompt, timestamp or display text never qualifies on its own.
+    if (authoritativeHistoryIndex >= 0
+        && matches.some((index) => index === authoritativeHistoryIndex)) {
+      const historyTurn = merged[authoritativeHistoryIndex];
+      const duplicateCandidates: number[] = [];
+      for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
+        if (matches[liveIndex] >= 0 || liveIndex !== live.length - 1) continue;
+        const candidate = live[liveIndex];
+        if (candidate.blocks.length === 0) continue;
+        const historyNativeId = nativeTaskIdentity(historyTurn);
+        const candidateNativeId = nativeTaskIdentity(candidate);
+        if (historyNativeId && candidateNativeId
+            && historyNativeId !== candidateNativeId) continue;
+        const keys = [...new Set(candidate.blocks.map(primaryBlockKey))];
+        const shared = keys.some((key) =>
+          owners.get(key)?.has(authoritativeHistoryIndex));
+        const conflicts = keys.some((key) => {
+          const keyOwners = owners.get(key);
+          return keyOwners != null && (
+            keyOwners.size !== 1
+            || !keyOwners.has(authoritativeHistoryIndex)
+          );
+        });
+        if (shared && !conflicts) duplicateCandidates.push(liveIndex);
+      }
+      if (duplicateCandidates.length === 1) {
+        const liveIndex = duplicateCandidates[0];
+        matches[liveIndex] = authoritativeHistoryIndex;
+        authoritativeHeadDuplicateMatches.add(liveIndex);
+      }
+    }
   }
 
   // Apply the precomputed mapping in original live order. Matching direction
@@ -964,6 +1062,26 @@ export function mergeInitialHistory(
     const liveTurn = live[liveIndex];
     const index = matches[liveIndex];
     if (index >= 0) {
+      if (authoritativeHeadDuplicateMatches.has(liveIndex)) continue;
+      if (activeReplayMatches.has(liveIndex)) {
+        const preserveLiveOpen = !!options.preserveLiveTailOpen
+          && liveTurn === live[live.length - 1]
+          && !liveTurn.done;
+        const bound = mergeTurn(
+          merged[index], liveTurn, preserveLiveOpen,
+        );
+        bound.blocks = mergeBlocks(
+          merged[index].blocks,
+          liveTurn.blocks,
+          preserveLiveOpen,
+          false,
+          false,
+        );
+        merged[index] = preserveLiveOpen
+          ? bound
+          : restoreAuthoritativeLifecycle(bound, merged[index]);
+        continue;
+      }
       if (replayOrphanMatches.has(liveIndex)) {
         // History owns row identity, lifecycle and detail authority. Preserve
         // only newer bytes for the exact native blocks proved above; a stale
@@ -991,6 +1109,27 @@ export function mergeInitialHistory(
     } else {
       unmatched.push({ ...liveTurn, blocks: liveTurn.blocks.map((b) => ({ ...b })) });
     }
+  }
+
+  // Apply a proven duplicate only after the ordinary exact match has refreshed
+  // the authoritative shell. This makes the accepted live id the stable React
+  // row id while preserving the native history id for detail/image requests.
+  for (const liveIndex of authoritativeHeadDuplicateMatches) {
+    const index = matches[liveIndex];
+    if (index < 0) continue;
+    const liveTurn = live[liveIndex];
+    const preserveLiveOpen = !!options.preserveLiveTailOpen && !liveTurn.done;
+    const bound = mergeTurn(merged[index], liveTurn, preserveLiveOpen);
+    bound.blocks = mergeBlocks(
+      merged[index].blocks,
+      liveTurn.blocks,
+      preserveLiveOpen,
+      false,
+      false,
+    );
+    merged[index] = preserveLiveOpen
+      ? bound
+      : restoreAuthoritativeLifecycle(bound, merged[index]);
   }
 
   const rows = [...merged, ...unmatched].map((turn, order) => ({ turn, order }));

@@ -211,6 +211,18 @@ export interface SessionRuntime {
   pendingHistoryCandidateBuildSeq: number | null;
   historyBuildSeq: number;
   historyLiveSeq: number;
+  // Sequence fence captured by the newest authoritative History head. An
+  // explicit TurnSteered owner may supersede that head only when its own
+  // downstream sequence is strictly newer. null means the producer supplied
+  // no ordering proof, so the exact History head remains authoritative.
+  historyFence: number | null;
+  // Latest ordered live-row owner and the downstream sequence which established
+  // it. This stays runtime-only and is never persisted as conversation content.
+  liveOwner: { turnId: string; seq: number } | null;
+  // A wrapper restart invalidated every unscoped liveTaskId fallback still
+  // present in the visible projection. New-generation events establish an
+  // ordered owner; old legacy identities remain ineligible for this generation.
+  legacyLiveFallbackBlocked: boolean;
   // A browser-triggered older-page response has been installed for the current
   // history revision/generation. Subsequent newest-page refreshes are only a
   // moving head window and must not discard those already-loaded older pages.
@@ -360,6 +372,7 @@ export function createRuntime(): SessionRuntime {
     historyGeneration: null, pendingHistoryGeneration: null,
     pendingHistoryCandidateBuildSeq: null,
     historyBuildSeq: 0, historyLiveSeq: 0,
+    historyFence: null, liveOwner: null, legacyLiveFallbackBlocked: false,
     lastLiveSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
@@ -630,6 +643,80 @@ function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn 
     || turn.forkPointId === id || turn.codexTurnId === id
     || mutableTurnBlocks(turn).some((block) => block.kind === "process"
       && block.turn_id === id));
+}
+
+function findExplicitLiveTaskOwner(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  newerThan?: number | null,
+): Turn | undefined {
+  // An ordered live row is the post-fence owner even when an early History
+  // snapshot has also painted an aliasless active shell. Message deltas carry
+  // no turn id, so prefer this binding before the provisional History head.
+  // Existing message/item ownership still wins at each call site, preserving
+  // delayed pre-fence updates on their old segment.
+  const owner = runtime.liveOwner;
+  const orderedOwner = owner
+    ? [...turns].reverse().find((turn) =>
+        !turn.done && turnHasIdentityAlias(turn, owner.turnId))
+    : undefined;
+  if (orderedOwner && (newerThan === undefined
+      || (newerThan != null && owner!.seq > newerThan))) {
+    return orderedOwner;
+  }
+  if (newerThan !== undefined) return undefined;
+  // After a wrapper restart, liveTaskId values left in the visible projection
+  // belong to the previous generation. Only the ordered owner established by
+  // a new-generation event is eligible for unbound narrative routing.
+  if (runtime.legacyLiveFallbackBlocked) return undefined;
+  return [...turns].reverse().find((turn) =>
+    !turn.done && !!turn.liveTaskId);
+}
+
+function remapExplicitLiveTaskOwner(
+  owner: SessionRuntime["liveOwner"],
+  turns: Turn[],
+): SessionRuntime["liveOwner"] {
+  if (!owner) return null;
+  const aliases = turns.filter((turn) =>
+    turnHasIdentityAlias(turn, owner.turnId));
+  return aliases.length === 1
+    ? { ...owner, turnId: aliases[0].id }
+    : null;
+}
+
+function findCurrentUnownedLiveOwner(
+  runtime: SessionRuntime, turns: Turn[],
+): Turn | undefined {
+  const authoritativeHead = findAuthoritativeActiveHistoryHead(runtime, turns);
+  if (!authoritativeHead) return findExplicitLiveTaskOwner(runtime, turns);
+  // An ordered live row only supersedes this exact History head when its
+  // downstream sequence proves it was created after the head's live fence.
+  // Array order is not evidence: a summary row can lack timestamps and sort
+  // ahead of an older local owner after Command+R.
+  return findExplicitLiveTaskOwner(
+    runtime, turns, runtime.historyFence,
+  )
+    ?? authoritativeHead;
+}
+
+function openUnboundLiveTurn(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  fallbackId: string,
+  ts?: number,
+): Turn {
+  const owner = findCurrentUnownedLiveOwner(runtime, turns);
+  if (owner) return owner;
+  if (!runtime.legacyLiveFallbackBlocked) {
+    return openTurn(turns, fallbackId, ts);
+  }
+  // openTurn deliberately reuses an unfinished tail for generation-less
+  // legacy streams. Across a wrapper restart that tail belongs to the old
+  // sequence domain, so establish a distinct row even while it remains open.
+  const turn = { id: fallbackId, prompt: "", blocks: [], done: false, ts };
+  turns.push(turn);
+  return turn;
 }
 
 function turnHasBoundEngineId(turn: Turn): boolean {
@@ -1119,7 +1206,10 @@ function unfinishedLiveTail(turns: Turn[], hydratedCacheTurnIds: string[]): Turn
  * envelope's `in_progress` bit plus its exact `newest_id` are authoritative;
  * recency, prompt text and timestamps are not. */
 function reopenAuthoritativeActiveHistoryHead(
-  turns: Turn[], newestId: string | null | undefined,
+  runtime: SessionRuntime,
+  turns: Turn[],
+  newestId: string | null | undefined,
+  ownerFenceSeq: number | null | undefined,
 ): Turn[] {
   if (!newestId) return turns;
   const matches = turns.map((turn, index) => ({ turn, index })).filter(
@@ -1128,6 +1218,15 @@ function reopenAuthoritativeActiveHistoryHead(
   );
   if (matches.length !== 1) return turns;
   const { turn, index } = matches[0];
+  const explicitLiveOwner = findExplicitLiveTaskOwner(
+    runtime, turns, ownerFenceSeq ?? null,
+  );
+  if (explicitLiveOwner) {
+    // The active native task is already owned by a newer ordered steer row.
+    // Until block identity proves both aliases are the same visible segment,
+    // leave this History shell terminal instead of displaying two spinners.
+    return turns;
+  }
   // forkPointId is the native task ownership proof supplied by Codex history.
   // Without it an active-but-not-yet-materialized head could make us reopen the
   // previous completed prompt.
@@ -1162,7 +1261,16 @@ function markTurnAsLive(
   eventSeq?: number | null,
 ): void {
   if (!liveEvent) return;
-  if (typeof eventSeq === "number") {
+  if (runtime.legacyLiveFallbackBlocked) {
+    runtime.liveOwner = {
+      turnId,
+      seq: eventSeq != null
+        ? eventSeq
+        : runtime.liveOwner?.turnId === turnId
+          ? runtime.liveOwner.seq : 0,
+    };
+  }
+  if (eventSeq != null) {
     runtime.lastLiveSeq = Math.max(runtime.lastLiveSeq, eventSeq);
   }
   if (runtime.hydratedCacheTurnIds.length > 0) {
@@ -1215,6 +1323,13 @@ function switchControlGeneration(
   runtime: SessionRuntime, generation: string | null | undefined,
 ): void {
   if (!generation) return;
+  const orderingGeneration = runtime.controlGeneration
+    ?? runtime.historyGeneration;
+  if (orderingGeneration != null && orderingGeneration !== generation) {
+    runtime.historyFence = null;
+    runtime.liveOwner = null;
+    runtime.legacyLiveFallbackBlocked = true;
+  }
   if (runtime.historyGeneration !== null
       && generation !== runtime.historyGeneration) {
     runtime.liveDetailTurnIds = [];
@@ -2240,11 +2355,25 @@ function reduceEvent(
       const { old_key, session_id } = e;
       if (old_key === session_id) return state;
       const runtimes = { ...state.runtimes };
+      let rekeyGenerationConflict = false;
       if (runtimes[old_key]) {
         const source = runtimes[old_key];
         const target = runtimes[session_id];
         if (target) {
-          const mergedTurns = [...target.turns];
+          const sourceOrderingGeneration = source.controlGeneration
+            ?? source.historyGeneration;
+          const targetOrderingGeneration = target.controlGeneration
+            ?? target.historyGeneration;
+          const orderingGenerationConflict = sourceOrderingGeneration != null
+            && targetOrderingGeneration != null
+            && sourceOrderingGeneration !== targetOrderingGeneration;
+          rekeyGenerationConflict = orderingGenerationConflict;
+          const mergeTarget = orderingGenerationConflict ? source : target;
+          // The temp runtime belongs to the generation which captured the real
+          // id. A durable runtime from an older wrapper cannot contribute its
+          // transcript, wrapper-owned queue or ordering watermarks.
+          const mergedTurns = orderingGenerationConflict
+            ? [] : [...target.turns];
           const usedTargetIndexes = new Set<number>();
           for (let sourceIndex = 0; sourceIndex < source.turns.length;
             sourceIndex += 1) {
@@ -2269,90 +2398,129 @@ function reduceEvent(
             if (merged) mergedTurns[targetIndex] = merged;
             usedTargetIndexes.add(targetIndex);
           }
-          const mergedControlGeneration =
-            source.controlGeneration ?? target.controlGeneration;
+          const mergedControlGeneration = source.controlGeneration
+            ?? mergeTarget.controlGeneration ?? sourceOrderingGeneration;
           const mergedControl = source.controlGeneration
-              && source.controlGeneration !== target.controlGeneration
+                && source.controlGeneration !== mergeTarget.controlGeneration
             ? source.control
-            : newestSessionControl(target.control, source.control);
-          const lifecycleRuntime = source.lastLifecycleSeq > target.lastLifecycleSeq
-            ? source
-            : target.lastLifecycleSeq > source.lastLifecycleSeq
-              ? target
-              : source.state !== "idle" && target.state === "idle"
-                ? source
-                : target.state !== "idle" && source.state === "idle"
-                  ? target
-                  : source;
+            : newestSessionControl(mergeTarget.control, source.control);
+          const lifecycleRuntime =
+            source.lastLifecycleSeq > mergeTarget.lastLifecycleSeq
+              ? source
+              : mergeTarget.lastLifecycleSeq > source.lastLifecycleSeq
+                ? mergeTarget
+                : source.state !== "idle" && mergeTarget.state === "idle"
+                  ? source
+                  : mergeTarget.state !== "idle" && source.state === "idle"
+                    ? mergeTarget
+                    : source;
+          const sameLiveOrderingScope = sourceOrderingGeneration != null
+            && sourceOrderingGeneration === (
+              mergeTarget.controlGeneration ?? mergeTarget.historyGeneration);
+          const sameHistoryOrderingScope = sameLiveOrderingScope
+            && source.historyRevision != null
+            && source.historyRevision === mergeTarget.historyRevision;
+          const sourceLiveTaskOwner = source.liveOwner;
+          const targetLiveTaskOwner = mergeTarget.liveOwner;
+          const mergedLiveTaskOwner = sameLiveOrderingScope
+              && targetLiveTaskOwner && (!sourceLiveTaskOwner
+                || targetLiveTaskOwner.seq > sourceLiveTaskOwner.seq)
+            ? targetLiveTaskOwner : sourceLiveTaskOwner ?? targetLiveTaskOwner;
           const mergedRuntime: SessionRuntime = {
             ...target,
             ...source,
             control: null,
             controlGeneration: null,
             hasRevisionedControl:
-              target.hasRevisionedControl || source.hasRevisionedControl,
+              orderingGenerationConflict
+                ? source.hasRevisionedControl
+                : target.hasRevisionedControl || source.hasRevisionedControl,
             state: lifecycleRuntime.state,
             mirroredRunning: lifecycleRuntime.mirroredRunning,
-            syncReady: target.syncReady || source.syncReady,
+            syncReady: mergeTarget.syncReady || source.syncReady,
             historyInvalidated:
-              target.historyInvalidated || source.historyInvalidated,
+              mergeTarget.historyInvalidated || source.historyInvalidated,
             historyRevision:
-              source.historyRevision ?? target.historyRevision,
+              source.historyRevision ?? mergeTarget.historyRevision,
             pendingHistoryRevision:
-              source.pendingHistoryRevision ?? target.pendingHistoryRevision,
+              source.pendingHistoryRevision ?? mergeTarget.pendingHistoryRevision,
             historyBuildSeq: source.historyRevision == null
-              ? target.historyBuildSeq
-              : source.historyRevision === target.historyRevision
-                ? Math.max(source.historyBuildSeq, target.historyBuildSeq)
+              ? mergeTarget.historyBuildSeq
+              : sameHistoryOrderingScope
+                ? Math.max(
+                    source.historyBuildSeq, mergeTarget.historyBuildSeq)
                 : source.historyBuildSeq,
             historyLiveSeq: source.historyRevision == null
-              ? target.historyLiveSeq
-              : source.historyRevision === target.historyRevision
-                ? Math.max(source.historyLiveSeq, target.historyLiveSeq)
+              ? mergeTarget.historyLiveSeq
+              : sameHistoryOrderingScope
+                ? Math.max(
+                    source.historyLiveSeq, mergeTarget.historyLiveSeq)
                 : source.historyLiveSeq,
+            historyFence: source.historyRevision == null
+              ? mergeTarget.historyFence
+              : sameHistoryOrderingScope
+                ? source.historyFence == null
+                  ? mergeTarget.historyFence
+                  : mergeTarget.historyFence == null
+                    ? source.historyFence
+                    : Math.max(
+                        source.historyFence,
+                        mergeTarget.historyFence,
+                      )
+                : source.historyFence,
+            liveOwner: mergedLiveTaskOwner,
             historyGeneration: source.historyRevision == null
-              ? target.historyGeneration : source.historyGeneration,
+              ? mergeTarget.historyGeneration : source.historyGeneration,
             pendingHistoryGeneration:
-              source.pendingHistoryGeneration ?? target.pendingHistoryGeneration,
+              source.pendingHistoryGeneration
+                ?? mergeTarget.pendingHistoryGeneration,
             pendingHistoryCandidateBuildSeq: source.historyInvalidated
               ? source.pendingHistoryCandidateBuildSeq
-              : target.pendingHistoryCandidateBuildSeq,
+              : mergeTarget.pendingHistoryCandidateBuildSeq,
             historyNewestId: source.historyRevision == null
-              ? target.historyNewestId : source.historyNewestId,
-            lastLiveSeq: Math.max(source.lastLiveSeq, target.lastLiveSeq),
+              ? mergeTarget.historyNewestId : source.historyNewestId,
+            lastLiveSeq: Math.max(
+              source.lastLiveSeq, mergeTarget.lastLiveSeq),
             lastLifecycleSeq: Math.max(
-              source.lastLifecycleSeq, target.lastLifecycleSeq),
+              source.lastLifecycleSeq, mergeTarget.lastLifecycleSeq),
             hydratedCacheTurnIds: Array.from(new Set([
-              ...target.hydratedCacheTurnIds,
-              ...source.hydratedCacheTurnIds,
-            ])),
+                  ...mergeTarget.hydratedCacheTurnIds,
+                  ...source.hydratedCacheTurnIds,
+                ])),
             liveDetailTurnIds: Array.from(new Set([
-              ...target.liveDetailTurnIds,
-              ...source.liveDetailTurnIds,
-            ])).slice(-MAX_LIVE_DETAIL_TURN_IDS),
+                  ...mergeTarget.liveDetailTurnIds,
+                  ...source.liveDetailTurnIds,
+                ])).slice(-MAX_LIVE_DETAIL_TURN_IDS),
             ccSessionId: session_id,
             turns: mergedTurns,
-            queue: [...source.queue, ...target.queue],
-            pendingSend: source.pendingSend ?? target.pendingSend,
+            queue: orderingGenerationConflict
+              ? [...source.queue] : [...source.queue, ...target.queue],
+            pendingSend: source.pendingSend ?? mergeTarget.pendingSend,
             failedDeferred: [
               ...source.failedDeferred,
-              ...target.failedDeferred.filter((query) => (
+              ...mergeTarget.failedDeferred.filter((query) => (
                 !source.failedDeferred.some(
                   (sourceQuery) => sourceQuery.msg_id === query.msg_id)
               )),
             ],
             acceptancePending:
-              source.acceptancePending ?? target.acceptancePending,
+              source.acceptancePending ?? mergeTarget.acceptancePending,
             acceptanceKind: source.acceptancePending
-              ? source.acceptanceKind : target.acceptanceKind,
+              ? source.acceptanceKind : mergeTarget.acceptanceKind,
             acceptanceHistoryBaseline: source.acceptancePending
               ? source.acceptanceHistoryBaseline
-              : target.acceptanceHistoryBaseline,
-            notices: mergeNotices(target.notices, source.notices),
+              : mergeTarget.acceptanceHistoryBaseline,
+            notices: mergeNotices(mergeTarget.notices, source.notices),
           };
           switchControlGeneration(mergedRuntime, mergedControlGeneration);
           if (mergedControl) applySessionControl(mergedRuntime, mergedControl);
           replaceWithBoundedTurns(mergedRuntime, mergedTurns);
+          // switchControlGeneration intentionally clears cross-generation
+          // sequence evidence. Restore only the owner already filtered to the
+          // source generation above, then bind it to a row which survived the
+          // bounded merge.
+          mergedRuntime.liveOwner = remapExplicitLiveTaskOwner(
+            mergedLiveTaskOwner, mergedRuntime.turns);
           runtimes[session_id] = mergedRuntime;
         } else {
           runtimes[session_id] = { ...source, ccSessionId: session_id };
@@ -2394,14 +2562,20 @@ function reduceEvent(
       }
       const historyRecovery = state.historyRecovery?.sid === old_key
         ? { ...state.historyRecovery, sid: session_id }
-        : state.historyRecovery;
+        : rekeyGenerationConflict
+            && state.historyRecovery?.sid === session_id
+          ? null : state.historyRecovery;
       // A new session cannot have deep authoritative history yet. Keeping a
       // temp-keyed browse projection through re-key would also leave its page
       // cache under the wrong durable identity.
       const historyBrowse = state.historyBrowse?.sid === old_key
+          || (rekeyGenerationConflict
+            && state.historyBrowse?.sid === session_id)
         ? null : state.historyBrowse;
       const retainedHistoryBrowse =
         state.retainedHistoryBrowse?.sid === old_key
+          || (rekeyGenerationConflict
+            && state.retainedHistoryBrowse?.sid === session_id)
           ? null : state.retainedHistoryBrowse;
       const artifact = state.artifact?.sid === old_key
         ? { ...state.artifact, sid: session_id }
@@ -2508,6 +2682,8 @@ function reduceEvent(
         // pre-rollback build from that same generation must remain rejectable.
         rt.historyBuildSeq = 0;
         rt.historyLiveSeq = 0;
+        rt.historyFence = null;
+        rt.liveOwner = null;
         rt.hasLoadedOlderHistory = false;
         rt.hydratedCacheTurnIds = [];
         rt.liveDetailTurnIds = [];
@@ -2814,7 +2990,8 @@ function reduceEvent(
           // wrapper without that field falls back to the local runtime state.
           preserveLiveTailOpen: racedLiveEvent || e.in_progress === true
             || (e.in_progress == null && base.state !== "idle"),
-          reconcileAuthoritativeReplayOrphans: true,
+          newestHistoryId: e.newest_id ?? null,
+          reconcileReplayOrphans: true,
         });
         if (acceptanceConfirmed && base.acceptancePending
             && (base.acceptanceKind === "steer"
@@ -2898,7 +3075,7 @@ function reduceEvent(
           && base.lastLifecycleSeq <= e.live_seq));
       if (currentRunningHistory) {
         turns = reopenAuthoritativeActiveHistoryHead(
-          turns, e.newest_id);
+          base, turns, e.newest_id, e.live_seq);
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
@@ -2998,6 +3175,9 @@ function reduceEvent(
             historyLiveSeq: acceptsControlState
               ? (e.live_seq ?? base.historyLiveSeq)
               : base.historyLiveSeq,
+            historyFence: acceptsControlState
+              ? (e.live_seq ?? null)
+              : base.historyFence,
             historyNewestId: acceptsControlState
               ? (Object.prototype.hasOwnProperty.call(e, "newest_id")
                   ? (e.newest_id ?? null)
@@ -3671,6 +3851,8 @@ function reduceEvent(
             // Never compare the new generation against old live/build watermarks.
             rt.historyBuildSeq = 0;
             rt.historyLiveSeq = 0;
+            rt.historyFence = null;
+            rt.liveOwner = null;
             rt.historyGeneration = null;
             rt.historyNewestId = null;
             rt.lastLiveSeq = 0;
@@ -3953,6 +4135,16 @@ function reduceEvent(
           existing.ts ??= stamp;
           existing.clientMsgId ??= e.msg_id;
           existing.liveTaskId ??= e.turn_id;
+          if (boundCompletedTurns && typeof e.seq === "number") {
+            rt.liveOwner = {
+              turnId: existing.id,
+              seq: Math.max(
+                rt.liveOwner?.turnId === existing.id
+                  ? rt.liveOwner.seq : 0,
+                e.seq,
+              ),
+            };
+          }
           markTurnAsLive(rt, existing.id, boundCompletedTurns, e.seq);
           rt.turns = turns;
           return;
@@ -3985,6 +4177,9 @@ function reduceEvent(
           turns.push(existing);
         }
         if (localAcceptance) clearAcceptance(rt);
+        if (boundCompletedTurns && typeof e.seq === "number") {
+          rt.liveOwner = { turnId: existing.id, seq: e.seq };
+        }
         markTurnAsLive(rt, existing.id, boundCompletedTurns, e.seq);
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
@@ -3999,8 +4194,8 @@ function reduceEvent(
         const turns = cloneTurns(rt.turns);
         const t = findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
-          ?? findAuthoritativeActiveHistoryHead(rt, turns)
-          ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
+          ?? openUnboundLiveTurn(
+            rt, turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const block = mutableTurnBlocks(t).find((b) => b.kind === "text"
@@ -4018,8 +4213,8 @@ function reduceEvent(
         const turns = cloneTurns(rt.turns);
         const t = findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
-          ?? findAuthoritativeActiveHistoryHead(rt, turns)
-          ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
+          ?? openUnboundLiveTurn(
+            rt, turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         let block = mutableTurnBlocks(t).find((b) => b.kind === "text"
@@ -4044,8 +4239,8 @@ function reduceEvent(
         const t = findTurnOwningItem(turns, e.tool_use_id)
           ?? findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
-          ?? findAuthoritativeActiveHistoryHead(rt, turns)
-          ?? openTurn(turns, e.message_id, eventTimestampMs(e.ts));
+          ?? openUnboundLiveTurn(
+            rt, turns, e.message_id, eventTimestampMs(e.ts));
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         t.progress = undefined;

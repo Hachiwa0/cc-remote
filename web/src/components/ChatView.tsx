@@ -45,6 +45,7 @@ import type { TextSelectionGuard } from "../history-selection-guard";
 import { HistoryUserImage } from "./HistoryUserImage";
 import {
   HistoryAnchorController,
+  HistoryPageActivityController,
   historyPageStatus,
   isAtHistoryEdge,
   isAtLatestEdge,
@@ -54,6 +55,7 @@ import {
   shouldAutoLoadNewerHistory,
   ScrollFollowController,
   type HistoryAnchorPoint,
+  type HistoryPageActivity,
   type HistoryPageDirection,
   type ScrollFollowSnapshot,
   type ScrollMetrics,
@@ -122,6 +124,23 @@ interface HistoryViewportPresentation {
   windowEpoch: number;
 }
 
+interface HistoryPageRequestTransaction {
+  sid: string | null;
+  revision: string | null;
+  authorityScope: string;
+  viewId: string | null;
+  direction: HistoryPageDirection;
+  before: string | null;
+  windowEpoch: number;
+  activityKey: number;
+}
+
+interface HistoryViewportScopeTransition {
+  source: HistoryViewportPresentation;
+  request: HistoryPageRequestTransaction;
+  presentation: HistoryViewportPresentation;
+}
+
 function sameHistoryViewportPresentation(
   left: HistoryViewportPresentation,
   right: HistoryViewportPresentation,
@@ -135,6 +154,24 @@ function sameHistoryViewportPresentation(
     && left.browseMode === right.browseMode
     && left.hasNewer === right.hasNewer
     && left.windowEpoch === right.windowEpoch;
+}
+
+function acceptedHistoryViewportTransition(
+  leaseActive: boolean,
+  transition: HistoryViewportScopeTransition | null,
+  request: HistoryPageRequestTransaction | null,
+  presented: HistoryViewportPresentation,
+  incoming: HistoryViewportPresentation,
+): HistoryViewportPresentation | null {
+  if (!leaseActive || !transition || !request) return null;
+  if (request !== transition.request
+      || presented.scope !== transition.source.scope
+      || presented.authorityScope !== transition.source.authorityScope
+      || incoming.scope !== transition.presentation.scope
+      || incoming.authorityScope !== transition.presentation.authorityScope
+      || incoming.generation !== transition.presentation.generation
+      || !incoming.browseMode) return null;
+  return transition.presentation;
 }
 
 interface TextSelectionRetention {
@@ -200,6 +237,9 @@ interface HistoryPageLoadAcceptance {
   accepted: true;
   /** The first runtime page creates its browse view synchronously in App. */
   viewId?: string;
+  /** The first runtime page also freezes its new cache authority scope. */
+  scopeKey?: string;
+  generation?: string | null;
 }
 
 type HistoryPageLoadResult = boolean | HistoryPageLoadAcceptance;
@@ -311,14 +351,22 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     | null
   >(null);
   const historyAnchorRef = useRef(new HistoryAnchorController());
-  const historyRequestRef = useRef<{
-    sid: string | null;
-    revision: string | null;
-    viewId: string | null;
-    direction: HistoryPageDirection;
-    before: string | null;
-    windowEpoch: number;
-  } | null>(null);
+  const historyPageActivityRef = useRef(new HistoryPageActivityController());
+  const [historyPageActivity, setHistoryPageActivity] =
+    useState<HistoryPageActivity | null>(null);
+  const beginHistoryPageActivity = useCallback((
+    input: Omit<HistoryPageActivity, "key">,
+  ): HistoryPageActivity => {
+    const activity = historyPageActivityRef.current.begin(input);
+    setHistoryPageActivity(activity);
+    return activity;
+  }, []);
+  const completeHistoryPageActivity = useCallback((key?: number): boolean => {
+    if (!historyPageActivityRef.current.complete(key)) return false;
+    setHistoryPageActivity(null);
+    return true;
+  }, []);
+  const historyRequestRef = useRef<HistoryPageRequestTransaction | null>(null);
   const turnNodeRefs = useRef(new Map<string, HTMLDivElement>());
   const textSelectionCandidateRef = useRef<TextSelectionCandidate | null>(null);
   const textSelectionRef = useRef<TextSelectionRetention | null>(null);
@@ -331,6 +379,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const historyReleaseFrameRef = useRef<number | null>(null);
   const historyRequestTimeoutRef = useRef<{
     generation: number | null;
+    activityKey: number;
     timer: number;
   } | null>(null);
   const historyLoadGateRef = useRef(new OlderHistoryLoadGate());
@@ -378,10 +427,20 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const pendingHistoryPresentationRef =
     useRef<HistoryViewportPresentation | null>(null);
   const historyViewportLeaseRef = useRef(false);
+  const historyViewportTransitionRef =
+    useRef<HistoryViewportScopeTransition | null>(null);
   const [presentedHistory, setPresentedHistory] =
     useState<HistoryViewportPresentation>(incomingHistoryPresentation);
+  const transitionPresentation = acceptedHistoryViewportTransition(
+    historyViewportLeaseRef.current,
+    historyViewportTransitionRef.current,
+    historyRequestRef.current,
+    presentedHistory,
+    incomingHistoryPresentation,
+  );
   const scopedPresentedHistory = presentedHistory.scope === scrollScope
-    ? presentedHistory : incomingHistoryPresentation;
+    ? presentedHistory
+    : transitionPresentation ?? incomingHistoryPresentation;
   const {
     turns,
     hasMore,
@@ -395,17 +454,25 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   useLayoutEffect(() => {
     const incoming = latestHistoryPresentationRef.current;
     if (presentedHistory.scope !== incoming.scope) {
-      if (historyViewportLeaseRef.current
-          && presentedHistory.authorityScope === incoming.authorityScope) {
-        // Entering the first deep-history browse view changes only its local
-        // view id before the network page arrives. Re-scope the unchanged base
-        // window without releasing the physical gesture; the later page for
-        // this new view will still be staged until touch/wheel idle.
-        pendingHistoryPresentationRef.current = null;
-        setPresentedHistory(incoming);
+      const retained = acceptedHistoryViewportTransition(
+        historyViewportLeaseRef.current,
+        historyViewportTransitionRef.current,
+        historyRequestRef.current,
+        presentedHistory,
+        incoming,
+      );
+      if (retained) {
+        // The first runtime page creates a cache-backed browse scope. Keep the
+        // exact pre-request rows mounted under that accepted target scope until
+        // the physical gesture ends; even a zero-latency response is staged.
+        pendingHistoryPresentationRef.current =
+          sameHistoryViewportPresentation(retained, incoming) ? null : incoming;
+        historyViewportTransitionRef.current = null;
+        setPresentedHistory(retained);
         return;
       }
       historyViewportLeaseRef.current = false;
+      historyViewportTransitionRef.current = null;
       pendingHistoryPresentationRef.current = null;
       setPresentedHistory(incoming);
       return;
@@ -419,6 +486,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, [
     incomingBrowseMode, incomingHasMore, incomingHasNewer,
     incomingHistoryCursor, incomingHistoryWindowEpoch, incomingTurns,
+    incomingHistoryPresentation.authorityScope,
     presentedHistory, scrollScope,
   ]);
 
@@ -427,6 +495,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, []);
   const flushHistoryViewportLease = useCallback(() => {
     historyViewportLeaseRef.current = false;
+    historyViewportTransitionRef.current = null;
     const pending = pendingHistoryPresentationRef.current
       ?? latestHistoryPresentationRef.current;
     pendingHistoryPresentationRef.current = null;
@@ -716,7 +785,6 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, []);
 
   const cancelHistoryAnchor = useCallback((generation?: number): boolean => {
-    clearHistoryRequestTimeout(generation);
     const activeGeneration =
       historyAnchorRef.current.current()?.generation ?? null;
     const cancelled = historyAnchorRef.current.cancel(generation);
@@ -731,7 +799,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
     setActiveHistoryGeneration(null);
     return cancelled;
-  }, [clearHistoryRequestTimeout]);
+  }, []);
 
   const syncScrollState = useCallback((next: ScrollFollowSnapshot) => {
     setScrollState((previous) =>
@@ -1071,39 +1139,88 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   // Cached-newer paging may append at the tail and evict rows at the head, so
   // it deliberately uses the same keyed measurement transaction as prepend.
   const doLoadPage = (direction: HistoryPageDirection): boolean => {
-    if (historyAnchorRef.current.current()) return false;
+    if (historyAnchorRef.current.current() || historyRequestRef.current) {
+      return false;
+    }
     const el = scrollRef.current;
     const point = el ? captureHistoryBoundary() : null;
+    const sourcePresentation = scopedPresentedHistory;
     if (el) pauseOutputFollow();
     const loadResult = direction === "older"
       ? onLoadMore?.(point?.anchorTurnId)
       : onLoadNewer?.(point?.anchorTurnId);
     const accepted = loadResult === true
       || (typeof loadResult === "object" && loadResult.accepted);
-    const requestViewId = typeof loadResult === "object"
-      ? loadResult.viewId ?? resolvedHistoryViewId
+    const acceptance = typeof loadResult === "object" ? loadResult : null;
+    const requestViewId = acceptance
+      ? acceptance.viewId ?? resolvedHistoryViewId
       : resolvedHistoryViewId;
     if (!accepted) {
       clearHistoryRequestTimeout();
       completeHistoryLoadGates();
       return false;
     }
-    historyRequestRef.current = {
+    const requestGeneration = acceptance
+        && Object.prototype.hasOwnProperty.call(acceptance, "generation")
+      ? acceptance.generation ?? null
+      : historyGeneration;
+    const requestScopeKey = acceptance?.scopeKey ?? historyScopeKey ?? "";
+    const requestAuthorityScope = [
+      requestScopeKey,
+      sid ?? "",
+      historyRevision ?? "",
+      requestGeneration ?? "",
+    ].join("\u0000");
+    const requestScrollScope = acceptance?.viewId != null
+      ? [
+          requestScopeKey,
+          sid ?? "",
+          historyRevision ?? "",
+          requestViewId,
+        ].join("\u0000")
+      : scrollScope;
+    const activity = beginHistoryPageActivity({
+      direction,
+    });
+    const request: HistoryPageRequestTransaction = {
       sid,
       revision: historyRevision,
+      authorityScope: requestAuthorityScope,
       viewId: requestViewId,
       direction,
       before: direction === "older" ? historyCursor : null,
       windowEpoch: historyWindowEpoch,
+      activityKey: activity.key,
     };
+    historyRequestRef.current = request;
+    if (historyViewportLeaseRef.current
+        && direction === "older"
+        && acceptance?.viewId != null
+        && requestScrollScope !== scrollScope
+        && sourcePresentation.scope === scrollScope
+        && sourcePresentation.authorityScope
+          === incomingHistoryPresentation.authorityScope
+        && sourcePresentation.cursor === historyCursor
+        && sourcePresentation.windowEpoch === historyWindowEpoch) {
+      historyViewportTransitionRef.current = {
+        source: sourcePresentation,
+        request,
+        presentation: {
+          ...sourcePresentation,
+          scope: requestScrollScope,
+          authorityScope: requestAuthorityScope,
+          generation: requestGeneration,
+          browseMode: true,
+          hasNewer: false,
+        },
+      };
+    } else {
+      historyViewportTransitionRef.current = null;
+    }
     let generation: number | null = null;
     if (point) {
-      cancelHistoryAnchor();
       setMeasurementBoundary({
-        scope: requestViewId === resolvedHistoryViewId
-          ? scrollScope
-          : `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000`
-            + `${historyRevision ?? ""}\u0000${requestViewId}`,
+        scope: requestScrollScope,
         sid,
         revision: historyRevision,
         viewId: requestViewId,
@@ -1141,14 +1258,17 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const timeoutGeneration = generation;
     const timer = window.setTimeout(() => {
       const pending = historyRequestTimeoutRef.current;
-      if (!pending || pending.timer !== timer) return;
+      if (!pending || pending.timer !== timer
+          || pending.activityKey !== activity.key) return;
       historyRequestTimeoutRef.current = null;
       historyRequestRef.current = null;
       if (timeoutGeneration != null) cancelHistoryAnchor(timeoutGeneration);
+      completeHistoryPageActivity(activity.key);
       completeHistoryLoadGates();
     }, HISTORY_PAGE_REQUEST_TIMEOUT_MS);
     historyRequestTimeoutRef.current = {
       generation: timeoutGeneration,
+      activityKey: activity.key,
       timer,
     };
     return true;
@@ -1240,7 +1360,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       readScrollMetrics(el), true, canLoadOlder,
     )) return;
     const boundary = [
-      "older", sid ?? "", resolvedHistoryViewId, turns[0]?.id ?? "",
+      "older", incomingHistoryPresentation.authorityScope,
+      sid ?? "", resolvedHistoryViewId, turns[0]?.id ?? "",
       turns.length, historyRevision ?? "", historyCursor ?? "", hasMore ? 1 : 0,
     ].join("\u0000");
     if (source === "other" && autoLoadedBoundaryRef.current === boundary) return;
@@ -1264,7 +1385,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       readScrollMetrics(el), movingTowardLatest, canLoadNewer,
     )) return;
     const boundary = [
-      "newer", sid ?? "", resolvedHistoryViewId,
+      "newer", incomingHistoryPresentation.authorityScope,
+      sid ?? "", resolvedHistoryViewId,
       turns.at(-1)?.id ?? "", turns.length,
       historyRevision ?? "", historyWindowEpoch, hasNewer ? 1 : 0,
     ].join("\u0000");
@@ -1294,6 +1416,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const requestScopeChanged = request && (
       request.sid !== sid
       || request.revision !== historyRevision
+      || request.authorityScope
+        !== incomingHistoryPresentation.authorityScope
       || request.viewId !== resolvedHistoryViewId
     );
     const requestCompleted = request && (
@@ -1304,10 +1428,20 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     if (requestScopeChanged || requestCompleted) {
       historyRequestRef.current = null;
       clearHistoryRequestTimeout();
+      completeHistoryPageActivity(request?.activityKey);
     }
     const anchor = historyAnchorRef.current.current();
     if (!anchor) {
       if (requestScopeChanged || requestCompleted) completeHistoryLoadGates();
+      return;
+    }
+    if (requestScopeChanged) {
+      // Authority/generation are not fields on the physical row anchor. Once
+      // the accepted request loses that authority, its timeout and activity
+      // are already gone above, so retaining the anchor would block every
+      // subsequent page forever with no self-healing path.
+      cancelHistoryAnchor(anchor.generation);
+      completeHistoryLoadGates();
       return;
     }
     if (anchor.sid !== sid || anchor.revision !== historyRevision
@@ -1328,6 +1462,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     });
     if (pageStatus === "pending") return;
     if (pageStatus === "stale") {
+      const activityKey = historyRequestRef.current?.activityKey;
+      historyRequestRef.current = null;
+      clearHistoryRequestTimeout();
+      completeHistoryPageActivity(activityKey);
       cancelHistoryAnchor(anchor.generation);
       completeHistoryLoadGates();
       return;
@@ -1336,6 +1474,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     if (!turns.some((turn) => turn.id === anchor.anchorTurnId)) {
       // The bounded projection no longer contains the reading row. Never
       // manufacture a viewport movement from cursor metadata alone.
+      const activityKey = historyRequestRef.current?.activityKey;
+      historyRequestRef.current = null;
+      clearHistoryRequestTimeout();
+      completeHistoryPageActivity(activityKey);
       cancelHistoryAnchor(anchor.generation);
       completeHistoryLoadGates();
       return;
@@ -1360,8 +1502,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
   }, [
     cancelHistoryAnchor, canLoadNewer, clearHistoryRequestTimeout,
-    completeHistoryLoadGates, hasMore,
-    historyCursor, historyRevision, historyWindowEpoch, resolvedHistoryViewId,
+    completeHistoryLoadGates, completeHistoryPageActivity, hasMore,
+    historyCursor, historyRevision, historyWindowEpoch,
+    incomingHistoryPresentation.authorityScope, resolvedHistoryViewId,
     scheduleHistoryAnchorRelease, sid, turns,
   ]);
 
@@ -1379,6 +1522,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       textSelectionCandidateRef.current = null;
       if (textSelectionRef.current) clearTextSelection();
       const request = historyRequestRef.current;
+      const requestActivityKey = request?.activityKey;
       const anchor = historyAnchorRef.current.current();
       const enteringBrowse = browseMode
         && request?.direction === "older"
@@ -1410,6 +1554,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       }
       wheelGestureActiveRef.current = false;
       historyRequestRef.current = null;
+      completeHistoryPageActivity(requestActivityKey);
       autoLoadedBoundaryRef.current = null;
       historyLoadGateRef.current.complete();
       historyLoadGateRef.current.endGesture();
@@ -1433,7 +1578,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
   }, [
     activeHistoryGeneration, applyScrollCommand, browseMode, cancelHistoryAnchor,
-    clearHistoryRequestTimeout, clearTextSelection, historyRevision,
+    clearHistoryRequestTimeout, clearTextSelection,
+    completeHistoryPageActivity, historyRevision,
     resolvedHistoryViewId,
     scrollScope, sid, syncScrollState, turns,
   ]);
@@ -1838,9 +1984,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const el = scrollRef.current;
     const controller = controllerRef.current;
     if (!el || !controller) return;
+    const requestActivityKey = historyRequestRef.current?.activityKey;
     cancelDetailAnchorFnRef.current?.();
     cancelHistoryAnchor();
     historyRequestRef.current = null;
+    clearHistoryRequestTimeout();
+    completeHistoryPageActivity(requestActivityKey);
+    completeHistoryLoadGates();
     setMeasurementBoundary(null);
     syncScrollState(controller.resume(readScrollMetrics(el)));
     applyScrollCommand(
@@ -1853,9 +2003,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       scrollToBottom();
       return;
     }
+    const requestActivityKey = historyRequestRef.current?.activityKey;
     cancelDetailAnchorFnRef.current?.();
     cancelHistoryAnchor();
     historyRequestRef.current = null;
+    clearHistoryRequestTimeout();
+    completeHistoryPageActivity(requestActivityKey);
     setMeasurementBoundary(null);
     completeHistoryLoadGates();
     onReturnLatest();
@@ -1871,10 +2024,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     return token;
   }, []);
 
-  const endProcessInteraction = useCallback((token: number): void => {
+  const endProcessInteraction = useCallback((
+    token: number,
+    followOutput?: boolean,
+  ): void => {
     const command = scrollCoordinatorRef.current.endInteraction(
       token,
-      controllerRef.current?.isFollowing() ?? false,
+      followOutput ?? (controllerRef.current?.isFollowing() ?? false),
     );
     setScrollPolicyEpoch((value) => value + 1);
     if (command) {
@@ -2178,6 +2334,11 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
           + index * (HISTORY_VIRTUAL_ESTIMATE_PX + HISTORY_TURN_GAP_PX),
       };
     });
+  const activityRequest = historyRequestRef.current;
+  const visibleHistoryPageActivity = historyPageActivity && (
+    activityRequest?.activityKey === historyPageActivity.key
+      && activityRequest.sid === sid)
+    ? historyPageActivity : null;
 
   if (turns.length === 0) {
     if (loading) {
@@ -2201,6 +2362,14 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
 
   return (
     <div className={surface === "work" ? "thread-shell work-thread-shell" : "thread-shell"}>
+      {visibleHistoryPageActivity && (
+        <div className="history-page-activity"
+          data-testid="history-page-activity" role="status" aria-live="polite">
+          <span className="history-page-activity-spinner" aria-hidden="true" />
+          <span>{visibleHistoryPageActivity.direction === "older"
+            ? "正在加载更早历史…" : "正在加载更新历史…"}</span>
+        </div>
+      )}
       <div className="thread" ref={scrollRef}
         data-detail-anchor-active={activeDetailAnchor ? "true" : "false"}
         data-text-selection-dragging={
@@ -2221,7 +2390,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             height: `${virtualLeadingPad}px`,
             overflowAnchor: "none",
           }} />
-          {showOlderHistory && (
+          {showOlderHistory
+              && visibleHistoryPageActivity?.direction !== "older" && (
             <div className="load-more-wrap virtual-history-loader">
               {olderHistoryAvailability === "ready"
                 ? (
@@ -2237,7 +2407,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                   )}
             </div>
           )}
-          {canLoadNewer && (
+          {canLoadNewer
+              && visibleHistoryPageActivity?.direction !== "newer" && (
             <div className="load-more-wrap virtual-history-loader"
               style={{ top: "auto", bottom: 0 }}>
               <button className="load-more-btn" onClick={doLoadNewer}>
@@ -2380,7 +2551,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 <div className="ubub-meta">
                   {t.ts && <span className="ubub-time">{formatTime(t.ts)}</span>}
                   {t.prompt && onEdit && <button className="ubub-act" onClick={() => onEdit(t.prompt!)} aria-label="编辑"><Icon name="edit" size={13} /></button>}
-                  {t.prompt && <button className={"ubub-act" + (copiedId === t.id ? " copied" : "")} onClick={() => copyText(t.id, t.prompt!)} aria-label="复制"><Icon name="check" size={13} /></button>}
+                  {t.prompt && <button className={"ubub-act" + (copiedId === t.id ? " copied" : "")} onClick={() => copyText(t.id, t.prompt!)} aria-label="复制"><Icon name="copy" size={13} /></button>}
                 </div>
               </div>
             )}
@@ -2461,7 +2632,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                         className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")}
                         onClick={() => copyText(t.id + "-ai", aiText(t))}
                         aria-label="复制">
-                        <Icon name="check" size={13} />
+                        <Icon name="copy" size={13} />
                       </button>}
                       {onFork && canForkTurn(engine, t) && (
                         <button className="ubub-act" aria-label="派生"

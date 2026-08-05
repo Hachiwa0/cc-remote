@@ -156,6 +156,36 @@ export class HistoryAnchorController {
   }
 }
 
+export interface HistoryPageActivityInput {
+  direction: HistoryPageDirection;
+}
+
+export interface HistoryPageActivity extends HistoryPageActivityInput {
+  key: number;
+}
+
+/** Owns the geometry-free progress affordance for one accepted history page.
+ * Its monotonic key keeps even identical retries distinct, so an old timeout
+ * or response cannot hide the newer request. */
+export class HistoryPageActivityController {
+  private activity: HistoryPageActivity | null = null;
+  private nextKey = 0;
+
+  begin(input: HistoryPageActivityInput): HistoryPageActivity {
+    this.activity = { ...input, key: ++this.nextKey };
+    return this.activity;
+  }
+
+  complete(expectedKey?: number): boolean {
+    if (!this.activity
+        || (expectedKey != null && this.activity.key !== expectedKey)) {
+      return false;
+    }
+    this.activity = null;
+    return true;
+  }
+}
+
 /** A pull gesture may request at most one older page. Network completion while
  * the finger is still down must not cascade through the entire history. */
 export class OlderHistoryLoadGate {

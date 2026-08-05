@@ -17,12 +17,18 @@ export class PointerTapGuard {
     if (this.pointers.size > 1) this.suppressPointerClick = true;
   }
 
-  pointerMove(pointerId: number, x: number, y: number): void {
+  pointerMove(pointerId: number, x: number, y: number): boolean {
     const start = this.pointers.get(pointerId);
-    if (!start) return;
+    if (!start) return false;
     if (Math.hypot(x - start.x, y - start.y) > this.threshold) {
       this.suppressPointerClick = true;
+      // Crossing the drag threshold is a terminal state for this pointer. The
+      // caller can release capture/visual focus exactly once while subsequent
+      // move events remain ordinary page scrolling.
+      this.pointers.delete(pointerId);
+      return true;
     }
+    return false;
   }
 
   pointerUp(pointerId: number): void {
@@ -40,4 +46,34 @@ export class PointerTapGuard {
     this.suppressPointerClick = false;
     return allowed;
   }
+}
+
+/** Release only the touch control on which a scroll gesture began.
+ *
+ * Do not preventDefault: Safari must retain ownership of native momentum
+ * scrolling. Mouse and keyboard focus are deliberately untouched.
+ */
+export function releaseDraggedPointer(
+  target: HTMLElement,
+  pointerId: number,
+  pointerType: string,
+): void {
+  try {
+    if (target.hasPointerCapture(pointerId)) {
+      target.releasePointerCapture(pointerId);
+    }
+  } catch {
+    // WebKit may have released capture as it promoted the gesture to scrolling.
+  }
+  if (pointerType === "touch") target.blur();
+}
+
+export function cancelDraggedPointer(
+  guard: PointerTapGuard,
+  target: HTMLElement,
+  pointerId: number,
+  pointerType: string,
+): void {
+  guard.pointerCancel(pointerId);
+  releaseDraggedPointer(target, pointerId, pointerType);
 }

@@ -270,12 +270,15 @@ assert.deepEqual(completionReceipts["parent-main"], {
 
 const processTap = new PointerTapGuard(8);
 processTap.pointerDown(1, 20, 20);
-processTap.pointerMove(1, 22, 24);
+assert.equal(processTap.pointerMove(1, 22, 24), false);
 processTap.pointerUp(1);
 assert.equal(processTap.consumeClick(1), true,
   "a stationary touch remains a real process-header tap");
 processTap.pointerDown(2, 20, 20);
-processTap.pointerMove(2, 20, 36);
+assert.equal(processTap.pointerMove(2, 20, 36), true,
+  "crossing the drag threshold releases the touch origin exactly once");
+assert.equal(processTap.pointerMove(2, 20, 48), false,
+  "a released drag pointer cannot repeatedly blur/release its control");
 processTap.pointerUp(2);
 assert.equal(processTap.consumeClick(1), false,
   "vertical history scrolling must not toggle the process header");
@@ -2534,7 +2537,7 @@ const replayOrphanMerged = mergeInitialHistory(
     }],
     detailError: "stale orphan detail",
   }],
-  { reconcileAuthoritativeReplayOrphans: true },
+  { reconcileReplayOrphans: true },
 );
 assert.equal(replayOrphanMerged.length, 1);
 assert.equal(replayOrphanMerged[0].id, "native-history-turn");
@@ -2575,7 +2578,7 @@ const ambiguousReplayOrphans = mergeInitialHistory(
       done: true,
     }],
   })),
-  { reconcileAuthoritativeReplayOrphans: true },
+  { reconcileReplayOrphans: true },
 );
 assert.equal(ambiguousReplayOrphans.length, 2,
   "multiple provisional rows claiming one item cannot replace canonical history");
@@ -2605,7 +2608,7 @@ const ambiguousCanonicalReplay = mergeInitialHistory(
       done: true,
     }],
   }],
-  { reconcileAuthoritativeReplayOrphans: true },
+  { reconcileReplayOrphans: true },
 );
 assert.equal(ambiguousCanonicalReplay.length, 3,
   "a message identity shared by canonical rows is not safe merge evidence");
@@ -2635,7 +2638,7 @@ const unrelatedAssistantOnly = mergeInitialHistory(
       done: true,
     }],
   }],
-  { reconcileAuthoritativeReplayOrphans: true },
+  { reconcileReplayOrphans: true },
 );
 assert.equal(unrelatedAssistantOnly.length, 2,
   "equal assistant text without an exact message identity remains separate");
@@ -2662,6 +2665,133 @@ assert.deepEqual(mergeInitialHistory(
 ).map((turn) => turn.id), [
   "old-assistant-only", "current-history",
 ]);
+const aliaslessSameText = mergeInitialHistory(
+  [{
+    id: "history-active-no-overlap",
+    prompt: "guide",
+    forkPointId: "shared-route-only",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "history-message-only",
+      channel: "commentary",
+      text: "the same visible words",
+      done: true,
+    }],
+  }],
+  [{
+    id: "live-active-no-overlap",
+    clientMsgId: "live-active-no-overlap",
+    liveTaskId: "shared-route-only",
+    prompt: "guide",
+    done: false,
+    blocks: [{
+      kind: "text",
+      message_id: "live-message-only",
+      channel: "commentary",
+      text: "the same visible words",
+      done: true,
+    }],
+  }],
+  {
+    preserveLiveTailOpen: true,
+    newestHistoryId: "history-active-no-overlap",
+    reconcileReplayOrphans: true,
+  },
+);
+assert.deepEqual(
+  aliaslessSameText.map((turn) => turn.id),
+  ["history-active-no-overlap", "live-active-no-overlap"],
+  "equal prompt/commentary text and one shared routing id cannot prove UI identity",
+);
+const terminalSameTaskDifferentItems = mergeInitialHistory(
+  [{
+    id: "terminal-history-head",
+    prompt: "same native task",
+    forkPointId: "terminal-shared-task",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "terminal-history-final",
+      channel: "final",
+      text: "history final",
+      done: true,
+    }],
+  }],
+  [{
+    id: "terminal-history-head",
+    prompt: "same native task",
+    forkPointId: "terminal-shared-task",
+    done: true,
+    blocks: [],
+  }, {
+    id: "terminal-distinct-steer",
+    clientMsgId: "terminal-distinct-steer",
+    prompt: "same native task",
+    forkPointId: "terminal-shared-task",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "terminal-distinct-final",
+      channel: "final",
+      text: "another real segment",
+      done: true,
+    }],
+  }],
+  {
+    newestHistoryId: "terminal-history-head",
+    reconcileReplayOrphans: true,
+  },
+);
+assert.deepEqual(
+  terminalSameTaskDifferentItems.map((turn) => turn.id),
+  ["terminal-history-head", "terminal-distinct-steer"],
+  "a terminal head cannot absorb another steer on task/prompt identity alone",
+);
+const conflictingTaskSharedItem = mergeInitialHistory(
+  [{
+    id: "conflicting-task-history",
+    prompt: "shared item is still not enough",
+    forkPointId: "history-native-task",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "conflicting-task-shared-message",
+      channel: "final",
+      text: "shared native item",
+      done: true,
+    }],
+  }],
+  [{
+    id: "conflicting-task-history",
+    prompt: "shared item is still not enough",
+    forkPointId: "history-native-task",
+    done: true,
+    blocks: [],
+  }, {
+    id: "conflicting-task-live",
+    clientMsgId: "conflicting-task-live",
+    liveTaskId: "different-native-task",
+    prompt: "shared item is still not enough",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "conflicting-task-shared-message",
+      channel: "final",
+      text: "shared native item",
+      done: true,
+    }],
+  }],
+  {
+    newestHistoryId: "conflicting-task-history",
+    reconcileReplayOrphans: true,
+  },
+);
+assert.deepEqual(
+  conflictingTaskSharedItem.map((turn) => turn.id),
+  ["conflicting-task-history", "conflicting-task-live"],
+  "an exact block overlap cannot merge rows with conflicting native tasks",
+);
 
 // Exercise the real reducer through Vite's zero-network SSR loader. The plain
 // Node test output cannot import reducer.js directly because the browser build
@@ -4911,6 +5041,222 @@ try {
   assert.equal(detailState.runtimes[summarySid].turns[0].blocks.filter(
     (block: Block) => block.kind === "text" && block.channel === "final").length, 1,
   "detail replaces the summary projection instead of duplicating its final text");
+
+  // Every bounded detail page is independently decodable, so the wrapper
+  // repeats the same user/terminal envelope around its disjoint display groups.
+  // Combining pages must combine those groups, not feed an intermediate
+  // TurnEnd back through the reducer and silently keep only one page.
+  const pagedDetailSid = "multi-page-detail-envelope";
+  let pagedDetailState = reduce({
+    ...initialState,
+    focusedSid: pagedDetailSid,
+    runtimes: { [pagedDetailSid]: createRuntime() },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: pagedDetailSid,
+      session_id: pagedDetailSid,
+      revision: "paged-detail-r1",
+      generation: "paged-detail-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      newest_id: "paged-detail-turn",
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "paged-detail-turn",
+        prompt: "run for eight hours",
+        done: true,
+        blocks: [{
+          kind: "text",
+          message_id: "paged-detail-final",
+          text: "finished",
+          done: true,
+          channel: "final",
+        }],
+        detailEventCount: 12,
+      }],
+    }),
+  });
+  const detailEnvelope = () => [
+    event({
+      type: "user_msg",
+      sid: pagedDetailSid,
+      msg_id: "paged-detail-turn",
+      prompt: "run for eight hours",
+    }),
+  ];
+  const detailTerminal = () => [
+    event({
+      type: "assistant_msg_start",
+      sid: pagedDetailSid,
+      message_id: "paged-detail-final",
+      channel: "final",
+    }),
+    event({
+      type: "delta",
+      sid: pagedDetailSid,
+      message_id: "paged-detail-final",
+      channel: "final",
+      text: "finished",
+    }),
+    event({
+      type: "assistant_msg_end",
+      sid: pagedDetailSid,
+      message_id: "paged-detail-final",
+      channel: "final",
+    }),
+    event({
+      type: "turn_end",
+      sid: pagedDetailSid,
+      turn_id: "paged-detail-native",
+      result: { subtype: "success", duration_ms: 1, is_error: false },
+    }),
+  ];
+  pagedDetailState = reduce(pagedDetailState, {
+    type: "event",
+    event: event({
+      type: "turn_detail",
+      sid: pagedDetailSid,
+      session_id: pagedDetailSid,
+      turn_id: "paged-detail-turn",
+      revision: "paged-detail-r1",
+      before: null,
+      has_more: true,
+      oldest_cursor: "2",
+      has_newer: false,
+      newer_cursor: null,
+      events: [
+        ...detailEnvelope(),
+        event({
+          type: "assistant_msg_start",
+          sid: pagedDetailSid,
+          message_id: "newer-commentary",
+          channel: "commentary",
+        }),
+        event({
+          type: "delta",
+          sid: pagedDetailSid,
+          message_id: "newer-commentary",
+          channel: "commentary",
+          text: "newer work",
+        }),
+        event({
+          type: "assistant_msg_end",
+          sid: pagedDetailSid,
+          message_id: "newer-commentary",
+          channel: "commentary",
+        }),
+        event({
+          type: "tool_use",
+          sid: pagedDetailSid,
+          message_id: "newer-tool-message",
+          tool_use_id: "newer-tool",
+          tool: "Read",
+          input: { file_path: "/tmp/newer" },
+        }),
+        event({
+          type: "tool_result",
+          sid: pagedDetailSid,
+          tool_use_id: "newer-tool",
+          content: "newer result",
+          is_error: false,
+        }),
+        event({
+          type: "process",
+          sid: pagedDetailSid,
+          item_id: "newer-compaction",
+          kind: "compaction",
+          phase: "end",
+          status: "succeeded",
+          turn_id: "paged-detail-native",
+          title: "压缩上下文",
+        }),
+        ...detailTerminal(),
+      ],
+    }),
+  });
+  pagedDetailState = reduce(pagedDetailState, {
+    type: "event",
+    event: event({
+      type: "turn_detail",
+      sid: pagedDetailSid,
+      session_id: pagedDetailSid,
+      turn_id: "paged-detail-turn",
+      revision: "paged-detail-r1",
+      before: "2",
+      has_more: false,
+      oldest_cursor: null,
+      has_newer: true,
+      newer_cursor: "4",
+      events: [
+        ...detailEnvelope(),
+        event({
+          type: "assistant_msg_start",
+          sid: pagedDetailSid,
+          message_id: "older-commentary",
+          channel: "commentary",
+        }),
+        event({
+          type: "delta",
+          sid: pagedDetailSid,
+          message_id: "older-commentary",
+          channel: "commentary",
+          text: "older work",
+        }),
+        event({
+          type: "assistant_msg_end",
+          sid: pagedDetailSid,
+          message_id: "older-commentary",
+          channel: "commentary",
+        }),
+        event({
+          type: "tool_use",
+          sid: pagedDetailSid,
+          message_id: "older-tool-message",
+          tool_use_id: "older-tool",
+          tool: "Read",
+          input: { file_path: "/tmp/older" },
+        }),
+        event({
+          type: "tool_result",
+          sid: pagedDetailSid,
+          tool_use_id: "older-tool",
+          content: "older result",
+          is_error: false,
+        }),
+        event({
+          type: "process",
+          sid: pagedDetailSid,
+          item_id: "older-compaction",
+          kind: "compaction",
+          phase: "end",
+          status: "succeeded",
+          turn_id: "paged-detail-native",
+          title: "压缩上下文",
+        }),
+        ...detailTerminal(),
+      ],
+    }),
+  });
+  assert.deepEqual(
+    pagedDetailState.runtimes[pagedDetailSid].turns[0]
+      .detailProjection?.blocks.map((block: Block) => block.kind === "text"
+        ? block.message_id
+        : block.kind === "tool" ? block.tool_use_id : block.item_id),
+    [
+      "older-commentary",
+      "older-tool",
+      "older-compaction",
+      "newer-commentary",
+      "newer-tool",
+      "newer-compaction",
+    ],
+    "disjoint detail pages survive repeated page envelopes in source order",
+  );
 
   const staleDetail = reduce(detailState, { type: "event", event: event({
     type: "turn_detail", session_id: summarySid, turn_id: "summary-message",
@@ -8185,6 +8531,1208 @@ try {
     ["before compact", "after compact"],
   );
 
+  // A newer authoritative active head supersedes an older explicit task owner.
+  // Assistant items have no turn id, so the downstream sequence is the only
+  // authoritative fence: an explicit owner accepted before the exact History
+  // head cannot steal its first output merely because that old row is still
+  // locally unfinished.
+  for (const [suffix, oldTaskId, newTaskId] of [
+    ["different-task", "stale-task", "current-task"],
+    ["same-task", "shared-task", "shared-task"],
+  ] as const) {
+    const sid = `history-head-after-old-steer-${suffix}`;
+    let routedState = {
+      ...initialState,
+      focusedSid: sid,
+      runtimes: {
+        [sid]: {
+          ...createRuntime(),
+          state: "running" as const,
+          syncReady: true,
+        },
+      },
+    };
+    routedState = reduce(routedState, {
+      type: "event",
+      event: event({
+        type: "turn_steered",
+        sid,
+        seq: 10,
+        msg_id: `old-client-${suffix}`,
+        turn_id: oldTaskId,
+        prompt: "old guided segment",
+      }),
+    });
+    routedState = reduce(routedState, {
+      type: "event",
+      event: event({
+        type: "history",
+        sid,
+        session_id: sid,
+        revision: `history-head-${suffix}-r1`,
+        generation: `history-head-${suffix}-g1`,
+        build_seq: 1,
+        live_seq: 10,
+        detail: "summary",
+        authoritative: true,
+        has_more: true,
+        newest_id: `new-history-${suffix}`,
+        in_progress: true,
+        events: [],
+        turns: [{
+          id: `new-history-${suffix}`,
+          prompt: "current native segment",
+          forkPointId: newTaskId,
+          done: true,
+          interrupted: true,
+          blocks: [],
+        }],
+      }),
+    });
+    routedState = reduce(routedState, {
+      type: "event",
+      event: event({
+        type: "assistant_msg_start",
+        sid,
+        seq: 11,
+        message_id: `current-output-${suffix}`,
+        channel: "commentary",
+      }),
+    });
+    const routedTurns = routedState.runtimes[sid].turns;
+    assert.equal(
+      routedTurns.find((turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === `current-output-${suffix}`))?.id,
+      `new-history-${suffix}`,
+      "an old explicit steer cannot steal output from a newer History head",
+    );
+  }
+
+  // Conversely, a TurnSteered event accepted after the active History shell is
+  // the ordered owner of subsequent id-less output. This is the normal local
+  // steer path and must not regress while stale pre-head owners are ignored.
+  const postHistorySteerSid = "post-history-local-steer-owner";
+  let postHistorySteerState = reduce({
+    ...initialState,
+    focusedSid: postHistorySteerSid,
+    runtimes: {
+      [postHistorySteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: postHistorySteerSid,
+      session_id: postHistorySteerSid,
+      revision: "post-history-steer-r1",
+      generation: "post-history-steer-g1",
+      build_seq: 1,
+      live_seq: 20,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "post-history-shell",
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "post-history-shell",
+        prompt: "work before guidance",
+        forkPointId: "post-history-native-task",
+        done: true,
+        interrupted: true,
+        blocks: [],
+      }],
+    }),
+  });
+  postHistorySteerState = reduce(postHistorySteerState, {
+    type: "event",
+    event: event({
+      type: "turn_steered",
+      sid: postHistorySteerSid,
+      seq: 21,
+      msg_id: "post-history-client-steer",
+      turn_id: "post-history-native-task",
+      prompt: "guide after the snapshot",
+    }),
+  });
+  postHistorySteerState = reduce(postHistorySteerState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: postHistorySteerSid,
+      seq: 22,
+      message_id: "post-history-output",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    postHistorySteerState.runtimes[postHistorySteerSid].turns.find(
+      (turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "post-history-output"))?.id,
+    "post-history-client-steer",
+    "a local steer created after the History head owns later output",
+  );
+
+  // Re-key can merge a temp runtime into an already-known native runtime. The
+  // two runtimes share one downstream generation, so their History/steer
+  // sequence evidence is comparable and must remain monotonic. Letting the
+  // lower source values overwrite the target makes a stale temp owner win the
+  // next id-less assistant item.
+  const rekeyFenceOld = "tmp-rekey-owner-fence";
+  const rekeyFenceSid = "real-rekey-owner-fence";
+  let rekeyFenceState = reduce({
+    ...initialState,
+    focusedSid: rekeyFenceOld,
+    runtimes: {
+      [rekeyFenceOld]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        historyRevision: "rekey-owner-r1",
+        historyGeneration: "rekey-owner-g1",
+        controlGeneration: "rekey-owner-g1",
+        historyNewestId: "rekey-owner-head",
+        historyFence: 10,
+        liveOwner: {
+          turnId: "rekey-stale-source-owner",
+          seq: 20,
+        },
+        turns: [{
+          id: "rekey-stale-source-owner",
+          liveTaskId: "rekey-stale-task",
+          prompt: "stale temp owner",
+          done: false,
+          blocks: [],
+        }],
+      },
+      [rekeyFenceSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        hasRevisionedControl: true,
+        historyRevision: "rekey-owner-r1",
+        historyGeneration: "rekey-owner-g1",
+        controlGeneration: "rekey-owner-g1",
+        historyNewestId: "rekey-owner-head",
+        historyFence: 50,
+        liveOwner: {
+          turnId: "rekey-current-target-owner",
+          seq: 55,
+        },
+        turns: [{
+          id: "rekey-owner-head",
+          forkPointId: "rekey-current-task",
+          prompt: "authoritative head",
+          done: false,
+          blocks: [],
+        }, {
+          id: "rekey-current-target-owner",
+          liveTaskId: "rekey-current-task",
+          prompt: "current owner after head",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "session_rekey",
+      sid: rekeyFenceOld,
+      old_key: rekeyFenceOld,
+      session_id: rekeyFenceSid,
+      cwd: "/repo",
+    }),
+  });
+  assert.equal(
+    rekeyFenceState.runtimes[rekeyFenceSid].historyFence,
+    50,
+    "same-generation rekey keeps the greatest History owner fence",
+  );
+  assert.deepEqual(
+    rekeyFenceState.runtimes[rekeyFenceSid].liveOwner,
+    { turnId: "rekey-current-target-owner", seq: 55 },
+    "same-generation rekey keeps the newest explicit owner proof",
+  );
+  assert.equal(
+    rekeyFenceState.runtimes[rekeyFenceSid].hasRevisionedControl,
+    true,
+    "same-generation rekey preserves revisioned-control authority from either runtime",
+  );
+  rekeyFenceState = reduce(rekeyFenceState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: rekeyFenceSid,
+      seq: 56,
+      message_id: "rekey-current-output",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    rekeyFenceState.runtimes[rekeyFenceSid].turns.find(
+      (turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "rekey-current-output"))?.id,
+    "rekey-current-target-owner",
+    "rekey cannot route new output through an older temp owner",
+  );
+
+  // A temp runtime belongs to the wrapper generation which captured its real
+  // id. If a stale durable runtime survived from an older wrapper, its History
+  // revision/head and sequence watermarks are not comparable and must not be
+  // inherited during the re-key.
+  const crossGenerationOld = "tmp-cross-generation-rekey";
+  const crossGenerationSid = "real-cross-generation-rekey";
+  const staleCrossGenerationTurn: Turn = {
+    id: "rekey-old-projection",
+    prompt: "old projected history",
+    done: true,
+    blocks: [],
+  };
+  const staleCrossGenerationBrowse = {
+    scopeKey: "rekey-old-scope",
+    sid: crossGenerationSid,
+    revision: "rekey-old-revision",
+    generation: "rekey-old-generation",
+    viewId: "rekey-old-view",
+    windowEpoch: 0,
+    turns: [staleCrossGenerationTurn],
+    segments: [],
+    loadedPageKeys: [],
+    oldestPageKey: null,
+    newestPageKey: null,
+    hasOlder: true,
+    olderCursor: "rekey-old-cursor",
+    hasNewer: false,
+    newerPageKey: null,
+    latestDirty: false,
+  };
+  let crossGenerationState = reduce({
+    ...initialState,
+    focusedSid: crossGenerationOld,
+    historyRecovery: {
+      sid: crossGenerationSid,
+      turns: [staleCrossGenerationTurn],
+      hasMore: true,
+      oldestId: "rekey-old-cursor",
+      viewRevision: "rekey-old-revision",
+      expectedGeneration: "rekey-old-generation",
+      candidateBuildSeq: null,
+      acceptedRevision: null,
+    },
+    historyBrowse: staleCrossGenerationBrowse,
+    retainedHistoryBrowse: {
+      ...staleCrossGenerationBrowse,
+      viewId: "rekey-old-retained-view",
+    },
+    runtimes: {
+      [crossGenerationOld]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "rekey-new-generation",
+        lastLiveSeq: 3,
+        lastLifecycleSeq: 3,
+        liveOwner: {
+          turnId: "rekey-new-owner",
+          seq: 3,
+        },
+        turns: [{
+          id: "rekey-new-owner",
+          clientMsgId: "rekey-new-owner",
+          liveTaskId: "rekey-new-native-task",
+          prompt: "new generation prompt",
+          done: false,
+          blocks: [],
+        }],
+      },
+      [crossGenerationSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        hasRevisionedControl: true,
+        controlGeneration: "rekey-old-generation",
+        historyRevision: "rekey-old-revision",
+        historyGeneration: "rekey-old-generation",
+        historyBuildSeq: 80,
+        historyLiveSeq: 81,
+        historyFence: 81,
+        historyNewestId: "rekey-old-head",
+        lastLiveSeq: 82,
+        lastLifecycleSeq: 82,
+        hydratedCacheTurnIds: ["rekey-old-head"],
+        liveDetailTurnIds: ["rekey-old-head"],
+        liveOwner: {
+          turnId: "rekey-old-head",
+          seq: 82,
+        },
+        turns: [{
+          id: "rekey-old-head",
+          forkPointId: "rekey-old-native-task",
+          prompt: "old generation prompt",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "session_rekey",
+      sid: crossGenerationOld,
+      old_key: crossGenerationOld,
+      session_id: crossGenerationSid,
+      cwd: "/repo",
+    }),
+  });
+  const crossGenerationRuntime =
+    crossGenerationState.runtimes[crossGenerationSid];
+  assert.deepEqual(
+    {
+      historyRevision: crossGenerationRuntime.historyRevision,
+      historyGeneration: crossGenerationRuntime.historyGeneration,
+      controlGeneration: crossGenerationRuntime.controlGeneration,
+      historyBuildSeq: crossGenerationRuntime.historyBuildSeq,
+      historyLiveSeq: crossGenerationRuntime.historyLiveSeq,
+      historyFence: crossGenerationRuntime.historyFence,
+      historyNewestId: crossGenerationRuntime.historyNewestId,
+      lastLiveSeq: crossGenerationRuntime.lastLiveSeq,
+      lastLifecycleSeq: crossGenerationRuntime.lastLifecycleSeq,
+      hydratedCacheTurnIds: crossGenerationRuntime.hydratedCacheTurnIds,
+      liveDetailTurnIds: crossGenerationRuntime.liveDetailTurnIds,
+    },
+    {
+      historyRevision: null,
+      historyGeneration: null,
+      controlGeneration: "rekey-new-generation",
+      historyBuildSeq: 0,
+      historyLiveSeq: 0,
+      historyFence: null,
+      historyNewestId: null,
+      lastLiveSeq: 3,
+      lastLifecycleSeq: 3,
+      hydratedCacheTurnIds: [],
+      liveDetailTurnIds: [],
+    },
+    "cross-generation rekey cannot inherit old History authority or watermarks",
+  );
+  assert.deepEqual(
+    crossGenerationRuntime.turns.map((turn: Turn) => turn.id),
+    ["rekey-new-owner"],
+    "cross-generation rekey drops the old generation's visible History head",
+  );
+  assert.deepEqual(
+    crossGenerationRuntime.liveOwner,
+    { turnId: "rekey-new-owner", seq: 3 },
+    "cross-generation rekey preserves only the new generation owner proof",
+  );
+  assert.equal(
+    crossGenerationRuntime.hasRevisionedControl,
+    false,
+    "cross-generation rekey cannot inherit sticky control authority from the old target runtime",
+  );
+  let crossGenerationLegacyControlState = reduce(crossGenerationState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: crossGenerationSid,
+      session_id: crossGenerationSid,
+      revision: "rekey-new-legacy-ownership",
+      generation: "rekey-new-generation",
+      build_seq: 1,
+      live_seq: 3,
+      has_more: false,
+      in_progress: true,
+      authoritative: true,
+      external: true,
+      takeover_pending: false,
+      events: [],
+    }),
+  });
+  assert.equal(
+    crossGenerationLegacyControlState.runtimes[crossGenerationSid].external,
+    true,
+    "cross-generation rekey restores authoritative History ownership fallback",
+  );
+  crossGenerationLegacyControlState = reduce(
+    crossGenerationLegacyControlState,
+    {
+      type: "event",
+      event: event({
+        type: "takeover_state",
+        sid: crossGenerationSid,
+        pending: true,
+        message: "new generation legacy takeover",
+      }),
+    },
+  );
+  assert.deepEqual(
+    {
+      pending: crossGenerationLegacyControlState
+        .runtimes[crossGenerationSid].takeoverPending,
+      message: crossGenerationLegacyControlState
+        .runtimes[crossGenerationSid].takeoverMessage,
+    },
+    {
+      pending: true,
+      message: "new generation legacy takeover",
+    },
+    "cross-generation rekey restores legacy takeover-state updates",
+  );
+  assert.equal(crossGenerationState.historyRecovery, null,
+    "cross-generation rekey drops the durable id's stale recovery window");
+  assert.equal(crossGenerationState.historyBrowse, null,
+    "cross-generation rekey drops the durable id's stale browse window");
+  assert.equal(crossGenerationState.retainedHistoryBrowse, null,
+    "cross-generation rekey drops the durable id's stale retained window");
+  crossGenerationState = reduce(crossGenerationState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: crossGenerationSid,
+      seq: 4,
+      message_id: "rekey-new-output",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    crossGenerationState.runtimes[crossGenerationSid].turns.find(
+      (turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "rekey-new-output"))?.id,
+    "rekey-new-owner",
+    "unbound new-generation output cannot attach to an old History head",
+  );
+
+  // In one generation mergeInitialHistory deliberately keeps the live/source
+  // row id while preserving the target id as historyTurnId. Owner evidence
+  // must follow that surviving id instead of becoming a dangling reference.
+  const overlapOwnerOld = "tmp-rekey-overlap-owner";
+  const overlapOwnerSid = "real-rekey-overlap-owner";
+  let overlapOwnerState = reduce({
+    ...initialState,
+    focusedSid: overlapOwnerOld,
+    runtimes: {
+      [overlapOwnerOld]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "rekey-overlap-generation",
+        historyRevision: "rekey-overlap-revision",
+        historyGeneration: "rekey-overlap-generation",
+        historyNewestId: "rekey-overlap-head",
+        historyFence: 10,
+        liveOwner: {
+          turnId: "rekey-surviving-owner",
+          seq: 19,
+        },
+        turns: [{
+          id: "rekey-surviving-owner",
+          historyTurnId: "rekey-retired-owner",
+          liveTaskId: "rekey-overlap-native-task",
+          prompt: "guided owner",
+          done: false,
+          blocks: [],
+        }],
+      },
+      [overlapOwnerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "rekey-overlap-generation",
+        historyRevision: "rekey-overlap-revision",
+        historyGeneration: "rekey-overlap-generation",
+        historyNewestId: "rekey-overlap-head",
+        historyFence: 10,
+        liveOwner: {
+          turnId: "rekey-retired-owner",
+          seq: 20,
+        },
+        turns: [{
+          id: "rekey-overlap-head",
+          forkPointId: "rekey-overlap-head-task",
+          prompt: "authoritative head",
+          done: false,
+          blocks: [],
+        }, {
+          id: "rekey-retired-owner",
+          clientMsgId: "rekey-surviving-owner",
+          liveTaskId: "rekey-overlap-native-task",
+          prompt: "guided owner",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "session_rekey",
+      sid: overlapOwnerOld,
+      old_key: overlapOwnerOld,
+      session_id: overlapOwnerSid,
+      cwd: "/repo",
+    }),
+  });
+  assert.equal(
+    overlapOwnerState.runtimes[overlapOwnerSid].turns.some(
+      (turn: Turn) => turn.id === "rekey-retired-owner"),
+    false,
+    "the target owner id is replaced by the overlapping source row",
+  );
+  assert.deepEqual(
+    overlapOwnerState.runtimes[overlapOwnerSid].liveOwner,
+    { turnId: "rekey-surviving-owner", seq: 20 },
+    "same-generation owner evidence follows the row which survives merging",
+  );
+  overlapOwnerState = reduce(overlapOwnerState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: overlapOwnerSid,
+      seq: 21,
+      message_id: "rekey-overlap-output",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    overlapOwnerState.runtimes[overlapOwnerSid].turns.find(
+      (turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "rekey-overlap-output"))?.id,
+    "rekey-surviving-owner",
+    "a remapped post-fence owner keeps unbound output off the History head",
+  );
+
+  // Sequence numbers restart with the wrapper generation. Even when no
+  // History page established historyGeneration yet, a new Snapshot must clear
+  // the old generation's owner/fence rather than comparing unrelated numbers.
+  const ownerGenerationSid = "owner-generation-reset-without-history";
+  const ownerGenerationState = reduce({
+    ...initialState,
+    focusedSid: ownerGenerationSid,
+    runtimes: {
+      [ownerGenerationSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "owner-old-g",
+        historyGeneration: null,
+        historyFence: 40,
+        liveOwner: {
+          turnId: "owner-old-turn",
+          seq: 41,
+        },
+        turns: [{
+          id: "owner-old-turn",
+          liveTaskId: "owner-old-task",
+          prompt: "old generation",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "snapshot",
+      sid: ownerGenerationSid,
+      cc_session_id: ownerGenerationSid,
+      generation: "owner-new-g",
+      state: "running",
+    }),
+  });
+  assert.equal(
+    ownerGenerationState.runtimes[ownerGenerationSid].historyFence,
+    null,
+    "generation switch clears an unscoped History owner fence",
+  );
+  assert.equal(
+    ownerGenerationState.runtimes[ownerGenerationSid].liveOwner,
+    null,
+    "generation switch clears an unscoped explicit owner proof",
+  );
+
+  // Clearing the explicit owner proof is insufficient if the legacy fallback
+  // can still select an unfinished row carrying the previous generation's
+  // liveTaskId. The first unbound narrative item in the new generation must
+  // open a fresh row, regardless of which item starts the stream.
+  for (const [kind, freshTurnId, unboundEvent, blockOwnsEvent] of [
+    [
+      "assistant",
+      "owner-new-assistant",
+      event({
+        type: "assistant_msg_start",
+        sid: ownerGenerationSid,
+        seq: 1,
+        message_id: "owner-new-assistant",
+        channel: "commentary",
+      }),
+      (block: Block) => block.kind === "text"
+        && block.message_id === "owner-new-assistant",
+    ],
+    [
+      "delta",
+      "owner-new-delta",
+      event({
+        type: "delta",
+        sid: ownerGenerationSid,
+        seq: 1,
+        message_id: "owner-new-delta",
+        channel: "commentary",
+        text: "new generation text",
+      }),
+      (block: Block) => block.kind === "text"
+        && block.message_id === "owner-new-delta",
+    ],
+    [
+      "tool",
+      "owner-new-tool-message",
+      event({
+        type: "tool_use",
+        sid: ownerGenerationSid,
+        seq: 1,
+        message_id: "owner-new-tool-message",
+        tool_use_id: "owner-new-tool",
+        tool: "Read",
+        input: { file_path: "README.md" },
+      }),
+      (block: Block) => block.kind === "tool"
+        && block.tool_use_id === "owner-new-tool",
+    ],
+  ] as const) {
+    const routed = reduce(ownerGenerationState, {
+      type: "event",
+      event: unboundEvent,
+    });
+    const owner = routed.runtimes[ownerGenerationSid].turns.find(
+      (turn: Turn) => turn.blocks.some(blockOwnsEvent),
+    );
+    assert.equal(
+      owner?.id,
+      freshTurnId,
+      `the first unbound ${kind} item cannot fall back across generations`,
+    );
+  }
+
+  let chainedGenerationState = ownerGenerationState;
+  for (const chainedEvent of [
+    event({
+      type: "assistant_msg_start",
+      sid: ownerGenerationSid,
+      seq: 1,
+      message_id: "owner-new-chain-first",
+      channel: "commentary",
+    }),
+    event({
+      type: "tool_use",
+      sid: ownerGenerationSid,
+      seq: 2,
+      message_id: "owner-new-chain-tool-message",
+      tool_use_id: "owner-new-chain-tool",
+      tool: "Read",
+      input: { file_path: "README.md" },
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: ownerGenerationSid,
+      seq: 3,
+      message_id: "owner-new-chain-second",
+      channel: "final",
+    }),
+  ]) {
+    chainedGenerationState = reduce(chainedGenerationState, {
+      type: "event",
+      event: chainedEvent,
+    });
+  }
+  const chainedGenerationTurns =
+    chainedGenerationState.runtimes[ownerGenerationSid].turns;
+  const chainedOwner = chainedGenerationTurns.find((turn: Turn) =>
+    turn.blocks.some((block: Block) => block.kind === "text"
+      && block.message_id === "owner-new-chain-first"));
+  assert.deepEqual(
+    chainedOwner?.blocks.map((block: Block) => block.kind === "text"
+      ? block.message_id
+      : block.kind === "tool" ? block.tool_use_id : block.item_id),
+    [
+      "owner-new-chain-first",
+      "owner-new-chain-tool",
+      "owner-new-chain-second",
+    ],
+    "every unbound item in the new turn stays on its generation-safe owner",
+  );
+  assert.equal(
+    chainedGenerationTurns.find((turn: Turn) =>
+      turn.id === "owner-old-turn")?.blocks.length,
+    0,
+    "later new-generation message ids cannot reactivate the old liveTaskId owner",
+  );
+
+  const sameGenerationLegacyState = reduce({
+    ...initialState,
+    focusedSid: "same-generation-legacy-owner",
+    runtimes: {
+      "same-generation-legacy-owner": {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "same-generation-legacy-g",
+        turns: [{
+          id: "same-generation-legacy-turn",
+          liveTaskId: "same-generation-legacy-task",
+          prompt: "legacy owner",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "delta",
+      sid: "same-generation-legacy-owner",
+      seq: 2,
+      message_id: "same-generation-legacy-output",
+      channel: "commentary",
+      text: "same generation",
+    }),
+  });
+  assert.equal(
+    sameGenerationLegacyState.runtimes["same-generation-legacy-owner"]
+      .turns.find((turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "same-generation-legacy-output"))?.id,
+    "same-generation-legacy-turn",
+    "same-generation legacy liveTaskId fallback remains supported",
+  );
+
+  // If TurnEnd is lost, an idle authoritative History owns the lifecycle of a
+  // block-overlapping aliasless live row. Its interrupted terminal and timing
+  // must not be converted into a successful local idle repair.
+  const idleInterruptedSid = "idle-interrupted-aliasless-replay";
+  let idleInterruptedState = {
+    ...initialState,
+    focusedSid: idleInterruptedSid,
+    runtimes: {
+      [idleInterruptedSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+      },
+    },
+  };
+  for (const liveEvent of [
+    event({
+      type: "turn_steered",
+      sid: idleInterruptedSid,
+      seq: 30,
+      msg_id: "idle-interrupted-client",
+      turn_id: "idle-interrupted-native",
+      prompt: "work until interrupted",
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: idleInterruptedSid,
+      seq: 31,
+      message_id: "idle-interrupted-final",
+      channel: "final",
+    }),
+    event({
+      type: "delta",
+      sid: idleInterruptedSid,
+      seq: 32,
+      message_id: "idle-interrupted-final",
+      channel: "final",
+      text: "partial final before interruption",
+    }),
+    event({
+      type: "assistant_msg_end",
+      sid: idleInterruptedSid,
+      seq: 33,
+      message_id: "idle-interrupted-final",
+      channel: "final",
+    }),
+  ]) {
+    idleInterruptedState = reduce(idleInterruptedState, {
+      type: "event", event: liveEvent,
+    });
+  }
+  idleInterruptedState = reduce(idleInterruptedState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: idleInterruptedSid,
+      session_id: idleInterruptedSid,
+      revision: "idle-interrupted-r1",
+      generation: "idle-interrupted-g1",
+      build_seq: 1,
+      live_seq: 33,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "idle-interrupted-history",
+      in_progress: false,
+      ts: 1.2,
+      events: [],
+      turns: [{
+        id: "idle-interrupted-history",
+        prompt: "work until interrupted",
+        forkPointId: "idle-interrupted-native",
+        done: true,
+        interrupted: true,
+        ts: 100,
+        doneTs: 1_200,
+        durationMs: 1_100,
+        blocks: [{
+          kind: "text",
+          message_id: "idle-interrupted-final",
+          channel: "final",
+          text: "partial final before interruption",
+          done: true,
+        }],
+      }],
+    }),
+  });
+  const idleInterruptedTurn =
+    idleInterruptedState.runtimes[idleInterruptedSid].turns[0];
+  assert.deepEqual(
+    {
+      done: idleInterruptedTurn.done,
+      interrupted: idleInterruptedTurn.interrupted,
+      doneTs: idleInterruptedTurn.doneTs,
+      durationMs: idleInterruptedTurn.durationMs,
+    },
+    { done: true, interrupted: true, doneTs: 1_200, durationMs: 1_100 },
+    "idle History keeps its authoritative interrupted lifecycle and timing",
+  );
+
+  // During Command+R the first authoritative summary can materialize a steered
+  // user row before its client/native alias is available. The same native
+  // commentary is already present in the live row. Exact block identity plus
+  // the envelope's exact active newest_id is sufficient to bind that one row;
+  // prompt equality or a shared native task id alone is not.
+  const aliaslessActiveSid = "aliasless-active-steer-refresh";
+  const aliaslessHistory = (buildSeq: number) => event({
+    type: "history",
+    sid: aliaslessActiveSid,
+    session_id: aliaslessActiveSid,
+    revision: "aliasless-active-r1",
+    generation: "aliasless-active-g1",
+    build_seq: buildSeq,
+    live_seq: 30,
+    detail: "summary",
+    authoritative: true,
+    has_more: true,
+    newest_id: "history-steer-row",
+    in_progress: true,
+    events: [],
+    turns: [
+      {
+        id: "native-active-task",
+        prompt: "start work",
+        forkPointId: "native-active-task",
+        done: true,
+        blocks: [],
+      },
+      {
+        id: "history-steer-row",
+        prompt: "guide the running task",
+        forkPointId: "native-active-task",
+        done: true,
+        blocks: [{
+          kind: "text",
+          message_id: "shared-active-commentary",
+          channel: "commentary",
+          text: "one visible update",
+          done: true,
+        }],
+      },
+    ],
+  });
+  let aliaslessActiveState = reduce({
+    ...initialState,
+    focusedSid: aliaslessActiveSid,
+    runtimes: {
+      [aliaslessActiveSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "client-steer-row",
+          clientMsgId: "client-steer-row",
+          liveTaskId: "native-active-task",
+          prompt: "guide the running task",
+          done: false,
+          blocks: [{
+            kind: "text",
+            message_id: "shared-active-commentary",
+            channel: "commentary",
+            text: "one visible update",
+            done: true,
+            liveOrder: 0,
+          }],
+          nextLiveBlockOrder: 1,
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: aliaslessHistory(1),
+  });
+  assert.deepEqual(
+    aliaslessActiveState.runtimes[aliaslessActiveSid].turns.map(
+      (turn: Turn) => ({
+        id: turn.id,
+        historyTurnId: turn.historyTurnId,
+        prompt: turn.prompt,
+        done: turn.done,
+      }),
+    ),
+    [
+      {
+        id: "native-active-task",
+        historyTurnId: undefined,
+        prompt: "start work",
+        done: true,
+      },
+      {
+        id: "client-steer-row",
+        historyTurnId: "history-steer-row",
+        prompt: "guide the running task",
+        done: false,
+      },
+    ],
+    "refresh binds one aliasless active history row to its proven live row",
+  );
+  aliaslessActiveState = reduce(aliaslessActiveState, {
+    type: "event",
+    event: aliaslessHistory(2),
+  });
+  assert.equal(
+    aliaslessActiveState.runtimes[aliaslessActiveSid].turns.length,
+    2,
+    "repeated active History refreshes cannot recreate the discarded duplicate",
+  );
+  assert.equal(
+    aliaslessActiveState.runtimes[aliaslessActiveSid].turns[1].blocks.filter(
+      (block: Block) => block.kind === "text"
+        && block.message_id === "shared-active-commentary").length,
+    1,
+    "the bound active commentary renders once",
+  );
+
+  // The first running summary can race ahead of every visible item. With no
+  // block identity yet it is correct to keep the authoritative row and the
+  // accepted local steer separate. Once the local row receives native items
+  // and the completed summary returns those same exact item ids, however, the
+  // terminal merge must collapse the stale empty shell instead of leaving an
+  // extra completed process row at the physical bottom of the conversation.
+  const emptyActiveSid = "empty-active-steer-terminal-binding";
+  const emptyActiveNative = "empty-active-native-task";
+  let emptyActiveState = reduce({
+    ...initialState,
+    focusedSid: emptyActiveSid,
+    runtimes: {
+      [emptyActiveSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "empty-active-g1",
+        historyFence: 10,
+        liveOwner: {
+          turnId: "empty-active-client-steer",
+          seq: 11,
+        },
+        turns: [{
+          id: "empty-active-client-steer",
+          clientMsgId: "empty-active-client-steer",
+          liveTaskId: emptyActiveNative,
+          prompt: "guide before the first item",
+          done: false,
+          ts: 20_001,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: emptyActiveSid,
+      session_id: emptyActiveSid,
+      revision: "empty-active-r1",
+      generation: "empty-active-g1",
+      build_seq: 1,
+      live_seq: 10,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      oldest_id: "empty-active-history-steer",
+      newest_id: "empty-active-history-steer",
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "empty-active-history-steer",
+        prompt: "guide before the first item",
+        forkPointId: emptyActiveNative,
+        done: true,
+        ts: 20_000,
+        blocks: [],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    emptyActiveState.runtimes[emptyActiveSid].turns.length,
+    2,
+    "an item-free running snapshot remains ambiguous until native blocks arrive",
+  );
+  assert.equal(
+    emptyActiveState.runtimes[emptyActiveSid].turns.filter(
+      (turn: Turn) => !turn.done).length,
+    1,
+    "the provisional History shell cannot render a second running indicator",
+  );
+  for (const liveEvent of [
+    event({
+      type: "process",
+      sid: emptyActiveSid,
+      seq: 11,
+      item_id: "empty-active-shared-process",
+      kind: "command",
+      phase: "end",
+      status: "succeeded",
+      turn_id: emptyActiveNative,
+      title: "ran the guided command",
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: emptyActiveSid,
+      seq: 12,
+      message_id: "empty-active-shared-final",
+      channel: "final",
+    }),
+    event({
+      type: "delta",
+      sid: emptyActiveSid,
+      seq: 13,
+      message_id: "empty-active-shared-final",
+      channel: "final",
+      text: "finished the guided work",
+    }),
+    event({
+      type: "assistant_msg_end",
+      sid: emptyActiveSid,
+      seq: 14,
+      message_id: "empty-active-shared-final",
+      channel: "final",
+    }),
+    event({
+      type: "turn_end",
+      sid: emptyActiveSid,
+      seq: 15,
+      turn_id: emptyActiveNative,
+      result: { subtype: "success", duration_ms: 5, is_error: false },
+    }),
+  ]) {
+    emptyActiveState = reduce(emptyActiveState, {
+      type: "event",
+      event: liveEvent,
+    });
+  }
+  const preTerminalRows =
+    emptyActiveState.runtimes[emptyActiveSid].turns;
+  assert.equal(
+    preTerminalRows[0].blocks.some((block: Block) => block.kind === "text"
+      && block.message_id === "empty-active-shared-final"),
+    false,
+    "an aliasless History shell cannot steal the post-steer final answer",
+  );
+  assert.deepEqual(
+    preTerminalRows[1].blocks.map((block: Block) => block.kind === "text"
+      ? block.message_id
+      : block.kind === "tool" ? block.tool_use_id : block.item_id),
+    ["empty-active-shared-process", "empty-active-shared-final"],
+    "post-steer process and final output remain on one live UI row",
+  );
+  emptyActiveState = reduce(emptyActiveState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: emptyActiveSid,
+      session_id: emptyActiveSid,
+      revision: "empty-active-r1",
+      generation: "empty-active-g1",
+      build_seq: 2,
+      live_seq: 15,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      oldest_id: "empty-active-history-steer",
+      newest_id: "empty-active-history-steer",
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "empty-active-history-steer",
+        prompt: "guide before the first item",
+        forkPointId: emptyActiveNative,
+        done: true,
+        ts: 20_000,
+        doneTs: 25_000,
+        durationMs: 5,
+        blocks: [{
+          kind: "process",
+          item_id: "empty-active-shared-process",
+          processKind: "command",
+          phase: "end",
+          status: "succeeded",
+          turn_id: emptyActiveNative,
+          title: "ran the guided command",
+          done: true,
+        }, {
+          kind: "text",
+          message_id: "empty-active-shared-final",
+          channel: "final",
+          text: "finished the guided work",
+          done: true,
+        }],
+        detailEventCount: 2,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    emptyActiveState.runtimes[emptyActiveSid].turns.map((turn: Turn) => ({
+      id: turn.id,
+      historyTurnId: turn.historyTurnId,
+      done: turn.done,
+      prompt: turn.prompt,
+      blockIds: turn.blocks.map((block: Block) => block.kind === "text"
+        ? block.message_id
+        : block.kind === "tool" ? block.tool_use_id : block.item_id),
+    })),
+    [{
+      id: "empty-active-client-steer",
+      historyTurnId: "empty-active-history-steer",
+      done: true,
+      prompt: "guide before the first item",
+      blockIds: [
+        "empty-active-shared-process",
+        "empty-active-shared-final",
+      ],
+    }],
+    "terminal History binds the now-proven live row and removes its stale active shell",
+  );
+
   const ambiguousActiveHeadSid = "ambiguous-active-history-head";
   let ambiguousActiveHeadState = reduce({
     ...initialState,
@@ -9146,6 +10694,9 @@ try {
     "reply copy keeps the original compact icon instead of adding a text action");
   assert.match(richMarkup, /class="ubub-meta ai-meta"[\s\S]*aria-label="复制"/,
     "the original reply copy icon remains in the completed-turn metadata row");
+  assert.match(richMarkup,
+    /class="ubub-meta ai-meta"[\s\S]*?<button[^>]*aria-label="复制"[^>]*><svg[^>]*>[\s\S]*?<rect x="8" y="8" width="14" height="14" rx="2"\/><path d="M4 16a2 2 0 01-2-2V4a2 2 0 012-2h10a2 2 0 012 2"/,
+    "reply copy uses the overlapping-squares icon instead of a checkmark");
   assert.doesNotMatch(richMarkup, /先检查代码/);
   assert.doesNotMatch(richMarkup, /class="turn-working"/);
 
@@ -9730,6 +11281,8 @@ try {
   }));
   assert.doesNotMatch(codexMarkup, /复制回复/);
   assert.match(codexMarkup, /class="ubub-meta ai-meta"[\s\S]*aria-label="复制"/);
+  assert.match(codexMarkup,
+    /class="ubub-meta ai-meta"[\s\S]*?<button[^>]*aria-label="复制"[^>]*><svg[^>]*>[\s\S]*?<rect x="8" y="8" width="14" height="14" rx="2"\/><path d="M4 16a2 2 0 01-2-2V4a2 2 0 012-2h10a2 2 0 012 2"/);
   assert.match(codexMarkup, /aria-label="派生"/);
   assert.match(codexMarkup, /data-tooltip="从此回复派生新会话"/);
   assert.doesNotMatch(codexMarkup, /title="从此回复派生/);

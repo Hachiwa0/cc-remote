@@ -1,7 +1,12 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { ToolBlock } from "../domain/conversation";
 import { Icon } from "../icons";
 import { buildEditDiffPreview } from "../diff";
+import {
+  cancelDraggedPointer,
+  PointerTapGuard,
+  releaseDraggedPointer,
+} from "../pointer-tap";
 import { isToolFailure, presentTool } from "../tool-presentation";
 
 function EditDiff({ oldString, newString, serverDiff }: {
@@ -32,6 +37,7 @@ function EditDiff({ oldString, newString, serverDiff }: {
 
 export function ToolCallCard({ block }: { block: ToolBlock }) {
   const [open, setOpen] = useState(false);
+  const tapGuard = useRef(new PointerTapGuard());
   const status = !block.done ? "run" : isToolFailure(block) ? "err" : "done";
   const presentation = presentTool(block);
   const inp = block.input as { file_path?: string; old_string?: string; new_string?: string; content?: string };
@@ -71,8 +77,31 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
     );
   }
   return (
-    <details className="tool" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary className="tool-h">{header}</summary>
+    <details className="tool" open={open}>
+      <summary className="tool-h"
+        onPointerDown={(event) => {
+          tapGuard.current.pointerDown(
+            event.pointerId, event.clientX, event.clientY);
+          event.currentTarget.setPointerCapture?.(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          if (tapGuard.current.pointerMove(
+            event.pointerId, event.clientX, event.clientY,
+          )) {
+            releaseDraggedPointer(
+              event.currentTarget, event.pointerId, event.pointerType);
+          }
+        }}
+        onPointerUp={(event) => tapGuard.current.pointerUp(event.pointerId)}
+        onPointerCancel={(event) => {
+          cancelDraggedPointer(
+            tapGuard.current,
+            event.currentTarget, event.pointerId, event.pointerType);
+        }}
+        onClick={(event) => {
+          event.preventDefault();
+          if (tapGuard.current.consumeClick(event.detail)) setOpen(!open);
+        }}>{header}</summary>
       {open && <div className="tool-b">
         {block.progress && <div className="tool-progress">{block.progress}</div>}
         {resultSummary && resultSummary !== output && (

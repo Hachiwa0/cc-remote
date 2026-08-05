@@ -1051,6 +1051,7 @@ function HistoryConversationBrowserFixture() {
   const recoveryReplacement = params.has("recovery-replace");
   const deepBrowse = params.has("deep-browse");
   const runtimeBrowse = params.has("runtime-browse");
+  const generationShift = params.has("generation-shift");
   const delayedHistoryAvailability = params.has("delayed-history-availability");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
   const emptyFinalPage = params.has("empty-final");
@@ -1145,6 +1146,8 @@ function HistoryConversationBrowserFixture() {
   });
   const [loads, setLoads] = useState(0);
   const [historyRevision, setHistoryRevision] = useState("revision-1");
+  const [historyGeneration, setHistoryGeneration] =
+    useState("fixture-generation-1");
   const [historyViewRevision, setHistoryViewRevision] = useState("revision-1");
   const [historyViewId, setHistoryViewId] = useState(
     deepBrowse ? "browse-1" : "runtime",
@@ -1257,6 +1260,8 @@ function HistoryConversationBrowserFixture() {
   const loadMore = useCallback((): boolean | {
     accepted: true;
     viewId: string;
+    scopeKey: string;
+    generation: string | null;
   } => {
     const requestSid = sid;
     if (!sessions[requestSid]?.hasMore) return false;
@@ -1300,7 +1305,12 @@ function HistoryConversationBrowserFixture() {
       }
     }, delayMs);
     return enteringViewId
-      ? { accepted: true, viewId: enteringViewId }
+      ? {
+          accepted: true,
+          viewId: enteringViewId,
+          scopeKey: "fixture-browse-scope",
+          generation: null,
+        }
       : true;
   }, [
     browseMode, delayMs, emptyFinalPage, growOlderRow, growthDelayMs,
@@ -1611,6 +1621,14 @@ function HistoryConversationBrowserFixture() {
           onClick={replaceHistoryRevision}>
           replace revision
         </button>
+        {generationShift && (
+          <button data-testid="shift-generation" type="button"
+            onClick={() => setHistoryGeneration((current) =>
+              current === "fixture-generation-1"
+                ? "fixture-generation-2" : "fixture-generation-3")}>
+            shift generation
+          </button>
+        )}
         {migrationPickerFixture && (
           <>
             <button data-testid="open-migration-picker" type="button"
@@ -1781,8 +1799,10 @@ function HistoryConversationBrowserFixture() {
           hasMore={active.hasMore}
           historyRevision={historyRevision}
           historyViewRevision={historyViewRevision}
+          historyGeneration={generationShift ? historyGeneration : undefined}
           historyViewId={deepBrowse || browseMode ? historyViewId : undefined}
-          historyScopeKey="fixture-history-scope"
+          historyScopeKey={runtimeBrowse && browseMode
+            ? "fixture-browse-scope" : "fixture-history-scope"}
           historyWindowEpoch={active.windowEpoch ?? 0}
           historyCursor={active.cursor}
           browseMode={browseMode && sid.endsWith("-a")}

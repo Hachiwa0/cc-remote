@@ -1,6 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const NEW_CHAT_CONTROL_TESTS = /new-chat controls|256-character profile id/;
+const WEBKIT_LIVE_INTERACTION_TESTS =
+  /live append follows|returning to a background-grown live turn|multi-line IME growth|multi-line composer growth|composer action growth|Codex controls stay on one row|queued messages expand|migration picker/;
 const WEBKIT_RENDERING_TESTS =
   /mounted message image|two visible images|HTML preview|artifact-(?:svg|markdown-svg)|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|real wide Robot|pending composer image/;
 
@@ -30,7 +32,11 @@ export default defineConfig({
     },
     {
       name: "webkit",
-      grepInvert: [NEW_CHAT_CONTROL_TESTS, WEBKIT_RENDERING_TESTS],
+      grepInvert: [
+        NEW_CHAT_CONTROL_TESTS,
+        WEBKIT_LIVE_INTERACTION_TESTS,
+        WEBKIT_RENDERING_TESTS,
+      ],
       use: {
         ...devices["iPhone 15"],
       },
@@ -42,6 +48,13 @@ export default defineConfig({
       // run in fresh browser processes without reducing the test matrix.
       name: "webkit-rendering",
       grep: WEBKIT_RENDERING_TESTS,
+      use: {
+        ...devices["iPhone 15"],
+      },
+    },
+    {
+      name: "webkit-live-interactions",
+      grep: WEBKIT_LIVE_INTERACTION_TESTS,
       use: {
         ...devices["iPhone 15"],
       },

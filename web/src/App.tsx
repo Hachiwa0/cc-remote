@@ -2965,7 +2965,12 @@ export default function App() {
   };
   const loadOlderHistoryPage = (
     anchorTurnId?: string,
-  ): boolean | { accepted: true; viewId: string } => {
+  ): boolean | {
+    accepted: true;
+    viewId: string;
+    scopeKey: string;
+    generation: string | null;
+  } => {
     const current = stateRef.current;
     const sid = current.focusedSid;
     const runtime = sid ? current.runtimes[sid] : null;
@@ -3027,7 +3032,12 @@ export default function App() {
         sourcePageKey: basePageKey,
         anchorTurnId: anchorTurnId ?? null,
       });
-    return accepted ? { accepted: true, viewId } : false;
+    return accepted ? {
+      accepted: true,
+      viewId,
+      scopeKey,
+      generation: browseGeneration,
+    } : false;
   };
   const loadNewerHistoryPage = (anchorTurnId?: string): boolean => {
     const browse = stateRef.current.historyBrowse;
