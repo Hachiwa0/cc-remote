@@ -96,6 +96,7 @@ _WORK_SKILL_LIMIT = 512
 _WORK_MCP_SERVER_LIMIT = 128
 _WORK_PATH_MAX = 4096
 _WORK_NAME_MAX = 256
+_COMPACTION_CONTINUATION_GRACE_SECONDS = 5.0
 _PROXY_HANDSHAKE_MAX = 16 * 1024
 _PROXY_HANDSHAKE_TIMEOUT = 5.0
 _PROXY_MESSAGE_MAX = 16 * 1024 * 1024
@@ -305,6 +306,62 @@ class CodexNoActiveTurnFence:
 
     def release_now(self) -> None:
         self.release.set()
+
+
+class _CodexCompactionContinuation:
+    """One managed browser turn spanning native compact turn ids.
+
+    ``logical_turn_id`` is frozen for the response consumer. ``native_turn_id``
+    follows app-server so interrupt and rollout ownership always target the real
+    active task. The queue/process/thread fences prevent another subscribed
+    daemon turn from inheriting this narrow continuation right.
+    """
+
+    __slots__ = (
+        "thread_id",
+        "native_turn_id",
+        "logical_turn_id",
+        "generation",
+        "queue",
+        "awaiting_replacement",
+        "interruption_consumed",
+        "suppression_enabled",
+        "deadline",
+        "suppressed_terminal",
+        "suppressed_size",
+        "candidate_turn_id",
+        "candidate_started",
+        "candidate_size",
+        "settled",
+        "expiry_task",
+    )
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        native_turn_id: str,
+        logical_turn_id: str,
+        generation: int,
+        queue: Any,
+    ):
+        self.thread_id = thread_id
+        self.native_turn_id = native_turn_id
+        self.logical_turn_id = logical_turn_id
+        self.generation = generation
+        self.queue = queue
+        self.awaiting_replacement = False
+        self.interruption_consumed = False
+        self.suppression_enabled = True
+        self.deadline = 0.0
+        self.suppressed_terminal: Optional[dict] = None
+        self.suppressed_size: Optional[int] = None
+        self.candidate_turn_id: Optional[str] = None
+        self.candidate_started: Optional[dict] = None
+        self.candidate_size: Optional[int] = None
+        self.settled = asyncio.Event()
+        self.settled.set()
+        self.expiry_task: Optional[asyncio.Task] = None
 
 
 class CodexNoActiveTurnConfirmation:
@@ -959,6 +1016,9 @@ class CodexHandle:
         # authoritative evidence that this otherwise-terminal boundary is a
         # continuation fence rather than a real user interrupt.
         self._compaction_continuation_turn_id: Optional[str] = None
+        self._managed_compaction_continuation: Optional[
+            _CodexCompactionContinuation
+        ] = None
         # Inline Review has two different app-server turn ids.  The response and
         # visible lifecycle use the outer id, while a nested reviewer turn is the
         # thread's actual interrupt target.  Keep them separate: collapsing both
@@ -1306,6 +1366,7 @@ class CodexHandle:
         self._goal_prompt_unbound = None
         self._spontaneous_turn_id = None
         self._compaction_continuation_turn_id = None
+        self._discard_managed_compaction_continuation()
         self.last_token_usage = None
         self.context_window = None
         self._stderr_task = asyncio.create_task(
@@ -1653,6 +1714,7 @@ class CodexHandle:
             self.proc is None or self._dead or self.proc.returncode is not None
         ):
             await self.force_reconnect(self.thread_id, self._cwd, reason="app-server unavailable")
+        await self._release_managed_compaction_continuation()
         assert self.proc is not None and self.thread_id, "connect() first"
         self._open_managed_stream()
         queue = self._turn_q
@@ -1727,6 +1789,7 @@ class CodexHandle:
         client_user_message_id: Optional[str] = None,
     ) -> str:
         """Append input to the exact active turn without changing lifecycle."""
+        await self._wait_managed_compaction_settled()
         if self.thread_id and (
             self.proc is None or self._dead or self.proc.returncode is not None
         ):
@@ -1779,6 +1842,19 @@ class CodexHandle:
     @property
     def owned_turn_ids(self) -> frozenset[str]:
         return frozenset(self._owned_turn_ids)
+
+    @property
+    def compaction_continuation_turn_ids(self) -> frozenset[str]:
+        """Native/logical ids backed by this handle's exact compact fence."""
+        fence = self._managed_compaction_continuation
+        if (
+            fence is None
+            or not fence.suppression_enabled
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        ):
+            return frozenset()
+        return frozenset({fence.logical_turn_id, fence.native_turn_id})
 
     @property
     def turn_attribution_pending(self) -> bool:
@@ -1872,8 +1948,316 @@ class CodexHandle:
         )
         return item_cap, byte_cap
 
+    @staticmethod
+    def _notification_is_user_message(message: dict) -> bool:
+        if message.get("method") not in {"item/started", "item/completed"}:
+            return False
+        params = message.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        return isinstance(item, dict) and item.get("type") == "userMessage"
+
+    def _managed_compaction_fence_current(
+        self,
+        fence: Optional[_CodexCompactionContinuation] = None,
+        *,
+        check_deadline: bool = True,
+    ) -> bool:
+        fence = fence or self._managed_compaction_continuation
+        if fence is None or self._managed_compaction_continuation is not fence:
+            return False
+        if (
+            fence.generation != self._generation
+            or fence.thread_id != self.thread_id
+            or fence.queue is not self._turn_q
+            or self._spontaneous_turn_id is not None
+            or self._review_active
+            or not self.turn_active
+            or fence.native_turn_id != self.turn_id
+        ):
+            return False
+        if (
+            check_deadline
+            and fence.awaiting_replacement
+            and fence.deadline > 0
+            and asyncio.get_running_loop().time() > fence.deadline
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _cancel_compaction_expiry(
+        fence: _CodexCompactionContinuation,
+    ) -> None:
+        task = fence.expiry_task
+        fence.expiry_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _discard_managed_compaction_continuation(self) -> None:
+        fence = self._managed_compaction_continuation
+        self._managed_compaction_continuation = None
+        if fence is not None:
+            fence.settled.set()
+            self._cancel_compaction_expiry(fence)
+
+    async def _release_managed_compaction_continuation(self) -> bool:
+        """Release the old terminal and replay an unconfirmed replacement.
+
+        A replacement ``turn/started`` is not enough to merge two native turns:
+        it may be an independent prompt arriving beside the compact boundary.
+        When the fence expires or meets a user boundary, close the managed turn
+        first, then replay that withheld start through the ordinary spontaneous
+        path so neither lifecycle can disappear.
+        """
+        fence = self._managed_compaction_continuation
+        if fence is None:
+            return False
+        terminal = fence.suppressed_terminal
+        raw_size = fence.suppressed_size
+        candidate_started = fence.candidate_started
+        candidate_size = fence.candidate_size
+        deliver = bool(
+            terminal is not None
+            and self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        )
+        replay_candidate = bool(deliver and candidate_started is not None)
+        self._managed_compaction_continuation = None
+        fence.settled.set()
+        self._cancel_compaction_expiry(fence)
+        self._compaction_continuation_turn_id = None
+        if not deliver:
+            return False
+        await self._dispatch(terminal, raw_size=raw_size)
+        if replay_candidate:
+            await self._dispatch(candidate_started, raw_size=candidate_size)
+        return True
+
+    async def _wait_managed_compaction_settled(self) -> None:
+        """Wait for exact continuation attribution before issuing a steer."""
+        fence = self._managed_compaction_continuation
+        if (
+            fence is None
+            or fence.settled.is_set()
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        ):
+            return
+        remaining = max(
+            0.0,
+            fence.deadline - asyncio.get_running_loop().time(),
+        )
+        try:
+            await asyncio.wait_for(
+                fence.settled.wait(),
+                timeout=remaining + 0.25,
+            )
+        except asyncio.TimeoutError:
+            if self._managed_compaction_continuation is fence:
+                await self._release_managed_compaction_continuation()
+
+    async def _expire_managed_compaction_continuation(
+        self, fence: _CodexCompactionContinuation,
+    ) -> None:
+        try:
+            delay = max(
+                0.0,
+                fence.deadline - asyncio.get_running_loop().time(),
+            )
+            await asyncio.sleep(delay)
+            if self._managed_compaction_continuation is fence:
+                await self._release_managed_compaction_continuation()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log.warning(
+                "Codex compaction continuation expiry failed",
+                error_type=type(exc).__name__,
+            )
+
+    def _arm_managed_compaction_continuation(
+        self, native_turn_id: str,
+    ) -> None:
+        queue = self._turn_q
+        thread_id = self.thread_id
+        if (
+            queue is None
+            or not thread_id
+            or self._spontaneous_turn_id is not None
+            or self._review_active
+        ):
+            return
+        previous = self._managed_compaction_continuation
+        logical_turn_id = native_turn_id
+        suppression_enabled = True
+        if (
+            previous is not None
+            and self._managed_compaction_fence_current(
+                previous, check_deadline=False)
+            and previous.native_turn_id == native_turn_id
+        ):
+            # A repeated compact notification is not proof that the suppressed
+            # terminal has gained a continuation. Keep the original deadline
+            # and terminal intact; replacing this fence would silently lose the
+            # only authoritative close if no further model item arrives.
+            if previous.awaiting_replacement:
+                return
+            logical_turn_id = previous.logical_turn_id
+            suppression_enabled = previous.suppression_enabled
+        self._discard_managed_compaction_continuation()
+        fence = _CodexCompactionContinuation(
+            thread_id=thread_id,
+            native_turn_id=native_turn_id,
+            logical_turn_id=logical_turn_id,
+            generation=self._generation,
+            queue=queue,
+        )
+        fence.suppression_enabled = suppression_enabled
+        self._managed_compaction_continuation = fence
+
+    def _confirm_same_id_compaction_continuation(
+        self, message: dict,
+    ) -> None:
+        fence = self._managed_compaction_continuation
+        if (
+            fence is None
+            or not fence.awaiting_replacement
+            or not self._managed_compaction_fence_current(fence)
+            or _notification_turn_id(message) != fence.native_turn_id
+            or message.get("method") in {
+                "turn/completed", "thread/compacted", "error",
+            }
+        ):
+            return
+        fence.awaiting_replacement = False
+        fence.suppressed_terminal = None
+        fence.suppressed_size = None
+        fence.settled.set()
+        self._cancel_compaction_expiry(fence)
+
+    def _can_stage_managed_compaction_replacement(
+        self,
+        message: dict,
+        target_thread_id: Optional[str],
+        target_turn_id: Optional[str],
+    ) -> bool:
+        fence = self._managed_compaction_continuation
+        if (
+            message.get("method") != "turn/started"
+            or fence is None
+            or not fence.awaiting_replacement
+            or not self._managed_compaction_fence_current(fence)
+            or target_thread_id != fence.thread_id
+            or target_turn_id is None
+            or target_turn_id == fence.native_turn_id
+            or (
+                fence.candidate_turn_id is not None
+                and fence.candidate_turn_id != target_turn_id
+            )
+        ):
+            return False
+        return True
+
+    def _stage_managed_compaction_replacement(
+        self,
+        message: dict,
+        raw_size: Optional[int],
+    ) -> bool:
+        target_thread_id = _notification_thread_id(message)
+        target_turn_id = _notification_turn_id(message)
+        if not self._can_stage_managed_compaction_replacement(
+            message, target_thread_id, target_turn_id,
+        ):
+            return False
+        fence = self._managed_compaction_continuation
+        assert fence is not None and target_turn_id is not None
+        if fence.candidate_turn_id is None:
+            fence.candidate_turn_id = target_turn_id
+            fence.candidate_started = message
+            fence.candidate_size = raw_size
+        return True
+
+    def _managed_compaction_candidate_matches(self, message: dict) -> bool:
+        fence = self._managed_compaction_continuation
+        return bool(
+            fence is not None
+            and fence.awaiting_replacement
+            and fence.candidate_turn_id is not None
+            and self._managed_compaction_fence_current(fence)
+            and _notification_turn_id(message) == fence.candidate_turn_id
+        )
+
+    async def _confirm_managed_compaction_replacement(
+        self, message: dict,
+    ) -> bool:
+        fence = self._managed_compaction_continuation
+        if (
+            fence is None
+            or not self._managed_compaction_candidate_matches(message)
+            or fence.candidate_turn_id is None
+            or fence.candidate_started is None
+        ):
+            return False
+        candidate_turn_id = fence.candidate_turn_id
+        candidate_started = fence.candidate_started
+        candidate_size = fence.candidate_size
+        fence.awaiting_replacement = False
+        fence.suppressed_terminal = None
+        fence.suppressed_size = None
+        fence.candidate_turn_id = None
+        fence.candidate_started = None
+        fence.candidate_size = None
+        fence.native_turn_id = candidate_turn_id
+        fence.interruption_consumed = False
+        fence.settled.set()
+        self._cancel_compaction_expiry(fence)
+        self.turn_id = candidate_turn_id
+        self.remember_owned_turn_id(candidate_turn_id)
+        logical_started = self._logicalize_managed_compaction_notification(
+            candidate_started)
+        logical_size = (
+            candidate_size
+            if logical_started is candidate_started
+            else self._notification_wire_size(logical_started)
+        )
+        queue = self._turn_q
+        if queue is not None and not self._queue_managed_notification(
+            logical_started, logical_size,
+        ):
+            await queue.put(logical_started)
+        return True
+
+    def _logicalize_managed_compaction_notification(
+        self, message: dict,
+    ) -> dict:
+        fence = self._managed_compaction_continuation
+        target_turn_id = _notification_turn_id(message)
+        if (
+            fence is None
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+            or target_turn_id != fence.native_turn_id
+            or fence.logical_turn_id == target_turn_id
+        ):
+            return message
+        logical = dict(message)
+        raw_params = message.get("params")
+        if not isinstance(raw_params, dict):
+            return message
+        params = dict(raw_params)
+        params["turnId"] = fence.logical_turn_id
+        raw_turn = raw_params.get("turn")
+        if isinstance(raw_turn, dict) and raw_turn.get("id") == target_turn_id:
+            params["turn"] = {
+                **raw_turn,
+                "id": fence.logical_turn_id,
+            }
+        logical["params"] = params
+        return logical
+
     def _open_managed_stream(self) -> None:
         """Create a bounded producer that can never block JSON-RPC stdout."""
+        self._discard_managed_compaction_continuation()
         item_cap, byte_cap = self._notification_queue_limits(managed=True)
         self._turn_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
         self._managed_overflow = False
@@ -2086,6 +2470,29 @@ class CodexHandle:
                 self._schedule_http_provider_descendant_repair()
 
     async def interrupt(self) -> None:
+        fence = self._managed_compaction_continuation
+        if fence is not None:
+            if (
+                fence.awaiting_replacement
+                and fence.candidate_started is not None
+            ):
+                # The withheld start is the newest exact native task. A user
+                # interrupt is itself sufficient attribution evidence: expose
+                # the logical continuation before targeting that native id.
+                await self._confirm_managed_compaction_replacement(
+                    fence.candidate_started)
+                fence = self._managed_compaction_continuation
+            elif fence.awaiting_replacement:
+                # The compact terminal already proved there is no steerable task
+                # yet. End the UI grace immediately instead of sending a stale
+                # interrupt RPC to the completed native id.
+                await self._release_managed_compaction_continuation()
+                return
+            # A user stop is authoritative. Keep only the native->logical id
+            # mapping so its eventual terminal still closes the original row;
+            # never suppress that terminal as another compact boundary.
+            if fence is not None:
+                fence.suppression_enabled = False
         if not (self.proc and self.thread_id and self.turn_id):
             raise RuntimeError("codex turn is not running")
         target_thread_id = self.thread_id
@@ -2255,6 +2662,7 @@ class CodexHandle:
         self._close_spontaneous_stream(spontaneous_turn_id)
         self._spontaneous_turn_id = None
         self._compaction_continuation_turn_id = None
+        self._discard_managed_compaction_continuation()
         self._clear_review_tracking()
         tasks = [t for t in (self._reader, self._stderr_task)
                  if t is not None and t is not asyncio.current_task()]
@@ -2674,6 +3082,7 @@ class CodexHandle:
                        status: Optional[str] = None,
                        token_budget: Optional[int] = None) -> dict:
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         if objective is not None and not self._goal_baseline_loaded:
             try:
                 await self.get_goal()
@@ -2724,6 +3133,7 @@ class CodexHandle:
 
     async def clear_goal(self) -> bool:
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         result = await self._request("thread/goal/clear", {"threadId": self.thread_id})
         cleared = bool((result or {}).get("cleared"))
         if cleared:
@@ -2742,6 +3152,7 @@ class CodexHandle:
         reader as ordinary turns instead of disappearing in a one-shot RPC.
         """
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         if self.turn_active:
             raise RuntimeError("codex thread is busy")
         self._open_managed_stream()
@@ -2807,6 +3218,7 @@ class CodexHandle:
 
     async def compact_thread(self) -> None:
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         if self.turn_active:
             raise RuntimeError("codex thread is busy")
         await self._request(
@@ -2814,6 +3226,7 @@ class CodexHandle:
 
     async def rollback_thread(self, num_turns: int) -> dict[str, Any]:
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         if self.turn_active:
             raise RuntimeError("codex thread is busy")
         if not isinstance(num_turns, int) or isinstance(num_turns, bool) \
@@ -3593,6 +4006,8 @@ class CodexHandle:
                     self.daemon_manager.invalidate()
                     self._using_daemon_proxy = False
                     self._proxy_read_buffer.clear()
+                self._compaction_continuation_turn_id = None
+                self._discard_managed_compaction_continuation()
                 self._clear_review_tracking()
                 spontaneous_turn_id = self._spontaneous_turn_id
                 self._spontaneous_turn_id = None
@@ -3628,8 +4043,21 @@ class CodexHandle:
             if self._using_daemon_proxy else None
         )
         current_thread_id = binding_thread_id or self.thread_id
+        target_turn_id = _notification_turn_id(message)
+        exact_unattributed_managed_turn = bool(
+            self._using_daemon_proxy
+            and target_thread_id is None
+            and target_turn_id is not None
+            and target_turn_id == self.turn_id
+            and self.turn_active
+            and self._turn_q is not None
+            and self._spontaneous_turn_id is None
+            and not self._review_active
+        )
         if (method in _MODEL_TURN_METHODS
-                and (target_thread_id is None or current_thread_id is None)):
+                and (current_thread_id is None
+                     or (target_thread_id is None
+                         and not exact_unattributed_managed_turn))):
             # These 0.144.1 notifications require both threadId and turnId.
             # Unlike legacy error/hook frames, there is no valid thread-scoped
             # form, so a partial payload must never be guessed into this session.
@@ -3639,7 +4067,8 @@ class CodexHandle:
         if (self._using_daemon_proxy
                 and (_is_turn_notification(method)
                      or method == "thread/compacted")
-                and target_thread_id is None):
+                and target_thread_id is None
+                and not exact_unattributed_managed_turn):
             # Private one-session app-servers historically omit threadId on
             # legitimate spontaneous turns. A shared daemon has no such safe
             # inference at any point in its connection lifetime: after resume
@@ -3654,7 +4083,6 @@ class CodexHandle:
                 and target_thread_id != current_thread_id):
             log.warning("foreign codex thread notification dropped", method=method)
             return False
-        target_turn_id = _notification_turn_id(message)
         if (not _is_turn_notification(method)
                 and method not in {"error", "thread/compacted"}):
             return True
@@ -3690,6 +4118,10 @@ class CodexHandle:
                 log.warning("unattributed codex turn notification dropped",
                             method=method)
                 return False
+            if self._can_stage_managed_compaction_replacement(
+                message, target_thread_id, target_turn_id,
+            ):
+                return True
             if (self.turn_active and self.turn_id is not None
                     and self.turn_id != target_turn_id):
                 log.warning("foreign codex turn notification dropped",
@@ -3700,6 +4132,8 @@ class CodexHandle:
             return True
 
         if target_turn_id is not None:
+            if self._managed_compaction_candidate_matches(message):
+                return True
             if self.turn_id is None:
                 if not (self.turn_active or self.turn_start_pending):
                     log.warning("orphan codex turn notification dropped",
@@ -3860,6 +4294,32 @@ class CodexHandle:
                     task.cancel()
         if not self._notification_is_current(m):
             return
+        if self._stage_managed_compaction_replacement(m, raw_size):
+            # ``turn/started`` alone is ambiguous: app-server may be announcing
+            # the compact replacement or an independent user/Goal turn. Hold it
+            # until the first attributable item settles that distinction.
+            return
+        candidate_frame = self._managed_compaction_candidate_matches(m)
+        candidate_user_boundary = candidate_frame and (
+            self._notification_is_user_message(m)
+            or method in {"thread/goal/updated", "thread/goal/cleared"}
+        )
+        candidate_terminal = candidate_frame and method in {
+            "turn/completed", "error",
+        }
+        if (
+            self._managed_compaction_continuation is not None
+            and (candidate_user_boundary or candidate_terminal)
+        ):
+            # Ownership has already been checked above. Close the old managed
+            # turn, replay a provisional replacement as spontaneous, then
+            # revalidate this frame against the resulting state.
+            await self._release_managed_compaction_continuation()
+            if not self._notification_is_current(m):
+                return
+        elif candidate_frame:
+            await self._confirm_managed_compaction_replacement(m)
+        self._confirm_same_id_compaction_continuation(m)
         if method == "error":
             diagnostic = _provider_error_diagnostic(m.get("params"))
             logger_method = log.info if diagnostic["will_retry"] else log.warning
@@ -3870,6 +4330,13 @@ class CodexHandle:
             and target_turn_id is not None
             and target_turn_id == self._review_execution_turn_id
             and target_turn_id != self._review_outer_turn_id
+        )
+        managed_queue_message = self._logicalize_managed_compaction_notification(
+            m)
+        managed_queue_raw_size = (
+            raw_size
+            if managed_queue_message is m
+            else self._notification_wire_size(managed_queue_message)
         )
         # Some app-server revisions may report a nested terminal before the
         # outer Review finishes its exitedReviewMode/agentMessage lifecycle.  It
@@ -3888,6 +4355,8 @@ class CodexHandle:
                 and compacted_turn_id == self.turn_id
             ):
                 self._compaction_continuation_turn_id = compacted_turn_id
+                self._arm_managed_compaction_continuation(
+                    compacted_turn_id)
         compact_continuation_boundary = False
         if method == "turn/completed":
             params = m.get("params")
@@ -3903,11 +4372,37 @@ class CodexHandle:
                 and self.turn_active
             )
             if compact_continuation_boundary:
-                # Do not deliver a false terminal to either managed or
-                # spontaneous consumers. Consume the one-shot proof so a later
-                # genuine interrupt of this turn still closes normally.
                 self._compaction_continuation_turn_id = None
-                return
+                fence = self._managed_compaction_continuation
+                if (
+                    fence is not None
+                    and fence.suppression_enabled
+                    and not fence.interruption_consumed
+                    and self._managed_compaction_fence_current(
+                        fence, check_deadline=False)
+                    and target_turn_id == fence.native_turn_id
+                ):
+                    # Delay this otherwise-authoritative terminal briefly. A
+                    # same-id item or exact replacement turn confirms compact
+                    # continuation; silence releases the real interrupt instead
+                    # of leaving the UI permanently running.
+                    fence.interruption_consumed = True
+                    fence.awaiting_replacement = True
+                    fence.deadline = (
+                        asyncio.get_running_loop().time()
+                        + _COMPACTION_CONTINUATION_GRACE_SECONDS
+                    )
+                    fence.suppressed_terminal = m
+                    fence.suppressed_size = raw_size
+                    fence.settled.clear()
+                    fence.expiry_task = asyncio.create_task(
+                        self._expire_managed_compaction_continuation(fence)
+                    )
+                    return
+                # Existing private/spontaneous behavior: compact is the only
+                # proof that one interrupted boundary is non-terminal.
+                if fence is None:
+                    return
         completed_spontaneous_turn_id: Optional[str] = None
         if method == "thread/started" and not self.thread_id:
             self.thread_id = _thread_id_of_notif(m)
@@ -4087,10 +4582,12 @@ class CodexHandle:
             await self._restore_http_provider_state()
         if self._turn_q is not None and _is_turn_queue_notification(method):
             queue = self._turn_q
-            if not self._queue_managed_notification(m, raw_size):
+            if not self._queue_managed_notification(
+                managed_queue_message, managed_queue_raw_size,
+            ):
                 # Compatibility for narrow unit tests which inject an
                 # asyncio.Queue directly instead of opening the live bridge.
-                await queue.put(m)
+                await queue.put(managed_queue_message)
                 if method == "turn/completed":
                     await queue.put(None)
         elif (_is_turn_queue_notification(method)
@@ -4104,6 +4601,7 @@ class CodexHandle:
             completed_turn_id = _notification_turn_id(m)
             if completed_turn_id == self.turn_id:
                 self.turn_id = None
+            self._discard_managed_compaction_continuation()
             if (self._review_active
                     and completed_turn_id == self._review_outer_turn_id):
                 self._clear_review_tracking()

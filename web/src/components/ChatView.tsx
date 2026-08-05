@@ -2657,7 +2657,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 </div>
               )}
               {fileChips(t)}
-              {t.interrupted && <div className="note interrupted">— 已打断 —</div>}
+              {t.interrupted && !t.error
+                && <div className="note interrupted">— 已打断 —</div>}
               {t.error && <div className="note interrupted">{
                 presentHistoricalTurnProblem(t.error)
               }</div>}

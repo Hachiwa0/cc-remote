@@ -620,6 +620,7 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
   const historyTurnId = history.historyTurnId
     ?? (history.id !== live.id ? history.id : live.historyTurnId);
   const detailProjection = live.detailProjection ?? history.detailProjection;
+  const terminalSource = live.terminalSource ?? history.terminalSource;
   return {
     ...history,
     id: live.id,
@@ -635,6 +636,7 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     done: preserveLiveOpen ? live.done : history.done || live.done,
     interrupted: history.interrupted || live.interrupted,
     error: live.error ?? history.error,
+    ...(terminalSource ? { terminalSource } : {}),
     progress: preserveLiveOpen ? live.progress : undefined,
     // A summary page replaces optimistic inline image bodies with canonical,
     // payload-free references. Retaining both makes ChatView lay out the same
@@ -689,7 +691,7 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
 }
 
 function restoreAuthoritativeLifecycle(merged: Turn, history: Turn): Turn {
-  return {
+  const restored = {
     ...merged,
     done: history.done,
     interrupted: history.interrupted,
@@ -698,6 +700,9 @@ function restoreAuthoritativeLifecycle(merged: Turn, history: Turn): Turn {
     doneTs: history.doneTs,
     durationMs: history.durationMs,
   };
+  if (history.terminalSource) restored.terminalSource = history.terminalSource;
+  else delete restored.terminalSource;
+  return restored;
 }
 
 /** Merge previously-loaded heavyweight detail into a newer summary without

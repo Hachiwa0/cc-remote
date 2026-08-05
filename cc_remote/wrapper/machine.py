@@ -920,6 +920,21 @@ def _session_effort(ctx: SessionContext) -> Optional[str]:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _codex_compaction_continuation_ids(
+    ctx: Optional[SessionContext],
+) -> list[str]:
+    """Return only handle-proven compact continuation ids for History."""
+    if ctx is None or ctx.engine != "codex":
+        return []
+    values = getattr(ctx.sdk, "compaction_continuation_turn_ids", frozenset())
+    if not isinstance(values, (set, frozenset, tuple, list)):
+        return []
+    return sorted({
+        value for value in values
+        if isinstance(value, str) and value
+    })[:4]
+
+
 def _codex_list_state(status: Optional[str]) -> Optional[State]:
     if status == "active":
         return "running"
@@ -6327,6 +6342,10 @@ class WrapperMachine:
         watched_engine = watch.get("engine")
         is_codex_hist = bool(
             (ctx is not None and ctx.engine == "codex") or watched_engine == "codex")
+        compaction_continuation_turn_ids = (
+            _codex_compaction_continuation_ids(ctx)
+            if is_codex_hist and before is None else []
+        )
         source_path = None
         source_fingerprint = None
         source_snapshot_stable: bool | None = None
@@ -6466,6 +6485,8 @@ class WrapperMachine:
                 takeover_pending=bool(
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
+                compaction_continuation_turn_ids=(
+                    compaction_continuation_turn_ids),
             )
             if stale_indexed_page:
                 # A sampled append-prefix page is useful for first paint, but it
@@ -6555,6 +6576,8 @@ class WrapperMachine:
                     takeover_pending=bool(
                         (self._watch.get(sid) or {}).get("takeover_pending")),
                     in_progress=in_progress,
+                    compaction_continuation_turn_ids=(
+                        compaction_continuation_turn_ids),
                 )
             source_window_has_more = oversized_compact_page.has_more
             source_window_oldest_cursor = oversized_compact_page.oldest_cursor
@@ -6705,6 +6728,8 @@ class WrapperMachine:
                 takeover_pending=bool(
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
+                compaction_continuation_turn_ids=(
+                    compaction_continuation_turn_ids),
             )
         for ev in events:
             # History may normalize file-operation presentation, but it cannot
@@ -6825,6 +6850,8 @@ class WrapperMachine:
                 takeover_pending=bool(
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
+                compaction_continuation_turn_ids=(
+                    compaction_continuation_turn_ids),
             )
 
         # A History response is one WebSocket frame. Keep it below the transport
@@ -7268,6 +7295,10 @@ class WrapperMachine:
                 and active_external_turns
             )
         )
+        compaction_continuation_turn_ids = (
+            _codex_compaction_continuation_ids(ctx)
+            if before is None else []
+        )
         page = await self._codex_history.summary_page(
             sid,
             before=before,
@@ -7310,6 +7341,8 @@ class WrapperMachine:
             external=self._is_external(sid),
             takeover_pending=bool(watch.get("takeover_pending")),
             in_progress=in_progress,
+            compaction_continuation_turn_ids=(
+                compaction_continuation_turn_ids),
         )
 
     async def _build_requested_history(
@@ -7388,6 +7421,9 @@ class WrapperMachine:
                         (ctx is not None and ctx.state != "idle")
                         or watch.get("active_external_turns")
                     ),
+                    compaction_continuation_turn_ids=(
+                        _codex_compaction_continuation_ids(ctx)
+                        if before is None else []),
                 )
         return await self._build_history(
             sid, before=before, limit=limit, cwd_hint=cwd, detail=detail,
@@ -11568,6 +11604,7 @@ class WrapperMachine:
                     else await ctx.sdk.refresh_goal(ctx.session_id))
             event = GoalState(
                 goal=goal,
+                request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
             await self._emit(ctx, event)
@@ -13502,6 +13539,7 @@ class WrapperMachine:
             event = SessionList(
                 engine="claude",
                 space=space,
+                request_id=getattr(cmd, "cmd_id", None),
                 sessions=sessions,
                 to=getattr(cmd, "client_id", None),
             )
@@ -13689,6 +13727,7 @@ class WrapperMachine:
             event = SessionList(
                 engine="codex",
                 space=space,
+                request_id=getattr(cmd, "cmd_id", None),
                 sessions=sessions,
                 to=getattr(cmd, "client_id", None),
             )

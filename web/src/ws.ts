@@ -158,8 +158,12 @@ export class RelayWs {
   private readonly surfaceEpochByScope: Record<string, number> = {};
   private readonly ownershipBySession: Record<string, EventOwnership> = {};
   private readonly pendingOwnershipByRequest: Record<string, EventOwnership> = {};
+  private readonly pendingListOwnershipByRequest =
+    new Map<string, EventOwnership>();
+  private readonly latestListRequestByScope = new Map<string, string>();
+  private readonly pendingGoalOwnershipByRequest =
+    new Map<string, EventOwnership>();
   private readonly pendingSwitchOwnership: Record<string, EventOwnership[]> = {};
-  private readonly pendingListOwnership: Record<string, EventOwnership[]> = {};
   private readonly outbox = new CommandOutbox(
     OUTBOX_MAX_COMMANDS, OUTBOX_MAX_BYTES, OUTBOX_MAX_FRAME_BYTES);
   private readonly queryAcceptance = new QueryAcceptanceLatch();
@@ -205,7 +209,13 @@ export class RelayWs {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.cancelProtocolRecovery();
     this.stopHeartbeat();
-    this.ws?.close();
+    const ws = this.ws;
+    // Retire the callback generation before close(). Browsers may still deliver
+    // queued open/message/close callbacks synchronously while an App effect is
+    // replacing this RelayWs instance.
+    this.connectionGeneration += 1;
+    this.ws = null;
+    ws?.close();
   }
 
   // App-level heartbeat. The browser's WS onclose does NOT fire for a HALF-OPEN
@@ -952,8 +962,33 @@ export class RelayWs {
     });
   }
 
-  sendGetGoal(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_goal", ts: nowTs(), ...this.sidObj() });
+  sendGetGoal(): string | null {
+    const sid = this.focusedSid;
+    return sid ? this.sendGetGoalTo(sid) : null;
+  }
+
+  sendGetGoalTo(sid: string): string | null {
+    const engine = this.engineBySession[sid]
+      ?? (sid === this.focusedSid ? this.activeEngine : undefined);
+    const space = this.spaceBySession[sid]
+      ?? (sid === this.focusedSid ? this.activeSpace : undefined);
+    const ownership = engine && space
+      ? this.ownershipSnapshot(engine, space) : undefined;
+    const commandId = uuid();
+    if (ownership) {
+      this.pendingGoalOwnershipByRequest.set(commandId, ownership);
+      while (this.pendingGoalOwnershipByRequest.size > OUTBOX_MAX_COMMANDS) {
+        const oldest = this.pendingGoalOwnershipByRequest.keys().next().value;
+        if (typeof oldest !== "string") break;
+        this.pendingGoalOwnershipByRequest.delete(oldest);
+      }
+    }
+    const requestId = this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_goal", sid,
+      client_id: this.clientId, ts: nowTs(),
+    }, commandId);
+    if (!requestId) this.pendingGoalOwnershipByRequest.delete(commandId);
+    return requestId;
   }
 
   sendGetStatus(): string | null {
@@ -984,15 +1019,20 @@ export class RelayWs {
 
   sendListSessions(engine?: "claude" | "codex", space: Space = "code"): boolean {
     const targetEngine = engine ?? "claude";
-    const scopeKey = sessionScopeKey(this.machineId, targetEngine, space);
     const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    const queued = this.send(obj);
-    if (queued) {
-      this.queueOwnership(this.pendingListOwnership, scopeKey, ownership);
+    const commandId = uuid();
+    this.pendingListOwnershipByRequest.set(commandId, ownership);
+    while (this.pendingListOwnershipByRequest.size > OUTBOX_MAX_COMMANDS) {
+      const oldest = this.pendingListOwnershipByRequest.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.pendingListOwnershipByRequest.delete(oldest);
     }
+    const queued = this.sendTracked(obj, commandId) !== null;
+    if (queued) this.latestListRequestByScope.set(ownership.scopeKey, commandId);
+    else this.pendingListOwnershipByRequest.delete(commandId);
     return queued;
   }
 
@@ -1289,6 +1329,7 @@ export class RelayWs {
     let compatibleFrameSeen = false;
     this.ws = ws;
     ws.onopen = () => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       this.backoff = 1;
       this.sendRecoveryPreamble();
       this.startHeartbeat();  // detect a half-open link and auto-recover
@@ -1379,9 +1420,12 @@ export class RelayWs {
           const listedSpace = msg.space ?? "code";
           const scopeKey = sessionScopeKey(
             this.machineId, msg.engine, listedSpace);
-          const listedOwnership = this.shiftOwnership(
-            this.pendingListOwnership, scopeKey);
-          if (this.acceptsOwnership(listedOwnership, socketGeneration)) {
+          const listedOwnership = msg.request_id
+            ? this.pendingListOwnershipByRequest.get(msg.request_id)
+            : undefined;
+          if (listedOwnership?.scopeKey === scopeKey
+              && this.latestListRequestByScope.get(scopeKey) === msg.request_id
+              && this.acceptsOwnership(listedOwnership, socketGeneration)) {
             eventOwnership = listedOwnership;
             for (const session of msg.sessions) {
               this.engineBySession[session.session_id] = msg.engine;
@@ -1389,6 +1433,10 @@ export class RelayWs {
               this.ownershipBySession[session.session_id] = listedOwnership;
             }
           }
+        }
+        if (msg.type === "error" && msg.request_id) {
+          this.pendingListOwnershipByRequest.delete(msg.request_id);
+          this.pendingGoalOwnershipByRequest.delete(msg.request_id);
         }
         if (msg.type === "session_focus") {
           // Drop a STALE switch-confirmation: when you click through several
@@ -1506,6 +1554,19 @@ export class RelayWs {
             eventOwnership = ownership;
           }
         }
+        if (msg.type === "goal_state" && msg.sid) {
+          const pendingOwnership = msg.request_id
+            ? this.pendingGoalOwnershipByRequest.get(msg.request_id)
+            : undefined;
+          if (msg.request_id) {
+            this.pendingGoalOwnershipByRequest.delete(msg.request_id);
+          }
+          const ownership = pendingOwnership
+            ?? this.ownershipBySession[msg.sid];
+          if (this.acceptsOwnership(ownership, socketGeneration)) {
+            eventOwnership = ownership;
+          }
+        }
         if (msg.type === "replay_start" && msg.sid && msg.generation) {
           this.noteGeneration(msg.sid, msg.generation);
         }
@@ -1561,6 +1622,7 @@ export class RelayWs {
       }
     };
     ws.onerror = () => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       /* onclose will follow */
     };
   }

@@ -2757,6 +2757,16 @@ test("goal entry stays compact and opens its editor", async ({ page }) => {
   await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
 });
 
+test("remembered goal shows a compact recovery state without opening its editor", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-status=loading");
+  const recovery = page.getByRole("status", { name: "正在恢复 Goal" });
+  await expect(recovery).toBeVisible();
+  await expect(recovery).toContainText("正在恢复…");
+  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
+});
+
 test("budgeted goal keeps its blocked status visible on mobile", async ({
   page,
 }) => {

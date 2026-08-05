@@ -616,7 +616,12 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
         ctx.state = "running"
         ctx.codex_owned_turn_id = "owned-turn"
         ctx.codex_spontaneous_turn_id = "goal-turn"
-        ctx.sdk = SimpleNamespace(turn_id="managed-turn")
+        ctx.sdk = SimpleNamespace(
+            turn_id="managed-turn",
+            compaction_continuation_turn_ids=frozenset({
+                "compact-logical", "managed-turn",
+            }),
+        )
         machine.sessions[ctx.key] = ctx
         machine._watch["active-summary"] = {
             "engine": "codex",
@@ -633,6 +638,9 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
         )
 
         assert history.in_progress is True
+        assert history.compaction_continuation_turn_ids == [
+            "compact-logical", "managed-turn",
+        ]
         assert seen == [("active-summary", {
             "before": None,
             "limit": 4,
@@ -642,7 +650,8 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
         })]
         seen.clear()
         machine._watch["active-summary"]["active_external_turns"] = {}
-        await machine._build_requested_history(
+        ctx.sdk.compaction_continuation_turn_ids = frozenset()
+        settled_history = await machine._build_requested_history(
             "active-summary",
             before=None,
             limit=4,
@@ -656,6 +665,7 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
             "active_turn_ids": {"owned-turn"},
             "hydrate_recent": 2,
         })]
+        assert settled_history.compaction_continuation_turn_ids == []
 
     asyncio.run(run())
 

@@ -15,13 +15,13 @@
   cwd if the new resume fails. The selected cwd survives wrapper restarts;
   migration never forks or steals browser focus.
 - Add requester-local confirmation for cwd-external previews under the
-  coordinated protocol v29 gate. Grants are bound to the engine, space,
+  coordinated protocol v30 gate. Grants are bound to the engine, space,
   session, canonical path, owner UID, device, and inode; a changed file asks
   again. User-approved files remain read-only, while successful structured
   writes can retain exact-file edit access. Relative assets in external
   Markdown resolve beside that document without becoming browser filesystem
   URLs.
-- Add isolated artifact and file-activity rendering under the coordinated v29
+- Add isolated artifact and file-activity rendering under the coordinated v30
   Wrapper/Relay/Web wire gate. HTML
   artifacts now retain document CSS and offer an explicit isolated interactive
   preview; standalone, Markdown, and conversation SVG images share one bounded

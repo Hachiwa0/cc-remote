@@ -7,6 +7,7 @@ interface Props {
   goal: ThreadGoal | null;
   revealed: boolean;
   open: boolean;
+  loading?: boolean;
   onOpen: () => void;
   onClose: () => void;
   onDismiss: () => void;
@@ -50,6 +51,17 @@ export function GoalPanel(p: Props) {
   const engineName = p.engine === "codex" ? "Codex" : "Claude";
 
   return <>
+    {p.revealed && !goal &&
+      <div className="goal-chip-wrap goal-loading" role="status"
+        aria-label={p.loading ? "正在恢复 Goal" : "Goal 暂时不可用，可重试"}>
+        <button className="goal-chip goal-chip-loading" onClick={p.onOpen}>
+          <span className="goal-chip-dot goal-chip-dot-active" aria-hidden="true" />
+          <span className="goal-chip-label">Goal</span>
+          <span className="goal-chip-objective">
+            {p.loading ? "正在恢复…" : "点击重试"}
+          </span>
+        </button>
+      </div>}
     {p.revealed && goal && <div className={`goal-chip-wrap goal-${goal.status}`}>
       <button className="goal-chip" onClick={p.onOpen}
         aria-label={`查看 Goal，${statusName[goal.status]}`}>

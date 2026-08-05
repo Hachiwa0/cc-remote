@@ -3679,7 +3679,7 @@ def test_machine_goal_emits_authoritative_state():
         ctx.sdk.clear_goal = clear_goal
         machine.sessions[ctx.key] = ctx
         await machine._handle_get_goal(SimpleNamespace(
-            sid=ctx.key, client_id="client-1"))
+            sid=ctx.key, client_id="client-1", cmd_id="goal-read-1"))
         await machine._handle_set_goal(SimpleNamespace(
             sid=ctx.key, client_id="client-1", objective="finish",
             status="active", token_budget=None))
@@ -3692,6 +3692,9 @@ def test_machine_goal_emits_authoritative_state():
         # Reads are private one-shot responses; mutations are shared state and are
         # broadcast so another signed-in device updates immediately.
         assert [state.to for state in states] == ["client-1", None, None]
+        assert [state.request_id for state in states] == [
+            "goal-read-1", None, None,
+        ]
 
         await machine._on_codex_goal(ctx, goal)
         assert isinstance(transport.sent[-1], GoalState)

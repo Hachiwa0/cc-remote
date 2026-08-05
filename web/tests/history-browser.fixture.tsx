@@ -2006,10 +2006,11 @@ function PlanUiFixture({ mode }: { mode: string }) {
 function GoalUiFixture({ status }: { status: string | null }) {
   const [open, setOpen] = useState(false);
   const [revealed, setRevealed] = useState(true);
+  const loading = status === "loading";
   const goalStatus = status === "blocked" ? "blocked" : "active";
-  const goal: ThreadGoal = {
+  const goal: ThreadGoal | null = loading ? null : {
     threadId: "goal-fixture-thread",
-    objective: "完成 protocol v29 发布并验证所有终端同步升级",
+    objective: "完成 protocol v30 发布并验证所有终端同步升级",
     status: goalStatus,
     engine: "codex",
     tokenBudget: 100_000,
@@ -2021,6 +2022,7 @@ function GoalUiFixture({ status }: { status: string | null }) {
     <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
       <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
       <GoalPanel engine="codex" goal={goal} revealed={revealed} open={open}
+        loading={loading}
         onOpen={() => setOpen(true)} onClose={() => setOpen(false)}
         onDismiss={() => setRevealed(false)} onSave={() => setOpen(false)}
         onClear={() => setRevealed(false)} />

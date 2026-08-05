@@ -1202,14 +1202,15 @@ function unfinishedLiveTail(turns: Turn[], hydratedCacheTurnIds: string[]): Turn
 /** Reopen only the exact newest row named by a current authoritative History.
  *
  * Codex 0.147 can persist ``interrupted`` for a native turn at a context
- * compaction boundary while that same turn keeps producing items. The History
- * envelope's `in_progress` bit plus its exact `newest_id` are authoritative;
- * recency, prompt text and timestamps are not. */
+ * compaction boundary while that same turn keeps producing items. Only the
+ * wrapper's live compact-fence ids plus the exact newest row are authoritative;
+ * `in_progress`, recency, prompt text and timestamps are not. */
 function reopenAuthoritativeActiveHistoryHead(
   runtime: SessionRuntime,
   turns: Turn[],
   newestId: string | null | undefined,
   ownerFenceSeq: number | null | undefined,
+  compactionContinuationTurnIds: string[] | null | undefined,
 ): Turn[] {
   if (!newestId) return turns;
   const matches = turns.map((turn, index) => ({ turn, index })).filter(
@@ -1227,20 +1228,26 @@ function reopenAuthoritativeActiveHistoryHead(
     // leave this History shell terminal instead of displaying two spinners.
     return turns;
   }
-  // forkPointId is the native task ownership proof supplied by Codex history.
-  // Without it an active-but-not-yet-materialized head could make us reopen the
-  // previous completed prompt.
-  if (!turn.forkPointId || turn.error || (!turn.done && !turn.interrupted)) {
+  // Only the wrapper's live compact fence can reopen a persisted interrupted
+  // row. ``in_progress``, a native forkPointId, recency, and browser-local
+  // terminalSource are all insufficient on a cold refresh: they also describe
+  // real user interrupts and crashes.
+  const continuationIds = new Set(compactionContinuationTurnIds ?? []);
+  if (!turn.forkPointId || !continuationIds.has(turn.forkPointId)
+      || !turn.done || turn.interrupted !== true) {
     return turns;
   }
   const next = [...turns];
-  next[index] = {
+  const reopened: Turn = {
     ...turn,
     done: false,
     doneTs: undefined,
     durationMs: undefined,
     interrupted: undefined,
+    terminalSource: "compact_continuation",
   };
+  delete reopened.error;
+  next[index] = reopened;
   return next;
 }
 
@@ -3071,12 +3078,29 @@ function reduceEvent(
       }
       const currentRunningHistory = !e.before
         && e.in_progress === true
-        && (!racedLiveEvent || (e.live_seq != null
-          && base.lastLifecycleSeq <= e.live_seq));
+        && e.live_seq != null
+        && base.lastLiveSeq <= e.live_seq
+        && base.lastLifecycleSeq <= e.live_seq
+        && (base.historyGeneration == null
+          || e.generation === base.historyGeneration);
       if (currentRunningHistory) {
         turns = reopenAuthoritativeActiveHistoryHead(
-          base, turns, e.newest_id, e.live_seq);
+          base, turns, e.newest_id, e.live_seq,
+          e.compaction_continuation_turn_ids);
       }
+      // A later canonical terminal is sufficient to settle a shell which an
+      // earlier running History reopened across a compact boundary. Do not
+      // depend on a separate State(idle) frame: reconnect can recover through
+      // History alone, and persisting this connection-local marker would make
+      // the next refresh look like another continuation candidate.
+      turns = turns.map((turn) => {
+        if (!turn.done || turn.terminalSource !== "compact_continuation") {
+          return turn;
+        }
+        const settled = { ...turn };
+        delete settled.terminalSource;
+        return settled;
+      });
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
       const historyTrimmed = boundedTurns.length < turns.length;
@@ -3615,6 +3639,13 @@ function reduceEvent(
         if (e.state === "idle") {
           rt.pendingQuestion = null;
           const doneTs = eventTimestampMs(e.ts) ?? Date.now();
+          for (const candidate of turns) {
+            if (!candidate.done
+                && candidate.terminalSource === "compact_continuation") {
+              finishTurnWithoutTerminal(candidate, doneTs, null);
+              delete candidate.terminalSource;
+            }
+          }
           if (rt.acceptanceKind === "steer_unknown") {
             for (const candidate of turns) {
               if (candidate.id === rt.acceptancePending) continue;
@@ -4016,13 +4047,15 @@ function reduceEvent(
         const t = turns.find((turn) => turn.id === e.msg_id);
         if (t) {
           t.error = presentTurnProblem(e);
+          t.terminalSource = "failed";
           t.progress = undefined;
           t.done = true;
           t.doneTs ??= Date.now();
           finishOpenBlocks(t, "failed", true);
         }
         else turns.push({ id: e.msg_id!, prompt: "", blocks: [], done: true,
-          error: presentTurnProblem(e), doneTs: Date.now() });
+          error: presentTurnProblem(e), terminalSource: "failed",
+          doneTs: Date.now() });
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
         rt.pendingQuestion = null;
@@ -4510,6 +4543,15 @@ function reduceEvent(
           if (e.checkpoint_id) t.checkpointId = e.checkpoint_id;
           t.progress = undefined;
           if (e.result.subtype === "error_during_execution") t.interrupted = true;
+          if (e.result.is_error) {
+            t.terminalSource = e.result.subtype === "error_during_execution"
+              ? (rt.state === "interrupting" || rt.state === "draining")
+                ? "remote_interrupt"
+                : "unexpected_interrupt"
+              : "failed";
+          } else {
+            delete t.terminalSource;
+          }
           // Stamp completion time from the event's own server ts (seconds -> ms).
           // Robust for BOTH live turns and replayed history: the old
           // `t.ts + duration_ms` reconstruction dropped the timestamp for any turn

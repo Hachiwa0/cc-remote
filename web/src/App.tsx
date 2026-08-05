@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  type TouchEvent,
+} from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
 import {
   createRuntime,
@@ -30,10 +39,8 @@ import {
   reconcileNewChatSelection,
   resolveNewChatLocalDefaults,
 } from "./components/NewChatView";
-import { ArtifactPanel } from "./components/ArtifactPanel";
 import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
-import { GoalPanel } from "./components/GoalPanel";
 import { StatusSheet } from "./components/StatusSheet";
 import { UsageActivitySheet } from "./components/UsageActivitySheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
@@ -44,6 +51,18 @@ import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { HeaderMenu } from "./components/HeaderMenu";
 import { parseGoalCommand } from "./goal-command";
+import {
+  dismissGoalUi,
+  goalStableIdentity,
+  goalUiScopeForEvent,
+  goalUiScopeKey,
+  readGoalUiPreferences,
+  reconcileGoalUiPreference,
+  rekeyGoalUiPreference,
+  rememberGoalUi,
+  writeGoalUiPreferences,
+  type GoalUiPreferences,
+} from "./scoped-goal-ui";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
 import {
@@ -182,6 +201,12 @@ const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
+const GoalPanel = lazy(() => import("./components/GoalPanel").then(
+  ({ GoalPanel: Panel }) => ({ default: Panel }),
+));
+const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
+  ({ ArtifactPanel: Panel }) => ({ default: Panel }),
+));
 
 interface QueuedQueryEditorState extends QueuedQueryEditor {
   detailRequestId: string | null;
@@ -215,9 +240,13 @@ export default function App() {
   // true from the moment /btw is clicked until the fork's btw_opened arrives — so
   // the panel appears instantly (spinner) instead of waiting ~1s for the fork.
   const [btwOpeningByParentSid, setBtwOpeningByParentSid] = useState<Record<string, boolean>>({});
-  // Goal is deliberately opt-in UI: no empty bar and no RPC until /goal runs.
-  // Keep reveal/editor state per session so switching sessions never leaks it.
-  const [goalUiBySid, setGoalUiBySid] = useState<Record<string, { revealed: boolean; open: boolean }>>({});
+  // Goal remains opt-in, but its reveal preference is scoped across machines,
+  // Work/Code and engines so a refresh can restore the correct session only.
+  const [goalUiByScope, setGoalUiByScope] = useState<Record<string, {
+    revealed: boolean;
+    open: boolean;
+    loading: boolean;
+  }>>({});
   const [statusOpenSid, setStatusOpenSid] = useState<string | null>(null);
   const [usageActivityOpen, setUsageActivityOpen] = useState(false);
   const [forkWorktreeSession, setForkWorktreeSession] = useState<SessionInfo | null>(null);
@@ -304,6 +333,16 @@ export default function App() {
   const rightViewRef = useRef(rightView);
   rightViewRef.current = rightView;
   const wsRef = useRef<RelayWs | null>(null);
+  const wsLifecycleEpochRef = useRef(0);
+  const goalUiPreferencesRef = useRef<GoalUiPreferences>(
+    readGoalUiPreferences(localStorage));
+  const goalRecoveryRequestsRef = useRef<Set<string>>(new Set());
+  const goalRequestScopeByIdRef = useRef<Map<
+    string, { scopeKey: string; sid: string }
+  >>(new Map());
+  const persistGoalUiPreferences = useCallback((next: GoalUiPreferences) => {
+    goalUiPreferencesRef.current = writeGoalUiPreferences(localStorage, next);
+  }, []);
   const skillCatalogsRef =
     useRef<Record<string, SkillCatalogCacheEntry>>({});
   const skillCatalogRequestsRef =
@@ -485,6 +524,7 @@ export default function App() {
     setCompletionReceipts({});
     sessionListsBySurfaceRef.current = {};
     historySessionListsRef.current = {};
+    preferredSurfaceFocusRef.current = null;
     authoritativeSurfaceListsRef.current.clear();
     notificationListRequestRef.current = null;
     sessionActivityPendingRef.current.clear();
@@ -492,7 +532,15 @@ export default function App() {
     skillCatalogRequestsRef.current?.reset();
     setSkillCatalogs({});
     setCapabilitiesByScope({});
+    setStatusOpenSid(null);
     setUsageActivityOpen(false);
+    setWorkArtifactsOpen(false);
+    setWorkArtifactsBySid({});
+    setGoalUiByScope((current) => Object.fromEntries(
+      Object.entries(current).map(([key, value]) => [
+        key, { ...value, open: false },
+      ]),
+    ));
     deferredStatusRefreshRef.current.clear();
     historyRequestsRef.current.clear();
     clearHistoryDetailRequests();
@@ -589,6 +637,22 @@ export default function App() {
     state, activeBtwSid);
   const activeBtwSendMode = activeBtwSid
     ? btwSendModeBySid[activeBtwSid] ?? "steer" : "steer";
+  const focusedGoalScopeKey = focusedSid
+    ? goalUiScopeKey(machineId, space, focusedEngine, focusedSid) : null;
+  const storedGoalPreference = focusedGoalScopeKey
+    ? goalUiPreferencesRef.current[focusedGoalScopeKey] : undefined;
+  const storedGoalIdentity = goalStableIdentity(rt.goal);
+  const goalUi = focusedGoalScopeKey
+    ? goalUiByScope[focusedGoalScopeKey] ?? (storedGoalPreference?.known
+      ? {
+          revealed: storedGoalPreference.hiddenGoal
+            ? !!rt.goal && storedGoalPreference.hiddenGoal !== storedGoalIdentity
+            : true,
+          open: false,
+          loading: !rt.goal,
+        }
+      : undefined)
+    : undefined;
 
   useEffect(() => {
     setQueuedQueryEditor((current) => (
@@ -599,6 +663,42 @@ export default function App() {
         : current
     ));
   }, [activeBtwSid, focusedSid]);
+
+  useEffect(() => {
+    if (!authed || !focusedSid || !focusedGoalScopeKey || state.newChat
+        || state.connState !== "connected" || !state.wrapperOnline
+        || !goalUiPreferencesRef.current[focusedGoalScopeKey]?.known) {
+      return;
+    }
+    const requestKey = `${wsLifecycleEpochRef.current}\0${focusedGoalScopeKey}`;
+    if (goalRecoveryRequestsRef.current.has(requestKey)) return;
+    const requestId = wsRef.current?.sendGetGoalTo(focusedSid) ?? null;
+    if (!requestId) return;
+    goalRecoveryRequestsRef.current.add(requestKey);
+    goalRequestScopeByIdRef.current.set(requestId, {
+      scopeKey: focusedGoalScopeKey,
+      sid: focusedSid,
+    });
+    setGoalUiByScope((current) => {
+      if (current[focusedGoalScopeKey]?.open) return current;
+      const preference = goalUiPreferencesRef.current[focusedGoalScopeKey];
+      return {
+        ...current,
+        [focusedGoalScopeKey]: {
+          revealed: !preference?.hiddenGoal,
+          open: false,
+          loading: true,
+        },
+      };
+    });
+  }, [
+    authed,
+    focusedGoalScopeKey,
+    focusedSid,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+  ]);
 
   useEffect(() => {
     const acknowledgeVisible = () => {
@@ -624,7 +724,6 @@ export default function App() {
       "visibilitychange", acknowledgeVisible);
   }, [visibleParentSid, activeBtwSid, rightView, state.artifact]);
 
-  const goalUi = focusedSid ? goalUiBySid[focusedSid] : undefined;
   const storeSkillCatalog = useCallback((
     key: string,
     items: EngineCapabilityItem[],
@@ -1093,9 +1192,11 @@ export default function App() {
     currentSpace: Space,
   ) => {
     if (focusedSid && !state.newChat) {
-      lastFocusBySurfaceRef.current[`${currentSpace}:${currentEngine}`] = focusedSid;
+      lastFocusBySurfaceRef.current[
+        sessionScopeKey(machineId, currentEngine, currentSpace)
+      ] = focusedSid;
     }
-  }, [focusedSid, state.newChat]);
+  }, [focusedSid, machineId, state.newChat]);
 
   const prepareSurfaceSwitch = useCallback((
     nextEngine: Engine,
@@ -1104,6 +1205,8 @@ export default function App() {
   ) => {
     rememberSurfaceFocus(engine, space);
     const surfaceKey = `${nextSpace}:${nextEngine}`;
+    const focusScopeKey = sessionScopeKey(
+      machineId, nextEngine, nextSpace);
     if (!preserveAuthority) {
       authoritativeSurfaceListsRef.current.delete(surfaceKey);
     }
@@ -1111,10 +1214,10 @@ export default function App() {
       type: "restore_session_list",
       sessions: sessionListsBySurfaceRef.current[surfaceKey] ?? [],
     });
-    const remembered = lastFocusBySurfaceRef.current[surfaceKey];
+    const remembered = lastFocusBySurfaceRef.current[focusScopeKey];
     preferredSurfaceFocusRef.current = preserveAuthority
       ? null
-      : remembered ? { key: surfaceKey, sid: remembered } : null;
+      : remembered ? { key: focusScopeKey, sid: remembered } : null;
     didInitFocusRef.current = preserveAuthority;
     wsRef.current?.setSurface(nextEngine, nextSpace);
     wsRef.current?.setFocusedSid(null);
@@ -1123,7 +1226,7 @@ export default function App() {
     // soon as the remembered (or latest valid) session is available.
     dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
     setNewChatAutoFocus(false);
-  }, [engine, rememberSurfaceFocus, space]);
+  }, [engine, machineId, rememberSurfaceFocus, space]);
 
   const focusListedSession = useCallback((selected: SessionInfo) => {
     const selectedEngine: Engine = selected.engine === "codex"
@@ -1194,7 +1297,11 @@ export default function App() {
         try { sessionStorage.removeItem(NOTIFICATION_TARGET_KEY); }
         catch { /* best-effort stale route cleanup */ }
         preferredSurfaceFocusRef.current = origin.sid
-          ? { key: `${origin.space}:${origin.engine}`, sid: origin.sid }
+          ? {
+              key: sessionScopeKey(
+                origin.machineId, origin.engine, origin.space),
+              sid: origin.sid,
+            }
           : null;
         didInitFocusRef.current = false;
         setEngine(origin.engine);
@@ -1280,15 +1387,20 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const historyRequests = historyRequestsRef.current;
+    const lifecycleEpoch = ++wsLifecycleEpochRef.current;
     didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
     authoritativeSurfaceListsRef.current.delete(`${spaceRef.current}:${engineRef.current}`);
 
     let cancelled = false;
+    let effectWs: RelayWs | null = null;
+    const acceptsLifecycle = () => !cancelled
+      && wsLifecycleEpochRef.current === lifecycleEpoch;
+    goalRecoveryRequestsRef.current.clear();
+    goalRequestScopeByIdRef.current.clear();
     const recoverableReads = new RecoverableReadCoordinator(
       (callback, delayMs) => window.setTimeout(callback, delayMs),
       (timer) => window.clearTimeout(timer),
     );
-
     // A snapshot announces a session (cc_session_id/state/cwd). We do NOT reset
     // the cursor here anymore — cursors are seeded from the IndexedDB cache before
     // connecting, so hello asks the wrapper only for the DELTA instead of a full
@@ -1305,6 +1417,94 @@ export default function App() {
       if (cancelled) return;
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
+          if (!acceptsLifecycle()) return;
+          // SessionList is a scoped response, not a broadcast catalog. Without
+          // the exact request ownership it may belong to an older surface or
+          // WebSocket generation and must not mutate any sidebar/focus cache.
+          if (msg.type === "session_list" && !ownership) return;
+          if (msg.type === "goal_state" && msg.sid) {
+            if (msg.request_id) {
+              goalRequestScopeByIdRef.current.delete(msg.request_id);
+            }
+            const key = goalUiScopeForEvent(msg.sid, ownership);
+            if (key) {
+              const reconciled = reconcileGoalUiPreference(
+                goalUiPreferencesRef.current,
+                key,
+                msg.goal,
+              );
+              persistGoalUiPreferences(reconciled.preferences);
+              setGoalUiByScope((current) => {
+                const previous = current[key] ?? {
+                  revealed: false,
+                  open: false,
+                  loading: false,
+                };
+                return {
+                  ...current,
+                  [key]: {
+                    revealed: reconciled.revealed,
+                    open: previous.open,
+                    loading: false,
+                  },
+                };
+              });
+              for (const [requestId, requestScope] of
+                goalRequestScopeByIdRef.current) {
+                if (requestScope.scopeKey === key) {
+                  goalRequestScopeByIdRef.current.delete(requestId);
+                }
+              }
+              recoverableReads.complete(["goal", key].join("\u0000"));
+            }
+          } else if (msg.type === "error" && msg.request_id) {
+            const request = goalRequestScopeByIdRef.current.get(msg.request_id);
+            if (request) {
+              goalRequestScopeByIdRef.current.delete(msg.request_id);
+              const { scopeKey: key, sid } = request;
+              goalRecoveryRequestsRef.current.delete(
+                `${lifecycleEpoch}\0${key}`);
+              setGoalUiByScope((current) => {
+                const previous = current[key];
+                if (!previous) return {
+                  ...current,
+                  [key]: {
+                    revealed: !!goalUiPreferencesRef.current[key]?.known,
+                    open: false,
+                    loading: false,
+                  },
+                };
+                return {
+                  ...current,
+                  [key]: {
+                    ...previous,
+                    loading: false,
+                  },
+                };
+              });
+              recoverableReads.retry(["goal", key].join("\u0000"), () => {
+                if (cancelled || stateRef.current.focusedSid !== sid) return;
+                const requestId = ws.sendGetGoalTo(sid);
+                if (!requestId) return;
+                goalRequestScopeByIdRef.current.set(
+                  requestId, { scopeKey: key, sid });
+                setGoalUiByScope((current) => ({
+                  ...current,
+                  [key]: {
+                    ...(current[key] ?? {
+                      revealed: true, open: false, loading: false,
+                    }),
+                    loading: true,
+                  },
+                }));
+              });
+              // This is a one-shot read repair, not a failed model/control
+              // operation. The Goal chip owns its retry state; feeding the same
+              // correlated Error into the reducer would also create a global
+              // "操作未完成" banner on every transient refresh failure.
+              return;
+            }
+          }
           if (msg.type === "session_rekey"
               && inlineImageAssetsRef.current.rekeySession(
                 msg.old_key,
@@ -1983,13 +2183,26 @@ export default function App() {
                 ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
               }
             }
-            setGoalUiBySid((current) => {
-              const prior = current[msg.old_key];
-              if (!prior) return current;
-              const next = { ...current, [msg.session_id]: prior };
-              delete next[msg.old_key];
-              return next;
-            });
+            if (ownership) {
+              const oldGoalKey = goalUiScopeKey(
+                ownership.machineId, ownership.space, ownership.engine,
+                msg.old_key);
+              const nextGoalKey = goalUiScopeKey(
+                ownership.machineId, ownership.space, ownership.engine,
+                msg.session_id);
+              setGoalUiByScope((current) => {
+                const prior = current[oldGoalKey];
+                if (!prior) return current;
+                const next = { ...current, [nextGoalKey]: prior };
+                delete next[oldGoalKey];
+                return next;
+              });
+              persistGoalUiPreferences(rekeyGoalUiPreference(
+                goalUiPreferencesRef.current,
+                oldGoalKey,
+                nextGoalKey,
+              ));
+            }
           }
           if (msg.type === "session_list" && ownership) {
             const listedSpace = msg.space ?? "code";
@@ -2176,11 +2389,14 @@ export default function App() {
           }
         },
         onConnState: (s, detail) => {
+          if (!acceptsLifecycle()) return;
           dispatch({ type: "conn", connState: s, detail });
           if (s !== "connected") {
             skillCatalogRequestsRef.current?.resetReads();
           }
           if (s === "connected") {
+            goalRecoveryRequestsRef.current.clear();
+            goalRequestScopeByIdRef.current.clear();
             recoverableReads.clear();
             historyRequestsRef.current.beginConnection();
             clearHistoryDetailRequests();
@@ -2199,6 +2415,7 @@ export default function App() {
           }
         },
         onAuthFail: () => {
+          if (!acceptsLifecycle()) return;
           setAuthReady(false);
           clearLegacyAuthMarkers(localStorage);
           pendingCreateRef.current = null;
@@ -2236,7 +2453,7 @@ export default function App() {
           setForkWorktreeSession(null);
           setForkWorktreeCreating(false);
           setForkWorktreeError(null);
-          setGoalUiBySid({});
+          setGoalUiByScope({});
           setStatusOpenSid(null);
           setUsageActivityOpen(false);
           setWorkArtifactsOpen(false);
@@ -2250,11 +2467,16 @@ export default function App() {
             setAuthReady(true);
           })();
         },
-        onCommandError: (detail) => dispatch({ type: "command_error", detail }),
+        onCommandError: (detail) => {
+          if (!acceptsLifecycle()) return;
+          dispatch({ type: "command_error", detail });
+        },
         onOutboxChanged: (protectedSids) => {
+          if (!acceptsLifecycle()) return;
           dispatch({ type: "prune_runtimes", protectedSids });
         },
         onWrapperGenerationChanged: () => {
+          if (!acceptsLifecycle()) return;
           clearHistoryDetailRequests();
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
@@ -2278,6 +2500,7 @@ export default function App() {
           }
         },
       }, machineId);
+      effectWs = ws;
       ws.setSurface(engineRef.current, spaceRef.current);
       // Seed both transport and reducer watermarks before Hello. This prevents
       // an older replay/snapshot from reviving a lock already superseded in the
@@ -2295,8 +2518,11 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      wsRef.current?.stop();
-      wsRef.current = null;
+      if (wsLifecycleEpochRef.current === lifecycleEpoch) {
+        wsLifecycleEpochRef.current += 1;
+      }
+      effectWs?.stop();
+      if (wsRef.current === effectWs) wsRef.current = null;
       historyRequests.clear();
       clearHistoryDetailRequests();
       recoverableReads.clear();
@@ -2308,6 +2534,7 @@ export default function App() {
     installBrowseHistoryPage,
     invalidateHistoryPageScopes,
     machineId,
+    persistGoalUiPreferences,
     requestHistory,
     requestSkillCatalog,
     setBtwOpeningFor,
@@ -2319,13 +2546,15 @@ export default function App() {
     if (pendingNotificationTarget) return;
     if (didInitFocusRef.current || !wsRef.current) return;
     const surfaceKey = `${spaceRef.current}:${engineRef.current}`;
+    const focusScopeKey = sessionScopeKey(
+      machineId, engineRef.current, spaceRef.current);
     if (!authoritativeSurfaceListsRef.current.has(surfaceKey)) return;
     if (state.sessions.length === 0) {
       preferredSurfaceFocusRef.current = null;
       didInitFocusRef.current = true;
       return;
     }
-    const preferred = preferredSurfaceFocusRef.current?.key === surfaceKey
+    const preferred = preferredSurfaceFocusRef.current?.key === focusScopeKey
       ? state.sessions.find((session) => (
           session.session_id === preferredSurfaceFocusRef.current?.sid
           && (session.space ?? "code") === spaceRef.current
@@ -2348,6 +2577,7 @@ export default function App() {
       wsRef.current.sendSwitchSession(latest.session_id, latestEngine, spaceRef.current);
     }
   }, [
+    machineId,
     pendingNotificationTarget,
     state.sessions,
     state.focusedSid,
@@ -2364,8 +2594,10 @@ export default function App() {
     if (!selected) return;
     const selectedEngine = (selected.engine as Engine | undefined) ?? engine;
     const selectedSpace: Space = selected.space === "work" ? "work" : "code";
-    lastFocusBySurfaceRef.current[`${selectedSpace}:${selectedEngine}`] = focusedSid;
-  }, [focusedSid, state.newChat, state.sessions, engine]);
+    lastFocusBySurfaceRef.current[
+      sessionScopeKey(machineId, selectedEngine, selectedSpace)
+    ] = focusedSid;
+  }, [focusedSid, state.newChat, state.sessions, engine, machineId]);
 
   // Warm the cwd-scoped Codex Skill catalog when a session becomes usable.
   // Composer completion then reads memory synchronously; an expired entry stays
@@ -3224,24 +3456,54 @@ export default function App() {
   const setCollaborationMode = (mode: CollaborationModeName) => {
     wsRef.current?.sendSetCollaborationMode(mode);
   };
-  const setGoalUi = (patch: Partial<{ revealed: boolean; open: boolean }>) => {
-    if (!focusedSid) return;
-    setGoalUiBySid((current) => {
-      const previous = current[focusedSid] ?? { revealed: false, open: false };
-      return { ...current, [focusedSid]: { ...previous, ...patch } };
+  const setGoalUi = (patch: Partial<{
+    revealed: boolean;
+    open: boolean;
+    loading: boolean;
+  }>) => {
+    if (!focusedGoalScopeKey) return;
+    setGoalUiByScope((current) => {
+      const previous = current[focusedGoalScopeKey] ?? {
+        revealed: false,
+        open: false,
+        loading: false,
+      };
+      return {
+        ...current,
+        [focusedGoalScopeKey]: { ...previous, ...patch },
+      };
     });
   };
+  const rememberFocusedGoalUi = () => {
+    if (!focusedGoalScopeKey) return;
+    persistGoalUiPreferences(rememberGoalUi(
+      goalUiPreferencesRef.current,
+      focusedGoalScopeKey,
+    ));
+  };
+  const requestFocusedGoal = () => {
+    if (!focusedSid || !focusedGoalScopeKey) return null;
+    const requestId = wsRef.current?.sendGetGoalTo(focusedSid) ?? null;
+    if (requestId) {
+      goalRequestScopeByIdRef.current.set(requestId, {
+        scopeKey: focusedGoalScopeKey,
+        sid: focusedSid,
+      });
+    }
+    return requestId;
+  };
   const runGoal = (args: string) => {
-    if (!focusedSid) return;
+    if (!focusedSid || !focusedGoalScopeKey) return;
     const command = parseGoalCommand(args, focusedEngine);
+    rememberFocusedGoalUi();
     if (command.kind === "clear") {
       wsRef.current?.sendClearGoal();
-      setGoalUi({ revealed: false, open: false });
+      setGoalUi({ revealed: false, open: false, loading: false });
       return;
     }
-    setGoalUi({ revealed: true, open: true });
+    setGoalUi({ revealed: true, open: true, loading: command.kind === "show" });
     if (command.kind === "show") {
-      wsRef.current?.sendGetGoal();
+      requestFocusedGoal();
     } else if (command.kind === "resume") {
       // Codex resumes the existing condition by changing only its status.
       if (focusedEngine === "codex") {
@@ -3855,19 +4117,41 @@ export default function App() {
               onFork={!historyView.recovering && space === "code"
                 ? forkFromTurn : undefined} />
 
-            <GoalPanel engine={engine} goal={rt.goal}
-              revealed={!!goalUi?.revealed} open={!!goalUi?.open}
-              onOpen={() => { wsRef.current?.sendGetGoal(); setGoalUi({ revealed: true, open: true }); }}
-              onClose={() => setGoalUi({ open: false })}
-              onDismiss={() => setGoalUi({ revealed: false, open: false })}
-              onSave={(objective, status, budget) => {
-                wsRef.current?.sendSetGoal(objective, status, engine === "codex" ? budget : null);
-                setGoalUi({ revealed: true, open: false });
-              }}
-              onClear={() => {
-                wsRef.current?.sendClearGoal();
-                setGoalUi({ revealed: false, open: false });
-              }} />
+            <Suspense fallback={(goalUi?.revealed || goalUi?.open)
+              ? <span className="goal-suspense" role="status"
+                  aria-label="正在加载 Goal" /> : null}>
+              <GoalPanel engine={focusedEngine} goal={rt.goal}
+                revealed={!!goalUi?.revealed} open={!!goalUi?.open}
+                loading={!!goalUi?.loading}
+                onOpen={() => {
+                  rememberFocusedGoalUi();
+                  requestFocusedGoal();
+                  setGoalUi({ revealed: true, open: true, loading: !rt.goal });
+                }}
+                onClose={() => setGoalUi({ open: false })}
+                onDismiss={() => {
+                  if (focusedGoalScopeKey) {
+                    persistGoalUiPreferences(dismissGoalUi(
+                      goalUiPreferencesRef.current,
+                      focusedGoalScopeKey,
+                      rt.goal,
+                    ));
+                  }
+                  setGoalUi({ revealed: false, open: false, loading: false });
+                }}
+                onSave={(objective, status, budget) => {
+                  rememberFocusedGoalUi();
+                  wsRef.current?.sendSetGoal(
+                    objective, status,
+                    focusedEngine === "codex" ? budget : null);
+                  setGoalUi({ revealed: true, open: false, loading: false });
+                }}
+                onClear={() => {
+                  rememberFocusedGoalUi();
+                  wsRef.current?.sendClearGoal();
+                  setGoalUi({ revealed: false, open: false, loading: false });
+                }} />
+            </Suspense>
 
             <Composer
           draftKey={focusedComposerDraftKey}
@@ -4035,12 +4319,19 @@ export default function App() {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
             }} />;
         if (view === "diff" && state.artifact)
-          return <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
-            onTab={switchRight} onRefresh={previewArtifactFile}
-            onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
-            onAuthorizePreview={authorizePreview}
-            onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
-            onClose={() => dispatch({ type: "clear_artifact" })} />;
+          return <Suspense fallback={
+            <div className="artifact-panel empty" role="status">
+              <div className="spinner" aria-hidden="true" />
+              <p className="loading-tx">加载预览…</p>
+            </div>
+          }>
+            <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
+              onTab={switchRight} onRefresh={previewArtifactFile}
+              onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
+              onAuthorizePreview={authorizePreview}
+              onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
+              onClose={() => dispatch({ type: "clear_artifact" })} />
+          </Suspense>;
         return null;
       })()}
       <QueuedQueryDialog

@@ -81,6 +81,18 @@ import {
 } from "../src/protocol.ts";
 import { protocolRecoveryAction, RelayWs } from "../src/ws.ts";
 import {
+  dismissGoalUi,
+  GOAL_UI_PREFERENCES_KEY,
+  goalStableIdentity,
+  goalUiScopeForEvent,
+  goalUiScopeKey,
+  readGoalUiPreferences,
+  reconcileGoalUiPreference,
+  rekeyGoalUiPreference,
+  rememberGoalUi,
+  writeGoalUiPreferences,
+} from "../src/scoped-goal-ui.ts";
+import {
   clientSlashesFor,
   commandsFor,
   isKnownCodeOnlySlash,
@@ -184,6 +196,75 @@ const draftB = composerDraftKey("machine-a", "code", "codex", "session-b");
 const draftOtherSurface = composerDraftKey(
   "machine-a", "work", "codex", "session-a",
 );
+const goalScopeA = goalUiScopeKey(
+  "machine-a", "code", "codex", "session-a");
+const goalScopeOtherMachine = goalUiScopeKey(
+  "machine-b", "code", "codex", "session-a");
+const goalScopeOtherSurface = goalUiScopeKey(
+  "machine-a", "work", "codex", "session-a");
+assert.notEqual(goalScopeA, goalScopeOtherMachine,
+  "the same sid on another machine must have independent Goal UI state");
+assert.notEqual(goalScopeA, goalScopeOtherSurface,
+  "the same sid on Work must not inherit Code Goal UI state");
+assert.equal(goalUiScopeForEvent("unknown-session"), null,
+  "Goal UI persistence must fail closed without receive-time ownership");
+assert.equal(goalUiScopeForEvent("session-a", {
+  machineId: "machine-a", space: "code", engine: "codex",
+}), goalScopeA);
+const persistedGoal = {
+  threadId: "session-a",
+  objective: "ship the release without leaking this text to storage",
+  status: "active" as const,
+  engine: "codex" as const,
+  tokensUsed: 1,
+  timeUsedSeconds: 2,
+  createdAt: 100,
+};
+let goalPreferences = rememberGoalUi({}, goalScopeA, 10);
+assert.equal(reconcileGoalUiPreference(
+  {}, goalScopeA, persistedGoal, 10).revealed, false,
+"an unsolicited Goal broadcast must not reveal Goal UI for an unknown scope");
+let reconciledGoal = reconcileGoalUiPreference(
+  goalPreferences, goalScopeA, persistedGoal, 11);
+assert.equal(reconciledGoal.revealed, true);
+goalPreferences = dismissGoalUi(
+  reconciledGoal.preferences, goalScopeA, persistedGoal, 12);
+reconciledGoal = reconcileGoalUiPreference(
+  goalPreferences, goalScopeA, persistedGoal, 13);
+assert.equal(reconciledGoal.revealed, false,
+  "refresh must preserve a dismissal for the exact stable Goal identity");
+reconciledGoal = reconcileGoalUiPreference(
+  goalPreferences, goalScopeA, { ...persistedGoal, createdAt: 101 }, 14);
+assert.equal(reconciledGoal.revealed, true,
+  "a newly-created Goal must not inherit the previous Goal's dismissal");
+assert.equal(goalStableIdentity({ ...persistedGoal, createdAt: undefined }), null);
+const identitylessDismissal = dismissGoalUi(
+  rememberGoalUi({}, goalScopeA, 20), goalScopeA,
+  { ...persistedGoal, createdAt: undefined }, 21);
+assert.equal(reconcileGoalUiPreference(
+  identitylessDismissal, goalScopeA,
+  { ...persistedGoal, createdAt: undefined }, 22).revealed, true,
+"an identityless Goal dismissal is page-local and must not hide future Goals");
+const goalStorageValues = new Map<string, string>();
+const goalStorage = {
+  getItem: (key: string) => goalStorageValues.get(key) ?? null,
+  setItem: (key: string, value: string) => {
+    goalStorageValues.set(key, value);
+  },
+};
+goalPreferences = writeGoalUiPreferences(goalStorage, goalPreferences);
+assert.doesNotMatch(
+  goalStorageValues.get(GOAL_UI_PREFERENCES_KEY) ?? "",
+  /ship the release/,
+  "Goal objective text must never be persisted in UI preferences",
+);
+assert.deepEqual(readGoalUiPreferences(goalStorage), goalPreferences);
+const rekeyedGoalPreferences = rekeyGoalUiPreference(
+  goalPreferences,
+  goalScopeA,
+  goalUiScopeKey("machine-a", "code", "codex", "session-real"),
+);
+assert.equal(goalScopeA in rekeyedGoalPreferences, false);
 composerDrafts.set(draftA, {
   input: "session A unfinished",
   images: [{ media_type: "image/png", data: "draft-image" }],
@@ -8470,6 +8551,7 @@ try {
       has_more: true,
       newest_id: compactRefreshVisibleId,
       in_progress: true,
+      compaction_continuation_turn_ids: [compactRefreshNativeId],
       events: [],
       turns: [{
         id: compactRefreshVisibleId,
@@ -8497,6 +8579,62 @@ try {
   assert.equal(
     compactRefreshState.runtimes[compactRefreshSid].turns[0].interrupted,
     undefined,
+  );
+  const compactIdleState = reduce(compactRefreshState, {
+    type: "event",
+    event: event({
+      type: "state", sid: compactRefreshSid, seq: 11, state: "idle",
+    }),
+  });
+  assert.deepEqual(
+    {
+      done: compactIdleState.runtimes[compactRefreshSid].turns[0].done,
+      interrupted: compactIdleState.runtimes[compactRefreshSid].turns[0]
+        .interrupted,
+    },
+    { done: true, interrupted: true },
+    "a later exact idle lifecycle cannot leave a compact History shell running",
+  );
+  const coldInterruptedState = reduce({
+    ...initialState,
+    focusedSid: compactRefreshSid,
+    runtimes: {
+      [compactRefreshSid]: {
+        ...createRuntime(), state: "idle" as const, syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: compactRefreshSid,
+      session_id: compactRefreshSid,
+      revision: "compact-cold-r1",
+      generation: "compact-cold-g1",
+      build_seq: 1,
+      live_seq: 10,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: compactRefreshVisibleId,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: compactRefreshVisibleId,
+        prompt: "a real interrupted turn on another device",
+        forkPointId: compactRefreshNativeId,
+        done: true,
+        interrupted: true,
+        blocks: [],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    coldInterruptedState.runtimes[compactRefreshSid].turns[0].done,
+    true,
+    "in_progress plus a native id cannot reopen a cold interrupt without compact evidence",
   );
   for (const liveEvent of [
     event({
@@ -8530,6 +8668,193 @@ try {
       .map((block: Block) => block.kind === "text" ? block.text : ""),
     ["before compact", "after compact"],
   );
+
+  const falseTerminalSid = "compact-false-terminal-recovery";
+  const falseTerminalId = "compact-false-terminal-user";
+  const falseTerminalRuntime = (
+    terminalSource: "unexpected_interrupt" | "remote_interrupt" | "failed",
+    error = "本次回复未完成，请重试。",
+  ) => ({
+    ...createRuntime(),
+    state: "running" as const,
+    syncReady: true,
+    historyRevision: "compact-false-r1",
+    historyGeneration: "compact-false-g1",
+    controlGeneration: "compact-false-g1",
+    historyBuildSeq: 1,
+    historyLiveSeq: 20,
+    historyFence: 20,
+    historyNewestId: falseTerminalId,
+    lastLiveSeq: 20,
+    lastLifecycleSeq: 20,
+    turns: [{
+      id: falseTerminalId,
+      prompt: "keep working through compaction",
+      forkPointId: "compact-false-native",
+      done: true,
+      interrupted: true,
+      error,
+      terminalSource,
+      blocks: [],
+    }],
+  });
+  const falseTerminalHistory = (
+    overrides: Record<string, unknown> = {},
+  ) => event({
+    type: "history",
+    sid: falseTerminalSid,
+    session_id: falseTerminalSid,
+    revision: "compact-false-r1",
+    generation: "compact-false-g1",
+    build_seq: 2,
+    live_seq: 20,
+    detail: "summary",
+    authoritative: true,
+    has_more: false,
+    newest_id: falseTerminalId,
+    in_progress: true,
+    compaction_continuation_turn_ids: ["compact-false-native"],
+    events: [],
+    turns: [{
+      id: falseTerminalId,
+      prompt: "keep working through compaction",
+      forkPointId: "compact-false-native",
+      done: true,
+      interrupted: true,
+      blocks: [],
+    }],
+    ...overrides,
+  });
+  const recoverFalseTerminal = (
+    terminalSource: "unexpected_interrupt" | "remote_interrupt" | "failed",
+    overrides: Record<string, unknown> = {},
+    error?: string,
+  ) => reduce({
+    ...initialState,
+    focusedSid: falseTerminalSid,
+    runtimes: {
+      [falseTerminalSid]: falseTerminalRuntime(terminalSource, error),
+    },
+  }, {
+    type: "event",
+    event: falseTerminalHistory(overrides),
+  });
+
+  let eventDrivenFalseTerminal = {
+    ...initialState,
+    focusedSid: falseTerminalSid,
+    runtimes: {
+      [falseTerminalSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        historyRevision: "compact-false-r1",
+        historyGeneration: "compact-false-g1",
+        controlGeneration: "compact-false-g1",
+        historyBuildSeq: 1,
+        historyLiveSeq: 18,
+        historyFence: 18,
+        historyNewestId: falseTerminalId,
+        lastLiveSeq: 18,
+        lastLifecycleSeq: 18,
+      },
+    },
+  };
+  for (const liveEvent of [
+    {
+      type: "user_msg", sid: falseTerminalSid, seq: 19,
+      msg_id: falseTerminalId, prompt: "keep working through compaction",
+    },
+    {
+      type: "turn_end", sid: falseTerminalSid, seq: 20,
+      turn_id: "compact-false-native",
+      result: {
+        subtype: "error_during_execution",
+        duration_ms: 1000,
+        is_error: true,
+      },
+    },
+  ]) {
+    eventDrivenFalseTerminal = reduce(eventDrivenFalseTerminal, {
+      type: "event", event: event(liveEvent),
+    });
+  }
+  assert.equal(
+    eventDrivenFalseTerminal.runtimes[falseTerminalSid].turns[0]
+      .terminalSource,
+    "unexpected_interrupt",
+    "the reducer must classify an unrequested interrupted TurnEnd itself",
+  );
+  let falseTerminalRecovered = reduce(eventDrivenFalseTerminal, {
+    type: "event",
+    event: falseTerminalHistory(),
+  });
+  assert.deepEqual(
+    {
+      done: falseTerminalRecovered.runtimes[falseTerminalSid].turns[0].done,
+      interrupted: falseTerminalRecovered.runtimes[falseTerminalSid]
+        .turns[0].interrupted,
+      error: falseTerminalRecovered.runtimes[falseTerminalSid].turns[0].error,
+      terminalSource: falseTerminalRecovered.runtimes[falseTerminalSid]
+        .turns[0].terminalSource,
+    },
+    { done: false, interrupted: undefined, error: undefined,
+      terminalSource: "compact_continuation" },
+    "a current exact running History head repairs one unexpected false terminal",
+  );
+  falseTerminalRecovered = reduce(falseTerminalRecovered, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: falseTerminalSid,
+      seq: 21,
+      message_id: "compact-false-follow-up",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    falseTerminalRecovered.runtimes[falseTerminalSid].turns.length,
+    1,
+    "assistant output after false-terminal recovery stays in the original row",
+  );
+  const compactHistorySettled = reduce(falseTerminalRecovered, {
+    type: "event",
+    event: falseTerminalHistory({
+      build_seq: 3,
+      live_seq: 21,
+      in_progress: false,
+      compaction_continuation_turn_ids: [],
+    }),
+  });
+  assert.deepEqual(
+    {
+      done: compactHistorySettled.runtimes[falseTerminalSid].turns[0].done,
+      terminalSource: compactHistorySettled.runtimes[falseTerminalSid]
+        .turns[0].terminalSource,
+    },
+    { done: true, terminalSource: undefined },
+    "an authoritative terminal History settles compact metadata without a State frame",
+  );
+
+  for (const [label, recovered] of [
+    ["stale live sequence", recoverFalseTerminal(
+      "unexpected_interrupt", { live_seq: 19 })],
+    ["wrong newest row", recoverFalseTerminal(
+      "unexpected_interrupt", { newest_id: "another-row" })],
+    ["old wrapper generation", recoverFalseTerminal(
+      "unexpected_interrupt", { generation: "compact-false-old" })],
+    ["explicit Remote interrupt", recoverFalseTerminal(
+      "remote_interrupt", { compaction_continuation_turn_ids: [] })],
+    ["failed/auth terminal", recoverFalseTerminal(
+      "failed", { compaction_continuation_turn_ids: [] },
+      "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。")],
+  ] as const) {
+    assert.equal(
+      recovered.runtimes[falseTerminalSid].turns[0].done,
+      true,
+      `${label} cannot be washed away by a running History envelope`,
+    );
+  }
 
   // A newer authoritative active head supersedes an older explicit task owner.
   // Assistant items have no turn id, so the downstream sequence is the only
@@ -8578,6 +8903,7 @@ try {
         has_more: true,
         newest_id: `new-history-${suffix}`,
         in_progress: true,
+        compaction_continuation_turn_ids: [newTaskId],
         events: [],
         turns: [{
           id: `new-history-${suffix}`,
@@ -10684,6 +11010,21 @@ try {
     onLoadDetail: () => {},
   }));
   assert.doesNotMatch(loadedDetailMarkup, /展开完整过程/);
+  const failedInterruptedMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "failed-interrupted-session",
+    turns: [{
+      id: "failed-interrupted-turn",
+      prompt: "work",
+      done: true,
+      interrupted: true,
+      error: "网络异常，连接失败，请重新尝试。",
+      blocks: [],
+    }],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(failedInterruptedMarkup, /网络异常，连接失败，请重新尝试。/);
+  assert.doesNotMatch(failedInterruptedMarkup, /— 已打断 —/,
+    "one terminal failure must not render a second interrupted note");
   const richMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [richTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {},
@@ -12733,6 +13074,15 @@ assert.equal(
 );
 
 const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
+assert.doesNotMatch(appSource, /<Suspense fallback=\{null\}>[\s\S]{0,120}<GoalPanel/,
+  "Goal lazy loading must keep a stable chip placeholder");
+assert.match(appSource, /fallback=\{\(goalUi\?\.revealed \|\| goalUi\?\.open\)[\s\S]{0,160}goal-suspense/,
+  "a remembered Goal entry stays visible while its component chunk loads");
+assert.match(appSource, /recoverableReads\.retry\(\["goal", key\]/,
+  "a transient Goal read failure must be retried in the same connection");
+assert.match(appSource,
+  /Goal chip owns its retry state; feeding the same[\s\S]{0,240}\n\s*return;/,
+  "a handled Goal read failure must not also become a global command banner");
 const btwPanelSource = readFileSync(
   resolve(process.cwd(), "src/components/BtwPanel.tsx"), "utf8");
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
@@ -13352,6 +13702,12 @@ for (const [type, sendCommand] of reliableControlFrames) {
   assert.equal(typeof frame.cmd_id, "string");
   assert.equal(typeof frame.client_id, "string");
 }
+const targetedGoalRequest = relay.sendGetGoalTo("background-goal-session");
+assert.equal(typeof targetedGoalRequest, "string");
+const targetedGoalFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(targetedGoalFrame.type, "get_goal");
+assert.equal(targetedGoalFrame.sid, "background-goal-session");
+assert.equal(typeof targetedGoalFrame.cmd_id, "string");
 
 socket.receive({
   type: "snapshot", sid: "s1", cc_session_id: "s1", generation: "g1",
@@ -13633,6 +13989,185 @@ scopedSocket.receive({
 assert.equal(scopedObserved.length, beforeReconnectFrame,
   "a delayed frame from an older underlying WebSocket generation is dropped");
 scopedRelay.stop();
+
+const goalOwnershipObserved: Array<{ event: ServerEvent; ownership?: {
+  scopeKey: string; surfaceEpoch: number; connectionGeneration: number;
+} }> = [];
+const goalOwnershipRelay = new RelayWs({
+  onEvent: (event, ownership) => {
+    goalOwnershipObserved.push({ event, ownership });
+  },
+  onConnState: () => {},
+}, "machine-goal");
+goalOwnershipRelay.start();
+const goalOwnershipSocket = FakeWebSocket.instances.at(-1);
+assert.ok(goalOwnershipSocket);
+goalOwnershipSocket.onopen?.();
+goalOwnershipRelay.setSurface("codex", "work");
+assert.equal(goalOwnershipRelay.sendListSessions("codex", "work"), true);
+const goalListRequest = JSON.parse(
+  goalOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.equal(typeof goalListRequest.cmd_id, "string");
+goalOwnershipSocket.receive({
+  type: "session_list", engine: "codex", space: "work",
+  request_id: goalListRequest.cmd_id,
+  sessions: [{
+    session_id: "background-goal-session",
+    engine: "codex",
+    space: "work",
+  }],
+});
+const listedGoalOwnership = goalOwnershipObserved.at(-1)?.ownership;
+assert.equal(listedGoalOwnership?.scopeKey, "machine-goal:work:codex");
+const correlatedGoalRequest = goalOwnershipRelay.sendGetGoalTo(
+  "background-goal-session");
+assert.equal(typeof correlatedGoalRequest, "string");
+goalOwnershipRelay.setSurface("claude", "code");
+goalOwnershipSocket.receive({
+  type: "goal_state", sid: "background-goal-session", goal: persistedGoal,
+  request_id: correlatedGoalRequest,
+});
+assert.equal(
+  goalOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-goal:work:codex",
+  "a Goal read keeps the exact request-time surface after the user switches",
+);
+goalOwnershipSocket.receive({
+  type: "goal_state", sid: "background-goal-session", goal: persistedGoal,
+});
+assert.equal(
+  goalOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-goal:work:codex",
+  "a valid background Goal broadcast keeps its accepted session ownership",
+);
+goalOwnershipSocket.receive({
+  type: "goal_state", sid: "unknown-goal-session", goal: persistedGoal,
+});
+assert.equal(goalOwnershipObserved.at(-1)?.ownership, undefined,
+  "an unknown Goal sid must not borrow the active surface");
+const beforeOldGoalFrame = goalOwnershipObserved.length;
+(goalOwnershipRelay as unknown as { connect: () => void }).connect();
+const nextGoalOwnershipSocket = FakeWebSocket.instances.at(-1);
+assert.ok(nextGoalOwnershipSocket
+  && nextGoalOwnershipSocket !== goalOwnershipSocket);
+nextGoalOwnershipSocket.onopen?.();
+goalOwnershipSocket.receive({
+  type: "goal_state", sid: "background-goal-session", goal: persistedGoal,
+});
+assert.equal(goalOwnershipObserved.length, beforeOldGoalFrame,
+  "a Goal frame from the retired socket generation must be ignored");
+goalOwnershipRelay.stop();
+
+// List reads run concurrently and one Codex request may return cached + fresh
+// frames. Ownership must follow cmd_id, never response arrival order.
+const listOwnershipObserved: Array<{ event: ServerEvent; ownership?: {
+  scopeKey: string; surfaceEpoch: number; connectionGeneration: number;
+} }> = [];
+const listOwnershipRelay = new RelayWs({
+  onEvent: (event, ownership) => {
+    listOwnershipObserved.push({ event, ownership });
+  },
+  onConnState: () => {},
+}, "machine-list-order");
+listOwnershipRelay.start();
+const listOwnershipSocket = FakeWebSocket.instances.at(-1);
+assert.ok(listOwnershipSocket);
+listOwnershipSocket.onopen?.();
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const oldListRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+listOwnershipRelay.setSurface("codex", "code");
+listOwnershipRelay.setSurface("claude", "code");
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const currentListRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.notEqual(currentListRequest.cmd_id, oldListRequest.cmd_id);
+
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: currentListRequest.cmd_id,
+  sessions: [{ session_id: "current-list-session" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+  "a newer request keeps its frozen ownership when its response wins the race",
+);
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: oldListRequest.cmd_id,
+  sessions: [{ session_id: "stale-list-session" }],
+});
+assert.equal(listOwnershipObserved.at(-1)?.ownership, undefined,
+  "a late old request cannot consume the current surface ownership");
+
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const cachedFreshRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+for (const sessionId of ["cached-list-session", "fresh-list-session"]) {
+  listOwnershipSocket.receive({
+    type: "session_list", engine: "claude", space: "code",
+    request_id: cachedFreshRequest.cmd_id,
+    sessions: [{ session_id: sessionId }],
+  });
+  assert.equal(
+    listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+    "machine-list-order:code:claude",
+    "cached and refreshed responses share one exact request ownership",
+  );
+}
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const supersededSameScopeRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const latestSameScopeRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: latestSameScopeRequest.cmd_id,
+  sessions: [{ session_id: "latest-same-scope-session" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+);
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: supersededSameScopeRequest.cmd_id,
+  sessions: [{ session_id: "superseded-same-scope-session" }],
+});
+assert.equal(listOwnershipObserved.at(-1)?.ownership, undefined,
+  "a slower request for the same scope cannot roll back a newer session list");
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  sessions: [{ session_id: "uncorrelated-list-session" }],
+});
+assert.equal(listOwnershipObserved.at(-1)?.ownership, undefined,
+  "an uncorrelated list fails closed");
+listOwnershipRelay.stop();
+
+const stoppedEvents: ServerEvent[] = [];
+const stoppedStates: string[] = [];
+const stoppedRelay = new RelayWs({
+  onEvent: (event) => { stoppedEvents.push(event); },
+  onConnState: (state) => { stoppedStates.push(state); },
+});
+stoppedRelay.start();
+const stoppedSocket = FakeWebSocket.instances.at(-1);
+assert.ok(stoppedSocket);
+stoppedSocket.onopen?.();
+const stoppedStateCount = stoppedStates.length;
+stoppedRelay.stop();
+stoppedSocket.receive({
+  type: "state", sid: "stopped-session", state: "running",
+});
+stoppedSocket.onopen?.();
+stoppedSocket.onclose?.({ code: 1006 });
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(stoppedEvents.length, 0,
+  "stop must invalidate delayed frames from the retired socket");
+assert.equal(stoppedStates.length, stoppedStateCount,
+  "retired socket open/close callbacks cannot mutate the next App lifecycle");
 
 // Query acceptance is a per-session lifecycle barrier, not an outbox ACK bit.
 // It survives this RelayWs instance's automatic reconnect and only correlated

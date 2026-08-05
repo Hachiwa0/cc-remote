@@ -186,9 +186,13 @@
   height:36px; margin:0 auto 8px; overflow:hidden; flex:none; border:1px solid var(--border-strong);
   border-radius:999px; background:color-mix(in srgb,var(--surface) 88%,var(--accent-weak));
   box-shadow:var(--shadow-sm); }
+.goal-suspense { align-self:center; width:36px; height:36px; margin:0 auto 8px;
+  flex:none; border-radius:50%; background:var(--accent-weak); animation:pulse 1.2s infinite; }
 .goal-chip { min-width:0; display:flex; align-items:center; gap:7px; padding:0 9px 0 7px;
   color:var(--text); text-align:left; }
 .goal-chip:hover { background:var(--accent-weak); }
+.goal-chip-loading { cursor:default; }
+.goal-loading .goal-chip-dot { animation:pulse 1.2s ease-in-out infinite; }
 .goal-chip-ring { --goal-progress:0deg; position:relative; width:21px; height:21px;
   display:grid; place-items:center; flex:none; border-radius:50%; color:var(--accent);
   background:conic-gradient(currentColor var(--goal-progress),var(--border-strong) 0); }
