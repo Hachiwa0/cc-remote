@@ -102,7 +102,7 @@ from cc_remote.protocol import (
     TurnResult, is_downstream,
     is_reliable_command,
     SessionInfo, SessionList, SessionListInvalidated, SessionActivity,
-    ListSessions, SessionFocus,
+    SessionFocus,
     SessionRekey, SessionForked, SessionMigrated, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
@@ -14179,12 +14179,10 @@ class WrapperMachine:
                 cached_responses.append(query_result)
         if space == "work" and ctx.session_id:
             # A newly durable Work item belongs in the sidebar immediately; do
-            # not wait for a later engine/space toggle to request another list.
-            await self._handle_list_sessions(ListSessions(
-                engine=engine,
-                space="work",
-                client_id=getattr(cmd, "client_id", None),
-            ))
+            # not broadcast an uncorrelated SessionList that every Web client
+            # must reject. Visible Work surfaces answer this unbuffered hint
+            # with their own generation- and surface-bound list request.
+            await self._invalidate_session_list(engine, "work")
         return tuple(cached_responses)
 
     async def _handle_rename_session(self, cmd) -> None:
