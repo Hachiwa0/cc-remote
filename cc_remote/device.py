@@ -55,16 +55,18 @@ def _write_private_text(path: Path, content: str, *, replace: bool) -> None:
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(staged, path)
         os.chmod(path, 0o600)
     except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         staged.unlink(missing_ok=True)
         raise
 
