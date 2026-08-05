@@ -383,6 +383,7 @@ const harness = await createServer({
 try {
   const { initialState, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
   const {
+    advanceMarkdownMathState,
     hasMathDelimiters,
     normalizeMathDelimiters,
     preloadMarkdownMathPlugins,
@@ -396,6 +397,35 @@ try {
     "an unmatched opener must not consume a later complete formula",
   );
   assert.equal(hasMathDelimiters(malformedMath), true);
+  let streamedMath = advanceMarkdownMathState({
+    source: "",
+    normalized: "",
+    active: false,
+  }, "\\(x\\");
+  assert.equal(streamedMath.active, false);
+  streamedMath = advanceMarkdownMathState(
+    streamedMath, "\\(x\\)");
+  assert.deepEqual(streamedMath, {
+    source: "\\(x\\)",
+    normalized: "$x$",
+    active: true,
+  }, "a closing bracket delimiter split after its slash activates immediately");
+  let streamedDisplayMath = advanceMarkdownMathState({
+    source: "",
+    normalized: "",
+    active: false,
+  }, "\\[x\\");
+  streamedDisplayMath = advanceMarkdownMathState(
+    streamedDisplayMath, "\\[x\\]");
+  assert.equal(streamedDisplayMath.active, true);
+  assert.equal(streamedDisplayMath.normalized, "\n$$\nx\n$$\n");
+  const escapedSplit = advanceMarkdownMathState({
+    source: "literal \\\\",
+    normalized: "literal \\\\",
+    active: false,
+  }, "literal \\\\)");
+  assert.equal(escapedSplit.active, false,
+    "an even trailing slash run must stay escaped across the append boundary");
   const { ArtifactPanel } = await harness.ssrLoadModule(
     "/src/components/ArtifactPanel.tsx");
   const { buildSandboxDocument } = await harness.ssrLoadModule(

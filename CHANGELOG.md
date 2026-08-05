@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v31. Wrapper-side
+  catalog mutations now broadcast an unbuffered invalidation instead of an
+  uncorrelated session list; each visible browser coalesces the hint into its
+  own generation- and surface-bound list read. Streaming math recognizes
+  delimiters split across deltas, paused Goal resumes retain one bounded
+  objective anchor, and compact continuation no longer renders a live spinner
+  beside a real interrupted terminal.
 - Add protocol v28 Codex account activity. The existing one-shot status read
   carries a validated, bounded 53-week daily token series, and Web exposes a
   Codex-only Desktop-style activity calendar without storing it in live replay.

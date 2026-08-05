@@ -8802,6 +8802,103 @@ try {
       terminalSource: "compact_continuation" },
     "a current exact running History head repairs one unexpected false terminal",
   );
+
+  const overlappingLiveTurn = {
+    id: falseTerminalId,
+    prompt: "keep working through compaction",
+    forkPointId: "compact-false-native",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "compact-live-command",
+      processKind: "command" as const,
+      phase: "start" as const,
+      status: "running" as const,
+      title: "still running",
+      done: false,
+    }],
+  };
+  const overlappingBase = {
+    ...initialState,
+    focusedSid: "another-session",
+    runtimes: {
+      [falseTerminalSid]: {
+        ...falseTerminalRuntime("unexpected_interrupt"),
+        turns: [overlappingLiveTurn],
+      },
+    },
+  };
+  const overlappingCompactRecovered = reduce(overlappingBase, {
+    type: "event",
+    event: falseTerminalHistory(),
+  });
+  assert.deepEqual({
+    done: overlappingCompactRecovered.runtimes[falseTerminalSid].turns[0].done,
+    interrupted: overlappingCompactRecovered.runtimes[falseTerminalSid]
+      .turns[0].interrupted,
+    processDone: overlappingCompactRecovered.runtimes[falseTerminalSid]
+      .turns[0].blocks[0].done,
+  }, {
+    done: false,
+    interrupted: undefined,
+    processDone: false,
+  }, "exact compact authority reopens an overlapping live row even in a background session");
+
+  const realInterruptRemainsTerminal = reduce(overlappingBase, {
+    type: "event",
+    event: falseTerminalHistory({
+      compaction_continuation_turn_ids: [],
+    }),
+  });
+  assert.deepEqual({
+    done: realInterruptRemainsTerminal.runtimes[falseTerminalSid].turns[0].done,
+    interrupted: realInterruptRemainsTerminal.runtimes[falseTerminalSid]
+      .turns[0].interrupted,
+    processDone: realInterruptRemainsTerminal.runtimes[falseTerminalSid]
+      .turns[0].blocks[0].done,
+  }, {
+    done: true,
+    interrupted: true,
+    processDone: true,
+  }, "running transport state cannot reopen a real terminal or leave its process open");
+
+  const successfulBackgroundBase = {
+    ...initialState,
+    focusedSid: "another-session",
+    runtimes: {
+      [falseTerminalSid]: {
+        ...falseTerminalRuntime("unexpected_interrupt"),
+        state: "idle" as const,
+        turns: [{ ...overlappingLiveTurn, done: true }],
+      },
+    },
+  };
+  const successfulBackgroundRemainsVisible = reduce(successfulBackgroundBase, {
+    type: "event",
+    event: falseTerminalHistory({
+      in_progress: false,
+      compaction_continuation_turn_ids: [],
+      turns: [{
+        id: falseTerminalId,
+        prompt: "keep working through compaction",
+        forkPointId: "compact-false-native",
+        done: true,
+        blocks: [],
+      }],
+    }),
+  });
+  assert.deepEqual({
+    done: successfulBackgroundRemainsVisible.runtimes[falseTerminalSid]
+      .turns[0].done,
+    interrupted: successfulBackgroundRemainsVisible
+      .runtimes[falseTerminalSid].turns[0].interrupted,
+    processDone: successfulBackgroundRemainsVisible
+      .runtimes[falseTerminalSid].turns[0].blocks[0].done,
+  }, {
+    done: true,
+    interrupted: undefined,
+    processDone: false,
+  }, "a successful answer can retain genuine background agent activity");
   falseTerminalRecovered = reduce(falseTerminalRecovered, {
     type: "event",
     event: event({
@@ -13665,6 +13762,11 @@ const chatViewSource = readFileSync(
 assert.match(chatViewSource, /surface !== "work"/);
 assert.match(chatViewSource, /arr\.length === 1 && onOpenFile/);
 assert.match(chatViewSource, /onOpenArtifacts\?\.\(\)/);
+assert.match(chatViewSource,
+  /const terminalProblem = t\.done[\s\S]{0,120}const working = !terminalProblem/,
+  "an interrupted or failed terminal must beat stale open process metadata");
+assert.match(chatViewSource, /t\.done && t\.interrupted && !t\.error/,
+  "an interrupted label must never render beside a live spinner");
 assert.match(layoutCss, /\.work-thread-shell \.thread-in\s*\{/);
 
 assert.equal(relay.sendTakeover("codex-model-session"), true);
@@ -14295,6 +14397,45 @@ listOwnershipSocket.receive({
 });
 assert.equal(listOwnershipObserved.at(-1)?.ownership, undefined,
   "an uncorrelated list fails closed");
+
+const invalidationEventCount = listOwnershipObserved.length;
+const sentBeforeInvalidation = listOwnershipSocket.sent.length;
+listOwnershipRelay.setSurface("claude", "code");
+listOwnershipSocket.receive({
+  type: "session_list_invalidated", engine: "claude", space: "code",
+});
+const invalidationRefresh = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as {
+    type?: string; cmd_id?: string; client_id?: string;
+  };
+assert.equal(listOwnershipSocket.sent.length, sentBeforeInvalidation + 1);
+assert.equal(invalidationRefresh.type, "list_sessions");
+assert.equal(typeof invalidationRefresh.cmd_id, "string");
+assert.equal(listOwnershipObserved.length, invalidationEventCount,
+  "a catalog invalidation is transport control, not mutable UI state");
+
+listOwnershipSocket.receive({
+  type: "session_list_invalidated", engine: "claude", space: "code",
+});
+assert.equal(listOwnershipSocket.sent.length, sentBeforeInvalidation + 1,
+  "same-scope invalidations coalesce while one correlated list is in flight");
+listOwnershipSocket.receive({
+  type: "session_list_invalidated", engine: "codex", space: "work",
+});
+assert.equal(listOwnershipSocket.sent.length, sentBeforeInvalidation + 1,
+  "an inactive surface invalidation must not issue or mutate a visible list");
+
+listOwnershipSocket.receive({
+  type: "command_ack",
+  client_id: invalidationRefresh.client_id,
+  cmd_id: invalidationRefresh.cmd_id,
+});
+const coalescedRefresh = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { type?: string; cmd_id?: string };
+assert.equal(listOwnershipSocket.sent.length, sentBeforeInvalidation + 2);
+assert.equal(coalescedRefresh.type, "list_sessions");
+assert.notEqual(coalescedRefresh.cmd_id, invalidationRefresh.cmd_id,
+  "one dirty bit schedules exactly one follow-up after the first refresh ACK");
 listOwnershipRelay.stop();
 
 const stoppedEvents: ServerEvent[] = [];

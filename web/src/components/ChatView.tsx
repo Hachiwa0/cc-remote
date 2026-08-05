@@ -2437,7 +2437,11 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             const activeTimeline = activeProcess
               || processItems.some((block) => !block.done);
             const finalBlocks = finalTextBlocks(t.blocks);
-            const working = !t.done || activeTimeline;
+            // A failed/interrupted enclosing terminal is authoritative. A
+            // successful answer may still own genuine background agent work,
+            // but a stale child flag must never animate beside "已打断".
+            const terminalProblem = t.done && (!!t.interrupted || !!t.error);
+            const working = !terminalProblem && (!t.done || activeTimeline);
             const hasProcessTimeline = processItems.length > 0
               || (!!t.detailEventCount && !t.detailLoaded)
               || !!t.detailError;
@@ -2657,7 +2661,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 </div>
               )}
               {fileChips(t)}
-              {t.interrupted && !t.error
+              {t.done && t.interrupted && !t.error
                 && <div className="note interrupted">— 已打断 —</div>}
               {t.error && <div className="note interrupted">{
                 presentHistoricalTurnProblem(t.error)

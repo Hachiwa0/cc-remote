@@ -176,6 +176,10 @@ interface MathAnalysis {
   normalized: string;
 }
 
+export interface MarkdownMathSourceState extends MathAnalysis {
+  source: string;
+}
+
 function analyzeMath(source: string): MathAnalysis {
   if (!source.includes("$") && !source.includes("\\(")
     && !source.includes("\\[")) {
@@ -226,6 +230,45 @@ export function hasMathDelimiters(source: string): boolean {
   return analyzeMath(source).active;
 }
 
+function hasOddTrailingBackslashRun(source: string): boolean {
+  let index = source.length;
+  while (index > 0 && source[index - 1] === "\\") index -= 1;
+  return (source.length - index) % 2 === 1;
+}
+
+/** Advance the streaming math scan without rescanning ordinary text deltas.
+ *
+ * A bracket delimiter can be split exactly between its slash and bracket, so
+ * inspecting only the appended delta misses `\\)` / `\\]` in that case.  The
+ * boundary check keeps the common token-stream fast path while making that
+ * split equivalent to receiving the delimiter in one delta.
+ */
+export function advanceMarkdownMathState(
+  previous: MarkdownMathSourceState,
+  source: string,
+): MarkdownMathSourceState {
+  const appended = source.startsWith(previous.source);
+  const delta = appended ? source.slice(previous.source.length) : "";
+  const delimiterCrossesBoundary = appended
+    && delta.length > 0
+    && hasOddTrailingBackslashRun(previous.source)
+    && ["(", ")", "[", "]"].includes(delta[0]);
+  if (appended && !delimiterCrossesBoundary
+    && !delta.includes("\\") && !delta.includes("$")) {
+    return {
+      source,
+      normalized: previous.normalized + delta,
+      active: previous.active,
+    };
+  }
+  const analysis = analyzeMath(source);
+  return {
+    source,
+    normalized: analysis.normalized,
+    active: analysis.active,
+  };
+}
+
 export interface MarkdownMathRenderState {
   plugins: MarkdownMathPlugins | null;
   normalizedSource: string;
@@ -235,7 +278,7 @@ export function useMarkdownMathPlugins(
   source: string,
   enabled: boolean,
 ): MarkdownMathRenderState {
-  const sticky = useRef({
+  const sticky = useRef<MarkdownMathSourceState>({
     source: "",
     normalized: "",
     active: false,
@@ -243,23 +286,7 @@ export function useMarkdownMathPlugins(
   if (!enabled) {
     sticky.current = { source: "", normalized: "", active: false };
   } else {
-    const previous = sticky.current;
-    const appended = source.startsWith(previous.source);
-    const delta = appended ? source.slice(previous.source.length) : "";
-    if (appended && !delta.includes("\\") && !delta.includes("$")) {
-      sticky.current = {
-        source,
-        normalized: previous.normalized + delta,
-        active: previous.active,
-      };
-    } else {
-      const analysis = analyzeMath(source);
-      sticky.current = {
-        source,
-        normalized: analysis.normalized,
-        active: analysis.active,
-      };
-    }
+    sticky.current = advanceMarkdownMathState(sticky.current, source);
   }
   const shouldLoad = enabled && sticky.current.active;
   const [plugins, setPlugins] = useState<MarkdownMathPlugins | null>(

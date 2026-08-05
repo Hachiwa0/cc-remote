@@ -11,6 +11,7 @@ from cc_remote.protocol import (
     Notice,
     RollbackResult,
     RollbackSession,
+    SessionListInvalidated,
     StateEvent,
 )
 from cc_remote.wrapper.codex_checkpoints import CompletedCheckpoint, CheckpointError
@@ -119,6 +120,14 @@ def test_combined_rollback_retires_checkpoint_before_native_history_mutation(
         # Codex also counts the hidden account-handoff input.
         assert ctx.sdk.rollbacks == [3]
         assert journal.discards == []
+        catalog_invalidations = [
+            item for item in transport.sent
+            if isinstance(item, SessionListInvalidated)
+        ]
+        assert [
+            (item.engine, item.space, item.seq, item.sid)
+            for item in catalog_invalidations
+        ] == [("codex", "code", None, None)]
         barriers = [
             item for item in transport.sent if isinstance(item, HistoryInvalidated)
         ]

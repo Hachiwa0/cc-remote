@@ -101,7 +101,8 @@ from cc_remote.protocol import (
     ToolUse, ToolResult, ProcessEvent, TurnBinding, TurnEnd, TurnNotificationContext,
     TurnResult, is_downstream,
     is_reliable_command,
-    SessionInfo, SessionList, SessionActivity, ListSessions, SessionFocus,
+    SessionInfo, SessionList, SessionListInvalidated, SessionActivity,
+    ListSessions, SessionFocus,
     SessionRekey, SessionForked, SessionMigrated, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
@@ -3481,7 +3482,7 @@ class WrapperMachine:
     ) -> None:
         try:
             await self.transport.send(await self._work_dashboard(engine))
-            await self._handle_list_sessions(ListSessions(engine=engine, space="work"))
+            await self._invalidate_session_list(engine, "work")
             if session_id:
                 store = self._work.for_engine(engine)
                 artifacts = await asyncio.to_thread(store.artifacts, session_id)
@@ -13432,6 +13433,14 @@ class WrapperMachine:
 
     # ---- sessions (list / switch / new) ----
 
+    async def _invalidate_session_list(
+        self, engine: str, space: str = "code",
+    ) -> SessionListInvalidated:
+        """Broadcast only a read hint; browsers own the correlated refresh."""
+        event = SessionListInvalidated(engine=engine, space=space)
+        await self.transport.send(event)
+        return event
+
     async def _handle_list_sessions(self, cmd) -> None:
         engine = getattr(cmd, "engine", "claude")
         space = getattr(cmd, "space", "code")
@@ -14907,9 +14916,7 @@ class WrapperMachine:
             if ctx.engine == "codex":
                 self._invalidate_codex_session_catalog()
                 try:
-                    await self._handle_list_sessions(
-                        ListSessions(engine="codex", space="code")
-                    )
+                    await self._invalidate_session_list("codex", "code")
                 except Exception as exc:
                     log.warning(
                         "rollback session list refresh failed",

@@ -621,6 +621,13 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     ?? (history.id !== live.id ? history.id : live.historyTurnId);
   const detailProjection = live.detailProjection ?? history.detailProjection;
   const terminalSource = live.terminalSource ?? history.terminalSource;
+  // preserveLiveOpen only says that a live projection overlaps the newest
+  // source row. It is not authority to erase a real interrupted/failed source
+  // terminal. Compact continuation is proven later from the wrapper's exact
+  // native-id fence and may then reopen that terminal deliberately.
+  const liveOwnsLifecycle = preserveLiveOpen
+    && history.interrupted !== true
+    && history.error == null;
   return {
     ...history,
     id: live.id,
@@ -633,11 +640,12 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     // A transcript has no ResultMessage, so its EOF is represented by a
     // synthetic TurnEnd.  While this same live tail is still running, that
     // marker is only a snapshot boundary and must not close the turn early.
-    done: preserveLiveOpen ? live.done : history.done || live.done,
-    interrupted: history.interrupted || live.interrupted,
+    done: liveOwnsLifecycle ? live.done : history.done || live.done,
+    interrupted: liveOwnsLifecycle
+      ? live.interrupted : history.interrupted || live.interrupted,
     error: live.error ?? history.error,
     ...(terminalSource ? { terminalSource } : {}),
-    progress: preserveLiveOpen ? live.progress : undefined,
+    progress: liveOwnsLifecycle ? live.progress : undefined,
     // A summary page replaces optimistic inline image bodies with canonical,
     // payload-free references. Retaining both makes ChatView lay out the same
     // attachment twice and leaves a large placeholder below the visible image.
@@ -649,7 +657,7 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
       ? undefined
       : Math.min(history.ts ?? Number.MAX_SAFE_INTEGER,
           live.ts ?? Number.MAX_SAFE_INTEGER),
-    doneTs: preserveLiveOpen
+    doneTs: liveOwnsLifecycle
       ? live.doneTs
       : Math.max(history.doneTs ?? 0, live.doneTs ?? 0) || undefined,
     durationMs: history.durationMs === 0 && (live.durationMs ?? 0) > 0

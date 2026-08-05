@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 30
+PROTOCOL_VERSION = 31
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -908,6 +908,18 @@ class SessionList(_Base):
     # then a refreshed list, so both responses intentionally carry the same id.
     request_id: Optional[WireId] = None
     sessions: list[SessionInfo]
+
+
+class SessionListInvalidated(_Base):
+    """wrapper -> clients: request a fresh, correlated catalog read.
+
+    This is intentionally an unbuffered control hint. Each visible browser
+    freezes its own socket/surface ownership when it answers the hint with
+    ListSessions; the wrapper never broadcasts an uncorrelated SessionList.
+    """
+    type: Literal["session_list_invalidated"] = "session_list_invalidated"
+    engine: Literal["claude", "codex"]
+    space: Space = "code"
 
 
 class SessionActivity(_Base):
@@ -2168,7 +2180,7 @@ class GoalState(_Base):
 AnyMessage = Union[
     Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
-    SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
+    SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, TurnSteered, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
@@ -2299,6 +2311,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "clear_goal": ClearGoal,
     "goal_state": GoalState,
     "session_list": SessionList,
+    "session_list_invalidated": SessionListInvalidated,
     "session_activity": SessionActivity,
     "session_focus": SessionFocus,
     "session_rekey": SessionRekey,

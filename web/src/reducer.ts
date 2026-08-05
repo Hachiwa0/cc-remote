@@ -3094,11 +3094,26 @@ function reduceEvent(
       // History alone, and persisting this connection-local marker would make
       // the next refresh look like another continuation candidate.
       turns = turns.map((turn) => {
-        if (!turn.done || turn.terminalSource !== "compact_continuation") {
-          return turn;
+        let settled = turn;
+        if (turn.done && turn.terminalSource === "compact_continuation") {
+          settled = { ...turn };
+          delete settled.terminalSource;
         }
-        const settled = { ...turn };
-        delete settled.terminalSource;
+        const terminalProblem = settled.interrupted === true
+          || settled.error != null;
+        if (settled.done && terminalProblem
+            && mutableTurnBlocks(settled).some((block) => !block.done)) {
+          settled = {
+            ...settled,
+            blocks: settled.blocks.map((block) => ({ ...block })),
+            liveSpillBlocks: settled.liveSpillBlocks?.map(
+              (block) => ({ ...block })),
+          };
+          const terminalStatus = settled.interrupted
+            ? "interrupted" : settled.error ? "failed" : "succeeded";
+          finishOpenBlocks(
+            settled, terminalStatus, terminalStatus !== "succeeded");
+        }
         return settled;
       });
       turns = turns.map(withLimitedTurnBlocks);
@@ -4587,6 +4602,7 @@ function reduceEvent(
     case "queued_query_updated":
     case "history_image":
     case "session_forked":
+    case "session_list_invalidated":
     case "hello":
       return state;
   }

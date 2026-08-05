@@ -28,6 +28,7 @@ import json
 import os
 import re
 import signal
+import time
 from collections import OrderedDict, deque
 from typing import Any, Awaitable, Callable, Optional
 
@@ -97,6 +98,7 @@ _WORK_MCP_SERVER_LIMIT = 128
 _WORK_PATH_MAX = 4096
 _WORK_NAME_MAX = 256
 _COMPACTION_CONTINUATION_GRACE_SECONDS = 5.0
+_GOAL_PROMPT_CANDIDATE_TTL_SECONDS = 30.0
 _PROXY_HANDSHAKE_MAX = 16 * 1024
 _PROXY_HANDSHAKE_TIMEOUT = 5.0
 _PROXY_MESSAGE_MAX = 16 * 1024 * 1024
@@ -306,6 +308,24 @@ class CodexNoActiveTurnFence:
 
     def release_now(self) -> None:
         self.release.set()
+
+
+class _GoalPromptCandidate:
+    """One short-lived Goal objective awaiting its spontaneous native turn."""
+
+    __slots__ = ("objective", "generation", "revision", "deadline")
+
+    def __init__(
+        self,
+        objective: str,
+        generation: int,
+        revision: int,
+        deadline: float,
+    ):
+        self.objective = objective
+        self.generation = generation
+        self.revision = revision
+        self.deadline = deadline
 
 
 class _CodexCompactionContinuation:
@@ -1113,9 +1133,10 @@ class CodexHandle:
         # Keep the objective separate from mutable Goal status/usage updates and
         # consume it exactly once when the correlated native turn is projected.
         self._goal_objective_baseline: Optional[str] = None
+        self._goal_status_baseline: Optional[str] = None
         self._goal_baseline_loaded = False
         self._goal_prompt_pending: OrderedDict[str, str] = OrderedDict()
-        self._goal_prompt_unbound: Optional[str] = None
+        self._goal_prompt_candidate: Optional[_GoalPromptCandidate] = None
         # A goal/automatic continuation can start without query(), hence without
         # a response queue owned by Machine._run_turn.  Track that one turn
         # separately so the machine can lock the session, expose interrupt, and
@@ -1361,9 +1382,10 @@ class CodexHandle:
         self.goal_revision = 0
         self.last_goal_turn_id = None
         self._goal_objective_baseline = None
+        self._goal_status_baseline = None
         self._goal_baseline_loaded = False
         self._goal_prompt_pending.clear()
-        self._goal_prompt_unbound = None
+        self._goal_prompt_candidate = None
         self._spontaneous_turn_id = None
         self._compaction_continuation_turn_id = None
         self._discard_managed_compaction_continuation()
@@ -2258,6 +2280,10 @@ class CodexHandle:
     def _open_managed_stream(self) -> None:
         """Create a bounded producer that can never block JSON-RPC stdout."""
         self._discard_managed_compaction_continuation()
+        # A query/review has its own authoritative user boundary. It must never
+        # consume a delayed Goal objective which was waiting for an automatic
+        # continuation.
+        self._goal_prompt_candidate = None
         item_cap, byte_cap = self._notification_queue_limits(managed=True)
         self._turn_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
         self._managed_overflow = False
@@ -2662,6 +2688,7 @@ class CodexHandle:
         self._close_spontaneous_stream(spontaneous_turn_id)
         self._spontaneous_turn_id = None
         self._compaction_continuation_turn_id = None
+        self._goal_prompt_candidate = None
         self._discard_managed_compaction_continuation()
         self._clear_review_tracking()
         tasks = [t for t in (self._reader, self._stderr_task)
@@ -3067,10 +3094,12 @@ class CodexHandle:
         if goal is None:
             self.last_goal = None
             self._goal_objective_baseline = None
+            self._goal_status_baseline = None
             self._goal_baseline_loaded = True
             return None
         self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
         self._goal_objective_baseline = self.last_goal.get("objective")
+        self._goal_status_baseline = self.last_goal.get("status")
         self._goal_baseline_loaded = True
         return self.last_goal
 
@@ -3078,12 +3107,49 @@ class CodexHandle:
         """Consume the one visible objective owned by ``turn_id``."""
         return self._goal_prompt_pending.pop(turn_id, None)
 
+    def _seed_goal_prompt_candidate(self, objective: str) -> None:
+        self._goal_prompt_candidate = _GoalPromptCandidate(
+            objective=objective,
+            generation=self._generation,
+            revision=self.goal_revision,
+            deadline=time.monotonic() + _GOAL_PROMPT_CANDIDATE_TTL_SECONDS,
+        )
+
+    def _refresh_goal_prompt_candidate(self, objective: Any) -> None:
+        candidate = self._goal_prompt_candidate
+        if candidate is None:
+            return
+        if (
+            candidate.generation != self._generation
+            or candidate.deadline < time.monotonic()
+            or candidate.objective != objective
+        ):
+            self._goal_prompt_candidate = None
+            return
+        candidate.revision = self.goal_revision
+
+    def _claim_goal_prompt_candidate(self) -> Optional[str]:
+        candidate = self._goal_prompt_candidate
+        self._goal_prompt_candidate = None
+        if candidate is None:
+            return None
+        if (
+            candidate.generation != self._generation
+            or candidate.revision != self.goal_revision
+            or candidate.deadline < time.monotonic()
+        ):
+            return None
+        return candidate.objective
+
     async def set_goal(self, *, objective: Optional[str] = None,
                        status: Optional[str] = None,
                        token_budget: Optional[int] = None) -> dict:
         assert self.thread_id, "connect() first"
         await self._release_managed_compaction_continuation()
-        if objective is not None and not self._goal_baseline_loaded:
+        if (
+            (objective is not None or status == "active")
+            and not self._goal_baseline_loaded
+        ):
             try:
                 await self.get_goal()
             except Exception as exc:
@@ -3101,34 +3167,46 @@ class CodexHandle:
             params["status"] = status
         if token_budget is not None:
             params["tokenBudget"] = token_budget
-        prompt_candidate = bool(
+        candidate_objective: Optional[str] = None
+        if (
             isinstance(objective, str)
             and objective
             and objective != self._goal_objective_baseline
             and status in (None, "active")
-        )
-        if prompt_candidate:
+        ):
+            candidate_objective = objective
+        elif (
+            status == "active"
+            and self._goal_status_baseline == "paused"
+            and isinstance(objective or self._goal_objective_baseline, str)
+            and bool(objective or self._goal_objective_baseline)
+        ):
+            candidate_objective = objective or self._goal_objective_baseline
+        if candidate_objective is not None:
             # thread/goal/set may synchronously emit turn/started before its RPC
             # response. Seed the candidate first so that exact spontaneous turn
             # can claim it even if the goal notification is delayed or omitted.
-            self._goal_prompt_unbound = objective
+            self._seed_goal_prompt_candidate(candidate_objective)
         try:
             result = await self._request("thread/goal/set", params)
         except BaseException:
-            if prompt_candidate and self._goal_prompt_unbound == objective:
-                self._goal_prompt_unbound = None
+            self._goal_prompt_candidate = None
             raise
         goal = (result or {}).get("goal")
         if not isinstance(goal, dict):
+            self._goal_prompt_candidate = None
             raise RuntimeError("codex app-server did not return a goal")
         self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
         self._goal_objective_baseline = self.last_goal.get("objective")
+        self._goal_status_baseline = self.last_goal.get("status")
         self._goal_baseline_loaded = True
         if (
             self.last_goal.get("status") != "active"
-            and self._goal_prompt_unbound == objective
         ):
-            self._goal_prompt_unbound = None
+            self._goal_prompt_candidate = None
+        elif self._goal_prompt_candidate is not None:
+            self._refresh_goal_prompt_candidate(
+                self.last_goal.get("objective"))
         return self.last_goal
 
     async def clear_goal(self) -> bool:
@@ -3139,9 +3217,10 @@ class CodexHandle:
         if cleared:
             self.last_goal = None
             self._goal_objective_baseline = None
+            self._goal_status_baseline = None
             self._goal_baseline_loaded = True
             self._goal_prompt_pending.clear()
-            self._goal_prompt_unbound = None
+            self._goal_prompt_candidate = None
         return cleared
 
     async def start_review(self, target: dict[str, Any]) -> dict[str, str]:
@@ -4007,6 +4086,7 @@ class CodexHandle:
                     self._using_daemon_proxy = False
                     self._proxy_read_buffer.clear()
                 self._compaction_continuation_turn_id = None
+                self._goal_prompt_candidate = None
                 self._discard_managed_compaction_continuation()
                 self._clear_review_tracking()
                 spontaneous_turn_id = self._spontaneous_turn_id
@@ -4429,18 +4509,18 @@ class CodexHandle:
             if (
                 isinstance(turn_id, str)
                 and turn_id
-                and self._goal_prompt_unbound is not None
+                and self._goal_prompt_candidate is not None
             ):
                 if not was_active and not review_execution_frame:
-                    self._goal_prompt_pending[turn_id] = (
-                        self._goal_prompt_unbound
-                    )
-                    self._goal_prompt_pending.move_to_end(turn_id)
-                    while len(self._goal_prompt_pending) > 8:
-                        self._goal_prompt_pending.popitem(last=False)
+                    objective = self._claim_goal_prompt_candidate()
+                    if objective is not None:
+                        self._goal_prompt_pending[turn_id] = objective
+                        self._goal_prompt_pending.move_to_end(turn_id)
+                        while len(self._goal_prompt_pending) > 8:
+                            self._goal_prompt_pending.popitem(last=False)
                 # Managed query/review turns have their own authoritative user
                 # boundary. Never let a stale Goal candidate steal one.
-                self._goal_prompt_unbound = None
+                self._goal_prompt_candidate = None
             self.turn_active = True
             if (not was_active and isinstance(turn_id, str) and turn_id
                     and not review_execution_frame):
@@ -4534,12 +4614,15 @@ class CodexHandle:
                         self._goal_objective_baseline = objective
                         self._goal_baseline_loaded = True
                     self.goal_revision += 1
+                    self._goal_status_baseline = goal.get("status")
                     turn_id = params.get("turnId")
                     self.last_goal_turn_id = (
                         turn_id if isinstance(turn_id, str) and turn_id else None
                     )
                     if goal.get("status") != "active":
-                        self._goal_prompt_unbound = None
+                        self._goal_prompt_candidate = None
+                    else:
+                        self._refresh_goal_prompt_candidate(objective)
                     if objective_changed and goal.get("status") == "active":
                         if self.last_goal_turn_id is not None:
                             self._goal_prompt_pending[
@@ -4550,17 +4633,24 @@ class CodexHandle:
                             )
                             while len(self._goal_prompt_pending) > 8:
                                 self._goal_prompt_pending.popitem(last=False)
+                            self._goal_prompt_candidate = None
                         else:
-                            self._goal_prompt_unbound = objective
+                            candidate = self._goal_prompt_candidate
+                            if (
+                                candidate is None
+                                or candidate.objective != objective
+                            ):
+                                self._seed_goal_prompt_candidate(objective)
                     await self._publish_goal(goal)
         elif method == "thread/goal/cleared":
             params = m.get("params") or {}
             if params.get("threadId") == self.thread_id:
                 self.last_goal = None
                 self._goal_objective_baseline = None
+                self._goal_status_baseline = None
                 self._goal_baseline_loaded = True
                 self._goal_prompt_pending.clear()
-                self._goal_prompt_unbound = None
+                self._goal_prompt_candidate = None
                 self.goal_revision += 1
                 self.last_goal_turn_id = None
                 await self._publish_goal(None)

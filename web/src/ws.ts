@@ -46,6 +46,13 @@ interface ListRequestOwnership {
   order: number;
 }
 
+interface InvalidatedListRefresh {
+  requestId: string;
+  engine: "claude" | "codex";
+  space: Space;
+  dirty: boolean;
+}
+
 export function sessionScopeKey(
   machineId: string, engine: "claude" | "codex", space: Space,
 ): string {
@@ -166,6 +173,9 @@ export class RelayWs {
   private readonly pendingListOwnershipByRequest =
     new Map<string, ListRequestOwnership>();
   private readonly latestAcceptedListOrderByScope = new Map<string, number>();
+  private readonly invalidatedListRefreshByScope =
+    new Map<string, InvalidatedListRefresh>();
+  private readonly invalidatedListScopeByRequest = new Map<string, string>();
   private listRequestOrder = 0;
   private readonly pendingGoalOwnershipByRequest =
     new Map<string, EventOwnership>();
@@ -215,6 +225,8 @@ export class RelayWs {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.cancelProtocolRecovery();
     this.stopHeartbeat();
+    this.invalidatedListRefreshByScope.clear();
+    this.invalidatedListScopeByRequest.clear();
     const ws = this.ws;
     // Retire the callback generation before close(). Browsers may still deliver
     // queued open/message/close callbacks synchronously while an App effect is
@@ -1055,6 +1067,50 @@ export class RelayWs {
     return queued ? commandId : null;
   }
 
+  private refreshInvalidatedSessionList(
+    engine: "claude" | "codex",
+    space: Space,
+    socketGeneration: number,
+  ): void {
+    if (socketGeneration !== this.connectionGeneration
+        || engine !== this.activeEngine || space !== this.activeSpace) return;
+    const scopeKey = sessionScopeKey(this.machineId, engine, space);
+    const inFlight = this.invalidatedListRefreshByScope.get(scopeKey);
+    if (inFlight) {
+      inFlight.dirty = true;
+      return;
+    }
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION,
+      type: "list_sessions",
+      ts: nowTs(),
+    };
+    if (engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    const requestId = this.sendListRefreshingCommand(obj, engine, space);
+    if (!requestId) return;
+    this.invalidatedListRefreshByScope.set(scopeKey, {
+      requestId, engine, space, dirty: false,
+    });
+    this.invalidatedListScopeByRequest.set(requestId, scopeKey);
+  }
+
+  private completeInvalidatedSessionListRefresh(
+    requestId: string,
+    socketGeneration: number,
+  ): void {
+    const scopeKey = this.invalidatedListScopeByRequest.get(requestId);
+    if (!scopeKey) return;
+    this.invalidatedListScopeByRequest.delete(requestId);
+    const refresh = this.invalidatedListRefreshByScope.get(scopeKey);
+    if (!refresh || refresh.requestId !== requestId) return;
+    this.invalidatedListRefreshByScope.delete(scopeKey);
+    if (refresh.dirty) {
+      this.refreshInvalidatedSessionList(
+        refresh.engine, refresh.space, socketGeneration);
+    }
+  }
+
   sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
     const targetEngine = engine ?? this.activeEngine;
     if (engine) this.engineBySession[sessionId] = engine;
@@ -1350,6 +1406,8 @@ export class RelayWs {
   private connect(): void {
     this.cb.onConnState("connecting");
     const socketGeneration = ++this.connectionGeneration;
+    this.invalidatedListRefreshByScope.clear();
+    this.invalidatedListScopeByRequest.clear();
     const ws = new WebSocket(this.url);
     let compatibleFrameSeen = false;
     this.ws = ws;
@@ -1381,6 +1439,11 @@ export class RelayWs {
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
+        if (msg.type === "session_list_invalidated") {
+          this.refreshInvalidatedSessionList(
+            msg.engine, msg.space ?? "code", socketGeneration);
+          return;
+        }
         if ((msg.type === "user_msg" || msg.type === "turn_steered"
               || msg.type === "turn_binding"
               || msg.type === "error")
@@ -1428,6 +1491,8 @@ export class RelayWs {
           }
         }
         if (msg.type === "command_ack") {
+          this.completeInvalidatedSessionListRefresh(
+            msg.cmd_id, socketGeneration);
           if (this.outbox.ack(msg.client_id, msg.cmd_id)) {
             this.cb.onOutboxChanged?.(this.pendingSessionIds());
           }

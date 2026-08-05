@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import cc_remote.wrapper.codex_handle as codex_handle_module
+import pytest
 from cc_remote.protocol import (
     Delta, Error, GoalState, ProcessEvent, StateEvent, ToolDelta, ToolResult,
     ToolUse, TurnDiff, TurnEnd, TurnPlan, UserMsg,
@@ -1314,6 +1315,67 @@ def test_goal_modify_after_reconnect_primes_baseline_before_set():
     asyncio.run(run())
 
 
+def test_goal_resume_reuses_paused_objective_for_spontaneous_turn():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        handle.proc = SimpleNamespace(returncode=None)
+        requests = []
+        paused_goal = {
+            "threadId": handle.thread_id,
+            "objective": "继续证明泰勒展开",
+            "status": "paused",
+            "tokensUsed": 10,
+            "timeUsedSeconds": 20,
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "thread/goal/get":
+                return {"goal": paused_goal}
+            assert method == "thread/goal/set"
+            assert params == {
+                "threadId": handle.thread_id,
+                "status": "active",
+            }
+            await handle._dispatch(_goal_notification(
+                "继续证明泰勒展开",
+                turn_id=None,
+                status="active",
+                created_at=1,
+                updated_at=3,
+            ))
+            await handle._dispatch(_notification(
+                "turn/started", "goal-resumed",
+                turn={"id": "goal-resumed"},
+            ))
+            return {"goal": {
+                "threadId": handle.thread_id,
+                "objective": "继续证明泰勒展开",
+                "status": "active",
+                "tokensUsed": 10,
+                "timeUsedSeconds": 20,
+                "createdAt": 1,
+                "updatedAt": 3,
+            }}
+
+        handle._request = request
+        await handle.set_goal(status="active")
+
+        assert requests == [
+            ("thread/goal/get", {"threadId": handle.thread_id}),
+            ("thread/goal/set", {
+                "threadId": handle.thread_id,
+                "status": "active",
+            }),
+        ]
+        assert handle.take_goal_prompt("goal-resumed") == "继续证明泰勒展开"
+
+    asyncio.run(run())
+
+
 def test_unbound_goal_prompt_never_binds_a_managed_user_turn():
     async def run():
         handle = CodexHandle(_Cfg())
@@ -1325,7 +1387,8 @@ def test_unbound_goal_prompt_never_binds_a_managed_user_turn():
         await handle._dispatch(_goal_notification(
             "新目标", turn_id=None, created_at=1, updated_at=2,
         ))
-        assert handle._goal_prompt_unbound == "新目标"
+        assert handle._goal_prompt_candidate is not None
+        assert handle._goal_prompt_candidate.objective == "新目标"
 
         # query() claims turn_active before the authoritative notification.  A
         # stale Goal candidate must be discarded instead of stealing this turn.
@@ -1335,7 +1398,127 @@ def test_unbound_goal_prompt_never_binds_a_managed_user_turn():
             turn={"id": "ordinary-turn"},
         ))
         assert handle.take_goal_prompt("ordinary-turn") is None
-        assert handle._goal_prompt_unbound is None
+        assert handle._goal_prompt_candidate is None
+
+    asyncio.run(run())
+
+
+def test_goal_prompt_candidate_expires_before_spontaneous_turn():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._goal_objective_baseline = "旧目标"
+        handle._goal_status_baseline = "paused"
+        handle._goal_baseline_loaded = True
+
+        await handle._dispatch(_goal_notification(
+            "新目标", turn_id=None, created_at=1, updated_at=2,
+        ))
+        assert handle._goal_prompt_candidate is not None
+        handle._goal_prompt_candidate.deadline = 0
+        await handle._dispatch(_notification(
+            "turn/started", "late-goal-turn",
+            turn={"id": "late-goal-turn"},
+        ))
+
+        assert handle.take_goal_prompt("late-goal-turn") is None
+        assert handle._goal_prompt_candidate is None
+
+    asyncio.run(run())
+
+
+def test_goal_prompt_candidate_cannot_cross_app_server_generation():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._goal_objective_baseline = "旧目标"
+        handle._goal_status_baseline = "paused"
+        handle._goal_baseline_loaded = True
+
+        await handle._dispatch(_goal_notification(
+            "新目标", turn_id=None, created_at=1, updated_at=2,
+        ))
+        assert handle._goal_prompt_candidate is not None
+        handle._generation += 1
+        await handle._dispatch(_notification(
+            "turn/started", "next-generation-turn",
+            turn={"id": "next-generation-turn"},
+        ))
+
+        assert handle.take_goal_prompt("next-generation-turn") is None
+        assert handle._goal_prompt_candidate is None
+
+    asyncio.run(run())
+
+
+def test_repeated_active_goal_update_binds_one_prompt_only():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._goal_objective_baseline = "旧目标"
+        handle._goal_status_baseline = "paused"
+        handle._goal_baseline_loaded = True
+        update = _goal_notification(
+            "新目标", turn_id=None, created_at=1, updated_at=2,
+        )
+
+        await handle._dispatch(update)
+        await handle._dispatch(update)
+        await handle._dispatch(_notification(
+            "turn/started", "one-goal-turn",
+            turn={"id": "one-goal-turn"},
+        ))
+
+        assert handle.take_goal_prompt("one-goal-turn") == "新目标"
+        assert handle.take_goal_prompt("one-goal-turn") is None
+        assert handle._goal_prompt_candidate is None
+
+    asyncio.run(run())
+
+
+def test_managed_query_clears_unbound_goal_prompt_candidate():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._goal_objective_baseline = "旧目标"
+        handle._goal_status_baseline = "paused"
+        handle._goal_baseline_loaded = True
+        await handle._dispatch(_goal_notification(
+            "新目标", turn_id=None, created_at=1, updated_at=2,
+        ))
+        assert handle._goal_prompt_candidate is not None
+
+        async def request(method, params=None):
+            assert method == "turn/start"
+            return {"turn": {"id": "managed-turn"}}
+
+        handle._request = request
+        assert await handle.query("ordinary prompt") == "managed-turn"
+        assert handle._goal_prompt_candidate is None
+
+    asyncio.run(run())
+
+
+def test_failed_goal_resume_clears_prompt_candidate():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._goal_objective_baseline = "继续证明泰勒展开"
+        handle._goal_status_baseline = "paused"
+        handle._goal_baseline_loaded = True
+
+        async def request(method, params=None):
+            raise RuntimeError("goal set failed")
+
+        handle._request = request
+        with pytest.raises(RuntimeError, match="goal set failed"):
+            await handle.set_goal(status="active")
+        assert handle._goal_prompt_candidate is None
 
     asyncio.run(run())
 
