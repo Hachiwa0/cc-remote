@@ -61,6 +61,7 @@ import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
+import { useMobileViewport } from "../src/use-mobile-viewport";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -231,6 +232,22 @@ function streamingTurn(id: string, paragraphs = 1): Turn {
       message_id: `${id}-message`,
       channel: "final",
       text,
+      done: false,
+    }],
+    done: false,
+    ts: Date.now(),
+  };
+}
+
+function streamingMathTurn(complete: boolean): Turn {
+  return {
+    id: "streaming-math",
+    prompt: "流式公式",
+    blocks: [{
+      kind: "text",
+      message_id: "streaming-math-message",
+      channel: "final",
+      text: String.raw`推导：\(x^2 + y^2 = r^2${complete ? String.raw`\)` : ""}`,
       done: false,
     }],
     done: false,
@@ -1020,6 +1037,7 @@ function HistoryConversationBrowserFixture() {
   const invalidMermaid = params.has("invalid-mermaid");
   const mermaidHistory = params.has("mermaid-history");
   const math = params.has("math");
+  const streamingMath = params.has("streaming-math");
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
   const quotaComposer = params.has("quota-composer");
@@ -1029,9 +1047,11 @@ function HistoryConversationBrowserFixture() {
   const migrationPickerNullInitial = params.has("migration-picker-null");
   const newChatControls = params.has("newchat-controls");
   const longProfile = params.has("long-profile");
+  const manyProfiles = params.has("many-profiles");
   const recoveryReplacement = params.has("recovery-replace");
   const deepBrowse = params.has("deep-browse");
   const runtimeBrowse = params.has("runtime-browse");
+  const generationShift = params.has("generation-shift");
   const delayedHistoryAvailability = params.has("delayed-history-availability");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
   const emptyFinalPage = params.has("empty-final");
@@ -1058,6 +1078,13 @@ function HistoryConversationBrowserFixture() {
       )];
     }
     if (math) return [mathTurn()];
+    if (streamingMath) {
+      return [
+        ...Array.from({ length: 8 }, (_, index) =>
+          finalTurn(`math-before-${index + 1}`, 3)),
+        streamingMathTurn(false),
+      ];
+    }
     if (mermaidHistory) {
       return [
         mermaidTurn(),
@@ -1090,7 +1117,7 @@ function HistoryConversationBrowserFixture() {
   }, [
     actualMermaid, compactTools, detailPaging, detailRetainedPreview,
     detailScrollCancel, dualImage,
-    interactiveTimeline, math,
+    interactiveTimeline, math, streamingMath,
     deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
     timeline,
   ]);
@@ -1100,7 +1127,7 @@ function HistoryConversationBrowserFixture() {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
       hasMore: !compactTools && !detailPaging && !invalidMermaid && !large && !mermaid
-        && !mermaidHistory && !math && !timeline && !deepBrowse
+        && !mermaidHistory && !math && !streamingMath && !timeline && !deepBrowse
         && !delayedHistoryAvailability,
       pagesLoaded: 0,
       hasNewer: deepBrowse,
@@ -1119,6 +1146,8 @@ function HistoryConversationBrowserFixture() {
   });
   const [loads, setLoads] = useState(0);
   const [historyRevision, setHistoryRevision] = useState("revision-1");
+  const [historyGeneration, setHistoryGeneration] =
+    useState("fixture-generation-1");
   const [historyViewRevision, setHistoryViewRevision] = useState("revision-1");
   const [historyViewId, setHistoryViewId] = useState(
     deepBrowse ? "browse-1" : "runtime",
@@ -1165,7 +1194,14 @@ function HistoryConversationBrowserFixture() {
           allowed: true,
         }]
       : []),
-  ], [longProfile]);
+    ...(manyProfiles
+      ? Array.from({ length: 12 }, (_, index) => ({
+          id: `custom-profile-${index}`,
+          description: `Custom execution profile ${index}`,
+          allowed: true,
+        }))
+      : []),
+  ], [longProfile, manyProfiles]);
   const [pendingImages, setPendingImages] = useState<QueryImg[]>(() =>
     composerAttachment ? [{
       media_type: "image/png",
@@ -1224,6 +1260,8 @@ function HistoryConversationBrowserFixture() {
   const loadMore = useCallback((): boolean | {
     accepted: true;
     viewId: string;
+    scopeKey: string;
+    generation: string | null;
   } => {
     const requestSid = sid;
     if (!sessions[requestSid]?.hasMore) return false;
@@ -1267,7 +1305,12 @@ function HistoryConversationBrowserFixture() {
       }
     }, delayMs);
     return enteringViewId
-      ? { accepted: true, viewId: enteringViewId }
+      ? {
+          accepted: true,
+          viewId: enteringViewId,
+          scopeKey: "fixture-browse-scope",
+          generation: null,
+        }
       : true;
   }, [
     browseMode, delayMs, emptyFinalPage, growOlderRow, growthDelayMs,
@@ -1478,6 +1521,20 @@ function HistoryConversationBrowserFixture() {
     });
   };
 
+  const closeStreamingFormula = () => {
+    setSessions((current) => {
+      const session = current[sid];
+      return {
+        ...current,
+        [sid]: {
+          ...session,
+          turns: session.turns.map((turn) => turn.id === "streaming-math"
+            ? streamingMathTurn(true) : turn),
+        },
+      };
+    });
+  };
+
   const growBackgroundStreamingTurn = () => {
     setSessions((current) => {
       const targetSid = "history-browser-session-a";
@@ -1564,6 +1621,14 @@ function HistoryConversationBrowserFixture() {
           onClick={replaceHistoryRevision}>
           replace revision
         </button>
+        {generationShift && (
+          <button data-testid="shift-generation" type="button"
+            onClick={() => setHistoryGeneration((current) =>
+              current === "fixture-generation-1"
+                ? "fixture-generation-2" : "fixture-generation-3")}>
+            shift generation
+          </button>
+        )}
         {migrationPickerFixture && (
           <>
             <button data-testid="open-migration-picker" type="button"
@@ -1675,6 +1740,12 @@ function HistoryConversationBrowserFixture() {
             </button>
           </>
         )}
+        {streamingMath && (
+          <button data-testid="close-streaming-formula" type="button"
+            onClick={closeStreamingFormula}>
+            close formula
+          </button>
+        )}
         {manualGrowth && (
           <button data-testid="grow-row" type="button"
             onClick={() => deepBrowse
@@ -1728,8 +1799,10 @@ function HistoryConversationBrowserFixture() {
           hasMore={active.hasMore}
           historyRevision={historyRevision}
           historyViewRevision={historyViewRevision}
+          historyGeneration={generationShift ? historyGeneration : undefined}
           historyViewId={deepBrowse || browseMode ? historyViewId : undefined}
-          historyScopeKey="fixture-history-scope"
+          historyScopeKey={runtimeBrowse && browseMode
+            ? "fixture-browse-scope" : "fixture-history-scope"}
           historyWindowEpoch={active.windowEpoch ?? 0}
           historyCursor={active.cursor}
           browseMode={browseMode && sid.endsWith("-a")}
@@ -1856,6 +1929,14 @@ export function HistoryBrowserFixture() {
       engine={params.get("engine") === "claude" ? "claude" : "codex"}
     />;
   }
+  if (params.has("newchat-controls")) {
+    return <MobileViewportHistoryConversationBrowserFixture />;
+  }
+  return <HistoryConversationBrowserFixture />;
+}
+
+function MobileViewportHistoryConversationBrowserFixture() {
+  useMobileViewport();
   return <HistoryConversationBrowserFixture />;
 }
 
@@ -1925,20 +2006,23 @@ function PlanUiFixture({ mode }: { mode: string }) {
 function GoalUiFixture({ status }: { status: string | null }) {
   const [open, setOpen] = useState(false);
   const [revealed, setRevealed] = useState(true);
+  const loading = status === "loading";
   const goalStatus = status === "blocked" ? "blocked" : "active";
-  const goal: ThreadGoal = {
+  const goal: ThreadGoal | null = loading ? null : {
     threadId: "goal-fixture-thread",
-    objective: "完成 protocol v29 发布并验证所有终端同步升级",
+    objective: "完成 protocol v30 发布并验证所有终端同步升级",
     status: goalStatus,
     engine: "codex",
     tokenBudget: 100_000,
     tokensUsed: 37_000,
     timeUsedSeconds: 321,
+    lastReason: "已完成协议兼容性检查，正在验证三端同步状态。",
   };
   return (
     <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
       <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
       <GoalPanel engine="codex" goal={goal} revealed={revealed} open={open}
+        loading={loading}
         onOpen={() => setOpen(true)} onClose={() => setOpen(false)}
         onDismiss={() => setRevealed(false)} onSave={() => setOpen(false)}
         onClear={() => setRevealed(false)} />

@@ -382,9 +382,50 @@ const harness = await createServer({
 });
 try {
   const { initialState, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
-  const { preloadMarkdownMathPlugins } = await harness.ssrLoadModule(
+  const {
+    advanceMarkdownMathState,
+    hasMathDelimiters,
+    normalizeMathDelimiters,
+    preloadMarkdownMathPlugins,
+  } = await harness.ssrLoadModule(
     "/src/markdown-math.ts");
   await preloadMarkdownMathPlugins();
+  const malformedMath = String.raw`坏的 \(text；正常 \(x^2\)`;
+  assert.equal(
+    normalizeMathDelimiters(malformedMath),
+    String.raw`坏的 \(text；正常 $x^2$`,
+    "an unmatched opener must not consume a later complete formula",
+  );
+  assert.equal(hasMathDelimiters(malformedMath), true);
+  let streamedMath = advanceMarkdownMathState({
+    source: "",
+    normalized: "",
+    active: false,
+  }, "\\(x\\");
+  assert.equal(streamedMath.active, false);
+  streamedMath = advanceMarkdownMathState(
+    streamedMath, "\\(x\\)");
+  assert.deepEqual(streamedMath, {
+    source: "\\(x\\)",
+    normalized: "$x$",
+    active: true,
+  }, "a closing bracket delimiter split after its slash activates immediately");
+  let streamedDisplayMath = advanceMarkdownMathState({
+    source: "",
+    normalized: "",
+    active: false,
+  }, "\\[x\\");
+  streamedDisplayMath = advanceMarkdownMathState(
+    streamedDisplayMath, "\\[x\\]");
+  assert.equal(streamedDisplayMath.active, true);
+  assert.equal(streamedDisplayMath.normalized, "\n$$\nx\n$$\n");
+  const escapedSplit = advanceMarkdownMathState({
+    source: "literal \\\\",
+    normalized: "literal \\\\",
+    active: false,
+  }, "literal \\\\)");
+  assert.equal(escapedSplit.active, false,
+    "an even trailing slash run must stay escaped across the append boundary");
   const { ArtifactPanel } = await harness.ssrLoadModule(
     "/src/components/ArtifactPanel.tsx");
   const { buildSandboxDocument } = await harness.ssrLoadModule(
@@ -447,10 +488,27 @@ $$`,
     text: String.raw`\[ r = \frac{h}{\sin |\alpha|} \]`,
     done: false,
   }));
-  assert.doesNotMatch(streamingMathMarkup, /class="katex/,
-    "streaming formula source stays stable until the message is terminal");
-  assert.match(streamingMathMarkup, /\\frac/,
-    "streaming formula source remains readable instead of repeatedly re-laying out");
+  assert.match(streamingMathMarkup, /class="katex-display"/,
+    "a complete streaming formula renders before the message is terminal");
+  const incompleteStreamingMathMarkup = renderToStaticMarkup(
+    createElement(MessageBlock, {
+      text: String.raw`推导中：\( r = \frac{h}{\sin |\alpha|}`,
+      done: false,
+    }),
+  );
+  assert.doesNotMatch(incompleteStreamingMathMarkup, /class="katex/,
+    "an unmatched streaming opener must remain readable source");
+  assert.match(incompleteStreamingMathMarkup, /\\frac/);
+  const mixedStreamingMathMarkup = renderToStaticMarkup(
+    createElement(MessageBlock, {
+      text: String.raw`已完成 \(x^2\)，继续 \(y^2`,
+      done: false,
+    }),
+  );
+  assert.match(mixedStreamingMathMarkup, /class="katex"/,
+    "matched spans render without waiting for an incomplete tail");
+  assert.match(mixedStreamingMathMarkup, /继续 \(y\^2/,
+    "normalization must not consume an unmatched tail opener");
   const literalMathMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "Inline code: `\\(\\alpha\\)`\n\n"
       + "```text\n\\[not math\\]\n```",

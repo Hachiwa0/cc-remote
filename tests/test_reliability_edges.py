@@ -12,9 +12,13 @@ from cc_remote.protocol import (
     NewSession,
     SessionFocus,
     SessionList,
+    SessionListInvalidated,
     TurnEnd,
     TurnResult,
     UserMsg,
+    deserialize,
+    is_downstream,
+    serialize,
 )
 from cc_remote.wrapper import machine as mm
 from tests.test_multisession import _mk_ctx, _mk_machine
@@ -112,6 +116,16 @@ def test_session_lists_echo_engine_and_are_unicast_to_each_requester(monkeypatch
         assert calls[0][0] != caller_thread
 
     asyncio.run(run())
+
+
+def test_session_list_invalidation_is_typed_and_never_replayed():
+    event = SessionListInvalidated(engine="codex", space="work")
+    decoded = deserialize(serialize(event))
+
+    assert isinstance(decoded, SessionListInvalidated)
+    assert decoded.engine == "codex"
+    assert decoded.space == "work"
+    assert not is_downstream(decoded)
 
 
 def test_duplicate_new_session_replays_snapshot_and_focus_without_creating_again():

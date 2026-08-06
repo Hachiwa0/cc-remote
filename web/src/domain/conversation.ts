@@ -119,6 +119,10 @@ export interface Turn {
   done: boolean;
   interrupted?: boolean;
   error?: string;
+  /** Connection-local terminal classification used only to reconcile a false
+   * compact boundary with a newer authoritative running History snapshot. */
+  terminalSource?: "unexpected_interrupt" | "remote_interrupt" | "failed"
+    | "compact_continuation";
   progress?: string;
   images?: QueryImg[];
   imageRefs?: ConversationImageRef[];

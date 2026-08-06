@@ -66,9 +66,18 @@ export class ScrollCoordinator {
 
   endInteraction(token: number, followOutput: boolean): ScrollCommand | null {
     const resumeAtBottom = this.interactions.get(token) ?? false;
-    if (!this.interactions.delete(token) || this.interactions.size > 0) {
-      return null;
+    if (!this.interactions.delete(token)) return null;
+    if (!followOutput) {
+      // One pointer becoming a scroll/cancel transfers the whole gesture away
+      // from output following. A second pointer released later must not replay
+      // a bottom request (or its original at-bottom snapshot) from before that
+      // cancellation.
+      this.pendingBottom = null;
+      for (const activeToken of this.interactions.keys()) {
+        this.interactions.set(activeToken, false);
+      }
     }
+    if (this.interactions.size > 0) return null;
     // Explicit history/detail reading pauses follow output. Never replay a
     // bottom request that arrived while the viewport was frozen after that
     // intent changed, or the eventual interaction release steals the reader's

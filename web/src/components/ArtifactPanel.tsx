@@ -21,7 +21,6 @@ import { isMermaidFenceClass } from "../mermaid";
 import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import {
   isMathFenceClass,
-  normalizeMathDelimiters,
   STREAMING_REMARK_PLUGINS,
   useMarkdownMathPlugins,
 } from "../markdown-math";
@@ -404,7 +403,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     draft: artifact.content || "",
     baseline: artifact.content || "",
   };
-  const mathPlugins = useMarkdownMathPlugins(
+  const math = useMarkdownMathPlugins(
     editor.draft,
     artifact.kind === "md" && mode === "preview",
   );
@@ -754,11 +753,10 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
                   })} />
               : <div className="prose markdown-preview"><ReactMarkdown
                   remarkPlugins={
-                    mathPlugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
-                  rehypePlugins={mathPlugins?.rehypePlugins}
+                    math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
+                  rehypePlugins={math.plugins?.rehypePlugins}
                   components={markdownComponents}>
-                  {mathPlugins
-                    ? normalizeMathDelimiters(editor.draft) : editor.draft}
+                  {math.normalizedSource}
                 </ReactMarkdown></div>}
           </>
         ) : null}

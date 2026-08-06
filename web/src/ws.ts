@@ -41,6 +41,18 @@ export interface EventOwnership {
   connectionGeneration: number;
 }
 
+interface ListRequestOwnership {
+  ownership: EventOwnership;
+  order: number;
+}
+
+interface InvalidatedListRefresh {
+  requestId: string;
+  engine: "claude" | "codex";
+  space: Space;
+  dirty: boolean;
+}
+
 export function sessionScopeKey(
   machineId: string, engine: "claude" | "codex", space: Space,
 ): string {
@@ -158,8 +170,16 @@ export class RelayWs {
   private readonly surfaceEpochByScope: Record<string, number> = {};
   private readonly ownershipBySession: Record<string, EventOwnership> = {};
   private readonly pendingOwnershipByRequest: Record<string, EventOwnership> = {};
+  private readonly pendingListOwnershipByRequest =
+    new Map<string, ListRequestOwnership>();
+  private readonly latestAcceptedListOrderByScope = new Map<string, number>();
+  private readonly invalidatedListRefreshByScope =
+    new Map<string, InvalidatedListRefresh>();
+  private readonly invalidatedListScopeByRequest = new Map<string, string>();
+  private listRequestOrder = 0;
+  private readonly pendingGoalOwnershipByRequest =
+    new Map<string, EventOwnership>();
   private readonly pendingSwitchOwnership: Record<string, EventOwnership[]> = {};
-  private readonly pendingListOwnership: Record<string, EventOwnership[]> = {};
   private readonly outbox = new CommandOutbox(
     OUTBOX_MAX_COMMANDS, OUTBOX_MAX_BYTES, OUTBOX_MAX_FRAME_BYTES);
   private readonly queryAcceptance = new QueryAcceptanceLatch();
@@ -205,7 +225,15 @@ export class RelayWs {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.cancelProtocolRecovery();
     this.stopHeartbeat();
-    this.ws?.close();
+    this.invalidatedListRefreshByScope.clear();
+    this.invalidatedListScopeByRequest.clear();
+    const ws = this.ws;
+    // Retire the callback generation before close(). Browsers may still deliver
+    // queued open/message/close callbacks synchronously while an App effect is
+    // replacing this RelayWs instance.
+    this.connectionGeneration += 1;
+    this.ws = null;
+    ws?.close();
   }
 
   // App-level heartbeat. The browser's WS onclose does NOT fire for a HALF-OPEN
@@ -539,26 +567,27 @@ export class RelayWs {
 
   sendForkSessionWorktree(parentSessionId: string, name: string,
                           requestId = uuid(), lastTurnId?: string): string | null {
-    const queued = this.send({
+    const queued = this.sendListRefreshingCommand({
       ...makeForkSessionWorktreeCommand(
         parentSessionId, name, requestId, nowTs(), lastTurnId),
-    });
+    }, "codex", "code") !== null;
     return queued ? requestId : null;
   }
 
   sendForkSession(parentSessionId: string, forkPointId: string,
                   requestId = uuid()): string | null {
-    const queued = this.send({
+    const engine = this.engineBySession[parentSessionId] ?? this.activeEngine;
+    const queued = this.sendListRefreshingCommand({
       ...makeForkSessionCommand(parentSessionId, forkPointId, requestId, nowTs()),
-    });
+    }, engine, "code") !== null;
     return queued ? requestId : null;
   }
 
   sendMigrateSession(sessionId: string, cwd: string,
                      requestId = uuid()): string | null {
-    const queued = this.send({
+    const queued = this.sendListRefreshingCommand({
       ...makeMigrateSessionCommand(sessionId, cwd, requestId, nowTs()),
-    });
+    }, "codex", "code") !== null;
     return queued ? requestId : null;
   }
 
@@ -952,8 +981,33 @@ export class RelayWs {
     });
   }
 
-  sendGetGoal(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_goal", ts: nowTs(), ...this.sidObj() });
+  sendGetGoal(): string | null {
+    const sid = this.focusedSid;
+    return sid ? this.sendGetGoalTo(sid) : null;
+  }
+
+  sendGetGoalTo(sid: string): string | null {
+    const engine = this.engineBySession[sid]
+      ?? (sid === this.focusedSid ? this.activeEngine : undefined);
+    const space = this.spaceBySession[sid]
+      ?? (sid === this.focusedSid ? this.activeSpace : undefined);
+    const ownership = engine && space
+      ? this.ownershipSnapshot(engine, space) : undefined;
+    const commandId = uuid();
+    if (ownership) {
+      this.pendingGoalOwnershipByRequest.set(commandId, ownership);
+      while (this.pendingGoalOwnershipByRequest.size > OUTBOX_MAX_COMMANDS) {
+        const oldest = this.pendingGoalOwnershipByRequest.keys().next().value;
+        if (typeof oldest !== "string") break;
+        this.pendingGoalOwnershipByRequest.delete(oldest);
+      }
+    }
+    const requestId = this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_goal", sid,
+      client_id: this.clientId, ts: nowTs(),
+    }, commandId);
+    if (!requestId) this.pendingGoalOwnershipByRequest.delete(commandId);
+    return requestId;
   }
 
   sendGetStatus(): string | null {
@@ -984,16 +1038,77 @@ export class RelayWs {
 
   sendListSessions(engine?: "claude" | "codex", space: Space = "code"): boolean {
     const targetEngine = engine ?? "claude";
-    const scopeKey = sessionScopeKey(this.machineId, targetEngine, space);
-    const ownership = this.ownershipSnapshot(targetEngine, space);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    const queued = this.send(obj);
-    if (queued) {
-      this.queueOwnership(this.pendingListOwnership, scopeKey, ownership);
+    return this.sendListRefreshingCommand(obj, targetEngine, space) !== null;
+  }
+
+  /** Session mutations return a SessionList correlated to the mutation's own
+   * cmd_id. Freeze the same request-time ownership used by an explicit list so
+   * those authoritative refreshes cannot borrow the surface active at receive
+   * time or be dropped as unowned. */
+  private sendListRefreshingCommand(
+    obj: Record<string, unknown>, engine: "claude" | "codex", space: Space,
+    commandId = uuid(),
+  ): string | null {
+    const ownership = this.ownershipSnapshot(engine, space);
+    this.pendingListOwnershipByRequest.set(commandId, {
+      ownership,
+      order: ++this.listRequestOrder,
+    });
+    while (this.pendingListOwnershipByRequest.size > OUTBOX_MAX_COMMANDS) {
+      const oldest = this.pendingListOwnershipByRequest.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.pendingListOwnershipByRequest.delete(oldest);
     }
-    return queued;
+    const queued = this.sendTracked(obj, commandId) !== null;
+    if (!queued) this.pendingListOwnershipByRequest.delete(commandId);
+    return queued ? commandId : null;
+  }
+
+  private refreshInvalidatedSessionList(
+    engine: "claude" | "codex",
+    space: Space,
+    socketGeneration: number,
+  ): void {
+    if (socketGeneration !== this.connectionGeneration
+        || engine !== this.activeEngine || space !== this.activeSpace) return;
+    const scopeKey = sessionScopeKey(this.machineId, engine, space);
+    const inFlight = this.invalidatedListRefreshByScope.get(scopeKey);
+    if (inFlight) {
+      inFlight.dirty = true;
+      return;
+    }
+    const obj: Record<string, unknown> = {
+      v: PROTOCOL_VERSION,
+      type: "list_sessions",
+      ts: nowTs(),
+    };
+    if (engine !== "claude") obj.engine = engine;
+    if (space !== "code") obj.space = space;
+    const requestId = this.sendListRefreshingCommand(obj, engine, space);
+    if (!requestId) return;
+    this.invalidatedListRefreshByScope.set(scopeKey, {
+      requestId, engine, space, dirty: false,
+    });
+    this.invalidatedListScopeByRequest.set(requestId, scopeKey);
+  }
+
+  private completeInvalidatedSessionListRefresh(
+    requestId: string,
+    socketGeneration: number,
+  ): void {
+    const scopeKey = this.invalidatedListScopeByRequest.get(requestId);
+    if (!scopeKey) return;
+    this.invalidatedListScopeByRequest.delete(requestId);
+    const refresh = this.invalidatedListRefreshByScope.get(scopeKey);
+    if (!refresh || refresh.requestId !== requestId) return;
+    this.invalidatedListRefreshByScope.delete(scopeKey);
+    if (refresh.dirty) {
+      this.refreshInvalidatedSessionList(
+        refresh.engine, refresh.space, socketGeneration);
+    }
   }
 
   sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
@@ -1065,44 +1180,50 @@ export class RelayWs {
 
   sendRenameSession(sessionId: string, title: string,
                     engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
   sendArchiveSession(sessionId: string, archived: boolean,
                      engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
   sendPinSession(sessionId: string, pinned: boolean,
                  engine?: "claude" | "codex", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "pin_session", session_id: sessionId,
       pinned, ts: nowTs(),
     };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
   sendDeleteWorkSession(sessionId: string, engine: "claude" | "codex"): boolean {
-    return this.send({
+    return this.sendListRefreshingCommand({
       v: PROTOCOL_VERSION, type: "delete_work_session", session_id: sessionId,
       engine, space: "work", ts: nowTs(),
-    });
+    }, engine, "work") !== null;
   }
 
   sendDeleteSession(sessionId: string, engine: "claude" | "codex",
                     space: Space = "code"): boolean {
-    return this.send({
+    return this.sendListRefreshingCommand({
       v: PROTOCOL_VERSION, type: "delete_session", session_id: sessionId,
       engine, space, ts: nowTs(),
-    });
+    }, engine, space) !== null;
   }
 
   sendRollbackSession(sessionId: string, engine: "claude" | "codex",
@@ -1285,10 +1406,13 @@ export class RelayWs {
   private connect(): void {
     this.cb.onConnState("connecting");
     const socketGeneration = ++this.connectionGeneration;
+    this.invalidatedListRefreshByScope.clear();
+    this.invalidatedListScopeByRequest.clear();
     const ws = new WebSocket(this.url);
     let compatibleFrameSeen = false;
     this.ws = ws;
     ws.onopen = () => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       this.backoff = 1;
       this.sendRecoveryPreamble();
       this.startHeartbeat();  // detect a half-open link and auto-recover
@@ -1315,6 +1439,11 @@ export class RelayWs {
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
+        if (msg.type === "session_list_invalidated") {
+          this.refreshInvalidatedSessionList(
+            msg.engine, msg.space ?? "code", socketGeneration);
+          return;
+        }
         if ((msg.type === "user_msg" || msg.type === "turn_steered"
               || msg.type === "turn_binding"
               || msg.type === "error")
@@ -1362,6 +1491,8 @@ export class RelayWs {
           }
         }
         if (msg.type === "command_ack") {
+          this.completeInvalidatedSessionListRefresh(
+            msg.cmd_id, socketGeneration);
           if (this.outbox.ack(msg.client_id, msg.cmd_id)) {
             this.cb.onOutboxChanged?.(this.pendingSessionIds());
           }
@@ -1379,16 +1510,37 @@ export class RelayWs {
           const listedSpace = msg.space ?? "code";
           const scopeKey = sessionScopeKey(
             this.machineId, msg.engine, listedSpace);
-          const listedOwnership = this.shiftOwnership(
-            this.pendingListOwnership, scopeKey);
-          if (this.acceptsOwnership(listedOwnership, socketGeneration)) {
+          const listedRequest = msg.request_id
+            ? this.pendingListOwnershipByRequest.get(msg.request_id)
+            : undefined;
+          const acceptedOrder =
+            this.latestAcceptedListOrderByScope.get(scopeKey) ?? 0;
+          if (listedRequest
+              && listedRequest.ownership.scopeKey === scopeKey
+              && listedRequest.order >= acceptedOrder
+              && this.acceptsOwnership(
+                listedRequest.ownership, socketGeneration)) {
+            const listedOwnership = listedRequest.ownership;
             eventOwnership = listedOwnership;
+            // Advance only when a response is accepted, not when its command is
+            // sent. A newer Error-only mutation then cannot strand an older
+            // valid list, while cached + refreshed frames from one request keep
+            // sharing the same order and a truly newer accepted list wins.
+            this.latestAcceptedListOrderByScope.set(
+              scopeKey, listedRequest.order);
             for (const session of msg.sessions) {
               this.engineBySession[session.session_id] = msg.engine;
               this.spaceBySession[session.session_id] = listedSpace;
               this.ownershipBySession[session.session_id] = listedOwnership;
             }
           }
+        }
+        if (msg.type === "error" && msg.request_id) {
+          // A failed mutation can deliberately send Error followed by its
+          // authoritative SessionList so the sidebar reconciles an uncertain
+          // outcome. Keep bounded list ownership for that possible second
+          // frame; Error alone never advances the accepted-response order.
+          this.pendingGoalOwnershipByRequest.delete(msg.request_id);
         }
         if (msg.type === "session_focus") {
           // Drop a STALE switch-confirmation: when you click through several
@@ -1506,6 +1658,19 @@ export class RelayWs {
             eventOwnership = ownership;
           }
         }
+        if (msg.type === "goal_state" && msg.sid) {
+          const pendingOwnership = msg.request_id
+            ? this.pendingGoalOwnershipByRequest.get(msg.request_id)
+            : undefined;
+          if (msg.request_id) {
+            this.pendingGoalOwnershipByRequest.delete(msg.request_id);
+          }
+          const ownership = pendingOwnership
+            ?? this.ownershipBySession[msg.sid];
+          if (this.acceptsOwnership(ownership, socketGeneration)) {
+            eventOwnership = ownership;
+          }
+        }
         if (msg.type === "replay_start" && msg.sid && msg.generation) {
           this.noteGeneration(msg.sid, msg.generation);
         }
@@ -1561,6 +1726,7 @@ export class RelayWs {
       }
     };
     ws.onerror = () => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       /* onclose will follow */
     };
   }

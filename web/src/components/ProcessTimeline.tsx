@@ -27,7 +27,11 @@ import {
   type HistoryImageAsset,
   type HistoryImageVariant,
 } from "../history-image-assets";
-import { PointerTapGuard } from "../pointer-tap";
+import {
+  cancelDraggedPointer,
+  PointerTapGuard,
+  releaseDraggedPointer,
+} from "../pointer-tap";
 import { PlanProgressPopover } from "./PlanProgressPopover";
 
 function durationLabel(ms: number): string {
@@ -59,39 +63,56 @@ function ProcessDisclosure({ className, summary, children, openOverride,
   openOverride?: boolean;
   onOpenChange?: (open: boolean) => void;
   onInteractionStart?: () => number;
-  onInteractionEnd?: (token: number) => void;
+  onInteractionEnd?: (token: number, followOutput?: boolean) => void;
 }) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const open = openOverride ?? uncontrolledOpen;
   const tapGuard = useRef(new PointerTapGuard());
   const interactionTokens = useRef(new Map<number, number>());
+  const pendingInteractionTokens = useRef(new Map<number, number>());
   const releaseInteractionFrame = useRef<number | null>(null);
   useEffect(() => () => {
     if (releaseInteractionFrame.current !== null) {
       window.cancelAnimationFrame(releaseInteractionFrame.current);
     }
     for (const token of interactionTokens.current.values()) {
-      onInteractionEnd?.(token);
+      onInteractionEnd?.(token, false);
+    }
+    for (const token of pendingInteractionTokens.current.values()) {
+      onInteractionEnd?.(token, false);
     }
     interactionTokens.current.clear();
+    pendingInteractionTokens.current.clear();
   }, [onInteractionEnd]);
   const setOpen = (next: boolean) => {
     setUncontrolledOpen(next);
     onOpenChange?.(next);
   };
-  const releaseInteractions = () => {
+  const releaseInteraction = (pointerId: number) => {
+    const token = interactionTokens.current.get(pointerId);
+    if (token == null) return;
+    interactionTokens.current.delete(pointerId);
+    pendingInteractionTokens.current.set(pointerId, token);
     if (releaseInteractionFrame.current !== null) {
       window.cancelAnimationFrame(releaseInteractionFrame.current);
     }
     releaseInteractionFrame.current = window.requestAnimationFrame(() => {
       releaseInteractionFrame.current = window.requestAnimationFrame(() => {
         releaseInteractionFrame.current = null;
-        for (const token of interactionTokens.current.values()) {
+        for (const token of pendingInteractionTokens.current.values()) {
           onInteractionEnd?.(token);
         }
-        interactionTokens.current.clear();
+        pendingInteractionTokens.current.clear();
       });
     });
+  };
+  const cancelInteraction = (pointerId: number) => {
+    const token = interactionTokens.current.get(pointerId)
+      ?? pendingInteractionTokens.current.get(pointerId);
+    if (token == null) return;
+    interactionTokens.current.delete(pointerId);
+    pendingInteractionTokens.current.delete(pointerId);
+    onInteractionEnd?.(token, false);
   };
   return (
     <details className={className} open={open}>
@@ -101,19 +122,28 @@ function ProcessDisclosure({ className, summary, children, openOverride,
             event.pointerId, event.clientX, event.clientY,
           );
           event.currentTarget.setPointerCapture?.(event.pointerId);
+          cancelInteraction(event.pointerId);
           const token = onInteractionStart?.();
           if (token != null) interactionTokens.current.set(event.pointerId, token);
         }}
-        onPointerMove={(event) => tapGuard.current.pointerMove(
-          event.pointerId, event.clientX, event.clientY,
-        )}
+        onPointerMove={(event) => {
+          if (tapGuard.current.pointerMove(
+            event.pointerId, event.clientX, event.clientY,
+          )) {
+            cancelInteraction(event.pointerId);
+            releaseDraggedPointer(
+              event.currentTarget, event.pointerId, event.pointerType);
+          }
+        }}
         onPointerUp={(event) => {
           tapGuard.current.pointerUp(event.pointerId);
-          releaseInteractions();
+          releaseInteraction(event.pointerId);
         }}
         onPointerCancel={(event) => {
-          tapGuard.current.pointerCancel(event.pointerId);
-          releaseInteractions();
+          cancelInteraction(event.pointerId);
+          cancelDraggedPointer(
+            tapGuard.current,
+            event.currentTarget, event.pointerId, event.pointerType);
         }}
         onClick={(event) => {
           event.preventDefault();
@@ -294,7 +324,7 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   openOverride?: boolean;
   onOpenChange?: (open: boolean) => void;
   onInteractionStart?: () => number;
-  onInteractionEnd?: (token: number) => void;
+  onInteractionEnd?: (token: number, followOutput?: boolean) => void;
 }) {
   const imageView = block.tool?.toLowerCase().replaceAll("_", "") === "viewimage";
   const imagePath = imageView
@@ -424,7 +454,7 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage,
   itemOpen?: (key: string) => boolean | undefined;
   onItemOpenChange?: (key: string, open: boolean) => void;
   onInteractionStart?: () => number;
-  onInteractionEnd?: (token: number) => void;
+  onInteractionEnd?: (token: number, followOutput?: boolean) => void;
 }) {
   if (block.kind === "process") {
     const key = `process:${block.item_id}`;
@@ -599,7 +629,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   itemOpen?: (key: string) => boolean | undefined;
   onItemOpenChange?: (key: string, open: boolean) => void;
   onInteractionStart?: () => number;
-  onInteractionEnd?: (token: number) => void;
+  onInteractionEnd?: (token: number, followOutput?: boolean) => void;
 }) {
   const retainedPlanBlock = useRef<ProcessBlock | null>(null);
   // Codex does not expose its private chain of thought in official clients.
@@ -649,6 +679,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   const manuallyToggled = useRef(false);
   const tapGuard = useRef(new PointerTapGuard());
   const interactionTokens = useRef(new Map<number, number>());
+  const pendingInteractionTokens = useRef(new Map<number, number>());
   const releaseInteractionFrame = useRef<number | null>(null);
 
   useEffect(() => {
@@ -670,9 +701,13 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
       releaseInteractionFrame.current = null;
     }
     for (const token of interactionTokens.current.values()) {
-      onInteractionEnd?.(token);
+      onInteractionEnd?.(token, false);
+    }
+    for (const token of pendingInteractionTokens.current.values()) {
+      onInteractionEnd?.(token, false);
     }
     interactionTokens.current.clear();
+    pendingInteractionTokens.current.clear();
   }, [onInteractionEnd]);
 
   const hasDeferredOnly = timelineItems.length === 0 && needsAuthoritativeDetail;
@@ -736,21 +771,43 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   };
   const pointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
     tapGuard.current.pointerDown(event.pointerId, event.clientX, event.clientY);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    releaseCancelledInteraction(event.pointerId);
     const token = onInteractionStart?.();
     if (token != null) interactionTokens.current.set(event.pointerId, token);
   };
   const pointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    tapGuard.current.pointerMove(event.pointerId, event.clientX, event.clientY);
+    if (tapGuard.current.pointerMove(
+      event.pointerId, event.clientX, event.clientY,
+    )) {
+      releaseCancelledInteraction(event.pointerId);
+      releaseDraggedPointer(
+        event.currentTarget, event.pointerId, event.pointerType);
+    }
   };
   const pointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
     tapGuard.current.pointerUp(event.pointerId);
-    releaseInteractions();
+    releaseInteraction(event.pointerId);
   };
   const pointerCancel = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    tapGuard.current.pointerCancel(event.pointerId);
-    releaseInteractions();
+    releaseCancelledInteraction(event.pointerId);
+    cancelDraggedPointer(
+      tapGuard.current,
+      event.currentTarget, event.pointerId, event.pointerType);
   };
-  const releaseInteractions = () => {
+  const releaseCancelledInteraction = (pointerId: number) => {
+    const token = interactionTokens.current.get(pointerId)
+      ?? pendingInteractionTokens.current.get(pointerId);
+    if (token == null) return;
+    interactionTokens.current.delete(pointerId);
+    pendingInteractionTokens.current.delete(pointerId);
+    onInteractionEnd?.(token, false);
+  };
+  const releaseInteraction = (pointerId: number) => {
+    const token = interactionTokens.current.get(pointerId);
+    if (token == null) return;
+    interactionTokens.current.delete(pointerId);
+    pendingInteractionTokens.current.set(pointerId, token);
     if (releaseInteractionFrame.current !== null) {
       window.cancelAnimationFrame(releaseInteractionFrame.current);
     }
@@ -760,10 +817,10 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
     releaseInteractionFrame.current = window.requestAnimationFrame(() => {
       releaseInteractionFrame.current = window.requestAnimationFrame(() => {
         releaseInteractionFrame.current = null;
-        for (const token of interactionTokens.current.values()) {
+        for (const token of pendingInteractionTokens.current.values()) {
           onInteractionEnd?.(token);
         }
-        interactionTokens.current.clear();
+        pendingInteractionTokens.current.clear();
       });
     });
   };

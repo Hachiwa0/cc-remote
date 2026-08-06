@@ -10,7 +10,11 @@ import {
 import { createPortal } from "react-dom";
 import type { ProcessBlock } from "../domain/conversation";
 import { Icon } from "../icons";
-import { PointerTapGuard } from "../pointer-tap";
+import {
+  cancelDraggedPointer,
+  PointerTapGuard,
+  releaseDraggedPointer,
+} from "../pointer-tap";
 
 interface PlanPopoverPosition {
   left: number;
@@ -129,12 +133,25 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
       aria-expanded={open} aria-controls={labelId}
       aria-label={`查看计划进度，${progressLabel}`}
       title={`计划进度 · ${progressLabel}`}
-      onPointerDown={(event) => tapGuard.current.pointerDown(
-        event.pointerId, event.clientX, event.clientY)}
-      onPointerMove={(event) => tapGuard.current.pointerMove(
-        event.pointerId, event.clientX, event.clientY)}
+      onPointerDown={(event) => {
+        tapGuard.current.pointerDown(
+          event.pointerId, event.clientX, event.clientY);
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+      }}
+      onPointerMove={(event) => {
+        if (tapGuard.current.pointerMove(
+          event.pointerId, event.clientX, event.clientY,
+        )) {
+          releaseDraggedPointer(
+            event.currentTarget, event.pointerId, event.pointerType);
+        }
+      }}
       onPointerUp={(event) => tapGuard.current.pointerUp(event.pointerId)}
-      onPointerCancel={(event) => tapGuard.current.pointerCancel(event.pointerId)}
+      onPointerCancel={(event) => {
+        cancelDraggedPointer(
+          tapGuard.current,
+          event.currentTarget, event.pointerId, event.pointerType);
+      }}
       onClick={(event) => {
         if (!tapGuard.current.consumeClick(event.detail)) {
           event.preventDefault();

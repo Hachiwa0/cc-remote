@@ -4,6 +4,11 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v31。wrapper 内部的目录
+  变化不再广播无关联会话列表，而是发送不进入重放环的失效提示；当前可见页面会
+  将并发提示合并为绑定自身连接 generation 与 surface 的列表读取。流式公式可识别
+  跨 delta 拆开的分隔符，暂停 Goal 恢复时会保留一次有界目标锚点，compact 续接也
+  不再同时显示运行转圈和真实“已打断”终态。
 - 新增 protocol v28 Codex 账户活动。现有的一次性状态读取会携带经过校验、限制
   为最近 53 周的每日 Token 序列；Web 提供仅 Codex 可见、仿 Desktop 的活动
   日历，且这些账户数据不会进入实时重放缓存。五档颜色按当前日历中的单日峰值
@@ -12,12 +17,12 @@
   原生 thread ID 在所选的现有目录恢复，保留其排队消息；若新目录恢复失败则回退
   原工作目录。所选目录可跨 wrapper 重启恢复；迁移不会派生新会话，也不会抢走
   浏览器焦点。
-- 在协同的 protocol v29 gate 下，为工作目录外预览新增仅面向请求客户端的确认。
+- 在协同的 protocol v30 gate 下，为工作目录外预览新增仅面向请求客户端的确认。
   授权同时绑定引擎、空间、会话、规范路径、文件所属 UID、设备号和 inode；文件
   身份变化后会重新确认。用户确认的文件保持只读，本会话结构化写入成功的精确文件
   才保留编辑权限。外部 Markdown 的相对图片按文档所在目录解析，但本地路径始终
   不会成为浏览器 URL。
-- 在 Wrapper、Relay 与 Web 协同的 protocol v29 wire gate 下新增隔离的 Artifact
+- 在 Wrapper、Relay 与 Web 协同的 protocol v30 wire gate 下新增隔离的 Artifact
   与文件活动渲染。HTML 产物预览
   会保留文档 CSS，并提供用户显式启动的隔离交互预览；独立 SVG、Markdown SVG
   和对话 SVG 共用同一套有界安全清洗。内置工具成功读取工作目录外图片后，只向

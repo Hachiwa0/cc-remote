@@ -101,7 +101,8 @@ from cc_remote.protocol import (
     ToolUse, ToolResult, ProcessEvent, TurnBinding, TurnEnd, TurnNotificationContext,
     TurnResult, is_downstream,
     is_reliable_command,
-    SessionInfo, SessionList, SessionActivity, ListSessions, SessionFocus,
+    SessionInfo, SessionList, SessionListInvalidated, SessionActivity,
+    SessionFocus,
     SessionRekey, SessionForked, SessionMigrated, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
@@ -181,6 +182,7 @@ from cc_remote.wrapper.codex_stream import (
     coalesce_codex_live_notifications,
     codex_history_image_views, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_turn_user,
+    codex_history_turn_users,
     codex_history_window,
     codex_native_rollback_turns,
     codex_translate_history,
@@ -919,6 +921,21 @@ def _session_effort(ctx: SessionContext) -> Optional[str]:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _codex_compaction_continuation_ids(
+    ctx: Optional[SessionContext],
+) -> list[str]:
+    """Return only handle-proven compact continuation ids for History."""
+    if ctx is None or ctx.engine != "codex":
+        return []
+    values = getattr(ctx.sdk, "compaction_continuation_turn_ids", frozenset())
+    if not isinstance(values, (set, frozenset, tuple, list)):
+        return []
+    return sorted({
+        value for value in values
+        if isinstance(value, str) and value
+    })[:4]
+
+
 def _codex_list_state(status: Optional[str]) -> Optional[State]:
     if status == "active":
         return "running"
@@ -988,6 +1005,13 @@ class _PreviewChallenge:
     created_at: float
 
 
+@dataclass(frozen=True)
+class _CodexGoalRecoveryMiss:
+    fingerprint: tuple[int, int, int, int]
+    source_scans: int
+    stable: bool
+
+
 class WrapperMachine:
     # Browser/TUI outboxes hold at most 256 commands. Keep a 2x retry window per
     # client and at most the relay's configured maximum of 64 client identities;
@@ -1012,6 +1036,8 @@ class WrapperMachine:
     PREVIEW_IMAGE_SNAPSHOT_SESSION_ENTRIES = 64
     PREVIEW_IMAGE_SNAPSHOT_GLOBAL_ENTRIES = 256
     CODEX_HISTORY_IMAGE_VIEW_CACHE_ENTRIES = 256
+    CODEX_GOAL_RECOVERY_MISS_CACHE_ENTRIES = 2048
+    CODEX_GOAL_RECOVERY_MAX_SOURCE_SCANS = 3
     NOTIFICATION_TITLE_CAP = 512
     NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
@@ -1134,6 +1160,12 @@ class WrapperMachine:
                 tuple[CodexHistoryImageView, ...],
             ],
         ] = OrderedDict()
+        # Goal metadata may be appended just after an official summary page is
+        # materialized. Unseen boundaries retry only after the rollout changes;
+        # a seen non-Goal boundary is stable, and both forms stay bounded.
+        self._codex_goal_recovery_misses: OrderedDict[
+            tuple[str, str], _CodexGoalRecoveryMiss
+        ] = OrderedDict()
         # Pool of resident sessions, keyed by real session_id (or a `tmp-<uuid>`
         # temp key for a brand-new session until its id is captured).
         self.sessions: dict[str, SessionContext] = {}
@@ -1211,6 +1243,7 @@ class WrapperMachine:
         self._codex_history = CodexOfficialHistory(
             cfg.tool_result_max,
             recover_user=self._recover_official_codex_user,
+            recover_users=self._recover_official_codex_users,
         )
         # In-memory at-most-once window for client retries. The outer and inner
         # OrderedDicts are both bounded; wrapper process restart intentionally
@@ -1381,6 +1414,9 @@ class WrapperMachine:
         )
         if callable(invalidate_official):
             invalidate_official(sid)
+        for key in tuple(self._codex_goal_recovery_misses):
+            if key[0] == sid:
+                self._codex_goal_recovery_misses.pop(key, None)
         return self._history_revision(sid)
 
     def _focused_ctx(self) -> Optional[SessionContext]:
@@ -3446,7 +3482,7 @@ class WrapperMachine:
     ) -> None:
         try:
             await self.transport.send(await self._work_dashboard(engine))
-            await self._handle_list_sessions(ListSessions(engine=engine, space="work"))
+            await self._invalidate_session_list(engine, "work")
             if session_id:
                 store = self._work.for_engine(engine)
                 artifacts = await asyncio.to_thread(store.artifacts, session_id)
@@ -6307,6 +6343,10 @@ class WrapperMachine:
         watched_engine = watch.get("engine")
         is_codex_hist = bool(
             (ctx is not None and ctx.engine == "codex") or watched_engine == "codex")
+        compaction_continuation_turn_ids = (
+            _codex_compaction_continuation_ids(ctx)
+            if is_codex_hist and before is None else []
+        )
         source_path = None
         source_fingerprint = None
         source_snapshot_stable: bool | None = None
@@ -6446,6 +6486,8 @@ class WrapperMachine:
                 takeover_pending=bool(
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
+                compaction_continuation_turn_ids=(
+                    compaction_continuation_turn_ids),
             )
             if stale_indexed_page:
                 # A sampled append-prefix page is useful for first paint, but it
@@ -6535,6 +6577,8 @@ class WrapperMachine:
                     takeover_pending=bool(
                         (self._watch.get(sid) or {}).get("takeover_pending")),
                     in_progress=in_progress,
+                    compaction_continuation_turn_ids=(
+                        compaction_continuation_turn_ids),
                 )
             source_window_has_more = oversized_compact_page.has_more
             source_window_oldest_cursor = oversized_compact_page.oldest_cursor
@@ -6685,6 +6729,8 @@ class WrapperMachine:
                 takeover_pending=bool(
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
+                compaction_continuation_turn_ids=(
+                    compaction_continuation_turn_ids),
             )
         for ev in events:
             # History may normalize file-operation presentation, but it cannot
@@ -6805,6 +6851,8 @@ class WrapperMachine:
                 takeover_pending=bool(
                     (self._watch.get(sid) or {}).get("takeover_pending")),
                 in_progress=in_progress,
+                compaction_continuation_turn_ids=(
+                    compaction_continuation_turn_ids),
             )
 
         # A History response is one WebSocket frame. Keep it below the transport
@@ -7133,6 +7181,78 @@ class WrapperMachine:
             user_index,
         )
 
+    async def _recover_official_codex_users(
+        self,
+        sid: str,
+        native_turn_ids: tuple[str, ...],
+    ) -> dict[str, UserMsg]:
+        """Recover assistant-only Goal prompts with one bounded rollout pass."""
+        path = await asyncio.to_thread(codex_rollout_path, sid)
+        if not path:
+            return {}
+        try:
+            source_stat = await asyncio.to_thread(os.stat, path)
+        except OSError:
+            return {}
+        fingerprint = (
+            int(source_stat.st_dev),
+            int(source_stat.st_ino),
+            int(source_stat.st_size),
+            int(source_stat.st_mtime_ns),
+        )
+        pending: list[str] = []
+        previous_misses: dict[
+            tuple[str, str], _CodexGoalRecoveryMiss
+        ] = {}
+        for native_turn_id in native_turn_ids:
+            key = (sid, native_turn_id)
+            miss = self._codex_goal_recovery_misses.get(key)
+            if miss is not None:
+                self._codex_goal_recovery_misses.move_to_end(key)
+                if (
+                    miss.stable
+                    or miss.fingerprint == fingerprint
+                    or miss.source_scans
+                    >= self.CODEX_GOAL_RECOVERY_MAX_SOURCE_SCANS
+                ):
+                    continue
+                previous_misses[key] = miss
+            pending.append(native_turn_id)
+        if not pending:
+            return {}
+        recovery = await asyncio.to_thread(
+            codex_history_turn_users,
+            path,
+            tuple(pending),
+        )
+        for native_turn_id in pending:
+            key = (sid, native_turn_id)
+            user = recovery.users.get(native_turn_id)
+            if user is not None and user.prompt:
+                self._codex_goal_recovery_misses.pop(key, None)
+                continue
+            # A live Goal callback can win while the bounded rollout scan is in
+            # a worker thread. Never let that older miss shadow the now
+            # authoritative prompt after the positive LRU is eventually evicted.
+            if self._codex_history.has_automatic_user(
+                sid, native_turn_id,
+            ):
+                self._codex_goal_recovery_misses.pop(key, None)
+                continue
+            previous = previous_misses.get(key)
+            self._codex_goal_recovery_misses[key] = _CodexGoalRecoveryMiss(
+                fingerprint=fingerprint,
+                source_scans=(previous.source_scans if previous else 0) + 1,
+                stable=native_turn_id in recovery.seen_turn_ids,
+            )
+            self._codex_goal_recovery_misses.move_to_end(key)
+        while (
+            len(self._codex_goal_recovery_misses)
+            > self.CODEX_GOAL_RECOVERY_MISS_CACHE_ENTRIES
+        ):
+            self._codex_goal_recovery_misses.popitem(last=False)
+        return recovery.users
+
     async def _build_official_codex_history(
         self,
         sid: str,
@@ -7176,6 +7296,10 @@ class WrapperMachine:
                 and active_external_turns
             )
         )
+        compaction_continuation_turn_ids = (
+            _codex_compaction_continuation_ids(ctx)
+            if before is None else []
+        )
         page = await self._codex_history.summary_page(
             sid,
             before=before,
@@ -7218,6 +7342,8 @@ class WrapperMachine:
             external=self._is_external(sid),
             takeover_pending=bool(watch.get("takeover_pending")),
             in_progress=in_progress,
+            compaction_continuation_turn_ids=(
+                compaction_continuation_turn_ids),
         )
 
     async def _build_requested_history(
@@ -7296,6 +7422,9 @@ class WrapperMachine:
                         (ctx is not None and ctx.state != "idle")
                         or watch.get("active_external_turns")
                     ),
+                    compaction_continuation_turn_ids=(
+                        _codex_compaction_continuation_ids(ctx)
+                        if before is None else []),
                 )
         return await self._build_history(
             sid, before=before, limit=limit, cwd_hint=cwd, detail=detail,
@@ -10185,6 +10314,25 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         return ctx
 
+    def _take_codex_goal_prompt(
+        self, ctx: SessionContext, turn_id: str,
+    ) -> Optional[str]:
+        take_prompt = getattr(ctx.sdk, "take_goal_prompt", None)
+        if not callable(take_prompt):
+            return None
+        prompt = take_prompt(turn_id)
+        if not isinstance(prompt, str) or not prompt:
+            return None
+        thread_id = ctx.session_id or ctx.key
+        self._codex_goal_recovery_misses.pop(
+            (thread_id, turn_id), None)
+        self._codex_history.remember_automatic_user(
+            thread_id,
+            turn_id,
+            UserMsg(msg_id=turn_id, prompt=prompt),
+        )
+        return prompt
+
     async def _on_codex_goal(self, ctx: SessionContext,
                              goal: Optional[dict]) -> None:
         """Broadcast an authoritative app-server goal notification.
@@ -10195,6 +10343,21 @@ class WrapperMachine:
         """
         if goal is None:
             ctx.codex_goal_mutation = None
+        else:
+            turn_id = getattr(ctx.sdk, "last_goal_turn_id", None)
+            if (
+                isinstance(turn_id, str)
+                and turn_id
+                and ctx.codex_spontaneous_turn_id == turn_id
+            ):
+                prompt = self._take_codex_goal_prompt(ctx, turn_id)
+                if prompt:
+                    # turn/started may win the stdout race and publish its empty
+                    # anchor first. Reusing the native turn id lets every client
+                    # fill that anchor instead of creating a duplicate turn.
+                    await self._emit(
+                        ctx, UserMsg(msg_id=turn_id, prompt=prompt)
+                    )
         await self._emit(ctx, GoalState(goal=goal))
 
     async def _on_codex_runtime_event(
@@ -10313,6 +10476,7 @@ class WrapperMachine:
                 turn_id,
                 announce_running=announce_running,
                 recovered_msg_id=recovered_msg_id,
+                goal_prompt=self._take_codex_goal_prompt(ctx, turn_id),
             ))
             ctx.codex_spontaneous_task = task
             ctx.codex_recovered_turn_id = None
@@ -10368,6 +10532,7 @@ class WrapperMachine:
         announce_running: bool,
         recovered_msg_id: Optional[str] = None,
         pending_switch: Optional[CodexDaemonRestartState] = None,
+        goal_prompt: Optional[str] = None,
     ) -> None:
         """Translate one goal/automatic turn from the handle's bounded bridge."""
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
@@ -10645,11 +10810,14 @@ class WrapperMachine:
                     ),
                 )
 
-            # Automatic continuations have no user prompt. A real empty anchor
-            # gives their assistant/process events a stable turn owner without
-            # rendering a fabricated user bubble.
+            # Ordinary automatic continuations have no user prompt. A newly-set
+            # or modified Goal objective is different: it is the user's durable
+            # request and must survive dismissal of the Goal status panel.
             if recovered_msg_id is None:
-                await self._emit(ctx, UserMsg(msg_id=turn_id, prompt=""))
+                await self._emit(ctx, UserMsg(
+                    msg_id=turn_id,
+                    prompt=goal_prompt or "",
+                ))
 
             if pending_switch is not None:
                 handoff = await handoff_account_switch(pending_switch)
@@ -11437,6 +11605,7 @@ class WrapperMachine:
                     else await ctx.sdk.refresh_goal(ctx.session_id))
             event = GoalState(
                 goal=goal,
+                request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
             await self._emit(ctx, event)
@@ -13264,6 +13433,14 @@ class WrapperMachine:
 
     # ---- sessions (list / switch / new) ----
 
+    async def _invalidate_session_list(
+        self, engine: str, space: str = "code",
+    ) -> SessionListInvalidated:
+        """Broadcast only a read hint; browsers own the correlated refresh."""
+        event = SessionListInvalidated(engine=engine, space=space)
+        await self.transport.send(event)
+        return event
+
     async def _handle_list_sessions(self, cmd) -> None:
         engine = getattr(cmd, "engine", "claude")
         space = getattr(cmd, "space", "code")
@@ -13371,6 +13548,7 @@ class WrapperMachine:
             event = SessionList(
                 engine="claude",
                 space=space,
+                request_id=getattr(cmd, "cmd_id", None),
                 sessions=sessions,
                 to=getattr(cmd, "client_id", None),
             )
@@ -13558,6 +13736,7 @@ class WrapperMachine:
             event = SessionList(
                 engine="codex",
                 space=space,
+                request_id=getattr(cmd, "cmd_id", None),
                 sessions=sessions,
                 to=getattr(cmd, "client_id", None),
             )
@@ -14000,12 +14179,10 @@ class WrapperMachine:
                 cached_responses.append(query_result)
         if space == "work" and ctx.session_id:
             # A newly durable Work item belongs in the sidebar immediately; do
-            # not wait for a later engine/space toggle to request another list.
-            await self._handle_list_sessions(ListSessions(
-                engine=engine,
-                space="work",
-                client_id=getattr(cmd, "client_id", None),
-            ))
+            # not broadcast an uncorrelated SessionList that every Web client
+            # must reject. Visible Work surfaces answer this unbuffered hint
+            # with their own generation- and surface-bound list request.
+            await self._invalidate_session_list(engine, "work")
         return tuple(cached_responses)
 
     async def _handle_rename_session(self, cmd) -> None:
@@ -14737,9 +14914,7 @@ class WrapperMachine:
             if ctx.engine == "codex":
                 self._invalidate_codex_session_catalog()
                 try:
-                    await self._handle_list_sessions(
-                        ListSessions(engine="codex", space="code")
-                    )
+                    await self._invalidate_session_list("codex", "code")
                 except Exception as exc:
                     log.warning(
                         "rollback session list refresh failed",
@@ -18816,45 +18991,22 @@ class WrapperMachine:
                     await target_queue.put(None)
 
         async def next_turn_message():
-            nonlocal notice_active
-            """Wait for one raw engine event, warning on a silent Codex turn.
+            """Wait for one raw engine event or an intentional daemon restart.
 
-            This is deliberately not a hard timeout: ultra reasoning and long
-            tools can be valid. A real interrupt still uses the existing bounded
-            drain path, and any raw app-server event rearms the warning timer on
-            the next loop iteration. A managed bridge overflow has already
-            explained why live detail is delayed, so it must not be overwritten
-            later by the generic no-progress warning.
+            Silence is valid while Codex reasons or runs a long tool, so it is
+            never translated into a user-facing warning. Authoritative retry,
+            provider-error and managed-overflow events still flow through the
+            normal translator paths below.
             """
-            warn = (
-                self.cfg.codex_turn_idle_warn_seconds
-                if is_codex and not codex_overflowed else 0
-            )
             wait_task = asyncio.create_task(self._next_from_queue(ctx, queue))
             try:
                 candidates = {wait_task}
                 if codex_restart_watch_task is not None:
                     candidates.add(codex_restart_watch_task)
-                timeout = (
-                    warn if warn > 0 and ctx.state != "interrupting" else None)
                 done, _ = await asyncio.wait(
                     candidates,
-                    timeout=timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if not done and ctx.state == "running":
-                    await self._emit(ctx, StateEvent(
-                        state="running",
-                        phase="waiting",
-                        detail=(f"Codex 已 {warn:g} 秒没有收到新进展，仍在等待；"
-                                "可点击停止。"),
-                        msg_id=ctx.active_msg_id,
-                    ))
-                    notice_active = True
-                    done, _ = await asyncio.wait(
-                        candidates,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
                 # The hook writes its marker before asking the daemon to stop.
                 # If a stale stream frame and the marker become ready together,
                 # account handoff wins so an old terminal cannot falsely unlock

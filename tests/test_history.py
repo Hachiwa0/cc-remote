@@ -39,7 +39,10 @@ from cc_remote.wrapper.codex_history import (
     CodexHistoryUnsupported,
 )
 from cc_remote.wrapper.codex_rpc import CodexRpcRejected
-from cc_remote.wrapper.codex_stream import CodexHistoryImageView
+from cc_remote.wrapper.codex_stream import (
+    CodexAutomaticUserRecovery,
+    CodexHistoryImageView,
+)
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
@@ -613,7 +616,12 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
         ctx.state = "running"
         ctx.codex_owned_turn_id = "owned-turn"
         ctx.codex_spontaneous_turn_id = "goal-turn"
-        ctx.sdk = SimpleNamespace(turn_id="managed-turn")
+        ctx.sdk = SimpleNamespace(
+            turn_id="managed-turn",
+            compaction_continuation_turn_ids=frozenset({
+                "compact-logical", "managed-turn",
+            }),
+        )
         machine.sessions[ctx.key] = ctx
         machine._watch["active-summary"] = {
             "engine": "codex",
@@ -630,6 +638,9 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
         )
 
         assert history.in_progress is True
+        assert history.compaction_continuation_turn_ids == [
+            "compact-logical", "managed-turn",
+        ]
         assert seen == [("active-summary", {
             "before": None,
             "limit": 4,
@@ -639,7 +650,8 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
         })]
         seen.clear()
         machine._watch["active-summary"]["active_external_turns"] = {}
-        await machine._build_requested_history(
+        ctx.sdk.compaction_continuation_turn_ids = frozenset()
+        settled_history = await machine._build_requested_history(
             "active-summary",
             before=None,
             limit=4,
@@ -653,6 +665,7 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
             "active_turn_ids": {"owned-turn"},
             "hydrate_recent": 2,
         })]
+        assert settled_history.compaction_continuation_turn_ids == []
 
     asyncio.run(run())
 
@@ -3278,6 +3291,157 @@ def test_history_refresh_backoff_scales_with_scan_cost():
     assert machine._history_refresh_backoff_seconds(0.1) == 0.5
     assert machine._history_refresh_backoff_seconds(3.0) == 3.0
     assert machine._history_refresh_backoff_seconds(30.0) == 10.0
+
+
+def test_codex_goal_recovery_miss_retries_only_after_rollout_changes(
+        monkeypatch, tmp_path):
+    async def go():
+        machine, _ = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("first\n", encoding="utf-8")
+        scans = []
+
+        monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+        def recover(_path, native_turn_ids):
+            scans.append(native_turn_ids)
+            if len(scans) == 1:
+                return CodexAutomaticUserRecovery()
+            return CodexAutomaticUserRecovery(
+                users={
+                    "native-goal": UserMsg(
+                        msg_id="native-goal",
+                        prompt="later goal",
+                    ),
+                },
+                seen_turn_ids=frozenset({"native-goal"}),
+            )
+
+        monkeypatch.setattr(mm, "codex_history_turn_users", recover)
+
+        assert await machine._recover_official_codex_users(
+            "thread-goal", ("native-goal",)) == {}
+        assert await machine._recover_official_codex_users(
+            "thread-goal", ("native-goal",)) == {}
+        assert scans == [("native-goal",)]
+
+        with rollout.open("a", encoding="utf-8") as source:
+            source.write("later\n")
+
+        recovered = await machine._recover_official_codex_users(
+            "thread-goal", ("native-goal",))
+        assert recovered["native-goal"].prompt == "later goal"
+        assert scans == [("native-goal",), ("native-goal",)]
+
+    asyncio.run(go())
+
+
+def test_codex_goal_recovery_stable_miss_ignores_later_rollout_appends(
+        monkeypatch, tmp_path):
+    async def go():
+        machine, _ = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("first\n", encoding="utf-8")
+        scans = 0
+
+        monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+        def recover(_path, _native_turn_ids):
+            nonlocal scans
+            scans += 1
+            return CodexAutomaticUserRecovery(
+                seen_turn_ids=frozenset({"native-continuation"}),
+            )
+
+        monkeypatch.setattr(mm, "codex_history_turn_users", recover)
+
+        assert await machine._recover_official_codex_users(
+            "thread-goal", ("native-continuation",)) == {}
+        for index in range(3):
+            with rollout.open("a", encoding="utf-8") as source:
+                source.write(f"later-{index}\n")
+            assert await machine._recover_official_codex_users(
+                "thread-goal", ("native-continuation",)) == {}
+        assert scans == 1
+
+    asyncio.run(go())
+
+
+def test_codex_goal_recovery_unseen_miss_has_bounded_source_retries(
+        monkeypatch, tmp_path):
+    async def go():
+        machine, _ = _mk_machine()
+        machine.CODEX_GOAL_RECOVERY_MAX_SOURCE_SCANS = 2
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("first\n", encoding="utf-8")
+        scans = 0
+
+        monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+        def recover(_path, _native_turn_ids):
+            nonlocal scans
+            scans += 1
+            return CodexAutomaticUserRecovery()
+
+        monkeypatch.setattr(mm, "codex_history_turn_users", recover)
+
+        for index in range(4):
+            if index:
+                with rollout.open("a", encoding="utf-8") as source:
+                    source.write(f"later-{index}\n")
+            assert await machine._recover_official_codex_users(
+                "thread-goal", ("native-unseen",)) == {}
+        assert scans == 2
+
+    asyncio.run(go())
+
+
+def test_live_codex_goal_prompt_clears_matching_recovery_miss():
+    machine, _ = _mk_machine()
+    ctx = _mk_ctx("thread-goal", "thread-goal")
+    ctx.sdk = SimpleNamespace(take_goal_prompt=lambda _turn_id: "live goal")
+    key = ("thread-goal", "native-goal")
+    machine._codex_goal_recovery_misses[key] = object()
+
+    assert machine._take_codex_goal_prompt(ctx, "native-goal") == "live goal"
+    assert key not in machine._codex_goal_recovery_misses
+    assert machine._codex_history._automatic_users[key].prompt == "live goal"
+
+
+def test_live_codex_goal_prompt_wins_over_inflight_recovery_miss(
+        monkeypatch, tmp_path):
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("thread-goal", "thread-goal")
+        ctx.sdk = SimpleNamespace(take_goal_prompt=lambda _turn_id: "live goal")
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("first\n", encoding="utf-8")
+        entered = threading.Event()
+        release = threading.Event()
+
+        monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+        def recover(_path, _native_turn_ids):
+            entered.set()
+            assert release.wait(timeout=2)
+            return CodexAutomaticUserRecovery()
+
+        monkeypatch.setattr(mm, "codex_history_turn_users", recover)
+        task = asyncio.create_task(machine._recover_official_codex_users(
+            "thread-goal", ("native-goal",),
+        ))
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert machine._take_codex_goal_prompt(
+            ctx, "native-goal",
+        ) == "live goal"
+        release.set()
+
+        assert await task == {}
+        assert (
+            "thread-goal", "native-goal"
+        ) not in machine._codex_goal_recovery_misses
+
+    asyncio.run(go())
 
 
 def test_history_refresh_skips_backoff_for_final_idle_rebuild(monkeypatch):

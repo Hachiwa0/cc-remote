@@ -7,6 +7,7 @@ import {
   createFrameCoalescer,
   HISTORY_ANCHOR_EPSILON_PX,
   HistoryAnchorController,
+  HistoryPageActivityController,
   historyPageStatus,
   isAtHistoryEdge,
   isAtLatestEdge,
@@ -133,6 +134,19 @@ assert.deepEqual(scrollCoordinator.endInteraction(followedInteraction, true), {
   behavior: "smooth",
 }, "a still-following viewport keeps the existing deferred-bottom behavior");
 
+const multiPointerCoordinator = new ScrollCoordinator();
+const draggedPointer = multiPointerCoordinator.beginInteraction(true);
+const heldPointer = multiPointerCoordinator.beginInteraction(true);
+assert.equal(multiPointerCoordinator.requestBottom("smooth"), null);
+assert.equal(multiPointerCoordinator.endInteraction(draggedPointer, false), null);
+assert.equal(multiPointerCoordinator.endInteraction(heldPointer, true), null,
+  "one dragged/cancelled pointer prevents a later pointerup from replaying bottom");
+assert.deepEqual(multiPointerCoordinator.policy(true), {
+  anchorTo: "end",
+  followOnAppend: "auto",
+  allowResizeAdjustment: true,
+}, "all pointer tokens still release after a multi-pointer cancellation");
+
 const historyGate = new OlderHistoryLoadGate();
 historyGate.beginGesture();
 assert.equal(historyGate.acquire(), true);
@@ -145,6 +159,30 @@ historyGate.beginGesture();
 assert.equal(historyGate.acquire(), true, "a new pull gesture may load the next page");
 historyGate.complete();
 historyGate.endGesture();
+
+const pageActivity = new HistoryPageActivityController();
+const firstPageActivity = pageActivity.begin({
+  direction: "older",
+});
+assert.equal(pageActivity.complete(firstPageActivity.key + 1), false,
+  "a stale response cannot clear the current history activity");
+const nextPageActivity = pageActivity.begin({
+  direction: "older",
+});
+assert.notEqual(nextPageActivity.key, firstPageActivity.key,
+  "each accepted cursor owns a distinct loading transaction");
+const repeatedPageActivity = pageActivity.begin({
+  direction: "older",
+});
+assert.notEqual(repeatedPageActivity.key, nextPageActivity.key,
+  "retrying the same cursor still owns a distinct loading transaction");
+assert.equal(pageActivity.complete(firstPageActivity.key), false,
+  "a late first page cannot hide the next page's activity");
+assert.equal(pageActivity.complete(nextPageActivity.key), false,
+  "a late same-cursor page cannot hide its retry activity");
+assert.equal(pageActivity.complete(repeatedPageActivity.key), true);
+assert.equal(pageActivity.complete(repeatedPageActivity.key), false,
+  "a completed activity cannot be cleared twice");
 
 // Merely painting at the top (short history, session switch, or layout clamp)
 // must not start pagination. A real gesture toward older content does, within

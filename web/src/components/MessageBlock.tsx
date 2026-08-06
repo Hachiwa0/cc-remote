@@ -15,7 +15,6 @@ import type { PreviewAuthorizationState } from "../reducer";
 import { isMermaidFenceClass } from "../mermaid";
 import {
   isMathFenceClass,
-  normalizeMathDelimiters,
   STREAMING_REMARK_PLUGINS,
   useMarkdownMathPlugins,
 } from "../markdown-math";
@@ -473,10 +472,11 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
     onOpenFile,
     onPreviewImage,
   ]);
-  const mathPlugins = useMarkdownMathPlugins(shown, done);
-  const parts = useMemo(() => splitCodexDirectives(
-    mathPlugins ? normalizeMathDelimiters(shown) : shown,
-  ), [mathPlugins, shown]);
+  const math = useMarkdownMathPlugins(shown, true);
+  const parts = useMemo(
+    () => splitCodexDirectives(math.normalizedSource),
+    [math.normalizedSource],
+  );
 
   if (!shown) return null;
   return (
@@ -485,8 +485,8 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
         {parts.map((part, index) => part.kind === "markdown"
           ? <ReactMarkdown key={`markdown-${index}`}
               remarkPlugins={
-                mathPlugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
-              rehypePlugins={mathPlugins?.rehypePlugins}
+                math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
+              rehypePlugins={math.plugins?.rehypePlugins}
               components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</ReactMarkdown>
           : <div key={`directive-${index}`} className="codex-directive-status"
               data-directive={part.name}>

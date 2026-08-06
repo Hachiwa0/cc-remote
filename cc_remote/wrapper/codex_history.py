@@ -34,6 +34,10 @@ _RecoverUser = Callable[
     [str, str, str, int],
     Awaitable[UserMsg | None],
 ]
+_RecoverUsers = Callable[
+    [str, tuple[str, ...]],
+    Awaitable[dict[str, UserMsg]],
+]
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _TURN_STATUSES = frozenset({
     "completed", "interrupted", "failed", "inProgress",
@@ -437,10 +441,12 @@ class CodexOfficialHistory:
         *,
         rpc: _Rpc = codex_rpc,
         recover_user: _RecoverUser | None = None,
+        recover_users: _RecoverUsers | None = None,
     ) -> None:
         self.tool_result_max = tool_result_max
         self._rpc = rpc
         self._recover_user = recover_user
+        self._recover_users = recover_users
         self._before_cursors: OrderedDict[
             tuple[str, str], str | None
         ] = OrderedDict()
@@ -449,6 +455,12 @@ class CodexOfficialHistory:
         ] = OrderedDict()
         self._summary_events: OrderedDict[
             tuple[str, str], tuple[dict[str, Any], ...]
+        ] = OrderedDict()
+        # Only authoritative prompts belong here. A recovery miss can be
+        # temporary while Codex is still flushing the correlated Goal records;
+        # caching None would permanently hide that prompt from later pages.
+        self._automatic_users: OrderedDict[
+            tuple[str, str], UserMsg
         ] = OrderedDict()
         # The official summary view collapses same-turn steer boundaries to the
         # first user and latest assistant item. Once an active turn has been
@@ -474,6 +486,29 @@ class CodexOfficialHistory:
         ] = OrderedDict()
         self._detail_event_bytes: dict[tuple[str, str], int] = {}
         self._detail_cache_bytes = 0
+
+    def remember_automatic_user(
+        self,
+        thread_id: str,
+        native_turn_id: str,
+        user: UserMsg,
+    ) -> None:
+        """Remember the authoritative live Goal prompt for one native turn."""
+        if not user.prompt:
+            return
+        self._remember(
+            self._automatic_users,
+            (thread_id, native_turn_id),
+            user,
+        )
+
+    def has_automatic_user(
+        self,
+        thread_id: str,
+        native_turn_id: str,
+    ) -> bool:
+        """Return whether a live or recovered Goal prompt is authoritative."""
+        return (thread_id, native_turn_id) in self._automatic_users
 
     async def _call(self, method: str, params: dict[str, Any]) -> Any:
         return await self._rpc(method, params, None)
@@ -638,6 +673,37 @@ class CodexOfficialHistory:
         chronological_segments: list[
             tuple[list[dict[str, Any]], _TurnLocator]
         ] = []
+        if self._recover_users is not None:
+            missing_automatic: list[str] = []
+            for native_index, summary_turn in enumerate(validated_rows):
+                turn = prefetched_full.get(native_index, summary_turn)
+                if any(
+                    item.get("type") == "userMessage"
+                    for item in turn["items"]
+                ):
+                    continue
+                native_id = _wire_id(turn["id"], "turn")
+                if (thread_id, native_id) not in self._automatic_users:
+                    missing_automatic.append(native_id)
+            if missing_automatic:
+                recovered_users = await self._recover_users(
+                    thread_id, tuple(missing_automatic))
+                if not isinstance(recovered_users, dict):
+                    raise CodexHistoryInvalidResponse(
+                        "invalid automatic Codex user recovery")
+                for native_id in missing_automatic:
+                    recovered = recovered_users.get(native_id)
+                    if recovered is not None and not isinstance(
+                        recovered, UserMsg
+                    ):
+                        raise CodexHistoryInvalidResponse(
+                            "invalid automatic Codex user row")
+                    if recovered is not None and recovered.prompt:
+                        self._remember(
+                            self._automatic_users,
+                            (thread_id, native_id),
+                            recovered,
+                        )
         for native_index, summary_turn in enumerate(validated_rows):
             turn = prefetched_full.get(native_index, summary_turn)
             native_id = _wire_id(turn["id"], "turn")
@@ -738,13 +804,13 @@ class CodexOfficialHistory:
                     }
                     self._native_full_turns.move_to_end(
                         (thread_id, native_id))
-            if self._recover_user is not None:
+            if self._recover_user is not None or self._recover_users is not None:
                 copied_items = None
                 user_index = 0
                 for item_index, item in enumerate(turn["items"]):
                     if item.get("type") != "userMessage":
                         continue
-                    if any(
+                    if self._recover_user is not None and any(
                         part.get("type") == "localImage"
                         for part in item.get("content", [])
                     ):
@@ -766,6 +832,39 @@ class CodexOfficialHistory:
                     user_index += 1
                 if copied_items is not None:
                     turn["items"] = copied_items
+                if user_index == 0:
+                    automatic_key = (thread_id, native_id)
+                    if automatic_key in self._automatic_users:
+                        recovered = self._automatic_users[automatic_key]
+                        self._automatic_users.move_to_end(automatic_key)
+                    elif self._recover_users is None:
+                        recovered = await self._recover_user(
+                            thread_id,
+                            native_id,
+                            native_id,
+                            0,
+                        )
+                        if recovered is not None and recovered.prompt:
+                            self._remember(
+                                self._automatic_users,
+                                automatic_key,
+                                recovered,
+                            )
+                    else:
+                        recovered = None
+                    if recovered is not None and recovered.prompt:
+                        turn["items"] = [{
+                            "type": "userMessage",
+                            "id": native_id,
+                            "clientId": recovered.client_msg_id,
+                            "content": [{
+                                "type": "text",
+                                "text": recovered.prompt,
+                            }],
+                            "_ccRemoteImages": [
+                                dict(image) for image in recovered.images or []
+                            ],
+                        }, *turn["items"]]
             projected_rows.append(turn)
             segments = _translate_turn(
                 thread_id, turn, tool_result_max=self.tool_result_max)
@@ -1143,6 +1242,7 @@ class CodexOfficialHistory:
             self._before_cursors,
             self._locators,
             self._summary_events,
+            self._automatic_users,
             self._native_full_turns,
             self._terminal_refresh_fallbacks,
         ):

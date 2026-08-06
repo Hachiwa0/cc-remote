@@ -23,6 +23,8 @@ export interface MobileViewportBindings {
   readViewport(): ViewportReading;
   setCssProperty(name: string, value: string): void;
   clearCssProperty(name: string): void;
+  setRootAttribute(name: string, value: string): void;
+  clearRootAttribute(name: string): void;
   listen(event: MobileViewportEvent, listener: ViewportListener): () => void;
   requestFrame(listener: ViewportListener): number;
   cancelFrame(id: number): void;
@@ -35,6 +37,8 @@ export interface MobileViewportBindings {
 const APP_HEIGHT = "--app-height";
 const APP_OFFSET_TOP = "--app-offset-top";
 const KEYBOARD_INSET = "--keyboard-inset";
+const SHORT_VIEWPORT_ATTRIBUTE = "data-short-viewport";
+const SHORT_VIEWPORT_MAX_HEIGHT = 720;
 const SETTLE_DELAYS_MS = [80, 260] as const;
 
 function finitePositive(value: number, fallback: number): number {
@@ -78,6 +82,12 @@ export function createMobileViewportSync(bindings: MobileViewportBindings): () =
     bindings.setCssProperty(APP_HEIGHT, px(height));
     bindings.setCssProperty(APP_OFFSET_TOP, px(scale <= 1.01 ? offsetTop : 0));
     bindings.setCssProperty(KEYBOARD_INSET, px(keyboardInset));
+    bindings.setRootAttribute(
+      SHORT_VIEWPORT_ATTRIBUTE,
+      (scale <= 1.01 ? height : layoutHeight) <= SHORT_VIEWPORT_MAX_HEIGHT
+        ? "true"
+        : "false",
+    );
   };
 
   const schedule = () => {
@@ -129,6 +139,7 @@ export function createMobileViewportSync(bindings: MobileViewportBindings): () =
     bindings.clearCssProperty(APP_HEIGHT);
     bindings.clearCssProperty(APP_OFFSET_TOP);
     bindings.clearCssProperty(KEYBOARD_INSET);
+    bindings.clearRootAttribute(SHORT_VIEWPORT_ATTRIBUTE);
   };
 }
 
@@ -152,6 +163,8 @@ function browserBindings(): MobileViewportBindings {
     },
     setCssProperty: (name, value) => document.documentElement.style.setProperty(name, value),
     clearCssProperty: (name) => document.documentElement.style.removeProperty(name),
+    setRootAttribute: (name, value) => document.documentElement.setAttribute(name, value),
+    clearRootAttribute: (name) => document.documentElement.removeAttribute(name),
     listen: (event, listener) => {
       let target: EventTarget = window;
       let eventName: string = event;

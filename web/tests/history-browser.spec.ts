@@ -602,6 +602,72 @@ async function textSelectionPoint(
   return point;
 }
 
+function isMobileWebKitProject(projectName: string): boolean {
+  return projectName.startsWith("webkit");
+}
+
+async function dispatchCancelledTouchTap(
+  locator: import("@playwright/test").Locator,
+  pointerId: number,
+): Promise<void> {
+  await locator.evaluate((node, id) => {
+    const target = node as HTMLElement;
+    let capturedPointer: number | null = null;
+    let releases = 0;
+    Object.defineProperties(target, {
+      setPointerCapture: {
+        configurable: true,
+        value: (candidate: number) => { capturedPointer = candidate; },
+      },
+      hasPointerCapture: {
+        configurable: true,
+        value: (candidate: number) => capturedPointer === candidate,
+      },
+      releasePointerCapture: {
+        configurable: true,
+        value: (candidate: number) => {
+          if (capturedPointer === candidate) capturedPointer = null;
+          releases += 1;
+        },
+      },
+    });
+    target.focus();
+    const bounds = target.getBoundingClientRect();
+    const clientX = bounds.left + bounds.width / 2;
+    const clientY = bounds.top + bounds.height / 2;
+    target.dispatchEvent(new PointerEvent("pointerdown", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: id,
+      pointerType: "touch",
+      clientX,
+      clientY,
+      buttons: 1,
+    }));
+    target.dispatchEvent(new PointerEvent("pointercancel", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: id,
+      pointerType: "touch",
+      clientX,
+      clientY,
+    }));
+    target.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      clientX,
+      clientY,
+      detail: 1,
+    }));
+    target.dataset.cancelReleaseCount = String(releases);
+    target.dataset.cancelCaptureActive = String(capturedPointer === id);
+    target.dataset.cancelStillFocused = String(document.activeElement === target);
+  }, pointerId);
+  await expect(locator).toHaveAttribute("data-cancel-release-count", "1");
+  await expect(locator).toHaveAttribute("data-cancel-capture-active", "false");
+  await expect(locator).toHaveAttribute("data-cancel-still-focused", "false");
+}
+
 async function wheelUntilTurn(
   page: import("@playwright/test").Page,
   turnId: string,
@@ -609,7 +675,7 @@ async function wheelUntilTurn(
   projectName: string,
 ): Promise<void> {
   const viewport = page.locator(".thread");
-  if (projectName === "webkit") {
+  if (isMobileWebKitProject(projectName)) {
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (await turnIntersectsViewport(page, turnId)) {
         if (deltaY < 0) {
@@ -651,7 +717,7 @@ async function scrollThreadToEdge(
 ): Promise<void> {
   const viewport = page.locator(".thread");
   for (let attempt = 0; attempt < 6; attempt += 1) {
-    if (projectName === "webkit") {
+    if (isMobileWebKitProject(projectName)) {
       await dispatchTouchGesture(page, edge === "start" ? 60 : -60);
     } else {
       await viewport.dispatchEvent("wheel", {
@@ -791,7 +857,7 @@ async function requestOlderHistory(
   repeat = 1,
 ): Promise<void> {
   const viewport = page.locator(".thread");
-  if (projectName !== "webkit") {
+  if (!isMobileWebKitProject(projectName)) {
     for (let index = 0; index < repeat; index += 1) {
       await viewport.dispatchEvent("wheel", { deltaY: -80 });
     }
@@ -806,7 +872,7 @@ async function requestNewerHistory(
   repeat = 1,
 ): Promise<void> {
   const viewport = page.locator(".thread");
-  if (projectName !== "webkit") {
+  if (!isMobileWebKitProject(projectName)) {
     for (let index = 0; index < repeat; index += 1) {
       await viewport.dispatchEvent("wheel", { deltaY: 80 });
     }
@@ -956,14 +1022,19 @@ test("a history page waits for the active touch to release before mounting", asy
   await dispatchTouchPhase(page, "touchstart", 160);
   await dispatchTouchPhase(page, "touchmove", 220);
   await expect(page.getByTestId("load-count")).toHaveText("1");
+  const pageActivity = page.getByTestId("history-page-activity");
+  await expect(pageActivity).toContainText("正在加载更早历史");
+  await expect(pageActivity).toHaveCSS("pointer-events", "none");
   await page.waitForTimeout(100);
   await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  await expect(pageActivity).toBeVisible();
   const held = await readingAnchor(page);
   expect(held.id).toBe(before.id);
   expect(Math.abs(held.offset - before.offset)).toBeLessThan(2);
 
   await dispatchTouchPhase(page, "touchend", 220);
   await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect(pageActivity).toHaveCount(0);
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
   await expect.poll(async () =>
     Math.abs((await readingAnchor(page)).offset - before.offset),
@@ -974,10 +1045,70 @@ test("a history page waits for the active touch to release before mounting", asy
   expect(Math.abs(settled.offset - before.offset)).toBeLessThan(2);
 });
 
+test("the first runtime browse page stays staged under an active touch", async ({
+  page,
+}, testInfo) => {
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "mobile WebKit touch path");
+  await page.goto(
+    "/tests/history-browser.html?runtime-browse=1&delay=0&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await dispatchTouchPhase(page, "touchstart", 160);
+  await dispatchTouchPhase(page, "touchmove", 220);
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await page.waitForTimeout(100);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  await expect(page.getByTestId("history-page-activity")).toBeVisible();
+  const held = await readingAnchor(page);
+  expect(held.id).toBe(before.id);
+  expect(Math.abs(held.offset - before.offset)).toBeLessThan(2);
+
+  await dispatchTouchPhase(page, "touchend", 220);
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+});
+
+test("the first runtime browse page stays staged until wheel idle", async ({
+  page,
+}, testInfo) => {
+  test.skip(isMobileWebKitProject(testInfo.project.name),
+    "desktop wheel path");
+  await page.goto(
+    "/tests/history-browser.html?runtime-browse=1&delay=20&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await viewport.dispatchEvent("wheel", { deltaY: -80 });
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await page.waitForTimeout(100);
+  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  await expect(page.getByTestId("history-page-activity")).toBeVisible();
+
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
+  await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
+  await expect.poll(async () =>
+    Math.abs((await readingAnchor(page)).offset - before.offset),
+  ).toBeLessThan(2);
+});
+
 test("older history becoming available during a wheel gesture is restored once", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name === "webkit", "desktop wheel path");
+  test.skip(isMobileWebKitProject(testInfo.project.name),
+    "desktop wheel path");
   await page.goto(
     "/tests/history-browser.html?delayed-history-availability=1&manual-growth=1",
   );
@@ -1001,7 +1132,8 @@ test("older history becoming available during a wheel gesture is restored once",
 test("older history becoming available under touch waits for release", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name !== "webkit", "mobile WebKit touch path");
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "mobile WebKit touch path");
   await page.goto(
     "/tests/history-browser.html?delayed-history-availability=1&manual-growth=1",
   );
@@ -1481,6 +1613,61 @@ test("expanded tool batches use dense rows instead of individual cards", async (
   }
 });
 
+test("tool disclosures keep keyboard activation and ignore a scroll drag", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?compact-tools=1");
+  await page.locator(".turn-process-head").click();
+  const group = page.locator("details.tool-group");
+  const groupSummary = group.locator(":scope > summary");
+
+  await groupSummary.focus();
+  await page.keyboard.press("Enter");
+  await expect(group).toHaveAttribute("open", "");
+  const firstTool = group.locator("details.tool").first();
+  const firstToolSummary = firstTool.locator(":scope > summary");
+  await firstToolSummary.focus();
+  await page.keyboard.press("Enter");
+  await expect(firstTool).toHaveAttribute("open", "");
+  await page.keyboard.press("Enter");
+  await expect(firstTool).not.toHaveAttribute("open", "");
+
+  await groupSummary.focus();
+  await page.keyboard.press("Enter");
+  await expect(group).not.toHaveAttribute("open", "");
+  const box = await groupSummary.boundingBox();
+  if (!box) throw new Error("tool group summary has no geometry");
+  await page.mouse.move(box.x + 20, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 20, box.y + box.height / 2 + 24, {
+    steps: 4,
+  });
+  await page.mouse.up();
+  await expect(group).not.toHaveAttribute("open", "");
+});
+
+test("iOS pointercancel releases tool disclosures without toggling", async ({
+  page,
+}, testInfo) => {
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "iOS WebKit pointer cancellation");
+  await page.goto("/tests/history-browser.html?compact-tools=1");
+  await page.locator(".turn-process-head").click();
+  const group = page.locator("details.tool-group");
+  const groupSummary = group.locator(":scope > summary");
+
+  await dispatchCancelledTouchTap(groupSummary, 181);
+  await expect(group).not.toHaveAttribute("open", "");
+
+  await groupSummary.click();
+  await expect(group).toHaveAttribute("open", "");
+  const firstTool = group.locator("details.tool").first();
+  await dispatchCancelledTouchTap(
+    firstTool.locator(":scope > summary"), 182,
+  );
+  await expect(firstTool).not.toHaveAttribute("open", "");
+});
+
 test("completed Mermaid fences render isolated sanitized SVGs", async ({
   page,
 }) => {
@@ -1557,6 +1744,45 @@ test("completed chat formulas lazy-load accessible KaTeX markup", async ({
   );
   await expect(page.locator('[data-turn-id="math"] .message-code-copy'))
     .toHaveCount(0);
+});
+
+test("a completed streaming formula renders while following the live tail", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?streaming-math=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await waitForScrollIdle(page);
+  await expect(page.locator('[data-turn-id="streaming-math"] .katex'))
+    .toHaveCount(0);
+
+  await page.getByTestId("close-streaming-formula").evaluate(
+    (button: HTMLButtonElement) => button.click(),
+  );
+  await expect(page.locator('[data-turn-id="streaming-math"] .katex'))
+    .toHaveCount(1);
+  await expect.poll(async () => viewport.evaluate((node) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight,
+  )).toBeLessThan(2);
+});
+
+test("streaming formula closure preserves a non-bottom reading anchor", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?streaming-math=1");
+  await wheelUntilTurn(
+    page, "math-before-4", -1_200, testInfo.project.name,
+  );
+  await waitForScrollIdle(page);
+  const before = await readingAnchor(page);
+
+  await page.getByTestId("close-streaming-formula").evaluate(
+    (button: HTMLButtonElement) => button.click(),
+  );
+  await page.waitForTimeout(150);
+  const after = await readingAnchor(page);
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 });
 
 test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
@@ -1880,7 +2106,8 @@ test("a pending composer image previews without triggering removal", async ({
 test("a page waits through post-touch momentum and restores its final boundary", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "iOS WebKit touch settlement");
   await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = 0; });
@@ -1899,19 +2126,21 @@ test("a page waits through post-touch momentum and restores its final boundary",
   // movements and unrelated row growth, then commit at the final idle point.
   await page.waitForTimeout(60);
   await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+  let momentumScrollTop = 0;
   for (const top of [240, 420, 540]) {
-    await viewport.evaluate((node, scrollTop) => {
+    momentumScrollTop = await viewport.evaluate((node, scrollTop) => {
       node.scrollTop = scrollTop;
       node.dispatchEvent(new Event("scroll"));
+      return node.scrollTop;
     }, top);
     await page.waitForTimeout(50);
   }
-  await page.getByTestId("grow-row").click();
+  // Capture the final momentum boundary before any slow-runner command can
+  // legitimately cross the 260 ms idle lease and mount the staged page.
   const momentumEnd = await readingAnchor(page);
-  const momentumScrollTop = await viewport.evaluate((node) => node.scrollTop);
   expect(momentumScrollTop).toBeGreaterThan(200);
-  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
 
+  await page.getByTestId("grow-row").click();
   await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
   await expect.poll(async () => (await readingAnchor(page)).id)
     .toBe(momentumEnd.id);
@@ -1924,7 +2153,8 @@ test("a page waits through post-touch momentum and restores its final boundary",
 test("a delayed pre-commit touchmove never rebases a retained page", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "iOS WebKit touch settlement");
   await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = 0; });
@@ -1956,7 +2186,8 @@ test("a delayed pre-commit touchmove never rebases a retained page", async ({
 test("a cached-newer page that finishes under touch keeps its retained row", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "iOS WebKit touch settlement");
   await page.goto("/tests/history-browser.html?deep-browse=1&delay=5");
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
@@ -1982,7 +2213,8 @@ test("a cached-newer page that finishes under touch keeps its retained row", asy
 test("movement while a page is staged becomes the release boundary", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "iOS WebKit touch settlement");
   await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = 0; });
@@ -2022,7 +2254,8 @@ test("movement while a page is staged becomes the release boundary", async ({
 test("continuing to pull at the top keeps the staged page invisible", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name !== "webkit", "iOS WebKit touch settlement");
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "iOS WebKit touch settlement");
   await page.goto("/tests/history-browser.html?delay=5&manual-growth=1");
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = 0; });
@@ -2093,7 +2326,7 @@ test("the first runtime-to-browse page preserves its captured reading row", asyn
   page,
 }) => {
   await page.goto(
-    "/tests/history-browser.html?runtime-browse=1&delay=5&manual-growth=1",
+    "/tests/history-browser.html?runtime-browse=1&delay=350&manual-growth=1",
   );
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = 0; });
@@ -2102,7 +2335,9 @@ test("the first runtime-to-browse page preserves its captured reading row", asyn
 
   await page.locator(".load-more-btn").dispatchEvent("click");
   await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.getByTestId("history-page-activity")).toBeVisible();
   await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
   await expect.poll(async () => (await readingAnchor(page)).id).toBe(before.id);
   await expect.poll(async () =>
     Math.abs((await readingAnchor(page)).offset - before.offset),
@@ -2202,7 +2437,13 @@ test("browse live updates stay passive until the user returns to latest", async 
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
   await expect(page.locator('[data-turn-id="live-41"]')).toHaveCount(0);
 
-  await page.getByRole("button", { name: "回到最新" }).click();
+  const returnButton = page.getByRole("button", { name: "回到最新" });
+  await expect(returnButton).toHaveText("");
+  const buttonBox = await returnButton.boundingBox();
+  expect(buttonBox).not.toBeNull();
+  expect(Math.abs((buttonBox?.width ?? 0) - (buttonBox?.height ?? 0)))
+    .toBeLessThan(1);
+  await returnButton.click();
   await expect(page.locator('[data-turn-id="live-41"]')).toBeVisible();
   await expect(page.getByRole("button", { name: "回到最新" })).toHaveCount(0);
 });
@@ -2214,8 +2455,10 @@ test("a delayed cached-newer page cannot move another session", async ({
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
   await requestNewerHistory(page, testInfo.project.name);
+  await expect(page.getByTestId("history-page-activity")).toBeVisible();
   await page.getByTestId("switch-session").click();
   await expect(page.locator('[data-turn-id="b4"]')).toBeVisible();
+  await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
   await waitForScrollIdle(page);
   const before = await readingAnchor(page);
   await page.waitForTimeout(500);
@@ -2237,6 +2480,7 @@ test("an empty final page removes the loader without moving the reading row", as
   await expect(page.getByRole("button", {
     name: "加载更早的历史",
   })).toHaveCount(0);
+  await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
   const after = await readingAnchor(page);
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
@@ -2283,6 +2527,47 @@ test("a delayed page from the previous session cannot move the new session", asy
 
   await page.getByTestId("switch-session").click();
   await expect(page.locator('[data-turn-id="o4"]')).toBeVisible();
+});
+
+test("a generation change cancels the old page anchor and permits a new request", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?generation-shift=1&delay=1000&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await page.locator(".load-more-btn").dispatchEvent("click");
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.getByTestId("history-page-activity")).toBeVisible();
+
+  await page.getByTestId("shift-generation").click();
+  await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
+  await page.locator(".load-more-btn").dispatchEvent("click");
+  await expect(page.getByTestId("load-count")).toHaveText("2");
+});
+
+test("a generation change clears the automatic keyboard paging boundary", async ({
+  page,
+}, testInfo) => {
+  test.skip(isMobileWebKitProject(testInfo.project.name),
+    "desktop keyboard path");
+  await page.goto(
+    "/tests/history-browser.html?generation-shift=1&delay=10000&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.focus();
+  await viewport.press("Home");
+  await expect(page.getByTestId("load-count")).toHaveText("1");
+  await expect(page.getByTestId("history-page-activity")).toBeVisible();
+
+  await page.getByTestId("shift-generation").click();
+  await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
+  await viewport.press("End");
+  await expect.poll(() => viewport.evaluate((node) => node.scrollTop))
+    .toBeGreaterThan(0);
+  await viewport.press("Home");
+  await expect(page.getByTestId("load-count")).toHaveText("2");
 });
 
 test("same-session revision replacement resets to the latest row", async ({
@@ -2386,6 +2671,22 @@ test("plan progress uses a compact popover that closes outside", async ({
   await expect(popover).toHaveCount(0);
 });
 
+test("iOS pointercancel releases the plan trigger without opening it", async ({
+  page,
+}, testInfo) => {
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "iOS WebKit pointer cancellation");
+  await page.goto("/tests/history-browser.html?interactive-timeline=1");
+  const trigger = page.getByRole("button", { name: /查看计划进度/ });
+  await expect(trigger).toBeVisible();
+
+  await dispatchCancelledTouchTap(trigger, 183);
+
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByRole("dialog", { name: "计划进度" }))
+    .toHaveCount(0);
+});
+
 test("terminal turn does not mark unfinished structured plan complete", async ({
   page,
 }) => {
@@ -2440,8 +2741,31 @@ test("goal entry stays compact and opens its editor", async ({ page }) => {
   expect(box.width).toBeLessThan(viewport.width - 20);
 
   await chip.click();
-  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toBeVisible();
+  const dialog = page.getByRole("dialog", { name: "Codex Goal" });
+  await expect(dialog).toBeVisible();
+  const dialogBox = await dialog.boundingBox();
+  if (!dialogBox || !viewport) throw new Error("goal dialog has no geometry");
+  expect(dialogBox.width).toBeLessThanOrEqual(Math.min(580, viewport.width));
+  const statCards = dialog.locator(".goal-stats > div");
+  await expect(statCards).toHaveCount(3);
+  expect(await statCards.first().evaluate((node) =>
+    getComputedStyle(node).borderTopWidth)).toBe("0px");
+  const icon = dialog.locator(".goal-sheet-icon");
+  expect(await icon.evaluate((node) => {
+    const style = getComputedStyle(node);
+    return style.backgroundColor !== style.color;
+  })).toBe(true);
   await page.locator(".scrim.show").click({ position: { x: 5, y: 5 } });
+  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
+});
+
+test("remembered goal shows a compact recovery state without opening its editor", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-status=loading");
+  const recovery = page.getByRole("status", { name: "正在恢复 Goal" });
+  await expect(recovery).toBeVisible();
+  await expect(recovery).toContainText("正在恢复…");
   await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
 });
 
@@ -2455,10 +2779,40 @@ test("budgeted goal keeps its blocked status visible on mobile", async ({
     .toHaveClass(/goal-chip-ring-blocked/);
 });
 
+test("goal editor stays inside the tablet visual viewport above the keyboard", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await page.goto("/tests/history-browser.html?goal-ui=1");
+  await page.getByRole("button", { name: "查看 Goal" }).click();
+  const dialog = page.getByRole("dialog", { name: "Codex Goal" });
+  await expect(dialog).toBeVisible();
+
+  const visualTop = 20;
+  const visualHeight = 560;
+  await page.evaluate(({ top, height }) => {
+    const root = document.documentElement;
+    root.style.setProperty("--app-offset-top", `${top}px`);
+    root.style.setProperty("--app-height", `${height}px`);
+    root.style.setProperty(
+      "--keyboard-inset", `${window.innerHeight - top - height}px`,
+    );
+  }, { top: visualTop, height: visualHeight });
+  await dialog.locator("textarea").focus();
+
+  await expect.poll(async () => dialog.boundingBox()).not.toBeNull();
+  const box = await dialog.boundingBox();
+  if (!box) throw new Error("goal dialog has no tablet geometry");
+  expect(box.y).toBeGreaterThanOrEqual(visualTop - 1);
+  expect(box.y + box.height).toBeLessThanOrEqual(
+    visualTop + visualHeight + 1,
+  );
+});
+
 test("desktop text selection keeps its original virtual turn while edge-dragging", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name === "webkit",
+  test.skip(isMobileWebKitProject(testInfo.project.name),
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=120");
   const viewport = page.locator(".thread");
@@ -2501,7 +2855,6 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   await expect(page.locator(
     `[data-turn-id="${startTurnId}"]`,
   )).toBeAttached();
-  const draggedAnchor = await readingAnchor(page);
   await page.mouse.up();
   await expect(viewport).toHaveAttribute(
     "data-text-selection-dragging", "false",
@@ -2515,11 +2868,13 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
   const immediateReleasedScrollTop =
     await viewport.evaluate((node) => node.scrollTop);
   expect(immediateReleasedScrollTop - startScrollTop).toBeGreaterThan(800);
+  const nativeReleaseAdvance = immediateReleasedScrollTop - draggedScrollTop;
+  expect(nativeReleaseAdvance).toBeGreaterThanOrEqual(-2);
+  expect(nativeReleaseAdvance).toBeLessThan(viewportBox.height / 2);
   const immediateReleasedAnchor = await readingAnchor(page);
-  // Chromium may finish one native selection auto-scroll step on mouseup.
-  // Retain that released visual position; the app must not replay an older
-  // scroll command after the browser has handed control back.
-  expect(immediateReleasedAnchor.id).toBe(draggedAnchor.id);
+  // Chromium may finish one native selection auto-scroll step on mouseup and
+  // cross a virtual-row boundary. The post-release position is authoritative;
+  // the app must not replay an older scroll command after control returns.
   await page.waitForTimeout(120);
   const releasedAnchor = await readingAnchor(page);
   expect(releasedAnchor.id).toBe(immediateReleasedAnchor.id);
@@ -2560,7 +2915,7 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
 test("desktop wheel scrolling remains available after text selection", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name === "webkit",
+  test.skip(isMobileWebKitProject(testInfo.project.name),
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=120");
   const viewport = page.locator(".thread");
@@ -2600,7 +2955,7 @@ test("desktop wheel scrolling remains available after text selection", async ({
 test("a late cached-newer page cannot evict an active text selection", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name === "webkit",
+  test.skip(isMobileWebKitProject(testInfo.project.name),
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto(
     "/tests/history-browser.html?deep-browse=1&delay=3000",
@@ -2643,7 +2998,7 @@ test("a late cached-newer page cannot evict an active text selection", async ({
 test("switching sessions clears retained desktop text selection", async ({
   page,
 }, testInfo) => {
-  test.skip(testInfo.project.name === "webkit",
+  test.skip(isMobileWebKitProject(testInfo.project.name),
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=80");
   const viewport = page.locator(".thread");
@@ -2761,6 +3116,91 @@ test("one stationary press opens nested thinking while a newer turn grows", asyn
 
   await expect(timeline.locator("details.process-reasoning"))
     .toHaveAttribute("open", "");
+});
+
+test("dragging a process header outside cannot leave output following locked", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?interactive-timeline=1");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  const header = page.locator(
+    '[data-turn-id="timeline"] .turn-process-head',
+  );
+  const box = await header.boundingBox();
+  if (!box) throw new Error("process header has no bounds");
+
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width + 80, box.y + box.height + 80);
+  await page.mouse.up();
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+
+  await page.getByTestId("grow-stream").click();
+  await expect.poll(() => viewport.evaluate((node) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight,
+  )).toBeLessThan(2);
+});
+
+test("dragging nested process thinking outside cannot leave output following locked", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?interactive-timeline=1&engine=claude",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  const timeline = page.locator('[data-turn-id="timeline"]');
+  await timeline.locator(".turn-process-head").click();
+  await waitForScrollIdle(page);
+  const summary = timeline.locator(".process-reasoning > summary");
+  const box = await summary.boundingBox();
+  if (!box) throw new Error("nested reasoning summary has no bounds");
+
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width + 80, box.y + box.height + 80);
+  await page.mouse.up();
+  await expect(timeline.locator("details.process-reasoning"))
+    .not.toHaveAttribute("open", "");
+
+  await page.getByTestId("grow-stream").click();
+  await expect.poll(() => viewport.evaluate((node) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight,
+  )).toBeLessThan(2);
+});
+
+test("iOS pointercancel releases process interactions and output following", async ({
+  page,
+}, testInfo) => {
+  test.skip(!isMobileWebKitProject(testInfo.project.name),
+    "iOS WebKit pointer cancellation");
+  await page.goto(
+    "/tests/history-browser.html?interactive-timeline=1&engine=claude",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  const timeline = page.locator('[data-turn-id="timeline"]');
+  const header = timeline.locator(".turn-process-head");
+
+  await dispatchCancelledTouchTap(header, 184);
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+  await page.getByTestId("grow-stream").click();
+  await expect.poll(() => viewport.evaluate((node) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight,
+  )).toBeLessThan(2);
+
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  const reasoning = timeline.locator("details.process-reasoning");
+  await dispatchCancelledTouchTap(
+    reasoning.locator(":scope > summary"), 185,
+  );
+  await expect(reasoning).not.toHaveAttribute("open", "");
+  await page.getByTestId("grow-stream").click();
+  await expect.poll(() => viewport.evaluate((node) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight,
+  )).toBeLessThan(2);
 });
 
 test("live append follows at the bottom but not while reading history", async ({
@@ -3446,4 +3886,120 @@ test("a 256-character profile id fits a 296 px new-chat row", async ({
   expect(layout.accessRight).toBeLessThanOrEqual(layout.cardRight);
   expect(layout.label).toContain("…");
   expect(Array.from(layout.label).length).toBeLessThan(32);
+});
+
+test("new-chat controls fit the default permission picker on a short phone", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 320, height: 568 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await page.locator(".newchat-access").click();
+  const dialog = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  });
+  await expect(dialog).toBeVisible();
+
+  const layout = await dialog.evaluate((sheet) => {
+    const scroll = sheet.querySelector<HTMLElement>(".sheet-scroll");
+    const optionButtons = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".permission-options .cmd"),
+    );
+    const searchButtons = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".cmd-search button"),
+    );
+    const live = searchButtons.find((button) => button.textContent === "Live");
+    if (!scroll || optionButtons.length !== 6 || !live) {
+      throw new Error("compact permission controls are incomplete");
+    }
+    const sheetRect = sheet.getBoundingClientRect();
+    return {
+      viewportHeight: window.innerHeight,
+      viewportWidth: window.innerWidth,
+      pageScrollWidth: document.documentElement.scrollWidth,
+      sheetTop: sheetRect.top,
+      sheetBottom: sheetRect.bottom,
+      scrollTop: scroll.scrollTop,
+      scrollHeight: scroll.scrollHeight,
+      scrollClientHeight: scroll.clientHeight,
+      liveBottom: live.getBoundingClientRect().bottom,
+      minOptionHeight: Math.min(...optionButtons.map(
+        (button) => button.getBoundingClientRect().height,
+      )),
+      minSearchHeight: Math.min(...searchButtons.map(
+        (button) => button.getBoundingClientRect().height,
+      )),
+    };
+  });
+
+  expect(layout.scrollTop).toBe(0);
+  expect(layout.scrollHeight).toBeLessThanOrEqual(
+    layout.scrollClientHeight + 1,
+  );
+  expect(layout.sheetTop).toBeGreaterThanOrEqual(0);
+  expect(layout.sheetBottom).toBeLessThanOrEqual(layout.viewportHeight + 1);
+  expect(layout.liveBottom).toBeLessThanOrEqual(layout.viewportHeight + 1);
+  expect(layout.minOptionHeight).toBeGreaterThanOrEqual(44);
+  expect(layout.minSearchHeight).toBeGreaterThanOrEqual(44);
+  expect(layout.pageScrollWidth).toBeLessThanOrEqual(layout.viewportWidth);
+});
+
+test("new-chat controls keep scrolling for many custom permission profiles", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 320, height: 400 });
+  await page.goto(
+    "/tests/history-browser.html?newchat-controls=1&many-profiles=1",
+  );
+  await page.locator(".newchat-access").click();
+  const dialog = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  });
+  await expect(dialog).toBeVisible();
+
+  const scrollState = await dialog.locator(".sheet-scroll").evaluate((scroll) => ({
+    clientHeight: scroll.clientHeight,
+    scrollHeight: scroll.scrollHeight,
+    overflowY: getComputedStyle(scroll).overflowY,
+  }));
+  expect(scrollState.scrollHeight).toBeGreaterThan(scrollState.clientHeight);
+  expect(scrollState.overflowY).toBe("auto");
+
+  const live = dialog.getByRole("button", { name: "Live", exact: true });
+  await live.scrollIntoViewIfNeeded();
+  await expect(live).toBeInViewport();
+});
+
+test("new-chat controls fit when the visual app height is keyboard-sized", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 393, height: 852 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty("--app-height", "400px");
+    document.documentElement.style.setProperty("--keyboard-inset", "452px");
+    document.documentElement.setAttribute("data-short-viewport", "true");
+  });
+  await page.locator(".newchat-access").click();
+  const dialog = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  });
+  await expect(dialog).toBeVisible();
+
+  const layout = await dialog.evaluate((sheet) => {
+    const scroll = sheet.querySelector<HTMLElement>(".sheet-scroll");
+    const live = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".cmd-search button"),
+    ).find((button) => button.textContent === "Live");
+    if (!scroll || !live) throw new Error("permission search controls missing");
+    return {
+      scrollHeight: scroll.scrollHeight,
+      clientHeight: scroll.clientHeight,
+      liveBottom: live.getBoundingClientRect().bottom,
+      sheetBottom: sheet.getBoundingClientRect().bottom,
+    };
+  });
+  expect(layout.scrollHeight).toBeLessThanOrEqual(layout.clientHeight + 1);
+  expect(layout.liveBottom).toBeLessThanOrEqual(layout.sheetBottom + 1);
 });

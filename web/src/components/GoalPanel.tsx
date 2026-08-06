@@ -7,6 +7,7 @@ interface Props {
   goal: ThreadGoal | null;
   revealed: boolean;
   open: boolean;
+  loading?: boolean;
   onOpen: () => void;
   onClose: () => void;
   onDismiss: () => void;
@@ -50,6 +51,17 @@ export function GoalPanel(p: Props) {
   const engineName = p.engine === "codex" ? "Codex" : "Claude";
 
   return <>
+    {p.revealed && !goal &&
+      <div className="goal-chip-wrap goal-loading" role="status"
+        aria-label={p.loading ? "正在恢复 Goal" : "Goal 暂时不可用，可重试"}>
+        <button className="goal-chip goal-chip-loading" onClick={p.onOpen}>
+          <span className="goal-chip-dot goal-chip-dot-active" aria-hidden="true" />
+          <span className="goal-chip-label">Goal</span>
+          <span className="goal-chip-objective">
+            {p.loading ? "正在恢复…" : "点击重试"}
+          </span>
+        </button>
+      </div>}
     {p.revealed && goal && <div className={`goal-chip-wrap goal-${goal.status}`}>
       <button className="goal-chip" onClick={p.onOpen}
         aria-label={`查看 Goal，${statusName[goal.status]}`}>
@@ -76,8 +88,8 @@ export function GoalPanel(p: Props) {
       <section className="sheet show goal-sheet" role="dialog" aria-modal="true" aria-label={`${engineName} Goal`}>
         <div className="sheet-grip" />
         <header className="goal-sheet-head">
-          <span className="goal-sheet-icon"><Icon name="verify" size={19} /></span>
-          <span><b>{engineName} Goal</b><small>持续运行，直到目标达成或被清除</small></span>
+          <span className="goal-sheet-icon"><Icon name="plan" size={18} /></span>
+          <span><b>{engineName} Goal</b><small>目标、预算与执行进展</small></span>
           <button onClick={p.onClose} aria-label="关闭"><Icon name="close" size={17} /></button>
         </header>
 
@@ -97,7 +109,7 @@ export function GoalPanel(p: Props) {
               <div><small>运行时间</small><b>{duration(goal.timeUsedSeconds)}</b></div>
               <div><small>{p.engine === "claude" ? "检查轮次" : "预算状态"}</small><b>{p.engine === "claude" ? String(goal.iterations ?? 0) : (total ? `${Math.round(progress ?? 0)}%` : "不限")}</b></div>
             </div>
-            {goal.lastReason && <div className="goal-last-check"><small>最近检查</small><p>{goal.lastReason}</p></div>}
+            {goal.lastReason && <div className="goal-last-check"><small>最近进展</small><p>{goal.lastReason}</p></div>}
           </div>}
 
           <div className="goal-editor">

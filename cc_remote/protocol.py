@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 29
+PROTOCOL_VERSION = 31
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -904,7 +904,22 @@ class SessionList(_Base):
     type: Literal["session_list"] = "session_list"
     engine: Literal["claude", "codex"]
     space: Space = "code"
+    # Exact ListSessions.cmd_id. A single Codex read may paint a cached list and
+    # then a refreshed list, so both responses intentionally carry the same id.
+    request_id: Optional[WireId] = None
     sessions: list[SessionInfo]
+
+
+class SessionListInvalidated(_Base):
+    """wrapper -> clients: request a fresh, correlated catalog read.
+
+    This is intentionally an unbuffered control hint. Each visible browser
+    freezes its own socket/surface ownership when it answers the hint with
+    ListSessions; the wrapper never broadcasts an uncorrelated SessionList.
+    """
+    type: Literal["session_list_invalidated"] = "session_list_invalidated"
+    engine: Literal["claude", "codex"]
+    space: Space = "code"
 
 
 class SessionActivity(_Base):
@@ -1971,6 +1986,12 @@ class History(_Base):
     # transcript has no ResultMessage, so the final History TurnEnd is synthetic;
     # clients must not let it close their matching live tail while this is true.
     in_progress: bool = False
+    # Exact native/logical Codex ids whose persisted interrupted terminal is a
+    # context-compaction boundary for the currently resident managed turn. This
+    # is deliberately narrower than ``in_progress``/active turn ownership: a
+    # real user interrupt or crash must stay terminal on a cold browser.
+    compaction_continuation_turn_ids: list[WireId] = Field(
+        default_factory=list, max_length=4)
     # Authoritative replacement after a destructive history mutation such as
     # Codex rollback. Ordinary loads merge with a live tail; reset loads must
     # discard turns that the engine has just removed.
@@ -2150,12 +2171,16 @@ class GoalState(_Base):
     """
     type: Literal["goal_state"] = "goal_state"
     goal: Optional[ThreadGoal] = None
+    # Present only on the one-shot GetGoal response. Broadcast mutations omit
+    # it, so clients can freeze request-time surface ownership without changing
+    # the normal per-session Goal stream.
+    request_id: Optional[WireId] = None
 
 
 AnyMessage = Union[
     Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
-    SessionList, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
+    SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, GoalState,
     UserMsg, TurnSteered, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
@@ -2286,6 +2311,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "clear_goal": ClearGoal,
     "goal_state": GoalState,
     "session_list": SessionList,
+    "session_list_invalidated": SessionListInvalidated,
     "session_activity": SessionActivity,
     "session_focus": SessionFocus,
     "session_rekey": SessionRekey,

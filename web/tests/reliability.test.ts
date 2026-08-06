@@ -81,6 +81,18 @@ import {
 } from "../src/protocol.ts";
 import { protocolRecoveryAction, RelayWs } from "../src/ws.ts";
 import {
+  dismissGoalUi,
+  GOAL_UI_PREFERENCES_KEY,
+  goalStableIdentity,
+  goalUiScopeForEvent,
+  goalUiScopeKey,
+  readGoalUiPreferences,
+  reconcileGoalUiPreference,
+  rekeyGoalUiPreference,
+  rememberGoalUi,
+  writeGoalUiPreferences,
+} from "../src/scoped-goal-ui.ts";
+import {
   clientSlashesFor,
   commandsFor,
   isKnownCodeOnlySlash,
@@ -184,6 +196,85 @@ const draftB = composerDraftKey("machine-a", "code", "codex", "session-b");
 const draftOtherSurface = composerDraftKey(
   "machine-a", "work", "codex", "session-a",
 );
+const goalScopeA = goalUiScopeKey(
+  "machine-a", "code", "codex", "session-a");
+const goalScopeOtherMachine = goalUiScopeKey(
+  "machine-b", "code", "codex", "session-a");
+const goalScopeOtherSurface = goalUiScopeKey(
+  "machine-a", "work", "codex", "session-a");
+assert.notEqual(goalScopeA, goalScopeOtherMachine,
+  "the same sid on another machine must have independent Goal UI state");
+assert.notEqual(goalScopeA, goalScopeOtherSurface,
+  "the same sid on Work must not inherit Code Goal UI state");
+assert.equal(goalUiScopeForEvent("unknown-session"), null,
+  "Goal UI persistence must fail closed without receive-time ownership");
+assert.equal(goalUiScopeForEvent("session-a", {
+  machineId: "machine-a", space: "code", engine: "codex",
+}), goalScopeA);
+const persistedGoal = {
+  threadId: "session-a",
+  objective: "ship the release without leaking this text to storage",
+  status: "active" as const,
+  engine: "codex" as const,
+  tokensUsed: 1,
+  timeUsedSeconds: 2,
+  createdAt: 100,
+};
+const discoveredGoal = reconcileGoalUiPreference(
+  {}, goalScopeA, persistedGoal, 10);
+assert.equal(discoveredGoal.revealed, true,
+  "an authoritative Goal must reveal itself on a new browser or device");
+assert.equal(discoveredGoal.preferences[goalScopeA]?.known, true,
+  "Goal discovery must survive a refresh without requiring /goal");
+let goalPreferences = rememberGoalUi(discoveredGoal.preferences, goalScopeA, 10);
+let reconciledGoal = reconcileGoalUiPreference(
+  goalPreferences, goalScopeA, persistedGoal, 11);
+assert.equal(reconciledGoal.revealed, true);
+goalPreferences = dismissGoalUi(
+  reconciledGoal.preferences, goalScopeA, persistedGoal, 12);
+reconciledGoal = reconcileGoalUiPreference(
+  goalPreferences, goalScopeA, persistedGoal, 13);
+assert.equal(reconciledGoal.revealed, false,
+  "refresh must preserve a dismissal for the exact stable Goal identity");
+reconciledGoal = reconcileGoalUiPreference(
+  goalPreferences, goalScopeA, { ...persistedGoal, createdAt: 101 }, 14);
+assert.equal(reconciledGoal.revealed, true,
+  "a newly-created Goal must not inherit the previous Goal's dismissal");
+reconciledGoal = reconcileGoalUiPreference(
+  goalPreferences, goalScopeA, {
+    ...persistedGoal,
+    objective: "a replacement objective with the same native createdAt",
+  }, 15);
+assert.equal(reconciledGoal.revealed, true,
+  "a replacement Codex Goal must not inherit the previous Goal's dismissal");
+assert.equal(goalStableIdentity({ ...persistedGoal, createdAt: undefined }), null);
+const identitylessDismissal = dismissGoalUi(
+  rememberGoalUi({}, goalScopeA, 20), goalScopeA,
+  { ...persistedGoal, createdAt: undefined }, 21);
+assert.equal(reconcileGoalUiPreference(
+  identitylessDismissal, goalScopeA,
+  { ...persistedGoal, createdAt: undefined }, 22).revealed, true,
+"an identityless Goal dismissal is page-local and must not hide future Goals");
+const goalStorageValues = new Map<string, string>();
+const goalStorage = {
+  getItem: (key: string) => goalStorageValues.get(key) ?? null,
+  setItem: (key: string, value: string) => {
+    goalStorageValues.set(key, value);
+  },
+};
+goalPreferences = writeGoalUiPreferences(goalStorage, goalPreferences);
+assert.doesNotMatch(
+  goalStorageValues.get(GOAL_UI_PREFERENCES_KEY) ?? "",
+  /ship the release/,
+  "Goal objective text must never be persisted in UI preferences",
+);
+assert.deepEqual(readGoalUiPreferences(goalStorage), goalPreferences);
+const rekeyedGoalPreferences = rekeyGoalUiPreference(
+  goalPreferences,
+  goalScopeA,
+  goalUiScopeKey("machine-a", "code", "codex", "session-real"),
+);
+assert.equal(goalScopeA in rekeyedGoalPreferences, false);
 composerDrafts.set(draftA, {
   input: "session A unfinished",
   images: [{ media_type: "image/png", data: "draft-image" }],
@@ -270,12 +361,15 @@ assert.deepEqual(completionReceipts["parent-main"], {
 
 const processTap = new PointerTapGuard(8);
 processTap.pointerDown(1, 20, 20);
-processTap.pointerMove(1, 22, 24);
+assert.equal(processTap.pointerMove(1, 22, 24), false);
 processTap.pointerUp(1);
 assert.equal(processTap.consumeClick(1), true,
   "a stationary touch remains a real process-header tap");
 processTap.pointerDown(2, 20, 20);
-processTap.pointerMove(2, 20, 36);
+assert.equal(processTap.pointerMove(2, 20, 36), true,
+  "crossing the drag threshold releases the touch origin exactly once");
+assert.equal(processTap.pointerMove(2, 20, 48), false,
+  "a released drag pointer cannot repeatedly blur/release its control");
 processTap.pointerUp(2);
 assert.equal(processTap.consumeClick(1), false,
   "vertical history scrolling must not toggle the process header");
@@ -957,6 +1051,7 @@ assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
 
 const viewportListeners = new Map<MobileViewportEvent, Set<() => void>>();
 const viewportCss = new Map<string, string>();
+const viewportAttributes = new Map<string, string>();
 const viewportFrames = new Map<number, () => void>();
 const viewportDelays = new Map<number, () => void>();
 let nextViewportTaskId = 1;
@@ -969,6 +1064,8 @@ const viewportBindings: MobileViewportBindings = {
   readViewport: () => viewportReading,
   setCssProperty: (name, value) => { viewportCss.set(name, value); },
   clearCssProperty: (name) => { viewportCss.delete(name); },
+  setRootAttribute: (name, value) => { viewportAttributes.set(name, value); },
+  clearRootAttribute: (name) => { viewportAttributes.delete(name); },
   listen: (event, listener) => {
     const listeners = viewportListeners.get(event) ?? new Set();
     listeners.add(listener);
@@ -1003,6 +1100,7 @@ const stopViewportSync = createMobileViewportSync(viewportBindings);
 assert.equal(viewportCss.get("--app-height"), "844px");
 assert.equal(viewportCss.get("--app-offset-top"), "0px");
 assert.equal(viewportCss.get("--keyboard-inset"), "0px");
+assert.equal(viewportAttributes.get("data-short-viewport"), "false");
 
 viewportReading = { height: 510.25, layoutHeight: 844, offsetTop: 0, scale: 1 };
 emitViewport("viewport-resize");
@@ -1010,6 +1108,7 @@ assert.equal(viewportCss.get("--app-height"), "844px");
 flushViewportFrames();
 assert.equal(viewportCss.get("--app-height"), "510.25px");
 assert.equal(viewportCss.get("--keyboard-inset"), "333.75px");
+assert.equal(viewportAttributes.get("data-short-viewport"), "true");
 
 viewportReading = { height: 500, layoutHeight: 844, offsetTop: 24, scale: 1 };
 emitViewport("viewport-scroll");
@@ -1024,6 +1123,7 @@ emitViewport("viewport-resize");
 flushViewportFrames();
 assert.equal(viewportCss.get("--app-offset-top"), "0px");
 assert.equal(viewportCss.get("--keyboard-inset"), "0px");
+assert.equal(viewportAttributes.get("data-short-viewport"), "false");
 
 // Safari can report its pre-blur viewport for a few animation frames. Delayed
 // settling rereads it and clears only the layout-level focus pan.
@@ -1067,6 +1167,7 @@ stopViewportSync();
 assert.equal(viewportCss.has("--app-height"), false);
 assert.equal(viewportCss.has("--app-offset-top"), false);
 assert.equal(viewportCss.has("--keyboard-inset"), false);
+assert.equal(viewportAttributes.has("data-short-viewport"), false);
 assert.equal(viewportFrames.size, 0);
 assert.equal(viewportDelays.size, 0);
 for (const listeners of viewportListeners.values()) assert.equal(listeners.size, 0);
@@ -2527,7 +2628,7 @@ const replayOrphanMerged = mergeInitialHistory(
     }],
     detailError: "stale orphan detail",
   }],
-  { reconcileAuthoritativeReplayOrphans: true },
+  { reconcileReplayOrphans: true },
 );
 assert.equal(replayOrphanMerged.length, 1);
 assert.equal(replayOrphanMerged[0].id, "native-history-turn");
@@ -2568,7 +2669,7 @@ const ambiguousReplayOrphans = mergeInitialHistory(
       done: true,
     }],
   })),
-  { reconcileAuthoritativeReplayOrphans: true },
+  { reconcileReplayOrphans: true },
 );
 assert.equal(ambiguousReplayOrphans.length, 2,
   "multiple provisional rows claiming one item cannot replace canonical history");
@@ -2598,7 +2699,7 @@ const ambiguousCanonicalReplay = mergeInitialHistory(
       done: true,
     }],
   }],
-  { reconcileAuthoritativeReplayOrphans: true },
+  { reconcileReplayOrphans: true },
 );
 assert.equal(ambiguousCanonicalReplay.length, 3,
   "a message identity shared by canonical rows is not safe merge evidence");
@@ -2628,7 +2729,7 @@ const unrelatedAssistantOnly = mergeInitialHistory(
       done: true,
     }],
   }],
-  { reconcileAuthoritativeReplayOrphans: true },
+  { reconcileReplayOrphans: true },
 );
 assert.equal(unrelatedAssistantOnly.length, 2,
   "equal assistant text without an exact message identity remains separate");
@@ -2655,6 +2756,133 @@ assert.deepEqual(mergeInitialHistory(
 ).map((turn) => turn.id), [
   "old-assistant-only", "current-history",
 ]);
+const aliaslessSameText = mergeInitialHistory(
+  [{
+    id: "history-active-no-overlap",
+    prompt: "guide",
+    forkPointId: "shared-route-only",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "history-message-only",
+      channel: "commentary",
+      text: "the same visible words",
+      done: true,
+    }],
+  }],
+  [{
+    id: "live-active-no-overlap",
+    clientMsgId: "live-active-no-overlap",
+    liveTaskId: "shared-route-only",
+    prompt: "guide",
+    done: false,
+    blocks: [{
+      kind: "text",
+      message_id: "live-message-only",
+      channel: "commentary",
+      text: "the same visible words",
+      done: true,
+    }],
+  }],
+  {
+    preserveLiveTailOpen: true,
+    newestHistoryId: "history-active-no-overlap",
+    reconcileReplayOrphans: true,
+  },
+);
+assert.deepEqual(
+  aliaslessSameText.map((turn) => turn.id),
+  ["history-active-no-overlap", "live-active-no-overlap"],
+  "equal prompt/commentary text and one shared routing id cannot prove UI identity",
+);
+const terminalSameTaskDifferentItems = mergeInitialHistory(
+  [{
+    id: "terminal-history-head",
+    prompt: "same native task",
+    forkPointId: "terminal-shared-task",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "terminal-history-final",
+      channel: "final",
+      text: "history final",
+      done: true,
+    }],
+  }],
+  [{
+    id: "terminal-history-head",
+    prompt: "same native task",
+    forkPointId: "terminal-shared-task",
+    done: true,
+    blocks: [],
+  }, {
+    id: "terminal-distinct-steer",
+    clientMsgId: "terminal-distinct-steer",
+    prompt: "same native task",
+    forkPointId: "terminal-shared-task",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "terminal-distinct-final",
+      channel: "final",
+      text: "another real segment",
+      done: true,
+    }],
+  }],
+  {
+    newestHistoryId: "terminal-history-head",
+    reconcileReplayOrphans: true,
+  },
+);
+assert.deepEqual(
+  terminalSameTaskDifferentItems.map((turn) => turn.id),
+  ["terminal-history-head", "terminal-distinct-steer"],
+  "a terminal head cannot absorb another steer on task/prompt identity alone",
+);
+const conflictingTaskSharedItem = mergeInitialHistory(
+  [{
+    id: "conflicting-task-history",
+    prompt: "shared item is still not enough",
+    forkPointId: "history-native-task",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "conflicting-task-shared-message",
+      channel: "final",
+      text: "shared native item",
+      done: true,
+    }],
+  }],
+  [{
+    id: "conflicting-task-history",
+    prompt: "shared item is still not enough",
+    forkPointId: "history-native-task",
+    done: true,
+    blocks: [],
+  }, {
+    id: "conflicting-task-live",
+    clientMsgId: "conflicting-task-live",
+    liveTaskId: "different-native-task",
+    prompt: "shared item is still not enough",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "conflicting-task-shared-message",
+      channel: "final",
+      text: "shared native item",
+      done: true,
+    }],
+  }],
+  {
+    newestHistoryId: "conflicting-task-history",
+    reconcileReplayOrphans: true,
+  },
+);
+assert.deepEqual(
+  conflictingTaskSharedItem.map((turn) => turn.id),
+  ["conflicting-task-history", "conflicting-task-live"],
+  "an exact block overlap cannot merge rows with conflicting native tasks",
+);
 
 // Exercise the real reducer through Vite's zero-network SSR loader. The plain
 // Node test output cannot import reducer.js directly because the browser build
@@ -4788,6 +5016,33 @@ try {
     "native-turn");
   assert.equal(duplicateState.runtimes[duplicateSid].turns[0].done, true);
 
+  const goalPromptSid = "goal-prompt-race";
+  let goalPromptState = reduce({
+    ...initialState, focusedSid: goalPromptSid,
+    runtimes: { [goalPromptSid]: createRuntime() },
+  }, { type: "event", event: event({
+    type: "user_msg", sid: goalPromptSid, msg_id: "native-goal-turn",
+    prompt: "", ts: 20,
+  }) });
+  goalPromptState = reduce(goalPromptState, {
+    type: "event", event: event({
+      type: "user_msg", sid: goalPromptSid, msg_id: "native-goal-turn",
+      prompt: "证明泰勒展开", ts: 20,
+    }),
+  });
+  goalPromptState = reduce(goalPromptState, {
+    type: "event", event: event({
+      type: "user_msg", sid: goalPromptSid, msg_id: "native-goal-turn",
+      prompt: "证明泰勒展开", ts: 20,
+    }),
+  });
+  assert.equal(goalPromptState.runtimes[goalPromptSid].turns.length, 1,
+    "late and retried Goal objective frames reuse the native empty anchor");
+  assert.equal(
+    goalPromptState.runtimes[goalPromptSid].turns[0].prompt,
+    "证明泰勒展开",
+  );
+
   const summarySid = "materialized-summary";
   const summaryState = reduce({
     ...initialState, focusedSid: summarySid,
@@ -4877,6 +5132,222 @@ try {
   assert.equal(detailState.runtimes[summarySid].turns[0].blocks.filter(
     (block: Block) => block.kind === "text" && block.channel === "final").length, 1,
   "detail replaces the summary projection instead of duplicating its final text");
+
+  // Every bounded detail page is independently decodable, so the wrapper
+  // repeats the same user/terminal envelope around its disjoint display groups.
+  // Combining pages must combine those groups, not feed an intermediate
+  // TurnEnd back through the reducer and silently keep only one page.
+  const pagedDetailSid = "multi-page-detail-envelope";
+  let pagedDetailState = reduce({
+    ...initialState,
+    focusedSid: pagedDetailSid,
+    runtimes: { [pagedDetailSid]: createRuntime() },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: pagedDetailSid,
+      session_id: pagedDetailSid,
+      revision: "paged-detail-r1",
+      generation: "paged-detail-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      has_more: false,
+      newest_id: "paged-detail-turn",
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "paged-detail-turn",
+        prompt: "run for eight hours",
+        done: true,
+        blocks: [{
+          kind: "text",
+          message_id: "paged-detail-final",
+          text: "finished",
+          done: true,
+          channel: "final",
+        }],
+        detailEventCount: 12,
+      }],
+    }),
+  });
+  const detailEnvelope = () => [
+    event({
+      type: "user_msg",
+      sid: pagedDetailSid,
+      msg_id: "paged-detail-turn",
+      prompt: "run for eight hours",
+    }),
+  ];
+  const detailTerminal = () => [
+    event({
+      type: "assistant_msg_start",
+      sid: pagedDetailSid,
+      message_id: "paged-detail-final",
+      channel: "final",
+    }),
+    event({
+      type: "delta",
+      sid: pagedDetailSid,
+      message_id: "paged-detail-final",
+      channel: "final",
+      text: "finished",
+    }),
+    event({
+      type: "assistant_msg_end",
+      sid: pagedDetailSid,
+      message_id: "paged-detail-final",
+      channel: "final",
+    }),
+    event({
+      type: "turn_end",
+      sid: pagedDetailSid,
+      turn_id: "paged-detail-native",
+      result: { subtype: "success", duration_ms: 1, is_error: false },
+    }),
+  ];
+  pagedDetailState = reduce(pagedDetailState, {
+    type: "event",
+    event: event({
+      type: "turn_detail",
+      sid: pagedDetailSid,
+      session_id: pagedDetailSid,
+      turn_id: "paged-detail-turn",
+      revision: "paged-detail-r1",
+      before: null,
+      has_more: true,
+      oldest_cursor: "2",
+      has_newer: false,
+      newer_cursor: null,
+      events: [
+        ...detailEnvelope(),
+        event({
+          type: "assistant_msg_start",
+          sid: pagedDetailSid,
+          message_id: "newer-commentary",
+          channel: "commentary",
+        }),
+        event({
+          type: "delta",
+          sid: pagedDetailSid,
+          message_id: "newer-commentary",
+          channel: "commentary",
+          text: "newer work",
+        }),
+        event({
+          type: "assistant_msg_end",
+          sid: pagedDetailSid,
+          message_id: "newer-commentary",
+          channel: "commentary",
+        }),
+        event({
+          type: "tool_use",
+          sid: pagedDetailSid,
+          message_id: "newer-tool-message",
+          tool_use_id: "newer-tool",
+          tool: "Read",
+          input: { file_path: "/tmp/newer" },
+        }),
+        event({
+          type: "tool_result",
+          sid: pagedDetailSid,
+          tool_use_id: "newer-tool",
+          content: "newer result",
+          is_error: false,
+        }),
+        event({
+          type: "process",
+          sid: pagedDetailSid,
+          item_id: "newer-compaction",
+          kind: "compaction",
+          phase: "end",
+          status: "succeeded",
+          turn_id: "paged-detail-native",
+          title: "压缩上下文",
+        }),
+        ...detailTerminal(),
+      ],
+    }),
+  });
+  pagedDetailState = reduce(pagedDetailState, {
+    type: "event",
+    event: event({
+      type: "turn_detail",
+      sid: pagedDetailSid,
+      session_id: pagedDetailSid,
+      turn_id: "paged-detail-turn",
+      revision: "paged-detail-r1",
+      before: "2",
+      has_more: false,
+      oldest_cursor: null,
+      has_newer: true,
+      newer_cursor: "4",
+      events: [
+        ...detailEnvelope(),
+        event({
+          type: "assistant_msg_start",
+          sid: pagedDetailSid,
+          message_id: "older-commentary",
+          channel: "commentary",
+        }),
+        event({
+          type: "delta",
+          sid: pagedDetailSid,
+          message_id: "older-commentary",
+          channel: "commentary",
+          text: "older work",
+        }),
+        event({
+          type: "assistant_msg_end",
+          sid: pagedDetailSid,
+          message_id: "older-commentary",
+          channel: "commentary",
+        }),
+        event({
+          type: "tool_use",
+          sid: pagedDetailSid,
+          message_id: "older-tool-message",
+          tool_use_id: "older-tool",
+          tool: "Read",
+          input: { file_path: "/tmp/older" },
+        }),
+        event({
+          type: "tool_result",
+          sid: pagedDetailSid,
+          tool_use_id: "older-tool",
+          content: "older result",
+          is_error: false,
+        }),
+        event({
+          type: "process",
+          sid: pagedDetailSid,
+          item_id: "older-compaction",
+          kind: "compaction",
+          phase: "end",
+          status: "succeeded",
+          turn_id: "paged-detail-native",
+          title: "压缩上下文",
+        }),
+        ...detailTerminal(),
+      ],
+    }),
+  });
+  assert.deepEqual(
+    pagedDetailState.runtimes[pagedDetailSid].turns[0]
+      .detailProjection?.blocks.map((block: Block) => block.kind === "text"
+        ? block.message_id
+        : block.kind === "tool" ? block.tool_use_id : block.item_id),
+    [
+      "older-commentary",
+      "older-tool",
+      "older-compaction",
+      "newer-commentary",
+      "newer-tool",
+      "newer-compaction",
+    ],
+    "disjoint detail pages survive repeated page envelopes in source order",
+  );
 
   const staleDetail = reduce(detailState, { type: "event", event: event({
     type: "turn_detail", session_id: summarySid, turn_id: "summary-message",
@@ -8090,6 +8561,7 @@ try {
       has_more: true,
       newest_id: compactRefreshVisibleId,
       in_progress: true,
+      compaction_continuation_turn_ids: [compactRefreshNativeId],
       events: [],
       turns: [{
         id: compactRefreshVisibleId,
@@ -8117,6 +8589,62 @@ try {
   assert.equal(
     compactRefreshState.runtimes[compactRefreshSid].turns[0].interrupted,
     undefined,
+  );
+  const compactIdleState = reduce(compactRefreshState, {
+    type: "event",
+    event: event({
+      type: "state", sid: compactRefreshSid, seq: 11, state: "idle",
+    }),
+  });
+  assert.deepEqual(
+    {
+      done: compactIdleState.runtimes[compactRefreshSid].turns[0].done,
+      interrupted: compactIdleState.runtimes[compactRefreshSid].turns[0]
+        .interrupted,
+    },
+    { done: true, interrupted: true },
+    "a later exact idle lifecycle cannot leave a compact History shell running",
+  );
+  const coldInterruptedState = reduce({
+    ...initialState,
+    focusedSid: compactRefreshSid,
+    runtimes: {
+      [compactRefreshSid]: {
+        ...createRuntime(), state: "idle" as const, syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: compactRefreshSid,
+      session_id: compactRefreshSid,
+      revision: "compact-cold-r1",
+      generation: "compact-cold-g1",
+      build_seq: 1,
+      live_seq: 10,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: compactRefreshVisibleId,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: compactRefreshVisibleId,
+        prompt: "a real interrupted turn on another device",
+        forkPointId: compactRefreshNativeId,
+        done: true,
+        interrupted: true,
+        blocks: [],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    coldInterruptedState.runtimes[compactRefreshSid].turns[0].done,
+    true,
+    "in_progress plus a native id cannot reopen a cold interrupt without compact evidence",
   );
   for (const liveEvent of [
     event({
@@ -8149,6 +8677,1493 @@ try {
       .filter((block: Block) => block.kind === "text")
       .map((block: Block) => block.kind === "text" ? block.text : ""),
     ["before compact", "after compact"],
+  );
+
+  const falseTerminalSid = "compact-false-terminal-recovery";
+  const falseTerminalId = "compact-false-terminal-user";
+  const falseTerminalRuntime = (
+    terminalSource: "unexpected_interrupt" | "remote_interrupt" | "failed",
+    error = "本次回复未完成，请重试。",
+  ) => ({
+    ...createRuntime(),
+    state: "running" as const,
+    syncReady: true,
+    historyRevision: "compact-false-r1",
+    historyGeneration: "compact-false-g1",
+    controlGeneration: "compact-false-g1",
+    historyBuildSeq: 1,
+    historyLiveSeq: 20,
+    historyFence: 20,
+    historyNewestId: falseTerminalId,
+    lastLiveSeq: 20,
+    lastLifecycleSeq: 20,
+    turns: [{
+      id: falseTerminalId,
+      prompt: "keep working through compaction",
+      forkPointId: "compact-false-native",
+      done: true,
+      interrupted: true,
+      error,
+      terminalSource,
+      blocks: [],
+    }],
+  });
+  const falseTerminalHistory = (
+    overrides: Record<string, unknown> = {},
+  ) => event({
+    type: "history",
+    sid: falseTerminalSid,
+    session_id: falseTerminalSid,
+    revision: "compact-false-r1",
+    generation: "compact-false-g1",
+    build_seq: 2,
+    live_seq: 20,
+    detail: "summary",
+    authoritative: true,
+    has_more: false,
+    newest_id: falseTerminalId,
+    in_progress: true,
+    compaction_continuation_turn_ids: ["compact-false-native"],
+    events: [],
+    turns: [{
+      id: falseTerminalId,
+      prompt: "keep working through compaction",
+      forkPointId: "compact-false-native",
+      done: true,
+      interrupted: true,
+      blocks: [],
+    }],
+    ...overrides,
+  });
+  const recoverFalseTerminal = (
+    terminalSource: "unexpected_interrupt" | "remote_interrupt" | "failed",
+    overrides: Record<string, unknown> = {},
+    error?: string,
+  ) => reduce({
+    ...initialState,
+    focusedSid: falseTerminalSid,
+    runtimes: {
+      [falseTerminalSid]: falseTerminalRuntime(terminalSource, error),
+    },
+  }, {
+    type: "event",
+    event: falseTerminalHistory(overrides),
+  });
+
+  let eventDrivenFalseTerminal = {
+    ...initialState,
+    focusedSid: falseTerminalSid,
+    runtimes: {
+      [falseTerminalSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        historyRevision: "compact-false-r1",
+        historyGeneration: "compact-false-g1",
+        controlGeneration: "compact-false-g1",
+        historyBuildSeq: 1,
+        historyLiveSeq: 18,
+        historyFence: 18,
+        historyNewestId: falseTerminalId,
+        lastLiveSeq: 18,
+        lastLifecycleSeq: 18,
+      },
+    },
+  };
+  for (const liveEvent of [
+    {
+      type: "user_msg", sid: falseTerminalSid, seq: 19,
+      msg_id: falseTerminalId, prompt: "keep working through compaction",
+    },
+    {
+      type: "turn_end", sid: falseTerminalSid, seq: 20,
+      turn_id: "compact-false-native",
+      result: {
+        subtype: "error_during_execution",
+        duration_ms: 1000,
+        is_error: true,
+      },
+    },
+  ]) {
+    eventDrivenFalseTerminal = reduce(eventDrivenFalseTerminal, {
+      type: "event", event: event(liveEvent),
+    });
+  }
+  assert.equal(
+    eventDrivenFalseTerminal.runtimes[falseTerminalSid].turns[0]
+      .terminalSource,
+    "unexpected_interrupt",
+    "the reducer must classify an unrequested interrupted TurnEnd itself",
+  );
+  let falseTerminalRecovered = reduce(eventDrivenFalseTerminal, {
+    type: "event",
+    event: falseTerminalHistory(),
+  });
+  assert.deepEqual(
+    {
+      done: falseTerminalRecovered.runtimes[falseTerminalSid].turns[0].done,
+      interrupted: falseTerminalRecovered.runtimes[falseTerminalSid]
+        .turns[0].interrupted,
+      error: falseTerminalRecovered.runtimes[falseTerminalSid].turns[0].error,
+      terminalSource: falseTerminalRecovered.runtimes[falseTerminalSid]
+        .turns[0].terminalSource,
+    },
+    { done: false, interrupted: undefined, error: undefined,
+      terminalSource: "compact_continuation" },
+    "a current exact running History head repairs one unexpected false terminal",
+  );
+
+  const overlappingLiveTurn = {
+    id: falseTerminalId,
+    prompt: "keep working through compaction",
+    forkPointId: "compact-false-native",
+    done: false,
+    blocks: [{
+      kind: "process" as const,
+      item_id: "compact-live-command",
+      processKind: "command" as const,
+      phase: "start" as const,
+      status: "running" as const,
+      title: "still running",
+      done: false,
+    }],
+  };
+  const overlappingBase = {
+    ...initialState,
+    focusedSid: "another-session",
+    runtimes: {
+      [falseTerminalSid]: {
+        ...falseTerminalRuntime("unexpected_interrupt"),
+        turns: [overlappingLiveTurn],
+      },
+    },
+  };
+  const overlappingCompactRecovered = reduce(overlappingBase, {
+    type: "event",
+    event: falseTerminalHistory(),
+  });
+  assert.deepEqual({
+    done: overlappingCompactRecovered.runtimes[falseTerminalSid].turns[0].done,
+    interrupted: overlappingCompactRecovered.runtimes[falseTerminalSid]
+      .turns[0].interrupted,
+    processDone: overlappingCompactRecovered.runtimes[falseTerminalSid]
+      .turns[0].blocks[0].done,
+  }, {
+    done: false,
+    interrupted: undefined,
+    processDone: false,
+  }, "exact compact authority reopens an overlapping live row even in a background session");
+
+  const realInterruptRemainsTerminal = reduce(overlappingBase, {
+    type: "event",
+    event: falseTerminalHistory({
+      compaction_continuation_turn_ids: [],
+    }),
+  });
+  assert.deepEqual({
+    done: realInterruptRemainsTerminal.runtimes[falseTerminalSid].turns[0].done,
+    interrupted: realInterruptRemainsTerminal.runtimes[falseTerminalSid]
+      .turns[0].interrupted,
+    processDone: realInterruptRemainsTerminal.runtimes[falseTerminalSid]
+      .turns[0].blocks[0].done,
+  }, {
+    done: true,
+    interrupted: true,
+    processDone: true,
+  }, "running transport state cannot reopen a real terminal or leave its process open");
+
+  const successfulBackgroundBase = {
+    ...initialState,
+    focusedSid: "another-session",
+    runtimes: {
+      [falseTerminalSid]: {
+        ...falseTerminalRuntime("unexpected_interrupt"),
+        state: "idle" as const,
+        turns: [{ ...overlappingLiveTurn, done: true }],
+      },
+    },
+  };
+  const successfulBackgroundRemainsVisible = reduce(successfulBackgroundBase, {
+    type: "event",
+    event: falseTerminalHistory({
+      in_progress: false,
+      compaction_continuation_turn_ids: [],
+      turns: [{
+        id: falseTerminalId,
+        prompt: "keep working through compaction",
+        forkPointId: "compact-false-native",
+        done: true,
+        blocks: [],
+      }],
+    }),
+  });
+  assert.deepEqual({
+    done: successfulBackgroundRemainsVisible.runtimes[falseTerminalSid]
+      .turns[0].done,
+    interrupted: successfulBackgroundRemainsVisible
+      .runtimes[falseTerminalSid].turns[0].interrupted,
+    processDone: successfulBackgroundRemainsVisible
+      .runtimes[falseTerminalSid].turns[0].blocks[0].done,
+  }, {
+    done: true,
+    interrupted: undefined,
+    processDone: false,
+  }, "a successful answer can retain genuine background agent activity");
+  falseTerminalRecovered = reduce(falseTerminalRecovered, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: falseTerminalSid,
+      seq: 21,
+      message_id: "compact-false-follow-up",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    falseTerminalRecovered.runtimes[falseTerminalSid].turns.length,
+    1,
+    "assistant output after false-terminal recovery stays in the original row",
+  );
+  const compactHistorySettled = reduce(falseTerminalRecovered, {
+    type: "event",
+    event: falseTerminalHistory({
+      build_seq: 3,
+      live_seq: 21,
+      in_progress: false,
+      compaction_continuation_turn_ids: [],
+    }),
+  });
+  assert.deepEqual(
+    {
+      done: compactHistorySettled.runtimes[falseTerminalSid].turns[0].done,
+      terminalSource: compactHistorySettled.runtimes[falseTerminalSid]
+        .turns[0].terminalSource,
+    },
+    { done: true, terminalSource: undefined },
+    "an authoritative terminal History settles compact metadata without a State frame",
+  );
+
+  for (const [label, recovered] of [
+    ["stale live sequence", recoverFalseTerminal(
+      "unexpected_interrupt", { live_seq: 19 })],
+    ["wrong newest row", recoverFalseTerminal(
+      "unexpected_interrupt", { newest_id: "another-row" })],
+    ["old wrapper generation", recoverFalseTerminal(
+      "unexpected_interrupt", { generation: "compact-false-old" })],
+    ["explicit Remote interrupt", recoverFalseTerminal(
+      "remote_interrupt", { compaction_continuation_turn_ids: [] })],
+    ["failed/auth terminal", recoverFalseTerminal(
+      "failed", { compaction_continuation_turn_ids: [] },
+      "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。")],
+  ] as const) {
+    assert.equal(
+      recovered.runtimes[falseTerminalSid].turns[0].done,
+      true,
+      `${label} cannot be washed away by a running History envelope`,
+    );
+  }
+
+  // A newer authoritative active head supersedes an older explicit task owner.
+  // Assistant items have no turn id, so the downstream sequence is the only
+  // authoritative fence: an explicit owner accepted before the exact History
+  // head cannot steal its first output merely because that old row is still
+  // locally unfinished.
+  for (const [suffix, oldTaskId, newTaskId] of [
+    ["different-task", "stale-task", "current-task"],
+    ["same-task", "shared-task", "shared-task"],
+  ] as const) {
+    const sid = `history-head-after-old-steer-${suffix}`;
+    let routedState = {
+      ...initialState,
+      focusedSid: sid,
+      runtimes: {
+        [sid]: {
+          ...createRuntime(),
+          state: "running" as const,
+          syncReady: true,
+        },
+      },
+    };
+    routedState = reduce(routedState, {
+      type: "event",
+      event: event({
+        type: "turn_steered",
+        sid,
+        seq: 10,
+        msg_id: `old-client-${suffix}`,
+        turn_id: oldTaskId,
+        prompt: "old guided segment",
+      }),
+    });
+    routedState = reduce(routedState, {
+      type: "event",
+      event: event({
+        type: "history",
+        sid,
+        session_id: sid,
+        revision: `history-head-${suffix}-r1`,
+        generation: `history-head-${suffix}-g1`,
+        build_seq: 1,
+        live_seq: 10,
+        detail: "summary",
+        authoritative: true,
+        has_more: true,
+        newest_id: `new-history-${suffix}`,
+        in_progress: true,
+        compaction_continuation_turn_ids: [newTaskId],
+        events: [],
+        turns: [{
+          id: `new-history-${suffix}`,
+          prompt: "current native segment",
+          forkPointId: newTaskId,
+          done: true,
+          interrupted: true,
+          blocks: [],
+        }],
+      }),
+    });
+    routedState = reduce(routedState, {
+      type: "event",
+      event: event({
+        type: "assistant_msg_start",
+        sid,
+        seq: 11,
+        message_id: `current-output-${suffix}`,
+        channel: "commentary",
+      }),
+    });
+    const routedTurns = routedState.runtimes[sid].turns;
+    assert.equal(
+      routedTurns.find((turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === `current-output-${suffix}`))?.id,
+      `new-history-${suffix}`,
+      "an old explicit steer cannot steal output from a newer History head",
+    );
+  }
+
+  // Conversely, a TurnSteered event accepted after the active History shell is
+  // the ordered owner of subsequent id-less output. This is the normal local
+  // steer path and must not regress while stale pre-head owners are ignored.
+  const postHistorySteerSid = "post-history-local-steer-owner";
+  let postHistorySteerState = reduce({
+    ...initialState,
+    focusedSid: postHistorySteerSid,
+    runtimes: {
+      [postHistorySteerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: postHistorySteerSid,
+      session_id: postHistorySteerSid,
+      revision: "post-history-steer-r1",
+      generation: "post-history-steer-g1",
+      build_seq: 1,
+      live_seq: 20,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "post-history-shell",
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "post-history-shell",
+        prompt: "work before guidance",
+        forkPointId: "post-history-native-task",
+        done: true,
+        interrupted: true,
+        blocks: [],
+      }],
+    }),
+  });
+  postHistorySteerState = reduce(postHistorySteerState, {
+    type: "event",
+    event: event({
+      type: "turn_steered",
+      sid: postHistorySteerSid,
+      seq: 21,
+      msg_id: "post-history-client-steer",
+      turn_id: "post-history-native-task",
+      prompt: "guide after the snapshot",
+    }),
+  });
+  postHistorySteerState = reduce(postHistorySteerState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: postHistorySteerSid,
+      seq: 22,
+      message_id: "post-history-output",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    postHistorySteerState.runtimes[postHistorySteerSid].turns.find(
+      (turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "post-history-output"))?.id,
+    "post-history-client-steer",
+    "a local steer created after the History head owns later output",
+  );
+
+  // Re-key can merge a temp runtime into an already-known native runtime. The
+  // two runtimes share one downstream generation, so their History/steer
+  // sequence evidence is comparable and must remain monotonic. Letting the
+  // lower source values overwrite the target makes a stale temp owner win the
+  // next id-less assistant item.
+  const rekeyFenceOld = "tmp-rekey-owner-fence";
+  const rekeyFenceSid = "real-rekey-owner-fence";
+  let rekeyFenceState = reduce({
+    ...initialState,
+    focusedSid: rekeyFenceOld,
+    runtimes: {
+      [rekeyFenceOld]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        historyRevision: "rekey-owner-r1",
+        historyGeneration: "rekey-owner-g1",
+        controlGeneration: "rekey-owner-g1",
+        historyNewestId: "rekey-owner-head",
+        historyFence: 10,
+        liveOwner: {
+          turnId: "rekey-stale-source-owner",
+          seq: 20,
+        },
+        turns: [{
+          id: "rekey-stale-source-owner",
+          liveTaskId: "rekey-stale-task",
+          prompt: "stale temp owner",
+          done: false,
+          blocks: [],
+        }],
+      },
+      [rekeyFenceSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        hasRevisionedControl: true,
+        historyRevision: "rekey-owner-r1",
+        historyGeneration: "rekey-owner-g1",
+        controlGeneration: "rekey-owner-g1",
+        historyNewestId: "rekey-owner-head",
+        historyFence: 50,
+        liveOwner: {
+          turnId: "rekey-current-target-owner",
+          seq: 55,
+        },
+        turns: [{
+          id: "rekey-owner-head",
+          forkPointId: "rekey-current-task",
+          prompt: "authoritative head",
+          done: false,
+          blocks: [],
+        }, {
+          id: "rekey-current-target-owner",
+          liveTaskId: "rekey-current-task",
+          prompt: "current owner after head",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "session_rekey",
+      sid: rekeyFenceOld,
+      old_key: rekeyFenceOld,
+      session_id: rekeyFenceSid,
+      cwd: "/repo",
+    }),
+  });
+  assert.equal(
+    rekeyFenceState.runtimes[rekeyFenceSid].historyFence,
+    50,
+    "same-generation rekey keeps the greatest History owner fence",
+  );
+  assert.deepEqual(
+    rekeyFenceState.runtimes[rekeyFenceSid].liveOwner,
+    { turnId: "rekey-current-target-owner", seq: 55 },
+    "same-generation rekey keeps the newest explicit owner proof",
+  );
+  assert.equal(
+    rekeyFenceState.runtimes[rekeyFenceSid].hasRevisionedControl,
+    true,
+    "same-generation rekey preserves revisioned-control authority from either runtime",
+  );
+  rekeyFenceState = reduce(rekeyFenceState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: rekeyFenceSid,
+      seq: 56,
+      message_id: "rekey-current-output",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    rekeyFenceState.runtimes[rekeyFenceSid].turns.find(
+      (turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "rekey-current-output"))?.id,
+    "rekey-current-target-owner",
+    "rekey cannot route new output through an older temp owner",
+  );
+
+  // A temp runtime belongs to the wrapper generation which captured its real
+  // id. If a stale durable runtime survived from an older wrapper, its History
+  // revision/head and sequence watermarks are not comparable and must not be
+  // inherited during the re-key.
+  const crossGenerationOld = "tmp-cross-generation-rekey";
+  const crossGenerationSid = "real-cross-generation-rekey";
+  const staleCrossGenerationTurn: Turn = {
+    id: "rekey-old-projection",
+    prompt: "old projected history",
+    done: true,
+    blocks: [],
+  };
+  const staleCrossGenerationBrowse = {
+    scopeKey: "rekey-old-scope",
+    sid: crossGenerationSid,
+    revision: "rekey-old-revision",
+    generation: "rekey-old-generation",
+    viewId: "rekey-old-view",
+    windowEpoch: 0,
+    turns: [staleCrossGenerationTurn],
+    segments: [],
+    loadedPageKeys: [],
+    oldestPageKey: null,
+    newestPageKey: null,
+    hasOlder: true,
+    olderCursor: "rekey-old-cursor",
+    hasNewer: false,
+    newerPageKey: null,
+    latestDirty: false,
+  };
+  let crossGenerationState = reduce({
+    ...initialState,
+    focusedSid: crossGenerationOld,
+    historyRecovery: {
+      sid: crossGenerationSid,
+      turns: [staleCrossGenerationTurn],
+      hasMore: true,
+      oldestId: "rekey-old-cursor",
+      viewRevision: "rekey-old-revision",
+      expectedGeneration: "rekey-old-generation",
+      candidateBuildSeq: null,
+      acceptedRevision: null,
+    },
+    historyBrowse: staleCrossGenerationBrowse,
+    retainedHistoryBrowse: {
+      ...staleCrossGenerationBrowse,
+      viewId: "rekey-old-retained-view",
+    },
+    runtimes: {
+      [crossGenerationOld]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "rekey-new-generation",
+        lastLiveSeq: 3,
+        lastLifecycleSeq: 3,
+        liveOwner: {
+          turnId: "rekey-new-owner",
+          seq: 3,
+        },
+        turns: [{
+          id: "rekey-new-owner",
+          clientMsgId: "rekey-new-owner",
+          liveTaskId: "rekey-new-native-task",
+          prompt: "new generation prompt",
+          done: false,
+          blocks: [],
+        }],
+      },
+      [crossGenerationSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        hasRevisionedControl: true,
+        controlGeneration: "rekey-old-generation",
+        historyRevision: "rekey-old-revision",
+        historyGeneration: "rekey-old-generation",
+        historyBuildSeq: 80,
+        historyLiveSeq: 81,
+        historyFence: 81,
+        historyNewestId: "rekey-old-head",
+        lastLiveSeq: 82,
+        lastLifecycleSeq: 82,
+        hydratedCacheTurnIds: ["rekey-old-head"],
+        liveDetailTurnIds: ["rekey-old-head"],
+        liveOwner: {
+          turnId: "rekey-old-head",
+          seq: 82,
+        },
+        turns: [{
+          id: "rekey-old-head",
+          forkPointId: "rekey-old-native-task",
+          prompt: "old generation prompt",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "session_rekey",
+      sid: crossGenerationOld,
+      old_key: crossGenerationOld,
+      session_id: crossGenerationSid,
+      cwd: "/repo",
+    }),
+  });
+  const crossGenerationRuntime =
+    crossGenerationState.runtimes[crossGenerationSid];
+  assert.deepEqual(
+    {
+      historyRevision: crossGenerationRuntime.historyRevision,
+      historyGeneration: crossGenerationRuntime.historyGeneration,
+      controlGeneration: crossGenerationRuntime.controlGeneration,
+      historyBuildSeq: crossGenerationRuntime.historyBuildSeq,
+      historyLiveSeq: crossGenerationRuntime.historyLiveSeq,
+      historyFence: crossGenerationRuntime.historyFence,
+      historyNewestId: crossGenerationRuntime.historyNewestId,
+      lastLiveSeq: crossGenerationRuntime.lastLiveSeq,
+      lastLifecycleSeq: crossGenerationRuntime.lastLifecycleSeq,
+      hydratedCacheTurnIds: crossGenerationRuntime.hydratedCacheTurnIds,
+      liveDetailTurnIds: crossGenerationRuntime.liveDetailTurnIds,
+    },
+    {
+      historyRevision: null,
+      historyGeneration: null,
+      controlGeneration: "rekey-new-generation",
+      historyBuildSeq: 0,
+      historyLiveSeq: 0,
+      historyFence: null,
+      historyNewestId: null,
+      lastLiveSeq: 3,
+      lastLifecycleSeq: 3,
+      hydratedCacheTurnIds: [],
+      liveDetailTurnIds: [],
+    },
+    "cross-generation rekey cannot inherit old History authority or watermarks",
+  );
+  assert.deepEqual(
+    crossGenerationRuntime.turns.map((turn: Turn) => turn.id),
+    ["rekey-new-owner"],
+    "cross-generation rekey drops the old generation's visible History head",
+  );
+  assert.deepEqual(
+    crossGenerationRuntime.liveOwner,
+    { turnId: "rekey-new-owner", seq: 3 },
+    "cross-generation rekey preserves only the new generation owner proof",
+  );
+  assert.equal(
+    crossGenerationRuntime.hasRevisionedControl,
+    false,
+    "cross-generation rekey cannot inherit sticky control authority from the old target runtime",
+  );
+  let crossGenerationLegacyControlState = reduce(crossGenerationState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: crossGenerationSid,
+      session_id: crossGenerationSid,
+      revision: "rekey-new-legacy-ownership",
+      generation: "rekey-new-generation",
+      build_seq: 1,
+      live_seq: 3,
+      has_more: false,
+      in_progress: true,
+      authoritative: true,
+      external: true,
+      takeover_pending: false,
+      events: [],
+    }),
+  });
+  assert.equal(
+    crossGenerationLegacyControlState.runtimes[crossGenerationSid].external,
+    true,
+    "cross-generation rekey restores authoritative History ownership fallback",
+  );
+  crossGenerationLegacyControlState = reduce(
+    crossGenerationLegacyControlState,
+    {
+      type: "event",
+      event: event({
+        type: "takeover_state",
+        sid: crossGenerationSid,
+        pending: true,
+        message: "new generation legacy takeover",
+      }),
+    },
+  );
+  assert.deepEqual(
+    {
+      pending: crossGenerationLegacyControlState
+        .runtimes[crossGenerationSid].takeoverPending,
+      message: crossGenerationLegacyControlState
+        .runtimes[crossGenerationSid].takeoverMessage,
+    },
+    {
+      pending: true,
+      message: "new generation legacy takeover",
+    },
+    "cross-generation rekey restores legacy takeover-state updates",
+  );
+  assert.equal(crossGenerationState.historyRecovery, null,
+    "cross-generation rekey drops the durable id's stale recovery window");
+  assert.equal(crossGenerationState.historyBrowse, null,
+    "cross-generation rekey drops the durable id's stale browse window");
+  assert.equal(crossGenerationState.retainedHistoryBrowse, null,
+    "cross-generation rekey drops the durable id's stale retained window");
+  crossGenerationState = reduce(crossGenerationState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: crossGenerationSid,
+      seq: 4,
+      message_id: "rekey-new-output",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    crossGenerationState.runtimes[crossGenerationSid].turns.find(
+      (turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "rekey-new-output"))?.id,
+    "rekey-new-owner",
+    "unbound new-generation output cannot attach to an old History head",
+  );
+
+  // In one generation mergeInitialHistory deliberately keeps the live/source
+  // row id while preserving the target id as historyTurnId. Owner evidence
+  // must follow that surviving id instead of becoming a dangling reference.
+  const overlapOwnerOld = "tmp-rekey-overlap-owner";
+  const overlapOwnerSid = "real-rekey-overlap-owner";
+  let overlapOwnerState = reduce({
+    ...initialState,
+    focusedSid: overlapOwnerOld,
+    runtimes: {
+      [overlapOwnerOld]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "rekey-overlap-generation",
+        historyRevision: "rekey-overlap-revision",
+        historyGeneration: "rekey-overlap-generation",
+        historyNewestId: "rekey-overlap-head",
+        historyFence: 10,
+        liveOwner: {
+          turnId: "rekey-surviving-owner",
+          seq: 19,
+        },
+        turns: [{
+          id: "rekey-surviving-owner",
+          historyTurnId: "rekey-retired-owner",
+          liveTaskId: "rekey-overlap-native-task",
+          prompt: "guided owner",
+          done: false,
+          blocks: [],
+        }],
+      },
+      [overlapOwnerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "rekey-overlap-generation",
+        historyRevision: "rekey-overlap-revision",
+        historyGeneration: "rekey-overlap-generation",
+        historyNewestId: "rekey-overlap-head",
+        historyFence: 10,
+        liveOwner: {
+          turnId: "rekey-retired-owner",
+          seq: 20,
+        },
+        turns: [{
+          id: "rekey-overlap-head",
+          forkPointId: "rekey-overlap-head-task",
+          prompt: "authoritative head",
+          done: false,
+          blocks: [],
+        }, {
+          id: "rekey-retired-owner",
+          clientMsgId: "rekey-surviving-owner",
+          liveTaskId: "rekey-overlap-native-task",
+          prompt: "guided owner",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "session_rekey",
+      sid: overlapOwnerOld,
+      old_key: overlapOwnerOld,
+      session_id: overlapOwnerSid,
+      cwd: "/repo",
+    }),
+  });
+  assert.equal(
+    overlapOwnerState.runtimes[overlapOwnerSid].turns.some(
+      (turn: Turn) => turn.id === "rekey-retired-owner"),
+    false,
+    "the target owner id is replaced by the overlapping source row",
+  );
+  assert.deepEqual(
+    overlapOwnerState.runtimes[overlapOwnerSid].liveOwner,
+    { turnId: "rekey-surviving-owner", seq: 20 },
+    "same-generation owner evidence follows the row which survives merging",
+  );
+  overlapOwnerState = reduce(overlapOwnerState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: overlapOwnerSid,
+      seq: 21,
+      message_id: "rekey-overlap-output",
+      channel: "commentary",
+    }),
+  });
+  assert.equal(
+    overlapOwnerState.runtimes[overlapOwnerSid].turns.find(
+      (turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "rekey-overlap-output"))?.id,
+    "rekey-surviving-owner",
+    "a remapped post-fence owner keeps unbound output off the History head",
+  );
+
+  // Sequence numbers restart with the wrapper generation. Even when no
+  // History page established historyGeneration yet, a new Snapshot must clear
+  // the old generation's owner/fence rather than comparing unrelated numbers.
+  const ownerGenerationSid = "owner-generation-reset-without-history";
+  const ownerGenerationState = reduce({
+    ...initialState,
+    focusedSid: ownerGenerationSid,
+    runtimes: {
+      [ownerGenerationSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "owner-old-g",
+        historyGeneration: null,
+        historyFence: 40,
+        liveOwner: {
+          turnId: "owner-old-turn",
+          seq: 41,
+        },
+        turns: [{
+          id: "owner-old-turn",
+          liveTaskId: "owner-old-task",
+          prompt: "old generation",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "snapshot",
+      sid: ownerGenerationSid,
+      cc_session_id: ownerGenerationSid,
+      generation: "owner-new-g",
+      state: "running",
+    }),
+  });
+  assert.equal(
+    ownerGenerationState.runtimes[ownerGenerationSid].historyFence,
+    null,
+    "generation switch clears an unscoped History owner fence",
+  );
+  assert.equal(
+    ownerGenerationState.runtimes[ownerGenerationSid].liveOwner,
+    null,
+    "generation switch clears an unscoped explicit owner proof",
+  );
+
+  // Clearing the explicit owner proof is insufficient if the legacy fallback
+  // can still select an unfinished row carrying the previous generation's
+  // liveTaskId. The first unbound narrative item in the new generation must
+  // open a fresh row, regardless of which item starts the stream.
+  for (const [kind, freshTurnId, unboundEvent, blockOwnsEvent] of [
+    [
+      "assistant",
+      "owner-new-assistant",
+      event({
+        type: "assistant_msg_start",
+        sid: ownerGenerationSid,
+        seq: 1,
+        message_id: "owner-new-assistant",
+        channel: "commentary",
+      }),
+      (block: Block) => block.kind === "text"
+        && block.message_id === "owner-new-assistant",
+    ],
+    [
+      "delta",
+      "owner-new-delta",
+      event({
+        type: "delta",
+        sid: ownerGenerationSid,
+        seq: 1,
+        message_id: "owner-new-delta",
+        channel: "commentary",
+        text: "new generation text",
+      }),
+      (block: Block) => block.kind === "text"
+        && block.message_id === "owner-new-delta",
+    ],
+    [
+      "tool",
+      "owner-new-tool-message",
+      event({
+        type: "tool_use",
+        sid: ownerGenerationSid,
+        seq: 1,
+        message_id: "owner-new-tool-message",
+        tool_use_id: "owner-new-tool",
+        tool: "Read",
+        input: { file_path: "README.md" },
+      }),
+      (block: Block) => block.kind === "tool"
+        && block.tool_use_id === "owner-new-tool",
+    ],
+  ] as const) {
+    const routed = reduce(ownerGenerationState, {
+      type: "event",
+      event: unboundEvent,
+    });
+    const owner = routed.runtimes[ownerGenerationSid].turns.find(
+      (turn: Turn) => turn.blocks.some(blockOwnsEvent),
+    );
+    assert.equal(
+      owner?.id,
+      freshTurnId,
+      `the first unbound ${kind} item cannot fall back across generations`,
+    );
+  }
+
+  let chainedGenerationState = ownerGenerationState;
+  for (const chainedEvent of [
+    event({
+      type: "assistant_msg_start",
+      sid: ownerGenerationSid,
+      seq: 1,
+      message_id: "owner-new-chain-first",
+      channel: "commentary",
+    }),
+    event({
+      type: "tool_use",
+      sid: ownerGenerationSid,
+      seq: 2,
+      message_id: "owner-new-chain-tool-message",
+      tool_use_id: "owner-new-chain-tool",
+      tool: "Read",
+      input: { file_path: "README.md" },
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: ownerGenerationSid,
+      seq: 3,
+      message_id: "owner-new-chain-second",
+      channel: "final",
+    }),
+  ]) {
+    chainedGenerationState = reduce(chainedGenerationState, {
+      type: "event",
+      event: chainedEvent,
+    });
+  }
+  const chainedGenerationTurns =
+    chainedGenerationState.runtimes[ownerGenerationSid].turns;
+  const chainedOwner = chainedGenerationTurns.find((turn: Turn) =>
+    turn.blocks.some((block: Block) => block.kind === "text"
+      && block.message_id === "owner-new-chain-first"));
+  assert.deepEqual(
+    chainedOwner?.blocks.map((block: Block) => block.kind === "text"
+      ? block.message_id
+      : block.kind === "tool" ? block.tool_use_id : block.item_id),
+    [
+      "owner-new-chain-first",
+      "owner-new-chain-tool",
+      "owner-new-chain-second",
+    ],
+    "every unbound item in the new turn stays on its generation-safe owner",
+  );
+  assert.equal(
+    chainedGenerationTurns.find((turn: Turn) =>
+      turn.id === "owner-old-turn")?.blocks.length,
+    0,
+    "later new-generation message ids cannot reactivate the old liveTaskId owner",
+  );
+
+  const sameGenerationLegacyState = reduce({
+    ...initialState,
+    focusedSid: "same-generation-legacy-owner",
+    runtimes: {
+      "same-generation-legacy-owner": {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "same-generation-legacy-g",
+        turns: [{
+          id: "same-generation-legacy-turn",
+          liveTaskId: "same-generation-legacy-task",
+          prompt: "legacy owner",
+          done: false,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "delta",
+      sid: "same-generation-legacy-owner",
+      seq: 2,
+      message_id: "same-generation-legacy-output",
+      channel: "commentary",
+      text: "same generation",
+    }),
+  });
+  assert.equal(
+    sameGenerationLegacyState.runtimes["same-generation-legacy-owner"]
+      .turns.find((turn: Turn) => turn.blocks.some((block: Block) =>
+        block.kind === "text"
+        && block.message_id === "same-generation-legacy-output"))?.id,
+    "same-generation-legacy-turn",
+    "same-generation legacy liveTaskId fallback remains supported",
+  );
+
+  // If TurnEnd is lost, an idle authoritative History owns the lifecycle of a
+  // block-overlapping aliasless live row. Its interrupted terminal and timing
+  // must not be converted into a successful local idle repair.
+  const idleInterruptedSid = "idle-interrupted-aliasless-replay";
+  let idleInterruptedState = {
+    ...initialState,
+    focusedSid: idleInterruptedSid,
+    runtimes: {
+      [idleInterruptedSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+      },
+    },
+  };
+  for (const liveEvent of [
+    event({
+      type: "turn_steered",
+      sid: idleInterruptedSid,
+      seq: 30,
+      msg_id: "idle-interrupted-client",
+      turn_id: "idle-interrupted-native",
+      prompt: "work until interrupted",
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: idleInterruptedSid,
+      seq: 31,
+      message_id: "idle-interrupted-final",
+      channel: "final",
+    }),
+    event({
+      type: "delta",
+      sid: idleInterruptedSid,
+      seq: 32,
+      message_id: "idle-interrupted-final",
+      channel: "final",
+      text: "partial final before interruption",
+    }),
+    event({
+      type: "assistant_msg_end",
+      sid: idleInterruptedSid,
+      seq: 33,
+      message_id: "idle-interrupted-final",
+      channel: "final",
+    }),
+  ]) {
+    idleInterruptedState = reduce(idleInterruptedState, {
+      type: "event", event: liveEvent,
+    });
+  }
+  idleInterruptedState = reduce(idleInterruptedState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: idleInterruptedSid,
+      session_id: idleInterruptedSid,
+      revision: "idle-interrupted-r1",
+      generation: "idle-interrupted-g1",
+      build_seq: 1,
+      live_seq: 33,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "idle-interrupted-history",
+      in_progress: false,
+      ts: 1.2,
+      events: [],
+      turns: [{
+        id: "idle-interrupted-history",
+        prompt: "work until interrupted",
+        forkPointId: "idle-interrupted-native",
+        done: true,
+        interrupted: true,
+        ts: 100,
+        doneTs: 1_200,
+        durationMs: 1_100,
+        blocks: [{
+          kind: "text",
+          message_id: "idle-interrupted-final",
+          channel: "final",
+          text: "partial final before interruption",
+          done: true,
+        }],
+      }],
+    }),
+  });
+  const idleInterruptedTurn =
+    idleInterruptedState.runtimes[idleInterruptedSid].turns[0];
+  assert.deepEqual(
+    {
+      done: idleInterruptedTurn.done,
+      interrupted: idleInterruptedTurn.interrupted,
+      doneTs: idleInterruptedTurn.doneTs,
+      durationMs: idleInterruptedTurn.durationMs,
+    },
+    { done: true, interrupted: true, doneTs: 1_200, durationMs: 1_100 },
+    "idle History keeps its authoritative interrupted lifecycle and timing",
+  );
+
+  // During Command+R the first authoritative summary can materialize a steered
+  // user row before its client/native alias is available. The same native
+  // commentary is already present in the live row. Exact block identity plus
+  // the envelope's exact active newest_id is sufficient to bind that one row;
+  // prompt equality or a shared native task id alone is not.
+  const aliaslessActiveSid = "aliasless-active-steer-refresh";
+  const aliaslessHistory = (buildSeq: number) => event({
+    type: "history",
+    sid: aliaslessActiveSid,
+    session_id: aliaslessActiveSid,
+    revision: "aliasless-active-r1",
+    generation: "aliasless-active-g1",
+    build_seq: buildSeq,
+    live_seq: 30,
+    detail: "summary",
+    authoritative: true,
+    has_more: true,
+    newest_id: "history-steer-row",
+    in_progress: true,
+    events: [],
+    turns: [
+      {
+        id: "native-active-task",
+        prompt: "start work",
+        forkPointId: "native-active-task",
+        done: true,
+        blocks: [],
+      },
+      {
+        id: "history-steer-row",
+        prompt: "guide the running task",
+        forkPointId: "native-active-task",
+        done: true,
+        blocks: [{
+          kind: "text",
+          message_id: "shared-active-commentary",
+          channel: "commentary",
+          text: "one visible update",
+          done: true,
+        }],
+      },
+    ],
+  });
+  let aliaslessActiveState = reduce({
+    ...initialState,
+    focusedSid: aliaslessActiveSid,
+    runtimes: {
+      [aliaslessActiveSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        turns: [{
+          id: "client-steer-row",
+          clientMsgId: "client-steer-row",
+          liveTaskId: "native-active-task",
+          prompt: "guide the running task",
+          done: false,
+          blocks: [{
+            kind: "text",
+            message_id: "shared-active-commentary",
+            channel: "commentary",
+            text: "one visible update",
+            done: true,
+            liveOrder: 0,
+          }],
+          nextLiveBlockOrder: 1,
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: aliaslessHistory(1),
+  });
+  assert.deepEqual(
+    aliaslessActiveState.runtimes[aliaslessActiveSid].turns.map(
+      (turn: Turn) => ({
+        id: turn.id,
+        historyTurnId: turn.historyTurnId,
+        prompt: turn.prompt,
+        done: turn.done,
+      }),
+    ),
+    [
+      {
+        id: "native-active-task",
+        historyTurnId: undefined,
+        prompt: "start work",
+        done: true,
+      },
+      {
+        id: "client-steer-row",
+        historyTurnId: "history-steer-row",
+        prompt: "guide the running task",
+        done: false,
+      },
+    ],
+    "refresh binds one aliasless active history row to its proven live row",
+  );
+  aliaslessActiveState = reduce(aliaslessActiveState, {
+    type: "event",
+    event: aliaslessHistory(2),
+  });
+  assert.equal(
+    aliaslessActiveState.runtimes[aliaslessActiveSid].turns.length,
+    2,
+    "repeated active History refreshes cannot recreate the discarded duplicate",
+  );
+  assert.equal(
+    aliaslessActiveState.runtimes[aliaslessActiveSid].turns[1].blocks.filter(
+      (block: Block) => block.kind === "text"
+        && block.message_id === "shared-active-commentary").length,
+    1,
+    "the bound active commentary renders once",
+  );
+
+  // The first running summary can race ahead of every visible item. With no
+  // block identity yet it is correct to keep the authoritative row and the
+  // accepted local steer separate. Once the local row receives native items
+  // and the completed summary returns those same exact item ids, however, the
+  // terminal merge must collapse the stale empty shell instead of leaving an
+  // extra completed process row at the physical bottom of the conversation.
+  const emptyActiveSid = "empty-active-steer-terminal-binding";
+  const emptyActiveNative = "empty-active-native-task";
+  let emptyActiveState = reduce({
+    ...initialState,
+    focusedSid: emptyActiveSid,
+    runtimes: {
+      [emptyActiveSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "empty-active-g1",
+        historyFence: 10,
+        liveOwner: {
+          turnId: "empty-active-client-steer",
+          seq: 11,
+        },
+        turns: [{
+          id: "empty-active-client-steer",
+          clientMsgId: "empty-active-client-steer",
+          liveTaskId: emptyActiveNative,
+          prompt: "guide before the first item",
+          done: false,
+          ts: 20_001,
+          blocks: [],
+        }],
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: emptyActiveSid,
+      session_id: emptyActiveSid,
+      revision: "empty-active-r1",
+      generation: "empty-active-g1",
+      build_seq: 1,
+      live_seq: 10,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      oldest_id: "empty-active-history-steer",
+      newest_id: "empty-active-history-steer",
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "empty-active-history-steer",
+        prompt: "guide before the first item",
+        forkPointId: emptyActiveNative,
+        done: true,
+        ts: 20_000,
+        blocks: [],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    emptyActiveState.runtimes[emptyActiveSid].turns.length,
+    2,
+    "an item-free running snapshot remains ambiguous until native blocks arrive",
+  );
+  assert.equal(
+    emptyActiveState.runtimes[emptyActiveSid].turns.filter(
+      (turn: Turn) => !turn.done).length,
+    1,
+    "the provisional History shell cannot render a second running indicator",
+  );
+  for (const liveEvent of [
+    event({
+      type: "process",
+      sid: emptyActiveSid,
+      seq: 11,
+      item_id: "empty-active-shared-process",
+      kind: "command",
+      phase: "end",
+      status: "succeeded",
+      turn_id: emptyActiveNative,
+      title: "ran the guided command",
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: emptyActiveSid,
+      seq: 12,
+      message_id: "empty-active-shared-final",
+      channel: "final",
+    }),
+    event({
+      type: "delta",
+      sid: emptyActiveSid,
+      seq: 13,
+      message_id: "empty-active-shared-final",
+      channel: "final",
+      text: "finished the guided work",
+    }),
+    event({
+      type: "assistant_msg_end",
+      sid: emptyActiveSid,
+      seq: 14,
+      message_id: "empty-active-shared-final",
+      channel: "final",
+    }),
+    event({
+      type: "turn_end",
+      sid: emptyActiveSid,
+      seq: 15,
+      turn_id: emptyActiveNative,
+      result: { subtype: "success", duration_ms: 5, is_error: false },
+    }),
+  ]) {
+    emptyActiveState = reduce(emptyActiveState, {
+      type: "event",
+      event: liveEvent,
+    });
+  }
+  const preTerminalRows =
+    emptyActiveState.runtimes[emptyActiveSid].turns;
+  assert.equal(
+    preTerminalRows[0].blocks.some((block: Block) => block.kind === "text"
+      && block.message_id === "empty-active-shared-final"),
+    false,
+    "an aliasless History shell cannot steal the post-steer final answer",
+  );
+  assert.deepEqual(
+    preTerminalRows[1].blocks.map((block: Block) => block.kind === "text"
+      ? block.message_id
+      : block.kind === "tool" ? block.tool_use_id : block.item_id),
+    ["empty-active-shared-process", "empty-active-shared-final"],
+    "post-steer process and final output remain on one live UI row",
+  );
+  emptyActiveState = reduce(emptyActiveState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: emptyActiveSid,
+      session_id: emptyActiveSid,
+      revision: "empty-active-r1",
+      generation: "empty-active-g1",
+      build_seq: 2,
+      live_seq: 15,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      oldest_id: "empty-active-history-steer",
+      newest_id: "empty-active-history-steer",
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "empty-active-history-steer",
+        prompt: "guide before the first item",
+        forkPointId: emptyActiveNative,
+        done: true,
+        ts: 20_000,
+        doneTs: 25_000,
+        durationMs: 5,
+        blocks: [{
+          kind: "process",
+          item_id: "empty-active-shared-process",
+          processKind: "command",
+          phase: "end",
+          status: "succeeded",
+          turn_id: emptyActiveNative,
+          title: "ran the guided command",
+          done: true,
+        }, {
+          kind: "text",
+          message_id: "empty-active-shared-final",
+          channel: "final",
+          text: "finished the guided work",
+          done: true,
+        }],
+        detailEventCount: 2,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.deepEqual(
+    emptyActiveState.runtimes[emptyActiveSid].turns.map((turn: Turn) => ({
+      id: turn.id,
+      historyTurnId: turn.historyTurnId,
+      done: turn.done,
+      prompt: turn.prompt,
+      blockIds: turn.blocks.map((block: Block) => block.kind === "text"
+        ? block.message_id
+        : block.kind === "tool" ? block.tool_use_id : block.item_id),
+    })),
+    [{
+      id: "empty-active-client-steer",
+      historyTurnId: "empty-active-history-steer",
+      done: true,
+      prompt: "guide before the first item",
+      blockIds: [
+        "empty-active-shared-process",
+        "empty-active-shared-final",
+      ],
+    }],
+    "terminal History binds the now-proven live row and removes its stale active shell",
   );
 
   const ambiguousActiveHeadSid = "ambiguous-active-history-head";
@@ -9102,6 +11117,21 @@ try {
     onLoadDetail: () => {},
   }));
   assert.doesNotMatch(loadedDetailMarkup, /展开完整过程/);
+  const failedInterruptedMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "failed-interrupted-session",
+    turns: [{
+      id: "failed-interrupted-turn",
+      prompt: "work",
+      done: true,
+      interrupted: true,
+      error: "网络异常，连接失败，请重新尝试。",
+      blocks: [],
+    }],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(failedInterruptedMarkup, /网络异常，连接失败，请重新尝试。/);
+  assert.doesNotMatch(failedInterruptedMarkup, /— 已打断 —/,
+    "one terminal failure must not render a second interrupted note");
   const richMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: richSid, turns: [richTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {},
@@ -9112,6 +11142,9 @@ try {
     "reply copy keeps the original compact icon instead of adding a text action");
   assert.match(richMarkup, /class="ubub-meta ai-meta"[\s\S]*aria-label="复制"/,
     "the original reply copy icon remains in the completed-turn metadata row");
+  assert.match(richMarkup,
+    /class="ubub-meta ai-meta"[\s\S]*?<button[^>]*aria-label="复制"[^>]*><svg[^>]*>[\s\S]*?<rect x="8" y="8" width="14" height="14" rx="2"\/><path d="M4 16a2 2 0 01-2-2V4a2 2 0 012-2h10a2 2 0 012 2"/,
+    "reply copy uses the overlapping-squares icon instead of a checkmark");
   assert.doesNotMatch(richMarkup, /先检查代码/);
   assert.doesNotMatch(richMarkup, /class="turn-working"/);
 
@@ -9696,6 +11729,8 @@ try {
   }));
   assert.doesNotMatch(codexMarkup, /复制回复/);
   assert.match(codexMarkup, /class="ubub-meta ai-meta"[\s\S]*aria-label="复制"/);
+  assert.match(codexMarkup,
+    /class="ubub-meta ai-meta"[\s\S]*?<button[^>]*aria-label="复制"[^>]*><svg[^>]*>[\s\S]*?<rect x="8" y="8" width="14" height="14" rx="2"\/><path d="M4 16a2 2 0 01-2-2V4a2 2 0 012-2h10a2 2 0 012 2"/);
   assert.match(codexMarkup, /aria-label="派生"/);
   assert.match(codexMarkup, /data-tooltip="从此回复派生新会话"/);
   assert.doesNotMatch(codexMarkup, /title="从此回复派生/);
@@ -11146,6 +13181,18 @@ assert.equal(
 );
 
 const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
+assert.doesNotMatch(appSource, /<Suspense fallback=\{null\}>[\s\S]{0,120}<GoalPanel/,
+  "Goal lazy loading must keep a stable chip placeholder");
+assert.match(appSource, /fallback=\{\(goalUi\?\.revealed \|\| goalUi\?\.open\)[\s\S]{0,160}goal-suspense/,
+  "a remembered Goal entry stays visible while its component chunk loads");
+assert.match(appSource, /recoverableReads\.retry\(\["goal", key\]/,
+  "a transient Goal read failure must be retried in the same connection");
+assert.doesNotMatch(appSource,
+  /state\.wrapperOnline\s*\n?\s*\|\|\s*!goalUiPreferencesRef\.current/,
+  "Goal recovery must query the focused session on a new browser/device");
+assert.match(appSource,
+  /Goal chip owns its retry state; feeding the same[\s\S]{0,240}\n\s*return;/,
+  "a handled Goal read failure must not also become a global command banner");
 const btwPanelSource = readFileSync(
   resolve(process.cwd(), "src/components/BtwPanel.tsx"), "utf8");
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
@@ -11728,6 +13775,11 @@ const chatViewSource = readFileSync(
 assert.match(chatViewSource, /surface !== "work"/);
 assert.match(chatViewSource, /arr\.length === 1 && onOpenFile/);
 assert.match(chatViewSource, /onOpenArtifacts\?\.\(\)/);
+assert.match(chatViewSource,
+  /const terminalProblem = t\.done[\s\S]{0,120}const working = !terminalProblem/,
+  "an interrupted or failed terminal must beat stale open process metadata");
+assert.match(chatViewSource, /t\.done && t\.interrupted && !t\.error/,
+  "an interrupted label must never render beside a live spinner");
 assert.match(layoutCss, /\.work-thread-shell \.thread-in\s*\{/);
 
 assert.equal(relay.sendTakeover("codex-model-session"), true);
@@ -11765,6 +13817,12 @@ for (const [type, sendCommand] of reliableControlFrames) {
   assert.equal(typeof frame.cmd_id, "string");
   assert.equal(typeof frame.client_id, "string");
 }
+const targetedGoalRequest = relay.sendGetGoalTo("background-goal-session");
+assert.equal(typeof targetedGoalRequest, "string");
+const targetedGoalFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(targetedGoalFrame.type, "get_goal");
+assert.equal(targetedGoalFrame.sid, "background-goal-session");
+assert.equal(typeof targetedGoalFrame.cmd_id, "string");
 
 socket.receive({
   type: "snapshot", sid: "s1", cc_session_id: "s1", generation: "g1",
@@ -12046,6 +14104,375 @@ scopedSocket.receive({
 assert.equal(scopedObserved.length, beforeReconnectFrame,
   "a delayed frame from an older underlying WebSocket generation is dropped");
 scopedRelay.stop();
+
+const goalOwnershipObserved: Array<{ event: ServerEvent; ownership?: {
+  scopeKey: string; surfaceEpoch: number; connectionGeneration: number;
+} }> = [];
+const goalOwnershipRelay = new RelayWs({
+  onEvent: (event, ownership) => {
+    goalOwnershipObserved.push({ event, ownership });
+  },
+  onConnState: () => {},
+}, "machine-goal");
+goalOwnershipRelay.start();
+const goalOwnershipSocket = FakeWebSocket.instances.at(-1);
+assert.ok(goalOwnershipSocket);
+goalOwnershipSocket.onopen?.();
+goalOwnershipRelay.setSurface("codex", "work");
+assert.equal(goalOwnershipRelay.sendListSessions("codex", "work"), true);
+const goalListRequest = JSON.parse(
+  goalOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.equal(typeof goalListRequest.cmd_id, "string");
+goalOwnershipSocket.receive({
+  type: "session_list", engine: "codex", space: "work",
+  request_id: goalListRequest.cmd_id,
+  sessions: [{
+    session_id: "background-goal-session",
+    engine: "codex",
+    space: "work",
+  }],
+});
+const listedGoalOwnership = goalOwnershipObserved.at(-1)?.ownership;
+assert.equal(listedGoalOwnership?.scopeKey, "machine-goal:work:codex");
+const correlatedGoalRequest = goalOwnershipRelay.sendGetGoalTo(
+  "background-goal-session");
+assert.equal(typeof correlatedGoalRequest, "string");
+goalOwnershipRelay.setSurface("claude", "code");
+goalOwnershipSocket.receive({
+  type: "goal_state", sid: "background-goal-session", goal: persistedGoal,
+  request_id: correlatedGoalRequest,
+});
+assert.equal(
+  goalOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-goal:work:codex",
+  "a Goal read keeps the exact request-time surface after the user switches",
+);
+goalOwnershipSocket.receive({
+  type: "goal_state", sid: "background-goal-session", goal: persistedGoal,
+});
+assert.equal(
+  goalOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-goal:work:codex",
+  "a valid background Goal broadcast keeps its accepted session ownership",
+);
+goalOwnershipSocket.receive({
+  type: "goal_state", sid: "unknown-goal-session", goal: persistedGoal,
+});
+assert.equal(goalOwnershipObserved.at(-1)?.ownership, undefined,
+  "an unknown Goal sid must not borrow the active surface");
+const beforeOldGoalFrame = goalOwnershipObserved.length;
+(goalOwnershipRelay as unknown as { connect: () => void }).connect();
+const nextGoalOwnershipSocket = FakeWebSocket.instances.at(-1);
+assert.ok(nextGoalOwnershipSocket
+  && nextGoalOwnershipSocket !== goalOwnershipSocket);
+nextGoalOwnershipSocket.onopen?.();
+goalOwnershipSocket.receive({
+  type: "goal_state", sid: "background-goal-session", goal: persistedGoal,
+});
+assert.equal(goalOwnershipObserved.length, beforeOldGoalFrame,
+  "a Goal frame from the retired socket generation must be ignored");
+goalOwnershipRelay.stop();
+
+// List reads run concurrently and one Codex request may return cached + fresh
+// frames. Ownership must follow cmd_id, never response arrival order.
+const listOwnershipObserved: Array<{ event: ServerEvent; ownership?: {
+  scopeKey: string; surfaceEpoch: number; connectionGeneration: number;
+} }> = [];
+const listOwnershipRelay = new RelayWs({
+  onEvent: (event, ownership) => {
+    listOwnershipObserved.push({ event, ownership });
+  },
+  onConnState: () => {},
+}, "machine-list-order");
+listOwnershipRelay.start();
+const listOwnershipSocket = FakeWebSocket.instances.at(-1);
+assert.ok(listOwnershipSocket);
+listOwnershipSocket.onopen?.();
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const oldListRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+listOwnershipRelay.setSurface("codex", "code");
+listOwnershipRelay.setSurface("claude", "code");
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const currentListRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.notEqual(currentListRequest.cmd_id, oldListRequest.cmd_id);
+
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: currentListRequest.cmd_id,
+  sessions: [{ session_id: "current-list-session" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+  "a newer request keeps its frozen ownership when its response wins the race",
+);
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: oldListRequest.cmd_id,
+  sessions: [{ session_id: "stale-list-session" }],
+});
+assert.equal(listOwnershipObserved.at(-1)?.ownership, undefined,
+  "a late old request cannot consume the current surface ownership");
+
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const cachedFreshRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+for (const sessionId of ["cached-list-session", "fresh-list-session"]) {
+  listOwnershipSocket.receive({
+    type: "session_list", engine: "claude", space: "code",
+    request_id: cachedFreshRequest.cmd_id,
+    sessions: [{ session_id: sessionId }],
+  });
+  assert.equal(
+    listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+    "machine-list-order:code:claude",
+    "cached and refreshed responses share one exact request ownership",
+  );
+}
+
+// Sidebar mutations and derived-session commands return SessionList using
+// their own transport cmd_id, not an id created by sendListSessions(). Each
+// path must therefore register the same frozen ownership before it is sent.
+listOwnershipRelay.setSessionEngines([
+  { session_id: "mutation-claude", engine: "claude", space: "code" },
+  { session_id: "mutation-codex", engine: "codex", space: "code" },
+]);
+const assertCommandListOwnership = (
+  sendCommand: () => unknown,
+  expectedType: string,
+  engine: "claude" | "codex",
+  space: "code" | "work" = "code",
+) => {
+  listOwnershipRelay.setSurface(engine, space);
+  sendCommand();
+  const frame = JSON.parse(
+    listOwnershipSocket.sent.at(-1) ?? "{}") as {
+      type?: string; cmd_id?: string;
+    };
+  assert.equal(frame.type, expectedType);
+  assert.equal(typeof frame.cmd_id, "string");
+  listOwnershipSocket.receive({
+    type: "session_list", engine, space,
+    request_id: frame.cmd_id,
+    sessions: [{ session_id: `${expectedType}-result`, engine, space }],
+  });
+  assert.equal(
+    listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+    `machine-list-order:${space}:${engine}`,
+    `${expectedType} refresh keeps its exact command-time ownership`,
+  );
+  return frame.cmd_id!;
+};
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendRenameSession(
+    "mutation-claude", "renamed", "claude", "code"),
+  "rename_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendArchiveSession(
+    "mutation-claude", true, "claude", "code"),
+  "archive_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendPinSession(
+    "mutation-claude", true, "claude", "code"),
+  "pin_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendDeleteSession(
+    "mutation-claude", "claude", "code"),
+  "delete_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendDeleteWorkSession(
+    "mutation-work", "claude"),
+  "delete_work_session", "claude", "work",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendForkSession(
+    "mutation-claude", "fork-point"),
+  "fork_session", "claude",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendForkSessionWorktree(
+    "mutation-codex", "review-fix"),
+  "fork_session_worktree", "codex",
+);
+assertCommandListOwnership(
+  () => listOwnershipRelay.sendMigrateSession(
+    "mutation-codex", "/repo/new"),
+  "migrate_session", "codex",
+);
+
+// Mutation failures may be followed by an authoritative list that reconciles
+// an outcome the wrapper could not report atomically.
+listOwnershipRelay.setSurface("claude", "code");
+listOwnershipRelay.sendArchiveSession(
+  "mutation-claude", false, "claude", "code");
+const failedMutation = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.equal(typeof failedMutation.cmd_id, "string");
+listOwnershipSocket.receive({
+  type: "error", code: "internal", message: "outcome uncertain",
+  request_id: failedMutation.cmd_id,
+});
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: failedMutation.cmd_id,
+  sessions: [{ session_id: "archive-reconciled" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+  "an Error followed by its mutation list keeps exact request ownership",
+);
+
+// A newer mutation that terminates with Error only must not suppress an older
+// list that is still the newest authoritative response to actually arrive.
+// Claude rename/archive and several delete failures have exactly this shape.
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const listBeforeErrorOnlyMutation = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+listOwnershipRelay.sendRenameSession(
+  "mutation-claude", "rename-that-fails", "claude", "code");
+const errorOnlyMutation = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.equal(typeof errorOnlyMutation.cmd_id, "string");
+listOwnershipSocket.receive({
+  type: "error", code: "internal", message: "rename failed",
+  request_id: errorOnlyMutation.cmd_id,
+});
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: listBeforeErrorOnlyMutation.cmd_id,
+  sessions: [{ session_id: "list-survived-error-only-mutation" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+  "an Error-only mutation cannot suppress an older unconsumed list",
+);
+
+// Fork/migrate errors carry their stable product request_id rather than the
+// transport cmd_id used by SessionList. Correct ordering cannot depend on an
+// Error being able to identify and roll back the list ownership entry.
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const listBeforeFailedFork = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+const failedForkRequestId = "failed-fork-product-request";
+listOwnershipRelay.sendForkSession(
+  "mutation-claude", "fork-point", failedForkRequestId);
+const failedForkCommand = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.notEqual(failedForkCommand.cmd_id, failedForkRequestId);
+listOwnershipSocket.receive({
+  type: "error", code: "busy", message: "fork rejected",
+  request_id: failedForkRequestId,
+});
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: listBeforeFailedFork.cmd_id,
+  sessions: [{ session_id: "list-survived-failed-fork" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+  "a product-request fork error cannot strand an older list",
+);
+
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const supersededSameScopeRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+assert.equal(listOwnershipRelay.sendListSessions("claude", "code"), true);
+const latestSameScopeRequest = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: latestSameScopeRequest.cmd_id,
+  sessions: [{ session_id: "latest-same-scope-session" }],
+});
+assert.equal(
+  listOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-list-order:code:claude",
+);
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  request_id: supersededSameScopeRequest.cmd_id,
+  sessions: [{ session_id: "superseded-same-scope-session" }],
+});
+assert.equal(listOwnershipObserved.at(-1)?.ownership, undefined,
+  "a slower request for the same scope cannot roll back a newer session list");
+listOwnershipSocket.receive({
+  type: "session_list", engine: "claude", space: "code",
+  sessions: [{ session_id: "uncorrelated-list-session" }],
+});
+assert.equal(listOwnershipObserved.at(-1)?.ownership, undefined,
+  "an uncorrelated list fails closed");
+
+const invalidationEventCount = listOwnershipObserved.length;
+const sentBeforeInvalidation = listOwnershipSocket.sent.length;
+listOwnershipRelay.setSurface("claude", "code");
+listOwnershipSocket.receive({
+  type: "session_list_invalidated", engine: "claude", space: "code",
+});
+const invalidationRefresh = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as {
+    type?: string; cmd_id?: string; client_id?: string;
+  };
+assert.equal(listOwnershipSocket.sent.length, sentBeforeInvalidation + 1);
+assert.equal(invalidationRefresh.type, "list_sessions");
+assert.equal(typeof invalidationRefresh.cmd_id, "string");
+assert.equal(listOwnershipObserved.length, invalidationEventCount,
+  "a catalog invalidation is transport control, not mutable UI state");
+
+listOwnershipSocket.receive({
+  type: "session_list_invalidated", engine: "claude", space: "code",
+});
+assert.equal(listOwnershipSocket.sent.length, sentBeforeInvalidation + 1,
+  "same-scope invalidations coalesce while one correlated list is in flight");
+listOwnershipSocket.receive({
+  type: "session_list_invalidated", engine: "codex", space: "work",
+});
+assert.equal(listOwnershipSocket.sent.length, sentBeforeInvalidation + 1,
+  "an inactive surface invalidation must not issue or mutate a visible list");
+
+listOwnershipSocket.receive({
+  type: "command_ack",
+  client_id: invalidationRefresh.client_id,
+  cmd_id: invalidationRefresh.cmd_id,
+});
+const coalescedRefresh = JSON.parse(
+  listOwnershipSocket.sent.at(-1) ?? "{}") as { type?: string; cmd_id?: string };
+assert.equal(listOwnershipSocket.sent.length, sentBeforeInvalidation + 2);
+assert.equal(coalescedRefresh.type, "list_sessions");
+assert.notEqual(coalescedRefresh.cmd_id, invalidationRefresh.cmd_id,
+  "one dirty bit schedules exactly one follow-up after the first refresh ACK");
+listOwnershipRelay.stop();
+
+const stoppedEvents: ServerEvent[] = [];
+const stoppedStates: string[] = [];
+const stoppedRelay = new RelayWs({
+  onEvent: (event) => { stoppedEvents.push(event); },
+  onConnState: (state) => { stoppedStates.push(state); },
+});
+stoppedRelay.start();
+const stoppedSocket = FakeWebSocket.instances.at(-1);
+assert.ok(stoppedSocket);
+stoppedSocket.onopen?.();
+const stoppedStateCount = stoppedStates.length;
+stoppedRelay.stop();
+stoppedSocket.receive({
+  type: "state", sid: "stopped-session", state: "running",
+});
+stoppedSocket.onopen?.();
+stoppedSocket.onclose?.({ code: 1006 });
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(stoppedEvents.length, 0,
+  "stop must invalidate delayed frames from the retired socket");
+assert.equal(stoppedStates.length, stoppedStateCount,
+  "retired socket open/close callbacks cannot mutate the next App lifecycle");
 
 // Query acceptance is a per-session lifecycle barrier, not an outbox ACK bit.
 // It survives this RelayWs instance's automatic reconnect and only correlated

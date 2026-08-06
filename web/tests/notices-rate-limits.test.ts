@@ -25,7 +25,7 @@ try {
   const { UsageMeter } = await harness.ssrLoadModule(
     "/src/components/UsageMeter.tsx");
   const {
-    accountQuotaWindows, remainingPercent,
+    accountQuotaWindows, quotaTone, remainingPercent,
   } = await harness.ssrLoadModule("/src/rate-limit-usage.ts");
   const { statusNotices } = await harness.ssrLoadModule(
     "/src/notice-presentation.ts");
@@ -295,6 +295,10 @@ try {
   const quotas = accountQuotaWindows(quotaReport);
   assert.equal(remainingPercent(quotas.fiveHour), 60);
   assert.equal(remainingPercent(quotas.weekly), 25);
+  assert.equal(quotaTone(51), "good");
+  assert.equal(quotaTone(50), "warn");
+  assert.equal(quotaTone(21), "warn");
+  assert.equal(quotaTone(20), "critical");
   const separateQuotaLimits = accountQuotaWindows({
     ...quotaReport,
     rate_limits: [{

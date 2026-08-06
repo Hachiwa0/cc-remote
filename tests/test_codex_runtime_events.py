@@ -13,6 +13,7 @@ from cc_remote.protocol import (
     NewSession,
     Notice,
     RateLimitUpdate,
+    SessionListInvalidated,
     deserialize,
     is_downstream,
     serialize,
@@ -353,7 +354,7 @@ def test_new_session_flushes_pending_notice_after_client_runtime_exists(
     asyncio.run(run())
 
 
-def test_new_codex_work_session_binds_native_id_and_refreshes_sidebar(
+def test_new_codex_work_session_binds_native_id_and_invalidates_sidebar(
         monkeypatch, tmp_path):
     created = {}
 
@@ -417,10 +418,19 @@ def test_new_codex_work_session_binds_native_id_and_refreshes_sidebar(
         focus = next(message for message in transport.sent
                      if message.type == "session_focus")
         assert focus.session_id == "work-thread-1"
-        listing = next(message for message in transport.sent
-                       if message.type == "session_list")
-        assert listing.space == "work"
-        assert [item.session_id for item in listing.sessions] == ["work-thread-1"]
+        assert not [message for message in transport.sent
+                    if message.type == "session_list"]
+        invalidations = [
+            message for message in transport.sent
+            if isinstance(message, SessionListInvalidated)
+        ]
+        assert [(item.engine, item.space, item.to, item.seq)
+                for item in invalidations] == [
+                    ("codex", "work", None, None),
+                ]
+        types = [message.type for message in transport.sent]
+        assert types.index("session_focus") < types.index(
+            "session_list_invalidated")
         assert not [message for message in transport.sent
                     if message.type == "error"]
 
