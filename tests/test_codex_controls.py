@@ -3659,6 +3659,612 @@ def test_codex_goal_notifications_are_sanitized_filtered_and_cleared():
     asyncio.run(run())
 
 
+def test_codex_goal_ignores_late_turn_updates_after_local_replacement(
+    monkeypatch,
+):
+    clock = [100.0]
+    monkeypatch.setattr(
+        codex_handle_module.time, "monotonic", lambda: clock[0])
+
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 20,
+            "timeUsedSeconds": 30, "createdAt": 1, "updatedAt": 20,
+        }
+        replacement = {
+            "threadId": "thread-1", "objective": "new objective",
+            "status": "active", "tokensUsed": 20,
+            "timeUsedSeconds": 31, "createdAt": 1, "updatedAt": 21,
+        }
+        stale_progress = {
+            **old_goal, "status": "active", "tokensUsed": 21,
+            "timeUsedSeconds": 34, "createdAt": 1, "updatedAt": 24,
+        }
+        stale_completion = {
+            **old_goal, "status": "complete", "tokensUsed": 22,
+            "timeUsedSeconds": 38, "createdAt": 1, "updatedAt": 28,
+        }
+
+        async def request(method, params=None):
+            if method == "thread/goal/get":
+                assert params == {"threadId": "thread-1"}
+                return {"goal": old_goal}
+            assert (method, params) == (
+                "thread/goal/set",
+                {
+                    "threadId": "thread-1",
+                    "objective": "new objective",
+                    "status": "active",
+                },
+            )
+            return {"goal": replacement}
+
+        handle._request = request
+        assert (await handle.get_goal())["objective"] == "old objective"
+        handle.turn_id = "old-turn"
+        handle.turn_active = True
+        assert (await handle.set_goal(
+            objective="new objective", status="active"
+        ))["objective"] == "new objective"
+        fence = handle._goal_replacement_fence
+        assert fence is not None and fence.authoritative
+
+        # A previous turn may drain behind a long-running tool. The replacement
+        # boundary is event-driven and must not expire on wall-clock time.
+        clock[0] += 60 * 60
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": stale_progress,
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": stale_completion,
+            },
+        })
+
+        assert seen == []
+        assert handle.last_goal["objective"] == "new objective"
+        assert handle.last_goal["status"] == "active"
+        assert handle.goal_revision == 0
+
+        current_completion = {
+            **replacement, "status": "complete", "updatedAt": 29,
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "replacement-turn",
+                "goal": current_completion,
+            },
+        })
+        assert seen[-1]["objective"] == "new objective"
+        assert seen[-1]["status"] == "complete"
+        assert handle.last_goal == seen[-1]
+        assert handle.goal_revision == 1
+
+        # A persisted read is authoritative even when another client restores
+        # the exact objective protected by the short-lived local fence.
+        async def restored_read(method, params=None):
+            assert (method, params) == (
+                "thread/goal/get", {"threadId": "thread-1"})
+            return {"goal": {**old_goal, "updatedAt": 30}}
+
+        handle._request = restored_read
+        assert (await handle.get_goal())["objective"] == "old objective"
+        restored_fence = handle._goal_replacement_fence
+        assert restored_fence is not None and restored_fence.authoritative
+        assert restored_fence.objective == "old objective"
+        assert restored_fence.retired_turn_ids == {
+            "new objective": {"replacement-turn"},
+        }
+
+    asyncio.run(run())
+
+
+def test_codex_goal_accepts_unowned_shared_daemon_replacement():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 10,
+            "timeUsedSeconds": 20, "createdAt": 1, "updatedAt": 2,
+        }
+        external_replacement = {
+            **old_goal,
+            "objective": "another client's objective",
+            "tokensUsed": 0,
+            "timeUsedSeconds": 0,
+            "updatedAt": 3,
+        }
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": old_goal,
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-continuation",
+                "goal": {**old_goal, "tokensUsed": 11, "updatedAt": 2.5},
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "external-turn",
+                "goal": external_replacement,
+            },
+        })
+
+        assert [goal["objective"] for goal in seen] == [
+            "old objective", "old objective",
+            "another client's objective",
+        ]
+        assert handle.last_goal == seen[-1]
+        assert handle.goal_revision == 3
+        external_fence = handle._goal_replacement_fence
+        assert external_fence is not None and external_fence.authoritative
+        assert external_fence.objective == "another client's objective"
+        assert external_fence.current_turn_ids == {"external-turn"}
+        assert external_fence.retired_turn_ids == {
+            "old objective": {"old-turn", "old-continuation"},
+        }
+
+        rapid_replacement = {
+            **external_replacement,
+            "objective": "rapid third objective",
+            "updatedAt": 4,
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "rapid-turn",
+                "goal": rapid_replacement,
+            },
+        })
+        rapid_fence = handle._goal_replacement_fence
+        assert rapid_fence is not None and rapid_fence.authoritative
+        assert rapid_fence.objective == "rapid third objective"
+        assert rapid_fence.current_turn_ids == {"rapid-turn"}
+        assert rapid_fence.retired_turn_ids == {
+            "old objective": {"old-turn", "old-continuation"},
+            "another client's objective": {"external-turn"},
+        }
+
+        # Another daemon client may restore an older public objective before its
+        # original turn drains. The new turn is authoritative; retaining the old
+        # turn id still lets us reject only that original generation.
+        restored_old_objective = {
+            **old_goal, "tokensUsed": 0, "timeUsedSeconds": 0,
+            "updatedAt": 5,
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "restored-turn",
+                "goal": restored_old_objective,
+            },
+        })
+        assert [goal["objective"] for goal in seen] == [
+            "old objective",
+            "old objective",
+            "another client's objective",
+            "rapid third objective",
+            "old objective",
+        ]
+        restored_fence = handle._goal_replacement_fence
+        assert restored_fence is not None and restored_fence.authoritative
+        assert restored_fence.objective == "old objective"
+        assert restored_fence.current_turn_ids == {"restored-turn"}
+        assert restored_fence.retired_turn_ids == {
+            "old objective": {"old-turn", "old-continuation"},
+            "another client's objective": {"external-turn"},
+            "rapid third objective": {"rapid-turn"},
+        }
+
+        # Turn-owned snapshots from the original Goal stay fenced even though
+        # its objective text is current again under a different turn.
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "tokensUsed": 11, "updatedAt": 6},
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {
+                    **old_goal, "status": "usageLimited", "updatedAt": 6.5,
+                },
+            },
+        })
+        assert handle._goal_replacement_fence.retired_turn_ids[
+            "old objective"
+        ] == {"old-turn", "old-continuation"}
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "tokensUsed": 12, "updatedAt": 6.75},
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "status": "complete", "updatedAt": 7},
+            },
+        })
+        assert handle._goal_replacement_fence.retired_turn_ids[
+            "old objective"
+        ] == {"old-continuation"}
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-continuation",
+                "goal": {**old_goal, "tokensUsed": 12, "updatedAt": 7.5},
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-continuation",
+                "goal": {**old_goal, "status": "complete", "updatedAt": 7.6},
+            },
+        })
+        assert len(seen) == 5
+        assert handle.last_goal["objective"] == "old objective"
+        assert handle.last_goal_turn_id == "restored-turn"
+        assert handle.goal_revision == 5
+        assert handle._goal_replacement_fence.retired_turn_ids == {
+            "another client's objective": {"external-turn"},
+            "rapid third objective": {"rapid-turn"},
+        }
+
+        third_objective = {
+            **rapid_replacement,
+            "objective": "authoritative read objective",
+            "updatedAt": 8,
+        }
+
+        async def external_read(method, params=None):
+            assert (method, params) == (
+                "thread/goal/get", {"threadId": "thread-1"})
+            return {"goal": third_objective}
+
+        handle._request = external_read
+        assert (await handle.get_goal())["objective"] == (
+            "authoritative read objective")
+        assert handle.last_goal["objective"] == "authoritative read objective"
+
+        # An explicit set notification is authoritative and may restore the
+        # exact objective currently protected as the previous generation.
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": None,
+                "goal": {**external_replacement, "updatedAt": 9},
+            },
+        })
+        assert len(seen) == 6
+        assert handle.last_goal["objective"] == "another client's objective"
+        fence = handle._goal_replacement_fence
+        assert fence is not None
+        assert fence.objective == "another client's objective"
+        assert fence.retired_turn_ids == {
+            "old objective": {"restored-turn"},
+            "another client's objective": {"external-turn"},
+            "rapid third objective": {"rapid-turn"},
+        }
+
+    asyncio.run(run())
+
+
+def test_codex_goal_accepts_unbound_turn_owned_restore():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        original = {
+            "threadId": "thread-1", "objective": "original objective",
+            "status": "active", "tokensUsed": 4,
+            "timeUsedSeconds": 8, "createdAt": 1, "updatedAt": 2,
+        }
+
+        async def get_original(method, params=None):
+            assert (method, params) == (
+                "thread/goal/get", {"threadId": "thread-1"})
+            return {"goal": original}
+
+        handle._request = get_original
+        assert (await handle.get_goal())["objective"] == "original objective"
+        initial_fence = handle._goal_replacement_fence
+        assert initial_fence is not None
+        assert initial_fence.current_turn_ids == set()
+
+        intervening = {
+            **original, "objective": "intervening objective", "updatedAt": 3,
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "intervening-turn",
+                "goal": intervening,
+            },
+        })
+        assert handle.last_goal["objective"] == "intervening objective"
+        assert "original objective" not in (
+            handle._goal_replacement_fence.retired_turn_ids
+        )
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "restored-turn",
+                "goal": {**original, "updatedAt": 4},
+            },
+        })
+        assert [goal["objective"] for goal in seen] == [
+            "intervening objective", "original objective",
+        ]
+        assert handle.last_goal_turn_id == "restored-turn"
+        restored_fence = handle._goal_replacement_fence
+        assert restored_fence is not None and restored_fence.authoritative
+        assert restored_fence.objective == "original objective"
+        assert restored_fence.current_turn_ids == {"restored-turn"}
+        assert restored_fence.retired_turn_ids == {
+            "intervening objective": {"intervening-turn"},
+        }
+
+    asyncio.run(run())
+
+
+def test_codex_goal_same_objective_resume_preserves_replacement_fence():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 10,
+            "timeUsedSeconds": 20, "createdAt": 1, "updatedAt": 2,
+        }
+        paused_goal = {
+            **old_goal, "objective": "current objective", "status": "paused",
+            "updatedAt": 3,
+        }
+        active_goal = {**paused_goal, "status": "active", "updatedAt": 4}
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": old_goal,
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "current-turn",
+                "goal": paused_goal,
+            },
+        })
+        fence = handle._goal_replacement_fence
+        assert fence is not None and fence.authoritative
+        assert fence.retired_turn_ids == {"old objective": {"old-turn"}}
+        seen.clear()
+
+        async def resume_request(method, params=None):
+            assert (method, params) == (
+                "thread/goal/set",
+                {"threadId": "thread-1", "status": "active"},
+            )
+            await handle._dispatch({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-1", "turnId": "old-turn",
+                    "goal": {**old_goal, "tokensUsed": 11, "updatedAt": 5},
+                },
+            })
+            assert handle._goal_replacement_fence is fence
+            assert handle.last_goal["objective"] == "current objective"
+            return {"goal": active_goal}
+
+        handle._request = resume_request
+        resumed = await handle.set_goal(status="active")
+        assert resumed["objective"] == "current objective"
+        assert resumed["status"] == "active"
+        assert seen == []
+        assert handle._goal_replacement_fence is fence
+        assert fence.authoritative
+        assert fence.retired_turn_ids == {"old objective": {"old-turn"}}
+
+    asyncio.run(run())
+
+
+def test_codex_goal_replacement_retires_turn_learned_during_rpc():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 10,
+            "timeUsedSeconds": 20, "createdAt": 1, "updatedAt": 2,
+        }
+        replacement = {
+            **old_goal, "objective": "new objective", "updatedAt": 3,
+        }
+
+        async def request(method, params=None):
+            if method == "thread/goal/get":
+                assert params == {"threadId": "thread-1"}
+                return {"goal": old_goal}
+            assert (method, params) == (
+                "thread/goal/set",
+                {
+                    "threadId": "thread-1",
+                    "objective": "new objective",
+                    "status": "active",
+                },
+            )
+            # The persisted baseline had no turn attribution. Learn the old
+            # turn only after the replacement request has started.
+            await handle._dispatch({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-1", "turnId": "old-turn",
+                    "goal": {**old_goal, "tokensUsed": 11, "updatedAt": 2.5},
+                },
+            })
+            return {"goal": replacement}
+
+        handle._request = request
+        result = await handle.set_goal(
+            objective="new objective", status="active")
+        assert result["objective"] == "new objective"
+        fence = handle._goal_replacement_fence
+        assert fence is not None and fence.authoritative
+        assert fence.objective == "new objective"
+        assert fence.retired_turn_ids == {
+            "old objective": {"old-turn"},
+        }
+        assert len(seen) == 1
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "status": "complete", "updatedAt": 4},
+            },
+        })
+        assert len(seen) == 1
+        assert handle.last_goal["objective"] == "new objective"
+        assert handle.last_goal["status"] == "active"
+        assert fence.retired_turn_ids == {}
+
+    asyncio.run(run())
+
+
+def test_codex_goal_replacement_accepts_update_before_lost_response():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 20,
+            "timeUsedSeconds": 30, "createdAt": 1, "updatedAt": 20,
+        }
+        replacement = {
+            "threadId": "thread-1", "objective": "new objective",
+            "status": "active", "tokensUsed": 20,
+            "timeUsedSeconds": 31, "createdAt": 1, "updatedAt": 21,
+        }
+
+        async def lost_response(method, params=None):
+            assert (method, params) == (
+                "thread/goal/set",
+                {
+                    "threadId": "thread-1",
+                    "objective": "new objective",
+                    "status": "active",
+                },
+            )
+            # turn/started consumes the short-lived prompt candidate. The
+            # independent replacement fence must still admit the matching Goal
+            # notification before this RPC response is lost.
+            await handle._dispatch({
+                "method": "turn/started",
+                "params": {"turn": {"id": "replacement-turn"}},
+            })
+            assert handle._goal_prompt_candidate is None
+            await handle._dispatch({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "replacement-turn",
+                    "goal": replacement,
+                },
+            })
+            raise TimeoutError("response lost after Goal replacement")
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": old_goal,
+            },
+        })
+        seen.clear()
+        handle._request = lost_response
+        with pytest.raises(TimeoutError, match="response lost"):
+            await handle.set_goal(
+                objective="new objective", status="active")
+
+        assert [goal["objective"] for goal in seen] == ["new objective"]
+        assert handle.last_goal == seen[0]
+        assert handle.goal_revision == 2
+        assert handle.last_goal_turn_id == "replacement-turn"
+        fence = handle._goal_replacement_fence
+        assert fence is not None and fence.authoritative
+        assert handle.take_goal_prompt("replacement-turn") == "new objective"
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "status": "complete", "updatedAt": 22},
+            },
+        })
+        assert [goal["objective"] for goal in seen] == ["new objective"]
+        assert handle.last_goal == seen[0]
+        assert handle.goal_revision == 2
+
+    asyncio.run(run())
+
+
 def test_machine_goal_emits_authoritative_state():
     async def run():
         machine, transport = _mk_machine()

@@ -220,10 +220,13 @@ const persistedGoal = {
   timeUsedSeconds: 2,
   createdAt: 100,
 };
-let goalPreferences = rememberGoalUi({}, goalScopeA, 10);
-assert.equal(reconcileGoalUiPreference(
-  {}, goalScopeA, persistedGoal, 10).revealed, false,
-"an unsolicited Goal broadcast must not reveal Goal UI for an unknown scope");
+const discoveredGoal = reconcileGoalUiPreference(
+  {}, goalScopeA, persistedGoal, 10);
+assert.equal(discoveredGoal.revealed, true,
+  "an authoritative Goal must reveal itself on a new browser or device");
+assert.equal(discoveredGoal.preferences[goalScopeA]?.known, true,
+  "Goal discovery must survive a refresh without requiring /goal");
+let goalPreferences = rememberGoalUi(discoveredGoal.preferences, goalScopeA, 10);
 let reconciledGoal = reconcileGoalUiPreference(
   goalPreferences, goalScopeA, persistedGoal, 11);
 assert.equal(reconciledGoal.revealed, true);
@@ -237,6 +240,13 @@ reconciledGoal = reconcileGoalUiPreference(
   goalPreferences, goalScopeA, { ...persistedGoal, createdAt: 101 }, 14);
 assert.equal(reconciledGoal.revealed, true,
   "a newly-created Goal must not inherit the previous Goal's dismissal");
+reconciledGoal = reconcileGoalUiPreference(
+  goalPreferences, goalScopeA, {
+    ...persistedGoal,
+    objective: "a replacement objective with the same native createdAt",
+  }, 15);
+assert.equal(reconciledGoal.revealed, true,
+  "a replacement Codex Goal must not inherit the previous Goal's dismissal");
 assert.equal(goalStableIdentity({ ...persistedGoal, createdAt: undefined }), null);
 const identitylessDismissal = dismissGoalUi(
   rememberGoalUi({}, goalScopeA, 20), goalScopeA,
@@ -13177,6 +13187,9 @@ assert.match(appSource, /fallback=\{\(goalUi\?\.revealed \|\| goalUi\?\.open\)[\
   "a remembered Goal entry stays visible while its component chunk loads");
 assert.match(appSource, /recoverableReads\.retry\(\["goal", key\]/,
   "a transient Goal read failure must be retried in the same connection");
+assert.doesNotMatch(appSource,
+  /state\.wrapperOnline\s*\n?\s*\|\|\s*!goalUiPreferencesRef\.current/,
+  "Goal recovery must query the focused session on a new browser/device");
 assert.match(appSource,
   /Goal chip owns its retry state; feeding the same[\s\S]{0,240}\n\s*return;/,
   "a handled Goal read failure must not also become a global command banner");

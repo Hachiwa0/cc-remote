@@ -45,7 +45,24 @@ export function goalStableIdentity(goal: ThreadGoal | null | undefined): string 
   if (typeof marker !== "number" || !Number.isFinite(marker) || marker < 0) {
     return null;
   }
-  return JSON.stringify([goal.engine, goal.threadId, marker]);
+  // Codex currently mutates one thread-level Goal record and can reuse
+  // createdAt when the objective is replaced. Keep the objective out of
+  // localStorage while still making a dismissal specific to that generation.
+  let left = 0x9e3779b9;
+  let right = 0x85ebca6b;
+  for (let index = 0; index < goal.objective.length; index += 1) {
+    const code = goal.objective.charCodeAt(index);
+    left = Math.imul(left ^ code, 0x85ebca6b);
+    right = Math.imul(right ^ code, 0xc2b2ae35);
+  }
+  const objectiveFingerprint = [
+    (left >>> 0).toString(36),
+    (right >>> 0).toString(36),
+    goal.objective.length.toString(36),
+  ].join(".");
+  return JSON.stringify([
+    goal.engine, goal.threadId, marker, objectiveFingerprint,
+  ]);
 }
 
 function boundPreferences(preferences: GoalUiPreferences): GoalUiPreferences {
@@ -139,7 +156,13 @@ export function reconcileGoalUiPreference(
   now = Date.now(),
 ): { preferences: GoalUiPreferences; revealed: boolean } {
   const current = preferences[key];
-  if (!current?.known) return { preferences, revealed: false };
+  if (!current?.known) {
+    if (!goal) return { preferences, revealed: false };
+    return {
+      preferences: rememberGoalUi(preferences, key, now),
+      revealed: true,
+    };
+  }
   const identity = goalStableIdentity(goal);
   const hidden = !!identity && current.hiddenGoal === identity;
   const next = boundPreferences({
